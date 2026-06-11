@@ -12,5 +12,6 @@ hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["full"] }
 percent-encoding = "2.3.2"
 tokio = { version = "1.52.3", features = ["full"] }
-tokio-postgres = "0.7.17"
+tokio-postgres = { version = "0.7.17", features = ["with-uuid-1"] }
 tokio-util = "0.7.18"
+uuid = { version = "1.23.3", features = ["v4"] }

@@ -24,11 +24,25 @@ const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS nodes (
     node_id     TEXT PRIMARY KEY,
     peer_url    TEXT NOT NULL,
-    last_seen   TIMESTAMPTZ NOT NULL DEFAULT now()
+    last_seen   TIMESTAMPTZ NOT NULL,
+    free_space  BIGINT NOT NULL            -- Free space available in bytes
 );
 
 CREATE TABLE IF NOT EXISTS buckets (
     name        TEXT PRIMARY KEY,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS parts (
+    part_id       UUID PRIMARY KEY,
+    size          BIGINT NOT NULL,
+    state         TEXT NOT NULL,            -- 'pending' | 'committed'
+    created_at    TIMESTAMPTZ NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS part_locations (
+    part_id     UUID NOT NULL REFERENCES parts(part_id) ON DELETE CASCADE,
+    node_id     TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+    PRIMARY KEY (part_id, node_id)
 );
 "#;

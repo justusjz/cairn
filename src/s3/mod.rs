@@ -12,6 +12,7 @@ use crate::{
 };
 
 mod buckets;
+mod objects;
 mod util;
 
 pub async fn handle(
