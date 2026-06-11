@@ -1,5 +1,6 @@
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, str::FromStr, sync::Arc};
 
+use clap::Parser;
 use deadpool_postgres::Pool;
 use hyper::{server::conn::http1, service::service_fn};
 use hyper_util::rt::TokioIo;
@@ -14,12 +15,24 @@ pub struct App {
     pool: Pool,
 }
 
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long)]
+    database: String,
+    #[arg(short, long)]
+    listen_client: String,
+    /*#[arg(short, long)]
+    listen_peer: String,*/
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let pool = db::connect("postgres://postgres:password@127.0.0.1:5432/cairn").await?;
+    let args = Args::parse();
+    let pool = db::connect(&args.database).await?;
     let app = Arc::new(App { pool });
-    let addr = SocketAddr::from(([127, 0, 0, 1], 19000));
-    let listener = TcpListener::bind(addr).await?;
+    let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
+    // let listen_peer_addr = SocketAddr::from_str(&args.listen_peer).unwrap();
+    let listener = TcpListener::bind(listen_client_addr).await?;
     println!("Listening on 127.0.0.1:19000...");
     loop {
         let (stream, _peer_addr) = listener.accept().await?;

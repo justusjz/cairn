@@ -6,7 +6,7 @@ use hyper::{Request, Response, StatusCode, body::Bytes};
 use crate::{
     App,
     s3::{
-        buckets::{create::create_bucket, list::list_buckets},
+        buckets::{create::create_bucket, delete::delete_bucket, list::list_buckets},
         util::{decode_path_param, format_s3_error},
     },
 };
@@ -37,6 +37,7 @@ pub async fn handle(
         // bucket operations
         match req.method() {
             &hyper::Method::PUT => create_bucket(&app, &bucket).await,
+            &hyper::Method::DELETE => delete_bucket(&app, &bucket).await,
             _ => Ok(format_s3_error(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "MethodNotAllowed",
