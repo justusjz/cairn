@@ -1,5 +1,5 @@
 use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes};
+use hyper::{Response, StatusCode, body::Bytes, header};
 use uuid::Uuid;
 
 use crate::{App, s3::util::format_s3_error};
@@ -9,21 +9,39 @@ pub async fn get_object(
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    let client = app.pool.get().await?;
-    // Resolve which part this key currently points at.
-    let row = client
+    let mut client = app.pool.get().await?;
+    // Resolve the part this key points at, plus the metadata we echo back.
+    // last_modified is formatted as an RFC 1123 HTTP-date (what S3 clients expect).
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    let row = tx
         .query_opt(
-            "SELECT part_id FROM objects WHERE bucket = $1 AND key = $2",
+            "SELECT etag, content_type,
+                    to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"')
+             FROM objects WHERE bucket = $1 AND key = $2",
             &[&bucket, &key],
         )
         .await?;
-    let part_id: Uuid = match row {
-        Some(row) => row.get(0),
+    let (etag, content_type, last_modified): (String, String, String) = match row {
+        Some(row) => (row.get(0), row.get(1), row.get(2)),
         None => return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")),
     };
+    let parts = tx
+        .query(
+            "SELECT part_number, part_id FROM object_parts WHERE bucket = $1 AND key = $2",
+            &[&bucket, &key],
+        )
+        .await?;
+    if parts.len() != 1 {
+        panic!("object does not have exactly 1 part");
+    }
+    let part_id: Uuid = parts[0].get(1);
     // Every replica that holds the part, with its peer URL — freshest heartbeat
     // first, so we try the node most likely to be alive before the others.
-    let locations = client
+    let locations = tx
         .query(
             "SELECT part_locations.node_id, nodes.peer_url
             FROM part_locations
@@ -57,6 +75,9 @@ pub async fn get_object(
             Ok(Some(data)) => {
                 return Ok(Response::builder()
                     .status(StatusCode::OK)
+                    .header(header::ETAG, format!("\"{etag}\""))
+                    .header(header::CONTENT_TYPE, content_type.as_str())
+                    .header(header::LAST_MODIFIED, last_modified.as_str())
                     .body(Full::new(data))
                     .unwrap());
             }
@@ -76,4 +97,39 @@ pub async fn get_object(
         "ServiceUnavailable",
         "no replica could serve the requested object",
     ))
+}
+
+/// Metadata-only response for the key: answered straight from `objects`, never
+/// touching a replica. s3cmd issues this before a download.
+pub async fn head_object(
+    app: &App,
+    bucket: &str,
+    key: &str,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let client = app.pool.get().await?;
+    let row = client
+        .query_opt(
+            "SELECT size, etag, content_type,
+                    to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"')
+             FROM objects WHERE bucket = $1 AND key = $2",
+            &[&bucket, &key],
+        )
+        .await?;
+    match row {
+        Some(row) => {
+            let size: i64 = row.get(0);
+            let etag: String = row.get(1);
+            let content_type: String = row.get(2);
+            let last_modified: String = row.get(3);
+            Ok(Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, size)
+                .header(header::ETAG, format!("\"{etag}\""))
+                .header(header::CONTENT_TYPE, content_type)
+                .header(header::LAST_MODIFIED, last_modified)
+                .body(Full::new(Bytes::new()))
+                .unwrap())
+        }
+        None => Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")),
+    }
 }

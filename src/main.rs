@@ -355,10 +355,10 @@ async fn try_commit_part(
             // replacing any parts the key referenced before (which then become
             // unreferenced and GC-eligible).
             tx.execute(
-                "INSERT INTO objects (bucket, key, size, etag, content_type, created_at)
+                "INSERT INTO objects (bucket, key, size, etag, content_type, last_modified)
                  VALUES ($1, $2, $3, $4, $5, NOW())
                  ON CONFLICT (bucket, key)
-                 DO UPDATE SET size = $3, etag = $4, content_type = $5, created_at = NOW()",
+                 DO UPDATE SET size = $3, etag = $4, content_type = $5, last_modified = NOW()",
                 &[bucket, key, size, etag, content_type],
             )
             .await?;

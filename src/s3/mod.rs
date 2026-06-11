@@ -7,7 +7,10 @@ use crate::{
     App,
     s3::{
         buckets::{create::create_bucket, delete::delete_bucket, list::list_buckets},
-        objects::{get::get_object, put::put_object},
+        objects::{
+            get::{get_object, head_object},
+            put::put_object,
+        },
         util::{decode_path_param, format_s3_error},
     },
 };
@@ -50,6 +53,7 @@ pub async fn handle(
         // object operations. Clone the method so the PUT arm can still consume
         // `req`'s body.
         match req.method().clone() {
+            hyper::Method::HEAD => head_object(&app, &bucket, &key).await,
             hyper::Method::GET => get_object(&app, &bucket, &key).await,
             hyper::Method::PUT => {
                 let content_type = req

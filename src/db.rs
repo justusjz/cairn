@@ -52,7 +52,7 @@ CREATE TABLE IF NOT EXISTS objects (
     size          BIGINT NOT NULL,          -- total object size in bytes
     etag          TEXT NOT NULL,            -- S3 ETag
     content_type  TEXT NOT NULL,
-    created_at    TIMESTAMPTZ NOT NULL,
+    last_modified    TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (bucket, key)
 );
 
