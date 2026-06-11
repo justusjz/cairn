@@ -45,4 +45,23 @@ CREATE TABLE IF NOT EXISTS part_locations (
     node_id     TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
     PRIMARY KEY (part_id, node_id)
 );
+
+CREATE TABLE IF NOT EXISTS objects (
+    bucket        TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
+    key           TEXT NOT NULL,
+    size          BIGINT NOT NULL,          -- total object size in bytes
+    etag          TEXT NOT NULL,            -- S3 ETag
+    content_type  TEXT NOT NULL,
+    created_at    TIMESTAMPTZ NOT NULL,
+    PRIMARY KEY (bucket, key)
+);
+
+CREATE TABLE IF NOT EXISTS object_parts (
+    bucket        TEXT NOT NULL,
+    key           TEXT NOT NULL,
+    part_number   INT NOT NULL,
+    part_id       UUID NOT NULL REFERENCES parts(part_id),
+    PRIMARY KEY (bucket, key, part_number),
+    FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
+);
 "#;

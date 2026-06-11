@@ -1,4 +1,4 @@
-use std::{path::PathBuf, str::FromStr};
+use std::path::PathBuf;
 
 use tokio::{fs, io::AsyncWriteExt};
 use uuid::Uuid;
@@ -9,12 +9,22 @@ pub struct Store {
 }
 
 impl Store {
-    pub fn new(data_dir: String) -> Store {
-        // TODO: we need to actually read the store of course
-        Store {
-            node_id: Uuid::new_v4(),
-            data_dir: PathBuf::from_str(&data_dir).unwrap(),
-        }
+    pub fn new(data_dir: String) -> anyhow::Result<Store> {
+        let data_dir = PathBuf::from(data_dir);
+        std::fs::create_dir_all(&data_dir)?;
+        // A node's identity is bound to its data dir: read it back if present,
+        // otherwise mint one and persist it so it's stable across restarts.
+        let id_path = data_dir.join("node_id");
+        let node_id = match std::fs::read_to_string(&id_path) {
+            Ok(s) => Uuid::parse_str(s.trim())?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let id = Uuid::new_v4();
+                std::fs::write(&id_path, id.to_string())?;
+                id
+            }
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Store { node_id, data_dir })
     }
 
     pub fn get_node_id(&self) -> Uuid {
@@ -41,10 +51,14 @@ impl Store {
         Ok(())
     }
 
-    pub async fn read_part(&self, part_id: Uuid) -> anyhow::Result<Vec<u8>> {
+    /// Reads a part from local disk, or `None` if this node doesn't have it.
+    pub async fn read_part_opt(&self, part_id: Uuid) -> anyhow::Result<Option<Vec<u8>>> {
         let part_id = part_id.to_string();
         let part_dir = self.get_part_dir(&part_id);
-        let data = fs::read(part_dir.join(part_id)).await?;
-        Ok(data)
+        match fs::read(part_dir.join(part_id)).await {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 }

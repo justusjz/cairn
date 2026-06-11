@@ -33,6 +33,7 @@ STARTUP_TIMEOUT=60               # seconds to wait for postgres / server
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="$(mktemp -d /tmp/s3-smoke.XXXXXX)"
+CARGO_ARGS+=(--data-dir "$WORK_DIR/data")   # required; per-run blob dir
 SERVER_LOG="$WORK_DIR/server.log"
 SERVER_PID=""
 BUCKET="smoke-$(date +%s)"
