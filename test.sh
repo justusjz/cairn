@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=28
+TOTAL=30
 STEP=0
 PASS=0
 FAIL=0
@@ -109,7 +109,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ─── Preflight ───────────────────────────────────────────────────────────────
-for tool in podman cargo s3cmd curl; do
+for tool in podman cargo s3cmd curl openssl; do
     command -v "$tool" >/dev/null 2>&1 || fatal "'$tool' not found in PATH"
 done
 
@@ -305,6 +305,59 @@ v2_prefixes_ok() {
     [ "$(list_v2_common_prefixes tree/ 1 | sort)" = "$(printf 'tree/d1/\ntree/d2/')" ]
 }
 
+# POST /{bucket}?delete with a <Delete> body — the batch-delete API. Sends the
+# Content-MD5 the endpoint requires (base64 of the body's MD5).
+delete_objects_via_api() {  # delete_objects_via_api <bucket> <key>...
+    local bucket="$1"; shift
+    local body='<Delete>' k md5
+    for k in "$@"; do body="${body}<Object><Key>${k}</Key></Object>"; done
+    body="${body}</Delete>"
+    md5="$(printf '%s' "$body" | openssl dgst -md5 -binary | base64)"
+    curl -fsS -X POST --data "$body" -H "Content-MD5: ${md5}" \
+        "http://${SERVER_HOST}:${SERVER_PORT}/${bucket}?delete"
+}
+
+# Verifies the integrity/existence guards: missing or wrong Content-MD5 → 400,
+# and a well-formed request against a missing bucket → 404 NoSuchBucket.
+batch_delete_guards_ok() {
+    local base="http://${SERVER_HOST}:${SERVER_PORT}" code
+    local body='<Delete><Object><Key>whatever.txt</Key></Object></Delete>' md5
+    md5="$(printf '%s' "$body" | openssl dgst -md5 -binary | base64)"
+    # missing Content-MD5
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "$body" "$base/${BUCKET}?delete")"
+    [ "$code" = 400 ] || return 1
+    # wrong Content-MD5
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "$body" \
+        -H 'Content-MD5: AAAAAAAAAAAAAAAAAAAAAA==' "$base/${BUCKET}?delete")"
+    [ "$code" = 400 ] || return 1
+    # correct request, missing bucket
+    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "$body" \
+        -H "Content-MD5: ${md5}" "$base/no-such-bucket-xyz?delete")"
+    [ "$code" = 404 ]
+}
+
+# Exercises DeleteObjects: reporting, idempotency for absent keys, that only the
+# named keys are removed, and that the result is well-formed.
+batch_delete_ok() {
+    local b="$BUCKET" base="http://${SERVER_HOST}:${SERVER_PORT}" k resp
+    printf 'batch delete fixture\n' >"$WORK_DIR/bd"
+    for k in bd1.txt bd2.txt bd3.txt; do
+        s3 put "$WORK_DIR/bd" "s3://$b/$k" >/dev/null 2>&1 || return 1
+    done
+    resp="$(delete_objects_via_api "$b" bd1.txt bd2.txt nope.txt)" || return 1
+    # both real keys and the absent one are acknowledged (delete is idempotent)
+    for k in bd1.txt bd2.txt nope.txt; do
+        printf '%s' "$resp" | grep -q "<Deleted><Key>${k}</Key></Deleted>" || return 1
+    done
+    # bd1/bd2 gone, bd3 untouched
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/$b/bd1.txt")" = 404 ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/$b/bd2.txt")" = 404 ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/$b/bd3.txt")" = 200 ] || return 1
+    # remove the survivor too, so the bucket teardown stays simple
+    delete_objects_via_api "$b" bd3.txt >/dev/null || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/$b/bd3.txt")" = 404 ]
+}
+
 echo ""
 echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
@@ -334,6 +387,8 @@ run_test "ListObjectsV2 paginates leaves"      v2_leaves_ok
 run_test "ListObjects (v1) paginates leaves"   v1_leaves_ok
 run_test "ListObjectsV2 paginates prefixes"    v2_prefixes_ok
 run_test "Tear down pagination bucket"         teardown_pagination
+run_test "Batch delete (DeleteObjects)"        batch_delete_ok
+run_test "Batch delete guards (MD5 / bucket)"  batch_delete_guards_ok
 run_test "Overwrite object, new content wins"  bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&

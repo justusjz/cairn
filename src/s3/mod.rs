@@ -15,7 +15,7 @@ use crate::{
             create::create_multipart_upload, upload_part::put_part,
         },
         objects::{
-            delete::delete_object,
+            delete::{delete_object, delete_objects},
             get::{get_object, head_object},
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
             put::put_object,
@@ -46,19 +46,21 @@ pub async fn handle(
         None => (decode_path_param(path), "".to_owned()),
     };
     if key.is_empty() {
-        // bucket operations
-        let resp = match req.method() {
-            &hyper::Method::GET => {
-                let query = req.uri().query().unwrap_or("");
-                let prefix = query_param(query, "prefix").unwrap_or_default();
-                let delimiter = query_param(query, "delimiter");
-                let is_v2 = query_param(query, "list-type").as_deref() == Some("2");
+        // bucket operations. POST (DeleteObjects) consumes the body, so capture the
+        // query up front and match on an owned method — mirroring the object branch
+        // below — instead of borrowing `req` across the arms.
+        let query = req.uri().query().unwrap_or("").to_owned();
+        let resp = match req.method().clone() {
+            hyper::Method::GET => {
+                let prefix = query_param(&query, "prefix").unwrap_or_default();
+                let delimiter = query_param(&query, "delimiter");
+                let is_v2 = query_param(&query, "list-type").as_deref() == Some("2");
                 // Resolve the pagination cursor to a single "resume after this
                 // key" marker. ListObjectsV2 carries it in an opaque
                 // continuation-token (our base64 of the marker), or in start-after
                 // on the first page; ListObjects (v1) uses a plain marker.
                 let marker = if is_v2 {
-                    match query_param(query, "continuation-token") {
+                    match query_param(&query, "continuation-token") {
                         Some(token) => match decode_continuation_token(&token) {
                             Some(marker) => marker,
                             None => {
@@ -69,24 +71,24 @@ pub async fn handle(
                                 )));
                             }
                         },
-                        None => query_param(query, "start-after").unwrap_or_default(),
+                        None => query_param(&query, "start-after").unwrap_or_default(),
                     }
                 } else {
-                    query_param(query, "marker").unwrap_or_default()
+                    query_param(&query, "marker").unwrap_or_default()
                 };
                 // The response envelope differs by dialect; v2 also echoes the raw
                 // (still-encoded) token and start-after it was given.
                 let version = if is_v2 {
                     ListVersion::V2 {
-                        continuation_token: query_param(query, "continuation-token"),
-                        start_after: query_param(query, "start-after"),
+                        continuation_token: query_param(&query, "continuation-token"),
+                        start_after: query_param(&query, "start-after"),
                     }
                 } else {
                     ListVersion::V1
                 };
                 // Clamp max-keys to [0, 1000]; absent or unparseable falls back to
                 // the 1000 default (lenient — we don't 400 on a garbage value).
-                let max_keys = query_param(query, "max-keys")
+                let max_keys = query_param(&query, "max-keys")
                     .and_then(|v| v.parse::<i64>().ok())
                     .unwrap_or(MAX_KEYS_LIMIT)
                     .clamp(0, MAX_KEYS_LIMIT);
@@ -101,9 +103,20 @@ pub async fn handle(
                 )
                 .await?
             }
-            &hyper::Method::HEAD => head_bucket(&app, &bucket).await?,
-            &hyper::Method::PUT => create_bucket(&app, &bucket).await?,
-            &hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
+            hyper::Method::HEAD => head_bucket(&app, &bucket).await?,
+            hyper::Method::PUT => create_bucket(&app, &bucket).await?,
+            // DeleteObjects (batch): POST /{bucket}?delete with a <Delete> body.
+            // Read Content-MD5 before consuming the body to verify it.
+            hyper::Method::POST if query_param(&query, "delete").is_some() => {
+                let content_md5 = req
+                    .headers()
+                    .get("content-md5")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned);
+                let body = req.into_body().collect().await?.to_bytes();
+                delete_objects(&app, &bucket, body, content_md5.as_deref()).await?
+            }
+            hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
         };
         return Ok(box_response(resp));
