@@ -75,7 +75,7 @@ pub async fn get_object(
     let self_id = app.store.get_node_id().to_string();
     tokio::spawn(async move {
         for (part_id, locations) in parts {
-            if let Err(e) = stream_part(&app, part_id, &locations, &self_id, &sender).await {
+            if let Err(e) = stream_part(&app, part_id, None, &locations, &self_id, &sender).await {
                 let _ = sender.send(Err(e)).await;
                 return;
             }
@@ -92,12 +92,14 @@ pub async fn get_object(
         .unwrap())
 }
 
-/// Streams one part to `tx`, trying its locations in order (freshest first).
-/// Failover only happens before a source produces its first byte — once we start
-/// forwarding, a mid-stream failure faults the whole response (we can't unsend).
+/// Streams one part to `tx` — the whole part, or just `range` (offset, length) of
+/// it — trying its locations in order (freshest first). Failover only happens
+/// before a source produces its first byte; once we start forwarding, a mid-stream
+/// failure faults the whole response (we can't unsend).
 async fn stream_part(
     app: &App,
     part_id: Uuid,
+    range: Option<(u64, u64)>,
     locations: &[(String, String)],
     self_id: &str,
     tx: &FrameSender,
@@ -106,7 +108,7 @@ async fn stream_part(
         if node_id == self_id {
             // We hold it: stream from local disk (no peer server needed).
             match app.store.open_part(part_id).await {
-                Ok(Some(file)) => return send_file(file, tx).await,
+                Ok(Some(file)) => return send_file(file, range, tx).await,
                 Ok(None) => continue,
                 Err(e) => {
                     eprintln!("local open of part {part_id} failed: {e}");
@@ -117,9 +119,15 @@ async fn stream_part(
             // `client` stays in scope across send_incoming, keeping the connection
             // alive while we stream the response body.
             let client = Client::builder(TokioExecutor::new()).build_http();
+            let uri = match range {
+                Some((offset, length)) => {
+                    format!("{peer_url}/parts/{part_id}?offset={offset}&length={length}")
+                }
+                None => format!("{peer_url}/parts/{part_id}"),
+            };
             let req = match Request::builder()
                 .method(Method::GET)
-                .uri(format!("{peer_url}/parts/{part_id}"))
+                .uri(uri)
                 .body(Empty::<Bytes>::new())
             {
                 Ok(req) => req,

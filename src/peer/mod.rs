@@ -38,13 +38,15 @@ pub async fn handle(
         // Clone the method so the PUT arm can still consume `req`'s body.
         return match req.method().clone() {
             hyper::Method::GET => {
-                // Dumb data plane: stream whatever bytes we hold from disk, or 404
-                // so the reader can fall through to another replica.
+                // Dumb data plane: stream whatever bytes we hold from disk — the
+                // whole part, or just `?offset=&length=` of it — or 404 so the
+                // reader can fall through to another replica.
+                let range = parse_range(req.uri().query().unwrap_or(""));
                 match app.store.open_part(part_id).await? {
                     Some(file) => {
                         let (tx, body) = channel_body();
                         tokio::spawn(async move {
-                            if let Err(e) = send_file(file, &tx).await {
+                            if let Err(e) = send_file(file, range, &tx).await {
                                 let _ = tx.send(Err(e)).await;
                             }
                         });
@@ -75,11 +77,19 @@ fn empty(status: StatusCode) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
-/// Reads a raw (undecoded) query parameter — prune's params are simple
+/// Reads a raw (undecoded) query parameter — peer params are simple
 /// flags/integers, so no percent-decoding is needed.
 fn param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|p| {
         let (k, v) = p.split_once('=')?;
         (k == name).then(|| v.to_owned())
     })
+}
+
+/// Parses an `?offset=&length=` part range; both must be present, else the whole
+/// part is served.
+fn parse_range(query: &str) -> Option<(u64, u64)> {
+    let offset = param(query, "offset")?.parse().ok()?;
+    let length = param(query, "length")?.parse().ok()?;
+    Some((offset, length))
 }
