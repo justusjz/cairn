@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=20
+TOTAL=22
 STEP=0
 PASS=0
 FAIL=0
@@ -202,6 +202,11 @@ status_is() {        # status_is <expected-code> <bucket/key> <range>
         "http://${SERVER_HOST}:${SERVER_PORT}/$2")" = "$1" ]
 }
 
+head_status() {      # head_status <expected-code> <path>
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -I \
+        "http://${SERVER_HOST}:${SERVER_PORT}/$2")" = "$1" ]
+}
+
 echo ""
 echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
@@ -209,6 +214,8 @@ echo ""
 # ─── 5. The tests ────────────────────────────────────────────────────────────
 run_test "Create bucket"                       s3 mb "s3://${BUCKET}"
 run_test "Bucket appears in bucket list"       list_contains "" "s3://${BUCKET}"
+run_test "HEAD existing bucket returns 200"    head_status 200 "${BUCKET}"
+run_test "HEAD missing bucket returns 404"     head_status 404 "${BUCKET}-nope"
 run_test "Upload small text object"            s3 put "$SMALL" "s3://${BUCKET}/small.txt"
 run_test "Object appears in bucket listing"    list_contains "s3://${BUCKET}" "small.txt"
 run_test "Download matches upload (small)"     check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"

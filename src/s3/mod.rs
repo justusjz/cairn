@@ -7,7 +7,9 @@ use crate::{
     App,
     body::{ResBody, box_response},
     s3::{
-        buckets::{create::create_bucket, delete::delete_bucket, list::list_buckets},
+        buckets::{
+            create::create_bucket, delete::delete_bucket, head::head_bucket, list::list_buckets,
+        },
         multipart::{
             abort::abort_multipart_upload, complete::complete_multipart_upload,
             create::create_multipart_upload, upload_part::put_part,
@@ -52,6 +54,7 @@ pub async fn handle(
                 let delimiter = query_param(query, "delimiter");
                 list_objects(&app, &bucket, &prefix, delimiter.as_deref()).await?
             }
+            &hyper::Method::HEAD => head_bucket(&app, &bucket).await?,
             &hyper::Method::PUT => create_bucket(&app, &bucket).await?,
             &hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
