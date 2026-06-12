@@ -8,6 +8,7 @@ use crate::{
     s3::{
         buckets::{create::create_bucket, delete::delete_bucket, list::list_buckets},
         objects::{
+            delete::delete_object,
             get::{get_object, head_object},
             list::list_objects,
             put::put_object,
@@ -62,6 +63,7 @@ pub async fn handle(
         match req.method().clone() {
             hyper::Method::HEAD => head_object(&app, &bucket, &key).await,
             hyper::Method::GET => get_object(&app, &bucket, &key).await,
+            hyper::Method::DELETE => delete_object(&app, &bucket, &key).await,
             hyper::Method::PUT => {
                 let content_type = req
                     .headers()

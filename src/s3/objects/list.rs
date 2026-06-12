@@ -1,9 +1,10 @@
+use anyhow::Ok;
 use http_body_util::Full;
-use hyper::{Response, body::Bytes};
+use hyper::{Response, StatusCode, body::Bytes};
 
 use crate::{
     App,
-    s3::util::{xml_escape, xml_ok},
+    s3::util::{format_s3_error, xml_escape, xml_ok},
 };
 
 pub async fn list_objects(
@@ -12,7 +13,15 @@ pub async fn list_objects(
     prefix: &str,
     delimiter: Option<&str>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    let client = app.pool.get().await?;
+    let mut client = app.pool.get().await?;
+    let tx = client.transaction().await?;
+
+    let exists = tx
+        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+        .await?;
+    if exists.is_none() {
+        return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", ""));
+    }
 
     // Leaf objects: keys under the prefix whose remainder (the part after the
     // prefix) contains no delimiter. With no delimiter, every matching key is a
@@ -20,7 +29,7 @@ pub async fn list_objects(
     // RFC-1123 `Last-Modified` *header* used by GET/HEAD.
     let contents = match delimiter {
         Some(d) if !d.is_empty() => {
-            client
+            tx
                 .query(
                     "SELECT key, size, etag,
                             to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
@@ -34,7 +43,7 @@ pub async fn list_objects(
                 .await?
         }
         _ => {
-            client
+            tx
                 .query(
                     "SELECT key, size, etag,
                             to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
@@ -53,9 +62,8 @@ pub async fn list_objects(
     // we only ship the handful of distinct prefixes, never the rolled-up keys.
     let common_prefixes = match delimiter {
         Some(d) if !d.is_empty() => {
-            client
-                .query(
-                    "SELECT DISTINCT
+            tx.query(
+                "SELECT DISTINCT
                             $2 || substr(rest, 1, position($3 IN rest) + length($3) - 1) AS cp
                      FROM (
                          SELECT substr(key, length($2) + 1) AS rest
@@ -64,12 +72,14 @@ pub async fn list_objects(
                      ) s
                      WHERE position($3 IN rest) > 0
                      ORDER BY cp",
-                    &[&bucket, &prefix, &d],
-                )
-                .await?
+                &[&bucket, &prefix, &d],
+            )
+            .await?
         }
         _ => Vec::new(),
     };
+    tx.commit().await?;
+    drop(client);
 
     let key_count = contents.len() + common_prefixes.len();
 
