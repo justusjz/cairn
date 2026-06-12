@@ -40,7 +40,7 @@ pub async fn get_object(
     // Freshest location first per part, so we try the most-likely-live node first.
     let rows = tx
         .query(
-            "SELECT p.part_number, p.part_id, pl.node_id, n.peer_url
+            "SELECT p.part_number, p.part_id, p.size, pl.node_id, n.peer_url
              FROM parts p
              JOIN part_locations pl ON pl.part_id = p.part_id
              JOIN nodes n ON n.node_id = pl.node_id
@@ -51,31 +51,63 @@ pub async fn get_object(
         .await?;
     tx.commit().await?;
 
-    // Group the flat rows into ordered parts, each with its candidate locations.
-    let mut parts: Vec<(Uuid, Vec<(String, String)>)> = Vec::new();
+    // Group the flat rows into ordered parts, each with its size and its
+    // candidate locations.
+    let mut parts: Vec<(Uuid, u64, Vec<(String, String)>)> = Vec::new();
     let mut current: Option<i32> = None;
     for row in &rows {
         let part_number: i32 = row.get(0);
         let part_id: Uuid = row.get(1);
-        let node_id: String = row.get(2);
-        let peer_url: String = row.get(3);
+        let part_size: i64 = row.get(2);
+        let node_id: String = row.get(3);
+        let peer_url: String = row.get(4);
         if current != Some(part_number) {
-            parts.push((part_id, Vec::new()));
+            parts.push((part_id, part_size as u64, Vec::new()));
             current = Some(part_number);
         }
-        parts.last_mut().unwrap().1.push((node_id, peer_url));
+        parts.last_mut().unwrap().2.push((node_id, peer_url));
     }
 
-    // Stream the parts in order through a channel-backed body: a background task
-    // pulls each from a replica (locally if that's us) and forwards its chunks.
-    // We set Content-Length, so a truncated stream (a part we can't serve) is
-    // detected by the client rather than read as a short-but-complete object.
+    // Requested object range as a half-open [start, end). Placeholder for now: the
+    // whole object. Parsing the Range header will set these later.
+    let range_start: u64 = 0;
+    let range_end: u64 = size as u64;
+
+    // Walk the ordered parts, tracking the object offset where each begins, and
+    // intersect each part's span with the requested range. An overlapping part
+    // yields the (offset, length) to read from *within* that part; parts entirely
+    // outside the range are dropped.
+    let mut to_stream: Vec<(Uuid, Vec<(String, String)>, u64, u64)> = Vec::new();
+    let mut cursor: u64 = 0; // object offset at which the current part begins
+    for (part_id, part_size, locations) in parts {
+        let part_start = cursor;
+        let part_end = cursor + part_size;
+        cursor = part_end;
+        let overlap_start = range_start.max(part_start);
+        let overlap_end = range_end.min(part_end);
+        if overlap_start >= overlap_end {
+            continue; // part lies entirely outside the requested range
+        }
+        to_stream.push((
+            part_id,
+            locations,
+            overlap_start - part_start,  // offset within the part
+            overlap_end - overlap_start, // bytes to read from it
+        ));
+    }
+
+    // Stream the selected parts (each over its computed range) through a
+    // channel-backed body: a background task pulls each from a replica (locally if
+    // that's us) and forwards its chunks. We set Content-Length, so a truncated
+    // stream (a part we can't serve) is detected by the client rather than read as
+    // a short-but-complete object.
     let (sender, body) = channel_body();
     let app = app.clone();
     let self_id = app.store.get_node_id().to_string();
     tokio::spawn(async move {
-        for (part_id, locations) in parts {
-            if let Err(e) = stream_part(&app, part_id, None, &locations, &self_id, &sender).await {
+        for (part_id, locations, offset, length) in to_stream {
+            let range = Some((offset, length));
+            if let Err(e) = stream_part(&app, part_id, range, &locations, &self_id, &sender).await {
                 let _ = sender.send(Err(e)).await;
                 return;
             }
