@@ -11,7 +11,10 @@ use crate::{
             delete::delete_object,
             get::{get_object, head_object},
             list::list_objects,
-            multipart::{complete_multipart_upload, create_multipart_upload, put_part},
+            multipart::{
+                abort_multipart_upload, complete_multipart_upload, create_multipart_upload,
+                put_part,
+            },
             put::put_object,
         },
         util::{decode_path_param, format_s3_error, query_param},
@@ -71,6 +74,11 @@ pub async fn handle(
         match req.method().clone() {
             hyper::Method::HEAD => head_object(&app, &bucket, &key).await,
             hyper::Method::GET => get_object(&app, &bucket, &key).await,
+            // AbortMultipartUpload
+            hyper::Method::DELETE if query_param(&query, "uploadId").is_some() => {
+                let upload_id = query_param(&query, "uploadId").unwrap_or_default();
+                abort_multipart_upload(&app, &upload_id).await
+            }
             hyper::Method::DELETE => delete_object(&app, &bucket, &key).await,
             // CreateMultipartUpload
             hyper::Method::POST if query_param(&query, "uploads").is_some() => {
