@@ -34,8 +34,7 @@ impl Store {
     fn get_part_dir(&self, file_id: &str) -> PathBuf {
         let level1 = &file_id[0..2];
         let level2 = &file_id[2..4];
-        let level3 = &file_id[4..6];
-        self.data_dir.join(level1).join(level2).join(level3)
+        self.data_dir.join(level1).join(level2)
     }
 
     pub async fn write_part<B: AsRef<[u8]>>(&self, part_id: Uuid, data: B) -> anyhow::Result<()> {
