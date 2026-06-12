@@ -7,14 +7,14 @@ use crate::{
     App,
     s3::{
         buckets::{create::create_bucket, delete::delete_bucket, list::list_buckets},
+        multipart::{
+            abort::abort_multipart_upload, complete::complete_multipart_upload,
+            create::create_multipart_upload, upload_part::put_part,
+        },
         objects::{
             delete::delete_object,
             get::{get_object, head_object},
             list::list_objects,
-            multipart::{
-                abort_multipart_upload, complete_multipart_upload, create_multipart_upload,
-                put_part,
-            },
             put::put_object,
         },
         util::{decode_path_param, format_s3_error, query_param},
@@ -22,6 +22,7 @@ use crate::{
 };
 
 mod buckets;
+mod multipart;
 mod objects;
 mod util;
 

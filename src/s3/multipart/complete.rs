@@ -1,127 +1,16 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use deadpool_postgres::Object;
 use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes, header};
+use hyper::{Response, StatusCode, body::Bytes};
 use md5::{Digest, Md5};
 use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
 use crate::{
-    App, AttachTarget,
+    App,
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
-
-/// CreateMultipartUpload: `POST /{bucket}/{key}?uploads`. Stages an upload and
-/// hands back its UploadId. Nothing about the live object changes until
-/// CompleteMultipartUpload.
-pub async fn create_multipart_upload(
-    app: &App,
-    bucket: &str,
-    key: &str,
-    content_type: &str,
-) -> anyhow::Result<Response<Full<Bytes>>> {
-    let client = app.pool.get().await?;
-    if client
-        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
-        .await?
-        .is_none()
-    {
-        return Ok(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchBucket",
-            "the specified bucket does not exist",
-        ));
-    }
-    // The content type is captured now and applied to the object at completion.
-    let upload_id = Uuid::new_v4();
-    client
-        .execute(
-            "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, initiated_at)
-             VALUES ($1, $2, $3, $4, NOW())",
-            &[&upload_id, &bucket, &key, &content_type],
-        )
-        .await?;
-    let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId>\
-         </InitiateMultipartUploadResult>",
-        xml_escape(bucket),
-        xml_escape(key),
-        upload_id
-    );
-    Ok(xml_ok(body))
-}
-
-/// UploadPart: `PUT /{bucket}/{key}?partNumber=N&uploadId=U`. Stores the part and
-/// stages it under the upload (the live object is untouched); returns its ETag.
-pub async fn put_part(
-    app: &Arc<App>,
-    upload_id: &str,
-    part_number: &str,
-    data: Bytes,
-) -> anyhow::Result<Response<Full<Bytes>>> {
-    let upload_id = match Uuid::parse_str(upload_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return Ok(format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchUpload",
-                "the specified multipart upload does not exist",
-            ));
-        }
-    };
-    let part_number: i32 = match part_number.parse() {
-        Ok(n) if (1..=10_000).contains(&n) => n,
-        _ => {
-            return Ok(format_s3_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                "partNumber must be an integer in 1..=10000",
-            ));
-        }
-    };
-    // Reject up front if the upload is gone, so we don't replicate a part we'd
-    // only fail to stage at commit (the FK would reject it anyway).
-    let client = app.pool.get().await?;
-    if client
-        .query_opt(
-            "SELECT 1 FROM multipart_uploads WHERE upload_id = $1",
-            &[&upload_id],
-        )
-        .await?
-        .is_none()
-    {
-        return Ok(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "the specified multipart upload does not exist",
-        ));
-    }
-    drop(client);
-
-    let etag: String = Md5::digest(&data)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    crate::upload_part(
-        app,
-        data,
-        &AttachTarget::MultipartPart {
-            upload_id,
-            part_number,
-            etag: etag.clone(),
-        },
-    )
-    .await?;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::ETAG, format!("\"{etag}\""))
-        .body(Full::new(Bytes::new()))
-        .unwrap())
-}
 
 const MAX_COMPLETE_ATTEMPTS: usize = 10;
 
@@ -327,8 +216,8 @@ async fn try_complete(
         &[&bucket, &key, upload_id, &part_numbers],
     )
     .await?;
-    // delete the multipart upload, which also drops any staged
-    // parts that were not included in the completed object
+    // Delete the upload, which cascades away any staged parts not included in the
+    // completed object.
     tx.execute(
         "DELETE FROM multipart_uploads WHERE upload_id = $1",
         &[upload_id],
@@ -340,41 +229,4 @@ async fn try_complete(
         key,
         etag: final_etag,
     })
-}
-
-/// AbortMultipartUpload: `DELETE /{bucket}/{key}?uploadId=U`. Drops the upload,
-/// cascading its staged parts (and their part_locations) away; the on-disk bytes
-/// are left dangling for the GC. The live object is untouched.
-pub async fn abort_multipart_upload(
-    app: &App,
-    upload_id: &str,
-) -> anyhow::Result<Response<Full<Bytes>>> {
-    let upload_id = match Uuid::parse_str(upload_id) {
-        Ok(id) => id,
-        Err(_) => {
-            return Ok(format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchUpload",
-                "the specified multipart upload does not exist",
-            ));
-        }
-    };
-    let client = app.pool.get().await?;
-    let affected = client
-        .execute(
-            "DELETE FROM multipart_uploads WHERE upload_id = $1",
-            &[&upload_id],
-        )
-        .await?;
-    if affected == 0 {
-        return Ok(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "the specified multipart upload does not exist",
-        ));
-    }
-    Ok(Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(Full::new(Bytes::new()))
-        .unwrap())
 }
