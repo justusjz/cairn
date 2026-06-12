@@ -133,6 +133,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "md-5 0.10.6",
  "percent-encoding",
  "roxmltree",

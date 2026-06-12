@@ -11,6 +11,7 @@ http-body-util = "0.1.3"
 md-5 = "0.10.6"
 hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["full"] }
+libc = "0.2"
 percent-encoding = "2.3.2"
 roxmltree = "0.20.0"
 tokio = { version = "1.52.3", features = ["full"] }

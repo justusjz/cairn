@@ -1,7 +1,11 @@
 use std::str::FromStr;
+use std::time::Duration;
 
 use deadpool_postgres::{Manager, ManagerConfig, Pool};
 use tokio_postgres::NoTls;
+
+const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_ATTEMPTS: u32 = 60;
 
 pub async fn connect(url: &str) -> anyhow::Result<Pool> {
     let conf = tokio_postgres::Config::from_str(url)?;
@@ -13,9 +17,26 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
         },
     );
     let pool = Pool::builder(mgr).max_size(16).build()?;
+    // Postgres may not be up yet (e.g. started alongside us), so retry the initial
+    // connect + schema for a while before giving up rather than crashing on boot.
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match init(&pool).await {
+            Ok(()) => return Ok(pool),
+            Err(e) if attempt >= MAX_ATTEMPTS => return Err(e),
+            Err(e) => {
+                eprintln!("waiting for postgres (attempt {attempt}/{MAX_ATTEMPTS}): {e}");
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            }
+        }
+    }
+}
+
+async fn init(pool: &Pool) -> anyhow::Result<()> {
     let client = pool.get().await?;
     client.batch_execute(SCHEMA).await?;
-    Ok(pool)
+    Ok(())
 }
 
 const SCHEMA: &str = r#"

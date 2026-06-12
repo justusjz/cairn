@@ -84,10 +84,6 @@ struct PruneArgs {
 /// How often a node refreshes its `nodes` row (last_seen / free_space).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
-// TODO: report real available disk space for the data dir (needs a statvfs-style
-// call or a small crate). Placeholder for now so replica selection has a value.
-const FREE_SPACE_PLACEHOLDER: i64 = 1 << 40; // 1 TiB
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
@@ -161,13 +157,14 @@ async fn prune_main(args: PruneArgs) -> anyhow::Result<()> {
 async fn register_node(app: &App, peer_url: &str) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     let node_id = app.store.get_node_id().to_string();
+    let free_space = app.store.available_space()? as i64;
     client
         .execute(
             "INSERT INTO nodes (node_id, peer_url, last_seen, free_space)
              VALUES ($1, $2, NOW(), $3)
              ON CONFLICT (node_id)
              DO UPDATE SET peer_url = $2, last_seen = NOW(), free_space = $3",
-            &[&node_id, &peer_url, &FREE_SPACE_PLACEHOLDER],
+            &[&node_id, &peer_url, &free_space],
         )
         .await?;
     Ok(())

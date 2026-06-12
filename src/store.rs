@@ -1,3 +1,5 @@
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 use tokio::fs;
@@ -29,6 +31,20 @@ impl Store {
 
     pub fn get_node_id(&self) -> Uuid {
         self.node_id
+    }
+
+    /// Bytes available on the filesystem backing the data dir (what an
+    /// unprivileged process may write). Reported in heartbeats for replica
+    /// selection.
+    pub fn available_space(&self) -> anyhow::Result<u64> {
+        let path = CString::new(self.data_dir.as_os_str().as_bytes())?;
+        // SAFETY: `path` is a valid NUL-terminated C string and `statvfs` only
+        // writes into the zeroed-out `stat`.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
     }
 
     fn get_part_dir(&self, file_id: &str) -> PathBuf {
