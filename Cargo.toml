@@ -12,6 +12,7 @@ md-5 = "0.10.6"
 hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["full"] }
 percent-encoding = "2.3.2"
+roxmltree = "0.20.0"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-postgres = { version = "0.7.17", features = ["with-uuid-1"] }
 tokio-util = "0.7.18"

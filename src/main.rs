@@ -235,6 +235,12 @@ enum AttachTarget {
         etag: String,
         content_type: String,
     },
+    /// A part staged under an in-progress multipart upload.
+    MultipartPart {
+        upload_id: Uuid,
+        part_number: i32,
+        etag: String,
+    },
 }
 
 /// Stores `data` as a new part replicated across the cluster, then commits and
@@ -372,6 +378,28 @@ async fn try_commit_part(
                      part_number = 1, etag = $3
                  WHERE part_id = $4",
                 &[bucket, key, etag, &part_id],
+            )
+            .await?;
+        }
+        AttachTarget::MultipartPart {
+            upload_id,
+            part_number,
+            etag,
+        } => {
+            // Displace any part previously uploaded at this number (S3 allows
+            // re-uploading a part number); its row + locations go now, its file
+            // is reclaimed later by GC. Frees the (upload_id, part_number) slot.
+            tx.execute(
+                "DELETE FROM parts WHERE upload_id = $1 AND part_number = $2",
+                &[upload_id, part_number],
+            )
+            .await?;
+            // Commit this part and stage it under the upload in one step.
+            tx.execute(
+                "UPDATE parts
+                 SET state = 'committed', upload_id = $1, part_number = $2, etag = $3
+                 WHERE part_id = $4",
+                &[upload_id, part_number, etag, &part_id],
             )
             .await?;
         }

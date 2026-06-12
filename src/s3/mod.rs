@@ -11,6 +11,7 @@ use crate::{
             delete::delete_object,
             get::{get_object, head_object},
             list::list_objects,
+            multipart::{complete_multipart_upload, create_multipart_upload, put_part},
             put::put_object,
         },
         util::{decode_path_param, format_s3_error, query_param},
@@ -58,19 +59,37 @@ pub async fn handle(
             )),
         }
     } else {
-        // object operations. Clone the method so the PUT arm can still consume
-        // `req`'s body.
+        // object operations. Pull query + content type out first (the latter
+        // borrows `req`); clone the method so the body-consuming arms still can.
+        let query = req.uri().query().unwrap_or("").to_owned();
+        let content_type = req
+            .headers()
+            .get(hyper::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
         match req.method().clone() {
             hyper::Method::HEAD => head_object(&app, &bucket, &key).await,
             hyper::Method::GET => get_object(&app, &bucket, &key).await,
             hyper::Method::DELETE => delete_object(&app, &bucket, &key).await,
+            // CreateMultipartUpload
+            hyper::Method::POST if query_param(&query, "uploads").is_some() => {
+                create_multipart_upload(&app, &bucket, &key, &content_type).await
+            }
+            // CompleteMultipartUpload
+            hyper::Method::POST if query_param(&query, "uploadId").is_some() => {
+                let body = req.into_body().collect().await?.to_bytes();
+                let upload_id = query_param(&query, "uploadId").unwrap_or_default();
+                complete_multipart_upload(&app, &upload_id, body).await
+            }
+            // UploadPart
+            hyper::Method::PUT if query_param(&query, "uploadId").is_some() => {
+                let data = req.into_body().collect().await?.to_bytes();
+                let upload_id = query_param(&query, "uploadId").unwrap_or_default();
+                let part_number = query_param(&query, "partNumber").unwrap_or_default();
+                put_part(&app, &upload_id, &part_number, data).await
+            }
             hyper::Method::PUT => {
-                let content_type = req
-                    .headers()
-                    .get(hyper::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("application/octet-stream")
-                    .to_owned();
                 let data = req.into_body().collect().await?.to_bytes();
                 put_object(&app, &bucket, &key, &content_type, data).await
             }
