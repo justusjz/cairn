@@ -66,12 +66,12 @@ pub async fn handle(
     // it returns the streaming response directly; everything else is buffered and
     // boxed. `query` borrows `req`, so own it before the body-consuming arms.
     let query = req.uri().query().unwrap_or("").to_owned();
+    let range = req
+        .headers()
+        .get(hyper::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     if *req.method() == hyper::Method::GET {
-        let range = req
-            .headers()
-            .get(hyper::header::RANGE)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_owned);
         return get_object(&app, &bucket, &key, range.as_deref()).await;
     }
     let content_type = req
@@ -81,7 +81,7 @@ pub async fn handle(
         .unwrap_or("application/octet-stream")
         .to_owned();
     let resp = match req.method().clone() {
-        hyper::Method::HEAD => head_object(&app, &bucket, &key).await?,
+        hyper::Method::HEAD => head_object(&app, &bucket, &key, range.as_deref()).await?,
         // AbortMultipartUpload
         hyper::Method::DELETE if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();

@@ -258,6 +258,7 @@ pub async fn head_object(
     app: &App,
     bucket: &str,
     key: &str,
+    range_header: Option<&str>,
 ) -> anyhow::Result<Response<http_body_util::Full<Bytes>>> {
     let client = app.pool.get().await?;
     let row = client
@@ -268,21 +269,37 @@ pub async fn head_object(
             &[&bucket, &key],
         )
         .await?;
-    match row {
-        Some(row) => {
-            let size: i64 = row.get(0);
-            let etag: String = row.get(1);
-            let content_type: String = row.get(2);
-            let last_modified: String = row.get(3);
-            Ok(Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_LENGTH, size)
-                .header(header::ETAG, format!("\"{etag}\""))
-                .header(header::CONTENT_TYPE, content_type)
-                .header(header::LAST_MODIFIED, last_modified)
-                .body(http_body_util::Full::new(Bytes::new()))
-                .unwrap())
+    let (size, etag, content_type, last_modified): (i64, String, String, String) = match row {
+        Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3)),
+        None => return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")),
+    };
+    // HEAD returns exactly the headers a GET would, with no body — so mirror the
+    // GET range handling (206 + Content-Range for a range, 416 if unsatisfiable).
+    let size = size as u64;
+    let (range_start, range_end, partial) = match parse_range(range_header, size) {
+        Ok(Some((start, end))) => (start, end, true),
+        Ok(None) => (0, size, false),
+        Err(()) => {
+            return Ok(format_s3_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "InvalidRange",
+                "the requested range is not satisfiable",
+            ));
         }
-        None => Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")),
-    }
+    };
+    let builder = Response::builder()
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(header::ETAG, format!("\"{etag}\""))
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, range_end - range_start)
+        .header(header::LAST_MODIFIED, last_modified);
+    let builder = if partial {
+        builder.status(StatusCode::PARTIAL_CONTENT).header(
+            header::CONTENT_RANGE,
+            format!("bytes {range_start}-{}/{size}", range_end - 1),
+        )
+    } else {
+        builder.status(StatusCode::OK)
+    };
+    Ok(builder.body(http_body_util::Full::new(Bytes::new())).unwrap())
 }
