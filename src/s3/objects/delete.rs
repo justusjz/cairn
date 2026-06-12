@@ -9,9 +9,9 @@ pub async fn delete_object(
     key: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
-    // Removing the object cascades its object_parts rows away, leaving the
-    // part(s) committed-but-unreferenced for the GC to reclaim. Idempotent:
-    // deleting a key that isn't there still returns 204, per S3.
+    // Removing the object cascades its part rows away (and, in turn, their
+    // part_locations); the on-disk bytes are left dangling for the GC to reclaim.
+    // Idempotent: deleting a key that isn't there still returns 204, per S3.
     client
         .execute(
             "DELETE FROM objects WHERE bucket = $1 AND key = $2",

@@ -33,35 +33,66 @@ CREATE TABLE IF NOT EXISTS buckets (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
-CREATE TABLE IF NOT EXISTS parts (
-    part_id       UUID PRIMARY KEY,
-    size          BIGINT NOT NULL,
-    state         TEXT NOT NULL,            -- 'pending' | 'committed'
-    created_at    TIMESTAMPTZ NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS part_locations (
-    part_id     UUID NOT NULL REFERENCES parts(part_id) ON DELETE CASCADE,
-    node_id     TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
-    PRIMARY KEY (part_id, node_id)
-);
-
 CREATE TABLE IF NOT EXISTS objects (
     bucket        TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
     key           TEXT NOT NULL,
     size          BIGINT NOT NULL,          -- total object size in bytes
     etag          TEXT NOT NULL,            -- S3 ETag
     content_type  TEXT NOT NULL,
-    last_modified    TIMESTAMPTZ NOT NULL,
+    last_modified TIMESTAMPTZ NOT NULL,
     PRIMARY KEY (bucket, key)
 );
 
-CREATE TABLE IF NOT EXISTS object_parts (
-    bucket        TEXT NOT NULL,
+-- In-progress multipart uploads. Keyed by upload_id and kept entirely separate
+-- from the live (bucket, key) object mapping: the object stays readable with its
+-- old data until CompleteMultipartUpload performs the atomic swap. `key` is plain
+-- text (the target object need not exist yet), only `bucket` must.
+CREATE TABLE IF NOT EXISTS multipart_uploads (
+    upload_id     UUID PRIMARY KEY,
+    bucket        TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
     key           TEXT NOT NULL,
-    part_number   INT NOT NULL,
-    part_id       UUID NOT NULL REFERENCES parts(part_id),
-    PRIMARY KEY (bucket, key, part_number),
-    FOREIGN KEY (bucket, key) REFERENCES objects(bucket, key) ON DELETE CASCADE
+    content_type  TEXT NOT NULL,
+    initiated_at  TIMESTAMPTZ NOT NULL
+);
+
+-- A stored blob, plus its ownership. A committed part belongs to exactly one of
+-- an object or an in-progress upload; a pending (in-flight) part may have neither
+-- yet, since a single-PUT object row doesn't exist until commit. The owner FKs
+-- are ON DELETE CASCADE: dropping an object or upload reclaims its part rows,
+-- which in turn cascades part_locations -- so the GC only ever has to reconcile
+-- dangling files against this table, never trace references.
+CREATE TABLE IF NOT EXISTS parts (
+    part_id        UUID PRIMARY KEY,
+    size           BIGINT NOT NULL,
+    state          TEXT NOT NULL,            -- 'pending' | 'committed'
+    created_at     TIMESTAMPTZ NOT NULL,
+    etag           TEXT,                     -- per-part MD5 hex, set at commit
+    object_bucket  TEXT,
+    object_key     TEXT,
+    upload_id      UUID,
+    part_number    INT,                      -- ordering within the owner
+    FOREIGN KEY (object_bucket, object_key) REFERENCES objects(bucket, key) ON DELETE CASCADE,
+    FOREIGN KEY (upload_id) REFERENCES multipart_uploads(upload_id) ON DELETE CASCADE,
+    -- object_bucket / object_key are set together or not at all (composite FKs
+    -- use MATCH SIMPLE, so a half-set owner would silently skip the FK check).
+    CHECK ((object_bucket IS NULL) = (object_key IS NULL)),
+    -- At most one owner. (Not exactly one: a pending single-PUT part has neither
+    -- until commit; "committed implies an owner" is an application invariant.)
+    CHECK (num_nonnulls(object_key, upload_id) <= 1)
+);
+
+-- One part per (owner, part_number); partial so pending/unowned parts (all NULL)
+-- don't collide.
+CREATE UNIQUE INDEX IF NOT EXISTS parts_object_part_number
+    ON parts (object_bucket, object_key, part_number)
+    WHERE object_key IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS parts_upload_part_number
+    ON parts (upload_id, part_number)
+    WHERE upload_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS part_locations (
+    part_id     UUID NOT NULL REFERENCES parts(part_id) ON DELETE CASCADE,
+    node_id     TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+    PRIMARY KEY (part_id, node_id)
 );
 "#;

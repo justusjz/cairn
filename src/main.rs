@@ -338,11 +338,6 @@ async fn try_commit_part(
             required: node_ids.len(),
         });
     }
-    tx.execute(
-        "UPDATE parts SET state = 'committed' WHERE part_id = $1",
-        &[&part_id],
-    )
-    .await?;
     match attach {
         AttachTarget::Object {
             bucket,
@@ -351,9 +346,8 @@ async fn try_commit_part(
             etag,
             content_type,
         } => {
-            // Upsert the object's metadata, then point it at this single part,
-            // replacing any parts the key referenced before (which then become
-            // unreferenced and GC-eligible).
+            // Upsert the object's metadata first, so the part's owner FK target
+            // exists.
             tx.execute(
                 "INSERT INTO objects (bucket, key, size, etag, content_type, last_modified)
                  VALUES ($1, $2, $3, $4, $5, NOW())
@@ -362,14 +356,22 @@ async fn try_commit_part(
                 &[bucket, key, size, etag, content_type],
             )
             .await?;
+            // Drop whatever parts the key referenced before: their rows (and, via
+            // cascade, their part_locations) go now, their on-disk bytes are
+            // reclaimed later by GC. This also frees the (bucket, key, part_number)
+            // slot for the new part.
             tx.execute(
-                "DELETE FROM object_parts WHERE bucket = $1 AND key = $2",
+                "DELETE FROM parts WHERE object_bucket = $1 AND object_key = $2",
                 &[bucket, key],
             )
             .await?;
+            // Commit this part and point it at the object in one step.
             tx.execute(
-                "INSERT INTO object_parts (bucket, key, part_number, part_id) VALUES ($1, $2, 1, $3)",
-                &[bucket, key, &part_id],
+                "UPDATE parts
+                 SET state = 'committed', object_bucket = $1, object_key = $2,
+                     part_number = 1, etag = $3
+                 WHERE part_id = $4",
+                &[bucket, key, etag, &part_id],
             )
             .await?;
         }

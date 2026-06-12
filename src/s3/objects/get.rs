@@ -31,7 +31,9 @@ pub async fn get_object(
     };
     let parts = tx
         .query(
-            "SELECT part_number, part_id FROM object_parts WHERE bucket = $1 AND key = $2",
+            "SELECT part_number, part_id FROM parts
+             WHERE object_bucket = $1 AND object_key = $2
+             ORDER BY part_number",
             &[&bucket, &key],
         )
         .await?;
