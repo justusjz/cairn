@@ -35,10 +35,17 @@ pub fn decode_path_param(param: &str) -> String {
     percent_decode_str(param).decode_utf8_lossy().into_owned()
 }
 
+/// Mints a ListObjectsV2 `continuation-token` carrying `marker` (the key to
+/// resume after). URL-safe base64 has no `+`/`/`/`=`, so the token survives
+/// `query_param` untouched on the way back. Inverse of
+/// [`decode_continuation_token`].
+pub fn encode_continuation_token(marker: &str) -> String {
+    URL_SAFE_NO_PAD.encode(marker)
+}
+
 /// Decodes a ListObjectsV2 `continuation-token` back to the marker it carries
-/// (the key to resume after). We mint these ourselves as URL-safe base64 of the
-/// marker — the URL-safe alphabet has no `+`/`/`/`=`, so it survives `query_param`
-/// untouched. A token that doesn't decode is a malformed client request.
+/// (the key to resume after). A token that doesn't decode is a malformed client
+/// request.
 pub fn decode_continuation_token(token: &str) -> Option<String> {
     let bytes = URL_SAFE_NO_PAD.decode(token).ok()?;
     String::from_utf8(bytes).ok()

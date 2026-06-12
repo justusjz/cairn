@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=23
+TOTAL=28
 STEP=0
 PASS=0
 FAIL=0
@@ -230,6 +230,81 @@ aws_chunked_roundtrip() {  # aws_chunked_roundtrip <bucket/key> <localfile>
     cmp -s "$src" "$dst"
 }
 
+# ─── Pagination helpers (curl, so we control max-keys/tokens precisely) ──────
+# Each lister walks every page with a small max-keys, following the cursor, and
+# prints what it collected — so the tests can assert "no dupes, nothing dropped".
+PBUCKET="page-$(date +%s)"   # dedicated bucket, torn down within the page tests
+
+# Page through ListObjectsV2, printing every <Key> across all pages.
+list_v2_keys() {  # list_v2_keys <prefix> <max-keys>
+    local prefix="$1" mk="$2" token="" url resp
+    while :; do
+        url="http://${SERVER_HOST}:${SERVER_PORT}/${PBUCKET}?list-type=2&max-keys=${mk}&prefix=${prefix}"
+        [ -n "$token" ] && url="${url}&continuation-token=${token}"
+        resp="$(curl -fsS "$url")" || return 1
+        printf '%s' "$resp" | grep -oP '(?<=<Key>).*?(?=</Key>)'
+        printf '%s' "$resp" | grep -q '<IsTruncated>true</IsTruncated>' || break
+        token="$(printf '%s' "$resp" | grep -oP '(?<=<NextContinuationToken>).*?(?=</NextContinuationToken>)')"
+        [ -n "$token" ] || return 1   # truncated but no token = bug
+    done
+}
+
+# Page through ListObjects (v1), printing every <Key> across all pages.
+list_v1_keys() {  # list_v1_keys <prefix> <max-keys>
+    local prefix="$1" mk="$2" marker="" url resp
+    while :; do
+        url="http://${SERVER_HOST}:${SERVER_PORT}/${PBUCKET}?max-keys=${mk}&prefix=${prefix}"
+        [ -n "$marker" ] && url="${url}&marker=${marker}"
+        resp="$(curl -fsS "$url")" || return 1
+        printf '%s' "$resp" | grep -oP '(?<=<Key>).*?(?=</Key>)'
+        printf '%s' "$resp" | grep -q '<IsTruncated>true</IsTruncated>' || break
+        marker="$(printf '%s' "$resp" | grep -oP '(?<=<NextMarker>).*?(?=</NextMarker>)')"
+        [ -n "$marker" ] || return 1
+    done
+}
+
+# Page through ListObjectsV2 with a delimiter, printing every CommonPrefixes
+# entry. \K drops the literal prefix so we don't also match the top-level <Prefix>.
+list_v2_common_prefixes() {  # list_v2_common_prefixes <prefix> <max-keys>
+    local prefix="$1" mk="$2" token="" url resp
+    while :; do
+        url="http://${SERVER_HOST}:${SERVER_PORT}/${PBUCKET}?list-type=2&max-keys=${mk}&prefix=${prefix}&delimiter=/"
+        [ -n "$token" ] && url="${url}&continuation-token=${token}"
+        resp="$(curl -fsS "$url")" || return 1
+        printf '%s' "$resp" | grep -oP '<CommonPrefixes><Prefix>\K.*?(?=</Prefix>)'
+        printf '%s' "$resp" | grep -q '<IsTruncated>true</IsTruncated>' || break
+        token="$(printf '%s' "$resp" | grep -oP '(?<=<NextContinuationToken>).*?(?=</NextContinuationToken>)')"
+        [ -n "$token" ] || return 1
+    done
+}
+
+setup_pagination() {
+    s3 mb "s3://${PBUCKET}" >/dev/null 2>&1 || return 1
+    local k
+    # 5 leaf objects under flat/, plus two folders under tree/ (d1 has two keys,
+    # so its resume cursor must be the *greater* of them to skip the whole folder).
+    for k in flat/obj0 flat/obj1 flat/obj2 flat/obj3 flat/obj4 \
+             tree/d1/x tree/d1/y tree/d2/x; do
+        printf 'content of %s\n' "$k" >"$WORK_DIR/pf"
+        s3 put "$WORK_DIR/pf" "s3://${PBUCKET}/${k}" >/dev/null 2>&1 || return 1
+    done
+}
+
+teardown_pagination() {
+    s3 del --recursive "s3://${PBUCKET}/" >/dev/null 2>&1
+    s3 rb "s3://${PBUCKET}" >/dev/null 2>&1
+}
+
+v2_leaves_ok() {
+    [ "$(list_v2_keys flat/ 2 | sort)" = "$(printf 'flat/obj0\nflat/obj1\nflat/obj2\nflat/obj3\nflat/obj4')" ]
+}
+v1_leaves_ok() {
+    [ "$(list_v1_keys flat/ 2 | sort)" = "$(printf 'flat/obj0\nflat/obj1\nflat/obj2\nflat/obj3\nflat/obj4')" ]
+}
+v2_prefixes_ok() {
+    [ "$(list_v2_common_prefixes tree/ 1 | sort)" = "$(printf 'tree/d1/\ntree/d2/')" ]
+}
+
 echo ""
 echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
@@ -254,6 +329,11 @@ run_test "Ranged GET across multipart boundary" \
 run_test "Ranged GET responds 206"             status_is 206 "${BUCKET}/big.bin" "0-99"
 run_test "Unsatisfiable range responds 416"    status_is 416 "${BUCKET}/big.bin" "99999999-100000000"
 run_test "aws-chunked upload is decoded"       aws_chunked_roundtrip "${BUCKET}/chunked.txt" "$NESTED"
+run_test "Set up pagination fixtures"          setup_pagination
+run_test "ListObjectsV2 paginates leaves"      v2_leaves_ok
+run_test "ListObjects (v1) paginates leaves"   v1_leaves_ok
+run_test "ListObjectsV2 paginates prefixes"    v2_prefixes_ok
+run_test "Tear down pagination bucket"         teardown_pagination
 run_test "Overwrite object, new content wins"  bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&

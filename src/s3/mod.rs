@@ -17,7 +17,7 @@ use crate::{
         objects::{
             delete::delete_object,
             get::{get_object, head_object},
-            list::list_objects,
+            list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
             put::put_object,
         },
         util::{decode_continuation_token, decode_path_param, format_s3_error, query_param},
@@ -52,11 +52,12 @@ pub async fn handle(
                 let query = req.uri().query().unwrap_or("");
                 let prefix = query_param(query, "prefix").unwrap_or_default();
                 let delimiter = query_param(query, "delimiter");
+                let is_v2 = query_param(query, "list-type").as_deref() == Some("2");
                 // Resolve the pagination cursor to a single "resume after this
-                // key" marker. ListObjectsV2 (list-type=2) carries it in an opaque
+                // key" marker. ListObjectsV2 carries it in an opaque
                 // continuation-token (our base64 of the marker), or in start-after
                 // on the first page; ListObjects (v1) uses a plain marker.
-                let marker = if query_param(query, "list-type").as_deref() == Some("2") {
+                let marker = if is_v2 {
                     match query_param(query, "continuation-token") {
                         Some(token) => match decode_continuation_token(&token) {
                             Some(marker) => marker,
@@ -73,7 +74,32 @@ pub async fn handle(
                 } else {
                     query_param(query, "marker").unwrap_or_default()
                 };
-                list_objects(&app, &bucket, &prefix, delimiter.as_deref(), &marker).await?
+                // The response envelope differs by dialect; v2 also echoes the raw
+                // (still-encoded) token and start-after it was given.
+                let version = if is_v2 {
+                    ListVersion::V2 {
+                        continuation_token: query_param(query, "continuation-token"),
+                        start_after: query_param(query, "start-after"),
+                    }
+                } else {
+                    ListVersion::V1
+                };
+                // Clamp max-keys to [0, 1000]; absent or unparseable falls back to
+                // the 1000 default (lenient — we don't 400 on a garbage value).
+                let max_keys = query_param(query, "max-keys")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(MAX_KEYS_LIMIT)
+                    .clamp(0, MAX_KEYS_LIMIT);
+                list_objects(
+                    &app,
+                    &bucket,
+                    &prefix,
+                    delimiter.as_deref(),
+                    &marker,
+                    max_keys,
+                    version,
+                )
+                .await?
             }
             &hyper::Method::HEAD => head_bucket(&app, &bucket).await?,
             &hyper::Method::PUT => create_bucket(&app, &bucket).await?,
