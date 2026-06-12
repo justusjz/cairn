@@ -1,3 +1,4 @@
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 use percent_encoding::percent_decode_str;
@@ -32,6 +33,15 @@ pub fn format_s3_error(status: StatusCode, code: &str, message: &str) -> Respons
 
 pub fn decode_path_param(param: &str) -> String {
     percent_decode_str(param).decode_utf8_lossy().into_owned()
+}
+
+/// Decodes a ListObjectsV2 `continuation-token` back to the marker it carries
+/// (the key to resume after). We mint these ourselves as URL-safe base64 of the
+/// marker — the URL-safe alphabet has no `+`/`/`/`=`, so it survives `query_param`
+/// untouched. A token that doesn't decode is a malformed client request.
+pub fn decode_continuation_token(token: &str) -> Option<String> {
+    let bytes = URL_SAFE_NO_PAD.decode(token).ok()?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Extracts and percent-decodes a single parameter from a raw query string

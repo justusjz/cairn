@@ -12,6 +12,7 @@ pub async fn list_objects(
     bucket: &str,
     prefix: &str,
     delimiter: Option<&str>,
+    marker: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let mut client = app.pool.get().await?;
     let tx = client.transaction().await?;
@@ -27,6 +28,13 @@ pub async fn list_objects(
     // prefix) contains no delimiter. With no delimiter, every matching key is a
     // leaf. LastModified is the ISO-8601 listing format here, distinct from the
     // RFC-1123 `Last-Modified` *header* used by GET/HEAD.
+    //
+    // `key > $marker` resumes after the pagination cursor, uniformly here and in
+    // the common-prefix query below. The marker is always a real key: a
+    // continuation token that stopped on a folder carries that folder's *greatest*
+    // key (an invariant the response side upholds), so `key > marker` skips the
+    // whole exhausted group; a `start-after` is just a client-supplied key. One
+    // comparison is correct for both, with no leaf-vs-prefix special-casing.
     let contents = match delimiter {
         Some(d) if !d.is_empty() => {
             tx
@@ -36,9 +44,10 @@ pub async fn list_objects(
                      FROM objects
                      WHERE bucket = $1
                        AND starts_with(key, $2)
+                       AND key > $4
                        AND position($3 IN substr(key, length($2) + 1)) = 0
                      ORDER BY key",
-                    &[&bucket, &prefix, &d],
+                    &[&bucket, &prefix, &d, &marker],
                 )
                 .await?
         }
@@ -48,9 +57,9 @@ pub async fn list_objects(
                     "SELECT key, size, etag,
                             to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"')
                      FROM objects
-                     WHERE bucket = $1 AND starts_with(key, $2)
+                     WHERE bucket = $1 AND starts_with(key, $2) AND key > $3
                      ORDER BY key",
-                    &[&bucket, &prefix],
+                    &[&bucket, &prefix, &marker],
                 )
                 .await?
         }
@@ -60,6 +69,12 @@ pub async fn list_objects(
     // the delimiter, roll them up to prefix + (remainder up to and including the
     // first delimiter). Done in Postgres — the DISTINCT happens server-side, so
     // we only ship the handful of distinct prefixes, never the rolled-up keys.
+    //
+    // The same `key > $marker` cursor as the leaf query applies. Because a token
+    // that stopped on a folder carries that folder's greatest key, `key > marker`
+    // drops the whole exhausted group (so we never re-emit it), while a mid-group
+    // `start-after` still leaves later keys that re-collapse to the folder — which
+    // is exactly what S3 does.
     let common_prefixes = match delimiter {
         Some(d) if !d.is_empty() => {
             tx.query(
@@ -68,11 +83,11 @@ pub async fn list_objects(
                      FROM (
                          SELECT substr(key, length($2) + 1) AS rest
                          FROM objects
-                         WHERE bucket = $1 AND starts_with(key, $2)
+                         WHERE bucket = $1 AND starts_with(key, $2) AND key > $4
                      ) s
                      WHERE position($3 IN rest) > 0
                      ORDER BY cp",
-                &[&bucket, &prefix, &d],
+                &[&bucket, &prefix, &d, &marker],
             )
             .await?
         }

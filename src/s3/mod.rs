@@ -20,7 +20,7 @@ use crate::{
             list::list_objects,
             put::put_object,
         },
-        util::{decode_path_param, format_s3_error, query_param},
+        util::{decode_continuation_token, decode_path_param, format_s3_error, query_param},
     },
 };
 
@@ -52,7 +52,28 @@ pub async fn handle(
                 let query = req.uri().query().unwrap_or("");
                 let prefix = query_param(query, "prefix").unwrap_or_default();
                 let delimiter = query_param(query, "delimiter");
-                list_objects(&app, &bucket, &prefix, delimiter.as_deref()).await?
+                // Resolve the pagination cursor to a single "resume after this
+                // key" marker. ListObjectsV2 (list-type=2) carries it in an opaque
+                // continuation-token (our base64 of the marker), or in start-after
+                // on the first page; ListObjects (v1) uses a plain marker.
+                let marker = if query_param(query, "list-type").as_deref() == Some("2") {
+                    match query_param(query, "continuation-token") {
+                        Some(token) => match decode_continuation_token(&token) {
+                            Some(marker) => marker,
+                            None => {
+                                return Ok(box_response(format_s3_error(
+                                    StatusCode::BAD_REQUEST,
+                                    "InvalidArgument",
+                                    "the continuation token is not valid",
+                                )));
+                            }
+                        },
+                        None => query_param(query, "start-after").unwrap_or_default(),
+                    }
+                } else {
+                    query_param(query, "marker").unwrap_or_default()
+                };
+                list_objects(&app, &bucket, &prefix, delimiter.as_deref(), &marker).await?
             }
             &hyper::Method::HEAD => head_bucket(&app, &bucket).await?,
             &hyper::Method::PUT => create_bucket(&app, &bucket).await?,
