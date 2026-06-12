@@ -57,4 +57,41 @@ impl Store {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Deletes a part's on-disk file. Idempotent: a missing file is not an error.
+    pub async fn remove_part(&self, part_id: Uuid) -> anyhow::Result<()> {
+        let part_id = part_id.to_string();
+        let part_dir = self.get_part_dir(&part_id);
+        match fs::remove_file(part_dir.join(part_id)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Walks the sharded data directory and returns every part_id with a local
+    /// file. Used only by the prune/repair full scan.
+    pub async fn list_local_parts(&self) -> anyhow::Result<Vec<Uuid>> {
+        let mut parts = Vec::new();
+        let mut level1 = fs::read_dir(&self.data_dir).await?;
+        while let Some(e1) = level1.next_entry().await? {
+            // Skip non-directories at the top level (e.g. the node_id file).
+            if !e1.file_type().await?.is_dir() {
+                continue;
+            }
+            let mut level2 = fs::read_dir(e1.path()).await?;
+            while let Some(e2) = level2.next_entry().await? {
+                if !e2.file_type().await?.is_dir() {
+                    continue;
+                }
+                let mut files = fs::read_dir(e2.path()).await?;
+                while let Some(f) = files.next_entry().await? {
+                    if let Some(id) = f.file_name().to_str().and_then(|n| Uuid::parse_str(n).ok()) {
+                        parts.push(id);
+                    }
+                }
+            }
+        }
+        Ok(parts)
+    }
 }

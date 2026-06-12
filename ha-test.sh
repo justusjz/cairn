@@ -165,7 +165,7 @@ start_instance() {  # start_instance <n>
     args+=(${EXTRA_SERVER_ARGS[@]+"${EXTRA_SERVER_ARGS[@]}"})
 
     info "Starting instance $n (client :${cport}, peer :${pport})..."
-    "$BIN" "${args[@]}" >>"$WORK_DIR/server$n.log" 2>&1 &
+    "$BIN" serve "${args[@]}" >>"$WORK_DIR/server$n.log" 2>&1 &
     PIDS[$n]=$!
 
     local elapsed=0

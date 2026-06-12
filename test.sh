@@ -26,7 +26,7 @@ SECRET_KEY="testsecret"
 USE_SIGV2=false                  # set to true if you haven't implemented SigV4 yet
 
 
-CARGO_ARGS=(-- --database postgres://$PG_USER:$PG_PASS@127.0.0.1:${PG_PORT}/$PG_DB --listen-client $SERVER_HOST:${SERVER_PORT})
+CARGO_ARGS=(-- serve --database postgres://$PG_USER:$PG_PASS@127.0.0.1:${PG_PORT}/$PG_DB --listen-client $SERVER_HOST:${SERVER_PORT})
 STARTUP_TIMEOUT=60               # seconds to wait for postgres / server
 # ─────────────────────────────────────────────────────────────────────────────
 

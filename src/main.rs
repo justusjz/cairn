@@ -1,8 +1,8 @@
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use deadpool_postgres::{Object, Pool};
-use http_body_util::BodyExt;
+use http_body_util::{BodyExt, Empty};
 use hyper::{
     Method, Request, StatusCode, body::Body, body::Bytes, body::Frame, body::Incoming,
     server::conn::http1, service::service_fn,
@@ -15,33 +15,53 @@ use uuid::Uuid;
 
 use crate::body::{FrameSender, channel_body};
 use crate::store::Store;
+use crate::writing::WritingSet;
 
 mod peer;
 
 mod body;
 mod db;
+mod prune;
 mod s3;
 mod store;
+mod writing;
 
 pub struct App {
     pool: Pool,
     store: Store,
     replication_factor: usize,
+    writing: WritingSet,
 }
 
 #[derive(Parser, Debug)]
-struct Args {
+#[command(version)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Run a storage node.
+    Serve(ServeArgs),
+    /// Reclaim orphaned and failed-upload parts on a node (manual repair).
+    Prune(PruneArgs),
+}
+
+#[derive(Args, Debug)]
+struct ServeArgs {
     #[arg(long)]
     database: String,
     #[arg(long)]
     listen_client: String,
-    /// Bind address for the peer endpoint. Omit on a single-host deployment:
-    /// with no peers to talk to, a node serves its own replicas locally.
-    #[arg(long)]
-    listen_peer: Option<String>,
+    /// Bind address for the peer endpoint (replica traffic + the prune endpoint).
+    /// It always runs; defaults to a loopback port. Override to bind externally,
+    /// or to run several nodes on one host.
+    #[arg(long, default_value = "127.0.0.1:9431")]
+    listen_peer: String,
     /// URL other nodes use to reach this node's peer endpoint, e.g.
-    /// http://10.0.0.1:9001. Defaults to http://<listen-peer> when omitted; set
-    /// it explicitly only if the bind address isn't routable (e.g. 0.0.0.0).
+    /// http://10.0.0.1:9431. Defaults to http://<listen-peer>; set it explicitly
+    /// only if the bind address isn't routable (e.g. 0.0.0.0).
     #[arg(long)]
     peer_url: Option<String>,
     /// How many replicas every part is stored on.
@@ -49,6 +69,16 @@ struct Args {
     replication_factor: usize,
     #[arg(long)]
     data_dir: String,
+}
+
+#[derive(Args, Debug)]
+struct PruneArgs {
+    /// Peer URL of the node to prune.
+    #[arg(long, default_value = "http://127.0.0.1:9431")]
+    peer: String,
+    /// Actually delete; without this it's a dry run that only reports.
+    #[arg(long)]
+    apply: bool,
 }
 
 /// How often a node refreshes its `nodes` row (last_seen / free_space).
@@ -60,38 +90,68 @@ const FREE_SPACE_PLACEHOLDER: i64 = 1 << 40; // 1 TiB
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+    match Cli::parse().command {
+        Command::Serve(args) => serve_main(args).await,
+        Command::Prune(args) => prune_main(args).await,
+    }
+}
+
+async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     let pool = db::connect(&args.database).await?;
     let app = Arc::new(App {
         pool,
         store: Store::new(args.data_dir)?,
         replication_factor: args.replication_factor,
+        writing: WritingSet::default(),
     });
-    // Resolve the URL peers use to reach us: explicit if given, otherwise derived
-    // from the peer bind address, otherwise empty (single host — we never get
-    // contacted, and our own replicas are served locally).
-    let peer_url = match (&args.peer_url, &args.listen_peer) {
-        (Some(url), _) => url.clone(),
-        (None, Some(listen_peer)) => format!("http://{listen_peer}"),
-        (None, None) => String::new(),
-    };
+    // The URL peers use to reach us: explicit if given, otherwise derived from
+    // the (always-set) peer bind address.
+    let peer_url = args
+        .peer_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{}", args.listen_peer));
     // Register this node before serving traffic, then keep its heartbeat fresh in
     // the background.
     register_node(&app, &peer_url).await?;
     tokio::spawn(heartbeat(app.clone(), peer_url));
 
     let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
-    let client = serve(listen_client_addr, app.clone(), ServeKind::Client);
-    // The peer server only runs when there are peers to serve. Both servers loop
-    // forever, so awaiting them keeps the process alive until one errors out.
-    match &args.listen_peer {
-        Some(listen_peer) => {
-            let listen_peer_addr = SocketAddr::from_str(listen_peer).unwrap();
-            let peer = serve(listen_peer_addr, app.clone(), ServeKind::Peer);
-            tokio::try_join!(client, peer)?;
-        }
-        None => client.await?,
+    let listen_peer_addr = SocketAddr::from_str(&args.listen_peer).unwrap();
+    // Both servers run and loop forever, so awaiting them keeps the process alive
+    // until one errors out.
+    tokio::try_join!(
+        serve(listen_client_addr, app.clone(), ServeKind::Client),
+        serve(listen_peer_addr, app.clone(), ServeKind::Peer),
+    )?;
+    Ok(())
+}
+
+/// `cairn prune`: triggers a prune on a node's peer endpoint and streams its
+/// report to stdout.
+async fn prune_main(args: PruneArgs) -> anyhow::Result<()> {
+    let http = Client::builder(TokioExecutor::new()).build_http();
+    let url = format!(
+        "{}/prune?apply={}",
+        args.peer.trim_end_matches('/'),
+        args.apply,
+    );
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(url)
+        .body(Empty::<Bytes>::new())?;
+    let res = http.request(req).await?;
+    if res.status() != StatusCode::OK {
+        anyhow::bail!("prune request to {} failed: {}", args.peer, res.status());
     }
+    // Stream the report straight to stdout as the node produces it.
+    let mut body = res.into_body();
+    let mut stdout = tokio::io::stdout();
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame?.into_data() {
+            stdout.write_all(&data).await?;
+        }
+    }
+    stdout.flush().await?;
     Ok(())
 }
 
@@ -201,6 +261,10 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    // Mark the part as being written for the whole write→announce window, so the
+    // GC's file sweep won't treat this in-flight file (no location yet) as an
+    // orphan. The guard drops after the location insert below.
+    let _writing = app.writing.begin(part_id);
     let mut file = app.store.create_part(part_id).await?;
     while let Some(frame) = body.frame().await {
         if let Ok(chunk) = frame?.into_data() {

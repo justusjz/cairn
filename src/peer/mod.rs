@@ -7,6 +7,7 @@ use uuid::Uuid;
 use crate::{
     App,
     body::{ResBody, box_response, channel_body, send_file},
+    prune,
 };
 
 pub async fn handle(
@@ -14,6 +15,19 @@ pub async fn handle(
     app: Arc<App>,
 ) -> anyhow::Result<Response<ResBody>> {
     let path = req.uri().path();
+    if path == "/prune" {
+        // Admin/repair: scan this node and stream a line-per-action report. The
+        // timers are node policy (hardcoded); the caller only chooses dry-run vs
+        // apply.
+        let apply = param(req.uri().query().unwrap_or(""), "apply").as_deref() == Some("true");
+        let (tx, body) = channel_body();
+        tokio::spawn(prune::run(app.clone(), apply, tx));
+        return Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .body(body)
+            .unwrap());
+    }
     if let Some(part_id) = path.strip_prefix("/parts/") {
         // Parse the id up front: `part_id` borrows `req` (via `path`), and
         // collecting the body below consumes `req`, so the borrow must end here.
@@ -59,4 +73,13 @@ fn empty(status: StatusCode) -> Response<Full<Bytes>> {
         .status(status)
         .body(Full::new(Bytes::new()))
         .unwrap()
+}
+
+/// Reads a raw (undecoded) query parameter — prune's params are simple
+/// flags/integers, so no percent-decoding is needed.
+fn param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|p| {
+        let (k, v) = p.split_once('=')?;
+        (k == name).then(|| v.to_owned())
+    })
 }
