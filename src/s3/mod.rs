@@ -80,6 +80,9 @@ pub async fn handle(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
+    // Streaming-signature uploads (e.g. Mimir) frame the body as `aws-chunked`;
+    // the upload path must decode it rather than store the framing verbatim.
+    let aws_chunked = crate::aws_chunked::is_aws_chunked(req.headers());
     let resp = match req.method().clone() {
         hyper::Method::HEAD => head_object(&app, &bucket, &key, range.as_deref()).await?,
         // AbortMultipartUpload
@@ -102,9 +105,11 @@ pub async fn handle(
         hyper::Method::PUT if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
             let part_number = query_param(&query, "partNumber").unwrap_or_default();
-            put_part(&app, &upload_id, &part_number, req.into_body()).await?
+            put_part(&app, &upload_id, &part_number, req.into_body(), aws_chunked).await?
         }
-        hyper::Method::PUT => put_object(&app, &bucket, &key, &content_type, req.into_body()).await?,
+        hyper::Method::PUT => {
+            put_object(&app, &bucket, &key, &content_type, req.into_body(), aws_chunked).await?
+        }
         _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
     };
     Ok(box_response(resp))

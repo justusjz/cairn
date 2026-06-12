@@ -13,12 +13,14 @@ use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
+use crate::aws_chunked::AwsChunkedDecoder;
 use crate::body::{FrameSender, channel_body};
 use crate::store::Store;
 use crate::writing::WritingSet;
 
 mod peer;
 
+mod aws_chunked;
 mod body;
 mod db;
 mod prune;
@@ -305,6 +307,7 @@ async fn upload_part(
     app: &Arc<App>,
     mut body: Incoming,
     attach: &AttachTarget,
+    aws_chunked: bool,
 ) -> anyhow::Result<String> {
     let client = app.pool.get().await?;
     let part_id = Uuid::new_v4();
@@ -343,10 +346,25 @@ async fn upload_part(
     let mut hasher = Md5::new();
     let mut size: i64 = 0;
     let mut read_err: Option<anyhow::Error> = None;
+    // A streaming-signature upload arrives `aws-chunked` framed; decode it back to
+    // the raw object bytes before hashing/sizing/teeing, so the ETag and size
+    // describe the object — not the framing.
+    let mut decoder = aws_chunked.then(AwsChunkedDecoder::new);
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
-                if let Ok(chunk) = frame.into_data() {
+                let Ok(chunk) = frame.into_data() else { continue };
+                let segments = match &mut decoder {
+                    Some(dec) => match dec.decode(chunk) {
+                        Ok(segments) => segments,
+                        Err(e) => {
+                            read_err = Some(e.into());
+                            break;
+                        }
+                    },
+                    None => vec![chunk],
+                };
+                for chunk in segments {
                     hasher.update(&chunk);
                     size += chunk.len() as i64;
                     for tx in &senders {
@@ -360,7 +378,17 @@ async fn upload_part(
                 read_err = Some(e.into());
                 break;
             }
-            None => break,
+            None => {
+                // A chunked body must end with its terminating zero-size chunk;
+                // stopping short means truncation, so fault the sinks rather than
+                // durably store a short object.
+                if let Some(dec) = &decoder
+                    && !dec.is_complete()
+                {
+                    read_err = Some(std::io::Error::other("aws-chunked: truncated body").into());
+                }
+                break;
+            }
         }
     }
     // On a client read error, fault the sinks so they don't durably store a

@@ -14,6 +14,7 @@ pub async fn put_part(
     upload_id: &str,
     part_number: &str,
     body: Incoming,
+    aws_chunked: bool,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -63,6 +64,7 @@ pub async fn put_part(
             upload_id,
             part_number,
         },
+        aws_chunked,
     )
     .await?;
     Ok(Response::builder()

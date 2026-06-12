@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=22
+TOTAL=23
 STEP=0
 PASS=0
 FAIL=0
@@ -207,6 +207,29 @@ head_status() {      # head_status <expected-code> <path>
         "http://${SERVER_HOST}:${SERVER_PORT}/$2")" = "$1" ]
 }
 
+# Uploads <localfile> wrapped in `aws-chunked` framing (the streaming-signature
+# encoding Mimir uses), then downloads it and confirms the server stored the
+# DECODED object, not the chunk framing. Signatures aren't verified, so a dummy
+# one is fine.
+aws_chunked_roundtrip() {  # aws_chunked_roundtrip <bucket/key> <localfile>
+    local path="$1" src="$2" body="$WORK_DIR/chunked.$RANDOM" dst="$WORK_DIR/chunked.dl.$RANDOM"
+    local size hexsize
+    size=$(wc -c < "$src")
+    hexsize=$(printf '%x' "$size")
+    {
+        printf '%s;chunk-signature=%064x\r\n' "$hexsize" 0
+        cat "$src"
+        printf '\r\n0;chunk-signature=%064x\r\n\r\n' 0
+    } >"$body"
+    curl -fsS -X PUT --data-binary "@$body" \
+        -H "Content-Encoding: aws-chunked" \
+        -H "x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD" \
+        -H "x-amz-decoded-content-length: ${size}" \
+        "http://${SERVER_HOST}:${SERVER_PORT}/${path}" >/dev/null || return 1
+    curl -fsS "http://${SERVER_HOST}:${SERVER_PORT}/${path}" -o "$dst" || return 1
+    cmp -s "$src" "$dst"
+}
+
 echo ""
 echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
@@ -230,6 +253,7 @@ run_test "Ranged GET across multipart boundary" \
                                                range_matches "${BUCKET}/multi.bin" 5242875 5242884 "$MULTIPART"
 run_test "Ranged GET responds 206"             status_is 206 "${BUCKET}/big.bin" "0-99"
 run_test "Unsatisfiable range responds 416"    status_is 416 "${BUCKET}/big.bin" "99999999-100000000"
+run_test "aws-chunked upload is decoded"       aws_chunked_roundtrip "${BUCKET}/chunked.txt" "$NESTED"
 run_test "Overwrite object, new content wins"  bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&
@@ -241,6 +265,7 @@ run_test "Delete remaining objects + bucket"   bash -c "
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/big.bin' >/dev/null &&
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/dir/sub/nested.txt' >/dev/null &&
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/multi.bin' >/dev/null &&
+    s3cmd --config '$S3CFG' del 's3://${BUCKET}/chunked.txt' >/dev/null &&
     s3cmd --config '$S3CFG' rb 's3://${BUCKET}' >/dev/null"
 expect_fail "Removed bucket is gone (ls fails)" s3 ls "s3://${BUCKET}"
 

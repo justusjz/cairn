@@ -11,6 +11,7 @@ pub async fn put_object(
     key: &str,
     content_type: &str,
     body: Incoming,
+    aws_chunked: bool,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     // Reject up front if the bucket doesn't exist, so we don't replicate a part
     // only to fail the FK at commit time. (There's still the objects -> buckets
@@ -36,7 +37,7 @@ pub async fn put_object(
         key: key.to_owned(),
         content_type: content_type.to_owned(),
     };
-    let etag = crate::upload_part(app, body, &attach).await?;
+    let etag = crate::upload_part(app, body, &attach, aws_chunked).await?;
 
     Ok(Response::builder()
         .status(StatusCode::OK)
