@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=30
+TOTAL=31
 STEP=0
 PASS=0
 FAIL=0
@@ -305,6 +305,19 @@ v2_prefixes_ok() {
     [ "$(list_v2_common_prefixes tree/ 1 | sort)" = "$(printf 'tree/d1/\ntree/d2/')" ]
 }
 
+# `?acl` GET (object and bucket) returns the stubbed AccessControlPolicy, and
+# `s3cmd info` — which issues that ACL query — completes instead of choking.
+acl_stub_ok() {
+    local base="http://${SERVER_HOST}:${SERVER_PORT}" r
+    r="$(curl -fsS "$base/${BUCKET}/big.bin?acl")" || return 1
+    printf '%s' "$r" | grep -q '<AccessControlPolicy' || return 1
+    printf '%s' "$r" | grep -q '<ID>cairn</ID>' || return 1
+    r="$(curl -fsS "$base/${BUCKET}?acl")" || return 1
+    printf '%s' "$r" | grep -q 'FULL_CONTROL' || return 1
+    # the actual client that broke: s3cmd info must now succeed
+    s3 info "s3://${BUCKET}/big.bin" >/dev/null 2>&1
+}
+
 # POST /{bucket}?delete with a <Delete> body — the batch-delete API. Sends the
 # Content-MD5 the endpoint requires (base64 of the body's MD5).
 delete_objects_via_api() {  # delete_objects_via_api <bucket> <key>...
@@ -389,6 +402,7 @@ run_test "ListObjectsV2 paginates prefixes"    v2_prefixes_ok
 run_test "Tear down pagination bucket"         teardown_pagination
 run_test "Batch delete (DeleteObjects)"        batch_delete_ok
 run_test "Batch delete guards (MD5 / bucket)"  batch_delete_guards_ok
+run_test "Stubbed ACL (s3cmd info works)"      acl_stub_ok
 run_test "Overwrite object, new content wins"  bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&

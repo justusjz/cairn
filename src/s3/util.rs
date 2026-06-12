@@ -17,6 +17,25 @@ pub fn xml_ok(body: String) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+/// A fixed AccessControlPolicy. Cairn doesn't model ACLs, so every bucket and
+/// object reports owner "cairn" with FULL_CONTROL. This lets clients that probe
+/// ACLs (e.g. `s3cmd info`, which issues a `?acl` GET) parse a valid response
+/// instead of choking on object bytes.
+pub fn stub_acl() -> Response<Full<Bytes>> {
+    xml_ok(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Owner><ID>cairn</ID><DisplayName>cairn</DisplayName></Owner>\
+         <AccessControlList><Grant>\
+         <Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
+         <ID>cairn</ID><DisplayName>cairn</DisplayName></Grantee>\
+         <Permission>FULL_CONTROL</Permission>\
+         </Grant></AccessControlList>\
+         </AccessControlPolicy>"
+            .to_string(),
+    )
+}
+
 pub fn format_s3_error(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\

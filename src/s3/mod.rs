@@ -20,7 +20,9 @@ use crate::{
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
             put::put_object,
         },
-        util::{decode_continuation_token, decode_path_param, format_s3_error, query_param},
+        util::{
+            decode_continuation_token, decode_path_param, format_s3_error, query_param, stub_acl,
+        },
     },
 };
 
@@ -50,6 +52,10 @@ pub async fn handle(
         // query up front and match on an owned method — mirroring the object branch
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
+        // ACL is stubbed (see stub_acl); intercept ?acl on GET before listing.
+        if *req.method() == hyper::Method::GET && query_param(&query, "acl").is_some() {
+            return Ok(box_response(stub_acl()));
+        }
         let resp = match req.method().clone() {
             hyper::Method::GET => {
                 let prefix = query_param(&query, "prefix").unwrap_or_default();
@@ -132,6 +138,11 @@ pub async fn handle(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     if *req.method() == hyper::Method::GET {
+        // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
+        // break XML-parsing clients like `s3cmd info`.
+        if query_param(&query, "acl").is_some() {
+            return Ok(box_response(stub_acl()));
+        }
         return get_object(&app, &bucket, &key, range.as_deref()).await;
     }
     let content_type = req
