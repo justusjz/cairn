@@ -151,7 +151,7 @@ async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Resu
 async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<(String, String)>> {
     let nodes = client
         .query(
-            "SELECT node_id, peer_url FROM nodes ORDER BY free_space DESC",
+            "SELECT node_id, peer_url FROM nodes WHERE last_seen > NOW() - INTERVAL '10 seconds' ORDER BY free_space DESC",
             &[],
         )
         .await?;

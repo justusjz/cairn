@@ -123,6 +123,7 @@ podman run -d --rm --name "$PG_CONTAINER" \
     -p "127.0.0.1:${PG_PORT}:5432" \
     "$PG_IMAGE" >/dev/null || fatal "could not start Postgres container"
 
+sleep 2
 elapsed=0
 until podman exec "$PG_CONTAINER" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/null 2>&1; do
     sleep 1
