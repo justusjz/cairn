@@ -30,7 +30,10 @@ pub async fn put_object(
     }
 
     // The S3 ETag of a single-part PUT is the hex MD5 of the body.
-    let etag: String = Md5::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+    let etag: String = Md5::digest(&data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
 
     // Store the data as one replicated, committed part and atomically point
     // (bucket, key) at it.

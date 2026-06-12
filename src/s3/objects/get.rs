@@ -52,6 +52,8 @@ pub async fn get_object(
             &[&part_id],
         )
         .await?;
+    tx.commit().await?;
+    drop(client);
     // Try each replica in turn, returning the first that has the bytes. This is
     // simple but serial: a slow or dead replica costs us its full latency before
     // we move on. Future improvement: hedged requests — fire a backup to the next

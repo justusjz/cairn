@@ -33,3 +33,12 @@ pub fn format_s3_error(status: StatusCode, code: &str, message: &str) -> Respons
 pub fn decode_path_param(param: &str) -> String {
     percent_decode_str(param).decode_utf8_lossy().into_owned()
 }
+
+/// Extracts and percent-decodes a single parameter from a raw query string
+/// (e.g. "prefix=dir%2F&delimiter=%2F").
+pub fn query_param(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        (k == name).then(|| decode_path_param(&v.replace('+', " ")))
+    })
+}

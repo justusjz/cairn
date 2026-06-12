@@ -9,9 +9,10 @@ use crate::{
         buckets::{create::create_bucket, delete::delete_bucket, list::list_buckets},
         objects::{
             get::{get_object, head_object},
+            list::list_objects,
             put::put_object,
         },
-        util::{decode_path_param, format_s3_error},
+        util::{decode_path_param, format_s3_error, query_param},
     },
 };
 
@@ -41,6 +42,12 @@ pub async fn handle(
     if key.is_empty() {
         // bucket operations
         match req.method() {
+            &hyper::Method::GET => {
+                let query = req.uri().query().unwrap_or("");
+                let prefix = query_param(query, "prefix").unwrap_or_default();
+                let delimiter = query_param(query, "delimiter");
+                list_objects(&app, &bucket, &prefix, delimiter.as_deref()).await
+            }
             &hyper::Method::PUT => create_bucket(&app, &bucket).await,
             &hyper::Method::DELETE => delete_bucket(&app, &bucket).await,
             _ => Ok(format_s3_error(
