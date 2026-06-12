@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=14
+TOTAL=16
 STEP=0
 PASS=0
 FAIL=0
@@ -172,9 +172,11 @@ s3() { s3cmd --config "$S3CFG" "$@"; }
 SMALL="$WORK_DIR/small.txt"
 BIG="$WORK_DIR/big.bin"
 NESTED="$WORK_DIR/nested.txt"
+MULTIPART="$WORK_DIR/multi.bin"
 printf 'hello from the smoke test\n' >"$SMALL"
-dd if=/dev/urandom of="$BIG" bs=1M count=4 status=none   # 4 MiB, below multipart thresholds
+dd if=/dev/urandom of="$BIG" bs=1M count=4 status=none    # 4 MiB, below multipart thresholds
 printf 'nested object content\n' >"$NESTED"
+dd if=/dev/urandom of="$MULTIPART" bs=1M count=16 status=none   # 16 MiB → 4 parts at 5 MiB chunks
 
 check_roundtrip() {  # check_roundtrip <local> <s3uri>
     local src="$1" uri="$2" dst="$WORK_DIR/dl.$RANDOM"
@@ -200,6 +202,8 @@ run_test "Upload 4 MiB binary object"          s3 put "$BIG" "s3://${BUCKET}/big
 run_test "Download matches upload (binary)"    check_roundtrip "$BIG" "s3://${BUCKET}/big.bin"
 run_test "Upload object under a prefix"        s3 put "$NESTED" "s3://${BUCKET}/dir/sub/nested.txt"
 run_test "Listing with prefix finds object"    list_contains "s3://${BUCKET}/dir/sub/" "nested.txt"
+run_test "Upload 16 MiB object via multipart"  s3 put --multipart-chunk-size-mb=5 "$MULTIPART" "s3://${BUCKET}/multi.bin"
+run_test "Download multipart object matches"   check_roundtrip "$MULTIPART" "s3://${BUCKET}/multi.bin"
 run_test "Overwrite object, new content wins"  bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&
@@ -210,6 +214,7 @@ expect_fail "Deleted object is gone (GET 404s)" s3 get "s3://${BUCKET}/small.txt
 run_test "Delete remaining objects + bucket"   bash -c "
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/big.bin' >/dev/null &&
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/dir/sub/nested.txt' >/dev/null &&
+    s3cmd --config '$S3CFG' del 's3://${BUCKET}/multi.bin' >/dev/null &&
     s3cmd --config '$S3CFG' rb 's3://${BUCKET}' >/dev/null"
 expect_fail "Removed bucket is gone (ls fails)" s3 ls "s3://${BUCKET}"
 

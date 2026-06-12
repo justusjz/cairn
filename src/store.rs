@@ -50,12 +50,12 @@ impl Store {
         Ok(())
     }
 
-    /// Reads a part from local disk, or `None` if this node doesn't have it.
-    pub async fn read_part_opt(&self, part_id: Uuid) -> anyhow::Result<Option<Vec<u8>>> {
+    /// Opens a part for reading, or `None` if this node doesn't have it.
+    pub async fn open_part(&self, part_id: Uuid) -> anyhow::Result<Option<fs::File>> {
         let part_id = part_id.to_string();
         let part_dir = self.get_part_dir(&part_id);
-        match fs::read(part_dir.join(part_id)).await {
-            Ok(data) => Ok(Some(data)),
+        match fs::File::open(part_dir.join(part_id)).await {
+            Ok(file) => Ok(Some(file)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }

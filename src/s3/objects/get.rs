@@ -1,17 +1,25 @@
-use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes, header};
+use std::io;
+use std::sync::Arc;
+
+use http_body_util::Empty;
+use hyper::{Method, Request, Response, StatusCode, body::Bytes, header};
+use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use uuid::Uuid;
 
-use crate::{App, s3::util::format_s3_error};
+use crate::{
+    App,
+    body::{FrameSender, ResBody, box_response, channel_body, send_file, send_incoming},
+    s3::util::format_s3_error,
+};
 
 pub async fn get_object(
-    app: &App,
+    app: &Arc<App>,
     bucket: &str,
     key: &str,
-) -> anyhow::Result<Response<Full<Bytes>>> {
+) -> anyhow::Result<Response<ResBody>> {
     let mut client = app.pool.get().await?;
-    // Resolve the part this key points at, plus the metadata we echo back.
-    // last_modified is formatted as an RFC 1123 HTTP-date (what S3 clients expect).
+    // Read the metadata, the ordered parts, and each part's locations in one
+    // RepeatableRead snapshot, so a concurrent overwrite can't tear the view.
     let tx = client
         .build_transaction()
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
@@ -19,88 +27,123 @@ pub async fn get_object(
         .await?;
     let row = tx
         .query_opt(
-            "SELECT etag, content_type,
+            "SELECT etag, content_type, size,
                     to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"')
              FROM objects WHERE bucket = $1 AND key = $2",
             &[&bucket, &key],
         )
         .await?;
-    let (etag, content_type, last_modified): (String, String, String) = match row {
-        Some(row) => (row.get(0), row.get(1), row.get(2)),
-        None => return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")),
+    let (etag, content_type, size, last_modified): (String, String, i64, String) = match row {
+        Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3)),
+        None => return Ok(box_response(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", ""))),
     };
-    let parts = tx
+    // Freshest location first per part, so we try the most-likely-live node first.
+    let rows = tx
         .query(
-            "SELECT part_number, part_id FROM parts
-             WHERE object_bucket = $1 AND object_key = $2
-             ORDER BY part_number",
+            "SELECT p.part_number, p.part_id, pl.node_id, n.peer_url
+             FROM parts p
+             JOIN part_locations pl ON pl.part_id = p.part_id
+             JOIN nodes n ON n.node_id = pl.node_id
+             WHERE p.object_bucket = $1 AND p.object_key = $2
+             ORDER BY p.part_number, n.last_seen DESC",
             &[&bucket, &key],
         )
         .await?;
-    if parts.len() != 1 {
-        panic!("object does not have exactly 1 part");
-    }
-    let part_id: Uuid = parts[0].get(1);
-    // Every replica that holds the part, with its peer URL — freshest heartbeat
-    // first, so we try the node most likely to be alive before the others.
-    let locations = tx
-        .query(
-            "SELECT part_locations.node_id, nodes.peer_url
-            FROM part_locations
-            JOIN nodes
-            ON part_locations.node_id = nodes.node_id
-            WHERE part_locations.part_id = $1
-            ORDER BY nodes.last_seen DESC",
-            &[&part_id],
-        )
-        .await?;
     tx.commit().await?;
-    drop(client);
-    // Try each replica in turn, returning the first that has the bytes. This is
-    // simple but serial: a slow or dead replica costs us its full latency before
-    // we move on. Future improvement: hedged requests — fire a backup to the next
-    // replica after a short delay and take whichever responds first — to bound
-    // tail latency without always doubling read load.
+
+    // Group the flat rows into ordered parts, each with its candidate locations.
+    let mut parts: Vec<(Uuid, Vec<(String, String)>)> = Vec::new();
+    let mut current: Option<i32> = None;
+    for row in &rows {
+        let part_number: i32 = row.get(0);
+        let part_id: Uuid = row.get(1);
+        let node_id: String = row.get(2);
+        let peer_url: String = row.get(3);
+        if current != Some(part_number) {
+            parts.push((part_id, Vec::new()));
+            current = Some(part_number);
+        }
+        parts.last_mut().unwrap().1.push((node_id, peer_url));
+    }
+
+    // Stream the parts in order through a channel-backed body: a background task
+    // pulls each from a replica (locally if that's us) and forwards its chunks.
+    // We set Content-Length, so a truncated stream (a part we can't serve) is
+    // detected by the client rather than read as a short-but-complete object.
+    let (sender, body) = channel_body();
+    let app = app.clone();
     let self_id = app.store.get_node_id().to_string();
-    for row in &locations {
-        let node_id: &str = row.get(0);
-        let peer_url: &str = row.get(1);
-        // If we hold it ourselves, read from local disk instead of an HTTP hop —
-        // and on a single host there's no peer server to hop to anyway.
-        let fetched = if node_id == self_id {
-            app.store
-                .read_part_opt(part_id)
-                .await
-                .map(|opt| opt.map(Bytes::from))
-        } else {
-            crate::fetch_from_replica(peer_url, part_id).await
-        };
-        match fetched {
-            Ok(Some(data)) => {
-                return Ok(Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::ETAG, format!("\"{etag}\""))
-                    .header(header::CONTENT_TYPE, content_type.as_str())
-                    .header(header::LAST_MODIFIED, last_modified.as_str())
-                    .body(Full::new(data))
-                    .unwrap());
+    tokio::spawn(async move {
+        for (part_id, locations) in parts {
+            if let Err(e) = stream_part(&app, part_id, &locations, &self_id, &sender).await {
+                let _ = sender.send(Err(e)).await;
+                return;
             }
-            // 404 means the DB lists this replica but it doesn't actually hold the
-            // bytes (GC / inconsistency) — just try the next one.
-            Ok(None) => continue,
-            // Couldn't reach this replica; log and fall through to the next.
-            Err(e) => {
-                eprintln!("fetch of part {part_id} from {peer_url} failed: {e}");
-                continue;
+        }
+    });
+
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header(header::ETAG, format!("\"{etag}\""))
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, size)
+        .header(header::LAST_MODIFIED, last_modified)
+        .body(body)
+        .unwrap())
+}
+
+/// Streams one part to `tx`, trying its locations in order (freshest first).
+/// Failover only happens before a source produces its first byte — once we start
+/// forwarding, a mid-stream failure faults the whole response (we can't unsend).
+async fn stream_part(
+    app: &App,
+    part_id: Uuid,
+    locations: &[(String, String)],
+    self_id: &str,
+    tx: &FrameSender,
+) -> io::Result<()> {
+    for (node_id, peer_url) in locations {
+        if node_id == self_id {
+            // We hold it: stream from local disk (no peer server needed).
+            match app.store.open_part(part_id).await {
+                Ok(Some(file)) => return send_file(file, tx).await,
+                Ok(None) => continue,
+                Err(e) => {
+                    eprintln!("local open of part {part_id} failed: {e}");
+                    continue;
+                }
+            }
+        } else {
+            // `client` stays in scope across send_incoming, keeping the connection
+            // alive while we stream the response body.
+            let client = Client::builder(TokioExecutor::new()).build_http();
+            let req = match Request::builder()
+                .method(Method::GET)
+                .uri(format!("{peer_url}/parts/{part_id}"))
+                .body(Empty::<Bytes>::new())
+            {
+                Ok(req) => req,
+                Err(_) => continue,
+            };
+            match client.request(req).await {
+                Ok(res) if res.status() == StatusCode::OK => {
+                    return send_incoming(res.into_body(), tx).await;
+                }
+                Ok(res) if res.status() == StatusCode::NOT_FOUND => continue,
+                Ok(res) => {
+                    eprintln!("replica {peer_url} returned {} for part {part_id}", res.status());
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("fetch of part {part_id} from {peer_url} failed: {e}");
+                    continue;
+                }
             }
         }
     }
-    // The object points at a part, but no replica could serve it right now.
-    Ok(format_s3_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "ServiceUnavailable",
-        "no replica could serve the requested object",
-    ))
+    Err(io::Error::other(format!(
+        "no replica could serve part {part_id}"
+    )))
 }
 
 /// Metadata-only response for the key: answered straight from `objects`, never
@@ -109,7 +152,7 @@ pub async fn head_object(
     app: &App,
     bucket: &str,
     key: &str,
-) -> anyhow::Result<Response<Full<Bytes>>> {
+) -> anyhow::Result<Response<http_body_util::Full<Bytes>>> {
     let client = app.pool.get().await?;
     let row = client
         .query_opt(
@@ -131,7 +174,7 @@ pub async fn head_object(
                 .header(header::ETAG, format!("\"{etag}\""))
                 .header(header::CONTENT_TYPE, content_type)
                 .header(header::LAST_MODIFIED, last_modified)
-                .body(Full::new(Bytes::new()))
+                .body(http_body_util::Full::new(Bytes::new()))
                 .unwrap())
         }
         None => Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")),

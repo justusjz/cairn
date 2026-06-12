@@ -2,7 +2,7 @@ use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use clap::Parser;
 use deadpool_postgres::{Object, Pool};
-use http_body_util::{BodyExt, Empty, Full};
+use http_body_util::Full;
 use hyper::{
     Method, Request, StatusCode, body::Body, body::Bytes, server::conn::http1, service::service_fn,
 };
@@ -15,6 +15,7 @@ use crate::store::Store;
 
 mod peer;
 
+mod body;
 mod db;
 mod s3;
 mod store;
@@ -186,24 +187,6 @@ where
         anyhow::bail!("replica {peer_url} returned status {}", res.status());
     }
     Ok(())
-}
-
-/// Fetches a part from a single replica's peer endpoint. `Ok(Some)` is the
-/// bytes, `Ok(None)` means the replica answered 404 (it doesn't hold the part),
-/// and `Err` is a transport-level failure. The caller can advance to the next
-/// replica on either of the latter two while still telling them apart.
-async fn fetch_from_replica(peer_url: &str, part_id: Uuid) -> anyhow::Result<Option<Bytes>> {
-    let client = Client::builder(TokioExecutor::new()).build_http();
-    let req = Request::builder()
-        .method(Method::GET)
-        .uri(format!("{peer_url}/parts/{part_id}"))
-        .body(Empty::<Bytes>::new())?;
-    let res = client.request(req).await?;
-    match res.status() {
-        StatusCode::OK => Ok(Some(res.into_body().collect().await?.to_bytes())),
-        StatusCode::NOT_FOUND => Ok(None),
-        status => anyhow::bail!("replica {peer_url} returned status {status}"),
-    }
 }
 
 /// Durably writes a part's bytes to this node's local disk and records this node
