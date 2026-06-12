@@ -64,7 +64,12 @@ pub async fn handle(
     // boxed. `query` borrows `req`, so own it before the body-consuming arms.
     let query = req.uri().query().unwrap_or("").to_owned();
     if *req.method() == hyper::Method::GET {
-        return get_object(&app, &bucket, &key).await;
+        let range = req
+            .headers()
+            .get(hyper::header::RANGE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        return get_object(&app, &bucket, &key, range.as_deref()).await;
     }
     let content_type = req
         .headers()

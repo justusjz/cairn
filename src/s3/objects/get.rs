@@ -16,6 +16,7 @@ pub async fn get_object(
     app: &Arc<App>,
     bucket: &str,
     key: &str,
+    range_header: Option<&str>,
 ) -> anyhow::Result<Response<ResBody>> {
     let mut client = app.pool.get().await?;
     // Read the metadata, the ordered parts, and each part's locations in one
@@ -36,6 +37,21 @@ pub async fn get_object(
     let (etag, content_type, size, last_modified): (String, String, i64, String) = match row {
         Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3)),
         None => return Ok(box_response(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", ""))),
+    };
+    let size = size as u64;
+    // Resolve the requested object range as a half-open [range_start, range_end).
+    // No/unsupported Range → the whole object (200); a satisfiable range → 206; a
+    // syntactically valid but unsatisfiable one → 416.
+    let (range_start, range_end, partial) = match parse_range(range_header, size) {
+        Ok(Some((start, end))) => (start, end, true),
+        Ok(None) => (0, size, false),
+        Err(()) => {
+            return Ok(box_response(format_s3_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "InvalidRange",
+                "the requested range is not satisfiable",
+            )));
+        }
     };
     // Freshest location first per part, so we try the most-likely-live node first.
     let rows = tx
@@ -67,11 +83,6 @@ pub async fn get_object(
         }
         parts.last_mut().unwrap().2.push((node_id, peer_url));
     }
-
-    // Requested object range as a half-open [start, end). Placeholder for now: the
-    // whole object. Parsing the Range header will set these later.
-    let range_start: u64 = 0;
-    let range_end: u64 = size as u64;
 
     // Walk the ordered parts, tracking the object offset where each begins, and
     // intersect each part's span with the requested range. An overlapping part
@@ -114,14 +125,69 @@ pub async fn get_object(
         }
     });
 
-    Ok(Response::builder()
-        .status(StatusCode::OK)
+    let builder = Response::builder()
+        .header(header::ACCEPT_RANGES, "bytes")
         .header(header::ETAG, format!("\"{etag}\""))
         .header(header::CONTENT_TYPE, content_type)
-        .header(header::CONTENT_LENGTH, size)
-        .header(header::LAST_MODIFIED, last_modified)
-        .body(body)
-        .unwrap())
+        .header(header::CONTENT_LENGTH, range_end - range_start)
+        .header(header::LAST_MODIFIED, last_modified);
+    let builder = if partial {
+        builder.status(StatusCode::PARTIAL_CONTENT).header(
+            header::CONTENT_RANGE,
+            format!("bytes {range_start}-{}/{size}", range_end - 1),
+        )
+    } else {
+        builder.status(StatusCode::OK)
+    };
+    Ok(builder.body(body).unwrap())
+}
+
+/// Parses a single-range `Range: bytes=…` header against the object `size` into a
+/// half-open [start, end). `Ok(None)` = no usable range (serve the whole object,
+/// 200); `Err(())` = a syntactically valid but unsatisfiable range (416).
+/// Malformed and multi-range headers are ignored (treated as `None`).
+fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(spec) = header.and_then(|h| h.strip_prefix("bytes=")) else {
+        return Ok(None);
+    };
+    let spec = spec.trim();
+    if spec.contains(',') {
+        return Ok(None); // multi-range unsupported — serve the whole object
+    }
+    let Some((start_s, end_s)) = spec.split_once('-') else {
+        return Ok(None); // malformed
+    };
+    let (start, end) = if start_s.trim().is_empty() {
+        // bytes=-N: the last N bytes.
+        let Ok(suffix) = end_s.trim().parse::<u64>() else {
+            return Ok(None);
+        };
+        if suffix == 0 {
+            return Err(());
+        }
+        (size.saturating_sub(suffix), size)
+    } else {
+        let Ok(start) = start_s.trim().parse::<u64>() else {
+            return Ok(None);
+        };
+        let end = if end_s.trim().is_empty() {
+            size // bytes=start-
+        } else {
+            let Ok(last) = end_s.trim().parse::<u64>() else {
+                return Ok(None);
+            };
+            if last < start {
+                return Err(());
+            }
+            last.saturating_add(1) // inclusive end → half-open
+        };
+        (start, end)
+    };
+    let end = end.min(size);
+    if start >= end {
+        return Err(()); // start at/after the object end, or an empty range
+    }
+    Ok(Some((start, end)))
 }
 
 /// Streams one part to `tx` — the whole part, or just `range` (offset, length) of

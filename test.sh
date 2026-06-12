@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=16
+TOTAL=20
 STEP=0
 PASS=0
 FAIL=0
@@ -109,7 +109,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ─── Preflight ───────────────────────────────────────────────────────────────
-for tool in podman cargo s3cmd; do
+for tool in podman cargo s3cmd curl; do
     command -v "$tool" >/dev/null 2>&1 || fatal "'$tool' not found in PATH"
 done
 
@@ -188,6 +188,20 @@ list_contains() {    # list_contains <s3 ls target> <needle>
     s3 ls "$1" 2>/dev/null | grep -qF "$2"
 }
 
+# s3cmd can't issue ranged GETs, so the Range tests hit the server directly with
+# curl (the server doesn't verify request signatures).
+range_matches() {    # range_matches <bucket/key> <start> <end> <localfile>
+    local path="$1" start="$2" end="$3" src="$4" got="$WORK_DIR/range.$RANDOM"
+    curl -fsS -H "Range: bytes=${start}-${end}" \
+        "http://${SERVER_HOST}:${SERVER_PORT}/${path}" -o "$got" || return 1
+    cmp -s "$got" <(tail -c "+$((start + 1))" "$src" | head -c "$((end - start + 1))")
+}
+
+status_is() {        # status_is <expected-code> <bucket/key> <range>
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Range: bytes=$3" \
+        "http://${SERVER_HOST}:${SERVER_PORT}/$2")" = "$1" ]
+}
+
 echo ""
 echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
@@ -204,6 +218,11 @@ run_test "Upload object under a prefix"        s3 put "$NESTED" "s3://${BUCKET}/
 run_test "Listing with prefix finds object"    list_contains "s3://${BUCKET}/dir/sub/" "nested.txt"
 run_test "Upload 16 MiB object via multipart"  s3 put --multipart-chunk-size-mb=5 "$MULTIPART" "s3://${BUCKET}/multi.bin"
 run_test "Download multipart object matches"   check_roundtrip "$MULTIPART" "s3://${BUCKET}/multi.bin"
+run_test "Ranged GET (single part) matches"    range_matches "${BUCKET}/big.bin" 1000000 1000099 "$BIG"
+run_test "Ranged GET across multipart boundary" \
+                                               range_matches "${BUCKET}/multi.bin" 5242875 5242884 "$MULTIPART"
+run_test "Ranged GET responds 206"             status_is 206 "${BUCKET}/big.bin" "0-99"
+run_test "Unsatisfiable range responds 416"    status_is 416 "${BUCKET}/big.bin" "99999999-100000000"
 run_test "Overwrite object, new content wins"  bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&
