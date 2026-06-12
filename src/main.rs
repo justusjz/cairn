@@ -2,15 +2,18 @@ use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use clap::Parser;
 use deadpool_postgres::{Object, Pool};
-use http_body_util::Full;
+use http_body_util::BodyExt;
 use hyper::{
-    Method, Request, StatusCode, body::Body, body::Bytes, server::conn::http1, service::service_fn,
+    Method, Request, StatusCode, body::Body, body::Bytes, body::Frame, body::Incoming,
+    server::conn::http1, service::service_fn,
 };
 use hyper_util::{client::legacy::Client, rt::TokioExecutor, rt::TokioIo};
-use tokio::{net::TcpListener, task::JoinSet};
+use md5::{Digest, Md5};
+use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
+use crate::body::{FrameSender, channel_body};
 use crate::store::Store;
 
 mod peer;
@@ -189,11 +192,24 @@ where
     Ok(())
 }
 
-/// Durably writes a part's bytes to this node's local disk and records this node
-/// as one of its locations. Shared by the peer PUT endpoint and the local-replica
-/// fast path in `upload_part` (no HTTP hop when a chosen replica is ourselves).
-async fn store_part_locally(app: &App, part_id: Uuid, data: Bytes) -> anyhow::Result<()> {
-    app.store.write_part(part_id, data).await?;
+/// Streams a body to this node's local disk, fsyncs it, and records this node as
+/// a location for the part. Shared by the peer PUT endpoint (an `Incoming`) and
+/// the local-replica sink in `upload_part` (a channel-backed body) — hence the
+/// generic body.
+async fn write_part_streaming<B>(app: &App, part_id: Uuid, mut body: B) -> anyhow::Result<()>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
+    let mut file = app.store.create_part(part_id).await?;
+    while let Some(frame) = body.frame().await {
+        if let Ok(chunk) = frame?.into_data() {
+            file.write_all(&chunk).await?;
+        }
+    }
+    // fsync before announcing the location, so the bytes survive a crash by the
+    // time the leader's commit can count this replica.
+    file.sync_all().await?;
     let node_id = app.store.get_node_id().to_string();
     let client = app.pool.get().await?;
     client
@@ -208,68 +224,106 @@ async fn store_part_locally(app: &App, part_id: Uuid, data: Bytes) -> anyhow::Re
 /// Where a freshly-committed part should be attached. The attach happens inside
 /// the same serializable transaction that flips the part to 'committed', so the
 /// invariant "committed implies referenced" holds with no orphan window.
+/// The size and ETag aren't carried here: they're computed by `upload_part` as
+/// the body streams, and passed to `try_commit_part` alongside the target.
 enum AttachTarget {
     /// A single-PUT object: point (bucket, key) at exactly this one part,
     /// replacing whatever it referenced before.
     Object {
         bucket: String,
         key: String,
-        size: i64,
-        etag: String,
         content_type: String,
     },
     /// A part staged under an in-progress multipart upload.
-    MultipartPart {
-        upload_id: Uuid,
-        part_number: i32,
-        etag: String,
-    },
+    MultipartPart { upload_id: Uuid, part_number: i32 },
 }
 
-/// Stores `data` as a new part replicated across the cluster, then commits and
-/// attaches it to `attach` atomically. Returns the new part's id.
-async fn upload_part(app: &Arc<App>, data: Bytes, attach: &AttachTarget) -> anyhow::Result<Uuid> {
-    let mut client = app.pool.get().await?;
+/// Streams `body` into a fresh part replicated across the cluster — hashing it
+/// as it flows — then commits and attaches it to `attach`. Returns the ETag.
+async fn upload_part(
+    app: &Arc<App>,
+    mut body: Incoming,
+    attach: &AttachTarget,
+) -> anyhow::Result<String> {
+    let client = app.pool.get().await?;
     let part_id = Uuid::new_v4();
-    // 1. create the (pending) part entry in the database
+    // 1. create the pending part. Its size isn't known until the body is fully
+    // streamed, so it starts at 0 and is set at commit.
     client
         .execute(
-            "INSERT INTO parts (part_id, size, state, created_at) VALUES ($1, $2, 'pending', NOW())",
-            &[&part_id, &(data.len() as i64)],
+            "INSERT INTO parts (part_id, size, state, created_at) VALUES ($1, 0, 'pending', NOW())",
+            &[&part_id],
         )
         .await?;
-    // 2. choose replicas
+    // 2. choose replicas; give each (local or remote) a channel-backed body that
+    // the tee loop below feeds. A replica that is ourselves writes straight to
+    // local disk (no HTTP hop — and on a single host there's no peer server).
     let replicas = choose_replicas(&client, app.replication_factor).await?;
     let node_ids: Vec<String> = replicas.iter().map(|(id, _)| id.clone()).collect();
-    // 3. send a copy of the part to each replica, concurrently. A replica that is
-    // ourselves writes locally (no HTTP hop — and on a single host there's no peer
-    // server to hop to); we spawn it alongside the remote uploads and join them
-    // all uniformly, so local disk I/O overlaps the network round-trips.
+    // Don't hold a pooled connection across the (potentially long) stream — the
+    // local sink needs one to record its location, and concurrent uploads could
+    // otherwise exhaust the pool and deadlock. Re-acquire one for the commit.
+    drop(client);
     let self_id = app.store.get_node_id().to_string();
-    let mut uploads = JoinSet::new();
+    let mut senders: Vec<FrameSender> = Vec::new();
+    let mut sinks = JoinSet::new();
     for (node_id, peer_url) in replicas {
-        let data = data.clone();
+        let (tx, part_body) = channel_body();
+        senders.push(tx);
         if node_id == self_id {
             let app = app.clone();
-            uploads.spawn(async move { store_part_locally(&app, part_id, data).await });
+            sinks.spawn(async move { write_part_streaming(&app, part_id, part_body).await });
         } else {
-            uploads
-                .spawn(async move { upload_to_replica(&peer_url, part_id, Full::new(data)).await });
+            sinks.spawn(async move { upload_to_replica(&peer_url, part_id, part_body).await });
         }
     }
-    while let Some(res) = uploads.join_next().await {
-        // res: Result<anyhow::Result<()>, JoinError> — the task itself panicking,
-        // then the upload's own error. Either one fails the whole part.
+    // 3. tee: read the client body once, hashing and fanning each chunk out to
+    // every replica. The bounded channels apply backpressure at the slowest sink.
+    let mut hasher = Md5::new();
+    let mut size: i64 = 0;
+    let mut read_err: Option<anyhow::Error> = None;
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                if let Ok(chunk) = frame.into_data() {
+                    hasher.update(&chunk);
+                    size += chunk.len() as i64;
+                    for tx in &senders {
+                        // A dropped receiver means that sink's task failed; we'll
+                        // surface its real error when we drain the JoinSet.
+                        let _ = tx.send(Ok(Frame::data(chunk.clone()))).await;
+                    }
+                }
+            }
+            Some(Err(e)) => {
+                read_err = Some(e.into());
+                break;
+            }
+            None => break,
+        }
+    }
+    // On a client read error, fault the sinks so they don't durably store a
+    // truncated part; then close the channels so the bodies finish.
+    if let Some(e) = &read_err {
+        for tx in &senders {
+            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
+        }
+    }
+    drop(senders);
+    // 4. wait for every replica to finish (or fail).
+    while let Some(res) = sinks.join_next().await {
         res??;
     }
-    // 4. commit + attach: flip the part to 'committed' and link it to `attach`,
-    // but only after re-confirming in a serializable transaction that every
-    // replica still holds a location row. A concurrent GC dropping one of those
-    // locations conflicts with our read, so SSI aborts one side with a
-    // serialization failure, which we retry afresh.
+    if let Some(e) = read_err {
+        return Err(e);
+    }
+    let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    // 5. commit + attach with the now-known size and ETag, under a serializable
+    // transaction; retry on a serialization conflict (e.g. a concurrent GC).
+    let mut client = app.pool.get().await?;
     let mut committed = false;
     for _ in 0..MAX_COMMIT_ATTEMPTS {
-        match try_commit_part(&mut client, part_id, &node_ids, attach).await {
+        match try_commit_part(&mut client, part_id, &node_ids, attach, size, &etag).await {
             Ok(CommitResult::Committed) => {
                 committed = true;
                 break;
@@ -277,7 +331,6 @@ async fn upload_part(app: &Arc<App>, data: Bytes, attach: &AttachTarget) -> anyh
             Ok(CommitResult::MissingLocations { present, required }) => anyhow::bail!(
                 "part {part_id} not durable: only {present}/{required} replicas reported a location"
             ),
-            // Serialization conflict (e.g. a concurrent GC delete) — retry.
             Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
             Err(e) => return Err(e.into()),
         }
@@ -287,7 +340,7 @@ async fn upload_part(app: &Arc<App>, data: Bytes, attach: &AttachTarget) -> anyh
             "part {part_id}: commit aborted after {MAX_COMMIT_ATTEMPTS} serialization retries"
         );
     }
-    Ok(part_id)
+    Ok(etag)
 }
 
 const MAX_COMMIT_ATTEMPTS: usize = 10;
@@ -307,6 +360,8 @@ async fn try_commit_part(
     part_id: Uuid,
     node_ids: &[String],
     attach: &AttachTarget,
+    size: i64,
+    etag: &str,
 ) -> Result<CommitResult, tokio_postgres::Error> {
     let tx = client
         .build_transaction()
@@ -331,8 +386,6 @@ async fn try_commit_part(
         AttachTarget::Object {
             bucket,
             key,
-            size,
-            etag,
             content_type,
         } => {
             // Upsert the object's metadata first, so the part's owner FK target
@@ -342,7 +395,7 @@ async fn try_commit_part(
                  VALUES ($1, $2, $3, $4, $5, NOW())
                  ON CONFLICT (bucket, key)
                  DO UPDATE SET size = $3, etag = $4, content_type = $5, last_modified = NOW()",
-                &[bucket, key, size, etag, content_type],
+                &[bucket, key, &size, &etag, content_type],
             )
             .await?;
             // Drop whatever parts the key referenced before: their rows (and, via
@@ -357,17 +410,16 @@ async fn try_commit_part(
             // Commit this part and point it at the object in one step.
             tx.execute(
                 "UPDATE parts
-                 SET state = 'committed', object_bucket = $1, object_key = $2,
-                     part_number = 1, etag = $3
-                 WHERE part_id = $4",
-                &[bucket, key, etag, &part_id],
+                 SET state = 'committed', size = $1, etag = $2,
+                     object_bucket = $3, object_key = $4, part_number = 1
+                 WHERE part_id = $5",
+                &[&size, &etag, bucket, key, &part_id],
             )
             .await?;
         }
         AttachTarget::MultipartPart {
             upload_id,
             part_number,
-            etag,
         } => {
             // Displace any part previously uploaded at this number (S3 allows
             // re-uploading a part number); its row + locations go now, its file
@@ -380,9 +432,9 @@ async fn try_commit_part(
             // Commit this part and stage it under the upload in one step.
             tx.execute(
                 "UPDATE parts
-                 SET state = 'committed', upload_id = $1, part_number = $2, etag = $3
-                 WHERE part_id = $4",
-                &[upload_id, part_number, etag, &part_id],
+                 SET state = 'committed', size = $1, etag = $2, upload_id = $3, part_number = $4
+                 WHERE part_id = $5",
+                &[&size, &etag, upload_id, part_number, &part_id],
             )
             .await?;
         }

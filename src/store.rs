@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::fs;
 use uuid::Uuid;
 
 pub struct Store {
@@ -37,17 +37,14 @@ impl Store {
         self.data_dir.join(level1).join(level2)
     }
 
-    pub async fn write_part<B: AsRef<[u8]>>(&self, part_id: Uuid, data: B) -> anyhow::Result<()> {
+    /// Creates (truncating) the on-disk file for a part, making its sharded
+    /// directory if needed. The caller streams the bytes in and fsyncs before
+    /// announcing this node as a durable location.
+    pub async fn create_part(&self, part_id: Uuid) -> anyhow::Result<fs::File> {
         let part_id = part_id.to_string();
         let part_dir = self.get_part_dir(&part_id);
         fs::create_dir_all(&part_dir).await?;
-        // Write *and fsync* before returning: the caller announces this node as a
-        // durable location for the part right after, so the bytes must survive a
-        // crash by the time we report success.
-        let mut file = fs::File::create(part_dir.join(part_id)).await?;
-        file.write_all(data.as_ref()).await?;
-        file.sync_all().await?;
-        Ok(())
+        Ok(fs::File::create(part_dir.join(part_id)).await?)
     }
 
     /// Opens a part for reading, or `None` if this node doesn't have it.

@@ -92,15 +92,11 @@ pub async fn handle(
         }
         // UploadPart
         hyper::Method::PUT if query_param(&query, "uploadId").is_some() => {
-            let data = req.into_body().collect().await?.to_bytes();
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
             let part_number = query_param(&query, "partNumber").unwrap_or_default();
-            put_part(&app, &upload_id, &part_number, data).await?
+            put_part(&app, &upload_id, &part_number, req.into_body()).await?
         }
-        hyper::Method::PUT => {
-            let data = req.into_body().collect().await?.to_bytes();
-            put_object(&app, &bucket, &key, &content_type, data).await?
-        }
+        hyper::Method::PUT => put_object(&app, &bucket, &key, &content_type, req.into_body()).await?,
         _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
     };
     Ok(box_response(resp))

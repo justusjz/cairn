@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::{Request, Response, StatusCode, body::Bytes};
 use uuid::Uuid;
 
@@ -43,10 +43,9 @@ pub async fn handle(
                 }
             }
             hyper::Method::PUT => {
-                // Buffer the whole body into memory, then write it durably and
-                // announce this node as a location for the part.
-                let data = req.into_body().collect().await?.to_bytes();
-                crate::store_part_locally(&app, part_id, data).await?;
+                // Stream the body straight to disk (and announce the location),
+                // without buffering the whole part in memory.
+                crate::write_part_streaming(&app, part_id, req.into_body()).await?;
                 Ok(box_response(empty(StatusCode::OK)))
             }
             _ => Ok(box_response(empty(StatusCode::METHOD_NOT_ALLOWED))),
