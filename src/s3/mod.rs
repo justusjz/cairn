@@ -156,6 +156,15 @@ pub async fn handle(
     let aws_chunked = crate::aws_chunked::is_aws_chunked(req.headers());
     // The body-integrity claim the client makes (verified as the body streams).
     let content_sha256 = crate::auth::ContentSha256::from_headers(req.headers());
+    // For a signed streaming body (mode 4), build the chunk-signature verifier
+    // from the request's SigV4 auth + the server secret. Absent for unsigned
+    // requests (no Authorization), which then stream without chunk verification.
+    let chunk_verifier = match &content_sha256 {
+        crate::auth::ContentSha256::Streaming => {
+            crate::auth::StreamingChunkVerifier::from_headers(req.headers(), crate::auth::SECRET_KEY)
+        }
+        _ => None,
+    };
     let resp = match req.method().clone() {
         hyper::Method::HEAD => head_object(&app, &bucket, &key, range.as_deref()).await?,
         // AbortMultipartUpload
@@ -185,6 +194,7 @@ pub async fn handle(
                 req.into_body(),
                 aws_chunked,
                 content_sha256,
+                chunk_verifier,
             )
             .await?
         }
@@ -197,6 +207,7 @@ pub async fn handle(
                 req.into_body(),
                 aws_chunked,
                 content_sha256,
+                chunk_verifier,
             )
             .await?
         }

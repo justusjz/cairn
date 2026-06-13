@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=32
+TOTAL=34
 STEP=0
 PASS=0
 FAIL=0
@@ -109,7 +109,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ─── Preflight ───────────────────────────────────────────────────────────────
-for tool in podman cargo s3cmd curl openssl python3; do
+for tool in podman cargo s3cmd curl openssl python3 mcli; do
     command -v "$tool" >/dev/null 2>&1 || fatal "'$tool' not found in PATH"
 done
 
@@ -252,6 +252,21 @@ streaming_trailer_put() {  # streaming_trailer_put <bucket/key> <localfile> <goo
         "http://${SERVER_HOST}:${SERVER_PORT}/${path}"
 }
 
+# Mode 2: a whole-body SHA-256 in x-amz-content-sha256. The correct hash is
+# accepted and the object round-trips; a wrong hash is rejected with 400 (proving
+# the check isn't a no-op).
+content_sha256_ok() {
+    local b="$BUCKET" host="http://${SERVER_HOST}:${SERVER_PORT}" sha
+    sha=$(openssl dgst -sha256 "$NESTED" | awk '{print $NF}')
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary "@$NESTED" \
+        -H "x-amz-content-sha256: $sha" "$host/$b/cs-good.txt")" = 200 ] || return 1
+    check_roundtrip "$NESTED" "s3://$b/cs-good.txt" || return 1
+    local wrong="0000000000000000000000000000000000000000000000000000000000000000"
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary "@$NESTED" \
+        -H "x-amz-content-sha256: $wrong" "$host/$b/cs-bad.txt")" = 400 ] || return 1
+    delete_objects_via_api "$b" cs-good.txt >/dev/null
+}
+
 # A correct trailer checksum is accepted (and the decoded object stored); a wrong
 # one is rejected with 400.
 streaming_trailer_ok() {
@@ -260,6 +275,22 @@ streaming_trailer_ok() {
     check_roundtrip "$NESTED" "s3://$b/st-good.txt" || return 1
     [ "$(streaming_trailer_put "$b/st-bad.txt" "$NESTED" bad)" = 400 ] || return 1
     delete_objects_via_api "$b" st-good.txt >/dev/null
+}
+
+# Mode 4 via mcli — minio-go under the hood, the exact client Mimir uses. Its
+# PUT streams with STREAMING-AWS4-HMAC-SHA256-PAYLOAD and per-chunk signatures.
+# The right secret is accepted and the object round-trips; a wrong secret makes
+# the chunk signatures fail to verify, so the upload is rejected.
+mc_streaming_ok() {
+    local b="$BUCKET" host="http://${SERVER_HOST}:${SERVER_PORT}" cfg="$WORK_DIR/mc"
+    mcli --config-dir "$cfg" alias set good "$host" testkey cairnsecret >/dev/null 2>&1 || return 1
+    mcli --config-dir "$cfg" cp "$NESTED" "good/${b}/mc-good.txt" >/dev/null 2>&1 || return 1
+    check_roundtrip "$NESTED" "s3://${b}/mc-good.txt" || return 1
+    mcli --config-dir "$cfg" alias set bad "$host" testkey wrongsecret123 >/dev/null 2>&1 || return 1
+    if mcli --config-dir "$cfg" cp "$NESTED" "bad/${b}/mc-bad.txt" >/dev/null 2>&1; then
+        return 1 # wrong secret must be rejected
+    fi
+    delete_objects_via_api "$b" mc-good.txt >/dev/null
 }
 
 # ─── Pagination helpers (curl, so we control max-keys/tokens precisely) ──────
@@ -426,8 +457,10 @@ run_test "Ranged GET across multipart boundary" \
                                                range_matches "${BUCKET}/multi.bin" 5242875 5242884 "$MULTIPART"
 run_test "Ranged GET responds 206"             status_is 206 "${BUCKET}/big.bin" "0-99"
 run_test "Unsatisfiable range responds 416"    status_is 416 "${BUCKET}/big.bin" "99999999-100000000"
+run_test "Body SHA-256 verified (good/bad)"    content_sha256_ok
 run_test "aws-chunked upload is decoded"       aws_chunked_roundtrip "${BUCKET}/chunked.txt" "$NESTED"
 run_test "aws-chunked trailer checksum (CRC32)" streaming_trailer_ok
+run_test "Signed streaming upload via mcli (mode 4)" mc_streaming_ok
 run_test "Set up pagination fixtures"          setup_pagination
 run_test "ListObjectsV2 paginates leaves"      v2_leaves_ok
 run_test "ListObjects (v1) paginates leaves"   v1_leaves_ok

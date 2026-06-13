@@ -12,14 +12,18 @@
 //! ```
 //!
 //! (The `;chunk-signature=…` is absent for `STREAMING-UNSIGNED-PAYLOAD-TRAILER`,
-//! and a trailer may follow the terminating zero-size chunk.) We don't verify
-//! signatures, so decoding just means stripping the framing and concatenating
-//! the chunk payloads. Size and ETag are then computed over the decoded bytes,
-//! which is what the object actually is.
+//! and a trailer may follow the terminating zero-size chunk.) Decoding strips the
+//! framing and concatenates the chunk payloads; size and ETag are then computed
+//! over the decoded bytes, which is what the object actually is. Given a
+//! [`StreamingChunkVerifier`], each chunk's signature is also verified as it's
+//! decoded (mode 4), faulting the stream on a mismatch.
 
 use std::io;
 
 use hyper::{HeaderMap, body::Bytes, header};
+use sha2::{Digest, Sha256};
+
+use crate::auth::{EMPTY_SHA256, StreamingChunkVerifier};
 
 /// True if the request body is `aws-chunked` framed and must be decoded before
 /// storage. Signalled by a streaming `x-amz-content-sha256`
@@ -61,14 +65,24 @@ pub struct AwsChunkedDecoder {
     state: State,
     header: Vec<u8>,
     trailer: Vec<u8>,
+    /// Set for a signed streaming body (mode 4): each chunk's signature is
+    /// verified against this as the chunk completes. `None` = no verification.
+    verifier: Option<StreamingChunkVerifier>,
+    /// SHA-256 of the current chunk's data, while verifying.
+    chunk_hasher: Option<Sha256>,
+    /// The current chunk header's `chunk-signature=` value, while verifying.
+    chunk_signature: String,
 }
 
 impl AwsChunkedDecoder {
-    pub fn new() -> Self {
+    pub fn new(verifier: Option<StreamingChunkVerifier>) -> Self {
         Self {
             state: State::Header,
             header: Vec::new(),
             trailer: Vec::new(),
+            verifier,
+            chunk_hasher: None,
+            chunk_signature: String::new(),
         }
     }
 
@@ -84,13 +98,24 @@ impl AwsChunkedDecoder {
                     self.header.push(input[i]);
                     i += 1;
                     if self.header.ends_with(b"\r\n") {
-                        let size = parse_chunk_size(&self.header)?;
+                        let (size, signature) = parse_chunk_header(&self.header)?;
                         self.header.clear();
-                        self.state = if size == 0 {
-                            State::Trailer
+                        if size == 0 {
+                            // The terminating chunk is itself signed, over the
+                            // empty-payload hash; verify it before finishing.
+                            if let Some(v) = self.verifier.as_mut()
+                                && !v.verify_chunk(EMPTY_SHA256, &signature)
+                            {
+                                return Err(io::Error::other(
+                                    "aws-chunked: chunk signature mismatch",
+                                ));
+                            }
+                            self.state = State::Trailer;
                         } else {
-                            State::Data(size)
-                        };
+                            self.chunk_signature = signature;
+                            self.chunk_hasher = self.verifier.is_some().then(Sha256::new);
+                            self.state = State::Data(size);
+                        }
                     } else if self.header.len() > MAX_HEADER_LINE {
                         return Err(io::Error::other("aws-chunked: chunk header too long"));
                     }
@@ -100,10 +125,27 @@ impl AwsChunkedDecoder {
                     let take = (*n).min(avail) as usize;
                     if take > 0 {
                         out.push(input.slice(i..i + take));
+                        if let Some(h) = self.chunk_hasher.as_mut() {
+                            h.update(&input[i..i + take]);
+                        }
                     }
                     i += take;
                     *n -= take as u64;
                     if *n == 0 {
+                        // Chunk data complete: verify its signature over the data
+                        // hash, chaining from the previous chunk's signature.
+                        if let Some(v) = self.verifier.as_mut() {
+                            let data_hash: String = self
+                                .chunk_hasher
+                                .take()
+                                .map(|h| h.finalize().iter().map(|b| format!("{b:02x}")).collect())
+                                .unwrap_or_default();
+                            if !v.verify_chunk(&data_hash, &self.chunk_signature) {
+                                return Err(io::Error::other(
+                                    "aws-chunked: chunk signature mismatch",
+                                ));
+                            }
+                        }
                         self.state = State::DataCrlf(2);
                     }
                 }
@@ -161,18 +203,25 @@ impl AwsChunkedDecoder {
 
 impl Default for AwsChunkedDecoder {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
 
-/// Parses the hex size from a `<hex>[;chunk-signature=…]\r\n` line.
-fn parse_chunk_size(line: &[u8]) -> io::Result<u64> {
+/// Parses a `<hex-size>[;chunk-signature=<sig>]\r\n` line into the chunk size and
+/// the chunk signature (empty if unsigned, e.g. mode 3).
+fn parse_chunk_header(line: &[u8]) -> io::Result<(u64, String)> {
     let line = &line[..line.len() - 2]; // strip the trailing \r\n
-    let hex = line.split(|&b| b == b';').next().unwrap_or(line);
-    let hex = std::str::from_utf8(hex)
-        .map_err(|_| io::Error::other("aws-chunked: non-utf8 chunk size"))?
-        .trim();
-    u64::from_str_radix(hex, 16).map_err(|_| io::Error::other("aws-chunked: invalid chunk size"))
+    let line = std::str::from_utf8(line)
+        .map_err(|_| io::Error::other("aws-chunked: non-utf8 chunk header"))?;
+    let mut parts = line.split(';');
+    let hex = parts.next().unwrap_or("").trim();
+    let size = u64::from_str_radix(hex, 16)
+        .map_err(|_| io::Error::other("aws-chunked: invalid chunk size"))?;
+    let signature = parts
+        .find_map(|p| p.trim().strip_prefix("chunk-signature="))
+        .unwrap_or("")
+        .to_owned();
+    Ok((size, signature))
 }
 
 #[cfg(test)]
@@ -195,7 +244,7 @@ mod tests {
     /// Feeds `input` to a fresh decoder in `step`-sized slices, returning the
     /// decoded payload and whether the stream completed.
     fn decode_in_steps(input: &[u8], step: usize) -> (Vec<u8>, bool) {
-        let mut dec = AwsChunkedDecoder::new();
+        let mut dec = AwsChunkedDecoder::new(None);
         let mut out = Vec::new();
         let mut i = 0;
         while i < input.len() {
@@ -264,7 +313,7 @@ mod tests {
 
     #[test]
     fn captures_trailer() {
-        let mut dec = AwsChunkedDecoder::new();
+        let mut dec = AwsChunkedDecoder::new(None);
         let body = b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:abc123==\r\n\r\n";
         let out: Vec<u8> = dec
             .decode(Bytes::copy_from_slice(body))
@@ -291,7 +340,7 @@ mod tests {
 
     #[test]
     fn invalid_chunk_size_errors() {
-        let mut dec = AwsChunkedDecoder::new();
+        let mut dec = AwsChunkedDecoder::new(None);
         assert!(dec.decode(Bytes::from_static(b"zz\r\n")).is_err());
     }
 
@@ -299,7 +348,7 @@ mod tests {
     fn missing_crlf_after_data_errors() {
         // The chunk claims 3 bytes ("abc") but follows them with "XY" instead of
         // CRLF — a misaligned frame that must be rejected, not silently skipped.
-        let mut dec = AwsChunkedDecoder::new();
+        let mut dec = AwsChunkedDecoder::new(None);
         assert!(dec.decode(Bytes::from_static(b"3\r\nabcXY")).is_err());
     }
 }

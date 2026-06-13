@@ -4,7 +4,11 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
 use uuid::Uuid;
 
-use crate::{App, AttachTarget, UploadResult, auth::ContentSha256, s3::util::format_s3_error};
+use crate::{
+    App, AttachTarget, UploadResult,
+    auth::{ContentSha256, StreamingChunkVerifier},
+    s3::util::format_s3_error,
+};
 
 /// UploadPart: `PUT /{bucket}/{key}?partNumber=N&uploadId=U`. Streams the part
 /// and stages it under the upload (the live object is untouched); returns its
@@ -16,6 +20,7 @@ pub async fn put_part(
     body: Incoming,
     aws_chunked: bool,
     content_sha256: ContentSha256,
+    chunk_verifier: Option<StreamingChunkVerifier>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -67,6 +72,7 @@ pub async fn put_part(
         },
         aws_chunked,
         content_sha256,
+        chunk_verifier,
     )
     .await?
     {
@@ -79,6 +85,11 @@ pub async fn put_part(
             StatusCode::BAD_REQUEST,
             "XAmzContentSHA256Mismatch",
             "the provided x-amz-content-sha256 does not match the calculated hash",
+        )),
+        UploadResult::ChunkSignatureMismatch => Ok(format_s3_error(
+            StatusCode::FORBIDDEN,
+            "SignatureDoesNotMatch",
+            "the request signature we calculated does not match the signature you provided",
         )),
     }
 }

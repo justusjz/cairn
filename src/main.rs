@@ -14,7 +14,7 @@ use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
-use crate::auth::{ContentSha256, TrailerChecksum};
+use crate::auth::{ContentSha256, StreamingChunkVerifier, TrailerChecksum};
 use crate::aws_chunked::AwsChunkedDecoder;
 use crate::body::{FrameSender, channel_body};
 use crate::store::Store;
@@ -311,6 +311,8 @@ enum AttachTarget {
 enum UploadResult {
     Committed(String),
     ContentSha256Mismatch,
+    /// A mode-4 chunk signature didn't verify against the secret.
+    ChunkSignatureMismatch,
 }
 
 async fn upload_part(
@@ -319,6 +321,7 @@ async fn upload_part(
     attach: &AttachTarget,
     aws_chunked: bool,
     content_sha256: ContentSha256,
+    chunk_verifier: Option<StreamingChunkVerifier>,
 ) -> anyhow::Result<UploadResult> {
     let client = app.pool.get().await?;
     let part_id = Uuid::new_v4();
@@ -359,8 +362,11 @@ async fn upload_part(
     let mut read_err: Option<anyhow::Error> = None;
     // A streaming-signature upload arrives `aws-chunked` framed; decode it back to
     // the raw object bytes before hashing/sizing/teeing, so the ETag and size
-    // describe the object — not the framing.
-    let mut decoder = aws_chunked.then(AwsChunkedDecoder::new);
+    // describe the object — not the framing. A verifier (mode 4) checks each
+    // chunk's signature as it's decoded; a bad chunk faults the stream.
+    let verifying = chunk_verifier.is_some();
+    let mut chunk_failed = false;
+    let mut decoder = aws_chunked.then(move || AwsChunkedDecoder::new(chunk_verifier));
     // Verify body integrity for a whole-body hash claim. The chunked modes carry
     // their integrity differently (trailer checksum or per-chunk signatures), so
     // they're handled elsewhere — only a non-chunked Single() hash is checked here.
@@ -390,6 +396,10 @@ async fn upload_part(
                     Some(dec) => match dec.decode(chunk) {
                         Ok(segments) => segments,
                         Err(e) => {
+                            // A decode error while verifying is a bad chunk
+                            // signature (or malformed signed framing) — a client
+                            // error, surfaced as 403 rather than a 500.
+                            chunk_failed = verifying;
                             read_err = Some(e.into());
                             break;
                         }
@@ -431,15 +441,27 @@ async fn upload_part(
     }
     // On a client read error, fault the sinks so they don't durably store a
     // truncated part; then close the channels so the bodies finish.
+    let faulted = read_err.is_some();
     if let Some(e) = &read_err {
         for tx in &senders {
             let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
         }
     }
     drop(senders);
-    // 4. wait for every replica to finish (or fail).
+    // 4. wait for every replica to finish (or fail). When we deliberately faulted
+    // the sinks above, their resulting error is expected — swallow it; otherwise a
+    // sink failure is a real durability problem.
     while let Some(res) = sinks.join_next().await {
-        res??;
+        match res {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) if !faulted => return Err(e),
+            Ok(Err(_)) => {}
+            Err(join_err) => return Err(join_err.into()),
+        }
+    }
+    // A bad chunk signature (mode 4) is a client error, not a server fault.
+    if chunk_failed {
+        return Ok(UploadResult::ChunkSignatureMismatch);
     }
     if let Some(e) = read_err {
         return Err(e);

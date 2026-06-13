@@ -123,6 +123,7 @@ dependencies = [
  "clap",
  "crc32fast",
  "deadpool-postgres",
+ "hmac",
  "http-body-util",
  "hyper",
  "hyper-util",
