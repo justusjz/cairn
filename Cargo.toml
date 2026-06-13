@@ -16,7 +16,7 @@ hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["full"] }
 libc = "0.2"
 percent-encoding = "2.3.2"
-roxmltree = "0.20.0"
+roxmltree = "0.21"
 sha2 = "0.11"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-postgres = { version = "0.7.17", features = ["with-uuid-1"] }
