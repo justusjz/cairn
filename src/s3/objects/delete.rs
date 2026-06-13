@@ -1,12 +1,11 @@
-use base64::{Engine, engine::general_purpose::STANDARD};
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use md5::{Digest, Md5};
 use tokio_postgres::{IsolationLevel, error::SqlState};
 
 use crate::{
     App,
+    auth::BodyChecksum,
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
 
@@ -116,29 +115,29 @@ fn parse_delete_request(body: &str) -> Option<(Vec<String>, bool)> {
 }
 
 /// DeleteObjects (batch): `POST /{bucket}?delete` with a `<Delete>` body listing
-/// keys. `content_md5` is the request's `Content-MD5` header, if any.
+/// keys. `checksum` is the request's body-integrity headers.
 pub async fn delete_objects(
     app: &App,
     bucket: &str,
     body: Bytes,
-    content_md5: Option<&str>,
+    checksum: BodyChecksum,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     // Integrity first: this operation is destructive and the body *is* the list of
     // things to destroy, so a corrupted body must never delete the wrong objects.
-    // S3 requires Content-MD5 (base64 of the body's MD5) here; verify it.
-    let Some(expected_md5) = content_md5 else {
+    // S3 requires an integrity header here — Content-MD5 (minio-go) or an
+    // x-amz-checksum-* (aws-cli). Require at least one and verify it.
+    if !checksum.is_present() {
         return Ok(format_s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
-            "missing required header for this request: Content-MD5",
+            "missing required integrity header: Content-MD5 or x-amz-checksum-*",
         ));
-    };
-    let actual_md5 = STANDARD.encode(Md5::digest(&body));
-    if actual_md5 != expected_md5.trim() {
+    }
+    if !checksum.matches(&body) {
         return Ok(format_s3_error(
             StatusCode::BAD_REQUEST,
             "BadDigest",
-            "the Content-MD5 you specified did not match what we received",
+            "the integrity checksum you specified did not match what we received",
         ));
     }
 

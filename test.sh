@@ -415,35 +415,32 @@ subresource_stubs_ok() {
     ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
 }
 
-# DeleteObjects: removes the named keys (incl. an absent one — idempotent),
-# leaving others untouched. Sent via scurl with the Content-MD5 the endpoint
-# requires — aws-cli sends a CRC32 checksum instead, which we don't accept.
+# DeleteObjects via aws-cli — which sends an x-amz-checksum-crc32 (not Content-MD5).
+# Removes the named keys (incl. an absent one — idempotent), leaving others alone.
 batch_delete_ok() {
-    local body="$WORK_DIR/del.xml" md5 k
+    local k
     printf 'batch delete fixture\n' >"$WORK_DIR/bd"
     for k in bd1.txt bd2.txt bd3.txt; do
         s3 put "$WORK_DIR/bd" "s3://${BUCKET}/$k" >/dev/null 2>&1 || return 1
     done
-    printf '<Delete><Object><Key>bd1.txt</Key></Object><Object><Key>bd2.txt</Key></Object><Object><Key>nope.txt</Key></Object></Delete>' >"$body"
-    md5="$(openssl dgst -md5 -binary "$body" | base64)"
-    [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 200 ] || return 1
+    awss3 s3api delete-objects --bucket "$BUCKET" \
+        --delete '{"Objects":[{"Key":"bd1.txt"},{"Key":"bd2.txt"},{"Key":"nope.txt"}]}' >/dev/null 2>&1 || return 1
     ! awss3 s3api head-object --bucket "$BUCKET" --key bd1.txt >/dev/null 2>&1 || return 1
     ! awss3 s3api head-object --bucket "$BUCKET" --key bd2.txt >/dev/null 2>&1 || return 1
     awss3 s3api head-object --bucket "$BUCKET" --key bd3.txt >/dev/null 2>&1 || return 1
     awss3 s3api delete-object --bucket "$BUCKET" --key bd3.txt >/dev/null 2>&1
 }
 
-# DeleteObjects integrity/existence guards. The malformed-MD5 cases can't come
-# from a real client, so they're signed crafted requests (scurl).
+# DeleteObjects integrity/existence guards (crafted, signed with scurl): no
+# integrity header → 400, a wrong CRC32 → 400, a valid Content-MD5 (minio-go's
+# path) → 200, and a well-formed request against a missing bucket → 404.
 batch_delete_guards_ok() {
     local body="$WORK_DIR/del.xml" md5
     printf '<Delete><Object><Key>whatever.txt</Key></Object></Delete>' >"$body"
     md5="$(openssl dgst -md5 -binary "$body" | base64)"
-    # missing Content-MD5 → 400
     [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body")" = 400 ] || return 1
-    # wrong Content-MD5 → 400
-    [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: AAAAAAAAAAAAAAAAAAAAAA==")" = 400 ] || return 1
-    # correct request against a missing bucket → 404
+    [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "x-amz-checksum-crc32: AAAAAA==")" = 400 ] || return 1
+    [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 200 ] || return 1
     [ "$(scurl POST "/no-such-bucket-xyz?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 404 ] || return 1
 }
 

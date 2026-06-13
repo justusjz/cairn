@@ -134,15 +134,11 @@ pub async fn handle(
             hyper::Method::HEAD => head_bucket(&app, &bucket).await?,
             hyper::Method::PUT => create_bucket(&app, &bucket).await?,
             // DeleteObjects (batch): POST /{bucket}?delete with a <Delete> body.
-            // Read Content-MD5 before consuming the body to verify it.
+            // Read the integrity headers before consuming the body to verify it.
             hyper::Method::POST if query_param(&query, "delete").is_some() => {
-                let content_md5 = req
-                    .headers()
-                    .get("content-md5")
-                    .and_then(|v| v.to_str().ok())
-                    .map(str::to_owned);
+                let checksum = crate::auth::BodyChecksum::from_headers(req.headers());
                 let body = req.into_body().collect().await?.to_bytes();
-                delete_objects(&app, &bucket, body, content_md5.as_deref()).await?
+                delete_objects(&app, &bucket, body, checksum).await?
             }
             hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),

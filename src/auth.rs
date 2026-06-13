@@ -7,6 +7,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use hyper::HeaderMap;
+use md5::Md5;
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -85,6 +86,54 @@ impl TrailerChecksum {
             Self::Crc32(h) => STANDARD.encode(h.finalize().to_be_bytes()),
             Self::Sha256(h) => STANDARD.encode(h.finalize()),
         }
+    }
+}
+
+/// The body-integrity headers a client may attach to a DeleteObjects request:
+/// `Content-MD5` (minio-go) or an `x-amz-checksum-{crc32,sha256}` (aws-cli). At
+/// least one must be present and correct — that's the destructive op's guard.
+pub struct BodyChecksum {
+    content_md5: Option<String>,
+    crc32: Option<String>,
+    sha256: Option<String>,
+}
+
+impl BodyChecksum {
+    pub fn from_headers(headers: &HeaderMap) -> Self {
+        let h = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
+        Self {
+            content_md5: h("content-md5"),
+            crc32: h("x-amz-checksum-crc32"),
+            sha256: h("x-amz-checksum-sha256"),
+        }
+    }
+
+    /// Whether the client supplied any supported integrity header.
+    pub fn is_present(&self) -> bool {
+        self.content_md5.is_some() || self.crc32.is_some() || self.sha256.is_some()
+    }
+
+    /// Checks every supplied checksum against `body` (base64-encoded, as on the
+    /// wire); `false` if any present one mismatches.
+    pub fn matches(&self, body: &[u8]) -> bool {
+        if let Some(md5) = &self.content_md5
+            && STANDARD.encode(Md5::digest(body)) != md5.trim()
+        {
+            return false;
+        }
+        if let Some(crc) = &self.crc32 {
+            let mut hasher = crc32fast::Hasher::new();
+            hasher.update(body);
+            if STANDARD.encode(hasher.finalize().to_be_bytes()) != crc.trim() {
+                return false;
+            }
+        }
+        if let Some(sha) = &self.sha256
+            && STANDARD.encode(Sha256::digest(body)) != sha.trim()
+        {
+            return false;
+        }
+        true
     }
 }
 
