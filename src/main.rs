@@ -9,10 +9,12 @@ use hyper::{
 };
 use hyper_util::{client::legacy::Client, rt::TokioExecutor, rt::TokioIo};
 use md5::{Digest, Md5};
+use sha2::Sha256;
 use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
+use crate::auth::ContentSha256;
 use crate::aws_chunked::AwsChunkedDecoder;
 use crate::body::{FrameSender, channel_body};
 use crate::store::Store;
@@ -20,6 +22,7 @@ use crate::writing::WritingSet;
 
 mod peer;
 
+mod auth;
 mod aws_chunked;
 mod body;
 mod db;
@@ -303,12 +306,20 @@ enum AttachTarget {
 
 /// Streams `body` into a fresh part replicated across the cluster — hashing it
 /// as it flows — then commits and attaches it to `attach`. Returns the ETag.
+/// The outcome of an upload: the committed part's ETag, or a rejection because
+/// the streamed body didn't match the client's `x-amz-content-sha256`.
+enum UploadResult {
+    Committed(String),
+    ContentSha256Mismatch,
+}
+
 async fn upload_part(
     app: &Arc<App>,
     mut body: Incoming,
     attach: &AttachTarget,
     aws_chunked: bool,
-) -> anyhow::Result<String> {
+    content_sha256: ContentSha256,
+) -> anyhow::Result<UploadResult> {
     let client = app.pool.get().await?;
     let part_id = Uuid::new_v4();
     // 1. create the pending part. Its size isn't known until the body is fully
@@ -350,6 +361,14 @@ async fn upload_part(
     // the raw object bytes before hashing/sizing/teeing, so the ETag and size
     // describe the object — not the framing.
     let mut decoder = aws_chunked.then(AwsChunkedDecoder::new);
+    // Verify body integrity for a whole-body hash claim. The chunked modes carry
+    // their integrity differently (trailer checksum or per-chunk signatures), so
+    // they're handled elsewhere — only a non-chunked Single() hash is checked here.
+    // `Md5` and `Sha256` share one `Digest` trait (same `digest` version), so both
+    // hashers coexist here without trait ambiguity.
+    let mut content_hasher: Option<Sha256> =
+        matches!((&content_sha256, aws_chunked), (ContentSha256::Single(_), false))
+            .then(Sha256::new);
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
@@ -366,6 +385,9 @@ async fn upload_part(
                 };
                 for chunk in segments {
                     hasher.update(&chunk);
+                    if let Some(h) = &mut content_hasher {
+                        h.update(&chunk);
+                    }
                     size += chunk.len() as i64;
                     for tx in &senders {
                         // A dropped receiver means that sink's task failed; we'll
@@ -406,6 +428,15 @@ async fn upload_part(
     if let Some(e) = read_err {
         return Err(e);
     }
+    // The body is fully read and replicated (but not yet committed). If the client
+    // claimed a whole-body hash, check it now and refuse to commit on a mismatch —
+    // the pending part is left for the GC to reclaim.
+    if let (Some(h), ContentSha256::Single(expected)) = (content_hasher, &content_sha256) {
+        let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        if actual != *expected {
+            return Ok(UploadResult::ContentSha256Mismatch);
+        }
+    }
     let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
     // 5. commit + attach with the now-known size and ETag, under a serializable
     // transaction; retry on a serialization conflict (e.g. a concurrent GC).
@@ -429,7 +460,7 @@ async fn upload_part(
             "part {part_id}: commit aborted after {MAX_COMMIT_ATTEMPTS} serialization retries"
         );
     }
-    Ok(etag)
+    Ok(UploadResult::Committed(etag))
 }
 
 const MAX_COMMIT_ATTEMPTS: usize = 10;

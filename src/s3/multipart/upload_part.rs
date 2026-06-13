@@ -4,7 +4,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
 use uuid::Uuid;
 
-use crate::{App, AttachTarget, s3::util::format_s3_error};
+use crate::{App, AttachTarget, UploadResult, auth::ContentSha256, s3::util::format_s3_error};
 
 /// UploadPart: `PUT /{bucket}/{key}?partNumber=N&uploadId=U`. Streams the part
 /// and stages it under the upload (the live object is untouched); returns its
@@ -15,6 +15,7 @@ pub async fn put_part(
     part_number: &str,
     body: Incoming,
     aws_chunked: bool,
+    content_sha256: ContentSha256,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -57,7 +58,7 @@ pub async fn put_part(
 
     // `upload_part` streams the body, computing the part's ETag (hex MD5) as it
     // goes.
-    let etag = crate::upload_part(
+    match crate::upload_part(
         app,
         body,
         &AttachTarget::MultipartPart {
@@ -65,11 +66,19 @@ pub async fn put_part(
             part_number,
         },
         aws_chunked,
+        content_sha256,
     )
-    .await?;
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::ETAG, format!("\"{etag}\""))
-        .body(Full::new(Bytes::new()))
-        .unwrap())
+    .await?
+    {
+        UploadResult::Committed(etag) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::ETAG, format!("\"{etag}\""))
+            .body(Full::new(Bytes::new()))
+            .unwrap()),
+        UploadResult::ContentSha256Mismatch => Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "XAmzContentSHA256Mismatch",
+            "the provided x-amz-content-sha256 does not match the calculated hash",
+        )),
+    }
 }

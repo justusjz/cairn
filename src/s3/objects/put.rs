@@ -3,7 +3,7 @@ use std::sync::Arc;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
 
-use crate::{App, AttachTarget, s3::util::format_s3_error};
+use crate::{App, AttachTarget, UploadResult, auth::ContentSha256, s3::util::format_s3_error};
 
 pub async fn put_object(
     app: &Arc<App>,
@@ -12,6 +12,7 @@ pub async fn put_object(
     content_type: &str,
     body: Incoming,
     aws_chunked: bool,
+    content_sha256: ContentSha256,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     // Reject up front if the bucket doesn't exist, so we don't replicate a part
     // only to fail the FK at commit time. (There's still the objects -> buckets
@@ -37,11 +38,16 @@ pub async fn put_object(
         key: key.to_owned(),
         content_type: content_type.to_owned(),
     };
-    let etag = crate::upload_part(app, body, &attach, aws_chunked).await?;
-
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header(header::ETAG, format!("\"{etag}\""))
-        .body(Full::new(Bytes::new()))
-        .unwrap())
+    match crate::upload_part(app, body, &attach, aws_chunked, content_sha256).await? {
+        UploadResult::Committed(etag) => Ok(Response::builder()
+            .status(StatusCode::OK)
+            .header(header::ETAG, format!("\"{etag}\""))
+            .body(Full::new(Bytes::new()))
+            .unwrap()),
+        UploadResult::ContentSha256Mismatch => Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "XAmzContentSHA256Mismatch",
+            "the provided x-amz-content-sha256 does not match the calculated hash",
+        )),
+    }
 }
