@@ -21,7 +21,8 @@ use crate::{
             put::put_object,
         },
         util::{
-            decode_continuation_token, decode_path_param, format_s3_error, query_param, stub_acl,
+            bucket_subresource_stub, decode_continuation_token, decode_path_param, format_s3_error,
+            query_param, stub_acl,
         },
     },
 };
@@ -52,9 +53,14 @@ pub async fn handle(
         // query up front and match on an owned method — mirroring the object branch
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
-        // ACL is stubbed (see stub_acl); intercept ?acl on GET before listing.
-        if *req.method() == hyper::Method::GET && query_param(&query, "acl").is_some() {
-            return Ok(box_response(stub_acl()));
+        // Bucket sub-resource GETs (acl/location/versioning/policy/cors/tagging/
+        // lifecycle/object-lock) are stubbed — Cairn implements none of them, so
+        // answer as S3 does for an unconfigured bucket before falling through to a
+        // listing.
+        if *req.method() == hyper::Method::GET {
+            if let Some(resp) = bucket_subresource_stub(&query) {
+                return Ok(box_response(resp));
+            }
         }
         let resp = match req.method().clone() {
             hyper::Method::GET => {

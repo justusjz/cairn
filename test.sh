@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=34
+TOTAL=35
 STEP=0
 PASS=0
 FAIL=0
@@ -381,6 +381,20 @@ acl_stub_ok() {
     s3 info "s3://${BUCKET}/big.bin" >/dev/null 2>&1
 }
 
+# Bucket sub-resource stubs: location/versioning answer 200 with the right config
+# root; policy/cors/tagging/lifecycle/object-lock answer "not configured" (404).
+subresource_stubs_ok() {
+    local base="http://${SERVER_HOST}:${SERVER_PORT}" sr code
+    curl -fsS "$base/${BUCKET}?location" | grep -q '<LocationConstraint' || return 1
+    curl -fsS "$base/${BUCKET}?versioning" | grep -q '<VersioningConfiguration' || return 1
+    for sr in policy cors tagging lifecycle object-lock; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' "$base/${BUCKET}?${sr}")
+        [ "$code" = 404 ] || return 1
+    done
+    # a normal listing GET (no sub-resource) is unaffected
+    curl -fsS "$base/${BUCKET}" | grep -q '<ListBucketResult'
+}
+
 # POST /{bucket}?delete with a <Delete> body — the batch-delete API. Sends the
 # Content-MD5 the endpoint requires (base64 of the body's MD5).
 delete_objects_via_api() {  # delete_objects_via_api <bucket> <key>...
@@ -469,6 +483,7 @@ run_test "Tear down pagination bucket"         teardown_pagination
 run_test "Batch delete (DeleteObjects)"        batch_delete_ok
 run_test "Batch delete guards (MD5 / bucket)"  batch_delete_guards_ok
 run_test "Stubbed ACL (s3cmd info works)"      acl_stub_ok
+run_test "Bucket sub-resource stubs"           subresource_stubs_ok
 run_test "Overwrite object, new content wins"  bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&

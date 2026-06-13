@@ -36,6 +36,65 @@ pub fn stub_acl() -> Response<Full<Bytes>> {
     )
 }
 
+/// Read-only stubs for the bucket sub-resource GETs S3 clients probe (s3cmd
+/// `info`, minio-go's `cp` preflight). Cairn implements none of these features,
+/// so we answer exactly as S3 does for an unconfigured bucket: `location` and
+/// `versioning` return a 200 empty config; the rest return their "not configured"
+/// 404. Returns `None` for a normal listing GET (no recognised sub-resource).
+///
+/// Existence-agnostic, like [`stub_acl`] — clients probe these on buckets they're
+/// already using.
+pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
+    let present = |name| query_param(query, name).is_some();
+    if present("acl") {
+        Some(stub_acl())
+    } else if present("location") {
+        Some(xml_ok(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></LocationConstraint>"
+                .to_string(),
+        ))
+    } else if present("versioning") {
+        Some(xml_ok(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></VersioningConfiguration>"
+                .to_string(),
+        ))
+    } else if present("object-lock") {
+        Some(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "ObjectLockConfigurationNotFoundError",
+            "object lock configuration does not exist for this bucket",
+        ))
+    } else if present("policy") {
+        Some(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchBucketPolicy",
+            "the bucket policy does not exist",
+        ))
+    } else if present("cors") {
+        Some(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchCORSConfiguration",
+            "the CORS configuration does not exist",
+        ))
+    } else if present("tagging") {
+        Some(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchTagSet",
+            "there is no tag set associated with the bucket",
+        ))
+    } else if present("lifecycle") {
+        Some(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchLifecycleConfiguration",
+            "the lifecycle configuration does not exist",
+        ))
+    } else {
+        None
+    }
+}
+
 pub fn format_s3_error(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
