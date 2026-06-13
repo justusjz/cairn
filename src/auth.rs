@@ -128,31 +128,13 @@ impl StreamingChunkVerifier {
     /// Builds the verifier from a signed streaming request, or `None` if it lacks
     /// the `Authorization` / `x-amz-date` we need (e.g. an unsigned request).
     pub fn from_headers(headers: &HeaderMap, secret: &str) -> Option<Self> {
-        let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
-        // Authorization: AWS4-HMAC-SHA256 Credential=<akid>/<date>/<region>/<service>/aws4_request,
-        //                SignedHeaders=…, Signature=<hex>
-        let auth = header("authorization")?.strip_prefix("AWS4-HMAC-SHA256 ")?;
-        let mut credential = None;
-        let mut signature = None;
-        for part in auth.split(',') {
-            let part = part.trim();
-            if let Some(c) = part.strip_prefix("Credential=") {
-                credential = Some(c);
-            } else if let Some(s) = part.strip_prefix("Signature=") {
-                signature = Some(s);
-            }
-        }
-        let mut cred = credential?.split('/');
-        let _access_key = cred.next()?;
-        let date = cred.next()?;
-        let region = cred.next()?;
-        let service = cred.next()?;
-        let terminator = cred.next()?; // aws4_request
+        let auth = Authorization::from_headers(headers)?;
+        let datetime = headers.get("x-amz-date").and_then(|v| v.to_str().ok())?;
         Some(Self {
-            signing_key: derive_signing_key(secret, date, region, service),
-            datetime: header("x-amz-date")?.to_owned(),
-            scope: format!("{date}/{region}/{service}/{terminator}"),
-            prev_signature: signature?.to_owned(),
+            signing_key: derive_signing_key(secret, &auth.date, &auth.region, &auth.service),
+            datetime: datetime.to_owned(),
+            scope: auth.scope,
+            prev_signature: auth.signature,
         })
     }
 
@@ -174,5 +156,174 @@ impl StreamingChunkVerifier {
         } else {
             false
         }
+    }
+}
+
+/// The SigV4 `Authorization` header fields, parsed once and shared by request
+/// verification and the streaming chunk verifier.
+///
+/// `AWS4-HMAC-SHA256 Credential=<akid>/<date>/<region>/<service>/aws4_request,
+///  SignedHeaders=h1;h2;…, Signature=<hex>`
+struct Authorization {
+    date: String,
+    region: String,
+    service: String,
+    scope: String,
+    signed_headers: Vec<String>,
+    signature: String,
+}
+
+impl Authorization {
+    fn from_headers(headers: &HeaderMap) -> Option<Self> {
+        let value = headers.get("authorization").and_then(|v| v.to_str().ok())?;
+        let rest = value.strip_prefix("AWS4-HMAC-SHA256 ")?;
+        let (mut credential, mut signed, mut signature) = (None, None, None);
+        for part in rest.split(',') {
+            let part = part.trim();
+            if let Some(c) = part.strip_prefix("Credential=") {
+                credential = Some(c);
+            } else if let Some(s) = part.strip_prefix("SignedHeaders=") {
+                signed = Some(s);
+            } else if let Some(s) = part.strip_prefix("Signature=") {
+                signature = Some(s);
+            }
+        }
+        let mut cred = credential?.split('/');
+        let _access_key = cred.next()?;
+        let date = cred.next()?.to_owned();
+        let region = cred.next()?.to_owned();
+        let service = cred.next()?.to_owned();
+        let terminator = cred.next()?; // aws4_request
+        Some(Authorization {
+            scope: format!("{date}/{region}/{service}/{terminator}"),
+            date,
+            region,
+            service,
+            signed_headers: signed?.split(';').map(str::to_owned).collect(),
+            signature: signature?.to_owned(),
+        })
+    }
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The AWS canonical query string: `key=value` pairs sorted by key (values are
+/// already percent-encoded on the wire by AWS clients), joined with `&`. A param
+/// with no `=` becomes `key=`.
+fn canonical_query(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<(&str, &str)> = query
+        .split('&')
+        .map(|p| p.split_once('=').unwrap_or((p, "")))
+        .collect();
+    pairs.sort_unstable();
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Rebuilds the SigV4 canonical request from the wire. The canonical URI is the
+/// request path as received (S3 signs it un-normalized, single-encoded); the
+/// payload hash is the `x-amz-content-sha256` value verbatim.
+fn canonical_request(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    auth: &Authorization,
+) -> String {
+    let uri = if path.is_empty() { "/" } else { path };
+    let mut canonical_headers = String::new();
+    for name in &auth.signed_headers {
+        let value = headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("");
+        // Trim and collapse internal whitespace runs, per the SigV4 spec.
+        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        canonical_headers.push_str(name);
+        canonical_headers.push(':');
+        canonical_headers.push_str(&value);
+        canonical_headers.push('\n');
+    }
+    let signed_headers = auth.signed_headers.join(";");
+    let payload_hash = headers
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("UNSIGNED-PAYLOAD");
+    format!(
+        "{method}\n{uri}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+        canonical_query(query),
+    )
+}
+
+/// Verifies a request's SigV4 header signature against `secret`. `Ok(())` on a
+/// match; `Err(code)` with the S3 error code otherwise — missing `Authorization`
+/// / `x-amz-date` → `AccessDenied`, wrong signature → `SignatureDoesNotMatch`.
+pub fn verify_sigv4(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    secret: &str,
+) -> Result<(), &'static str> {
+    let auth = Authorization::from_headers(headers).ok_or("AccessDenied")?;
+    let datetime = headers
+        .get("x-amz-date")
+        .and_then(|v| v.to_str().ok())
+        .ok_or("AccessDenied")?;
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{datetime}\n{}\n{}",
+        auth.scope,
+        sha256_hex(canonical_request(method, path, query, headers, &auth).as_bytes()),
+    );
+    let key = derive_signing_key(secret, &auth.date, &auth.region, &auth.service);
+    let sig = hex_decode(&auth.signature).ok_or("SignatureDoesNotMatch")?;
+    let mut mac = HmacSha256::new_from_slice(&key).expect("any key length");
+    mac.update(string_to_sign.as_bytes());
+    mac.verify_slice(&sig).map_err(|_| "SignatureDoesNotMatch")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyper::HeaderMap;
+
+    fn test_verifier() -> StreamingChunkVerifier {
+        let mut h = HeaderMap::new();
+        h.insert("x-amz-date", "20260613T000000Z".parse().unwrap());
+        h.insert(
+            "authorization",
+            "AWS4-HMAC-SHA256 Credential=akid/20260613/us-east-1/s3/aws4_request, \
+             SignedHeaders=host, Signature=53ed0a"
+                .parse()
+                .unwrap(),
+        );
+        StreamingChunkVerifier::from_headers(&h, "cairnsecret").unwrap()
+    }
+
+    #[test]
+    fn chunk_chain_accepts_correct_signature() {
+        // Compute the chunk signature the way a client would, then verify it.
+        let key = derive_signing_key("cairnsecret", "20260613", "us-east-1", "s3");
+        let sts = format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n20260613T000000Z\n\
+             20260613/us-east-1/s3/aws4_request\n53ed0a\n{EMPTY_SHA256}\n{EMPTY_SHA256}",
+        );
+        let good: String = hmac_sha256(&key, sts.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(test_verifier().verify_chunk(EMPTY_SHA256, &good));
+    }
+
+    #[test]
+    fn chunk_chain_rejects_tampered_signature() {
+        assert!(!test_verifier().verify_chunk(EMPTY_SHA256, &"0".repeat(64)));
+        // a non-hex / wrong-length signature is rejected too
+        assert!(!test_verifier().verify_chunk(EMPTY_SHA256, "nothex"));
     }
 }

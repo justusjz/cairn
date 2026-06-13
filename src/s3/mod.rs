@@ -36,6 +36,22 @@ pub async fn handle(
     req: Request<hyper::body::Incoming>,
     app: Arc<App>,
 ) -> anyhow::Result<Response<ResBody>> {
+    // Authenticate every S3 request up front (SigV4 header signature). Needs only
+    // the method/URI/query/headers, so it runs before any body is read. The peer
+    // endpoint is a separate service and stays open for internal traffic.
+    if let Err(code) = crate::auth::verify_sigv4(
+        req.method().as_str(),
+        req.uri().path(),
+        req.uri().query().unwrap_or(""),
+        req.headers(),
+        crate::auth::SECRET_KEY,
+    ) {
+        return Ok(box_response(format_s3_error(
+            StatusCode::FORBIDDEN,
+            code,
+            "request authentication failed",
+        )));
+    }
     let path = req.uri().path().trim_start_matches('/');
     if path.is_empty() {
         let resp = match req.method() {

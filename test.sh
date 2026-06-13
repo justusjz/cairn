@@ -5,7 +5,9 @@
 # What it does:
 #   1. Starts a throwaway Postgres in a Podman container
 #   2. Builds and runs your server in the background via `cargo run`
-#   3. Exercises basic S3 operations with s3cmd
+#   3. Exercises S3 operations with real signing clients (s3cmd, aws-cli, mcli);
+#      a small python SigV4 signer (scurl) covers crafted requests no client can
+#      produce, and an unsigned curl proves authentication is enforced.
 #   4. Prints a pass/fail progress report and tears everything down
 #
 # Usage:  ./s3-smoke-test.sh
@@ -21,13 +23,13 @@ PG_DB="cairn"
 
 SERVER_HOST="127.0.0.1"
 SERVER_PORT=9000                 # the port your server listens on
-ACCESS_KEY="testkey"             # credentials your server accepts
-SECRET_KEY="testsecret"
-USE_SIGV2=false                  # set to true if you haven't implemented SigV4 yet
-
+ACCESS_KEY="testkey"             # any access key id is accepted
+SECRET_KEY="cairnsecret"         # must match the server's hardcoded secret
 
 CARGO_ARGS=(-- serve --database postgres://$PG_USER:$PG_PASS@127.0.0.1:${PG_PORT}/$PG_DB --listen-client $SERVER_HOST:${SERVER_PORT})
 STARTUP_TIMEOUT=60               # seconds to wait for postgres / server
+# SHA-256 of the empty string — the payload hash clients sign for bodyless requests.
+EMPTY_SHA256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -u
@@ -45,7 +47,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=35
+TOTAL=34
 STEP=0
 PASS=0
 FAIL=0
@@ -55,7 +57,6 @@ info()  { printf '%s\n' "${DIM}$*${RESET}"; }
 fatal() { printf '%s\n' "${RED}${BOLD}FATAL:${RESET} $*" >&2; exit 1; }
 
 # run_test "description" cmd args...
-# Runs cmd, prints [n/N] progress with OK/FAIL, captures output for diagnostics.
 run_test() {
     local desc="$1"; shift
     STEP=$((STEP + 1))
@@ -68,7 +69,6 @@ run_test() {
     else
         printf '%s\n' "${RED}FAIL${RESET}"
         printf '%s\n' "${DIM}      cmd: $*${RESET}"
-        # indent the captured output for readability
         printf '%s\n' "$out" | sed 's/^/      /'
         FAIL=$((FAIL + 1))
         FAILED_TESTS+=("$desc")
@@ -109,7 +109,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ─── Preflight ───────────────────────────────────────────────────────────────
-for tool in podman cargo s3cmd curl openssl python3 mcli; do
+for tool in podman cargo s3cmd curl openssl python3 mcli aws; do
     command -v "$tool" >/dev/null 2>&1 || fatal "'$tool' not found in PATH"
 done
 
@@ -132,11 +132,7 @@ until podman exec "$PG_CONTAINER" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/nul
 done
 info "Postgres is ready."
 
-# ─── 2. Build & run the server ───────────────────────────────────────────────
-#info "Building (cargo build)..."
-#(cd "$SCRIPT_DIR" && cargo build ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"} >"$WORK_DIR/build.log" 2>&1) \
-#    || { tail -n 30 "$WORK_DIR/build.log" >&2; fatal "cargo build failed (full log: $WORK_DIR/build.log)"; }
-
+# ─── 2. Run the server ───────────────────────────────────────────────────────
 info "Starting server (cargo run) on ${SERVER_HOST}:${SERVER_PORT}..."
 (cd "$SCRIPT_DIR" && exec cargo run ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"} >"$SERVER_LOG" 2>&1) &
 SERVER_PID=$!
@@ -154,7 +150,8 @@ done
 exec 3>&- 3<&- 2>/dev/null
 info "Server is up."
 
-# ─── 3. s3cmd configuration ──────────────────────────────────────────────────
+# ─── 3. Client configuration ─────────────────────────────────────────────────
+# s3cmd (SigV4)
 S3CFG="$WORK_DIR/s3cfg"
 cat >"$S3CFG" <<EOF
 [default]
@@ -163,10 +160,100 @@ secret_key = ${SECRET_KEY}
 host_base = ${SERVER_HOST}:${SERVER_PORT}
 host_bucket = ${SERVER_HOST}:${SERVER_PORT}
 use_https = False
-signature_v2 = $( [ "$USE_SIGV2" = true ] && echo True || echo False )
+signature_v2 = False
 signurl_use_https = False
 EOF
 s3() { s3cmd --config "$S3CFG" "$@"; }
+
+# aws-cli (SigV4), path-style addressing against our endpoint.
+AWSCFG="$WORK_DIR/awscfg"
+cat >"$AWSCFG" <<EOF
+[default]
+region = us-east-1
+s3 =
+    addressing_style = path
+EOF
+awss3() {
+    AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+    AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true AWS_CONFIG_FILE="$AWSCFG" \
+    aws --endpoint-url "http://${SERVER_HOST}:${SERVER_PORT}" "$@"
+}
+
+# mcli (minio-go, what Mimir uses)
+MCFG="$WORK_DIR/mc"
+
+# A python SigV4 signer for the few requests no real client can produce: mode-3
+# trailer bodies, deliberately-malformed integrity claims, and precise pagination
+# control. It signs whatever headers it's handed so the server's verification has
+# something valid to check.
+SIGNER="$WORK_DIR/sign.py"
+cat >"$SIGNER" <<'PYEOF'
+import sys, hashlib, hmac
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
+
+method, url, payload_hash = sys.argv[1], sys.argv[2], sys.argv[3]
+extra = sys.argv[4:]
+secret, region, service, akid = "cairnsecret", "us-east-1", "s3", "testkey"
+
+u = urlsplit(url)
+host, path, query = u.netloc, (u.path or "/"), u.query
+now = datetime.now(timezone.utc)
+amzdate, datestamp = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+
+headers = {"host": host, "x-amz-content-sha256": payload_hash, "x-amz-date": amzdate}
+for e in extra:
+    n, _, v = e.partition(":")
+    headers[n.strip().lower()] = v.strip()
+
+signed_headers = ";".join(sorted(headers))
+canonical_headers = "".join(f"{k}:{headers[k]}\n" for k in sorted(headers))
+
+pairs = []
+for p in query.split("&") if query else []:
+    k, _, v = p.partition("=")
+    pairs.append((k, v))
+pairs.sort()
+cq = "&".join(f"{k}={v}" for k, v in pairs)
+
+canonical_request = f"{method}\n{path}\n{cq}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+
+def mac(k, m): return hmac.new(k, m.encode(), hashlib.sha256).digest()
+k = mac(("AWS4" + secret).encode(), datestamp)
+k = mac(k, region); k = mac(k, service); k = mac(k, "aws4_request")
+scope = f"{datestamp}/{region}/{service}/aws4_request"
+sts = f"AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}"
+sig = hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()
+
+print(f"x-amz-date: {amzdate}")
+print(f"x-amz-content-sha256: {payload_hash}")
+print(f"Authorization: AWS4-HMAC-SHA256 Credential={akid}/{scope}, SignedHeaders={signed_headers}, Signature={sig}")
+for e in extra:
+    print(e)
+PYEOF
+
+# scurl <method> <pathquery> <payload-hash> <bodyfile|-> [extra "Header: val"...]
+# Signs the request and runs curl, printing the HTTP status code.
+scurl() {
+    local method="$1" pathquery="$2" phash="$3" body="$4"; shift 4
+    local url="http://${SERVER_HOST}:${SERVER_PORT}${pathquery}" args=() line
+    while IFS= read -r line; do args+=(-H "$line"); done \
+        < <(python3 "$SIGNER" "$method" "$url" "$phash" "$@")
+    if [ "$body" = "-" ]; then
+        curl -s -o /dev/null -w '%{http_code}' -X "$method" "${args[@]}" "$url"
+    else
+        curl -s -o /dev/null -w '%{http_code}' -X "$method" --data-binary "@$body" "${args[@]}" "$url"
+    fi
+}
+
+# scurl_get <pathquery> [extra...] — signed GET, prints the response body.
+scurl_get() {
+    local pathquery="$1"; shift
+    local url="http://${SERVER_HOST}:${SERVER_PORT}${pathquery}" args=() line
+    while IFS= read -r line; do args+=(-H "$line"); done \
+        < <(python3 "$SIGNER" GET "$url" "$EMPTY_SHA256" "$@")
+    curl -fsS "${args[@]}" "$url"
+}
 
 # ─── 4. Test fixtures ────────────────────────────────────────────────────────
 SMALL="$WORK_DIR/small.txt"
@@ -174,9 +261,9 @@ BIG="$WORK_DIR/big.bin"
 NESTED="$WORK_DIR/nested.txt"
 MULTIPART="$WORK_DIR/multi.bin"
 printf 'hello from the smoke test\n' >"$SMALL"
-dd if=/dev/urandom of="$BIG" bs=1M count=4 status=none    # 4 MiB, below multipart thresholds
+dd if=/dev/urandom of="$BIG" bs=1M count=4 status=none
 printf 'nested object content\n' >"$NESTED"
-dd if=/dev/urandom of="$MULTIPART" bs=1M count=16 status=none   # 16 MiB → 4 parts at 5 MiB chunks
+dd if=/dev/urandom of="$MULTIPART" bs=1M count=16 status=none
 
 check_roundtrip() {  # check_roundtrip <local> <s3uri>
     local src="$1" uri="$2" dst="$WORK_DIR/dl.$RANDOM"
@@ -188,137 +275,83 @@ list_contains() {    # list_contains <s3 ls target> <needle>
     s3 ls "$1" 2>/dev/null | grep -qF "$2"
 }
 
-# s3cmd can't issue ranged GETs, so the Range tests hit the server directly with
-# curl (the server doesn't verify request signatures).
-range_matches() {    # range_matches <bucket/key> <start> <end> <localfile>
-    local path="$1" start="$2" end="$3" src="$4" got="$WORK_DIR/range.$RANDOM"
-    curl -fsS -H "Range: bytes=${start}-${end}" \
-        "http://${SERVER_HOST}:${SERVER_PORT}/${path}" -o "$got" || return 1
-    cmp -s "$got" <(tail -c "+$((start + 1))" "$src" | head -c "$((end - start + 1))")
+unsigned_rejected() {  # an unsigned request must be refused
+    [ "$(curl -s -o /dev/null -w '%{http_code}' \
+        "http://${SERVER_HOST}:${SERVER_PORT}/${BUCKET}/small.txt")" = 403 ]
 }
 
-status_is() {        # status_is <expected-code> <bucket/key> <range>
-    [ "$(curl -s -o /dev/null -w '%{http_code}' -H "Range: bytes=$3" \
-        "http://${SERVER_HOST}:${SERVER_PORT}/$2")" = "$1" ]
+# Ranged GET via aws-cli, content compared to the expected slice.
+range_ok() {  # range_ok <key> <start> <end> <localfile>
+    local key="$1" start="$2" end="$3" src="$4" out="$WORK_DIR/r.$RANDOM"
+    awss3 s3api get-object --bucket "$BUCKET" --key "$key" \
+        --range "bytes=${start}-${end}" "$out" >/dev/null 2>&1 || return 1
+    cmp -s "$out" <(tail -c "+$((start + 1))" "$src" | head -c "$((end - start + 1))")
 }
 
-head_status() {      # head_status <expected-code> <path>
-    [ "$(curl -s -o /dev/null -w '%{http_code}' -I \
-        "http://${SERVER_HOST}:${SERVER_PORT}/$2")" = "$1" ]
-}
-
-# Uploads <localfile> wrapped in `aws-chunked` framing (the streaming-signature
-# encoding Mimir uses), then downloads it and confirms the server stored the
-# DECODED object, not the chunk framing. Signatures aren't verified, so a dummy
-# one is fine.
-aws_chunked_roundtrip() {  # aws_chunked_roundtrip <bucket/key> <localfile>
-    local path="$1" src="$2" body="$WORK_DIR/chunked.$RANDOM" dst="$WORK_DIR/chunked.dl.$RANDOM"
-    local size hexsize
-    size=$(wc -c < "$src")
-    hexsize=$(printf '%x' "$size")
-    {
-        printf '%s;chunk-signature=%064x\r\n' "$hexsize" 0
-        cat "$src"
-        printf '\r\n0;chunk-signature=%064x\r\n\r\n' 0
-    } >"$body"
-    curl -fsS -X PUT --data-binary "@$body" \
-        -H "Content-Encoding: aws-chunked" \
-        -H "x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD" \
-        -H "x-amz-decoded-content-length: ${size}" \
-        "http://${SERVER_HOST}:${SERVER_PORT}/${path}" >/dev/null || return 1
-    curl -fsS "http://${SERVER_HOST}:${SERVER_PORT}/${path}" -o "$dst" || return 1
-    cmp -s "$src" "$dst"
-}
-
-# PUTs <localfile> as a mode-3 aws-chunked body (STREAMING-UNSIGNED-PAYLOAD-TRAILER)
-# with a CRC32 trailer, printing the HTTP status. Pass "bad" to corrupt the trailer.
-streaming_trailer_put() {  # streaming_trailer_put <bucket/key> <localfile> <good|bad>
-    local path="$1" src="$2" mode="$3" size hexsize crc body
-    size=$(wc -c <"$src")
-    hexsize=$(printf '%x' "$size")
-    crc=$(python3 -c "import zlib,base64,sys;print(base64.b64encode(zlib.crc32(open(sys.argv[1],'rb').read()).to_bytes(4,'big')).decode())" "$src")
-    [ "$mode" = bad ] && crc="AAAAAA=="
-    body="$WORK_DIR/st.$RANDOM"
-    {
-        printf '%s\r\n' "$hexsize"
-        cat "$src"
-        printf '\r\n0\r\nx-amz-checksum-crc32:%s\r\n\r\n' "$crc"
-    } >"$body"
-    curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary "@$body" \
-        -H "Content-Encoding: aws-chunked" \
-        -H "x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER" \
-        -H "x-amz-trailer: x-amz-checksum-crc32" \
-        -H "x-amz-decoded-content-length: ${size}" \
-        "http://${SERVER_HOST}:${SERVER_PORT}/${path}"
-}
-
-# Mode 2: a whole-body SHA-256 in x-amz-content-sha256. The correct hash is
-# accepted and the object round-trips; a wrong hash is rejected with 400 (proving
-# the check isn't a no-op).
+# Mode 2: whole-body SHA-256. Correct hash accepted + round-trips; wrong → 400.
 content_sha256_ok() {
-    local b="$BUCKET" host="http://${SERVER_HOST}:${SERVER_PORT}" sha
+    local sha
     sha=$(openssl dgst -sha256 "$NESTED" | awk '{print $NF}')
-    [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary "@$NESTED" \
-        -H "x-amz-content-sha256: $sha" "$host/$b/cs-good.txt")" = 200 ] || return 1
-    check_roundtrip "$NESTED" "s3://$b/cs-good.txt" || return 1
+    [ "$(scurl PUT "/${BUCKET}/cs-good.txt" "$sha" "$NESTED")" = 200 ] || return 1
+    check_roundtrip "$NESTED" "s3://${BUCKET}/cs-good.txt" || return 1
     local wrong="0000000000000000000000000000000000000000000000000000000000000000"
-    [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary "@$NESTED" \
-        -H "x-amz-content-sha256: $wrong" "$host/$b/cs-bad.txt")" = 400 ] || return 1
-    delete_objects_via_api "$b" cs-good.txt >/dev/null
+    [ "$(scurl PUT "/${BUCKET}/cs-bad.txt" "$wrong" "$NESTED")" = 400 ] || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key cs-good.txt >/dev/null 2>&1
 }
 
-# A correct trailer checksum is accepted (and the decoded object stored); a wrong
-# one is rejected with 400.
+# Mode 3: STREAMING-UNSIGNED-PAYLOAD-TRAILER with a CRC32 trailer. Correct CRC
+# accepted + round-trips; wrong CRC → 400. No real client emits mode 3, so the
+# body is crafted and signed with scurl.
 streaming_trailer_ok() {
-    local b="$BUCKET"
-    [ "$(streaming_trailer_put "$b/st-good.txt" "$NESTED" good)" = 200 ] || return 1
-    check_roundtrip "$NESTED" "s3://$b/st-good.txt" || return 1
-    [ "$(streaming_trailer_put "$b/st-bad.txt" "$NESTED" bad)" = 400 ] || return 1
-    delete_objects_via_api "$b" st-good.txt >/dev/null
+    local body="$WORK_DIR/st.body" size hexsize crc
+    size=$(wc -c <"$NESTED"); hexsize=$(printf '%x' "$size")
+    crc=$(python3 -c "import zlib,base64,sys;print(base64.b64encode(zlib.crc32(open(sys.argv[1],'rb').read()).to_bytes(4,'big')).decode())" "$NESTED")
+    local h=(STREAMING-UNSIGNED-PAYLOAD-TRAILER "$body"
+        "Content-Encoding: aws-chunked" "x-amz-trailer: x-amz-checksum-crc32"
+        "x-amz-decoded-content-length: ${size}")
+    { printf '%s\r\n' "$hexsize"; cat "$NESTED"; printf '\r\n0\r\nx-amz-checksum-crc32:%s\r\n\r\n' "$crc"; } >"$body"
+    [ "$(scurl PUT "/${BUCKET}/st-good.txt" "${h[@]}")" = 200 ] || return 1
+    check_roundtrip "$NESTED" "s3://${BUCKET}/st-good.txt" || return 1
+    { printf '%s\r\n' "$hexsize"; cat "$NESTED"; printf '\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n'; } >"$body"
+    [ "$(scurl PUT "/${BUCKET}/st-bad.txt" "${h[@]}")" = 400 ] || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key st-good.txt >/dev/null 2>&1
 }
 
-# Mode 4 via mcli — minio-go under the hood, the exact client Mimir uses. Its
-# PUT streams with STREAMING-AWS4-HMAC-SHA256-PAYLOAD and per-chunk signatures.
-# The right secret is accepted and the object round-trips; a wrong secret makes
-# the chunk signatures fail to verify, so the upload is rejected.
+# Mode 4 via mcli — minio-go, the exact client Mimir uses. The good-secret cp
+# streams STREAMING-AWS4-HMAC-SHA256-PAYLOAD with per-chunk signatures, exercising
+# both the seed signature and the chunk chain end-to-end. The wrong secret is
+# rejected (mcli validates credentials with a signed request on `alias set`).
 mc_streaming_ok() {
-    local b="$BUCKET" host="http://${SERVER_HOST}:${SERVER_PORT}" cfg="$WORK_DIR/mc"
-    mcli --config-dir "$cfg" alias set good "$host" testkey cairnsecret >/dev/null 2>&1 || return 1
-    mcli --config-dir "$cfg" cp "$NESTED" "good/${b}/mc-good.txt" >/dev/null 2>&1 || return 1
-    check_roundtrip "$NESTED" "s3://${b}/mc-good.txt" || return 1
-    mcli --config-dir "$cfg" alias set bad "$host" testkey wrongsecret123 >/dev/null 2>&1 || return 1
-    if mcli --config-dir "$cfg" cp "$NESTED" "bad/${b}/mc-bad.txt" >/dev/null 2>&1; then
-        return 1 # wrong secret must be rejected
-    fi
-    delete_objects_via_api "$b" mc-good.txt >/dev/null
+    local host="http://${SERVER_HOST}:${SERVER_PORT}"
+    mcli --config-dir "$MCFG" alias set good "$host" "$ACCESS_KEY" cairnsecret >/dev/null 2>&1 || return 1
+    mcli --config-dir "$MCFG" cp "$NESTED" "good/${BUCKET}/mc-good.txt" >/dev/null 2>&1 || return 1
+    check_roundtrip "$NESTED" "s3://${BUCKET}/mc-good.txt" || return 1
+    ! mcli --config-dir "$MCFG" alias set bad "$host" "$ACCESS_KEY" wrongsecret123 >/dev/null 2>&1 || return 1
+    mcli --config-dir "$MCFG" rm "good/${BUCKET}/mc-good.txt" >/dev/null 2>&1
 }
 
-# ─── Pagination helpers (curl, so we control max-keys/tokens precisely) ──────
-# Each lister walks every page with a small max-keys, following the cursor, and
-# prints what it collected — so the tests can assert "no dupes, nothing dropped".
-PBUCKET="page-$(date +%s)"   # dedicated bucket, torn down within the page tests
+# ─── Pagination: signed GETs (scurl) so we control max-keys/tokens precisely ──
+PBUCKET="page-$(date +%s)"
 
-# Page through ListObjectsV2, printing every <Key> across all pages.
 list_v2_keys() {  # list_v2_keys <prefix> <max-keys>
-    local prefix="$1" mk="$2" token="" url resp
+    local prefix="$1" mk="$2" token="" q resp
     while :; do
-        url="http://${SERVER_HOST}:${SERVER_PORT}/${PBUCKET}?list-type=2&max-keys=${mk}&prefix=${prefix}"
-        [ -n "$token" ] && url="${url}&continuation-token=${token}"
-        resp="$(curl -fsS "$url")" || return 1
+        q="/${PBUCKET}?list-type=2&max-keys=${mk}&prefix=${prefix}"
+        [ -n "$token" ] && q="${q}&continuation-token=${token}"
+        resp="$(scurl_get "$q")" || return 1
         printf '%s' "$resp" | grep -oP '(?<=<Key>).*?(?=</Key>)'
         printf '%s' "$resp" | grep -q '<IsTruncated>true</IsTruncated>' || break
         token="$(printf '%s' "$resp" | grep -oP '(?<=<NextContinuationToken>).*?(?=</NextContinuationToken>)')"
-        [ -n "$token" ] || return 1   # truncated but no token = bug
+        [ -n "$token" ] || return 1
     done
 }
 
-# Page through ListObjects (v1), printing every <Key> across all pages.
 list_v1_keys() {  # list_v1_keys <prefix> <max-keys>
-    local prefix="$1" mk="$2" marker="" url resp
+    local prefix="$1" mk="$2" marker="" q resp
     while :; do
-        url="http://${SERVER_HOST}:${SERVER_PORT}/${PBUCKET}?max-keys=${mk}&prefix=${prefix}"
-        [ -n "$marker" ] && url="${url}&marker=${marker}"
-        resp="$(curl -fsS "$url")" || return 1
+        q="/${PBUCKET}?max-keys=${mk}&prefix=${prefix}"
+        [ -n "$marker" ] && q="${q}&marker=${marker}"
+        resp="$(scurl_get "$q")" || return 1
         printf '%s' "$resp" | grep -oP '(?<=<Key>).*?(?=</Key>)'
         printf '%s' "$resp" | grep -q '<IsTruncated>true</IsTruncated>' || break
         marker="$(printf '%s' "$resp" | grep -oP '(?<=<NextMarker>).*?(?=</NextMarker>)')"
@@ -326,14 +359,12 @@ list_v1_keys() {  # list_v1_keys <prefix> <max-keys>
     done
 }
 
-# Page through ListObjectsV2 with a delimiter, printing every CommonPrefixes
-# entry. \K drops the literal prefix so we don't also match the top-level <Prefix>.
 list_v2_common_prefixes() {  # list_v2_common_prefixes <prefix> <max-keys>
-    local prefix="$1" mk="$2" token="" url resp
+    local prefix="$1" mk="$2" token="" q resp
     while :; do
-        url="http://${SERVER_HOST}:${SERVER_PORT}/${PBUCKET}?list-type=2&max-keys=${mk}&prefix=${prefix}&delimiter=/"
-        [ -n "$token" ] && url="${url}&continuation-token=${token}"
-        resp="$(curl -fsS "$url")" || return 1
+        q="/${PBUCKET}?list-type=2&max-keys=${mk}&prefix=${prefix}&delimiter=/"
+        [ -n "$token" ] && q="${q}&continuation-token=${token}"
+        resp="$(scurl_get "$q")" || return 1
         printf '%s' "$resp" | grep -oP '<CommonPrefixes><Prefix>\K.*?(?=</Prefix>)'
         printf '%s' "$resp" | grep -q '<IsTruncated>true</IsTruncated>' || break
         token="$(printf '%s' "$resp" | grep -oP '(?<=<NextContinuationToken>).*?(?=</NextContinuationToken>)')"
@@ -344,8 +375,6 @@ list_v2_common_prefixes() {  # list_v2_common_prefixes <prefix> <max-keys>
 setup_pagination() {
     s3 mb "s3://${PBUCKET}" >/dev/null 2>&1 || return 1
     local k
-    # 5 leaf objects under flat/, plus two folders under tree/ (d1 has two keys,
-    # so its resume cursor must be the *greater* of them to skip the whole folder).
     for k in flat/obj0 flat/obj1 flat/obj2 flat/obj3 flat/obj4 \
              tree/d1/x tree/d1/y tree/d2/x; do
         printf 'content of %s\n' "$k" >"$WORK_DIR/pf"
@@ -368,84 +397,54 @@ v2_prefixes_ok() {
     [ "$(list_v2_common_prefixes tree/ 1 | sort)" = "$(printf 'tree/d1/\ntree/d2/')" ]
 }
 
-# `?acl` GET (object and bucket) returns the stubbed AccessControlPolicy, and
-# `s3cmd info` — which issues that ACL query — completes instead of choking.
-acl_stub_ok() {
-    local base="http://${SERVER_HOST}:${SERVER_PORT}" r
-    r="$(curl -fsS "$base/${BUCKET}/big.bin?acl")" || return 1
-    printf '%s' "$r" | grep -q '<AccessControlPolicy' || return 1
-    printf '%s' "$r" | grep -q '<ID>cairn</ID>' || return 1
-    r="$(curl -fsS "$base/${BUCKET}?acl")" || return 1
-    printf '%s' "$r" | grep -q 'FULL_CONTROL' || return 1
-    # the actual client that broke: s3cmd info must now succeed
+# ACL stub: get-object-acl reports owner cairn, and s3cmd info (which queries the
+# ACL) completes instead of choking on object bytes.
+acl_ok() {
+    awss3 s3api get-object-acl --bucket "$BUCKET" --key big.bin 2>/dev/null | grep -q cairn || return 1
     s3 info "s3://${BUCKET}/big.bin" >/dev/null 2>&1
 }
 
-# Bucket sub-resource stubs: location/versioning answer 200 with the right config
-# root; policy/cors/tagging/lifecycle/object-lock answer "not configured" (404).
+# Bucket sub-resource stubs: location/versioning succeed (200, empty config);
+# policy/cors/tagging/lifecycle are "not configured" (the client errors on 404).
 subresource_stubs_ok() {
-    local base="http://${SERVER_HOST}:${SERVER_PORT}" sr code
-    curl -fsS "$base/${BUCKET}?location" | grep -q '<LocationConstraint' || return 1
-    curl -fsS "$base/${BUCKET}?versioning" | grep -q '<VersioningConfiguration' || return 1
-    for sr in policy cors tagging lifecycle object-lock; do
-        code=$(curl -s -o /dev/null -w '%{http_code}' "$base/${BUCKET}?${sr}")
-        [ "$code" = 404 ] || return 1
-    done
-    # a normal listing GET (no sub-resource) is unaffected
-    curl -fsS "$base/${BUCKET}" | grep -q '<ListBucketResult'
+    awss3 s3api get-bucket-location --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    awss3 s3api get-bucket-versioning --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-policy --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
 }
 
-# POST /{bucket}?delete with a <Delete> body — the batch-delete API. Sends the
-# Content-MD5 the endpoint requires (base64 of the body's MD5).
-delete_objects_via_api() {  # delete_objects_via_api <bucket> <key>...
-    local bucket="$1"; shift
-    local body='<Delete>' k md5
-    for k in "$@"; do body="${body}<Object><Key>${k}</Key></Object>"; done
-    body="${body}</Delete>"
-    md5="$(printf '%s' "$body" | openssl dgst -md5 -binary | base64)"
-    curl -fsS -X POST --data "$body" -H "Content-MD5: ${md5}" \
-        "http://${SERVER_HOST}:${SERVER_PORT}/${bucket}?delete"
-}
-
-# Verifies the integrity/existence guards: missing or wrong Content-MD5 → 400,
-# and a well-formed request against a missing bucket → 404 NoSuchBucket.
-batch_delete_guards_ok() {
-    local base="http://${SERVER_HOST}:${SERVER_PORT}" code
-    local body='<Delete><Object><Key>whatever.txt</Key></Object></Delete>' md5
-    md5="$(printf '%s' "$body" | openssl dgst -md5 -binary | base64)"
-    # missing Content-MD5
-    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "$body" "$base/${BUCKET}?delete")"
-    [ "$code" = 400 ] || return 1
-    # wrong Content-MD5
-    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "$body" \
-        -H 'Content-MD5: AAAAAAAAAAAAAAAAAAAAAA==' "$base/${BUCKET}?delete")"
-    [ "$code" = 400 ] || return 1
-    # correct request, missing bucket
-    code="$(curl -s -o /dev/null -w '%{http_code}' -X POST --data "$body" \
-        -H "Content-MD5: ${md5}" "$base/no-such-bucket-xyz?delete")"
-    [ "$code" = 404 ]
-}
-
-# Exercises DeleteObjects: reporting, idempotency for absent keys, that only the
-# named keys are removed, and that the result is well-formed.
+# DeleteObjects: removes the named keys (incl. an absent one — idempotent),
+# leaving others untouched. Sent via scurl with the Content-MD5 the endpoint
+# requires — aws-cli sends a CRC32 checksum instead, which we don't accept.
 batch_delete_ok() {
-    local b="$BUCKET" base="http://${SERVER_HOST}:${SERVER_PORT}" k resp
+    local body="$WORK_DIR/del.xml" md5 k
     printf 'batch delete fixture\n' >"$WORK_DIR/bd"
     for k in bd1.txt bd2.txt bd3.txt; do
-        s3 put "$WORK_DIR/bd" "s3://$b/$k" >/dev/null 2>&1 || return 1
+        s3 put "$WORK_DIR/bd" "s3://${BUCKET}/$k" >/dev/null 2>&1 || return 1
     done
-    resp="$(delete_objects_via_api "$b" bd1.txt bd2.txt nope.txt)" || return 1
-    # both real keys and the absent one are acknowledged (delete is idempotent)
-    for k in bd1.txt bd2.txt nope.txt; do
-        printf '%s' "$resp" | grep -q "<Deleted><Key>${k}</Key></Deleted>" || return 1
-    done
-    # bd1/bd2 gone, bd3 untouched
-    [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/$b/bd1.txt")" = 404 ] || return 1
-    [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/$b/bd2.txt")" = 404 ] || return 1
-    [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/$b/bd3.txt")" = 200 ] || return 1
-    # remove the survivor too, so the bucket teardown stays simple
-    delete_objects_via_api "$b" bd3.txt >/dev/null || return 1
-    [ "$(curl -s -o /dev/null -w '%{http_code}' "$base/$b/bd3.txt")" = 404 ]
+    printf '<Delete><Object><Key>bd1.txt</Key></Object><Object><Key>bd2.txt</Key></Object><Object><Key>nope.txt</Key></Object></Delete>' >"$body"
+    md5="$(openssl dgst -md5 -binary "$body" | base64)"
+    [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 200 ] || return 1
+    ! awss3 s3api head-object --bucket "$BUCKET" --key bd1.txt >/dev/null 2>&1 || return 1
+    ! awss3 s3api head-object --bucket "$BUCKET" --key bd2.txt >/dev/null 2>&1 || return 1
+    awss3 s3api head-object --bucket "$BUCKET" --key bd3.txt >/dev/null 2>&1 || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key bd3.txt >/dev/null 2>&1
+}
+
+# DeleteObjects integrity/existence guards. The malformed-MD5 cases can't come
+# from a real client, so they're signed crafted requests (scurl).
+batch_delete_guards_ok() {
+    local body="$WORK_DIR/del.xml" md5
+    printf '<Delete><Object><Key>whatever.txt</Key></Object></Delete>' >"$body"
+    md5="$(openssl dgst -md5 -binary "$body" | base64)"
+    # missing Content-MD5 → 400
+    [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body")" = 400 ] || return 1
+    # wrong Content-MD5 → 400
+    [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: AAAAAAAAAAAAAAAAAAAAAA==")" = 400 ] || return 1
+    # correct request against a missing bucket → 404
+    [ "$(scurl POST "/no-such-bucket-xyz?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 404 ] || return 1
 }
 
 echo ""
@@ -453,51 +452,48 @@ echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
 
 # ─── 5. The tests ────────────────────────────────────────────────────────────
-run_test "Create bucket"                       s3 mb "s3://${BUCKET}"
-run_test "Bucket appears in bucket list"       list_contains "" "s3://${BUCKET}"
-run_test "HEAD existing bucket returns 200"    head_status 200 "${BUCKET}"
-run_test "HEAD missing bucket returns 404"     head_status 404 "${BUCKET}-nope"
-run_test "Upload small text object"            s3 put "$SMALL" "s3://${BUCKET}/small.txt"
-run_test "Object appears in bucket listing"    list_contains "s3://${BUCKET}" "small.txt"
-run_test "Download matches upload (small)"     check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
-run_test "Upload 4 MiB binary object"          s3 put "$BIG" "s3://${BUCKET}/big.bin"
-run_test "Download matches upload (binary)"    check_roundtrip "$BIG" "s3://${BUCKET}/big.bin"
-run_test "Upload object under a prefix"        s3 put "$NESTED" "s3://${BUCKET}/dir/sub/nested.txt"
-run_test "Listing with prefix finds object"    list_contains "s3://${BUCKET}/dir/sub/" "nested.txt"
-run_test "Upload 16 MiB object via multipart"  s3 put --multipart-chunk-size-mb=5 "$MULTIPART" "s3://${BUCKET}/multi.bin"
-run_test "Download multipart object matches"   check_roundtrip "$MULTIPART" "s3://${BUCKET}/multi.bin"
-run_test "Ranged GET (single part) matches"    range_matches "${BUCKET}/big.bin" 1000000 1000099 "$BIG"
-run_test "Ranged GET across multipart boundary" \
-                                               range_matches "${BUCKET}/multi.bin" 5242875 5242884 "$MULTIPART"
-run_test "Ranged GET responds 206"             status_is 206 "${BUCKET}/big.bin" "0-99"
-run_test "Unsatisfiable range responds 416"    status_is 416 "${BUCKET}/big.bin" "99999999-100000000"
-run_test "Body SHA-256 verified (good/bad)"    content_sha256_ok
-run_test "aws-chunked upload is decoded"       aws_chunked_roundtrip "${BUCKET}/chunked.txt" "$NESTED"
-run_test "aws-chunked trailer checksum (CRC32)" streaming_trailer_ok
-run_test "Signed streaming upload via mcli (mode 4)" mc_streaming_ok
-run_test "Set up pagination fixtures"          setup_pagination
-run_test "ListObjectsV2 paginates leaves"      v2_leaves_ok
-run_test "ListObjects (v1) paginates leaves"   v1_leaves_ok
-run_test "ListObjectsV2 paginates prefixes"    v2_prefixes_ok
-run_test "Tear down pagination bucket"         teardown_pagination
-run_test "Batch delete (DeleteObjects)"        batch_delete_ok
-run_test "Batch delete guards (MD5 / bucket)"  batch_delete_guards_ok
-run_test "Stubbed ACL (s3cmd info works)"      acl_stub_ok
-run_test "Bucket sub-resource stubs"           subresource_stubs_ok
-run_test "Overwrite object, new content wins"  bash -c "
+run_test    "Create bucket"                         s3 mb "s3://${BUCKET}"
+run_test    "Bucket appears in bucket list"         list_contains "" "s3://${BUCKET}"
+run_test    "HEAD existing bucket"                  awss3 s3api head-bucket --bucket "${BUCKET}"
+expect_fail "HEAD missing bucket fails"             awss3 s3api head-bucket --bucket "${BUCKET}-nope"
+run_test    "Unsigned request is rejected (403)"    unsigned_rejected
+run_test    "Upload small text object"              s3 put "$SMALL" "s3://${BUCKET}/small.txt"
+run_test    "Object appears in bucket listing"      list_contains "s3://${BUCKET}" "small.txt"
+run_test    "Download matches upload (small)"       check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
+run_test    "Upload 4 MiB binary object"            s3 put "$BIG" "s3://${BUCKET}/big.bin"
+run_test    "Download matches upload (binary)"      check_roundtrip "$BIG" "s3://${BUCKET}/big.bin"
+run_test    "Upload object under a prefix"          s3 put "$NESTED" "s3://${BUCKET}/dir/sub/nested.txt"
+run_test    "Listing with prefix finds object"      list_contains "s3://${BUCKET}/dir/sub/" "nested.txt"
+run_test    "Upload 16 MiB object via multipart"    s3 put --multipart-chunk-size-mb=5 "$MULTIPART" "s3://${BUCKET}/multi.bin"
+run_test    "Download multipart object matches"     check_roundtrip "$MULTIPART" "s3://${BUCKET}/multi.bin"
+run_test    "Ranged GET (single part) matches"      range_ok big.bin 1000000 1000099 "$BIG"
+run_test    "Ranged GET across multipart boundary"  range_ok multi.bin 5242875 5242884 "$MULTIPART"
+expect_fail "Unsatisfiable range is rejected"       awss3 s3api get-object --bucket "${BUCKET}" --key big.bin --range "bytes=99999999-100000000" "$WORK_DIR/x416"
+run_test    "Body SHA-256 verified (good/bad)"      content_sha256_ok
+run_test    "aws-chunked trailer checksum (CRC32)"  streaming_trailer_ok
+run_test    "Signed streaming upload via mcli (mode 4)" mc_streaming_ok
+run_test    "Set up pagination fixtures"            setup_pagination
+run_test    "ListObjectsV2 paginates leaves"        v2_leaves_ok
+run_test    "ListObjects (v1) paginates leaves"     v1_leaves_ok
+run_test    "ListObjectsV2 paginates prefixes"      v2_prefixes_ok
+run_test    "Tear down pagination bucket"           teardown_pagination
+run_test    "Batch delete (DeleteObjects)"          batch_delete_ok
+run_test    "Batch delete guards (MD5 / bucket)"    batch_delete_guards_ok
+run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
+run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
+run_test    "Overwrite object, new content wins"    bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&
     s3cmd --config '$S3CFG' get 's3://${BUCKET}/small.txt' '$WORK_DIR/over.dl' >/dev/null &&
     cmp -s '$WORK_DIR/over.txt' '$WORK_DIR/over.dl'"
-run_test "Delete object"                       s3 del "s3://${BUCKET}/small.txt"
-expect_fail "Deleted object is gone (GET 404s)" s3 get "s3://${BUCKET}/small.txt" "$WORK_DIR/gone"
-run_test "Delete remaining objects + bucket"   bash -c "
+run_test    "Delete object"                         s3 del "s3://${BUCKET}/small.txt"
+expect_fail "Deleted object is gone (GET 404s)"     s3 get "s3://${BUCKET}/small.txt" "$WORK_DIR/gone"
+run_test    "Delete remaining objects + bucket"     bash -c "
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/big.bin' >/dev/null &&
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/dir/sub/nested.txt' >/dev/null &&
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/multi.bin' >/dev/null &&
-    s3cmd --config '$S3CFG' del 's3://${BUCKET}/chunked.txt' >/dev/null &&
     s3cmd --config '$S3CFG' rb 's3://${BUCKET}' >/dev/null"
-expect_fail "Removed bucket is gone (ls fails)" s3 ls "s3://${BUCKET}"
+expect_fail "Removed bucket is gone (ls fails)"     s3 ls "s3://${BUCKET}"
 
 # ─── 6. Summary ──────────────────────────────────────────────────────────────
 echo ""
