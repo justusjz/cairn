@@ -14,7 +14,7 @@ use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
-use crate::auth::ContentSha256;
+use crate::auth::{ContentSha256, TrailerChecksum};
 use crate::aws_chunked::AwsChunkedDecoder;
 use crate::body::{FrameSender, channel_body};
 use crate::store::Store;
@@ -369,6 +369,19 @@ async fn upload_part(
     let mut content_hasher: Option<Sha256> =
         matches!((&content_sha256, aws_chunked), (ContentSha256::Single(_), false))
             .then(Sha256::new);
+    // For an `aws-chunked` trailer body, compute the declared checksum over the
+    // decoded payload; it's compared to the body's trailer value at the end. An
+    // algorithm we don't support is skipped (logged) rather than rejected.
+    let mut trailer_checksum = match (&content_sha256, aws_chunked) {
+        (ContentSha256::StreamingTrailer { trailer }, true) => {
+            let checksum = TrailerChecksum::for_trailer(trailer);
+            if checksum.is_none() && !trailer.is_empty() {
+                eprintln!("unsupported aws-chunked trailer '{trailer}', skipping integrity check");
+            }
+            checksum
+        }
+        _ => None,
+    };
     loop {
         match body.frame().await {
             Some(Ok(frame)) => {
@@ -387,6 +400,9 @@ async fn upload_part(
                     hasher.update(&chunk);
                     if let Some(h) = &mut content_hasher {
                         h.update(&chunk);
+                    }
+                    if let Some(c) = &mut trailer_checksum {
+                        c.update(&chunk);
                     }
                     size += chunk.len() as i64;
                     for tx in &senders {
@@ -434,6 +450,16 @@ async fn upload_part(
     if let (Some(h), ContentSha256::Single(expected)) = (content_hasher, &content_sha256) {
         let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
         if actual != *expected {
+            return Ok(UploadResult::ContentSha256Mismatch);
+        }
+    }
+    // For a trailer body, compare our checksum to the value the body carried in
+    // its trailer (captured by the decoder). A missing/garbled trailer fails too.
+    if let (Some(c), ContentSha256::StreamingTrailer { trailer }) =
+        (trailer_checksum, &content_sha256)
+    {
+        let claimed = decoder.as_ref().and_then(|d| d.trailer(trailer));
+        if claimed.as_deref() != Some(c.finish_base64().as_str()) {
             return Ok(UploadResult::ContentSha256Mismatch);
         }
     }

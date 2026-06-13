@@ -45,7 +45,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=31
+TOTAL=32
 STEP=0
 PASS=0
 FAIL=0
@@ -109,7 +109,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 # ─── Preflight ───────────────────────────────────────────────────────────────
-for tool in podman cargo s3cmd curl openssl; do
+for tool in podman cargo s3cmd curl openssl python3; do
     command -v "$tool" >/dev/null 2>&1 || fatal "'$tool' not found in PATH"
 done
 
@@ -228,6 +228,38 @@ aws_chunked_roundtrip() {  # aws_chunked_roundtrip <bucket/key> <localfile>
         "http://${SERVER_HOST}:${SERVER_PORT}/${path}" >/dev/null || return 1
     curl -fsS "http://${SERVER_HOST}:${SERVER_PORT}/${path}" -o "$dst" || return 1
     cmp -s "$src" "$dst"
+}
+
+# PUTs <localfile> as a mode-3 aws-chunked body (STREAMING-UNSIGNED-PAYLOAD-TRAILER)
+# with a CRC32 trailer, printing the HTTP status. Pass "bad" to corrupt the trailer.
+streaming_trailer_put() {  # streaming_trailer_put <bucket/key> <localfile> <good|bad>
+    local path="$1" src="$2" mode="$3" size hexsize crc body
+    size=$(wc -c <"$src")
+    hexsize=$(printf '%x' "$size")
+    crc=$(python3 -c "import zlib,base64,sys;print(base64.b64encode(zlib.crc32(open(sys.argv[1],'rb').read()).to_bytes(4,'big')).decode())" "$src")
+    [ "$mode" = bad ] && crc="AAAAAA=="
+    body="$WORK_DIR/st.$RANDOM"
+    {
+        printf '%s\r\n' "$hexsize"
+        cat "$src"
+        printf '\r\n0\r\nx-amz-checksum-crc32:%s\r\n\r\n' "$crc"
+    } >"$body"
+    curl -s -o /dev/null -w '%{http_code}' -X PUT --data-binary "@$body" \
+        -H "Content-Encoding: aws-chunked" \
+        -H "x-amz-content-sha256: STREAMING-UNSIGNED-PAYLOAD-TRAILER" \
+        -H "x-amz-trailer: x-amz-checksum-crc32" \
+        -H "x-amz-decoded-content-length: ${size}" \
+        "http://${SERVER_HOST}:${SERVER_PORT}/${path}"
+}
+
+# A correct trailer checksum is accepted (and the decoded object stored); a wrong
+# one is rejected with 400.
+streaming_trailer_ok() {
+    local b="$BUCKET"
+    [ "$(streaming_trailer_put "$b/st-good.txt" "$NESTED" good)" = 200 ] || return 1
+    check_roundtrip "$NESTED" "s3://$b/st-good.txt" || return 1
+    [ "$(streaming_trailer_put "$b/st-bad.txt" "$NESTED" bad)" = 400 ] || return 1
+    delete_objects_via_api "$b" st-good.txt >/dev/null
 }
 
 # ─── Pagination helpers (curl, so we control max-keys/tokens precisely) ──────
@@ -395,6 +427,7 @@ run_test "Ranged GET across multipart boundary" \
 run_test "Ranged GET responds 206"             status_is 206 "${BUCKET}/big.bin" "0-99"
 run_test "Unsatisfiable range responds 416"    status_is 416 "${BUCKET}/big.bin" "99999999-100000000"
 run_test "aws-chunked upload is decoded"       aws_chunked_roundtrip "${BUCKET}/chunked.txt" "$NESTED"
+run_test "aws-chunked trailer checksum (CRC32)" streaming_trailer_ok
 run_test "Set up pagination fixtures"          setup_pagination
 run_test "ListObjectsV2 paginates leaves"      v2_leaves_ok
 run_test "ListObjects (v1) paginates leaves"   v1_leaves_ok

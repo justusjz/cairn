@@ -40,6 +40,8 @@ pub fn is_aws_chunked(headers: &HeaderMap) -> bool {
 /// Cap on a single chunk-size line, so a malformed stream can't make us buffer
 /// without bound. Real headers are well under 100 bytes (hex size + signature).
 const MAX_HEADER_LINE: usize = 8192;
+/// Cap on the captured trailer, same reasoning as the chunk-header cap.
+const MAX_TRAILER: usize = 8192;
 
 enum State {
     /// Accumulating the `<hex-size>[;…]\r\n` line into `header`.
@@ -48,16 +50,17 @@ enum State {
     Data(u64),
     /// Consuming the `\r\n` that follows a chunk's payload; `rem` bytes left.
     DataCrlf(u8),
-    /// Saw the terminating zero-size chunk; everything after (a trailer) is
-    /// ignored.
-    Done,
+    /// Saw the terminating zero-size chunk; everything after is the trailer
+    /// section (`name:value\r\n` lines), accumulated into `trailer`.
+    Trailer,
 }
 
 /// Incremental decoder: fed body chunks as they arrive (split at arbitrary byte
-/// boundaries), it emits the decoded payload bytes.
+/// boundaries), it emits the decoded payload bytes and captures any trailer.
 pub struct AwsChunkedDecoder {
     state: State,
     header: Vec<u8>,
+    trailer: Vec<u8>,
 }
 
 impl AwsChunkedDecoder {
@@ -65,6 +68,7 @@ impl AwsChunkedDecoder {
         Self {
             state: State::Header,
             header: Vec::new(),
+            trailer: Vec::new(),
         }
     }
 
@@ -83,7 +87,7 @@ impl AwsChunkedDecoder {
                         let size = parse_chunk_size(&self.header)?;
                         self.header.clear();
                         self.state = if size == 0 {
-                            State::Done
+                            State::Trailer
                         } else {
                             State::Data(size)
                         };
@@ -122,16 +126,36 @@ impl AwsChunkedDecoder {
                         self.state = State::Header;
                     }
                 }
-                State::Done => break,
+                State::Trailer => {
+                    let rest = &input[i..];
+                    if self.trailer.len() + rest.len() > MAX_TRAILER {
+                        return Err(io::Error::other("aws-chunked: trailer too long"));
+                    }
+                    self.trailer.extend_from_slice(rest);
+                    i = input.len();
+                }
             }
         }
         Ok(out)
     }
 
+    /// The value of trailer header `name` (case-insensitive), if the body carried
+    /// one — e.g. `x-amz-checksum-crc32`. Only meaningful once the body is fully
+    /// read (`is_complete`).
+    pub fn trailer(&self, name: &str) -> Option<String> {
+        let text = std::str::from_utf8(&self.trailer).ok()?;
+        text.lines().find_map(|line| {
+            let (k, v) = line.split_once(':')?;
+            k.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| v.trim().to_owned())
+        })
+    }
+
     /// Whether the terminating zero-size chunk has been seen. A stream that ends
     /// without it is truncated, and storing it would silently corrupt the object.
     pub fn is_complete(&self) -> bool {
-        matches!(self.state, State::Done)
+        matches!(self.state, State::Trailer)
     }
 }
 
@@ -236,6 +260,23 @@ mod tests {
         let (out, complete) = decode_in_steps(&body, 1);
         assert_eq!(out, b"data");
         assert!(complete);
+    }
+
+    #[test]
+    fn captures_trailer() {
+        let mut dec = AwsChunkedDecoder::new();
+        let body = b"5\r\nhello\r\n0\r\nx-amz-checksum-crc32:abc123==\r\n\r\n";
+        let out: Vec<u8> = dec
+            .decode(Bytes::copy_from_slice(body))
+            .unwrap()
+            .iter()
+            .flat_map(|b| b.to_vec())
+            .collect();
+        assert_eq!(out, b"hello");
+        assert!(dec.is_complete());
+        // case-insensitive name lookup; absent trailer is None
+        assert_eq!(dec.trailer("X-Amz-Checksum-Crc32").as_deref(), Some("abc123=="));
+        assert_eq!(dec.trailer("x-amz-checksum-sha256"), None);
     }
 
     #[test]
