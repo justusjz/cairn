@@ -47,7 +47,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=34
+TOTAL=35
 STEP=0
 PASS=0
 FAIL=0
@@ -444,6 +444,24 @@ batch_delete_guards_ok() {
     [ "$(scurl POST "/no-such-bucket-xyz?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 404 ] || return 1
 }
 
+# Immediate part reaping: after deleting objects, their on-disk part files should
+# disappear WITHOUT running prune (the happy-path optimization). We can't map keys
+# to part files, so we check the data-dir file count returns to its pre-upload
+# baseline (single node, RF=1, so the coordinator reaps its own files). Polls,
+# since the reap runs in the background.
+immediate_reap_ok() {
+    local datadir="$WORK_DIR/data" before after k i
+    before=$(find "$datadir" -type f | wc -l)
+    for k in r1 r2 r3; do s3 put "$NESTED" "s3://${BUCKET}/reap/$k" >/dev/null 2>&1 || return 1; done
+    for k in r1 r2 r3; do s3 del "s3://${BUCKET}/reap/$k" >/dev/null 2>&1 || return 1; done
+    for i in $(seq 1 20); do
+        after=$(find "$datadir" -type f | wc -l)
+        [ "$after" -le "$before" ] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
 echo ""
 echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
@@ -476,6 +494,7 @@ run_test    "ListObjectsV2 paginates prefixes"      v2_prefixes_ok
 run_test    "Tear down pagination bucket"           teardown_pagination
 run_test    "Batch delete (DeleteObjects)"          batch_delete_ok
 run_test    "Batch delete guards (MD5 / bucket)"    batch_delete_guards_ok
+run_test    "Deleted parts reaped without prune"    immediate_reap_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "Overwrite object, new content wins"    bash -c "

@@ -64,6 +64,13 @@ pub async fn handle(
                 crate::write_part_streaming(&app, part_id, req.into_body()).await?;
                 Ok(box_response(empty(StatusCode::OK)))
             }
+            hyper::Method::DELETE => {
+                // Best-effort happy-path reap: the coordinator dropped this part's
+                // catalog rows and is asking us to delete the file now (idempotent;
+                // a missing file is fine). The GC is the backstop if this is missed.
+                app.store.remove_part(part_id).await?;
+                Ok(box_response(empty(StatusCode::OK)))
+            }
             _ => Ok(box_response(empty(StatusCode::METHOD_NOT_ALLOWED))),
         };
     }

@@ -1,11 +1,14 @@
+use std::sync::Arc;
+
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 use tokio_postgres::{IsolationLevel, error::SqlState};
 
 use crate::{
-    App,
+    App, ReapTarget,
     auth::BodyChecksum,
+    reap_parts, reap_targets,
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
 
@@ -18,17 +21,18 @@ enum DeleteStatus {
     Unavailable,
 }
 
-/// One serializable attempt: confirm the bucket exists, then remove the keys
-/// (cascading their parts/part_locations away; on-disk bytes are left for the GC).
-/// The raw postgres error is returned so the caller can retry on a serialization
-/// failure. Runs at the same isolation as the put/complete/GC transactions that
-/// also touch `objects`/`parts`, so the delete can't undermine their guarantees —
-/// and the bucket check shares the snapshot, so there's no check-then-delete race.
+/// One serializable attempt: confirm the bucket exists, capture the removed
+/// parts' replica locations (for immediate reaping), then drop the keys
+/// (cascading their parts/part_locations away). The raw postgres error is
+/// returned so the caller can retry on a serialization failure. Runs at the same
+/// isolation as the put/complete/GC transactions that also touch `objects`/
+/// `parts`, so the delete can't undermine their guarantees — and the bucket
+/// check shares the snapshot, so there's no check-then-delete race.
 async fn try_delete(
     client: &mut Object,
     bucket: &str,
     keys: &[&str],
-) -> Result<DeleteStatus, tokio_postgres::Error> {
+) -> Result<(DeleteStatus, Vec<ReapTarget>), tokio_postgres::Error> {
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::Serializable)
@@ -39,24 +43,40 @@ async fn try_delete(
         .await?
         .is_none()
     {
-        return Ok(DeleteStatus::NoSuchBucket); // tx rolls back on drop
+        return Ok((DeleteStatus::NoSuchBucket, Vec::new())); // tx rolls back on drop
     }
+    let removed = tx
+        .query(
+            "SELECT pl.part_id, pl.node_id, n.peer_url
+             FROM parts p
+             JOIN part_locations pl ON pl.part_id = p.part_id
+             JOIN nodes n ON n.node_id = pl.node_id
+             WHERE p.object_bucket = $1 AND p.object_key = ANY($2)",
+            &[&bucket, &keys],
+        )
+        .await?;
+    let targets = reap_targets(&removed);
     tx.execute(
         "DELETE FROM objects WHERE bucket = $1 AND key = ANY($2)",
         &[&bucket, &keys],
     )
     .await?;
     tx.commit().await?;
-    Ok(DeleteStatus::Deleted)
+    Ok((DeleteStatus::Deleted, targets))
 }
 
 /// Deletes `keys` from `bucket` in a serializable transaction, retrying on a
-/// serialization conflict (e.g. a concurrent overwrite or GC).
-async fn delete_keys(app: &App, bucket: &str, keys: &[&str]) -> anyhow::Result<DeleteStatus> {
+/// serialization conflict (e.g. a concurrent overwrite or GC). On success, reaps
+/// the removed parts' files in the background.
+async fn delete_keys(app: &Arc<App>, bucket: &str, keys: &[&str]) -> anyhow::Result<DeleteStatus> {
     let mut client = app.pool.get().await?;
     for _ in 0..MAX_DELETE_ATTEMPTS {
         match try_delete(&mut client, bucket, keys).await {
-            Ok(status) => return Ok(status),
+            Ok((DeleteStatus::Deleted, targets)) => {
+                reap_parts(app, targets);
+                return Ok(DeleteStatus::Deleted);
+            }
+            Ok((status, _)) => return Ok(status),
             Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
             Err(e) => return Err(e.into()),
         }
@@ -65,7 +85,7 @@ async fn delete_keys(app: &App, bucket: &str, keys: &[&str]) -> anyhow::Result<D
 }
 
 pub async fn delete_object(
-    app: &App,
+    app: &Arc<App>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
@@ -117,7 +137,7 @@ fn parse_delete_request(body: &str) -> Option<(Vec<String>, bool)> {
 /// DeleteObjects (batch): `POST /{bucket}?delete` with a `<Delete>` body listing
 /// keys. `checksum` is the request's body-integrity headers.
 pub async fn delete_objects(
-    app: &App,
+    app: &Arc<App>,
     bucket: &str,
     body: Bytes,
     checksum: BodyChecksum,

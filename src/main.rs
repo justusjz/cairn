@@ -254,6 +254,55 @@ where
     Ok(())
 }
 
+/// A part file to reap, and where it lives: (part_id, holder node_id, holder
+/// peer_url). One per replica.
+pub(crate) type ReapTarget = (Uuid, String, String);
+
+/// Maps location rows (part_id, node_id, peer_url) into reap targets.
+pub(crate) fn reap_targets(rows: &[tokio_postgres::Row]) -> Vec<ReapTarget> {
+    rows.iter()
+        .map(|r| (r.get::<_, Uuid>(0), r.get::<_, String>(1), r.get::<_, String>(2)))
+        .collect()
+}
+
+/// Best-effort: once a set of parts has been removed from the catalog (deleted or
+/// replaced), ask each holder to delete the file from disk *now* — locally if
+/// that's us, else via the peer's `DELETE /parts/{id}`. The rows are already gone,
+/// so any deletion that fails (peer down, network) is harmless: `cairn prune`
+/// reclaims the leftovers. Runs in the background so it never delays the response.
+pub(crate) fn reap_parts(app: &Arc<App>, targets: Vec<ReapTarget>) {
+    if targets.is_empty() {
+        return;
+    }
+    let app = app.clone();
+    tokio::spawn(async move {
+        let self_id = app.store.get_node_id().to_string();
+        for (part_id, node_id, peer_url) in targets {
+            let result = if node_id == self_id {
+                app.store.remove_part(part_id).await
+            } else {
+                delete_from_replica(&peer_url, part_id).await
+            };
+            if let Err(e) = result {
+                eprintln!("best-effort reap of part {part_id} on {peer_url} failed: {e}");
+            }
+        }
+    });
+}
+
+async fn delete_from_replica(peer_url: &str, part_id: Uuid) -> anyhow::Result<()> {
+    let client = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::builder()
+        .method(Method::DELETE)
+        .uri(format!("{peer_url}/parts/{part_id}"))
+        .body(Empty::<Bytes>::new())?;
+    let res = client.request(req).await?;
+    if res.status() != StatusCode::OK {
+        anyhow::bail!("replica {peer_url} returned status {}", res.status());
+    }
+    Ok(())
+}
+
 /// Streams a body to this node's local disk, fsyncs it, and records this node as
 /// a location for the part. Shared by the peer PUT endpoint (an `Incoming`) and
 /// the local-replica sink in `upload_part` (a channel-backed body) — hence the
@@ -492,7 +541,9 @@ async fn upload_part(
     let mut committed = false;
     for _ in 0..MAX_COMMIT_ATTEMPTS {
         match try_commit_part(&mut client, part_id, &node_ids, attach, size, &etag).await {
-            Ok(CommitResult::Committed) => {
+            Ok(CommitResult::Committed(displaced)) => {
+                // Reap the parts this overwrite displaced; their rows are gone.
+                reap_parts(app, displaced);
                 committed = true;
                 break;
             }
@@ -514,7 +565,9 @@ async fn upload_part(
 const MAX_COMMIT_ATTEMPTS: usize = 10;
 
 enum CommitResult {
-    Committed,
+    /// Committed; carries the replica locations of any parts this displaced
+    /// (an overwrite or part re-upload), for the caller to reap.
+    Committed(Vec<ReapTarget>),
     MissingLocations { present: i64, required: usize },
 }
 
@@ -550,6 +603,15 @@ async fn try_commit_part(
             required: node_ids.len(),
         });
     }
+    // Capture the replica locations of the parts this commit displaces, before
+    // their rows (and, via cascade, their part_locations) are dropped — so the
+    // caller can reap the files immediately rather than leave them for GC.
+    const CAPTURE: &str = "SELECT pl.part_id, pl.node_id, n.peer_url
+         FROM parts p
+         JOIN part_locations pl ON pl.part_id = p.part_id
+         JOIN nodes n ON n.node_id = pl.node_id
+         WHERE ";
+    let reap: Vec<ReapTarget>;
     match attach {
         AttachTarget::Object {
             bucket,
@@ -566,10 +628,16 @@ async fn try_commit_part(
                 &[bucket, key, &size, &etag, content_type],
             )
             .await?;
-            // Drop whatever parts the key referenced before: their rows (and, via
-            // cascade, their part_locations) go now, their on-disk bytes are
-            // reclaimed later by GC. This also frees the (bucket, key, part_number)
-            // slot for the new part.
+            // Drop whatever parts the key referenced before (the new part isn't
+            // attached yet, so it's not captured). This frees the (bucket, key,
+            // part_number) slot for the new part.
+            let displaced = tx
+                .query(
+                    &format!("{CAPTURE} p.object_bucket = $1 AND p.object_key = $2"),
+                    &[bucket, key],
+                )
+                .await?;
+            reap = reap_targets(&displaced);
             tx.execute(
                 "DELETE FROM parts WHERE object_bucket = $1 AND object_key = $2",
                 &[bucket, key],
@@ -590,8 +658,15 @@ async fn try_commit_part(
             part_number,
         } => {
             // Displace any part previously uploaded at this number (S3 allows
-            // re-uploading a part number); its row + locations go now, its file
-            // is reclaimed later by GC. Frees the (upload_id, part_number) slot.
+            // re-uploading a part number); the new part isn't staged yet, so it's
+            // not captured. Frees the (upload_id, part_number) slot.
+            let displaced = tx
+                .query(
+                    &format!("{CAPTURE} p.upload_id = $1 AND p.part_number = $2"),
+                    &[upload_id, part_number],
+                )
+                .await?;
+            reap = reap_targets(&displaced);
             tx.execute(
                 "DELETE FROM parts WHERE upload_id = $1 AND part_number = $2",
                 &[upload_id, part_number],
@@ -608,5 +683,5 @@ async fn try_commit_part(
         }
     }
     tx.commit().await?;
-    Ok(CommitResult::Committed)
+    Ok(CommitResult::Committed(reap))
 }
