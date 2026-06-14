@@ -24,8 +24,8 @@ Download the static binary from the
 [releases page](https://codeberg.org/justusjz/cairn/releases) and extract it:
 
 ```sh
-tar xzf cairn-v0.1.0-x86_64-unknown-linux-musl.tar.gz
-sudo install -m755 cairn-v0.1.0-x86_64-unknown-linux-musl/cairn /usr/local/bin/cairn
+tar xzf cairn-v0.1.3-x86_64-unknown-linux-musl.tar.gz
+sudo install -m755 cairn-v0.1.3-x86_64-unknown-linux-musl/cairn /usr/local/bin/cairn
 ```
 
 It is statically linked (musl), so it runs on any x86-64 Linux with no
