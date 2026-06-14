@@ -47,7 +47,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=35
+TOTAL=36
 STEP=0
 PASS=0
 FAIL=0
@@ -462,6 +462,21 @@ immediate_reap_ok() {
     return 1
 }
 
+# Prune rmdir's empty shard directories. Upload then delete a batch of objects
+# (emptying their shard dirs), then run `prune --apply` against the peer endpoint
+# and confirm the directory count dropped. Live objects' shards stay (non-empty).
+prune_empty_dirs_ok() {
+    local datadir="$WORK_DIR/data" before after k
+    for k in $(seq 1 8); do s3 put "$NESTED" "s3://${BUCKET}/dirs/o$k" >/dev/null 2>&1 || return 1; done
+    for k in $(seq 1 8); do s3 del "s3://${BUCKET}/dirs/o$k" >/dev/null 2>&1 || return 1; done
+    before=$(find "$datadir" -type d | wc -l)
+    # The peer endpoint (unauthenticated) defaults to :9431. curl blocks until the
+    # streamed prune report ends, i.e. until the prune has finished.
+    curl -fsS "http://${SERVER_HOST}:9431/prune?apply=true" >/dev/null 2>&1 || return 1
+    after=$(find "$datadir" -type d | wc -l)
+    [ "$after" -lt "$before" ]
+}
+
 echo ""
 echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
@@ -495,6 +510,7 @@ run_test    "Tear down pagination bucket"           teardown_pagination
 run_test    "Batch delete (DeleteObjects)"          batch_delete_ok
 run_test    "Batch delete guards (MD5 / bucket)"    batch_delete_guards_ok
 run_test    "Deleted parts reaped without prune"    immediate_reap_ok
+run_test    "Prune removes empty shard dirs"         prune_empty_dirs_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "Overwrite object, new content wins"    bash -c "

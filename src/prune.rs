@@ -108,13 +108,22 @@ async fn run_inner(app: &App, apply: bool, tx: &FrameSender) -> anyhow::Result<(
         line(tx, format!("phase3 reap-part part={part_id} reason=abandoned-pending")).await;
     }
 
+    // ── Phase 4: rmdir empty shard directories left behind by file deletions ──
+    // Pure filesystem cleanup: rmdir only removes an *empty* directory, so it can
+    // never touch a part, and writes recreate shards on demand.
+    let removed_dirs = app.store.prune_empty_dirs(apply).await?;
+    for dir in &removed_dirs {
+        line(tx, format!("phase4 remove-dir path={dir} reason=empty-shard")).await;
+    }
+
     line(
         tx,
         format!(
-            "done: phase1-locations={} phase2-files={} phase3-parts={}",
+            "done: phase1-locations={} phase2-files={} phase3-parts={} phase4-dirs={}",
             dropped.len(),
             deleted_files,
-            reaped.len()
+            reaped.len(),
+            removed_dirs.len()
         ),
     )
     .await;
