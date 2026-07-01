@@ -10,6 +10,7 @@ use crate::{
         buckets::{
             create::create_bucket, delete::delete_bucket, head::head_bucket, list::list_buckets,
         },
+        conditional::Preconditions,
         multipart::{
             abort::abort_multipart_upload, complete::complete_multipart_upload,
             create::create_multipart_upload, upload_part::put_part,
@@ -29,6 +30,7 @@ use crate::{
 };
 
 mod buckets;
+mod conditional;
 mod multipart;
 mod objects;
 mod util;
@@ -156,13 +158,16 @@ pub async fn handle(
         .get(hyper::header::RANGE)
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // Conditional-request headers (If-Match / If-None-Match / If-[Un]Modified-Since)
+    // gate GET and HEAD; read them before the body-consuming arms.
+    let preconditions = Preconditions::from_headers(req.headers());
     if *req.method() == hyper::Method::GET {
         // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
         // break XML-parsing clients like `s3cmd info`.
         if query_param(&query, "acl").is_some() {
             return Ok(box_response(stub_acl()));
         }
-        return get_object(&app, &bucket, &key, range.as_deref()).await;
+        return get_object(&app, &bucket, &key, range.as_deref(), &preconditions).await;
     }
     let content_type = req
         .headers()
@@ -190,6 +195,8 @@ pub async fn handle(
         .get("x-amz-copy-source-range")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // The copy endpoints gate on the *source* via x-amz-copy-source-if-* headers.
+    let copy_source_preconditions = Preconditions::from_copy_source_headers(req.headers());
     // Streaming-signature uploads (e.g. Mimir) frame the body as `aws-chunked`;
     // the upload path must decode it rather than store the framing verbatim.
     let aws_chunked = crate::aws_chunked::is_aws_chunked(req.headers());
@@ -205,7 +212,9 @@ pub async fn handle(
         _ => None,
     };
     let resp = match req.method().clone() {
-        hyper::Method::HEAD => head_object(&app, &bucket, &key, range.as_deref()).await?,
+        hyper::Method::HEAD => {
+            head_object(&app, &bucket, &key, range.as_deref(), &preconditions).await?
+        }
         // AbortMultipartUpload
         hyper::Method::DELETE if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
@@ -235,6 +244,7 @@ pub async fn handle(
                 &part_number,
                 &copy_source.unwrap(),
                 copy_source_range.as_deref(),
+                &copy_source_preconditions,
             )
             .await?
         }
@@ -264,6 +274,7 @@ pub async fn handle(
                 &copy_source.unwrap(),
                 metadata_directive.as_deref(),
                 &content_type,
+                &copy_source_preconditions,
             )
             .await?
         }

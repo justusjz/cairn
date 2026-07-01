@@ -47,7 +47,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=43
+TOTAL=46
 STEP=0
 PASS=0
 FAIL=0
@@ -365,6 +365,49 @@ upload_part_copy_ranged_ok() {
     awss3 s3api delete-object --bucket "$BUCKET" --key "$dest" >/dev/null 2>&1
 }
 
+# ─── Conditional requests (RFC 7232 if-* headers) ────────────────────────────
+# Signed with scurl so we can assert exact status codes (304 / 412 / 200).
+
+# Conditional GET on ETag: If-None-Match hit → 304, miss → 200; If-Match hit →
+# 200, miss → 412.
+conditional_get_etag_ok() {
+    local etag zero='"00000000000000000000000000000000"'
+    etag=$(awss3 s3api head-object --bucket "$BUCKET" --key small.txt \
+        --query ETag --output text 2>/dev/null) || return 1
+    etag=${etag//\"/}
+    [ "$(scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" - "If-None-Match: \"$etag\"")" = 304 ] || return 1
+    [ "$(scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" - "If-None-Match: $zero")" = 200 ] || return 1
+    [ "$(scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" - "If-Match: \"$etag\"")" = 200 ] || return 1
+    [ "$(scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" - "If-Match: $zero")" = 412 ]
+}
+
+# Conditional GET on dates: not-modified-since a future date → 304; modified
+# since 1970 → 200; unmodified-since 1970 → 412; unmodified-since future → 200.
+conditional_get_date_ok() {
+    local past="Thu, 01 Jan 1970 00:00:00 GMT" future="Sat, 01 Jan 2050 00:00:00 GMT"
+    [ "$(scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" - "If-Modified-Since: $future")" = 304 ] || return 1
+    [ "$(scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" - "If-Modified-Since: $past")" = 200 ] || return 1
+    [ "$(scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" - "If-Unmodified-Since: $past")" = 412 ] || return 1
+    [ "$(scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" - "If-Unmodified-Since: $future")" = 200 ]
+}
+
+# Conditional copy: x-amz-copy-source-if-match against the source ETag — a wrong
+# tag blocks the copy (412 → aws errors), the right tag lets it through.
+conditional_copy_ok() {
+    local etag
+    etag=$(awss3 s3api head-object --bucket "$BUCKET" --key small.txt \
+        --query ETag --output text 2>/dev/null) || return 1
+    etag=${etag//\"/}
+    ! awss3 s3api copy-object --bucket "$BUCKET" --key copy/cond.txt \
+        --copy-source "${BUCKET}/small.txt" \
+        --copy-source-if-match 00000000000000000000000000000000 >/dev/null 2>&1 || return 1
+    awss3 s3api copy-object --bucket "$BUCKET" --key copy/cond.txt \
+        --copy-source "${BUCKET}/small.txt" \
+        --copy-source-if-match "$etag" >/dev/null 2>&1 || return 1
+    check_roundtrip "$SMALL" "s3://${BUCKET}/copy/cond.txt" || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key copy/cond.txt >/dev/null 2>&1
+}
+
 # Mode 2: whole-body SHA-256. Correct hash accepted + round-trips; wrong → 400.
 content_sha256_ok() {
     local sha
@@ -583,6 +626,9 @@ expect_fail "Self-copy without REPLACE rejected"    awss3 s3api copy-object --bu
 expect_fail "Copy from missing source fails"        awss3 s3api copy-object --bucket "$BUCKET" --key copy/none.txt --copy-source "${BUCKET}/does-not-exist.txt"
 run_test    "UploadPartCopy (whole object)"         upload_part_copy_whole_ok
 run_test    "UploadPartCopy (ranged, multipart src)" upload_part_copy_ranged_ok
+run_test    "Conditional GET (ETag: 304/412/200)"   conditional_get_etag_ok
+run_test    "Conditional GET (dates: 304/412/200)"  conditional_get_date_ok
+run_test    "Conditional copy (copy-source-if-match)" conditional_copy_ok
 run_test    "Body SHA-256 verified (good/bad)"      content_sha256_ok
 run_test    "aws-chunked trailer checksum (CRC32)"  streaming_trailer_ok
 run_test    "Signed streaming upload via mcli (mode 4)" mc_streaming_ok

@@ -9,12 +9,22 @@ use crate::{
     auth::ContentSha256,
     body::channel_body,
     s3::{
+        conditional::{Precondition, Preconditions},
         objects::get::{
             parse_range, resolve_object_parts, select_parts_in_range, spawn_range_stream,
         },
         util::{decode_path_param, format_s3_error, xml_ok},
     },
 };
+
+/// The 412 response returned when a copy-source precondition isn't met.
+fn copy_precondition_failed() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::PRECONDITION_FAILED,
+        "PreconditionFailed",
+        "the source object did not satisfy the copy conditions",
+    )
+}
 
 /// CopyObject (deep copy): `PUT /{dest_bucket}/{dest_key}` with an
 /// `x-amz-copy-source` header. Streams the source object's bytes into a fresh,
@@ -32,6 +42,7 @@ pub async fn copy_object(
     copy_source: &str,
     metadata_directive: Option<&str>,
     request_content_type: &str,
+    preconditions: &Preconditions,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let (src_bucket, src_key) = match parse_copy_source(copy_source) {
         Some(pair) => pair,
@@ -82,14 +93,15 @@ pub async fn copy_object(
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .start()
         .await?;
-    let src_content_type: String = match tx
+    let (src_content_type, src_etag, src_epoch): (String, String, i64) = match tx
         .query_opt(
-            "SELECT content_type FROM objects WHERE bucket = $1 AND key = $2",
+            "SELECT content_type, etag, floor(extract(epoch FROM last_modified))::bigint
+             FROM objects WHERE bucket = $1 AND key = $2",
             &[&src_bucket, &src_key],
         )
         .await?
     {
-        Some(row) => row.get(0),
+        Some(row) => (row.get(0), row.get(1), row.get(2)),
         None => {
             return Ok(format_s3_error(
                 StatusCode::NOT_FOUND,
@@ -98,6 +110,11 @@ pub async fn copy_object(
             ));
         }
     };
+    // Honour x-amz-copy-source-if-* conditions on the source; any failure (a 304
+    // for a read maps to 412 here) aborts the copy before any data is moved.
+    if preconditions.evaluate(&src_etag, src_epoch, true) != Precondition::Proceed {
+        return Ok(copy_precondition_failed());
+    }
     // Resolve the source's ordered parts and their locations from the same
     // snapshot (an empty object simply has none, and streams as a zero-byte body).
     let parts = resolve_object_parts(&tx, &src_bucket, &src_key).await?;
@@ -177,6 +194,7 @@ pub async fn copy_part(
     part_number: &str,
     copy_source: &str,
     copy_source_range: Option<&str>,
+    preconditions: &Preconditions,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -237,13 +255,14 @@ pub async fn copy_part(
         .await?;
     let row = tx
         .query_opt(
-            "SELECT size, to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"')
+            "SELECT size, to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"'),
+                    etag, floor(extract(epoch FROM last_modified))::bigint
              FROM objects WHERE bucket = $1 AND key = $2",
             &[&src_bucket, &src_key],
         )
         .await?;
-    let (size, last_modified): (i64, String) = match row {
-        Some(row) => (row.get(0), row.get(1)),
+    let (size, last_modified, src_etag, src_epoch): (i64, String, String, i64) = match row {
+        Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3)),
         None => {
             return Ok(format_s3_error(
                 StatusCode::NOT_FOUND,
@@ -252,6 +271,10 @@ pub async fn copy_part(
             ));
         }
     };
+    // Honour x-amz-copy-source-if-* conditions on the source before copying.
+    if preconditions.evaluate(&src_etag, src_epoch, true) != Precondition::Proceed {
+        return Ok(copy_precondition_failed());
+    }
     let size = size as u64;
     let parts = resolve_object_parts(&tx, &src_bucket, &src_key).await?;
     tx.commit().await?;

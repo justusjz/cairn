@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::{
     App,
     body::{FrameSender, ResBody, box_response, channel_body, send_file, send_incoming},
+    s3::conditional::{Precondition, Preconditions, not_modified},
     s3::util::format_s3_error,
 };
 
@@ -18,6 +19,7 @@ pub async fn get_object(
     bucket: &str,
     key: &str,
     range_header: Option<&str>,
+    preconditions: &Preconditions,
 ) -> anyhow::Result<Response<ResBody>> {
     let mut client = app.pool.get().await?;
     // Read the metadata, the ordered parts, and each part's locations in one
@@ -30,15 +32,31 @@ pub async fn get_object(
     let row = tx
         .query_opt(
             "SELECT etag, content_type, size,
-                    to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"')
+                    to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
+                    floor(extract(epoch FROM last_modified))::bigint
              FROM objects WHERE bucket = $1 AND key = $2",
             &[&bucket, &key],
         )
         .await?;
-    let (etag, content_type, size, last_modified): (String, String, i64, String) = match row {
-        Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3)),
-        None => return Ok(box_response(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", ""))),
-    };
+    let (etag, content_type, size, last_modified, lm_epoch): (String, String, i64, String, i64) =
+        match row {
+            Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)),
+            None => {
+                return Ok(box_response(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")));
+            }
+        };
+    // Honour conditional-request headers before doing any streaming work.
+    match preconditions.evaluate(&etag, lm_epoch, true) {
+        Precondition::Proceed => {}
+        Precondition::NotModified => return Ok(box_response(not_modified(&etag, &last_modified))),
+        Precondition::Failed => {
+            return Ok(box_response(format_s3_error(
+                StatusCode::PRECONDITION_FAILED,
+                "PreconditionFailed",
+                "at least one of the preconditions you specified did not hold",
+            )));
+        }
+    }
     let size = size as u64;
     // Resolve the requested object range as a half-open [range_start, range_end).
     // No/unsupported Range → the whole object (200); a satisfiable range → 206; a
@@ -299,20 +317,35 @@ pub async fn head_object(
     bucket: &str,
     key: &str,
     range_header: Option<&str>,
+    preconditions: &Preconditions,
 ) -> anyhow::Result<Response<http_body_util::Full<Bytes>>> {
     let client = app.pool.get().await?;
     let row = client
         .query_opt(
             "SELECT size, etag, content_type,
-                    to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"')
+                    to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
+                    floor(extract(epoch FROM last_modified))::bigint
              FROM objects WHERE bucket = $1 AND key = $2",
             &[&bucket, &key],
         )
         .await?;
-    let (size, etag, content_type, last_modified): (i64, String, String, String) = match row {
-        Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3)),
-        None => return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")),
-    };
+    let (size, etag, content_type, last_modified, lm_epoch): (i64, String, String, String, i64) =
+        match row {
+            Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)),
+            None => return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")),
+        };
+    // Honour conditional-request headers, exactly as GET does.
+    match preconditions.evaluate(&etag, lm_epoch, true) {
+        Precondition::Proceed => {}
+        Precondition::NotModified => return Ok(not_modified(&etag, &last_modified)),
+        Precondition::Failed => {
+            return Ok(format_s3_error(
+                StatusCode::PRECONDITION_FAILED,
+                "PreconditionFailed",
+                "at least one of the preconditions you specified did not hold",
+            ));
+        }
+    }
     // HEAD returns exactly the headers a GET would, with no body — so mirror the
     // GET range handling (206 + Content-Range for a range, 416 if unsatisfiable).
     let size = size as u64;
