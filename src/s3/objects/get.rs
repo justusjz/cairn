@@ -59,46 +59,14 @@ pub async fn get_object(
     let parts = resolve_object_parts(&tx, bucket, key).await?;
     tx.commit().await?;
 
-    // Walk the ordered parts, tracking the object offset where each begins, and
-    // intersect each part's span with the requested range. An overlapping part
-    // yields the (offset, length) to read from *within* that part; parts entirely
-    // outside the range are dropped.
-    let mut to_stream: Vec<(Uuid, Vec<(String, String)>, u64, u64)> = Vec::new();
-    let mut cursor: u64 = 0; // object offset at which the current part begins
-    for (part_id, part_size, locations) in parts {
-        let part_start = cursor;
-        let part_end = cursor + part_size;
-        cursor = part_end;
-        let overlap_start = range_start.max(part_start);
-        let overlap_end = range_end.min(part_end);
-        if overlap_start >= overlap_end {
-            continue; // part lies entirely outside the requested range
-        }
-        to_stream.push((
-            part_id,
-            locations,
-            overlap_start - part_start,  // offset within the part
-            overlap_end - overlap_start, // bytes to read from it
-        ));
-    }
-
-    // Stream the selected parts (each over its computed range) through a
-    // channel-backed body: a background task pulls each from a replica (locally if
-    // that's us) and forwards its chunks. We set Content-Length, so a truncated
-    // stream (a part we can't serve) is detected by the client rather than read as
-    // a short-but-complete object.
+    // Select the parts overlapping the requested range and stream them (each over
+    // its computed sub-range) through a channel-backed body: a background task
+    // pulls each from a replica (locally if that's us) and forwards its chunks. We
+    // set Content-Length, so a truncated stream (a part we can't serve) is detected
+    // by the client rather than read as a short-but-complete object.
+    let slices = select_parts_in_range(parts, range_start, range_end);
     let (sender, body) = channel_body();
-    let app = app.clone();
-    let self_id = app.store.get_node_id().to_string();
-    tokio::spawn(async move {
-        for (part_id, locations, offset, length) in to_stream {
-            let range = Some((offset, length));
-            if let Err(e) = stream_part(&app, part_id, range, &locations, &self_id, &sender).await {
-                let _ = sender.send(Err(e)).await;
-                return;
-            }
-        }
-    });
+    spawn_range_stream(app.clone(), slices, sender);
 
     let builder = Response::builder()
         .header(header::ACCEPT_RANGES, "bytes")
@@ -161,11 +129,64 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
     Ok(parts)
 }
 
+/// A slice of one part selected for streaming: its id, its candidate replica
+/// locations, and the (offset, length) to read from *within* the part.
+pub(crate) type PartSlice = (Uuid, Vec<(String, String)>, u64, u64);
+
+/// Selects the parts overlapping the half-open byte range [range_start, range_end)
+/// of the assembled object, each with the (offset, length) to read from within it.
+/// Parts entirely outside the range are dropped; `parts` must be in object order.
+/// Shared by GetObject (ranged reads) and the copy paths.
+pub(crate) fn select_parts_in_range(
+    parts: Vec<PartLocation>,
+    range_start: u64,
+    range_end: u64,
+) -> Vec<PartSlice> {
+    // Track the object offset where each part begins, and intersect its span with
+    // the requested range.
+    let mut slices: Vec<PartSlice> = Vec::new();
+    let mut cursor: u64 = 0;
+    for (part_id, part_size, locations) in parts {
+        let part_start = cursor;
+        let part_end = cursor + part_size;
+        cursor = part_end;
+        let overlap_start = range_start.max(part_start);
+        let overlap_end = range_end.min(part_end);
+        if overlap_start >= overlap_end {
+            continue; // part lies entirely outside the requested range
+        }
+        slices.push((
+            part_id,
+            locations,
+            overlap_start - part_start,  // offset within the part
+            overlap_end - overlap_start, // bytes to read from it
+        ));
+    }
+    slices
+}
+
+/// Spawns a background task that streams each selected part-slice to `sender`,
+/// pulling each from a replica (locally if that's us) via [`stream_part`]. If any
+/// slice can't be served the stream is faulted. Shared by GetObject and the copy
+/// paths.
+pub(crate) fn spawn_range_stream(app: Arc<App>, slices: Vec<PartSlice>, sender: FrameSender) {
+    let self_id = app.store.get_node_id().to_string();
+    tokio::spawn(async move {
+        for (part_id, locations, offset, length) in slices {
+            let range = Some((offset, length));
+            if let Err(e) = stream_part(&app, part_id, range, &locations, &self_id, &sender).await {
+                let _ = sender.send(Err(e)).await;
+                return;
+            }
+        }
+    });
+}
+
 /// Parses a single-range `Range: bytes=…` header against the object `size` into a
 /// half-open [start, end). `Ok(None)` = no usable range (serve the whole object,
 /// 200); `Err(())` = a syntactically valid but unsatisfiable range (416).
 /// Malformed and multi-range headers are ignored (treated as `None`).
-fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()> {
+pub(crate) fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()> {
     let Some(spec) = header.and_then(|h| h.strip_prefix("bytes=")) else {
         return Ok(None);
     };
@@ -213,7 +234,7 @@ fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()
 /// it — trying its locations in order (freshest first). Failover only happens
 /// before a source produces its first byte; once we start forwarding, a mid-stream
 /// failure faults the whole response (we can't unsend).
-pub(super) async fn stream_part(
+async fn stream_part(
     app: &App,
     part_id: Uuid,
     range: Option<(u64, u64)>,

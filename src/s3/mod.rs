@@ -15,7 +15,7 @@ use crate::{
             create::create_multipart_upload, upload_part::put_part,
         },
         objects::{
-            copy::copy_object,
+            copy::{copy_object, copy_part},
             delete::{delete_object, delete_objects},
             get::{get_object, head_object},
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
@@ -184,6 +184,12 @@ pub async fn handle(
         .get("x-amz-metadata-directive")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
+    // UploadPartCopy narrows the copy to a byte range of the source object.
+    let copy_source_range = req
+        .headers()
+        .get("x-amz-copy-source-range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     // Streaming-signature uploads (e.g. Mimir) frame the body as `aws-chunked`;
     // the upload path must decode it rather than store the framing verbatim.
     let aws_chunked = crate::aws_chunked::is_aws_chunked(req.headers());
@@ -216,6 +222,22 @@ pub async fn handle(
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
             complete_multipart_upload(&app, &upload_id, body).await?
         }
+        // UploadPartCopy: an UploadPart whose bytes come from another object
+        // (x-amz-copy-source) instead of the request body. Must precede UploadPart.
+        hyper::Method::PUT
+            if query_param(&query, "uploadId").is_some() && copy_source.is_some() =>
+        {
+            let upload_id = query_param(&query, "uploadId").unwrap_or_default();
+            let part_number = query_param(&query, "partNumber").unwrap_or_default();
+            copy_part(
+                &app,
+                &upload_id,
+                &part_number,
+                &copy_source.unwrap(),
+                copy_source_range.as_deref(),
+            )
+            .await?
+        }
         // UploadPart
         hyper::Method::PUT if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
@@ -231,9 +253,9 @@ pub async fn handle(
             )
             .await?
         }
-        // CopyObject: a PUT with x-amz-copy-source and no uploadId (the multipart
-        // UploadPartCopy variant is not supported). The source is read server-side,
-        // so the request body is ignored.
+        // CopyObject: a PUT with x-amz-copy-source and no uploadId (the uploadId
+        // variant, UploadPartCopy, is handled above). The source is read
+        // server-side, so the request body is ignored.
         hyper::Method::PUT if copy_source.is_some() => {
             copy_object(
                 &app,

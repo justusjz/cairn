@@ -2,13 +2,16 @@ use std::sync::Arc;
 
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
+use uuid::Uuid;
 
 use crate::{
     App, AttachTarget, UploadResult,
     auth::ContentSha256,
     body::channel_body,
     s3::{
-        objects::get::{resolve_object_parts, stream_part},
+        objects::get::{
+            parse_range, resolve_object_parts, select_parts_in_range, spawn_range_stream,
+        },
         util::{decode_path_param, format_s3_error, xml_ok},
     },
 };
@@ -30,14 +33,8 @@ pub async fn copy_object(
     metadata_directive: Option<&str>,
     request_content_type: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    // Parse `x-amz-copy-source`: "/bucket/key" or "bucket/key", optionally with a
-    // "?versionId=..." suffix, percent-encoded. Strip a leading slash and the
-    // (unsupported) version qualifier, then split bucket/key at the first slash and
-    // decode each half — mirroring how the request path itself is parsed.
-    let raw = copy_source.trim_start_matches('/');
-    let raw = raw.split('?').next().unwrap_or(raw);
-    let (src_bucket, src_key) = match raw.split_once('/') {
-        Some((bucket, key)) => (decode_path_param(bucket), decode_path_param(key)),
+    let (src_bucket, src_key) = match parse_copy_source(copy_source) {
+        Some(pair) => pair,
         None => {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
@@ -46,13 +43,6 @@ pub async fn copy_object(
             ));
         }
     };
-    if src_bucket.is_empty() || src_key.is_empty() {
-        return Ok(format_s3_error(
-            StatusCode::BAD_REQUEST,
-            "InvalidArgument",
-            "the x-amz-copy-source header is malformed",
-        ));
-    }
 
     // COPY (the default) keeps the source metadata; only REPLACE substitutes new.
     let replace = metadata_directive
@@ -114,24 +104,13 @@ pub async fn copy_object(
     tx.commit().await?;
     drop(client);
 
-    // Stream the source parts (in order, each whole) through a channel-backed body:
+    // Stream the whole source (every part, in order) through a channel-backed body:
     // a background task pulls each from a replica — locally if that's us — and
     // forwards its chunks, exactly as get_object does. That body is then fed to the
     // normal upload path, which replicates and commits it as the destination's part.
+    let total: u64 = parts.iter().map(|(_, size, _)| *size).sum();
     let (sender, source_body) = channel_body();
-    let stream_app = app.clone();
-    let self_id = app.store.get_node_id().to_string();
-    tokio::spawn(async move {
-        // The whole part is copied, so its size (used only for range math in GET)
-        // is irrelevant here.
-        for (part_id, _size, locations) in parts {
-            if let Err(e) = stream_part(&stream_app, part_id, None, &locations, &self_id, &sender).await
-            {
-                let _ = sender.send(Err(e)).await;
-                return;
-            }
-        }
-    });
+    spawn_range_stream(app.clone(), select_parts_in_range(parts, 0, total), sender);
 
     let attach = AttachTarget::Object {
         bucket: dest_bucket.to_owned(),
@@ -182,4 +161,165 @@ pub async fn copy_object(
          <ETag>\"{etag}\"</ETag>\
          </CopyObjectResult>"
     )))
+}
+
+/// UploadPartCopy: `PUT /{bucket}/{key}?partNumber=N&uploadId=U` with an
+/// `x-amz-copy-source` header (and optional `x-amz-copy-source-range`). Copies a
+/// byte range of the source object into a part staged under the upload — the
+/// large-object counterpart to CopyObject, letting a client assemble a copy out of
+/// parts bigger than a single CopyObject would allow. Returns the new part's ETag.
+///
+/// This is the clean path for large copies: the client owns the multipart upload's
+/// lifecycle and aborts it on failure, so there's no server-side state to orphan.
+pub async fn copy_part(
+    app: &Arc<App>,
+    upload_id: &str,
+    part_number: &str,
+    copy_source: &str,
+    copy_source_range: Option<&str>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let upload_id = match Uuid::parse_str(upload_id) {
+        Ok(id) => id,
+        Err(_) => {
+            return Ok(format_s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchUpload",
+                "the specified multipart upload does not exist",
+            ));
+        }
+    };
+    let part_number: i32 = match part_number.parse() {
+        Ok(n) if (1..=10_000).contains(&n) => n,
+        _ => {
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "partNumber must be an integer in 1..=10000",
+            ));
+        }
+    };
+    let (src_bucket, src_key) = match parse_copy_source(copy_source) {
+        Some(pair) => pair,
+        None => {
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "the x-amz-copy-source header is malformed",
+            ));
+        }
+    };
+
+    // Reject up front if the upload is gone, so we don't replicate a part we'd only
+    // fail to stage at commit (the FK would reject it anyway) — as put_part does.
+    let mut client = app.pool.get().await?;
+    if client
+        .query_opt(
+            "SELECT 1 FROM multipart_uploads WHERE upload_id = $1",
+            &[&upload_id],
+        )
+        .await?
+        .is_none()
+    {
+        return Ok(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "the specified multipart upload does not exist",
+        ));
+    }
+
+    // Read the source's total size, last-modified, and its ordered parts from one
+    // RepeatableRead snapshot, so a concurrent overwrite can't tear the view
+    // (mirrors get_object).
+    let tx = client
+        .build_transaction()
+        .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
+        .start()
+        .await?;
+    let row = tx
+        .query_opt(
+            "SELECT size, to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"')
+             FROM objects WHERE bucket = $1 AND key = $2",
+            &[&src_bucket, &src_key],
+        )
+        .await?;
+    let (size, last_modified): (i64, String) = match row {
+        Some(row) => (row.get(0), row.get(1)),
+        None => {
+            return Ok(format_s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchKey",
+                "the specified source key does not exist",
+            ));
+        }
+    };
+    let size = size as u64;
+    let parts = resolve_object_parts(&tx, &src_bucket, &src_key).await?;
+    tx.commit().await?;
+    drop(client);
+
+    // Resolve the copy range against the source size (absent header → whole
+    // object). Reuses GET's range parser; an unsatisfiable range is a 400.
+    let (start, end) = match parse_range(copy_source_range, size) {
+        Ok(Some((start, end))) => (start, end),
+        Ok(None) => (0, size),
+        Err(()) => {
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "the x-amz-copy-source-range is not satisfiable",
+            ));
+        }
+    };
+
+    // Stream the selected byte range of the source into one part staged under the
+    // upload, reusing the normal replicate-then-commit path (which computes the new
+    // part's ETag as it streams).
+    let (sender, source_body) = channel_body();
+    spawn_range_stream(app.clone(), select_parts_in_range(parts, start, end), sender);
+    let attach = AttachTarget::MultipartPart {
+        upload_id,
+        part_number,
+    };
+    let etag = match crate::upload_part(
+        app,
+        source_body,
+        &attach,
+        false,
+        ContentSha256::Unsigned,
+        None,
+    )
+    .await?
+    {
+        UploadResult::Committed(etag) => etag,
+        UploadResult::ContentSha256Mismatch | UploadResult::ChunkSignatureMismatch => {
+            return Ok(format_s3_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalError",
+                "the copy failed an integrity check",
+            ));
+        }
+    };
+    Ok(xml_ok(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+         <CopyPartResult>\
+         <LastModified>{last_modified}</LastModified>\
+         <ETag>\"{etag}\"</ETag>\
+         </CopyPartResult>"
+    )))
+}
+
+/// Parses an `x-amz-copy-source` value ("/bucket/key" or "bucket/key", optionally
+/// with a "?versionId=…" suffix, percent-encoded) into (bucket, key). Strips a
+/// leading slash and the (unsupported) version qualifier, then splits bucket/key
+/// at the first slash and decodes each half — mirroring how the request path is
+/// parsed. Returns None if malformed (no key separator, or an empty component).
+fn parse_copy_source(copy_source: &str) -> Option<(String, String)> {
+    let raw = copy_source.trim_start_matches('/');
+    let raw = raw.split('?').next().unwrap_or(raw);
+    let (bucket, key) = raw.split_once('/')?;
+    let (bucket, key) = (decode_path_param(bucket), decode_path_param(key));
+    if bucket.is_empty() || key.is_empty() {
+        return None;
+    }
+    Some((bucket, key))
 }
