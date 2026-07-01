@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use http_body_util::Empty;
 use hyper::{Method, Request, Response, StatusCode, body::Bytes, header};
+use deadpool_postgres::GenericClient;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use uuid::Uuid;
 
@@ -53,36 +54,10 @@ pub async fn get_object(
             )));
         }
     };
-    // Freshest location first per part, so we try the most-likely-live node first.
-    let rows = tx
-        .query(
-            "SELECT p.part_number, p.part_id, p.size, pl.node_id, n.peer_url
-             FROM parts p
-             JOIN part_locations pl ON pl.part_id = p.part_id
-             JOIN nodes n ON n.node_id = pl.node_id
-             WHERE p.object_bucket = $1 AND p.object_key = $2
-             ORDER BY p.part_number, n.last_seen DESC",
-            &[&bucket, &key],
-        )
-        .await?;
+    // Resolve the ordered parts and each part's candidate locations (freshest
+    // first) from this same snapshot.
+    let parts = resolve_object_parts(&tx, bucket, key).await?;
     tx.commit().await?;
-
-    // Group the flat rows into ordered parts, each with its size and its
-    // candidate locations.
-    let mut parts: Vec<(Uuid, u64, Vec<(String, String)>)> = Vec::new();
-    let mut current: Option<i32> = None;
-    for row in &rows {
-        let part_number: i32 = row.get(0);
-        let part_id: Uuid = row.get(1);
-        let part_size: i64 = row.get(2);
-        let node_id: String = row.get(3);
-        let peer_url: String = row.get(4);
-        if current != Some(part_number) {
-            parts.push((part_id, part_size as u64, Vec::new()));
-            current = Some(part_number);
-        }
-        parts.last_mut().unwrap().2.push((node_id, peer_url));
-    }
 
     // Walk the ordered parts, tracking the object offset where each begins, and
     // intersect each part's span with the requested range. An overlapping part
@@ -142,6 +117,50 @@ pub async fn get_object(
     Ok(builder.body(body).unwrap())
 }
 
+/// One committed part of an object for streaming: its id, its size in bytes, and
+/// its candidate replica locations as (node_id, peer_url), freshest node first.
+pub(crate) type PartLocation = (Uuid, u64, Vec<(String, String)>);
+
+/// Resolves an object's committed parts in order, each with its size and its
+/// candidate replica locations (freshest node first). Runs within the caller's
+/// transaction, so the parts and their locations come from one consistent
+/// snapshot. Shared by GetObject (range streaming) and CopyObject (whole-object
+/// copy).
+pub(crate) async fn resolve_object_parts<C: GenericClient>(
+    client: &C,
+    bucket: &str,
+    key: &str,
+) -> Result<Vec<PartLocation>, tokio_postgres::Error> {
+    let rows = client
+        .query(
+            "SELECT p.part_number, p.part_id, p.size, pl.node_id, n.peer_url
+             FROM parts p
+             JOIN part_locations pl ON pl.part_id = p.part_id
+             JOIN nodes n ON n.node_id = pl.node_id
+             WHERE p.object_bucket = $1 AND p.object_key = $2
+             ORDER BY p.part_number, n.last_seen DESC",
+            &[&bucket, &key],
+        )
+        .await?;
+    // Fold the flat join rows into one entry per part (rows are ordered by
+    // part_number, then location), collecting each part's candidate locations.
+    let mut parts: Vec<PartLocation> = Vec::new();
+    let mut current: Option<i32> = None;
+    for row in &rows {
+        let part_number: i32 = row.get(0);
+        let part_id: Uuid = row.get(1);
+        let part_size: i64 = row.get(2);
+        let node_id: String = row.get(3);
+        let peer_url: String = row.get(4);
+        if current != Some(part_number) {
+            parts.push((part_id, part_size as u64, Vec::new()));
+            current = Some(part_number);
+        }
+        parts.last_mut().unwrap().2.push((node_id, peer_url));
+    }
+    Ok(parts)
+}
+
 /// Parses a single-range `Range: bytes=…` header against the object `size` into a
 /// half-open [start, end). `Ok(None)` = no usable range (serve the whole object,
 /// 200); `Err(())` = a syntactically valid but unsatisfiable range (416).
@@ -194,7 +213,7 @@ fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()
 /// it — trying its locations in order (freshest first). Failover only happens
 /// before a source produces its first byte; once we start forwarding, a mid-stream
 /// failure faults the whole response (we can't unsend).
-async fn stream_part(
+pub(super) async fn stream_part(
     app: &App,
     part_id: Uuid,
     range: Option<(u64, u64)>,

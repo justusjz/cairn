@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 use deadpool_postgres::{Object, Pool};
 use http_body_util::{BodyExt, Empty};
 use hyper::{
-    Method, Request, StatusCode, body::Body, body::Bytes, body::Frame, body::Incoming,
+    Method, Request, StatusCode, body::Body, body::Bytes, body::Frame,
     server::conn::http1, service::service_fn,
 };
 use hyper_util::{client::legacy::Client, rt::TokioExecutor, rt::TokioIo};
@@ -364,14 +364,18 @@ enum UploadResult {
     ChunkSignatureMismatch,
 }
 
-async fn upload_part(
+async fn upload_part<B>(
     app: &Arc<App>,
-    mut body: Incoming,
+    mut body: B,
     attach: &AttachTarget,
     aws_chunked: bool,
     content_sha256: ContentSha256,
     chunk_verifier: Option<StreamingChunkVerifier>,
-) -> anyhow::Result<UploadResult> {
+) -> anyhow::Result<UploadResult>
+where
+    B: Body<Data = Bytes> + Unpin + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let client = app.pool.get().await?;
     let part_id = Uuid::new_v4();
     // 1. create the pending part. Its size isn't known until the body is fully

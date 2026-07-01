@@ -15,6 +15,7 @@ use crate::{
             create::create_multipart_upload, upload_part::put_part,
         },
         objects::{
+            copy::copy_object,
             delete::{delete_object, delete_objects},
             get::{get_object, head_object},
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
@@ -169,6 +170,20 @@ pub async fn handle(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
+    // A PUT carrying x-amz-copy-source is a CopyObject (server-side copy); its
+    // metadata-directive decides whether the destination inherits the source's
+    // metadata (COPY, default) or takes the request's own (REPLACE). Read both
+    // before the body-consuming arms.
+    let copy_source = req
+        .headers()
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let metadata_directive = req
+        .headers()
+        .get("x-amz-metadata-directive")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
     // Streaming-signature uploads (e.g. Mimir) frame the body as `aws-chunked`;
     // the upload path must decode it rather than store the framing verbatim.
     let aws_chunked = crate::aws_chunked::is_aws_chunked(req.headers());
@@ -213,6 +228,20 @@ pub async fn handle(
                 aws_chunked,
                 content_sha256,
                 chunk_verifier,
+            )
+            .await?
+        }
+        // CopyObject: a PUT with x-amz-copy-source and no uploadId (the multipart
+        // UploadPartCopy variant is not supported). The source is read server-side,
+        // so the request body is ignored.
+        hyper::Method::PUT if copy_source.is_some() => {
+            copy_object(
+                &app,
+                &bucket,
+                &key,
+                &copy_source.unwrap(),
+                metadata_directive.as_deref(),
+                &content_type,
             )
             .await?
         }
