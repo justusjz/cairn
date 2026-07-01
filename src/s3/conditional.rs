@@ -14,7 +14,7 @@ pub enum Precondition {
 
 /// The conditional-request headers (RFC 7232), or their `x-amz-copy-source-*`
 /// equivalents for the copy endpoints. An absent header is `None`.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Preconditions {
     if_match: Option<String>,
     if_none_match: Option<String>,
@@ -81,6 +81,37 @@ impl Preconditions {
             return Precondition::NotModified;
         }
         Precondition::Proceed
+    }
+
+    /// Whether any *write* precondition (If-Match / If-None-Match) is present. The
+    /// date conditions are not honored on writes, so they don't count.
+    pub fn has_write_conditions(&self) -> bool {
+        self.if_match.is_some() || self.if_none_match.is_some()
+    }
+
+    /// Evaluates the write preconditions (If-Match / If-None-Match) against the
+    /// object currently at the target key — `current_etag` is `Some` iff it
+    /// exists — returning whether the write may proceed. Date conditions are
+    /// ignored on writes, matching S3 (which honors only the entity-tag forms for
+    /// conditional writes).
+    pub fn allows_write(&self, current_etag: Option<&str>) -> bool {
+        // If-None-Match: proceed unless the current object matches, so `*` means
+        // "only if absent" and a tag means "only if it differs".
+        if let Some(if_none_match) = &self.if_none_match
+            && let Some(etag) = current_etag
+            && etag_matches(if_none_match, etag)
+        {
+            return false;
+        }
+        // If-Match: proceed only if the current object exists and matches, so `*`
+        // means "only if present".
+        if let Some(if_match) = &self.if_match {
+            match current_etag {
+                Some(etag) if etag_matches(if_match, etag) => {}
+                _ => return false,
+            }
+        }
+        true
     }
 }
 
@@ -257,6 +288,38 @@ mod tests {
         assert_eq!(conds(None, None, Some(EARLIER), None).evaluate("abc", REF, true), Precondition::Proceed);
         // Ignored for writes (precedence step 4 is read-only).
         assert_eq!(conds(None, None, Some(REF_DATE), None).evaluate("abc", REF, false), Precondition::Proceed);
+    }
+
+    #[test]
+    fn write_if_none_match_star_is_create_if_absent() {
+        let c = conds(None, Some("*"), None, None);
+        assert!(c.has_write_conditions());
+        assert!(c.allows_write(None)); // absent → create
+        assert!(!c.allows_write(Some("abc"))); // exists → blocked
+    }
+
+    #[test]
+    fn write_if_match_is_compare_and_swap() {
+        let c = conds(Some("\"abc\""), None, None, None);
+        assert!(c.allows_write(Some("abc"))); // matches → overwrite
+        assert!(!c.allows_write(Some("def"))); // differs → blocked
+        assert!(!c.allows_write(None)); // absent → nothing to match → blocked
+    }
+
+    #[test]
+    fn write_if_none_match_specific_tag() {
+        let c = conds(None, Some("\"abc\""), None, None);
+        assert!(!c.allows_write(Some("abc"))); // matches → blocked
+        assert!(c.allows_write(Some("def"))); // differs → ok
+        assert!(c.allows_write(None)); // absent → ok
+    }
+
+    #[test]
+    fn write_without_conditions_always_allowed() {
+        let c = conds(None, None, None, None);
+        assert!(!c.has_write_conditions());
+        assert!(c.allows_write(Some("abc")));
+        assert!(c.allows_write(None));
     }
 
     #[test]

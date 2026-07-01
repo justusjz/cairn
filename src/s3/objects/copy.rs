@@ -137,6 +137,9 @@ pub async fn copy_object(
         } else {
             src_content_type
         },
+        // Copy conditions gate on the source (checked above); the destination
+        // carries no write guard.
+        conditions: Preconditions::default(),
     };
     // The source stream is trusted internal data, so it carries no content-sha256
     // claim (Unsigned) and no aws-chunked framing — only Committed is reachable.
@@ -151,7 +154,9 @@ pub async fn copy_object(
     .await?
     {
         UploadResult::Committed(etag) => etag,
-        UploadResult::ContentSha256Mismatch | UploadResult::ChunkSignatureMismatch => {
+        UploadResult::ContentSha256Mismatch
+        | UploadResult::ChunkSignatureMismatch
+        | UploadResult::PreconditionFailed => {
             return Ok(format_s3_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",
@@ -314,7 +319,9 @@ pub async fn copy_part(
     .await?
     {
         UploadResult::Committed(etag) => etag,
-        UploadResult::ContentSha256Mismatch | UploadResult::ChunkSignatureMismatch => {
+        UploadResult::ContentSha256Mismatch
+        | UploadResult::ChunkSignatureMismatch
+        | UploadResult::PreconditionFailed => {
             return Ok(format_s3_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "InternalError",

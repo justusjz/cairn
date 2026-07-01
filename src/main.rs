@@ -17,6 +17,7 @@ use uuid::Uuid;
 use crate::auth::{ContentSha256, StreamingChunkVerifier, TrailerChecksum};
 use crate::aws_chunked::AwsChunkedDecoder;
 use crate::body::{FrameSender, channel_body};
+use crate::s3::conditional::Preconditions;
 use crate::store::Store;
 use crate::writing::WritingSet;
 
@@ -343,11 +344,15 @@ where
 /// the body streams, and passed to `try_commit_part` alongside the target.
 enum AttachTarget {
     /// A single-PUT object: point (bucket, key) at exactly this one part,
-    /// replacing whatever it referenced before.
+    /// replacing whatever it referenced before. `conditions` carries any
+    /// conditional-write guard (If-Match / If-None-Match), evaluated against the
+    /// current object inside the commit transaction; it's empty for a copy
+    /// destination (whose conditions apply to the source instead).
     Object {
         bucket: String,
         key: String,
         content_type: String,
+        conditions: Preconditions,
     },
     /// A part staged under an in-progress multipart upload.
     MultipartPart { upload_id: Uuid, part_number: i32 },
@@ -362,6 +367,9 @@ enum UploadResult {
     ContentSha256Mismatch,
     /// A mode-4 chunk signature didn't verify against the secret.
     ChunkSignatureMismatch,
+    /// A conditional-write guard (If-Match / If-None-Match) didn't hold against
+    /// the object currently at the target key.
+    PreconditionFailed,
 }
 
 async fn upload_part<B>(
@@ -543,6 +551,7 @@ where
     // transaction; retry on a serialization conflict (e.g. a concurrent GC).
     let mut client = app.pool.get().await?;
     let mut committed = false;
+    let mut precondition_failed = false;
     for _ in 0..MAX_COMMIT_ATTEMPTS {
         match try_commit_part(&mut client, part_id, &node_ids, attach, size, &etag).await {
             Ok(CommitResult::Committed(displaced)) => {
@@ -551,12 +560,21 @@ where
                 committed = true;
                 break;
             }
+            Ok(CommitResult::PreconditionFailed) => {
+                precondition_failed = true;
+                break;
+            }
             Ok(CommitResult::MissingLocations { present, required }) => anyhow::bail!(
                 "part {part_id} not durable: only {present}/{required} replicas reported a location"
             ),
             Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
             Err(e) => return Err(e.into()),
         }
+    }
+    // The pending part left behind by a failed conditional write is reclaimed by
+    // the GC, exactly like the content-sha256 mismatch path above.
+    if precondition_failed {
+        return Ok(UploadResult::PreconditionFailed);
     }
     if !committed {
         anyhow::bail!(
@@ -573,6 +591,8 @@ enum CommitResult {
     /// (an overwrite or part re-upload), for the caller to reap.
     Committed(Vec<ReapTarget>),
     MissingLocations { present: i64, required: usize },
+    /// A conditional-write guard didn't hold; nothing was written.
+    PreconditionFailed,
 }
 
 /// Runs the commit transaction once under SERIALIZABLE isolation: confirms that
@@ -621,7 +641,25 @@ async fn try_commit_part(
             bucket,
             key,
             content_type,
+            conditions,
         } => {
+            // Conditional write: evaluate If-Match / If-None-Match against the
+            // object currently at the key, inside this serializable transaction so
+            // the guard is atomic with the overwrite below (a pre-check would race
+            // a concurrent writer). Skipped when no write conditions are set.
+            if conditions.has_write_conditions() {
+                let current: Option<String> = tx
+                    .query_opt(
+                        "SELECT etag FROM objects WHERE bucket = $1 AND key = $2",
+                        &[bucket, key],
+                    )
+                    .await?
+                    .map(|row| row.get(0));
+                if !conditions.allows_write(current.as_deref()) {
+                    // Dropping `tx` here rolls the transaction back.
+                    return Ok(CommitResult::PreconditionFailed);
+                }
+            }
             // Upsert the object's metadata first, so the part's owner FK target
             // exists.
             tx.execute(

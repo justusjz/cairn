@@ -91,5 +91,11 @@ pub async fn put_part(
             "SignatureDoesNotMatch",
             "the request signature we calculated does not match the signature you provided",
         )),
+        // UploadPart carries no conditional-write guard, so this can't occur.
+        UploadResult::PreconditionFailed => Ok(format_s3_error(
+            StatusCode::PRECONDITION_FAILED,
+            "PreconditionFailed",
+            "at least one of the preconditions you specified did not hold",
+        )),
     }
 }

@@ -30,7 +30,7 @@ use crate::{
 };
 
 mod buckets;
-mod conditional;
+pub(crate) mod conditional;
 mod multipart;
 mod objects;
 mod util;
@@ -229,7 +229,7 @@ pub async fn handle(
         hyper::Method::POST if query_param(&query, "uploadId").is_some() => {
             let body = req.into_body().collect().await?.to_bytes();
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
-            complete_multipart_upload(&app, &upload_id, body).await?
+            complete_multipart_upload(&app, &upload_id, body, &preconditions).await?
         }
         // UploadPartCopy: an UploadPart whose bytes come from another object
         // (x-amz-copy-source) instead of the request body. Must precede UploadPart.
@@ -288,6 +288,7 @@ pub async fn handle(
                 aws_chunked,
                 content_sha256,
                 chunk_verifier,
+                &preconditions,
             )
             .await?
         }

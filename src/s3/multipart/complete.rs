@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     App,
+    s3::conditional::Preconditions,
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
 
@@ -22,6 +23,8 @@ enum CompleteOutcome {
     },
     NoSuchUpload,
     InvalidPart,
+    /// A conditional-completion guard (If-Match / If-None-Match) didn't hold.
+    PreconditionFailed,
 }
 
 /// Parses a CompleteMultipartUpload body into (part_number, unquoted-etag) pairs,
@@ -62,6 +65,7 @@ pub async fn complete_multipart_upload(
     app: &App,
     upload_id: &str,
     body: Bytes,
+    preconditions: &Preconditions,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -101,7 +105,7 @@ pub async fn complete_multipart_upload(
 
     let mut client = app.pool.get().await?;
     for _ in 0..MAX_COMPLETE_ATTEMPTS {
-        match try_complete(&mut client, &upload_id, &requested).await {
+        match try_complete(&mut client, &upload_id, &requested, preconditions).await {
             Ok(CompleteOutcome::Done { bucket, key, etag }) => {
                 let body = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -128,6 +132,13 @@ pub async fn complete_multipart_upload(
                     "one or more listed parts could not be found or its ETag did not match",
                 ));
             }
+            Ok(CompleteOutcome::PreconditionFailed) => {
+                return Ok(format_s3_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "PreconditionFailed",
+                    "at least one of the preconditions you specified did not hold",
+                ));
+            }
             Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
             Err(e) => return Err(e.into()),
         }
@@ -146,6 +157,7 @@ async fn try_complete(
     client: &mut Object,
     upload_id: &Uuid,
     requested: &[(i32, String)],
+    preconditions: &Preconditions,
 ) -> Result<CompleteOutcome, tokio_postgres::Error> {
     let tx = client
         .build_transaction()
@@ -192,6 +204,24 @@ async fn try_complete(
         .map(|b| format!("{b:02x}"))
         .collect();
     let final_etag = format!("{combined}-{}", requested.len());
+
+    // Conditional completion: honour If-Match / If-None-Match against the object
+    // currently at the key, inside this serializable transaction so the guard is
+    // atomic with the swap below (matching conditional PutObject).
+    if preconditions.has_write_conditions() {
+        let current: Option<String> = tx
+            .query_opt(
+                "SELECT etag FROM objects WHERE bucket = $1 AND key = $2",
+                &[&bucket, &key],
+            )
+            .await?
+            .map(|row| row.get(0));
+        if !preconditions.allows_write(current.as_deref()) {
+            // Dropping `tx` here rolls the transaction back, leaving the upload
+            // intact for the client to retry or abort.
+            return Ok(CompleteOutcome::PreconditionFailed);
+        }
+    }
 
     // Publish atomically: object metadata, drop the old object's parts, re-point
     // the chosen staged parts to the object, then delete the upload (cascading

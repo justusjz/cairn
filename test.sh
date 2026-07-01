@@ -47,7 +47,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=46
+TOTAL=48
 STEP=0
 PASS=0
 FAIL=0
@@ -408,6 +408,45 @@ conditional_copy_ok() {
     awss3 s3api delete-object --bucket "$BUCKET" --key copy/cond.txt >/dev/null 2>&1
 }
 
+# Conditional PUT (crafted with scurl for exact codes): If-None-Match:* is
+# create-if-absent (200 then 412); If-Match is compare-and-swap (200 on the
+# current tag, 412 on a wrong one).
+conditional_put_ok() {
+    local key="cput-$RANDOM" etag zero='"00000000000000000000000000000000"'
+    [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$SMALL" "If-None-Match: *")" = 200 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$SMALL" "If-None-Match: *")" = 412 ] || return 1
+    etag=$(awss3 s3api head-object --bucket "$BUCKET" --key "$key" \
+        --query ETag --output text 2>/dev/null) || return 1
+    etag=${etag//\"/}
+    [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$SMALL" "If-Match: \"$etag\"")" = 200 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$SMALL" "If-Match: $zero")" = 412 ] || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key "$key" >/dev/null 2>&1
+}
+
+# Conditional CompleteMultipartUpload: If-None-Match:* is create-if-absent — the
+# first completion creates the object (200), a second one to the same key is
+# rejected (412). Uses scurl for the complete POST to assert exact codes.
+conditional_complete_ok() {
+    local key="cmu-$RANDOM" uid etag xml="$WORK_DIR/cmu.xml"
+    complete_once() {  # complete_once <expected-code>; echoes nothing, returns status
+        uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key "$key" \
+            --query UploadId --output text 2>/dev/null) || return 1
+        etag=$(awss3 s3api upload-part --bucket "$BUCKET" --key "$key" \
+            --part-number 1 --upload-id "$uid" --body "$SMALL" \
+            --query ETag --output text 2>/dev/null) || return 1
+        etag=${etag//\"/}
+        printf '<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"%s"</ETag></Part></CompleteMultipartUpload>' \
+            "$etag" >"$xml"
+        [ "$(scurl POST "/${BUCKET}/${key}?uploadId=${uid}" UNSIGNED-PAYLOAD "$xml" "If-None-Match: *")" = "$1" ]
+    }
+    complete_once 200 || return 1
+    # Second upload to the now-existing key: its conditional completion is refused,
+    # leaving the upload staged — abort it as cleanup.
+    complete_once 412 || { awss3 s3api abort-multipart-upload --bucket "$BUCKET" --key "$key" --upload-id "$uid" >/dev/null 2>&1; return 1; }
+    awss3 s3api abort-multipart-upload --bucket "$BUCKET" --key "$key" --upload-id "$uid" >/dev/null 2>&1
+    awss3 s3api delete-object --bucket "$BUCKET" --key "$key" >/dev/null 2>&1
+}
+
 # Mode 2: whole-body SHA-256. Correct hash accepted + round-trips; wrong → 400.
 content_sha256_ok() {
     local sha
@@ -629,6 +668,8 @@ run_test    "UploadPartCopy (ranged, multipart src)" upload_part_copy_ranged_ok
 run_test    "Conditional GET (ETag: 304/412/200)"   conditional_get_etag_ok
 run_test    "Conditional GET (dates: 304/412/200)"  conditional_get_date_ok
 run_test    "Conditional copy (copy-source-if-match)" conditional_copy_ok
+run_test    "Conditional PUT (If-None-Match / If-Match)" conditional_put_ok
+run_test    "Conditional CompleteMultipartUpload"     conditional_complete_ok
 run_test    "Body SHA-256 verified (good/bad)"      content_sha256_ok
 run_test    "aws-chunked trailer checksum (CRC32)"  streaming_trailer_ok
 run_test    "Signed streaming upload via mcli (mode 4)" mc_streaming_ok
