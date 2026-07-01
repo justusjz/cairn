@@ -47,7 +47,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=36
+TOTAL=43
 STEP=0
 PASS=0
 FAIL=0
@@ -288,6 +288,83 @@ range_ok() {  # range_ok <key> <start> <end> <localfile>
     cmp -s "$out" <(tail -c "+$((start + 1))" "$src" | head -c "$((end - start + 1))")
 }
 
+# ─── CopyObject / UploadPartCopy (server-side copy) ──────────────────────────
+# Each helper removes the object(s) it creates; as elsewhere, that final delete
+# is the test's success condition (after the `|| return 1` guards).
+
+# CopyObject: a server-side copy of a small object matches the source.
+copy_small_ok() {
+    awss3 s3api copy-object --bucket "$BUCKET" --key copy/small.txt \
+        --copy-source "${BUCKET}/small.txt" >/dev/null 2>&1 || return 1
+    check_roundtrip "$SMALL" "s3://${BUCKET}/copy/small.txt" || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key copy/small.txt >/dev/null 2>&1
+}
+
+# CopyObject of a multipart-uploaded source produces a *normal* object: the
+# content matches and the ETag is a plain 32-hex MD5 (no multipart "-N" suffix).
+copy_multipart_source_normal_ok() {
+    awss3 s3api copy-object --bucket "$BUCKET" --key copy/multi.bin \
+        --copy-source "${BUCKET}/multi.bin" >/dev/null 2>&1 || return 1
+    check_roundtrip "$MULTIPART" "s3://${BUCKET}/copy/multi.bin" || return 1
+    local etag
+    etag=$(awss3 s3api head-object --bucket "$BUCKET" --key copy/multi.bin \
+        --query ETag --output text 2>/dev/null) || return 1
+    etag=${etag//\"/}
+    [[ "$etag" =~ ^[0-9a-f]{32}$ ]] || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key copy/multi.bin >/dev/null 2>&1
+}
+
+# CopyObject with metadata-directive REPLACE overrides the content-type.
+copy_replace_content_type_ok() {
+    awss3 s3api copy-object --bucket "$BUCKET" --key copy/typed.txt \
+        --copy-source "${BUCKET}/small.txt" \
+        --metadata-directive REPLACE --content-type text/x-cairn >/dev/null 2>&1 || return 1
+    awss3 s3api head-object --bucket "$BUCKET" --key copy/typed.txt \
+        --query ContentType --output text 2>/dev/null | grep -qx text/x-cairn || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key copy/typed.txt >/dev/null 2>&1
+}
+
+# UploadPartCopy: assemble a destination by copying the whole source as a single
+# part through a multipart upload; the result matches the source.
+upload_part_copy_whole_ok() {
+    local dest="upc/whole.bin" uid etag
+    uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key "$dest" \
+        --query UploadId --output text 2>/dev/null) || return 1
+    etag=$(awss3 s3api upload-part-copy --bucket "$BUCKET" --key "$dest" \
+        --part-number 1 --upload-id "$uid" --copy-source "${BUCKET}/big.bin" \
+        --query 'CopyPartResult.ETag' --output text 2>/dev/null) || return 1
+    etag=${etag//\"/}
+    awss3 s3api complete-multipart-upload --bucket "$BUCKET" --key "$dest" \
+        --upload-id "$uid" \
+        --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":\"${etag}\"}]}" >/dev/null 2>&1 || return 1
+    check_roundtrip "$BIG" "s3://${BUCKET}/${dest}" || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key "$dest" >/dev/null 2>&1
+}
+
+# UploadPartCopy with copy-source-range: build a destination from two byte ranges
+# of a multipart source (the split crosses its internal part boundaries), then
+# complete. The reassembled object matches the whole source.
+upload_part_copy_ranged_ok() {
+    local dest="upc/ranged.bin" uid e1 e2 size half
+    size=$(wc -c <"$MULTIPART"); half=$((size / 2))
+    uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key "$dest" \
+        --query UploadId --output text 2>/dev/null) || return 1
+    e1=$(awss3 s3api upload-part-copy --bucket "$BUCKET" --key "$dest" \
+        --part-number 1 --upload-id "$uid" --copy-source "${BUCKET}/multi.bin" \
+        --copy-source-range "bytes=0-$((half - 1))" \
+        --query 'CopyPartResult.ETag' --output text 2>/dev/null) || return 1
+    e2=$(awss3 s3api upload-part-copy --bucket "$BUCKET" --key "$dest" \
+        --part-number 2 --upload-id "$uid" --copy-source "${BUCKET}/multi.bin" \
+        --copy-source-range "bytes=${half}-$((size - 1))" \
+        --query 'CopyPartResult.ETag' --output text 2>/dev/null) || return 1
+    e1=${e1//\"/}; e2=${e2//\"/}
+    awss3 s3api complete-multipart-upload --bucket "$BUCKET" --key "$dest" \
+        --upload-id "$uid" \
+        --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":\"${e1}\"},{\"PartNumber\":2,\"ETag\":\"${e2}\"}]}" >/dev/null 2>&1 || return 1
+    check_roundtrip "$MULTIPART" "s3://${BUCKET}/${dest}" || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key "$dest" >/dev/null 2>&1
+}
+
 # Mode 2: whole-body SHA-256. Correct hash accepted + round-trips; wrong → 400.
 content_sha256_ok() {
     local sha
@@ -499,6 +576,13 @@ run_test    "Download multipart object matches"     check_roundtrip "$MULTIPART"
 run_test    "Ranged GET (single part) matches"      range_ok big.bin 1000000 1000099 "$BIG"
 run_test    "Ranged GET across multipart boundary"  range_ok multi.bin 5242875 5242884 "$MULTIPART"
 expect_fail "Unsatisfiable range is rejected"       awss3 s3api get-object --bucket "${BUCKET}" --key big.bin --range "bytes=99999999-100000000" "$WORK_DIR/x416"
+run_test    "CopyObject (small object)"             copy_small_ok
+run_test    "CopyObject of multipart src is normal" copy_multipart_source_normal_ok
+run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok
+expect_fail "Self-copy without REPLACE rejected"    awss3 s3api copy-object --bucket "$BUCKET" --key big.bin --copy-source "${BUCKET}/big.bin"
+expect_fail "Copy from missing source fails"        awss3 s3api copy-object --bucket "$BUCKET" --key copy/none.txt --copy-source "${BUCKET}/does-not-exist.txt"
+run_test    "UploadPartCopy (whole object)"         upload_part_copy_whole_ok
+run_test    "UploadPartCopy (ranged, multipart src)" upload_part_copy_ranged_ok
 run_test    "Body SHA-256 verified (good/bad)"      content_sha256_ok
 run_test    "aws-chunked trailer checksum (CRC32)"  streaming_trailer_ok
 run_test    "Signed streaming upload via mcli (mode 4)" mc_streaming_ok
