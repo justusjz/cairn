@@ -47,7 +47,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=48
+TOTAL=49
 STEP=0
 PASS=0
 FAIL=0
@@ -542,7 +542,10 @@ setup_pagination() {
 }
 
 teardown_pagination() {
-    s3 del --recursive "s3://${PBUCKET}/" >/dev/null 2>&1
+    # --force: s3cmd refuses a recursive bucket wipe without it (and does nothing).
+    # rb then requires the bucket to be empty (DeleteBucket returns BucketNotEmpty
+    # otherwise), so the recursive delete must actually succeed first.
+    s3 del --recursive --force "s3://${PBUCKET}/" >/dev/null 2>&1
     s3 rb "s3://${PBUCKET}" >/dev/null 2>&1
 }
 
@@ -588,6 +591,21 @@ batch_delete_ok() {
     ! awss3 s3api head-object --bucket "$BUCKET" --key bd2.txt >/dev/null 2>&1 || return 1
     awss3 s3api head-object --bucket "$BUCKET" --key bd3.txt >/dev/null 2>&1 || return 1
     awss3 s3api delete-object --bucket "$BUCKET" --key bd3.txt >/dev/null 2>&1
+}
+
+# DeleteBucket refuses a non-empty bucket. S3 returns 409 BucketNotEmpty; without
+# the emptiness guard the buckets->objects ON DELETE CASCADE would silently wipe
+# every object. Assert the exact codes with scurl, confirm the object survives the
+# rejected delete, then empty the bucket and delete it cleanly (204). Self-contained
+# throwaway bucket so it's independent of the main fixtures.
+delete_nonempty_bucket_rejected() {
+    local nb="nonempty-$(date +%s)"
+    s3 mb "s3://${nb}" >/dev/null 2>&1 || return 1
+    s3 put "$SMALL" "s3://${nb}/keep.txt" >/dev/null 2>&1 || return 1
+    [ "$(scurl DELETE "/${nb}" "$EMPTY_SHA256" -)" = 409 ] || return 1
+    check_roundtrip "$SMALL" "s3://${nb}/keep.txt" || return 1
+    s3 del "s3://${nb}/keep.txt" >/dev/null 2>&1 || return 1
+    [ "$(scurl DELETE "/${nb}" "$EMPTY_SHA256" -)" = 204 ]
 }
 
 # DeleteObjects integrity/existence guards (crafted, signed with scurl): no
@@ -680,6 +698,7 @@ run_test    "ListObjectsV2 paginates prefixes"      v2_prefixes_ok
 run_test    "Tear down pagination bucket"           teardown_pagination
 run_test    "Batch delete (DeleteObjects)"          batch_delete_ok
 run_test    "Batch delete guards (MD5 / bucket)"    batch_delete_guards_ok
+run_test    "DeleteBucket on non-empty bucket rejected" delete_nonempty_bucket_rejected
 run_test    "Deleted parts reaped without prune"    immediate_reap_ok
 run_test    "Prune removes empty shard dirs"         prune_empty_dirs_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
