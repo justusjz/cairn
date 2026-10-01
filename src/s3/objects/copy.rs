@@ -195,6 +195,8 @@ pub async fn copy_object(
 /// lifecycle and aborts it on failure, so there's no server-side state to orphan.
 pub async fn copy_part(
     app: &Arc<App>,
+    bucket: &str,
+    key: &str,
     upload_id: &str,
     part_number: &str,
     copy_source: &str,
@@ -233,12 +235,13 @@ pub async fn copy_part(
     };
 
     // Reject up front if the upload is gone, so we don't replicate a part we'd only
-    // fail to stage at commit (the FK would reject it anyway) — as put_part does.
+    // fail to stage at commit (the FK would reject it anyway), and require it to
+    // belong to the request's bucket/key — as put_part does.
     let mut client = app.pool.get().await?;
     if client
         .query_opt(
-            "SELECT 1 FROM multipart_uploads WHERE upload_id = $1",
-            &[&upload_id],
+            "SELECT 1 FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
+            &[&upload_id, &bucket, &key],
         )
         .await?
         .is_none()
@@ -343,7 +346,7 @@ pub async fn copy_part(
 /// leading slash and the (unsupported) version qualifier, then splits bucket/key
 /// at the first slash and decodes each half — mirroring how the request path is
 /// parsed. Returns None if malformed (no key separator, or an empty component).
-fn parse_copy_source(copy_source: &str) -> Option<(String, String)> {
+pub(crate) fn parse_copy_source(copy_source: &str) -> Option<(String, String)> {
     let raw = copy_source.trim_start_matches('/');
     let raw = raw.split('?').next().unwrap_or(raw);
     let (bucket, key) = raw.split_once('/')?;

@@ -23,10 +23,11 @@ PG_DB="cairn"
 
 SERVER_HOST="127.0.0.1"
 SERVER_PORT=9000                 # the port your server listens on
-ACCESS_KEY="testkey"             # any access key id is accepted
-SECRET_KEY="cairnsecret"         # must match the server's hardcoded secret
+ACCESS_KEY="testkey"             # created below as an admin role
+SECRET_KEY="cairnsecret"         # with this secret
 
-CARGO_ARGS=(-- serve --database postgres://$PG_USER:$PG_PASS@127.0.0.1:${PG_PORT}/$PG_DB --listen-client $SERVER_HOST:${SERVER_PORT})
+DB_URL="postgres://$PG_USER:$PG_PASS@127.0.0.1:${PG_PORT}/$PG_DB"
+CARGO_ARGS=(-- serve --database "$DB_URL" --listen-client $SERVER_HOST:${SERVER_PORT})
 STARTUP_TIMEOUT=60               # seconds to wait for postgres / server
 # SHA-256 of the empty string — the payload hash clients sign for bodyless requests.
 EMPTY_SHA256="e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
@@ -39,6 +40,9 @@ CARGO_ARGS+=(--data-dir "$WORK_DIR/data")   # required; per-run blob dir
 SERVER_LOG="$WORK_DIR/server.log"
 SERVER_PID=""
 BUCKET="smoke-$(date +%s)"
+PBUCKET="page-$(date +%s)"       # pagination fixtures
+NBUCKET="nonempty-$(date +%s)"   # DeleteBucket-on-non-empty test
+OBUCKET="other-$(date +%s)"      # cross-bucket permission tests
 
 # ─── Pretty output ───────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -47,7 +51,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=49
+TOTAL=58
 STEP=0
 PASS=0
 FAIL=0
@@ -56,20 +60,43 @@ FAILED_TESTS=()
 info()  { printf '%s\n' "${DIM}$*${RESET}"; }
 fatal() { printf '%s\n' "${RED}${BOLD}FATAL:${RESET} $*" >&2; exit 1; }
 
+# run_bg cmd args... — runs a test command in the background, its output in
+# $TEST_OUT, and waits for it. Background commands ignore SIGINT, so Ctrl+C
+# reaches only this script, whose INT trap interrupts the `wait` and aborts the
+# run. (In the foreground, clients that handle Ctrl+C themselves — s3cmd and
+# aws-cli exit 130 — make bash ignore the signal, so the run would just carry on
+# with the next test.)
+TEST_OUT="$WORK_DIR/test.out"
+TEST_PID=""
+run_bg() {
+    "$@" >"$TEST_OUT" 2>&1 &
+    TEST_PID=$!
+    wait "$TEST_PID"
+    local rc=$?
+    TEST_PID=""
+    return "$rc"
+}
+
+# kill_tree <pid> — kills a process and all its descendants.
+kill_tree() {
+    local child
+    for child in $(pgrep -P "$1"); do kill_tree "$child"; done
+    kill "$1" 2>/dev/null
+}
+
 # run_test "description" cmd args...
 run_test() {
     local desc="$1"; shift
     STEP=$((STEP + 1))
     printf '%s' "${BOLD}[${STEP}/${TOTAL}]${RESET} ${desc} ... "
-    local out
-    if out="$("$@" 2>&1)"; then
+    if run_bg "$@"; then
         printf '%s\n' "${GREEN}OK${RESET}"
         PASS=$((PASS + 1))
         return 0
     else
         printf '%s\n' "${RED}FAIL${RESET}"
         printf '%s\n' "${DIM}      cmd: $*${RESET}"
-        printf '%s\n' "$out" | sed 's/^/      /'
+        sed 's/^/      /' "$TEST_OUT"
         FAIL=$((FAIL + 1))
         FAILED_TESTS+=("$desc")
         return 1
@@ -81,10 +108,9 @@ expect_fail() {
     local desc="$1"; shift
     STEP=$((STEP + 1))
     printf '%s' "${BOLD}[${STEP}/${TOTAL}]${RESET} ${desc} ... "
-    local out
-    if out="$("$@" 2>&1)"; then
+    if run_bg "$@"; then
         printf '%s\n' "${RED}FAIL (command unexpectedly succeeded)${RESET}"
-        printf '%s\n' "$out" | sed 's/^/      /'
+        sed 's/^/      /' "$TEST_OUT"
         FAIL=$((FAIL + 1))
         FAILED_TESTS+=("$desc")
         return 1
@@ -97,8 +123,10 @@ expect_fail() {
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 cleanup() {
+    trap '' INT TERM   # don't let a second Ctrl+C cut the cleanup short
     info ""
     info "Cleaning up..."
+    [ -n "$TEST_PID" ] && kill_tree "$TEST_PID"
     if [ -n "$SERVER_PID" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
         kill "$SERVER_PID" 2>/dev/null
         wait "$SERVER_PID" 2>/dev/null
@@ -106,7 +134,11 @@ cleanup() {
     podman rm -f "$PG_CONTAINER" >/dev/null 2>&1
     rm -rf "$WORK_DIR"
 }
-trap cleanup EXIT INT TERM
+# On Ctrl+C / SIGTERM, exit (running cleanup via the EXIT trap) rather than
+# continuing with the next test against a torn-down environment.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ─── Preflight ───────────────────────────────────────────────────────────────
 for tool in podman cargo s3cmd curl openssl python3 mcli aws; do
@@ -132,7 +164,23 @@ until podman exec "$PG_CONTAINER" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/nul
 done
 info "Postgres is ready."
 
-# ─── 2. Run the server ───────────────────────────────────────────────────────
+# ─── 2. Roles ────────────────────────────────────────────────────────────────
+# Roles live in Postgres and are managed with `cairn role`, so set them up before
+# the server starts. testkey is an admin (bucket management); since grants need
+# an existing bucket, it's granted read/write on each test bucket right after
+# creating it (mb_granted). The others exercise permission checks: reader can
+# only read $BUCKET, writer can only use $OBUCKET (both granted once those
+# exist), and bucketadmin can manage buckets but holds no grants.
+cairn_role() { (cd "$SCRIPT_DIR" && cargo run -q -- role --database "$DB_URL" "$@"); }
+info "Creating roles..."
+{
+    cairn_role create "$ACCESS_KEY" --admin --secret "$SECRET_KEY" &&
+    cairn_role create reader --secret readersecret &&
+    cairn_role create writer --secret writersecret &&
+    cairn_role create bucketadmin --admin --secret adminsecret
+} >"$WORK_DIR/roles.log" 2>&1 || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create roles"; }
+
+# ─── 2b. Run the server ───────────────────────────────────────────────────────
 info "Starting server (cargo run) on ${SERVER_HOST}:${SERVER_PORT}..."
 (cd "$SCRIPT_DIR" && exec cargo run ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"} >"$SERVER_LOG" 2>&1) &
 SERVER_PID=$!
@@ -173,11 +221,14 @@ region = us-east-1
 s3 =
     addressing_style = path
 EOF
-awss3() {
-    AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+# as_role <access-key> <secret> <aws args...> — aws-cli under a given role.
+as_role() {
+    local key="$1" secret="$2"; shift 2
+    AWS_ACCESS_KEY_ID="$key" AWS_SECRET_ACCESS_KEY="$secret" \
     AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true AWS_CONFIG_FILE="$AWSCFG" \
     aws --endpoint-url "http://${SERVER_HOST}:${SERVER_PORT}" "$@"
 }
+awss3() { as_role "$ACCESS_KEY" "$SECRET_KEY" "$@"; }
 
 # mcli (minio-go, what Mimir uses)
 MCFG="$WORK_DIR/mc"
@@ -188,8 +239,8 @@ MCFG="$WORK_DIR/mc"
 # something valid to check.
 SIGNER="$WORK_DIR/sign.py"
 cat >"$SIGNER" <<'PYEOF'
-import sys, hashlib, hmac
-from datetime import datetime, timezone
+import os, sys, hashlib, hmac
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 method, url, payload_hash = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -198,7 +249,8 @@ secret, region, service, akid = "cairnsecret", "us-east-1", "s3", "testkey"
 
 u = urlsplit(url)
 host, path, query = u.netloc, (u.path or "/"), u.query
-now = datetime.now(timezone.utc)
+# SIGN_SKEW_SECS shifts the signing time, to test the server's clock-skew check.
+now = datetime.now(timezone.utc) + timedelta(seconds=int(os.environ.get("SIGN_SKEW_SECS", "0")))
 amzdate, datestamp = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
 
 headers = {"host": host, "x-amz-content-sha256": payload_hash, "x-amz-date": amzdate}
@@ -255,6 +307,13 @@ scurl_get() {
     curl -fsS "${args[@]}" "$url"
 }
 
+# mb_granted <bucket> — creates a bucket as testkey, then grants testkey
+# read/write on it: admin alone allows no object access.
+mb_granted() {
+    s3 mb "s3://$1" >/dev/null 2>&1 || return 1
+    cairn_role grant "$ACCESS_KEY" "$1" read write
+}
+
 # ─── 4. Test fixtures ────────────────────────────────────────────────────────
 SMALL="$WORK_DIR/small.txt"
 BIG="$WORK_DIR/big.bin"
@@ -278,6 +337,15 @@ list_contains() {    # list_contains <s3 ls target> <needle>
 unsigned_rejected() {  # an unsigned request must be refused
     [ "$(curl -s -o /dev/null -w '%{http_code}' \
         "http://${SERVER_HOST}:${SERVER_PORT}/${BUCKET}/small.txt")" = 403 ]
+}
+
+# A correctly signed request whose x-amz-date is outside the 15-minute skew
+# window (either way) is refused, so a captured request can't be replayed later;
+# one just inside the window is accepted.
+stale_request_rejected() {
+    [ "$(SIGN_SKEW_SECS=-1200 scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" -)" = 403 ] || return 1
+    [ "$(SIGN_SKEW_SECS=1200 scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" -)" = 403 ] || return 1
+    [ "$(SIGN_SKEW_SECS=-600 scurl GET "/${BUCKET}/small.txt" "$EMPTY_SHA256" -)" = 200 ]
 }
 
 # Ranged GET via aws-cli, content compared to the expected slice.
@@ -490,7 +558,6 @@ mc_streaming_ok() {
 }
 
 # ─── Pagination: signed GETs (scurl) so we control max-keys/tokens precisely ──
-PBUCKET="page-$(date +%s)"
 
 list_v2_keys() {  # list_v2_keys <prefix> <max-keys>
     local prefix="$1" mk="$2" token="" q resp
@@ -532,7 +599,7 @@ list_v2_common_prefixes() {  # list_v2_common_prefixes <prefix> <max-keys>
 }
 
 setup_pagination() {
-    s3 mb "s3://${PBUCKET}" >/dev/null 2>&1 || return 1
+    mb_granted "$PBUCKET" >/dev/null 2>&1 || return 1
     local k
     for k in flat/obj0 flat/obj1 flat/obj2 flat/obj3 flat/obj4 \
              tree/d1/x tree/d1/y tree/d2/x; do
@@ -599,8 +666,8 @@ batch_delete_ok() {
 # rejected delete, then empty the bucket and delete it cleanly (204). Self-contained
 # throwaway bucket so it's independent of the main fixtures.
 delete_nonempty_bucket_rejected() {
-    local nb="nonempty-$(date +%s)"
-    s3 mb "s3://${nb}" >/dev/null 2>&1 || return 1
+    local nb="$NBUCKET"
+    mb_granted "$nb" >/dev/null 2>&1 || return 1
     s3 put "$SMALL" "s3://${nb}/keep.txt" >/dev/null 2>&1 || return 1
     [ "$(scurl DELETE "/${nb}" "$EMPTY_SHA256" -)" = 409 ] || return 1
     check_roundtrip "$SMALL" "s3://${nb}/keep.txt" || return 1
@@ -610,7 +677,8 @@ delete_nonempty_bucket_rejected() {
 
 # DeleteObjects integrity/existence guards (crafted, signed with scurl): no
 # integrity header → 400, a wrong CRC32 → 400, a valid Content-MD5 (minio-go's
-# path) → 200, and a well-formed request against a missing bucket → 404.
+# path) → 200, and a well-formed request against a missing bucket → 403: no role
+# can hold a grant on a missing bucket, so it can't tell whether it exists.
 batch_delete_guards_ok() {
     local body="$WORK_DIR/del.xml" md5
     printf '<Delete><Object><Key>whatever.txt</Key></Object></Delete>' >"$body"
@@ -618,7 +686,7 @@ batch_delete_guards_ok() {
     [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body")" = 400 ] || return 1
     [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "x-amz-checksum-crc32: AAAAAA==")" = 400 ] || return 1
     [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 200 ] || return 1
-    [ "$(scurl POST "/no-such-bucket-xyz?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 404 ] || return 1
+    [ "$(scurl POST "/no-such-bucket-xyz?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 403 ] || return 1
 }
 
 # Immediate part reaping: after deleting objects, their on-disk part files should
@@ -658,13 +726,97 @@ echo ""
 echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
 
+# ─── Roles and permissions ───────────────────────────────────────────────────
+
+# reader holds only `read` on $BUCKET: it can fetch and list, but not write,
+# delete, create buckets, or see into a bucket it has no grant on.
+reader_permissions_ok() {
+    local r=(as_role reader readersecret)
+    "${r[@]}" s3api get-object --bucket "$BUCKET" --key big.bin "$WORK_DIR/rd.bin" >/dev/null 2>&1 || return 1
+    cmp -s "$BIG" "$WORK_DIR/rd.bin" || return 1
+    "${r[@]}" s3api list-objects-v2 --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! "${r[@]}" s3api put-object --bucket "$BUCKET" --key rd.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+    ! "${r[@]}" s3api delete-object --bucket "$BUCKET" --key big.bin >/dev/null 2>&1 || return 1
+    ! "${r[@]}" s3api create-bucket --bucket "rd-$(date +%s)" >/dev/null 2>&1 || return 1
+    ! "${r[@]}" s3api list-objects-v2 --bucket "$OBUCKET" >/dev/null 2>&1
+}
+
+# ListBuckets shows a non-admin only the buckets it holds a grant on; an admin
+# sees them all.
+list_buckets_filtered_ok() {
+    local names
+    names=$(as_role reader readersecret s3api list-buckets \
+        --query 'Buckets[].Name' --output text 2>/dev/null) || return 1
+    [ "$names" = "$BUCKET" ] || return 1
+    awss3 s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null \
+        | tr '\t' '\n' | grep -qx "$OBUCKET"
+}
+
+# Admin is bucket management only: bucketadmin can create, HEAD, and delete a
+# bucket, but can't touch objects without a grant.
+admin_scope_ok() {
+    local a=(as_role bucketadmin adminsecret) b="adm-$(date +%s)"
+    "${a[@]}" s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    ! "${a[@]}" s3api put-object --bucket "$b" --key x.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+    ! "${a[@]}" s3api get-object --bucket "$BUCKET" --key big.bin "$WORK_DIR/adm.bin" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
+# writer holds read/write on $OBUCKET only. It can use its own bucket, but can't
+# copy out of $BUCKET (no read on the source), nor reach an upload in $BUCKET by
+# its ID through its own bucket's URL.
+cross_bucket_denied_ok() {
+    local w=(as_role writer writersecret) uid
+    "${w[@]}" s3api put-object --bucket "$OBUCKET" --key mine.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+    "${w[@]}" s3api delete-object --bucket "$OBUCKET" --key mine.txt >/dev/null 2>&1 || return 1
+    ! "${w[@]}" s3api copy-object --bucket "$OBUCKET" --key stolen.bin \
+        --copy-source "${BUCKET}/big.bin" >/dev/null 2>&1 || return 1
+    uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key xb.bin \
+        --query UploadId --output text 2>/dev/null) || return 1
+    ! "${w[@]}" s3api abort-multipart-upload --bucket "$OBUCKET" --key xb.bin \
+        --upload-id "$uid" >/dev/null 2>&1 || return 1
+    # The upload survived the foreign abort; its owner can still abort it.
+    awss3 s3api abort-multipart-upload --bucket "$BUCKET" --key xb.bin \
+        --upload-id "$uid" >/dev/null 2>&1
+}
+
+# Second bucket for the cross-bucket tests, and the grants for reader/writer.
+setup_role_buckets() {
+    mb_granted "$OBUCKET" || return 1
+    cairn_role grant writer "$OBUCKET" read write || return 1
+    cairn_role grant reader "$BUCKET" read
+}
+
+# Grants follow the bucket's lifecycle: granting on a missing bucket fails, and
+# deleting a bucket drops its grants, so re-creating it doesn't revive them.
+grants_follow_bucket_ok() {
+    local a=(as_role bucketadmin adminsecret) b="life-$(date +%s)"
+    ! cairn_role grant writer "$b" read >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    cairn_role grant writer "$b" read >/dev/null 2>&1 || return 1
+    as_role writer writersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    ! as_role writer writersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
+# A revoked grant takes effect on the very next request (no caching).
+revoke_takes_effect_ok() {
+    cairn_role revoke reader "$BUCKET" >/dev/null 2>&1 || return 1
+    ! as_role reader readersecret s3api head-object --bucket "$BUCKET" --key big.bin >/dev/null 2>&1
+}
+
 # ─── 5. The tests ────────────────────────────────────────────────────────────
-run_test    "Create bucket"                         s3 mb "s3://${BUCKET}"
+run_test    "Create bucket"                         mb_granted "$BUCKET"
 run_test    "Bucket appears in bucket list"         list_contains "" "s3://${BUCKET}"
 run_test    "HEAD existing bucket"                  awss3 s3api head-bucket --bucket "${BUCKET}"
 expect_fail "HEAD missing bucket fails"             awss3 s3api head-bucket --bucket "${BUCKET}-nope"
 run_test    "Unsigned request is rejected (403)"    unsigned_rejected
+expect_fail "Unknown access key is rejected"        as_role nosuchrole nosuchsecret s3api list-buckets
 run_test    "Upload small text object"              s3 put "$SMALL" "s3://${BUCKET}/small.txt"
+run_test    "Stale/future-dated request rejected"   stale_request_rejected
 run_test    "Object appears in bucket listing"      list_contains "s3://${BUCKET}" "small.txt"
 run_test    "Download matches upload (small)"       check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
 run_test    "Upload 4 MiB binary object"            s3 put "$BIG" "s3://${BUCKET}/big.bin"
@@ -703,6 +855,13 @@ run_test    "Deleted parts reaped without prune"    immediate_reap_ok
 run_test    "Prune removes empty shard dirs"         prune_empty_dirs_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
+run_test    "Create second bucket, grant roles"     setup_role_buckets
+run_test    "Read-only role can read, not write"    reader_permissions_ok
+run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
+run_test    "Admin manages buckets, not objects"    admin_scope_ok
+run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
+run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok
+run_test    "Revoked grant takes effect"            revoke_takes_effect_ok
 run_test    "Overwrite object, new content wins"    bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&
@@ -714,7 +873,8 @@ run_test    "Delete remaining objects + bucket"     bash -c "
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/big.bin' >/dev/null &&
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/dir/sub/nested.txt' >/dev/null &&
     s3cmd --config '$S3CFG' del 's3://${BUCKET}/multi.bin' >/dev/null &&
-    s3cmd --config '$S3CFG' rb 's3://${BUCKET}' >/dev/null"
+    s3cmd --config '$S3CFG' rb 's3://${BUCKET}' >/dev/null &&
+    s3cmd --config '$S3CFG' rb 's3://${OBUCKET}' >/dev/null"
 expect_fail "Removed bucket is gone (ls fails)"     s3 ls "s3://${BUCKET}"
 
 # ─── 6. Summary ──────────────────────────────────────────────────────────────

@@ -42,12 +42,26 @@ cairn serve \
     --data-dir /var/lib/cairn/data
 ```
 
-The S3 API is now served on `:9000`. Point any S3 client at it (Cairn does not
-verify credentials, so any access/secret key works):
+The S3 API is now served on `:9000`. Every request must be signed (SigV4) with
+the credentials of a role, and a fresh database has none. Create an admin role
+to manage buckets, and an application role with access to a bucket (see
+[Roles and permissions](#roles-and-permissions)):
 
 ```sh
-s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl mb s3://my-bucket
-s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl put file.txt s3://my-bucket/
+DB="postgres://user:pass@localhost:5432/cairn"
+cairn role --database "$DB" create admin --admin        # prints a generated secret
+cairn role --database "$DB" create app                  # prints a generated secret
+```
+
+Create a bucket as the admin, grant the application role access to it, and use
+it:
+
+```sh
+s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
+    --access_key=admin --secret_key=<admin secret> mb s3://my-bucket
+cairn role --database "$DB" grant app my-bucket read write
+s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
+    --access_key=app --secret_key=<app secret> put file.txt s3://my-bucket/
 ```
 
 ### `serve` flags
@@ -103,6 +117,53 @@ holds the part.
 With replication factor `N`, writes succeed as long as at least `N` nodes are
 live; if fewer than `N` are available, uploads are rejected (metadata operations
 still work, since they live in Postgres).
+
+## Roles and permissions
+
+A **role** is a set of S3 credentials: its name is the access key ID, and it has
+a secret. Roles are stored in Postgres, so every node picks up a change on the
+very next request; there is nothing to restart or sync.
+
+What a role may do:
+
+- **admin** (`--admin`): create and delete buckets, HEAD any bucket, and see
+  every bucket in ListBuckets. Admin does **not** grant access to objects.
+- **`read`** on a bucket: GetObject, HeadObject, ListObjects, and being the
+  source of a CopyObject / UploadPartCopy.
+- **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads, and
+  being the destination of a copy.
+
+A role sees only the buckets it holds a grant on (or all of them, if admin).
+Permissions are per bucket; there are no per-key permissions. A bucket must
+exist before you can grant access to it, so the setup order is: an admin creates
+the bucket (with any S3 client), then you grant roles access. Deleting a bucket
+removes its grants, so a bucket re-created under the same name starts with no
+access for anyone.
+
+Manage roles with `cairn role --database <URL> <command>`:
+
+| Command | Description |
+| --- | --- |
+| `create <name> [--admin] [--secret <S>]` | Create a role. Prints a generated 40-char secret unless `--secret` is given (min. 8 chars). |
+| `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret (`--rotate-secret` prints the new one). |
+| `delete <name>` | Delete a role and all its grants. |
+| `grant <name> <bucket> <read\|write>...` | Grant permissions on an existing bucket. |
+| `revoke <name> <bucket> [read\|write]...` | Revoke permissions on a bucket; all of them if none are listed. |
+| `list` | List roles, their admin flag, and their grants (secrets are not shown). |
+
+Secrets are stored in plaintext in the `roles` table: SigV4 is an HMAC scheme,
+so verifying a signature needs the secret itself. Restrict access to the
+database accordingly.
+
+A signed request is only accepted within **15 minutes** of its timestamp
+(either way), as in S3, so a captured request can't be replayed later. Keep the
+clocks of nodes and clients in sync (e.g. NTP); otherwise requests fail with
+`RequestTimeTooSkewed`.
+
+> [!NOTE]
+> Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
+> proxy in front of it. The proxy must pass the `Host` header through unchanged,
+> since it is part of the signature.
 
 ## Garbage collection
 

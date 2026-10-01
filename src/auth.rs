@@ -4,6 +4,8 @@
 //! body matches that claim — by hashing (modes 2/3) or, for a signed streaming
 //! body (mode 4), by verifying the per-chunk HMAC signature chain.
 
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use hyper::HeaderMap;
@@ -16,11 +18,6 @@ type HmacSha256 = Hmac<Sha256>;
 /// and the data hash of the terminating zero-size chunk.
 pub const EMPTY_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
-
-/// The shared secret S3 clients sign streaming uploads with. Fixed for now (not
-/// yet configurable). minio-go clients (mcli, Mimir) require a secret of at least
-/// 8 characters, so it can't be shortened to just "cairn".
-pub const SECRET_KEY: &str = "cairnsecret";
 
 /// What a client's `x-amz-content-sha256` header claims about the body.
 #[derive(Debug)]
@@ -214,6 +211,7 @@ impl StreamingChunkVerifier {
 /// `AWS4-HMAC-SHA256 Credential=<akid>/<date>/<region>/<service>/aws4_request,
 ///  SignedHeaders=h1;h2;…, Signature=<hex>`
 struct Authorization {
+    access_key: String,
     date: String,
     region: String,
     service: String,
@@ -238,12 +236,13 @@ impl Authorization {
             }
         }
         let mut cred = credential?.split('/');
-        let _access_key = cred.next()?;
+        let access_key = cred.next()?.to_owned();
         let date = cred.next()?.to_owned();
         let region = cred.next()?.to_owned();
         let service = cred.next()?.to_owned();
         let terminator = cred.next()?; // aws4_request
         Some(Authorization {
+            access_key,
             scope: format!("{date}/{region}/{service}/{terminator}"),
             date,
             region,
@@ -252,6 +251,13 @@ impl Authorization {
             signature: signature?.to_owned(),
         })
     }
+}
+
+/// The access key ID a SigV4-signed request claims (from its `Authorization`
+/// credential), used to look up the secret to verify it with. `None` for an
+/// unsigned or malformed request.
+pub fn access_key(headers: &HeaderMap) -> Option<String> {
+    Authorization::from_headers(headers).map(|a| a.access_key)
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -309,9 +315,59 @@ fn canonical_request(
     )
 }
 
+/// How far a request's `x-amz-date` may be from the server clock, either way.
+/// Matches S3's 15 minutes. `x-amz-date` is part of the string-to-sign, so this
+/// bounds how long a captured request can be replayed.
+const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
+
+/// Parses an `x-amz-date` (`YYYYMMDDTHHMMSSZ`, UTC) into Unix seconds; `None` if
+/// it isn't in exactly that form or names an impossible date/time.
+fn parse_amz_date(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+        return None;
+    }
+    let num = |range: std::ops::Range<usize>| -> Option<i64> {
+        let digits = &s[range];
+        digits.bytes().all(|c| c.is_ascii_digit()).then(|| digits.parse().ok())?
+    };
+    let (year, month, day) = (num(0..4)?, num(4..6)?, num(6..8)?);
+    let (hour, min, sec) = (num(9..11)?, num(11..13)?, num(13..15)?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60
+    {
+        return None;
+    }
+    // Days since the epoch for a proleptic Gregorian date (Howard Hinnant's
+    // days_from_civil).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12; // March = 0
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
+}
+
+/// Checks a request's `x-amz-date` against the server clock (`now`, Unix
+/// seconds) and its credential scope date, as S3 does: a malformed timestamp or a
+/// scope dated another day is `AccessDenied`, and one outside the allowed skew is
+/// `RequestTimeTooSkewed`.
+fn check_request_time(datetime: &str, scope_date: &str, now: i64) -> Result<(), &'static str> {
+    let t = parse_amz_date(datetime).ok_or("AccessDenied")?;
+    if datetime[..8] != *scope_date {
+        return Err("AccessDenied");
+    }
+    if (now - t).abs() > MAX_CLOCK_SKEW_SECS {
+        return Err("RequestTimeTooSkewed");
+    }
+    Ok(())
+}
+
 /// Verifies a request's SigV4 header signature against `secret`. `Ok(())` on a
 /// match; `Err(code)` with the S3 error code otherwise — missing `Authorization`
-/// / `x-amz-date` → `AccessDenied`, wrong signature → `SignatureDoesNotMatch`.
+/// / `x-amz-date` → `AccessDenied`, a timestamp too far from the server clock →
+/// `RequestTimeTooSkewed`, wrong signature → `SignatureDoesNotMatch`.
 pub fn verify_sigv4(
     method: &str,
     path: &str,
@@ -324,6 +380,11 @@ pub fn verify_sigv4(
         .get("x-amz-date")
         .and_then(|v| v.to_str().ok())
         .ok_or("AccessDenied")?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock after 1970")
+        .as_secs() as i64;
+    check_request_time(datetime, &auth.date, now)?;
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{datetime}\n{}\n{}",
         auth.scope,
@@ -367,6 +428,41 @@ mod tests {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert!(test_verifier().verify_chunk(EMPTY_SHA256, &good));
+    }
+
+    #[test]
+    fn parses_amz_date() {
+        assert_eq!(parse_amz_date("19700101T000000Z"), Some(0));
+        assert_eq!(parse_amz_date("20000229T123456Z"), Some(951_827_696));
+        assert_eq!(parse_amz_date("20260613T000000Z"), Some(1_781_308_800));
+        for bad in [
+            "",
+            "20260613T000000",
+            "20260613 000000Z",
+            "2026-6-13T00000Z",
+            "20261301T000000Z",
+            "20260613T240000Z",
+            "+0260613T000000Z",
+        ] {
+            assert_eq!(parse_amz_date(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn request_time_skew() {
+        let t = parse_amz_date("20260613T120000Z").unwrap();
+        let check = |now| check_request_time("20260613T120000Z", "20260613", now);
+        assert_eq!(check(t), Ok(()));
+        assert_eq!(check(t + MAX_CLOCK_SKEW_SECS), Ok(()));
+        assert_eq!(check(t - MAX_CLOCK_SKEW_SECS), Ok(()));
+        assert_eq!(check(t + MAX_CLOCK_SKEW_SECS + 1), Err("RequestTimeTooSkewed"));
+        assert_eq!(check(t - MAX_CLOCK_SKEW_SECS - 1), Err("RequestTimeTooSkewed"));
+        // the credential scope must be dated the same day as x-amz-date
+        assert_eq!(
+            check_request_time("20260613T120000Z", "20260612", t),
+            Err("AccessDenied"),
+        );
+        assert_eq!(check_request_time("garbage", "20260613", t), Err("AccessDenied"));
     }
 
     #[test]

@@ -3,10 +3,16 @@ use hyper::{Response, body::Bytes};
 
 use crate::{
     App,
+    roles::Principal,
     s3::util::{xml_escape, xml_ok},
 };
 
-pub async fn list_buckets(app: &App) -> anyhow::Result<Response<Full<Bytes>>> {
+/// ListBuckets: `GET /`. Lists the buckets the role can see: every bucket for an
+/// admin, otherwise only those it holds a grant on.
+pub async fn list_buckets(
+    app: &App,
+    principal: &Principal,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     let rows = client
         .query(
@@ -22,6 +28,9 @@ pub async fn list_buckets(app: &App) -> anyhow::Result<Response<Full<Bytes>>> {
     );
     for r in &rows {
         let name: String = r.get(0);
+        if !principal.can_see(&name) {
+            continue;
+        }
         let created: String = r.get(1);
         body.push_str(&format!(
             "<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>",

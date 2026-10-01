@@ -15,6 +15,8 @@ use crate::{
 /// ETag.
 pub async fn put_part(
     app: &Arc<App>,
+    bucket: &str,
+    key: &str,
     upload_id: &str,
     part_number: &str,
     body: Incoming,
@@ -43,12 +45,13 @@ pub async fn put_part(
         }
     };
     // Reject up front if the upload is gone, so we don't replicate a part we'd
-    // only fail to stage at commit (the FK would reject it anyway).
+    // only fail to stage at commit (the FK would reject it anyway). It must also
+    // belong to the request's bucket/key: authorization only checked that bucket.
     let client = app.pool.get().await?;
     if client
         .query_opt(
-            "SELECT 1 FROM multipart_uploads WHERE upload_id = $1",
-            &[&upload_id],
+            "SELECT 1 FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
+            &[&upload_id, &bucket, &key],
         )
         .await?
         .is_none()

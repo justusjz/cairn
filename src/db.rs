@@ -111,6 +111,27 @@ CREATE UNIQUE INDEX IF NOT EXISTS parts_upload_part_number
     ON parts (upload_id, part_number)
     WHERE upload_id IS NOT NULL;
 
+-- S3 credentials. The role name is the access key ID. The secret is stored in
+-- plaintext because SigV4 is an HMAC scheme: verifying a signature needs the
+-- secret itself, not a hash of it. `admin` grants bucket management (create,
+-- delete, list all) but no object access.
+CREATE TABLE IF NOT EXISTS roles (
+    name        TEXT PRIMARY KEY,
+    secret      TEXT NOT NULL,
+    admin       BOOLEAN NOT NULL DEFAULT false,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Per-bucket object permissions. A grant needs its bucket to exist, and goes
+-- away with it: a bucket re-created under the same name starts with no grants,
+-- so a stale grant can't silently hand an old role access to a new bucket.
+CREATE TABLE IF NOT EXISTS role_grants (
+    role        TEXT NOT NULL REFERENCES roles(name) ON DELETE CASCADE,
+    bucket      TEXT NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
+    permission  TEXT NOT NULL CHECK (permission IN ('read', 'write')),
+    PRIMARY KEY (role, bucket, permission)
+);
+
 CREATE TABLE IF NOT EXISTS part_locations (
     part_id     UUID NOT NULL REFERENCES parts(part_id) ON DELETE CASCADE,
     node_id     TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,

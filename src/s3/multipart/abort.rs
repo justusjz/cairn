@@ -6,9 +6,13 @@ use crate::{App, s3::util::format_s3_error};
 
 /// AbortMultipartUpload: `DELETE /{bucket}/{key}?uploadId=U`. Drops the upload,
 /// cascading its staged parts (and their part_locations) away; the on-disk bytes
-/// are left dangling for the GC. The live object is untouched.
+/// are left dangling for the GC. The live object is untouched. The upload must
+/// belong to `bucket`/`key`, so a role can't reach an upload in another bucket
+/// by its ID.
 pub async fn abort_multipart_upload(
     app: &App,
+    bucket: &str,
+    key: &str,
     upload_id: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
@@ -24,8 +28,8 @@ pub async fn abort_multipart_upload(
     let client = app.pool.get().await?;
     let affected = client
         .execute(
-            "DELETE FROM multipart_uploads WHERE upload_id = $1",
-            &[&upload_id],
+            "DELETE FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
+            &[&upload_id, &bucket, &key],
         )
         .await?;
     if affected == 0 {

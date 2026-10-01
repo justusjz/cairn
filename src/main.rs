@@ -28,6 +28,7 @@ mod aws_chunked;
 mod body;
 mod db;
 mod prune;
+mod roles;
 mod s3;
 mod store;
 mod writing;
@@ -52,6 +53,8 @@ enum Command {
     Serve(ServeArgs),
     /// Reclaim orphaned and failed-upload parts on a node (manual repair).
     Prune(PruneArgs),
+    /// Manage roles: S3 credentials and their bucket permissions.
+    Role(roles::RoleArgs),
 }
 
 #[derive(Args, Debug)]
@@ -95,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve_main(args).await,
         Command::Prune(args) => prune_main(args).await,
+        Command::Role(args) => roles::role_main(args).await,
     }
 }
 
@@ -186,6 +190,20 @@ async fn heartbeat(app: Arc<App>, peer_url: String) {
     }
 }
 
+/// An error caused by storage nodes being down or unreachable (too few live
+/// nodes, or a replica failing mid-upload), as opposed to a bug or a database
+/// fault. Answered with 503, since retrying once the cluster recovers can succeed.
+#[derive(Debug)]
+pub struct Unavailable(pub String);
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
 #[derive(Clone, Copy)]
 enum ServeKind {
     Client,
@@ -202,10 +220,21 @@ async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Resu
             let service = service_fn(move |req| {
                 let app = app.clone();
                 async move {
-                    match kind {
+                    // A handler error must still produce a response: returning
+                    // it to hyper would drop the connection without one, which
+                    // clients take as a network fault and retry with backoff.
+                    let what = format!("{} {}", req.method(), req.uri().path());
+                    let res = match kind {
                         ServeKind::Client => s3::handle(req, app).await,
                         ServeKind::Peer => peer::handle(req, app).await,
-                    }
+                    };
+                    Ok::<_, std::convert::Infallible>(res.unwrap_or_else(|e| {
+                        eprintln!("{what} failed: {e:#}");
+                        match kind {
+                            ServeKind::Client => s3::error_response(&e),
+                            ServeKind::Peer => peer::error_response(&e),
+                        }
+                    }))
                 }
             });
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
@@ -223,10 +252,11 @@ async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<(S
         )
         .await?;
     if nodes.len() < count {
-        anyhow::bail!(
-            "need {count} replicas but only {} node(s) are registered",
+        return Err(Unavailable(format!(
+            "need {count} replicas but only {} node(s) are live",
             nodes.len()
-        );
+        ))
+        .into());
     }
     Ok(nodes[0..count]
         .iter()
@@ -413,7 +443,11 @@ where
             let app = app.clone();
             sinks.spawn(async move { write_part_streaming(&app, part_id, part_body).await });
         } else {
-            sinks.spawn(async move { upload_to_replica(&peer_url, part_id, part_body).await });
+            sinks.spawn(async move {
+                upload_to_replica(&peer_url, part_id, part_body)
+                    .await
+                    .map_err(|e| Unavailable(format!("replica {peer_url}: {e:#}")).into())
+            });
         }
     }
     // 3. tee: read the client body once, hashing and fanning each chunk out to
@@ -564,9 +598,12 @@ where
                 precondition_failed = true;
                 break;
             }
-            Ok(CommitResult::MissingLocations { present, required }) => anyhow::bail!(
-                "part {part_id} not durable: only {present}/{required} replicas reported a location"
-            ),
+            Ok(CommitResult::MissingLocations { present, required }) => {
+                return Err(Unavailable(format!(
+                    "part {part_id} not durable: only {present}/{required} replicas reported a location"
+                ))
+                .into());
+            }
             Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
             Err(e) => return Err(e.into()),
         }

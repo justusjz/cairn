@@ -63,6 +63,8 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 /// body. Assembles the listed parts into the object atomically.
 pub async fn complete_multipart_upload(
     app: &App,
+    bucket: &str,
+    key: &str,
     upload_id: &str,
     body: Bytes,
     preconditions: &Preconditions,
@@ -105,7 +107,7 @@ pub async fn complete_multipart_upload(
 
     let mut client = app.pool.get().await?;
     for _ in 0..MAX_COMPLETE_ATTEMPTS {
-        match try_complete(&mut client, &upload_id, &requested, preconditions).await {
+        match try_complete(&mut client, bucket, key, &upload_id, &requested, preconditions).await {
             Ok(CompleteOutcome::Done { bucket, key, etag }) => {
                 let body = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -155,6 +157,8 @@ pub async fn complete_multipart_upload(
 /// is returned so the caller can retry on a serialization failure.
 async fn try_complete(
     client: &mut Object,
+    bucket: &str,
+    key: &str,
     upload_id: &Uuid,
     requested: &[(i32, String)],
     preconditions: &Preconditions,
@@ -164,17 +168,20 @@ async fn try_complete(
         .isolation_level(IsolationLevel::Serializable)
         .start()
         .await?;
-    // The upload defines the target object and its content type.
+    // The upload defines the target object's content type. It must belong to
+    // the request's bucket/key: authorization only checked that bucket.
     let upload = tx
         .query_opt(
-            "SELECT bucket, key, content_type FROM multipart_uploads WHERE upload_id = $1",
-            &[upload_id],
+            "SELECT content_type FROM multipart_uploads
+             WHERE upload_id = $1 AND bucket = $2 AND key = $3",
+            &[upload_id, &bucket, &key],
         )
         .await?;
-    let (bucket, key, content_type): (String, String, String) = match upload {
-        Some(row) => (row.get(0), row.get(1), row.get(2)),
+    let content_type: String = match upload {
+        Some(row) => row.get(0),
         None => return Ok(CompleteOutcome::NoSuchUpload),
     };
+    let (bucket, key) = (bucket.to_owned(), key.to_owned());
     // Index the staged parts by number, then validate each requested part while
     // summing the total size and folding the binary MD5s for the combined ETag.
     let staged = tx

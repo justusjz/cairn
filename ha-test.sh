@@ -71,18 +71,41 @@ info()    { printf '%s\n' "${DIM}$*${RESET}"; }
 phase()   { printf '\n%s\n' "${YELLOW}${BOLD}── $* ──${RESET}"; }
 fatal()   { printf '%s\n' "${RED}${BOLD}FATAL:${RESET} $*" >&2; exit 1; }
 
+# run_bg cmd args... — runs a test command in the background, its output in
+# $TEST_OUT, and waits for it. Background commands ignore SIGINT, so Ctrl+C
+# reaches only this script, whose INT trap interrupts the `wait` and aborts the
+# run. (In the foreground, clients that handle Ctrl+C themselves — s3cmd and
+# aws-cli exit 130 — make bash ignore the signal, so the run would just carry on
+# with the next test.)
+TEST_OUT="$WORK_DIR/test.out"
+TEST_PID=""
+run_bg() {
+    "$@" >"$TEST_OUT" 2>&1 &
+    TEST_PID=$!
+    wait "$TEST_PID"
+    local rc=$?
+    TEST_PID=""
+    return "$rc"
+}
+
+# kill_tree <pid> — kills a process and all its descendants.
+kill_tree() {
+    local child
+    for child in $(pgrep -P "$1"); do kill_tree "$child"; done
+    kill "$1" 2>/dev/null
+}
+
 run_test() {
     local desc="$1"; shift
     STEP=$((STEP + 1))
     printf '%s' "${BOLD}[${STEP}/${TOTAL}]${RESET} ${desc} ... "
-    local out
-    if out="$("$@" 2>&1)"; then
+    if run_bg "$@"; then
         printf '%s\n' "${GREEN}OK${RESET}"
         PASS=$((PASS + 1)); return 0
     else
         printf '%s\n' "${RED}FAIL${RESET}"
         printf '%s\n' "${DIM}      cmd: $*${RESET}"
-        printf '%s\n' "$out" | sed 's/^/      /'
+        sed 's/^/      /' "$TEST_OUT"
         FAIL=$((FAIL + 1)); FAILED_TESTS+=("$desc"); return 1
     fi
 }
@@ -91,10 +114,9 @@ expect_fail() {
     local desc="$1"; shift
     STEP=$((STEP + 1))
     printf '%s' "${BOLD}[${STEP}/${TOTAL}]${RESET} ${desc} ... "
-    local out
-    if out="$("$@" 2>&1)"; then
+    if run_bg "$@"; then
         printf '%s\n' "${RED}FAIL (command unexpectedly succeeded)${RESET}"
-        printf '%s\n' "$out" | sed 's/^/      /'
+        sed 's/^/      /' "$TEST_OUT"
         FAIL=$((FAIL + 1)); FAILED_TESTS+=("$desc"); return 1
     else
         printf '%s\n' "${GREEN}OK${RESET}"
@@ -104,8 +126,10 @@ expect_fail() {
 
 # ─── Cleanup ─────────────────────────────────────────────────────────────────
 cleanup() {
+    trap '' INT TERM   # don't let a second Ctrl+C cut the cleanup short
     info ""
     info "Cleaning up..."
+    [ -n "$TEST_PID" ] && kill_tree "$TEST_PID"
     local pid
     for pid in ${PIDS[@]+"${PIDS[@]}"}; do
         [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
@@ -114,7 +138,11 @@ cleanup() {
     podman rm -f "$PG_CONTAINER" >/dev/null 2>&1
     rm -rf "$WORK_DIR"
 }
-trap cleanup EXIT INT TERM
+# On Ctrl+C / SIGTERM, exit (running cleanup via the EXIT trap) rather than
+# continuing with the next test against a torn-down environment.
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # ─── Preflight ───────────────────────────────────────────────────────────────
 for tool in podman cargo s3cmd; do
@@ -148,6 +176,13 @@ info "Building (cargo build)..."
 
 BIN="$SCRIPT_DIR/target/debug/$BIN_NAME"
 [ -x "$BIN" ] || fatal "binary not found at $BIN — adjust BIN_NAME at the top of this script"
+
+# Roles live in Postgres, shared by every instance: one admin role, granted
+# read/write on the test bucket once it exists (mb_granted).
+cairn_role() { "$BIN" role --database "postgres://${PG_USER}:${PG_PASS}@127.0.0.1:${PG_PORT}/${PG_DB}" "$@"; }
+info "Creating test role..."
+cairn_role create "$ACCESS_KEY" --admin --secret "$SECRET_KEY" >"$WORK_DIR/roles.log" 2>&1 \
+    || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create role"; }
 
 start_instance() {  # start_instance <n>
     local n="$1" cport pport
@@ -210,6 +245,22 @@ EOF
 done
 s3i() { local n="$1"; shift; s3cmd --config "$WORK_DIR/s3cfg.$n" "$@"; }
 
+# mb_granted <n> <bucket> — creates a bucket via node n, then grants the test
+# role read/write on it (admin alone allows no object access).
+mb_granted() {
+    s3i "$1" mb "s3://$2" && cairn_role grant "$ACCESS_KEY" "$2" read write
+}
+
+# upload_rejected_503 <n> <file> <uri> — the upload must fail with a proper 503
+# ServiceUnavailable (not a dropped connection). No retries: s3cmd would back off
+# for 45s retrying an error we expect.
+upload_rejected_503() {
+    local out
+    out=$(s3i "$1" --max-retries=0 put "$2" "$3" 2>&1) && return 1
+    printf '%s\n' "$out"
+    grep -q "503 (ServiceUnavailable)" <<<"$out"
+}
+
 # ─── 4. Fixtures & helpers ───────────────────────────────────────────────────
 FILE_A="$WORK_DIR/a.txt";  printf 'object A: uploaded while all nodes were up\n' >"$FILE_A"
 FILE_B="$WORK_DIR/b.bin";  dd if=/dev/urandom of="$FILE_B" bs=1M count=4 status=none
@@ -231,7 +282,7 @@ echo "${BOLD}Running HA tests against s3://${BUCKET} (${INSTANCES} nodes, RF=${R
 
 # ─── 5. Phase A: all nodes up ────────────────────────────────────────────────
 phase "Phase A: all ${INSTANCES} nodes up"
-run_test "Create bucket via node 1"                 s3i 1 mb "s3://${BUCKET}"
+run_test "Create bucket via node 1"                 mb_granted 1 "$BUCKET"
 run_test "Upload A via node 1"                      s3i 1 put "$FILE_A" "s3://${BUCKET}/a.txt"
 run_test "Download A via node 2 matches"            roundtrip_via 2 "$FILE_A" "s3://${BUCKET}/a.txt"
 run_test "Download A via node 3 matches"            roundtrip_via 3 "$FILE_A" "s3://${BUCKET}/a.txt"
@@ -250,7 +301,7 @@ run_test "Download C via node 1 matches"            roundtrip_via 1 "$FILE_C" "s
 # ─── 7. Phase C: two nodes down (beyond tolerance for writes) ────────────────
 phase "Phase C: node 2 also crashed — writes must now FAIL (RF=${REPLICATION_FACTOR} > 1 live node)"
 kill_instance 2
-expect_fail "Upload D via node 1 is rejected"       s3i 1 put "$FILE_D" "s3://${BUCKET}/d.txt"
+run_test    "Upload D via node 1 is rejected (503)" upload_rejected_503 1 "$FILE_D" "s3://${BUCKET}/d.txt"
 run_test "Listing via node 1 still works (metadata is in Postgres)" \
                                                     list_contains_via 1 "s3://${BUCKET}" "c.txt"
 

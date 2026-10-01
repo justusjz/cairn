@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use http_body_util::BodyExt;
-use hyper::{Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
 
 use crate::{
     App,
     body::{ResBody, box_response},
+    roles::{Permission, Principal},
     s3::{
         buckets::{
             create::create_bucket, delete::delete_bucket, head::head_bucket, list::list_buckets,
@@ -16,7 +17,7 @@ use crate::{
             create::create_multipart_upload, upload_part::put_part,
         },
         objects::{
-            copy::{copy_object, copy_part},
+            copy::{copy_object, copy_part, parse_copy_source},
             delete::{delete_object, delete_objects},
             get::{get_object, head_object},
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
@@ -39,26 +40,33 @@ pub async fn handle(
     req: Request<hyper::body::Incoming>,
     app: Arc<App>,
 ) -> anyhow::Result<Response<ResBody>> {
-    // Authenticate every S3 request up front (SigV4 header signature). Needs only
-    // the method/URI/query/headers, so it runs before any body is read. The peer
-    // endpoint is a separate service and stays open for internal traffic.
+    // Authenticate every S3 request up front: look up the role the SigV4
+    // credential names and verify the header signature with its secret. Needs
+    // only the method/URI/query/headers, so it runs before any body is read. The
+    // peer endpoint is a separate service and stays open for internal traffic.
+    let Some(access_key) = crate::auth::access_key(req.headers()) else {
+        return Ok(forbidden("AccessDenied", "request is not signed"));
+    };
+    let principal = Principal::load(&app.pool.get().await?, &access_key).await?;
+    let Some(principal) = principal else {
+        return Ok(forbidden(
+            "InvalidAccessKeyId",
+            "the access key ID does not exist",
+        ));
+    };
     if let Err(code) = crate::auth::verify_sigv4(
         req.method().as_str(),
         req.uri().path(),
         req.uri().query().unwrap_or(""),
         req.headers(),
-        crate::auth::SECRET_KEY,
+        &principal.secret,
     ) {
-        return Ok(box_response(format_s3_error(
-            StatusCode::FORBIDDEN,
-            code,
-            "request authentication failed",
-        )));
+        return Ok(forbidden(code, "request authentication failed"));
     }
     let path = req.uri().path().trim_start_matches('/');
     if path.is_empty() {
         let resp = match req.method() {
-            &hyper::Method::GET => list_buckets(&app).await?,
+            &hyper::Method::GET => list_buckets(&app, &principal).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
         };
         return Ok(box_response(resp));
@@ -67,6 +75,13 @@ pub async fn handle(
         Some((bucket, key)) => (decode_path_param(bucket), decode_path_param(key)),
         None => (decode_path_param(path), "".to_owned()),
     };
+    let copy_source_header = req
+        .headers()
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok());
+    if !authorize(&principal, req.method(), &bucket, &key, copy_source_header) {
+        return Ok(forbidden("AccessDenied", "Access Denied"));
+    }
     if key.is_empty() {
         // bucket operations. POST (DeleteObjects) consumes the body, so capture the
         // query up front and match on an owned method — mirroring the object branch
@@ -203,11 +218,11 @@ pub async fn handle(
     // The body-integrity claim the client makes (verified as the body streams).
     let content_sha256 = crate::auth::ContentSha256::from_headers(req.headers());
     // For a signed streaming body (mode 4), build the chunk-signature verifier
-    // from the request's SigV4 auth + the server secret. Absent for unsigned
+    // from the request's SigV4 auth + the role's secret. Absent for unsigned
     // requests (no Authorization), which then stream without chunk verification.
     let chunk_verifier = match &content_sha256 {
         crate::auth::ContentSha256::Streaming => {
-            crate::auth::StreamingChunkVerifier::from_headers(req.headers(), crate::auth::SECRET_KEY)
+            crate::auth::StreamingChunkVerifier::from_headers(req.headers(), &principal.secret)
         }
         _ => None,
     };
@@ -218,7 +233,7 @@ pub async fn handle(
         // AbortMultipartUpload
         hyper::Method::DELETE if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
-            abort_multipart_upload(&app, &upload_id).await?
+            abort_multipart_upload(&app, &bucket, &key, &upload_id).await?
         }
         hyper::Method::DELETE => delete_object(&app, &bucket, &key).await?,
         // CreateMultipartUpload
@@ -229,7 +244,7 @@ pub async fn handle(
         hyper::Method::POST if query_param(&query, "uploadId").is_some() => {
             let body = req.into_body().collect().await?.to_bytes();
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
-            complete_multipart_upload(&app, &upload_id, body, &preconditions).await?
+            complete_multipart_upload(&app, &bucket, &key, &upload_id, body, &preconditions).await?
         }
         // UploadPartCopy: an UploadPart whose bytes come from another object
         // (x-amz-copy-source) instead of the request body. Must precede UploadPart.
@@ -240,6 +255,8 @@ pub async fn handle(
             let part_number = query_param(&query, "partNumber").unwrap_or_default();
             copy_part(
                 &app,
+                &bucket,
+                &key,
                 &upload_id,
                 &part_number,
                 &copy_source.unwrap(),
@@ -254,6 +271,8 @@ pub async fn handle(
             let part_number = query_param(&query, "partNumber").unwrap_or_default();
             put_part(
                 &app,
+                &bucket,
+                &key,
                 &upload_id,
                 &part_number,
                 req.into_body(),
@@ -295,4 +314,63 @@ pub async fn handle(
         _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
     };
     Ok(box_response(resp))
+}
+
+/// The S3 error for a request whose handler failed: 503 if storage nodes are
+/// down (retrying later can succeed), 500 otherwise. The details are logged, not
+/// sent, as they can name internal hosts.
+pub fn error_response(e: &anyhow::Error) -> Response<ResBody> {
+    let resp = if e.downcast_ref::<crate::Unavailable>().is_some() {
+        format_s3_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ServiceUnavailable",
+            "not enough storage nodes are available; please try again later",
+        )
+    } else {
+        format_s3_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalError",
+            "we encountered an internal error; please try again",
+        )
+    };
+    box_response(resp)
+}
+
+/// A 403 with the given S3 error code.
+fn forbidden(code: &str, message: &str) -> Response<ResBody> {
+    box_response(format_s3_error(StatusCode::FORBIDDEN, code, message))
+}
+
+/// Whether `principal` may make this request against `bucket` (`key` empty for a
+/// bucket-level request). Creating and deleting buckets is admin-only, and a
+/// bucket HEAD just needs the bucket to be visible to the role. Everything else
+/// needs a grant on the bucket: `read` for GET/HEAD, `write` for the rest. A
+/// copy also needs `read` on its source bucket.
+fn authorize(
+    principal: &Principal,
+    method: &Method,
+    bucket: &str,
+    key: &str,
+    copy_source: Option<&str>,
+) -> bool {
+    if key.is_empty() {
+        return match *method {
+            Method::PUT | Method::DELETE => principal.admin,
+            Method::HEAD => principal.can_see(bucket),
+            Method::GET => principal.can(Permission::Read, bucket),
+            _ => principal.can(Permission::Write, bucket),
+        };
+    }
+    match *method {
+        Method::GET | Method::HEAD => principal.can(Permission::Read, bucket),
+        Method::PUT => {
+            // A malformed copy source is left for the handler to reject with 400.
+            let source_ok = match copy_source.and_then(parse_copy_source) {
+                Some((src_bucket, _)) => principal.can(Permission::Read, &src_bucket),
+                None => true,
+            };
+            principal.can(Permission::Write, bucket) && source_ok
+        }
+        _ => principal.can(Permission::Write, bucket),
+    }
 }

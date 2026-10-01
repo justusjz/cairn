@@ -10,6 +10,12 @@ use crate::{
     prune,
 };
 
+/// The response for a failed peer request: a bare 500 (peers only check the
+/// status; the error itself is logged by the caller).
+pub fn error_response(_e: &anyhow::Error) -> Response<ResBody> {
+    box_response(empty(StatusCode::INTERNAL_SERVER_ERROR))
+}
+
 pub async fn handle(
     req: Request<hyper::body::Incoming>,
     app: Arc<App>,
