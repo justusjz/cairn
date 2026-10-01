@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
 # build-release.sh — build a static musl binary of Cairn and package it for
-# distribution (a .tar.gz plus its .sha256), ready to upload to a Codeberg
-# release.
+# distribution (a .tar.gz plus its .sha256). The release workflow
+# (.github/workflows/release.yml) runs this and attaches the result to the
+# GitHub release; run it locally to build the same bundle by hand.
 #
 # Usage:  ./build-release.sh
 # Output: dist/cairn-v<version>-x86_64-unknown-linux-musl.tar.gz (+ .sha256)
@@ -21,7 +22,7 @@ PKG="cairn-v${VERSION}-${TARGET}"
 BIN="target/${TARGET}/release/cairn"
 
 echo "Building cairn v${VERSION} for ${TARGET}..."
-cargo build --release --target "$TARGET"
+cargo build --release --locked --target "$TARGET"
 
 # A musl build links crt-static by default, so the result should have no dynamic
 # dependencies. Verify it, since a non-static binary defeats the whole point.
@@ -45,7 +46,7 @@ tar -C dist -czf "dist/${PKG}.tar.gz" "$PKG"
 rm -rf "dist/${PKG}"
 
 echo ""
-echo "Done. Upload these to the Codeberg release:"
+echo "Done. Release assets:"
 echo "  dist/${PKG}.tar.gz"
 echo "  dist/${PKG}.tar.gz.sha256"
 ls -lh "dist/${PKG}.tar.gz" "dist/${PKG}.tar.gz.sha256"

@@ -21,11 +21,12 @@ The schema is created automatically; just point Cairn at an empty database.
 ## Installing
 
 Download the static binary from the
-[releases page](https://codeberg.org/justusjz/cairn/releases) and extract it:
+[releases page](https://github.com/justusjz/cairn/releases) and extract it
+(replace `<version>` with the release you downloaded, e.g. `0.1.4`):
 
 ```sh
-tar xzf cairn-v0.1.3-x86_64-unknown-linux-musl.tar.gz
-sudo install -m755 cairn-v0.1.3-x86_64-unknown-linux-musl/cairn /usr/local/bin/cairn
+tar xzf cairn-v<version>-x86_64-unknown-linux-musl.tar.gz
+sudo install -m755 cairn-v<version>-x86_64-unknown-linux-musl/cairn /usr/local/bin/cairn
 ```
 
 It is statically linked (musl), so it runs on any x86-64 Linux with no

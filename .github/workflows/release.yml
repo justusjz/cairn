@@ -1,0 +1,58 @@
+# Builds the static musl release bundle with build-release.sh and attaches it
+# (the .tar.gz and its .sha256) to the GitHub release that triggered the run.
+#
+# Run it manually (workflow_dispatch) to try the build without a release; the
+# bundle is then uploaded as a workflow artifact instead.
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write # to upload release assets
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # The bundle is named after the Cargo.toml version, so a tag that doesn't
+      # match would attach e.g. a v0.1.4 bundle to a v0.1.5 release.
+      - name: Check tag matches Cargo.toml version
+        if: github.event_name == 'release'
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::release tag $TAG does not match Cargo.toml version v$version"
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: cargo test --locked
+
+      - name: Build release bundle
+        run: ./build-release.sh
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+
+      - name: Upload as workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: cairn-release
+          path: dist/
+          if-no-files-found: error
