@@ -22,7 +22,7 @@ The schema is created automatically; just point Cairn at an empty database.
 
 Download the static binary from the
 [releases page](https://github.com/justusjz/cairn/releases) and extract it
-(replace `<version>` with the release you downloaded, e.g. `0.1.4`):
+(replace `<version>` with the release you downloaded, e.g. `0.2.0`):
 
 ```sh
 tar xzf cairn-v<version>-x86_64-unknown-linux-musl.tar.gz
