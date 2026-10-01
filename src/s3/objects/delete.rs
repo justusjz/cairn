@@ -22,8 +22,10 @@ enum DeleteStatus {
 }
 
 /// One serializable attempt: confirm the bucket exists, capture the removed
-/// parts' replica locations (for immediate reaping), then drop the keys
-/// (cascading their parts/part_locations away). The raw postgres error is
+/// parts' replica locations (for immediate reaping), then drop the keys' `null`
+/// versions (cascading their parts/part_locations away). That is a complete
+/// delete in an unversioned bucket, the only kind there is so far: such a bucket
+/// holds nothing but `null` versions. The raw postgres error is
 /// returned so the caller can retry on a serialization failure. Runs at the same
 /// isolation as the put/complete/GC transactions that also touch `objects`/
 /// `parts`, so the delete can't undermine their guarantees — and the bucket
@@ -48,16 +50,17 @@ async fn try_delete(
     let removed = tx
         .query(
             "SELECT pl.part_id, pl.node_id, n.peer_url
-             FROM parts p
+             FROM objects o
+             JOIN parts p ON p.object_id = o.id
              JOIN part_locations pl ON pl.part_id = p.part_id
              JOIN nodes n ON n.node_id = pl.node_id
-             WHERE p.object_bucket = $1 AND p.object_key = ANY($2)",
+             WHERE o.bucket = $1 AND o.key = ANY($2) AND o.version_id = 'null'",
             &[&bucket, &keys],
         )
         .await?;
     let targets = reap_targets(&removed);
     tx.execute(
-        "DELETE FROM objects WHERE bucket = $1 AND key = ANY($2)",
+        "DELETE FROM objects WHERE bucket = $1 AND key = ANY($2) AND version_id = 'null'",
         &[&bucket, &keys],
     )
     .await?;

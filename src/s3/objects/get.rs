@@ -33,18 +33,19 @@ pub async fn get_object(
         .query_opt(
             "SELECT etag, content_type, size,
                     to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
-                    floor(extract(epoch FROM last_modified))::bigint
-             FROM objects WHERE bucket = $1 AND key = $2",
+                    floor(extract(epoch FROM last_modified))::bigint,
+                    id
+             FROM objects
+             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
             &[&bucket, &key],
         )
         .await?;
+    let Some(row) = row else {
+        return Ok(box_response(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")));
+    };
     let (etag, content_type, size, last_modified, lm_epoch): (String, String, i64, String, i64) =
-        match row {
-            Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)),
-            None => {
-                return Ok(box_response(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")));
-            }
-        };
+        (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+    let object_id: i64 = row.get(5);
     // Honour conditional-request headers before doing any streaming work.
     match preconditions.evaluate(&etag, lm_epoch, true) {
         Precondition::Proceed => {}
@@ -74,7 +75,7 @@ pub async fn get_object(
     };
     // Resolve the ordered parts and each part's candidate locations (freshest
     // first) from this same snapshot.
-    let parts = resolve_object_parts(&tx, bucket, key).await?;
+    let parts = resolve_object_parts(&tx, object_id).await?;
     tx.commit().await?;
 
     // Select the parts overlapping the requested range and stream them (each over
@@ -107,15 +108,14 @@ pub async fn get_object(
 /// its candidate replica locations as (node_id, peer_url), freshest node first.
 pub(crate) type PartLocation = (Uuid, u64, Vec<(String, String)>);
 
-/// Resolves an object's committed parts in order, each with its size and its
+/// Resolves an object version's committed parts in order, each with its size and its
 /// candidate replica locations (freshest node first). Runs within the caller's
 /// transaction, so the parts and their locations come from one consistent
 /// snapshot. Shared by GetObject (range streaming) and CopyObject (whole-object
 /// copy).
 pub(crate) async fn resolve_object_parts<C: GenericClient>(
     client: &C,
-    bucket: &str,
-    key: &str,
+    object_id: i64,
 ) -> Result<Vec<PartLocation>, tokio_postgres::Error> {
     let rows = client
         .query(
@@ -123,9 +123,9 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
              FROM parts p
              JOIN part_locations pl ON pl.part_id = p.part_id
              JOIN nodes n ON n.node_id = pl.node_id
-             WHERE p.object_bucket = $1 AND p.object_key = $2
+             WHERE p.object_id = $1
              ORDER BY p.part_number, n.last_seen DESC",
-            &[&bucket, &key],
+            &[&object_id],
         )
         .await?;
     // Fold the flat join rows into one entry per part (rows are ordered by
@@ -325,7 +325,8 @@ pub async fn head_object(
             "SELECT size, etag, content_type,
                     to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
                     floor(extract(epoch FROM last_modified))::bigint
-             FROM objects WHERE bucket = $1 AND key = $2",
+             FROM objects
+             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
             &[&bucket, &key],
         )
         .await?;

@@ -41,13 +41,7 @@ pub async fn put_object(
     // the whole object just to be rejected. This is only an optimization — the
     // authoritative, race-free check runs inside the commit transaction.
     if conditions.has_write_conditions() {
-        let current: Option<String> = client
-            .query_opt(
-                "SELECT etag FROM objects WHERE bucket = $1 AND key = $2",
-                &[&bucket, &key],
-            )
-            .await?
-            .map(|row| row.get(0));
+        let current = crate::current_etag(&client, bucket, key).await?;
         if !conditions.allows_write(current.as_deref()) {
             return Ok(precondition_failed());
         }

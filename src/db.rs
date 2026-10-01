@@ -33,13 +33,58 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
     }
 }
 
+/// Arbitrary key for the advisory lock that serializes migrations, so nodes
+/// starting at the same time don't race to apply the same step.
+const MIGRATION_LOCK: i64 = 0x6361_6972_6e00; // "cairn\0"
+
+/// The schema, as an ordered list of steps. Migration `n` (1-based) is
+/// `MIGRATIONS[n - 1]`; `schema_migrations` records which have been applied.
+/// Only ever append: an applied step must never change.
+const MIGRATIONS: &[&str] = &[INITIAL_SCHEMA, VERSIONING];
+
+/// Applies every pending migration in a single transaction, so a failure leaves
+/// the schema untouched. Refuses to run against a database migrated by a newer
+/// Cairn, whose schema this binary doesn't understand.
 async fn init(pool: &Pool) -> anyhow::Result<()> {
-    let client = pool.get().await?;
-    client.batch_execute(SCHEMA).await?;
+    let mut client = pool.get().await?;
+    let tx = client.transaction().await?;
+    tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK])
+        .await?;
+    tx.batch_execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+             version     INT PRIMARY KEY,
+             applied_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+         )",
+    )
+    .await?;
+    let current: i32 = tx
+        .query_one("SELECT coalesce(max(version), 0) FROM schema_migrations", &[])
+        .await?
+        .get(0);
+    let known = MIGRATIONS.len() as i32;
+    if current > known {
+        anyhow::bail!(
+            "database schema is at version {current}, but this Cairn only knows up to {known}; \
+             upgrade Cairn"
+        );
+    }
+    for (version, sql) in (1..).zip(MIGRATIONS).skip(current as usize) {
+        tx.batch_execute(sql).await?;
+        tx.execute(
+            "INSERT INTO schema_migrations (version) VALUES ($1)",
+            &[&version],
+        )
+        .await?;
+        eprintln!("applied schema migration {version}");
+    }
+    tx.commit().await?;
     Ok(())
 }
 
-const SCHEMA: &str = r#"
+/// Migration 1: the schema as it stood before migrations were tracked. Written
+/// with `IF NOT EXISTS`, so a database created by an earlier Cairn (which ran
+/// this on every boot) passes through it unchanged.
+const INITIAL_SCHEMA: &str = r#"
 -- Cluster membership: each node self-registers and heartbeats `last_seen`.
 -- node_id is a UUID bound to the node's data dir (never operator-supplied).
 CREATE TABLE IF NOT EXISTS nodes (
@@ -137,4 +182,69 @@ CREATE TABLE IF NOT EXISTS part_locations (
     node_id     TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
     PRIMARY KEY (part_id, node_id)
 );
+"#;
+
+/// Migration 2: object versioning. `objects` goes from one row per key to one
+/// row per *version* of a key, identified by a surrogate `id` that parts now
+/// reference. Existing objects become the `null` version (what S3 calls the
+/// version of an object written while the bucket was unversioned), and every
+/// bucket starts out unversioned.
+const VERSIONING: &str = r#"
+-- 'unversioned' until versioning is first enabled; after that it only moves
+-- between 'enabled' and 'suspended', never back (as in S3).
+ALTER TABLE buckets ADD COLUMN versioning TEXT NOT NULL DEFAULT 'unversioned'
+    CHECK (versioning IN ('unversioned', 'enabled', 'suspended'));
+
+-- `id` is internal: it is the row's identity and orders a key's versions
+-- (higher is newer). Replacing the null version deletes its row and inserts a
+-- fresh one, so the replacement also sorts newest. `version_id` is the opaque
+-- S3 version ID, or the literal 'null'. A delete marker carries no data, so it
+-- has no ETag or content type.
+ALTER TABLE objects
+    ADD COLUMN id BIGINT GENERATED ALWAYS AS IDENTITY,
+    ADD COLUMN version_id TEXT NOT NULL DEFAULT 'null',
+    ADD COLUMN is_latest BOOLEAN NOT NULL DEFAULT true,
+    ADD COLUMN is_delete_marker BOOLEAN NOT NULL DEFAULT false,
+    ALTER COLUMN etag DROP NOT NULL,
+    ALTER COLUMN content_type DROP NOT NULL;
+-- The defaults only exist to backfill existing rows; new rows must be explicit.
+ALTER TABLE objects
+    ALTER COLUMN version_id DROP DEFAULT,
+    ALTER COLUMN is_latest DROP DEFAULT,
+    ALTER COLUMN is_delete_marker DROP DEFAULT,
+    ADD CHECK (is_delete_marker = (etag IS NULL)),
+    ADD CHECK (is_delete_marker = (content_type IS NULL)),
+    ADD CHECK (NOT is_delete_marker OR size = 0);
+
+-- Re-point parts from (object_bucket, object_key) to the version's id. Dropping
+-- the old columns also drops the composite FK, the unique part-number index and
+-- both CHECKs that mention them; they're recreated against object_id below,
+-- once `id` is the primary key.
+ALTER TABLE parts ADD COLUMN object_id BIGINT;
+UPDATE parts p SET object_id = o.id
+    FROM objects o
+    WHERE o.bucket = p.object_bucket AND o.key = p.object_key;
+ALTER TABLE parts DROP COLUMN object_bucket, DROP COLUMN object_key;
+
+-- (bucket, key) is no longer unique, only (bucket, key, version_id) is.
+ALTER TABLE objects DROP CONSTRAINT objects_pkey;
+ALTER TABLE objects ADD PRIMARY KEY (id);
+ALTER TABLE objects ADD UNIQUE (bucket, key, version_id);
+
+ALTER TABLE parts
+    ADD FOREIGN KEY (object_id) REFERENCES objects(id) ON DELETE CASCADE,
+    -- At most one owner, as before.
+    ADD CHECK (num_nonnulls(object_id, upload_id) <= 1);
+CREATE UNIQUE INDEX parts_object_part_number
+    ON parts (object_id, part_number)
+    WHERE object_id IS NOT NULL;
+-- At most one current version per key; the current version is what a plain
+-- GET/HEAD sees (unless it's a delete marker, in which case the key reads as
+-- absent).
+CREATE UNIQUE INDEX objects_latest ON objects (bucket, key) WHERE is_latest;
+-- ListObjects(V2) scans only live objects: current, and not a delete marker.
+CREATE INDEX objects_live ON objects (bucket, key)
+    WHERE is_latest AND NOT is_delete_marker;
+-- ListObjectVersions walks each key's versions newest first.
+CREATE INDEX objects_versions ON objects (bucket, key, id DESC);
 "#;

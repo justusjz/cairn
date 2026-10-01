@@ -80,7 +80,8 @@ pub async fn list_objects(
                         END AS token,
                         ($3 <> '' AND position($3 IN substr(key, length($2) + 1)) > 0) AS is_prefix
                  FROM objects
-                 WHERE bucket = $1 AND starts_with(key, $2) AND key > $4
+                 WHERE bucket = $1 AND is_latest AND NOT is_delete_marker
+                   AND starts_with(key, $2) AND key > $4
              ) t
              GROUP BY token
              ORDER BY token

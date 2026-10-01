@@ -93,15 +93,16 @@ pub async fn copy_object(
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .start()
         .await?;
-    let (src_content_type, src_etag, src_epoch): (String, String, i64) = match tx
+    let (src_content_type, src_etag, src_epoch, src_id): (String, String, i64, i64) = match tx
         .query_opt(
-            "SELECT content_type, etag, floor(extract(epoch FROM last_modified))::bigint
-             FROM objects WHERE bucket = $1 AND key = $2",
+            "SELECT content_type, etag, floor(extract(epoch FROM last_modified))::bigint, id
+             FROM objects
+             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
             &[&src_bucket, &src_key],
         )
         .await?
     {
-        Some(row) => (row.get(0), row.get(1), row.get(2)),
+        Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3)),
         None => {
             return Ok(format_s3_error(
                 StatusCode::NOT_FOUND,
@@ -117,7 +118,7 @@ pub async fn copy_object(
     }
     // Resolve the source's ordered parts and their locations from the same
     // snapshot (an empty object simply has none, and streams as a zero-byte body).
-    let parts = resolve_object_parts(&tx, &src_bucket, &src_key).await?;
+    let parts = resolve_object_parts(&tx, src_id).await?;
     tx.commit().await?;
     drop(client);
 
@@ -171,7 +172,7 @@ pub async fn copy_object(
     let last_modified: String = client
         .query_one(
             "SELECT to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"')
-             FROM objects WHERE bucket = $1 AND key = $2",
+             FROM objects WHERE bucket = $1 AND key = $2 AND is_latest",
             &[&dest_bucket, &dest_key],
         )
         .await?
@@ -264,27 +265,29 @@ pub async fn copy_part(
     let row = tx
         .query_opt(
             "SELECT size, to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"'),
-                    etag, floor(extract(epoch FROM last_modified))::bigint
-             FROM objects WHERE bucket = $1 AND key = $2",
+                    etag, floor(extract(epoch FROM last_modified))::bigint, id
+             FROM objects
+             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
             &[&src_bucket, &src_key],
         )
         .await?;
-    let (size, last_modified, src_etag, src_epoch): (i64, String, String, i64) = match row {
-        Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3)),
-        None => {
-            return Ok(format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchKey",
-                "the specified source key does not exist",
-            ));
-        }
-    };
+    let (size, last_modified, src_etag, src_epoch, src_id): (i64, String, String, i64, i64) =
+        match row {
+            Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)),
+            None => {
+                return Ok(format_s3_error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchKey",
+                    "the specified source key does not exist",
+                ));
+            }
+        };
     // Honour x-amz-copy-source-if-* conditions on the source before copying.
     if preconditions.evaluate(&src_etag, src_epoch, true) != Precondition::Proceed {
         return Ok(copy_precondition_failed());
     }
     let size = size as u64;
-    let parts = resolve_object_parts(&tx, &src_bucket, &src_key).await?;
+    let parts = resolve_object_parts(&tx, src_id).await?;
     tx.commit().await?;
     drop(client);
 

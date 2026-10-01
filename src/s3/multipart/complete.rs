@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use deadpool_postgres::Object;
 use http_body_util::Full;
@@ -8,7 +8,7 @@ use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
 use crate::{
-    App,
+    App, ReapTarget, current_etag, reap_parts, replace_null_version,
     s3::conditional::Preconditions,
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
@@ -20,6 +20,8 @@ enum CompleteOutcome {
         bucket: String,
         key: String,
         etag: String,
+        /// Locations of the replaced version's parts, to reap after commit.
+        reap: Vec<ReapTarget>,
     },
     NoSuchUpload,
     InvalidPart,
@@ -62,7 +64,7 @@ fn hex_to_bytes(hex: &str) -> Vec<u8> {
 /// CompleteMultipartUpload: `POST /{bucket}/{key}?uploadId=U` with a part-list
 /// body. Assembles the listed parts into the object atomically.
 pub async fn complete_multipart_upload(
-    app: &App,
+    app: &Arc<App>,
     bucket: &str,
     key: &str,
     upload_id: &str,
@@ -108,7 +110,8 @@ pub async fn complete_multipart_upload(
     let mut client = app.pool.get().await?;
     for _ in 0..MAX_COMPLETE_ATTEMPTS {
         match try_complete(&mut client, bucket, key, &upload_id, &requested, preconditions).await {
-            Ok(CompleteOutcome::Done { bucket, key, etag }) => {
+            Ok(CompleteOutcome::Done { bucket, key, etag, reap }) => {
+                reap_parts(app, reap);
                 let body = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                      <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -216,13 +219,7 @@ async fn try_complete(
     // currently at the key, inside this serializable transaction so the guard is
     // atomic with the swap below (matching conditional PutObject).
     if preconditions.has_write_conditions() {
-        let current: Option<String> = tx
-            .query_opt(
-                "SELECT etag FROM objects WHERE bucket = $1 AND key = $2",
-                &[&bucket, &key],
-            )
-            .await?
-            .map(|row| row.get(0));
+        let current = current_etag(&tx, &bucket, &key).await?;
         if !preconditions.allows_write(current.as_deref()) {
             // Dropping `tx` here rolls the transaction back, leaving the upload
             // intact for the client to retry or abort.
@@ -230,27 +227,16 @@ async fn try_complete(
         }
     }
 
-    // Publish atomically: object metadata, drop the old object's parts, re-point
-    // the chosen staged parts to the object, then delete the upload (cascading
+    // Publish atomically: the new version (replacing the old one and its parts),
+    // re-point the chosen staged parts to it, then delete the upload (cascading
     // away the staged parts the client didn't include).
-    tx.execute(
-        "INSERT INTO objects (bucket, key, size, etag, content_type, last_modified)
-         VALUES ($1, $2, $3, $4, $5, NOW())
-         ON CONFLICT (bucket, key)
-         DO UPDATE SET size = $3, etag = $4, content_type = $5, last_modified = NOW()",
-        &[&bucket, &key, &total_size, &final_etag, &content_type],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM parts WHERE object_bucket = $1 AND object_key = $2",
-        &[&bucket, &key],
-    )
-    .await?;
+    let (object_id, reap) =
+        replace_null_version(&tx, &bucket, &key, total_size, &final_etag, &content_type).await?;
     let part_numbers: Vec<i32> = requested.iter().map(|(pn, _)| *pn).collect();
     tx.execute(
-        "UPDATE parts SET upload_id = NULL, object_bucket = $1, object_key = $2
-         WHERE upload_id = $3 AND part_number = ANY($4)",
-        &[&bucket, &key, upload_id, &part_numbers],
+        "UPDATE parts SET upload_id = NULL, object_id = $1
+         WHERE upload_id = $2 AND part_number = ANY($3)",
+        &[&object_id, upload_id, &part_numbers],
     )
     .await?;
     // Delete the upload, which cascades away any staged parts not included in the
@@ -265,5 +251,6 @@ async fn try_complete(
         bucket,
         key,
         etag: final_etag,
+        reap,
     })
 }

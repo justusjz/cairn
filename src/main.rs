@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
-use deadpool_postgres::{Object, Pool};
+use deadpool_postgres::{GenericClient, Object, Pool};
 use http_body_util::{BodyExt, Empty};
 use hyper::{
     Method, Request, StatusCode, body::Body, body::Bytes, body::Frame,
@@ -685,50 +685,22 @@ async fn try_commit_part(
             // the guard is atomic with the overwrite below (a pre-check would race
             // a concurrent writer). Skipped when no write conditions are set.
             if conditions.has_write_conditions() {
-                let current: Option<String> = tx
-                    .query_opt(
-                        "SELECT etag FROM objects WHERE bucket = $1 AND key = $2",
-                        &[bucket, key],
-                    )
-                    .await?
-                    .map(|row| row.get(0));
+                let current = current_etag(&tx, bucket, key).await?;
                 if !conditions.allows_write(current.as_deref()) {
                     // Dropping `tx` here rolls the transaction back.
                     return Ok(CommitResult::PreconditionFailed);
                 }
             }
-            // Upsert the object's metadata first, so the part's owner FK target
-            // exists.
-            tx.execute(
-                "INSERT INTO objects (bucket, key, size, etag, content_type, last_modified)
-                 VALUES ($1, $2, $3, $4, $5, NOW())
-                 ON CONFLICT (bucket, key)
-                 DO UPDATE SET size = $3, etag = $4, content_type = $5, last_modified = NOW()",
-                &[bucket, key, &size, &etag, content_type],
-            )
-            .await?;
-            // Drop whatever parts the key referenced before (the new part isn't
-            // attached yet, so it's not captured). This frees the (bucket, key,
-            // part_number) slot for the new part.
-            let displaced = tx
-                .query(
-                    &format!("{CAPTURE} p.object_bucket = $1 AND p.object_key = $2"),
-                    &[bucket, key],
-                )
-                .await?;
-            reap = reap_targets(&displaced);
-            tx.execute(
-                "DELETE FROM parts WHERE object_bucket = $1 AND object_key = $2",
-                &[bucket, key],
-            )
-            .await?;
-            // Commit this part and point it at the object in one step.
+            // Insert the new version first, so the part's owner FK target exists.
+            let (object_id, displaced) =
+                replace_null_version(&tx, bucket, key, size, etag, content_type).await?;
+            reap = displaced;
+            // Commit this part and point it at the new version in one step.
             tx.execute(
                 "UPDATE parts
-                 SET state = 'committed', size = $1, etag = $2,
-                     object_bucket = $3, object_key = $4, part_number = 1
-                 WHERE part_id = $5",
-                &[&size, &etag, bucket, key, &part_id],
+                 SET state = 'committed', size = $1, etag = $2, object_id = $3, part_number = 1
+                 WHERE part_id = $4",
+                &[&size, &etag, &object_id, &part_id],
             )
             .await?;
         }
@@ -763,4 +735,75 @@ async fn try_commit_part(
     }
     tx.commit().await?;
     Ok(CommitResult::Committed(reap))
+}
+
+/// The ETag of the object a plain GET of the key would return: the current
+/// version, unless that's a delete marker (then the key reads as absent). This is
+/// what conditional writes (If-Match / If-None-Match) are evaluated against.
+async fn current_etag<C: GenericClient>(
+    client: &C,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<String>, tokio_postgres::Error> {
+    Ok(client
+        .query_opt(
+            "SELECT etag FROM objects
+             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
+            &[&bucket, &key],
+        )
+        .await?
+        .map(|row| row.get(0)))
+}
+
+/// Writes a new `null` version of the key as its current version, the way a
+/// write lands in an unversioned (or suspended) bucket: the existing `null`
+/// version, wherever it sits among the key's versions, is dropped along with its
+/// parts, and whatever was current is demoted. Returns the new version's id (for
+/// the caller to attach parts to) and the dropped parts' locations to reap. Runs
+/// inside the caller's serializable transaction.
+async fn replace_null_version<C: GenericClient>(
+    client: &C,
+    bucket: &str,
+    key: &str,
+    size: i64,
+    etag: &str,
+    content_type: &str,
+) -> Result<(i64, Vec<ReapTarget>), tokio_postgres::Error> {
+    // Capture the replaced version's replica locations before its rows (and, via
+    // cascade, its parts and part_locations) are dropped, so the caller can reap
+    // the files immediately rather than leave them for GC.
+    let displaced = client
+        .query(
+            "SELECT pl.part_id, pl.node_id, n.peer_url
+             FROM objects o
+             JOIN parts p ON p.object_id = o.id
+             JOIN part_locations pl ON pl.part_id = p.part_id
+             JOIN nodes n ON n.node_id = pl.node_id
+             WHERE o.bucket = $1 AND o.key = $2 AND o.version_id = 'null'",
+            &[&bucket, &key],
+        )
+        .await?;
+    client
+        .execute(
+            "DELETE FROM objects WHERE bucket = $1 AND key = $2 AND version_id = 'null'",
+            &[&bucket, &key],
+        )
+        .await?;
+    client
+        .execute(
+            "UPDATE objects SET is_latest = false WHERE bucket = $1 AND key = $2 AND is_latest",
+            &[&bucket, &key],
+        )
+        .await?;
+    let object_id: i64 = client
+        .query_one(
+            "INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
+                                  size, etag, content_type, last_modified)
+             VALUES ($1, $2, 'null', true, false, $3, $4, $5, NOW())
+             RETURNING id",
+            &[&bucket, &key, &size, &etag, &content_type],
+        )
+        .await?
+        .get(0);
+    Ok((object_id, reap_targets(&displaced)))
 }
