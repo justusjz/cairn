@@ -8,7 +8,7 @@ use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
 use crate::{
-    App, ReapTarget, current_etag, reap_parts, replace_null_version,
+    App, ReapTarget, current_etag, reap_parts, reap_targets, replace_null_version,
     s3::conditional::Preconditions,
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
@@ -20,7 +20,8 @@ enum CompleteOutcome {
         bucket: String,
         key: String,
         etag: String,
-        /// Locations of the replaced version's parts, to reap after commit.
+        /// Locations of the replaced version's parts and of the staged parts the
+        /// client left out, to reap after commit.
         reap: Vec<ReapTarget>,
     },
     NoSuchUpload,
@@ -230,7 +231,7 @@ async fn try_complete(
     // Publish atomically: the new version (replacing the old one and its parts),
     // re-point the chosen staged parts to it, then delete the upload (cascading
     // away the staged parts the client didn't include).
-    let (object_id, reap) =
+    let (object_id, mut reap) =
         replace_null_version(&tx, &bucket, &key, total_size, &final_etag, &content_type).await?;
     let part_numbers: Vec<i32> = requested.iter().map(|(pn, _)| *pn).collect();
     tx.execute(
@@ -240,7 +241,19 @@ async fn try_complete(
     )
     .await?;
     // Delete the upload, which cascades away any staged parts not included in the
-    // completed object.
+    // completed object. Those are the only parts still staged under it now, so
+    // capture their locations first to reap them along with the replaced ones.
+    let unused = tx
+        .query(
+            "SELECT pl.part_id, pl.node_id, n.peer_url
+             FROM parts p
+             JOIN part_locations pl ON pl.part_id = p.part_id
+             JOIN nodes n ON n.node_id = pl.node_id
+             WHERE p.upload_id = $1",
+            &[upload_id],
+        )
+        .await?;
+    reap.extend(reap_targets(&unused));
     tx.execute(
         "DELETE FROM multipart_uploads WHERE upload_id = $1",
         &[upload_id],

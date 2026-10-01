@@ -51,7 +51,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=58
+TOTAL=59
 STEP=0
 PASS=0
 FAIL=0
@@ -707,6 +707,40 @@ immediate_reap_ok() {
     return 1
 }
 
+# Multipart cleanup reaps too: an aborted upload's staged parts, and the staged
+# parts a completion leaves out, are deleted from disk without a prune. Stages two
+# parts, aborts; stages two more, completes with only the first, deletes the
+# result; then waits for the part-file count to return to its starting point.
+multipart_reap_ok() {
+    local datadir="$WORK_DIR/data" before after uid e1 i
+    before=$(find "$datadir" -type f | wc -l)
+    uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key reap/mpu \
+        --query UploadId --output text 2>/dev/null) || return 1
+    for i in 1 2; do
+        awss3 s3api upload-part --bucket "$BUCKET" --key reap/mpu --upload-id "$uid" \
+            --part-number $i --body "$NESTED" >/dev/null 2>&1 || return 1
+    done
+    awss3 s3api abort-multipart-upload --bucket "$BUCKET" --key reap/mpu \
+        --upload-id "$uid" >/dev/null 2>&1 || return 1
+    uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key reap/mpu \
+        --query UploadId --output text 2>/dev/null) || return 1
+    e1=$(awss3 s3api upload-part --bucket "$BUCKET" --key reap/mpu --upload-id "$uid" \
+        --part-number 1 --body "$NESTED" --query ETag --output text 2>/dev/null) || return 1
+    awss3 s3api upload-part --bucket "$BUCKET" --key reap/mpu --upload-id "$uid" \
+        --part-number 2 --body "$NESTED" >/dev/null 2>&1 || return 1
+    e1=${e1//\"/}
+    awss3 s3api complete-multipart-upload --bucket "$BUCKET" --key reap/mpu \
+        --upload-id "$uid" \
+        --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":\"${e1}\"}]}" >/dev/null 2>&1 || return 1
+    s3 del "s3://${BUCKET}/reap/mpu" >/dev/null 2>&1 || return 1
+    for i in $(seq 1 20); do
+        after=$(find "$datadir" -type f | wc -l)
+        [ "$after" -le "$before" ] && return 0
+        sleep 0.5
+    done
+    return 1
+}
+
 # Prune rmdir's empty shard directories. Upload then delete a batch of objects
 # (emptying their shard dirs), then run `prune --apply` against the peer endpoint
 # and confirm the directory count dropped. Live objects' shards stay (non-empty).
@@ -852,6 +886,7 @@ run_test    "Batch delete (DeleteObjects)"          batch_delete_ok
 run_test    "Batch delete guards (MD5 / bucket)"    batch_delete_guards_ok
 run_test    "DeleteBucket on non-empty bucket rejected" delete_nonempty_bucket_rejected
 run_test    "Deleted parts reaped without prune"    immediate_reap_ok
+run_test    "Multipart leftovers reaped without prune" multipart_reap_ok
 run_test    "Prune removes empty shard dirs"         prune_empty_dirs_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
