@@ -198,10 +198,17 @@ A bucket starts out unversioned, and once enabled can only be switched between
   good needs `delete-version`. A bucket with any versions or delete markers
   left counts as non-empty and can't be deleted.
 
+To find old versions, list them (ListObjectVersions, which needs `read`); to
+restore one, copy it onto its own key, which makes it the current version again:
+
+```sh
+aws s3api list-object-versions --bucket my-bucket --prefix some/key
+aws s3api copy-object --bucket my-bucket --key some/key \
+    --copy-source 'my-bucket/some/key?versionId=<version id>'
+```
+
 Old versions take up space until they're deleted. There are no lifecycle rules
-yet to expire them automatically, and listing versions (ListObjectVersions) is
-not supported yet, so a version can only be read or deleted by an ID you
-already know.
+yet to expire them automatically.
 
 ## Garbage collection
 

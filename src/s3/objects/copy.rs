@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes};
+use hyper::{Response, StatusCode, body::Bytes, header::HeaderValue};
 use uuid::Uuid;
 
 use crate::{
@@ -11,9 +11,10 @@ use crate::{
     s3::{
         conditional::{Precondition, Preconditions},
         objects::get::{
-            parse_range, resolve_object_parts, select_parts_in_range, spawn_range_stream,
+            Missing, ObjectVersion, lookup_version, no_such_version, parse_range,
+            resolve_object_parts, select_parts_in_range, spawn_range_stream,
         },
-        util::{decode_path_param, format_s3_error, with_version_id, xml_ok},
+        util::{decode_path_param, format_s3_error, query_param, with_version_id, xml_ok},
     },
 };
 
@@ -44,8 +45,8 @@ pub async fn copy_object(
     request_content_type: &str,
     preconditions: &Preconditions,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    let (src_bucket, src_key) = match parse_copy_source(copy_source) {
-        Some(pair) => pair,
+    let (src_bucket, src_key, src_version) = match parse_copy_source(copy_source) {
+        Some(source) => source,
         None => {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
@@ -60,8 +61,9 @@ pub async fn copy_object(
         .map(|d| d.eq_ignore_ascii_case("REPLACE"))
         .unwrap_or(false);
     // S3 rejects a copy of an object onto itself that changes nothing, guarding
-    // against a client accidentally issuing a destructive no-op.
-    if src_bucket == dest_bucket && src_key == dest_key && !replace {
+    // against a client accidentally issuing a destructive no-op. Copying a named
+    // version onto its own key is allowed: that's how an old version is restored.
+    if src_bucket == dest_bucket && src_key == dest_key && !replace && src_version.is_none() {
         return Ok(format_s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
@@ -93,24 +95,18 @@ pub async fn copy_object(
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .start()
         .await?;
-    let (src_content_type, src_etag, src_epoch, src_id): (String, String, i64, i64) = match tx
-        .query_opt(
-            "SELECT content_type, etag, floor(extract(epoch FROM last_modified))::bigint, id
-             FROM objects
-             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
-            &[&src_bucket, &src_key],
-        )
-        .await?
-    {
-        Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3)),
-        None => {
-            return Ok(format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchKey",
-                "the specified source key does not exist",
-            ));
-        }
+    let source = match lookup_version(&tx, &src_bucket, &src_key, src_version.as_deref()).await? {
+        Ok(source) => source,
+        Err(missing) => return Ok(source_missing(missing)),
     };
+    let ObjectVersion {
+        id: src_id,
+        etag: src_etag,
+        content_type: src_content_type,
+        lm_epoch: src_epoch,
+        version_id: src_version_id,
+        ..
+    } = source;
     // Honour x-amz-copy-source-if-* conditions on the source; any failure (a 304
     // for a read maps to 412 here) aborts the copy before any data is moved.
     if preconditions.evaluate(&src_etag, src_epoch, true) != Precondition::Proceed {
@@ -178,7 +174,7 @@ pub async fn copy_object(
         )
         .await?
         .get(0);
-    Ok(with_version_id(
+    let resp = with_version_id(
         xml_ok(format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <CopyObjectResult>\
@@ -187,7 +183,8 @@ pub async fn copy_object(
              </CopyObjectResult>"
         )),
         version_id.as_deref(),
-    ))
+    );
+    Ok(with_copy_source_version_id(resp, src_version_id.as_deref()))
 }
 
 /// UploadPartCopy: `PUT /{bucket}/{key}?partNumber=N&uploadId=U` with an
@@ -228,8 +225,8 @@ pub async fn copy_part(
             ));
         }
     };
-    let (src_bucket, src_key) = match parse_copy_source(copy_source) {
-        Some(pair) => pair,
+    let (src_bucket, src_key, src_version) = match parse_copy_source(copy_source) {
+        Some(source) => source,
         None => {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
@@ -266,26 +263,19 @@ pub async fn copy_part(
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .start()
         .await?;
-    let row = tx
-        .query_opt(
-            "SELECT size, to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"'),
-                    etag, floor(extract(epoch FROM last_modified))::bigint, id
-             FROM objects
-             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
-            &[&src_bucket, &src_key],
-        )
-        .await?;
-    let (size, last_modified, src_etag, src_epoch, src_id): (i64, String, String, i64, i64) =
-        match row {
-            Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)),
-            None => {
-                return Ok(format_s3_error(
-                    StatusCode::NOT_FOUND,
-                    "NoSuchKey",
-                    "the specified source key does not exist",
-                ));
-            }
-        };
+    let source = match lookup_version(&tx, &src_bucket, &src_key, src_version.as_deref()).await? {
+        Ok(source) => source,
+        Err(missing) => return Ok(source_missing(missing)),
+    };
+    let ObjectVersion {
+        id: src_id,
+        etag: src_etag,
+        size,
+        last_modified_iso: last_modified,
+        lm_epoch: src_epoch,
+        version_id: src_version_id,
+        ..
+    } = source;
     // Honour x-amz-copy-source-if-* conditions on the source before copying.
     if preconditions.evaluate(&src_etag, src_epoch, true) != Precondition::Proceed {
         return Ok(copy_precondition_failed());
@@ -339,27 +329,63 @@ pub async fn copy_part(
             ));
         }
     };
-    Ok(xml_ok(format!(
+    let resp = xml_ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <CopyPartResult>\
          <LastModified>{last_modified}</LastModified>\
          <ETag>\"{etag}\"</ETag>\
          </CopyPartResult>"
-    )))
+    ));
+    Ok(with_copy_source_version_id(resp, src_version_id.as_deref()))
+}
+
+/// The S3 error for a copy source with nothing to copy. Unlike a GET, naming a
+/// delete marker by version ID is a 400: a copy source may not refer to one.
+fn source_missing(missing: Missing) -> Response<Full<Bytes>> {
+    match missing {
+        Missing::NoSuchKey | Missing::DeleteMarker { named: false, .. } => format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchKey",
+            "the specified source key does not exist",
+        ),
+        Missing::NoSuchVersion => no_such_version(),
+        Missing::DeleteMarker { named: true, .. } => format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "the source of a copy request may not specifically refer to a delete marker by \
+             version id",
+        ),
+    }
+}
+
+/// Sets `x-amz-copy-source-version-id`, the version a copy read, if there's one
+/// to report.
+fn with_copy_source_version_id(
+    mut resp: Response<Full<Bytes>>,
+    version_id: Option<&str>,
+) -> Response<Full<Bytes>> {
+    if let Some(v) = version_id {
+        resp.headers_mut().insert(
+            "x-amz-copy-source-version-id",
+            HeaderValue::from_str(v).unwrap(),
+        );
+    }
+    resp
 }
 
 /// Parses an `x-amz-copy-source` value ("/bucket/key" or "bucket/key", optionally
-/// with a "?versionId=…" suffix, percent-encoded) into (bucket, key). Strips a
-/// leading slash and the (unsupported) version qualifier, then splits bucket/key
-/// at the first slash and decodes each half — mirroring how the request path is
-/// parsed. Returns None if malformed (no key separator, or an empty component).
-pub(crate) fn parse_copy_source(copy_source: &str) -> Option<(String, String)> {
+/// with a "?versionId=…" suffix, percent-encoded) into (bucket, key, version ID).
+/// Strips a leading slash and splits off the query, then splits bucket/key at the
+/// first slash and decodes each half — mirroring how the request path is parsed.
+/// Returns None if malformed (no key separator, or an empty component).
+pub(crate) fn parse_copy_source(copy_source: &str) -> Option<(String, String, Option<String>)> {
     let raw = copy_source.trim_start_matches('/');
-    let raw = raw.split('?').next().unwrap_or(raw);
+    let (raw, query) = raw.split_once('?').unwrap_or((raw, ""));
+    let version_id = query_param(query, "versionId");
     let (bucket, key) = raw.split_once('/')?;
     let (bucket, key) = (decode_path_param(bucket), decode_path_param(key));
     if bucket.is_empty() || key.is_empty() {
         return None;
     }
-    Some((bucket, key))
+    Some((bucket, key, version_id))
 }

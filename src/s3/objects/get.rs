@@ -22,32 +22,79 @@ pub(crate) struct ObjectVersion {
     pub etag: String,
     pub content_type: String,
     pub size: i64,
-    /// Last-Modified as an HTTP date, and as a Unix timestamp for conditionals.
+    /// Last-Modified as an HTTP date (for headers) and in ISO 8601 (for XML
+    /// bodies), and as a Unix timestamp for conditionals.
     pub last_modified: String,
+    pub last_modified_iso: String,
     pub lm_epoch: i64,
     /// The `x-amz-version-id` to report.
     pub version_id: Option<String>,
 }
 
-/// Looks up the version a GET or HEAD reads: the one named by `version_id`, or
-/// else the key's current version. When there's nothing to read, returns the S3
-/// error response for why instead:
-/// - no such key (or the bucket is gone): 404 NoSuchKey;
-/// - no such version: 404 NoSuchVersion;
-/// - the current version is a delete marker: 404 NoSuchKey, flagged with
-///   `x-amz-delete-marker` and the marker's version ID;
-/// - the named version is a delete marker: 405 MethodNotAllowed, flagged the
-///   same way (a marker has no data to read).
+/// Why a read found nothing to read. Each read reports it differently.
+pub(crate) enum Missing {
+    /// No such key (or the bucket is gone).
+    NoSuchKey,
+    /// The named version doesn't exist.
+    NoSuchVersion,
+    /// The version read is a delete marker: the current one when no version was
+    /// named (`named` false), else the named one. Carries the marker's
+    /// `x-amz-version-id` and HTTP Last-Modified.
+    DeleteMarker {
+        named: bool,
+        version_id: Option<String>,
+        last_modified: String,
+    },
+}
+
+impl Missing {
+    /// The S3 error a GET or HEAD answers with:
+    /// - no such key: 404 NoSuchKey;
+    /// - no such version: 404 NoSuchVersion;
+    /// - the current version is a delete marker: 404 NoSuchKey, flagged with
+    ///   `x-amz-delete-marker` and the marker's version ID;
+    /// - the named version is a delete marker: 405 MethodNotAllowed, flagged the
+    ///   same way (a marker has no data to read).
+    pub fn read_response(self) -> Response<Full<Bytes>> {
+        match self {
+            Missing::NoSuchKey => no_such_key(),
+            Missing::NoSuchVersion => no_such_version(),
+            Missing::DeleteMarker {
+                named,
+                version_id,
+                last_modified,
+            } => {
+                let resp = if named {
+                    let mut resp = format_s3_error(
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        "MethodNotAllowed",
+                        "the specified method is not allowed against this resource",
+                    );
+                    resp.headers_mut()
+                        .insert(header::LAST_MODIFIED, last_modified.parse().unwrap());
+                    resp
+                } else {
+                    no_such_key()
+                };
+                with_delete_marker(with_version_id(resp, version_id.as_deref()))
+            }
+        }
+    }
+}
+
+/// Looks up the version a read addresses: the one named by `version_id`, or
+/// else the key's current version — or why there's nothing to read.
 pub(crate) async fn lookup_version<C: GenericClient>(
     client: &C,
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
-) -> Result<Result<ObjectVersion, Response<Full<Bytes>>>, tokio_postgres::Error> {
+) -> Result<Result<ObjectVersion, Missing>, tokio_postgres::Error> {
     let row = client
         .query_opt(
             "SELECT o.id, o.etag, o.content_type, o.size,
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
+                    to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
                     floor(extract(epoch FROM o.last_modified))::bigint,
                     o.version_id, o.is_delete_marker, b.versioning
              FROM objects o JOIN buckets b ON b.name = o.bucket
@@ -58,32 +105,18 @@ pub(crate) async fn lookup_version<C: GenericClient>(
         .await?;
     let Some(row) = row else {
         return Ok(Err(match version_id {
-            Some(_) => format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchVersion",
-                "the specified version does not exist",
-            ),
-            None => no_such_key(),
+            Some(_) => Missing::NoSuchVersion,
+            None => Missing::NoSuchKey,
         }));
     };
-    let versioning = Versioning::from_db(row.get(8));
-    let reported = versioning.reported(row.get(6));
-    if row.get::<_, bool>(7) {
-        let resp = match version_id {
-            Some(_) => {
-                let mut resp = format_s3_error(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "MethodNotAllowed",
-                    "the specified method is not allowed against this resource",
-                );
-                let last_modified: String = row.get(4);
-                resp.headers_mut()
-                    .insert(header::LAST_MODIFIED, last_modified.parse().unwrap());
-                resp
-            }
-            None => no_such_key(),
-        };
-        return Ok(Err(with_delete_marker(with_version_id(resp, reported.as_deref()))));
+    let versioning = Versioning::from_db(row.get(9));
+    let reported = versioning.reported(row.get(7));
+    if row.get::<_, bool>(8) {
+        return Ok(Err(Missing::DeleteMarker {
+            named: version_id.is_some(),
+            version_id: reported,
+            last_modified: row.get(4),
+        }));
     }
     Ok(Ok(ObjectVersion {
         id: row.get(0),
@@ -91,7 +124,8 @@ pub(crate) async fn lookup_version<C: GenericClient>(
         content_type: row.get(2),
         size: row.get(3),
         last_modified: row.get(4),
-        lm_epoch: row.get(5),
+        last_modified_iso: row.get(5),
+        lm_epoch: row.get(6),
         version_id: reported,
     }))
 }
@@ -103,6 +137,14 @@ fn no_such_key() -> Response<Full<Bytes>> {
         StatusCode::NOT_FOUND,
         "NoSuchKey",
         "the specified key does not exist",
+    )
+}
+
+pub(crate) fn no_such_version() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchVersion",
+        "the specified version does not exist",
     )
 }
 
@@ -124,7 +166,7 @@ pub async fn get_object(
         .await?;
     let version = match lookup_version(&tx, bucket, key, version_id).await? {
         Ok(version) => version,
-        Err(resp) => return Ok(box_response(resp)),
+        Err(missing) => return Ok(box_response(missing.read_response())),
     };
     let ObjectVersion {
         id: object_id,
@@ -134,6 +176,7 @@ pub async fn get_object(
         last_modified,
         lm_epoch,
         version_id,
+        ..
     } = version;
     // Honour conditional-request headers before doing any streaming work.
     match preconditions.evaluate(&etag, lm_epoch, true) {
@@ -420,7 +463,7 @@ pub async fn head_object(
         ..
     } = match lookup_version(&client, bucket, key, version_id).await? {
         Ok(version) => version,
-        Err(resp) => return Ok(resp),
+        Err(missing) => return Ok(missing.read_response()),
     };
     // Honour conditional-request headers, exactly as GET does.
     match preconditions.evaluate(&etag, lm_epoch, true) {

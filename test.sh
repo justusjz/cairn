@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=68
+TOTAL=73
 STEP=0
 PASS=0
 FAIL=0
@@ -880,6 +880,105 @@ delete_version_needs_grant_ok() {
     ! vget_is perm "$SMALL" "$v"
 }
 
+# ListObjectVersions lists every version and delete marker, keys ascending and
+# each key's versions newest first, with the current one flagged IsLatest.
+list_versions_ok() {
+    local v1 v2 out
+    v1=$(vput lv/a "$SMALL") && v2=$(vput lv/a "$NESTED") || return 1
+    vdel lv/a >/dev/null || return 1
+    vput lv/b "$SMALL" >/dev/null && vput lv/dir/c "$SMALL" >/dev/null || return 1
+    out=$(awss3 s3api list-object-versions --bucket "$VBUCKET" --prefix lv/ \
+        --query '[Versions[].[Key,VersionId,IsLatest], DeleteMarkers[].[Key,IsLatest]]' \
+        --output text 2>/dev/null) || return 1
+    [ "$out" = "lv/a	$v2	False
+lv/a	$v1	False
+lv/b	$(awss3 s3api head-object --bucket "$VBUCKET" --key lv/b --query VersionId --output text)	True
+lv/dir/c	$(awss3 s3api head-object --bucket "$VBUCKET" --key lv/dir/c --query VersionId --output text)	True
+lv/a	True" ] || { echo "$out"; return 1; }
+    # A delimiter rolls lv/dir/ up into one common prefix.
+    [ "$(awss3 s3api list-object-versions --bucket "$VBUCKET" --prefix lv/ --delimiter / \
+        --query 'CommonPrefixes[].Prefix' --output text 2>/dev/null)" = "lv/dir/" ]
+}
+
+# Paging through ListObjectVersions with key-marker / version-id-marker (aws-cli
+# follows NextKeyMarker / NextVersionIdMarker) yields exactly the full listing,
+# for any page size, with and without a delimiter.
+list_versions_paginates_ok() {
+    local q='[Versions[].[Key,VersionId], DeleteMarkers[].[Key,VersionId], CommonPrefixes[].Prefix]'
+    local full paged d n
+    for d in "" "/"; do
+        full=$(awss3 s3api list-object-versions --bucket "$VBUCKET" ${d:+--delimiter "$d"} \
+            --query "$q" --output json 2>/dev/null) || return 1
+        for n in 1 2 3; do
+            paged=$(awss3 s3api list-object-versions --bucket "$VBUCKET" ${d:+--delimiter "$d"} \
+                --page-size "$n" --query "$q" --output json 2>/dev/null) || return 1
+            [ "$paged" = "$full" ] || { echo "page size $n, delimiter '$d' differs"; return 1; }
+        done
+    done
+    # The pages above really were pages: one entry per request is truncated, and
+    # hands back both markers.
+    [ "$(awss3 s3api list-object-versions --bucket "$VBUCKET" --max-keys 1 --no-paginate \
+        --query '[IsTruncated, NextKeyMarker != null, NextVersionIdMarker != null]' \
+        --output text 2>/dev/null)" = "True	True	True" ] || return 1
+    # A version-id-marker needs a key-marker.
+    ! awss3 s3api list-object-versions --bucket "$VBUCKET" --version-id-marker x \
+        --no-paginate >/dev/null 2>&1
+}
+
+# Copying a named source version: CopyObject onto the same key restores an old
+# version as the new current one (reporting both version IDs), UploadPartCopy
+# reads the named version too, and naming a delete marker as the source fails.
+copy_source_version_ok() {
+    local v1 v2 out cv marker uid etag
+    v1=$(vput cs "$SMALL") && v2=$(vput cs "$NESTED") || return 1
+    out=$(awss3 s3api copy-object --bucket "$VBUCKET" --key cs \
+        --copy-source "${VBUCKET}/cs?versionId=${v1}" \
+        --query '[CopySourceVersionId,VersionId]' --output text 2>/dev/null) || return 1
+    [ "${out%%$'\t'*}" = "$v1" ] || return 1
+    cv=${out#*$'\t'}
+    [ "$cv" != "$v1" ] && [ "$cv" != "$v2" ] || return 1
+    vget_is cs "$SMALL" || return 1
+    vget_is cs "$NESTED" "$v2" || return 1
+    uid=$(awss3 s3api create-multipart-upload --bucket "$VBUCKET" --key cs-mpu \
+        --query UploadId --output text 2>/dev/null) || return 1
+    out=$(awss3 s3api upload-part-copy --bucket "$VBUCKET" --key cs-mpu --upload-id "$uid" \
+        --part-number 1 --copy-source "${VBUCKET}/cs?versionId=${v2}" \
+        --query '[CopySourceVersionId,CopyPartResult.ETag]' --output text 2>/dev/null) || return 1
+    [ "${out%%$'\t'*}" = "$v2" ] || return 1
+    etag=${out#*$'\t'}; etag=${etag//\"/}
+    awss3 s3api complete-multipart-upload --bucket "$VBUCKET" --key cs-mpu --upload-id "$uid" \
+        --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":\"${etag}\"}]}" >/dev/null 2>&1 || return 1
+    vget_is cs-mpu "$NESTED" || return 1
+    marker=$(vdel cs) || return 1
+    marker=${marker#*$'\t'}
+    awss3 s3api copy-object --bucket "$VBUCKET" --key cs2 \
+        --copy-source "${VBUCKET}/cs?versionId=${marker}" 2>&1 | grep -q InvalidRequest || return 1
+    awss3 s3api copy-object --bucket "$VBUCKET" --key cs2 \
+        --copy-source "${VBUCKET}/cs" 2>&1 | grep -q NoSuchKey || return 1
+    awss3 s3api copy-object --bucket "$VBUCKET" --key cs2 \
+        --copy-source "${VBUCKET}/cs?versionId=nosuchversion" 2>&1 | grep -q NoSuchVersion
+}
+
+# An unversioned bucket lists its objects as `null` versions, all current.
+list_versions_unversioned_ok() {
+    local out
+    awss3 s3api put-object --bucket "$BUCKET" --key unv-list.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+    out=$(awss3 s3api list-object-versions --bucket "$BUCKET" --prefix unv-list \
+        --query 'Versions[].[Key,VersionId,IsLatest]' --output text 2>/dev/null) || return 1
+    [ "$out" = "unv-list.txt	null	True" ] || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key unv-list.txt >/dev/null 2>&1
+}
+
+# Listing versions is a read: a role holding only `write` on the bucket can't.
+# (The grant is revoked again, as later tests expect writer to have none here.)
+list_versions_needs_read_ok() {
+    cairn_role grant writer "$BUCKET" write >/dev/null 2>&1 || return 1
+    ! as_role writer writersecret s3api list-object-versions --bucket "$BUCKET" >/dev/null 2>&1
+    local rc=$?
+    cairn_role revoke writer "$BUCKET" >/dev/null 2>&1 || return 1
+    return "$rc"
+}
+
 # A bucket that has never been versioned reports no version IDs at all.
 unversioned_no_version_id_ok() {
     [ "$(awss3 s3api put-object --bucket "$BUCKET" --key unv.txt --body "$SMALL" \
@@ -1061,6 +1160,11 @@ run_test    "Multipart + copy create versions"       versioned_multipart_copy_ok
 run_test    "Suspended versioning uses null version" versioning_suspended_ok
 run_test    "Deleting a version needs the grant"     delete_version_needs_grant_ok
 run_test    "Unversioned bucket reports no versions" unversioned_no_version_id_ok
+run_test    "ListObjectVersions lists versions"      list_versions_ok
+run_test    "ListObjectVersions paginates"           list_versions_paginates_ok
+run_test    "Copy from a named source version"       copy_source_version_ok
+run_test    "Unversioned bucket lists null versions" list_versions_unversioned_ok
+run_test    "Listing versions needs read"            list_versions_needs_read_ok
 run_test    "Delete markers keep a bucket non-empty" versioned_bucket_not_empty_ok
 run_test    "Prune removes empty shard dirs"         prune_empty_dirs_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok

@@ -25,6 +25,7 @@ use crate::{
             delete::{delete_object, delete_objects},
             get::{get_object, head_object},
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
+            list_versions::list_object_versions,
             put::put_object,
         },
         util::{
@@ -105,7 +106,27 @@ pub async fn handle(
                 return Ok(box_response(resp));
             }
         }
+        // Clamp max-keys to [0, 1000]; absent or unparseable falls back to the 1000
+        // default (lenient — we don't 400 on a garbage value).
+        let max_keys = query_param(&query, "max-keys")
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(MAX_KEYS_LIMIT)
+            .clamp(0, MAX_KEYS_LIMIT);
         let resp = match req.method().clone() {
+            // ListObjectVersions: GET /{bucket}?versions, paginated by key-marker
+            // and version-id-marker.
+            hyper::Method::GET if query_param(&query, "versions").is_some() => {
+                list_object_versions(
+                    &app,
+                    &bucket,
+                    &query_param(&query, "prefix").unwrap_or_default(),
+                    query_param(&query, "delimiter").as_deref(),
+                    &query_param(&query, "key-marker").unwrap_or_default(),
+                    query_param(&query, "version-id-marker").as_deref(),
+                    max_keys,
+                )
+                .await?
+            }
             hyper::Method::GET => {
                 let prefix = query_param(&query, "prefix").unwrap_or_default();
                 let delimiter = query_param(&query, "delimiter");
@@ -141,12 +162,6 @@ pub async fn handle(
                 } else {
                     ListVersion::V1
                 };
-                // Clamp max-keys to [0, 1000]; absent or unparseable falls back to
-                // the 1000 default (lenient — we don't 400 on a garbage value).
-                let max_keys = query_param(&query, "max-keys")
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(MAX_KEYS_LIMIT)
-                    .clamp(0, MAX_KEYS_LIMIT);
                 list_objects(
                     &app,
                     &bucket,
@@ -414,7 +429,7 @@ fn authorize(
         Method::PUT => {
             // A malformed copy source is left for the handler to reject with 400.
             let source_ok = match copy_source.and_then(parse_copy_source) {
-                Some((src_bucket, _)) => principal.can(Permission::Read, &src_bucket),
+                Some((src_bucket, _, _)) => principal.can(Permission::Read, &src_bucket),
                 None => true,
             };
             principal.can(Permission::Write, bucket) && source_ok
