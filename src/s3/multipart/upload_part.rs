@@ -79,7 +79,7 @@ pub async fn put_part(
     )
     .await?
     {
-        UploadResult::Committed(etag) => Ok(Response::builder()
+        UploadResult::Committed { etag, .. } => Ok(Response::builder()
             .status(StatusCode::OK)
             .header(header::ETAG, format!("\"{etag}\""))
             .body(Full::new(Bytes::new()))

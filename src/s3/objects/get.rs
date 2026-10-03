@@ -1,7 +1,7 @@
 use std::io;
 use std::sync::Arc;
 
-use http_body_util::Empty;
+use http_body_util::{Empty, Full};
 use hyper::{Method, Request, Response, StatusCode, body::Bytes, header};
 use deadpool_postgres::GenericClient;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
@@ -11,13 +11,106 @@ use crate::{
     App,
     body::{FrameSender, ResBody, box_response, channel_body, send_file, send_incoming},
     s3::conditional::{Precondition, Preconditions, not_modified},
-    s3::util::format_s3_error,
+    s3::util::{format_s3_error, with_delete_marker, with_version_id},
+    s3::versions::Versioning,
 };
+
+/// The object version a read addresses, as far as its response needs it.
+pub(crate) struct ObjectVersion {
+    /// Row id, to resolve its parts by.
+    pub id: i64,
+    pub etag: String,
+    pub content_type: String,
+    pub size: i64,
+    /// Last-Modified as an HTTP date, and as a Unix timestamp for conditionals.
+    pub last_modified: String,
+    pub lm_epoch: i64,
+    /// The `x-amz-version-id` to report.
+    pub version_id: Option<String>,
+}
+
+/// Looks up the version a GET or HEAD reads: the one named by `version_id`, or
+/// else the key's current version. When there's nothing to read, returns the S3
+/// error response for why instead:
+/// - no such key (or the bucket is gone): 404 NoSuchKey;
+/// - no such version: 404 NoSuchVersion;
+/// - the current version is a delete marker: 404 NoSuchKey, flagged with
+///   `x-amz-delete-marker` and the marker's version ID;
+/// - the named version is a delete marker: 405 MethodNotAllowed, flagged the
+///   same way (a marker has no data to read).
+pub(crate) async fn lookup_version<C: GenericClient>(
+    client: &C,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> Result<Result<ObjectVersion, Response<Full<Bytes>>>, tokio_postgres::Error> {
+    let row = client
+        .query_opt(
+            "SELECT o.id, o.etag, o.content_type, o.size,
+                    to_char(o.last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
+                    floor(extract(epoch FROM o.last_modified))::bigint,
+                    o.version_id, o.is_delete_marker, b.versioning
+             FROM objects o JOIN buckets b ON b.name = o.bucket
+             WHERE o.bucket = $1 AND o.key = $2
+               AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",
+            &[&bucket, &key, &version_id],
+        )
+        .await?;
+    let Some(row) = row else {
+        return Ok(Err(match version_id {
+            Some(_) => format_s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchVersion",
+                "the specified version does not exist",
+            ),
+            None => no_such_key(),
+        }));
+    };
+    let versioning = Versioning::from_db(row.get(8));
+    let reported = versioning.reported(row.get(6));
+    if row.get::<_, bool>(7) {
+        let resp = match version_id {
+            Some(_) => {
+                let mut resp = format_s3_error(
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "MethodNotAllowed",
+                    "the specified method is not allowed against this resource",
+                );
+                let last_modified: String = row.get(4);
+                resp.headers_mut()
+                    .insert(header::LAST_MODIFIED, last_modified.parse().unwrap());
+                resp
+            }
+            None => no_such_key(),
+        };
+        return Ok(Err(with_delete_marker(with_version_id(resp, reported.as_deref()))));
+    }
+    Ok(Ok(ObjectVersion {
+        id: row.get(0),
+        etag: row.get(1),
+        content_type: row.get(2),
+        size: row.get(3),
+        last_modified: row.get(4),
+        lm_epoch: row.get(5),
+        version_id: reported,
+    }))
+}
+
+/// S3's 404 for a key with nothing to read. The message must not be empty:
+/// aws-cli's error-message hook crashes on an empty `<Message>`.
+fn no_such_key() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "the specified key does not exist",
+    )
+}
 
 pub async fn get_object(
     app: &Arc<App>,
     bucket: &str,
     key: &str,
+    version_id: Option<&str>,
     range_header: Option<&str>,
     preconditions: &Preconditions,
 ) -> anyhow::Result<Response<ResBody>> {
@@ -29,23 +122,19 @@ pub async fn get_object(
         .isolation_level(tokio_postgres::IsolationLevel::RepeatableRead)
         .start()
         .await?;
-    let row = tx
-        .query_opt(
-            "SELECT etag, content_type, size,
-                    to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
-                    floor(extract(epoch FROM last_modified))::bigint,
-                    id
-             FROM objects
-             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
-            &[&bucket, &key],
-        )
-        .await?;
-    let Some(row) = row else {
-        return Ok(box_response(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")));
+    let version = match lookup_version(&tx, bucket, key, version_id).await? {
+        Ok(version) => version,
+        Err(resp) => return Ok(box_response(resp)),
     };
-    let (etag, content_type, size, last_modified, lm_epoch): (String, String, i64, String, i64) =
-        (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
-    let object_id: i64 = row.get(5);
+    let ObjectVersion {
+        id: object_id,
+        etag,
+        content_type,
+        size,
+        last_modified,
+        lm_epoch,
+        version_id,
+    } = version;
     // Honour conditional-request headers before doing any streaming work.
     match preconditions.evaluate(&etag, lm_epoch, true) {
         Precondition::Proceed => {}
@@ -101,7 +190,7 @@ pub async fn get_object(
     } else {
         builder.status(StatusCode::OK)
     };
-    Ok(builder.body(body).unwrap())
+    Ok(with_version_id(builder.body(body).unwrap(), version_id.as_deref()))
 }
 
 /// One committed part of an object for streaming: its id, its size in bytes, and
@@ -316,25 +405,23 @@ pub async fn head_object(
     app: &App,
     bucket: &str,
     key: &str,
+    version_id: Option<&str>,
     range_header: Option<&str>,
     preconditions: &Preconditions,
-) -> anyhow::Result<Response<http_body_util::Full<Bytes>>> {
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
-    let row = client
-        .query_opt(
-            "SELECT size, etag, content_type,
-                    to_char(last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
-                    floor(extract(epoch FROM last_modified))::bigint
-             FROM objects
-             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
-            &[&bucket, &key],
-        )
-        .await?;
-    let (size, etag, content_type, last_modified, lm_epoch): (i64, String, String, String, i64) =
-        match row {
-            Some(row) => (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)),
-            None => return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "")),
-        };
+    let ObjectVersion {
+        etag,
+        content_type,
+        size,
+        last_modified,
+        lm_epoch,
+        version_id,
+        ..
+    } = match lookup_version(&client, bucket, key, version_id).await? {
+        Ok(version) => version,
+        Err(resp) => return Ok(resp),
+    };
     // Honour conditional-request headers, exactly as GET does.
     match preconditions.evaluate(&etag, lm_epoch, true) {
         Precondition::Proceed => {}
@@ -375,5 +462,5 @@ pub async fn head_object(
     } else {
         builder.status(StatusCode::OK)
     };
-    Ok(builder.body(http_body_util::Full::new(Bytes::new())).unwrap())
+    Ok(with_version_id(builder.body(Full::new(Bytes::new())).unwrap(), version_id.as_deref()))
 }

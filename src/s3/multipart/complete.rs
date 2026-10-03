@@ -8,9 +8,10 @@ use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
 use crate::{
-    App, ReapTarget, current_etag, reap_parts, reap_targets, replace_null_version,
+    App, ReapTarget, reap_parts, reap_targets,
     s3::conditional::Preconditions,
-    s3::util::{format_s3_error, xml_escape, xml_ok},
+    s3::util::{format_s3_error, with_version_id, xml_escape, xml_ok},
+    s3::versions::{Versioning, bucket_versioning, current_etag, put_version},
 };
 
 const MAX_COMPLETE_ATTEMPTS: usize = 10;
@@ -23,6 +24,8 @@ enum CompleteOutcome {
         /// Locations of the replaced version's parts and of the staged parts the
         /// client left out, to reap after commit.
         reap: Vec<ReapTarget>,
+        /// The `x-amz-version-id` to report for the new version.
+        version_id: Option<String>,
     },
     NoSuchUpload,
     InvalidPart,
@@ -111,7 +114,13 @@ pub async fn complete_multipart_upload(
     let mut client = app.pool.get().await?;
     for _ in 0..MAX_COMPLETE_ATTEMPTS {
         match try_complete(&mut client, bucket, key, &upload_id, &requested, preconditions).await {
-            Ok(CompleteOutcome::Done { bucket, key, etag, reap }) => {
+            Ok(CompleteOutcome::Done {
+                bucket,
+                key,
+                etag,
+                reap,
+                version_id,
+            }) => {
                 reap_parts(app, reap);
                 let body = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -122,7 +131,7 @@ pub async fn complete_multipart_upload(
                     xml_escape(&key),
                     xml_escape(&etag),
                 );
-                return Ok(xml_ok(body));
+                return Ok(with_version_id(xml_ok(body), version_id.as_deref()));
             }
             Ok(CompleteOutcome::NoSuchUpload) => {
                 return Ok(format_s3_error(
@@ -231,13 +240,27 @@ async fn try_complete(
     // Publish atomically: the new version (replacing the old one and its parts),
     // re-point the chosen staged parts to it, then delete the upload (cascading
     // away the staged parts the client didn't include).
-    let (object_id, mut reap) =
-        replace_null_version(&tx, &bucket, &key, total_size, &final_etag, &content_type).await?;
+    // The upload's FK guarantees the bucket exists.
+    let versioning = bucket_versioning(&tx, &bucket)
+        .await?
+        .unwrap_or(Versioning::Unversioned);
+    let mut reap = Vec::new();
+    let version = put_version(
+        &tx,
+        &bucket,
+        &key,
+        versioning,
+        total_size,
+        &final_etag,
+        &content_type,
+        &mut reap,
+    )
+    .await?;
     let part_numbers: Vec<i32> = requested.iter().map(|(pn, _)| *pn).collect();
     tx.execute(
         "UPDATE parts SET upload_id = NULL, object_id = $1
          WHERE upload_id = $2 AND part_number = ANY($3)",
-        &[&object_id, upload_id, &part_numbers],
+        &[&version.id, upload_id, &part_numbers],
     )
     .await?;
     // Delete the upload, which cascades away any staged parts not included in the
@@ -265,5 +288,6 @@ async fn try_complete(
         key,
         etag: final_etag,
         reap,
+        version_id: version.version_id,
     })
 }

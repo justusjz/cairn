@@ -13,7 +13,7 @@ use crate::{
         objects::get::{
             parse_range, resolve_object_parts, select_parts_in_range, spawn_range_stream,
         },
-        util::{decode_path_param, format_s3_error, xml_ok},
+        util::{decode_path_param, format_s3_error, with_version_id, xml_ok},
     },
 };
 
@@ -144,7 +144,7 @@ pub async fn copy_object(
     };
     // The source stream is trusted internal data, so it carries no content-sha256
     // claim (Unsigned) and no aws-chunked framing — only Committed is reachable.
-    let etag = match crate::upload_part(
+    let (etag, version_id) = match crate::upload_part(
         app,
         source_body,
         &attach,
@@ -154,7 +154,7 @@ pub async fn copy_object(
     )
     .await?
     {
-        UploadResult::Committed(etag) => etag,
+        UploadResult::Committed { etag, version_id } => (etag, version_id),
         UploadResult::ContentSha256Mismatch
         | UploadResult::ChunkSignatureMismatch
         | UploadResult::PreconditionFailed => {
@@ -167,23 +167,27 @@ pub async fn copy_object(
     };
 
     // CopyObject reports the result in the body (not just the ETag header): read
-    // back the destination's freshly-stamped last-modified in ISO 8601.
+    // back the new version's freshly-stamped last-modified in ISO 8601. An
+    // unversioned bucket's only version is `null`.
     let client = app.pool.get().await?;
     let last_modified: String = client
         .query_one(
             "SELECT to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"')
-             FROM objects WHERE bucket = $1 AND key = $2 AND is_latest",
-            &[&dest_bucket, &dest_key],
+             FROM objects WHERE bucket = $1 AND key = $2 AND version_id = $3",
+            &[&dest_bucket, &dest_key, &version_id.as_deref().unwrap_or("null")],
         )
         .await?
         .get(0);
-    Ok(xml_ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <CopyObjectResult>\
-         <LastModified>{last_modified}</LastModified>\
-         <ETag>\"{etag}\"</ETag>\
-         </CopyObjectResult>"
-    )))
+    Ok(with_version_id(
+        xml_ok(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+             <CopyObjectResult>\
+             <LastModified>{last_modified}</LastModified>\
+             <ETag>\"{etag}\"</ETag>\
+             </CopyObjectResult>"
+        )),
+        version_id.as_deref(),
+    ))
 }
 
 /// UploadPartCopy: `PUT /{bucket}/{key}?partNumber=N&uploadId=U` with an
@@ -324,7 +328,7 @@ pub async fn copy_part(
     )
     .await?
     {
-        UploadResult::Committed(etag) => etag,
+        UploadResult::Committed { etag, .. } => etag,
         UploadResult::ContentSha256Mismatch
         | UploadResult::ChunkSignatureMismatch
         | UploadResult::PreconditionFailed => {

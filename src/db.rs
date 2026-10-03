@@ -40,7 +40,7 @@ const MIGRATION_LOCK: i64 = 0x6361_6972_6e00; // "cairn\0"
 /// The schema, as an ordered list of steps. Migration `n` (1-based) is
 /// `MIGRATIONS[n - 1]`; `schema_migrations` records which have been applied.
 /// Only ever append: an applied step must never change.
-const MIGRATIONS: &[&str] = &[INITIAL_SCHEMA, VERSIONING];
+const MIGRATIONS: &[&str] = &[INITIAL_SCHEMA, VERSIONING, DELETE_VERSION_GRANT];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
 /// the schema untouched. Refuses to run against a database migrated by a newer
@@ -247,4 +247,14 @@ CREATE INDEX objects_live ON objects (bucket, key)
     WHERE is_latest AND NOT is_delete_marker;
 -- ListObjectVersions walks each key's versions newest first.
 CREATE INDEX objects_versions ON objects (bucket, key, id DESC);
+"#;
+
+/// Migration 3: the `delete-version` grant, which permanently deletes specific
+/// object versions. Kept apart from `write` so that a role able to write (e.g. a
+/// backup client) can't destroy the history versioning preserves.
+const DELETE_VERSION_GRANT: &str = r#"
+ALTER TABLE role_grants
+    DROP CONSTRAINT role_grants_permission_check,
+    ADD CONSTRAINT role_grants_permission_check
+        CHECK (permission IN ('read', 'write', 'delete-version'));
 "#;

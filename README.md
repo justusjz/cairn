@@ -127,12 +127,16 @@ very next request; there is nothing to restart or sync.
 
 What a role may do:
 
-- **admin** (`--admin`): create and delete buckets, HEAD any bucket, and see
-  every bucket in ListBuckets. Admin does **not** grant access to objects.
+- **admin** (`--admin`): create and delete buckets, configure their
+  [versioning](#versioning), HEAD any bucket, and see every bucket in
+  ListBuckets. Admin does **not** grant access to objects.
 - **`read`** on a bucket: GetObject, HeadObject, ListObjects, and being the
   source of a CopyObject / UploadPartCopy.
 - **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads, and
-  being the destination of a copy.
+  being the destination of a copy. In a versioned bucket, a delete only adds a
+  delete marker.
+- **`delete-version`** on a bucket: DeleteObject(s) naming a version ID, which
+  removes that version for good.
 
 A role sees only the buckets it holds a grant on (or all of them, if admin).
 Permissions are per bucket; there are no per-key permissions. A bucket must
@@ -148,8 +152,8 @@ Manage roles with `cairn role --database <URL> <command>`:
 | `create <name> [--admin] [--secret <S>]` | Create a role. Prints a generated 40-char secret unless `--secret` is given (min. 8 chars). |
 | `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret (`--rotate-secret` prints the new one). |
 | `delete <name>` | Delete a role and all its grants. |
-| `grant <name> <bucket> <read\|write>...` | Grant permissions on an existing bucket. |
-| `revoke <name> <bucket> [read\|write]...` | Revoke permissions on a bucket; all of them if none are listed. |
+| `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket. |
+| `revoke <name> <bucket> [read\|write\|delete-version]...` | Revoke permissions on a bucket; all of them if none are listed. |
 | `list` | List roles, their admin flag, and their grants (secrets are not shown). |
 
 Secrets are stored in plaintext in the `roles` table: SigV4 is an HMAC scheme,
@@ -165,6 +169,39 @@ clocks of nodes and clients in sync (e.g. NTP); otherwise requests fail with
 > Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,
 > since it is part of the signature.
+
+## Versioning
+
+Buckets support S3 versioning, which keeps every version of an object instead
+of overwriting it. This is what makes Cairn a ransomware-resistant backup
+target: a client that can write and delete (e.g. restic) can't destroy the
+history, as long as it isn't granted `delete-version`.
+
+An admin enables it per bucket with any S3 client:
+
+```sh
+aws s3api put-bucket-versioning --bucket my-bucket \
+    --versioning-configuration Status=Enabled
+```
+
+A bucket starts out unversioned, and once enabled can only be switched between
+`Enabled` and `Suspended`, never back. As in S3:
+
+- **Enabled:** every write creates a new version with its own ID, and a delete
+  without a version ID only adds a *delete marker*, hiding the object from
+  GET and listings while every version stays readable by ID.
+- **Suspended:** existing versions are kept, but new writes replace the single
+  `null` version, and a delete replaces it with a `null` delete marker.
+  Overwriting or deleting an object then destroys its `null` version, so
+  suspending versioning gives up the protection for new writes.
+- Reading a specific version (`?versionId=`) needs `read`; removing one for
+  good needs `delete-version`. A bucket with any versions or delete markers
+  left counts as non-empty and can't be deleted.
+
+Old versions take up space until they're deleted. There are no lifecycle rules
+yet to expire them automatically, and listing versions (ListObjectVersions) is
+not supported yet, so a version can only be read or deleted by an ID you
+already know.
 
 ## Garbage collection
 

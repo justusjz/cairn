@@ -8,78 +8,72 @@ use tokio_postgres::{IsolationLevel, error::SqlState};
 use crate::{
     App, ReapTarget,
     auth::BodyChecksum,
-    reap_parts, reap_targets,
-    s3::util::{format_s3_error, xml_escape, xml_ok},
+    reap_parts,
+    s3::util::{format_s3_error, with_delete_marker, with_version_id, xml_escape, xml_ok},
+    s3::versions::{Deleted, bucket_versioning, delete_key},
 };
 
 /// Bounded retry for the serializable delete, mirroring the commit paths.
 const MAX_DELETE_ATTEMPTS: usize = 10;
 
+/// What a delete addresses: a key, and optionally one specific version of it.
+struct Target {
+    key: String,
+    version_id: Option<String>,
+}
+
 enum DeleteStatus {
-    Deleted,
+    /// One outcome per target, in order.
+    Deleted(Vec<Deleted>),
     NoSuchBucket,
     Unavailable,
 }
 
-/// One serializable attempt: confirm the bucket exists, capture the removed
-/// parts' replica locations (for immediate reaping), then drop the keys' `null`
-/// versions (cascading their parts/part_locations away). That is a complete
-/// delete in an unversioned bucket, the only kind there is so far: such a bucket
-/// holds nothing but `null` versions. The raw postgres error is
-/// returned so the caller can retry on a serialization failure. Runs at the same
-/// isolation as the put/complete/GC transactions that also touch `objects`/
-/// `parts`, so the delete can't undermine their guarantees — and the bucket
-/// check shares the snapshot, so there's no check-then-delete race.
+/// One serializable attempt: read the bucket's versioning state (which doubles
+/// as the existence check), then delete each target the way that state dictates,
+/// capturing the removed parts' replica locations for immediate reaping. The raw
+/// postgres error is returned so the caller can retry on a serialization failure.
+/// Runs at the same isolation as the put/complete/GC transactions that also touch
+/// `objects`/`parts`, so the delete can't undermine their guarantees — and the
+/// bucket check shares the snapshot, so there's no check-then-delete race.
 async fn try_delete(
     client: &mut Object,
     bucket: &str,
-    keys: &[&str],
+    targets: &[Target],
 ) -> Result<(DeleteStatus, Vec<ReapTarget>), tokio_postgres::Error> {
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::Serializable)
         .start()
         .await?;
-    if tx
-        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
-        .await?
-        .is_none()
-    {
+    let Some(versioning) = bucket_versioning(&tx, bucket).await? else {
         return Ok((DeleteStatus::NoSuchBucket, Vec::new())); // tx rolls back on drop
+    };
+    let mut reap = Vec::new();
+    let mut outcomes = Vec::with_capacity(targets.len());
+    for t in targets {
+        let version_id = t.version_id.as_deref();
+        outcomes.push(delete_key(&tx, bucket, &t.key, versioning, version_id, &mut reap).await?);
     }
-    let removed = tx
-        .query(
-            "SELECT pl.part_id, pl.node_id, n.peer_url
-             FROM objects o
-             JOIN parts p ON p.object_id = o.id
-             JOIN part_locations pl ON pl.part_id = p.part_id
-             JOIN nodes n ON n.node_id = pl.node_id
-             WHERE o.bucket = $1 AND o.key = ANY($2) AND o.version_id = 'null'",
-            &[&bucket, &keys],
-        )
-        .await?;
-    let targets = reap_targets(&removed);
-    tx.execute(
-        "DELETE FROM objects WHERE bucket = $1 AND key = ANY($2) AND version_id = 'null'",
-        &[&bucket, &keys],
-    )
-    .await?;
     tx.commit().await?;
-    Ok((DeleteStatus::Deleted, targets))
+    Ok((DeleteStatus::Deleted(outcomes), reap))
 }
 
-/// Deletes `keys` from `bucket` in a serializable transaction, retrying on a
+/// Deletes `targets` from `bucket` in a serializable transaction, retrying on a
 /// serialization conflict (e.g. a concurrent overwrite or GC). On success, reaps
 /// the removed parts' files in the background.
-async fn delete_keys(app: &Arc<App>, bucket: &str, keys: &[&str]) -> anyhow::Result<DeleteStatus> {
+async fn delete_targets(
+    app: &Arc<App>,
+    bucket: &str,
+    targets: &[Target],
+) -> anyhow::Result<DeleteStatus> {
     let mut client = app.pool.get().await?;
     for _ in 0..MAX_DELETE_ATTEMPTS {
-        match try_delete(&mut client, bucket, keys).await {
-            Ok((DeleteStatus::Deleted, targets)) => {
-                reap_parts(app, targets);
-                return Ok(DeleteStatus::Deleted);
+        match try_delete(&mut client, bucket, targets).await {
+            Ok((status, reap)) => {
+                reap_parts(app, reap);
+                return Ok(status);
             }
-            Ok((status, _)) => return Ok(status),
             Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
             Err(e) => return Err(e.into()),
         }
@@ -87,17 +81,35 @@ async fn delete_keys(app: &Arc<App>, bucket: &str, keys: &[&str]) -> anyhow::Res
     Ok(DeleteStatus::Unavailable)
 }
 
+/// DeleteObject: `DELETE /{bucket}/{key}`, optionally `?versionId=V` to remove one
+/// version for good. Reports the version concerned (the removed one, or the delete
+/// marker just created) in `x-amz-version-id` / `x-amz-delete-marker`.
 pub async fn delete_object(
     app: &Arc<App>,
     bucket: &str,
     key: &str,
+    version_id: Option<&str>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    // Idempotent: deleting a key that isn't there still returns 204, per S3.
-    match delete_keys(app, bucket, &[key]).await? {
-        DeleteStatus::Deleted => Ok(Response::builder()
-            .status(StatusCode::NO_CONTENT)
-            .body(Full::new(Bytes::new()))
-            .unwrap()),
+    let target = Target {
+        key: key.to_owned(),
+        version_id: version_id.map(str::to_owned),
+    };
+    // Idempotent: deleting a key or version that isn't there still returns 204,
+    // per S3.
+    match delete_targets(app, bucket, &[target]).await? {
+        DeleteStatus::Deleted(outcomes) => {
+            let deleted = &outcomes[0];
+            let resp = Response::builder()
+                .status(StatusCode::NO_CONTENT)
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let resp = with_version_id(resp, deleted.version_id.as_deref());
+            Ok(if deleted.delete_marker {
+                with_delete_marker(resp)
+            } else {
+                resp
+            })
+        }
         DeleteStatus::NoSuchBucket => Ok(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
@@ -114,18 +126,22 @@ pub async fn delete_object(
 /// S3 caps a batch delete at 1000 keys per request.
 const MAX_DELETE_KEYS: usize = 1000;
 
-/// Parses a DeleteObjects body into the keys to delete and the Quiet flag.
-/// Namespace-agnostic like the other parsers; returns None on malformed XML.
-fn parse_delete_request(body: &str) -> Option<(Vec<String>, bool)> {
+/// Parses a DeleteObjects body into the targets to delete (each a key with an
+/// optional version ID) and the Quiet flag. Namespace-agnostic like the other
+/// parsers; returns None on malformed XML.
+fn parse_delete_request(body: &str) -> Option<(Vec<Target>, bool)> {
     let doc = roxmltree::Document::parse(body).ok()?;
-    let mut keys = Vec::new();
+    let mut targets = Vec::new();
     for obj in doc.descendants().filter(|n| n.tag_name().name() == "Object") {
-        let key = obj
-            .children()
-            .find(|n| n.tag_name().name() == "Key")
-            .and_then(|n| n.text())?
-            .to_owned();
-        keys.push(key);
+        let child = |name| {
+            obj.children()
+                .find(|n| n.tag_name().name() == name)
+                .and_then(|n| n.text())
+        };
+        targets.push(Target {
+            key: child("Key")?.to_owned(),
+            version_id: child("VersionId").map(str::to_owned),
+        });
     }
     // Quiet mode (default false): suppress the per-key <Deleted> entries, leaving
     // only <Error>s in the response.
@@ -134,16 +150,21 @@ fn parse_delete_request(body: &str) -> Option<(Vec<String>, bool)> {
         .find(|n| n.tag_name().name() == "Quiet")
         .and_then(|n| n.text())
         .is_some_and(|t| t.trim().eq_ignore_ascii_case("true"));
-    Some((keys, quiet))
+    Some((targets, quiet))
 }
 
 /// DeleteObjects (batch): `POST /{bucket}?delete` with a `<Delete>` body listing
-/// keys. `checksum` is the request's body-integrity headers.
+/// keys, each optionally with a version ID. `checksum` is the request's
+/// body-integrity headers. Authorization is per entry, as in S3: an entry naming
+/// a version needs `may_delete_versions`, any other needs `may_write`; a denied
+/// entry is reported as an AccessDenied `<Error>` and the rest still proceed.
 pub async fn delete_objects(
     app: &Arc<App>,
     bucket: &str,
     body: Bytes,
     checksum: BodyChecksum,
+    may_write: bool,
+    may_delete_versions: bool,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     // Integrity first: this operation is destructive and the body *is* the list of
     // things to destroy, so a corrupted body must never delete the wrong objects.
@@ -171,8 +192,8 @@ pub async fn delete_objects(
             "request body is not valid UTF-8",
         ));
     };
-    let (keys, quiet) = match parse_delete_request(body_str) {
-        Some((keys, quiet)) if !keys.is_empty() => (keys, quiet),
+    let (targets, quiet) = match parse_delete_request(body_str) {
+        Some((targets, quiet)) if !targets.is_empty() => (targets, quiet),
         _ => {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
@@ -181,7 +202,7 @@ pub async fn delete_objects(
             ));
         }
     };
-    if keys.len() > MAX_DELETE_KEYS {
+    if targets.len() > MAX_DELETE_KEYS {
         return Ok(format_s3_error(
             StatusCode::BAD_REQUEST,
             "MalformedXML",
@@ -189,12 +210,16 @@ pub async fn delete_objects(
         ));
     }
 
-    // One serializable statement removes every requested key. Absent keys are
-    // no-ops, so — like the single-key delete — every requested key is reported
-    // deleted (delete is idempotent; there are no per-key failure modes here).
-    let key_refs: Vec<&str> = keys.iter().map(String::as_str).collect();
-    match delete_keys(app, bucket, &key_refs).await? {
-        DeleteStatus::Deleted => {}
+    // One serializable transaction deletes every permitted target. Absent keys and
+    // versions are no-ops, so — like the single-key delete — every permitted
+    // target is reported deleted (delete is idempotent).
+    let (permitted, denied): (Vec<Target>, Vec<Target>) =
+        targets.into_iter().partition(|t| match t.version_id {
+            Some(_) => may_delete_versions,
+            None => may_write,
+        });
+    let outcomes = match delete_targets(app, bucket, &permitted).await? {
+        DeleteStatus::Deleted(outcomes) => outcomes,
         DeleteStatus::NoSuchBucket => {
             return Ok(format_s3_error(
                 StatusCode::NOT_FOUND,
@@ -209,16 +234,42 @@ pub async fn delete_objects(
                 "delete aborted after serialization retries",
             ));
         }
-    }
+    };
 
     let mut out = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <DeleteResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
+    // S3's per-entry report: the requested VersionId is echoed back, and when the
+    // entry concerns a delete marker (one just created, or the one removed), so is
+    // that marker's version ID.
     if !quiet {
-        for key in &keys {
-            out.push_str(&format!("<Deleted><Key>{}</Key></Deleted>", xml_escape(key)));
+        for (t, deleted) in permitted.iter().zip(&outcomes) {
+            out.push_str("<Deleted>");
+            out.push_str(&format!("<Key>{}</Key>", xml_escape(&t.key)));
+            if let Some(v) = &t.version_id {
+                out.push_str(&format!("<VersionId>{}</VersionId>", xml_escape(v)));
+            }
+            if deleted.delete_marker {
+                out.push_str("<DeleteMarker>true</DeleteMarker>");
+                if let Some(v) = &deleted.version_id {
+                    out.push_str(&format!(
+                        "<DeleteMarkerVersionId>{}</DeleteMarkerVersionId>",
+                        xml_escape(v)
+                    ));
+                }
+            }
+            out.push_str("</Deleted>");
         }
+    }
+    // Errors are reported even in quiet mode.
+    for t in &denied {
+        out.push_str("<Error>");
+        out.push_str(&format!("<Key>{}</Key>", xml_escape(&t.key)));
+        if let Some(v) = &t.version_id {
+            out.push_str(&format!("<VersionId>{}</VersionId>", xml_escape(v)));
+        }
+        out.push_str("<Code>AccessDenied</Code><Message>Access Denied</Message></Error>");
     }
     out.push_str("</DeleteResult>");
     Ok(xml_ok(out))

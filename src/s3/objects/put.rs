@@ -7,7 +7,8 @@ use crate::{
     App, AttachTarget, UploadResult,
     auth::{ContentSha256, StreamingChunkVerifier},
     s3::conditional::Preconditions,
-    s3::util::format_s3_error,
+    s3::util::{format_s3_error, with_version_id},
+    s3::versions::current_etag,
 };
 
 pub async fn put_object(
@@ -41,7 +42,7 @@ pub async fn put_object(
     // the whole object just to be rejected. This is only an optimization — the
     // authoritative, race-free check runs inside the commit transaction.
     if conditions.has_write_conditions() {
-        let current = crate::current_etag(&client, bucket, key).await?;
+        let current = current_etag(&client, bucket, key).await?;
         if !conditions.allows_write(current.as_deref()) {
             return Ok(precondition_failed());
         }
@@ -58,11 +59,14 @@ pub async fn put_object(
     };
     match crate::upload_part(app, body, &attach, aws_chunked, content_sha256, chunk_verifier).await?
     {
-        UploadResult::Committed(etag) => Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(header::ETAG, format!("\"{etag}\""))
-            .body(Full::new(Bytes::new()))
-            .unwrap()),
+        UploadResult::Committed { etag, version_id } => Ok(with_version_id(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::ETAG, format!("\"{etag}\""))
+                .body(Full::new(Bytes::new()))
+                .unwrap(),
+            version_id.as_deref(),
+        )),
         UploadResult::ContentSha256Mismatch => Ok(format_s3_error(
             StatusCode::BAD_REQUEST,
             "XAmzContentSHA256Mismatch",

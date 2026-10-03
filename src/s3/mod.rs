@@ -9,7 +9,11 @@ use crate::{
     roles::{Permission, Principal},
     s3::{
         buckets::{
-            create::create_bucket, delete::delete_bucket, head::head_bucket, list::list_buckets,
+            create::create_bucket,
+            delete::delete_bucket,
+            head::head_bucket,
+            list::list_buckets,
+            versioning::{get_bucket_versioning, put_bucket_versioning},
         },
         conditional::Preconditions,
         multipart::{
@@ -35,6 +39,7 @@ pub(crate) mod conditional;
 mod multipart;
 mod objects;
 mod util;
+pub(crate) mod versions;
 
 pub async fn handle(
     req: Request<hyper::body::Incoming>,
@@ -79,7 +84,8 @@ pub async fn handle(
         .headers()
         .get("x-amz-copy-source")
         .and_then(|v| v.to_str().ok());
-    if !authorize(&principal, req.method(), &bucket, &key, copy_source_header) {
+    let query = req.uri().query().unwrap_or("");
+    if !authorize(&principal, req.method(), &bucket, &key, query, copy_source_header) {
         return Ok(forbidden("AccessDenied", "Access Denied"));
     }
     if key.is_empty() {
@@ -87,11 +93,14 @@ pub async fn handle(
         // query up front and match on an owned method — mirroring the object branch
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
-        // Bucket sub-resource GETs (acl/location/versioning/policy/cors/tagging/
-        // lifecycle/object-lock) are stubbed — Cairn implements none of them, so
-        // answer as S3 does for an unconfigured bucket before falling through to a
-        // listing.
+        // Bucket sub-resource GETs: versioning is real; the rest (acl/location/
+        // policy/cors/tagging/lifecycle/object-lock) are stubbed — Cairn implements
+        // none of them, so answer as S3 does for an unconfigured bucket before
+        // falling through to a listing.
         if *req.method() == hyper::Method::GET {
+            if query_param(&query, "versioning").is_some() {
+                return Ok(box_response(get_bucket_versioning(&app, &bucket).await?));
+            }
             if let Some(resp) = bucket_subresource_stub(&query) {
                 return Ok(box_response(resp));
             }
@@ -150,13 +159,23 @@ pub async fn handle(
                 .await?
             }
             hyper::Method::HEAD => head_bucket(&app, &bucket).await?,
+            // PutBucketVersioning: PUT /{bucket}?versioning with a
+            // <VersioningConfiguration> body.
+            hyper::Method::PUT if query_param(&query, "versioning").is_some() => {
+                let checksum = crate::auth::BodyChecksum::from_headers(req.headers());
+                let body = req.into_body().collect().await?.to_bytes();
+                put_bucket_versioning(&app, &bucket, body, checksum).await?
+            }
             hyper::Method::PUT => create_bucket(&app, &bucket).await?,
             // DeleteObjects (batch): POST /{bucket}?delete with a <Delete> body.
             // Read the integrity headers before consuming the body to verify it.
             hyper::Method::POST if query_param(&query, "delete").is_some() => {
                 let checksum = crate::auth::BodyChecksum::from_headers(req.headers());
                 let body = req.into_body().collect().await?.to_bytes();
-                delete_objects(&app, &bucket, body, checksum).await?
+                let may_write = principal.can(Permission::Write, &bucket);
+                let may_delete_versions = principal.can(Permission::DeleteVersion, &bucket);
+                delete_objects(&app, &bucket, body, checksum, may_write, may_delete_versions)
+                    .await?
             }
             hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
@@ -176,13 +195,23 @@ pub async fn handle(
     // Conditional-request headers (If-Match / If-None-Match / If-[Un]Modified-Since)
     // gate GET and HEAD; read them before the body-consuming arms.
     let preconditions = Preconditions::from_headers(req.headers());
+    // GET, HEAD and DELETE may address one specific version of the object.
+    let version_id = query_param(&query, "versionId");
     if *req.method() == hyper::Method::GET {
         // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
         // break XML-parsing clients like `s3cmd info`.
         if query_param(&query, "acl").is_some() {
             return Ok(box_response(stub_acl()));
         }
-        return get_object(&app, &bucket, &key, range.as_deref(), &preconditions).await;
+        return get_object(
+            &app,
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            range.as_deref(),
+            &preconditions,
+        )
+        .await;
     }
     let content_type = req
         .headers()
@@ -228,14 +257,24 @@ pub async fn handle(
     };
     let resp = match req.method().clone() {
         hyper::Method::HEAD => {
-            head_object(&app, &bucket, &key, range.as_deref(), &preconditions).await?
+            head_object(
+                &app,
+                &bucket,
+                &key,
+                version_id.as_deref(),
+                range.as_deref(),
+                &preconditions,
+            )
+            .await?
         }
         // AbortMultipartUpload
         hyper::Method::DELETE if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
             abort_multipart_upload(&app, &bucket, &key, &upload_id).await?
         }
-        hyper::Method::DELETE => delete_object(&app, &bucket, &key).await?,
+        hyper::Method::DELETE => {
+            delete_object(&app, &bucket, &key, version_id.as_deref()).await?
+        }
         // CreateMultipartUpload
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {
             create_multipart_upload(&app, &bucket, &key, &content_type).await?
@@ -342,22 +381,31 @@ fn forbidden(code: &str, message: &str) -> Response<ResBody> {
 }
 
 /// Whether `principal` may make this request against `bucket` (`key` empty for a
-/// bucket-level request). Creating and deleting buckets is admin-only, and a
-/// bucket HEAD just needs the bucket to be visible to the role. Everything else
-/// needs a grant on the bucket: `read` for GET/HEAD, `write` for the rest. A
-/// copy also needs `read` on its source bucket.
+/// bucket-level request). Bucket management — creating, deleting, and
+/// configuring versioning — is admin-only, while a bucket HEAD or reading its
+/// versioning state just needs the bucket to be visible to the role. Everything
+/// else needs a grant on the bucket: `read` for GET/HEAD, `delete-version` to
+/// delete a specific version, `write` for the rest. A copy also needs `read` on
+/// its source bucket. DeleteObjects only needs one of `write` / `delete-version`
+/// here; it checks each entry against them itself.
 fn authorize(
     principal: &Principal,
     method: &Method,
     bucket: &str,
     key: &str,
+    query: &str,
     copy_source: Option<&str>,
 ) -> bool {
     if key.is_empty() {
         return match *method {
             Method::PUT | Method::DELETE => principal.admin,
             Method::HEAD => principal.can_see(bucket),
+            Method::GET if query_param(query, "versioning").is_some() => principal.can_see(bucket),
             Method::GET => principal.can(Permission::Read, bucket),
+            Method::POST if query_param(query, "delete").is_some() => {
+                principal.can(Permission::Write, bucket)
+                    || principal.can(Permission::DeleteVersion, bucket)
+            }
             _ => principal.can(Permission::Write, bucket),
         };
     }
@@ -370,6 +418,12 @@ fn authorize(
                 None => true,
             };
             principal.can(Permission::Write, bucket) && source_ok
+        }
+        Method::DELETE
+            if query_param(query, "versionId").is_some()
+                && query_param(query, "uploadId").is_none() =>
+        {
+            principal.can(Permission::DeleteVersion, bucket)
         }
         _ => principal.can(Permission::Write, bucket),
     }

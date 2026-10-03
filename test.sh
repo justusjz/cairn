@@ -43,6 +43,7 @@ BUCKET="smoke-$(date +%s)"
 PBUCKET="page-$(date +%s)"       # pagination fixtures
 NBUCKET="nonempty-$(date +%s)"   # DeleteBucket-on-non-empty test
 OBUCKET="other-$(date +%s)"      # cross-bucket permission tests
+VBUCKET="versioned-$(date +%s)"  # versioning tests
 
 # ─── Pretty output ───────────────────────────────────────────────────────────
 if [ -t 1 ]; then
@@ -51,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=59
+TOTAL=68
 STEP=0
 PASS=0
 FAIL=0
@@ -741,6 +742,171 @@ multipart_reap_ok() {
     return 1
 }
 
+# ─── Versioning helpers ───
+# vput <key> <file> — PUT into $VBUCKET, printing the reported VersionId.
+vput() {
+    awss3 s3api put-object --bucket "$VBUCKET" --key "$1" --body "$2" \
+        --query VersionId --output text 2>/dev/null
+}
+# vget_is <key> <expected-file> [version] — the (given version of the) key reads
+# back as exactly <expected-file>.
+vget_is() {
+    awss3 s3api get-object --bucket "$VBUCKET" --key "$1" ${3:+--version-id "$3"} \
+        "$WORK_DIR/vget.out" >/dev/null 2>&1 && cmp -s "$2" "$WORK_DIR/vget.out"
+}
+# vdel <key> [version] — DELETE, printing "<DeleteMarker>\t<VersionId>".
+vdel() {
+    awss3 s3api delete-object --bucket "$VBUCKET" --key "$1" ${2:+--version-id "$2"} \
+        --query '[DeleteMarker,VersionId]' --output text 2>/dev/null
+}
+
+# A new bucket reports no versioning state. Changing it is bucket management
+# (admin-only), so writer, holding read/write, can't; the admin enables it and
+# it reads back. testkey also gets delete-version here, for the tests below.
+versioning_enable_ok() {
+    mb_granted "$VBUCKET" || return 1
+    cairn_role grant "$ACCESS_KEY" "$VBUCKET" delete-version >/dev/null 2>&1 || return 1
+    cairn_role grant writer "$VBUCKET" read write >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-versioning --bucket "$VBUCKET" \
+        --query Status --output text 2>/dev/null)" = "None" ] || return 1
+    ! as_role writer writersecret s3api put-bucket-versioning --bucket "$VBUCKET" \
+        --versioning-configuration Status=Enabled >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-versioning --bucket "$VBUCKET" \
+        --versioning-configuration Status=Enabled >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-versioning --bucket "$VBUCKET" \
+        --query Status --output text 2>/dev/null)" = "Enabled" ]
+}
+
+# An overwrite in an enabled bucket keeps the old version: each PUT reports a
+# fresh VersionId, a plain GET reads the newest, and the old one stays readable
+# by its ID (HEAD reports it back too).
+versioned_overwrite_ok() {
+    local v1 v2
+    v1=$(vput ow "$SMALL") && v2=$(vput ow "$NESTED") || return 1
+    [ -n "$v1" ] && [ "$v1" != "None" ] && [ "$v1" != "null" ] && [ "$v1" != "$v2" ] || return 1
+    vget_is ow "$NESTED" || return 1
+    vget_is ow "$SMALL" "$v1" || return 1
+    [ "$(awss3 s3api head-object --bucket "$VBUCKET" --key ow --version-id "$v1" \
+        --query VersionId --output text 2>/dev/null)" = "$v1" ]
+}
+
+# A plain DELETE adds a delete marker: the key reads as gone (404) and drops out
+# of listings, but its data stays readable by version ID. Reading the marker
+# itself by ID is a 405, as in S3.
+delete_marker_ok() {
+    local v1 out marker
+    v1=$(vput dm "$SMALL") || return 1
+    out=$(vdel dm) || return 1
+    [ "${out%%$'\t'*}" = "True" ] || return 1
+    marker=${out#*$'\t'}
+    [ -n "$marker" ] && [ "$marker" != "$v1" ] || return 1
+    awss3 s3api get-object --bucket "$VBUCKET" --key dm "$WORK_DIR/dm" 2>&1 | grep -q NoSuchKey || return 1
+    [ "$(awss3 s3api list-objects-v2 --bucket "$VBUCKET" --prefix dm \
+        --query 'length(Contents || `[]`)' --output text 2>/dev/null)" = "0" ] || return 1
+    vget_is dm "$SMALL" "$v1" || return 1
+    awss3 s3api head-object --bucket "$VBUCKET" --key dm --version-id "$marker" 2>&1 | grep -q 405
+}
+
+# DELETE with a versionId removes that version for good; removing the current
+# one promotes the next-newest. Peel a marker and two versions off one by one.
+delete_version_promotes_ok() {
+    local v1 v2 marker
+    v1=$(vput pr "$SMALL") && v2=$(vput pr "$NESTED") || return 1
+    marker=$(vdel pr) || return 1
+    marker=${marker#*$'\t'}
+    [ "$(vdel pr "$marker")" = "True"$'\t'"$marker" ] || return 1
+    vget_is pr "$NESTED" || return 1
+    vdel pr "$v2" >/dev/null || return 1
+    vget_is pr "$SMALL" || return 1
+    ! vget_is pr "$SMALL" "$v2" || return 1
+    vdel pr "$v1" >/dev/null || return 1
+    ! vget_is pr "$SMALL"
+}
+
+# Multipart uploads and copies create versions too, and report them.
+versioned_multipart_copy_ok() {
+    local v cv
+    awss3 s3 cp "$MULTIPART" "s3://${VBUCKET}/mp" >/dev/null 2>&1 || return 1
+    v=$(awss3 s3api head-object --bucket "$VBUCKET" --key mp \
+        --query VersionId --output text 2>/dev/null) || return 1
+    [ -n "$v" ] && [ "$v" != "None" ] && [ "$v" != "null" ] || return 1
+    cv=$(awss3 s3api copy-object --bucket "$VBUCKET" --key mp-copy --copy-source "${VBUCKET}/mp" \
+        --query VersionId --output text 2>/dev/null) || return 1
+    [ -n "$cv" ] && [ "$cv" != "None" ] && [ "$cv" != "$v" ] || return 1
+    vget_is mp-copy "$MULTIPART" "$cv"
+}
+
+# Suspending keeps existing versions but lands new writes on the single `null`
+# version (an overwrite replaces it), and a DELETE swaps the null version for a
+# null delete marker. Re-enables versioning afterwards.
+versioning_suspended_ok() {
+    local v1 out
+    v1=$(vput su "$SMALL") || return 1
+    awss3 s3api put-bucket-versioning --bucket "$VBUCKET" \
+        --versioning-configuration Status=Suspended >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-versioning --bucket "$VBUCKET" \
+        --query Status --output text 2>/dev/null)" = "Suspended" ] || return 1
+    [ "$(vput su "$NESTED")" = "null" ] || return 1
+    [ "$(vput su "$BIG")" = "null" ] || return 1
+    vget_is su "$BIG" || return 1
+    vget_is su "$BIG" null || return 1
+    vget_is su "$SMALL" "$v1" || return 1
+    out=$(vdel su) || return 1
+    [ "$out" = "True"$'\t'"null" ] || return 1
+    ! vget_is su "$BIG" null || return 1
+    vget_is su "$SMALL" "$v1" || return 1
+    awss3 s3api put-bucket-versioning --bucket "$VBUCKET" \
+        --versioning-configuration Status=Enabled >/dev/null 2>&1
+}
+
+# Removing a version for good needs the delete-version grant, so a role with
+# only read/write (like a backup client) can't destroy history: writer may add a
+# delete marker but not delete a version, by DeleteObject or DeleteObjects
+# (where the entry fails with AccessDenied). testkey, holding the grant, can.
+delete_version_needs_grant_ok() {
+    local w=(as_role writer writersecret) v req
+    v=$("${w[@]}" s3api put-object --bucket "$VBUCKET" --key perm --body "$SMALL" \
+        --query VersionId --output text 2>/dev/null) || return 1
+    ! "${w[@]}" s3api delete-object --bucket "$VBUCKET" --key perm --version-id "$v" >/dev/null 2>&1 || return 1
+    req="{\"Objects\":[{\"Key\":\"perm\",\"VersionId\":\"$v\"}]}"
+    [ "$("${w[@]}" s3api delete-objects --bucket "$VBUCKET" --delete "$req" \
+        --query 'Errors[0].Code' --output text 2>/dev/null)" = "AccessDenied" ] || return 1
+    vget_is perm "$SMALL" "$v" || return 1
+    [ "$("${w[@]}" s3api delete-object --bucket "$VBUCKET" --key perm \
+        --query DeleteMarker --output text 2>/dev/null)" = "True" ] || return 1
+    vget_is perm "$SMALL" "$v" || return 1
+    [ "$(awss3 s3api delete-objects --bucket "$VBUCKET" --delete "$req" \
+        --query 'Deleted[0].VersionId' --output text 2>/dev/null)" = "$v" ] || return 1
+    ! vget_is perm "$SMALL" "$v"
+}
+
+# A bucket that has never been versioned reports no version IDs at all.
+unversioned_no_version_id_ok() {
+    [ "$(awss3 s3api put-object --bucket "$BUCKET" --key unv.txt --body "$SMALL" \
+        --query VersionId --output text 2>/dev/null)" = "None" ] || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key unv.txt \
+        --query VersionId --output text 2>/dev/null)" = "None" ] || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key unv.txt >/dev/null 2>&1
+}
+
+# Old versions and delete markers count as content: a bucket holding nothing
+# but a delete marker can't be deleted until the marker is removed too.
+versioned_bucket_not_empty_ok() {
+    local b="dmonly-$(date +%s)" v marker
+    mb_granted "$b" || return 1
+    cairn_role grant "$ACCESS_KEY" "$b" delete-version >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-versioning --bucket "$b" \
+        --versioning-configuration Status=Enabled >/dev/null 2>&1 || return 1
+    v=$(awss3 s3api put-object --bucket "$b" --key k --body "$SMALL" \
+        --query VersionId --output text 2>/dev/null) || return 1
+    marker=$(awss3 s3api delete-object --bucket "$b" --key k \
+        --query VersionId --output text 2>/dev/null) || return 1
+    awss3 s3api delete-object --bucket "$b" --key k --version-id "$v" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket --bucket "$b" 2>&1 | grep -q BucketNotEmpty || return 1
+    awss3 s3api delete-object --bucket "$b" --key k --version-id "$marker" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
 # Prune rmdir's empty shard directories. Upload then delete a batch of objects
 # (emptying their shard dirs), then run `prune --apply` against the peer endpoint
 # and confirm the directory count dropped. Live objects' shards stay (non-empty).
@@ -887,6 +1053,15 @@ run_test    "Batch delete guards (MD5 / bucket)"    batch_delete_guards_ok
 run_test    "DeleteBucket on non-empty bucket rejected" delete_nonempty_bucket_rejected
 run_test    "Deleted parts reaped without prune"    immediate_reap_ok
 run_test    "Multipart leftovers reaped without prune" multipart_reap_ok
+run_test    "Enable versioning (admin-only)"         versioning_enable_ok
+run_test    "Versioned overwrite keeps old version"  versioned_overwrite_ok
+run_test    "Delete adds a delete marker"            delete_marker_ok
+run_test    "Deleting versions promotes the next"    delete_version_promotes_ok
+run_test    "Multipart + copy create versions"       versioned_multipart_copy_ok
+run_test    "Suspended versioning uses null version" versioning_suspended_ok
+run_test    "Deleting a version needs the grant"     delete_version_needs_grant_ok
+run_test    "Unversioned bucket reports no versions" unversioned_no_version_id_ok
+run_test    "Delete markers keep a bucket non-empty" versioned_bucket_not_empty_ok
 run_test    "Prune removes empty shard dirs"         prune_empty_dirs_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok

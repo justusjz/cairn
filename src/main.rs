@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
-use deadpool_postgres::{GenericClient, Object, Pool};
+use deadpool_postgres::{Object, Pool};
 use http_body_util::{BodyExt, Empty};
 use hyper::{
     Method, Request, StatusCode, body::Body, body::Bytes, body::Frame,
@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::auth::{ContentSha256, StreamingChunkVerifier, TrailerChecksum};
 use crate::aws_chunked::AwsChunkedDecoder;
 use crate::body::{FrameSender, channel_body};
-use crate::s3::conditional::Preconditions;
+use crate::s3::{conditional::Preconditions, versions::Versioning};
 use crate::store::Store;
 use crate::writing::WritingSet;
 
@@ -393,7 +393,12 @@ enum AttachTarget {
 /// The outcome of an upload: the committed part's ETag, or a rejection because
 /// the streamed body didn't match the client's `x-amz-content-sha256`.
 enum UploadResult {
-    Committed(String),
+    /// Committed, with the new part's ETag and, for an object write, the
+    /// `x-amz-version-id` to report for the version it created.
+    Committed {
+        etag: String,
+        version_id: Option<String>,
+    },
     ContentSha256Mismatch,
     /// A mode-4 chunk signature didn't verify against the secret.
     ChunkSignatureMismatch,
@@ -584,14 +589,14 @@ where
     // 5. commit + attach with the now-known size and ETag, under a serializable
     // transaction; retry on a serialization conflict (e.g. a concurrent GC).
     let mut client = app.pool.get().await?;
-    let mut committed = false;
+    let mut committed = None;
     let mut precondition_failed = false;
     for _ in 0..MAX_COMMIT_ATTEMPTS {
         match try_commit_part(&mut client, part_id, &node_ids, attach, size, &etag).await {
-            Ok(CommitResult::Committed(displaced)) => {
+            Ok(CommitResult::Committed { reap, version_id }) => {
                 // Reap the parts this overwrite displaced; their rows are gone.
-                reap_parts(app, displaced);
-                committed = true;
+                reap_parts(app, reap);
+                committed = Some(version_id);
                 break;
             }
             Ok(CommitResult::PreconditionFailed) => {
@@ -613,20 +618,24 @@ where
     if precondition_failed {
         return Ok(UploadResult::PreconditionFailed);
     }
-    if !committed {
+    let Some(version_id) = committed else {
         anyhow::bail!(
             "part {part_id}: commit aborted after {MAX_COMMIT_ATTEMPTS} serialization retries"
         );
-    }
-    Ok(UploadResult::Committed(etag))
+    };
+    Ok(UploadResult::Committed { etag, version_id })
 }
 
 const MAX_COMMIT_ATTEMPTS: usize = 10;
 
 enum CommitResult {
     /// Committed; carries the replica locations of any parts this displaced
-    /// (an overwrite or part re-upload), for the caller to reap.
-    Committed(Vec<ReapTarget>),
+    /// (an overwrite or part re-upload), for the caller to reap, and the
+    /// version ID to report for an object write.
+    Committed {
+        reap: Vec<ReapTarget>,
+        version_id: Option<String>,
+    },
     MissingLocations { present: i64, required: usize },
     /// A conditional-write guard didn't hold; nothing was written.
     PreconditionFailed,
@@ -672,7 +681,8 @@ async fn try_commit_part(
          JOIN part_locations pl ON pl.part_id = p.part_id
          JOIN nodes n ON n.node_id = pl.node_id
          WHERE ";
-    let reap: Vec<ReapTarget>;
+    let mut reap: Vec<ReapTarget> = Vec::new();
+    let mut version_id = None;
     match attach {
         AttachTarget::Object {
             bucket,
@@ -685,22 +695,31 @@ async fn try_commit_part(
             // the guard is atomic with the overwrite below (a pre-check would race
             // a concurrent writer). Skipped when no write conditions are set.
             if conditions.has_write_conditions() {
-                let current = current_etag(&tx, bucket, key).await?;
+                let current = s3::versions::current_etag(&tx, bucket, key).await?;
                 if !conditions.allows_write(current.as_deref()) {
                     // Dropping `tx` here rolls the transaction back.
                     return Ok(CommitResult::PreconditionFailed);
                 }
             }
             // Insert the new version first, so the part's owner FK target exists.
-            let (object_id, displaced) =
-                replace_null_version(&tx, bucket, key, size, etag, content_type).await?;
-            reap = displaced;
+            // Reading the bucket's versioning state in this transaction orders the
+            // write against a concurrent PutBucketVersioning. A bucket deleted
+            // meanwhile reads as unversioned; the objects -> buckets FK then
+            // rejects the insert.
+            let versioning = s3::versions::bucket_versioning(&tx, bucket)
+                .await?
+                .unwrap_or(Versioning::Unversioned);
+            let version = s3::versions::put_version(
+                &tx, bucket, key, versioning, size, etag, content_type, &mut reap,
+            )
+            .await?;
+            version_id = version.version_id;
             // Commit this part and point it at the new version in one step.
             tx.execute(
                 "UPDATE parts
                  SET state = 'committed', size = $1, etag = $2, object_id = $3, part_number = 1
                  WHERE part_id = $4",
-                &[&size, &etag, &object_id, &part_id],
+                &[&size, &etag, &version.id, &part_id],
             )
             .await?;
         }
@@ -734,76 +753,5 @@ async fn try_commit_part(
         }
     }
     tx.commit().await?;
-    Ok(CommitResult::Committed(reap))
-}
-
-/// The ETag of the object a plain GET of the key would return: the current
-/// version, unless that's a delete marker (then the key reads as absent). This is
-/// what conditional writes (If-Match / If-None-Match) are evaluated against.
-async fn current_etag<C: GenericClient>(
-    client: &C,
-    bucket: &str,
-    key: &str,
-) -> Result<Option<String>, tokio_postgres::Error> {
-    Ok(client
-        .query_opt(
-            "SELECT etag FROM objects
-             WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
-            &[&bucket, &key],
-        )
-        .await?
-        .map(|row| row.get(0)))
-}
-
-/// Writes a new `null` version of the key as its current version, the way a
-/// write lands in an unversioned (or suspended) bucket: the existing `null`
-/// version, wherever it sits among the key's versions, is dropped along with its
-/// parts, and whatever was current is demoted. Returns the new version's id (for
-/// the caller to attach parts to) and the dropped parts' locations to reap. Runs
-/// inside the caller's serializable transaction.
-async fn replace_null_version<C: GenericClient>(
-    client: &C,
-    bucket: &str,
-    key: &str,
-    size: i64,
-    etag: &str,
-    content_type: &str,
-) -> Result<(i64, Vec<ReapTarget>), tokio_postgres::Error> {
-    // Capture the replaced version's replica locations before its rows (and, via
-    // cascade, its parts and part_locations) are dropped, so the caller can reap
-    // the files immediately rather than leave them for GC.
-    let displaced = client
-        .query(
-            "SELECT pl.part_id, pl.node_id, n.peer_url
-             FROM objects o
-             JOIN parts p ON p.object_id = o.id
-             JOIN part_locations pl ON pl.part_id = p.part_id
-             JOIN nodes n ON n.node_id = pl.node_id
-             WHERE o.bucket = $1 AND o.key = $2 AND o.version_id = 'null'",
-            &[&bucket, &key],
-        )
-        .await?;
-    client
-        .execute(
-            "DELETE FROM objects WHERE bucket = $1 AND key = $2 AND version_id = 'null'",
-            &[&bucket, &key],
-        )
-        .await?;
-    client
-        .execute(
-            "UPDATE objects SET is_latest = false WHERE bucket = $1 AND key = $2 AND is_latest",
-            &[&bucket, &key],
-        )
-        .await?;
-    let object_id: i64 = client
-        .query_one(
-            "INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
-                                  size, etag, content_type, last_modified)
-             VALUES ($1, $2, 'null', true, false, $3, $4, $5, NOW())
-             RETURNING id",
-            &[&bucket, &key, &size, &etag, &content_type],
-        )
-        .await?
-        .get(0);
-    Ok((object_id, reap_targets(&displaced)))
+    Ok(CommitResult::Committed { reap, version_id })
 }

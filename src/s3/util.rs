@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes};
+use hyper::{Response, StatusCode, body::Bytes, header::HeaderValue};
 use percent_encoding::percent_decode_str;
 
 pub fn xml_escape(s: &str) -> String {
@@ -93,6 +93,22 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
     } else {
         None
     }
+}
+
+/// Sets `x-amz-version-id` on a response, if there's a version ID to report.
+pub fn with_version_id<B>(mut resp: Response<B>, version_id: Option<&str>) -> Response<B> {
+    if let Some(v) = version_id {
+        resp.headers_mut()
+            .insert("x-amz-version-id", HeaderValue::from_str(v).unwrap());
+    }
+    resp
+}
+
+/// Marks a response as concerning a delete marker (`x-amz-delete-marker: true`).
+pub fn with_delete_marker<B>(mut resp: Response<B>) -> Response<B> {
+    resp.headers_mut()
+        .insert("x-amz-delete-marker", HeaderValue::from_static("true"));
+    resp
 }
 
 pub fn format_s3_error(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {

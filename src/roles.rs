@@ -21,7 +21,10 @@ pub enum Permission {
     /// GetObject, HeadObject, ListObjects; the source side of a copy.
     Read,
     /// PutObject, DeleteObject(s), multipart uploads; the destination of a copy.
+    /// In a versioned bucket, a delete only adds a delete marker.
     Write,
+    /// DeleteObject(s) naming a version ID, which removes that version for good.
+    DeleteVersion,
 }
 
 impl Permission {
@@ -29,6 +32,7 @@ impl Permission {
         match self {
             Permission::Read => "read",
             Permission::Write => "write",
+            Permission::DeleteVersion => "delete-version",
         }
     }
 }
@@ -39,6 +43,7 @@ pub struct Principal {
     pub admin: bool,
     read: HashSet<String>,
     write: HashSet<String>,
+    delete_version: HashSet<String>,
 }
 
 impl Principal {
@@ -50,7 +55,9 @@ impl Principal {
                         ARRAY(SELECT bucket FROM role_grants
                               WHERE role = r.name AND permission = 'read'),
                         ARRAY(SELECT bucket FROM role_grants
-                              WHERE role = r.name AND permission = 'write')
+                              WHERE role = r.name AND permission = 'write'),
+                        ARRAY(SELECT bucket FROM role_grants
+                              WHERE role = r.name AND permission = 'delete-version')
                  FROM roles r WHERE r.name = $1",
                 &[&access_key],
             )
@@ -60,6 +67,7 @@ impl Principal {
             admin: r.get(1),
             read: r.get::<_, Vec<String>>(2).into_iter().collect(),
             write: r.get::<_, Vec<String>>(3).into_iter().collect(),
+            delete_version: r.get::<_, Vec<String>>(4).into_iter().collect(),
         }))
     }
 
@@ -67,13 +75,17 @@ impl Principal {
         match permission {
             Permission::Read => self.read.contains(bucket),
             Permission::Write => self.write.contains(bucket),
+            Permission::DeleteVersion => self.delete_version.contains(bucket),
         }
     }
 
     /// Whether the role may learn that `bucket` exists: admins see every bucket,
     /// others only the ones they hold a grant on.
     pub fn can_see(&self, bucket: &str) -> bool {
-        self.admin || self.read.contains(bucket) || self.write.contains(bucket)
+        self.admin
+            || self.read.contains(bucket)
+            || self.write.contains(bucket)
+            || self.delete_version.contains(bucket)
     }
 }
 
@@ -352,7 +364,7 @@ async fn revoke(
     let client = pool.get().await?;
     require_role(&client, name).await?;
     let permissions: Vec<&str> = if permissions.is_empty() {
-        vec!["read", "write"]
+        vec!["read", "write", "delete-version"]
     } else {
         permissions.iter().map(|p| p.as_str()).collect()
     };
