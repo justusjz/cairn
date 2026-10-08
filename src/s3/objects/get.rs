@@ -1,15 +1,15 @@
-use std::io;
 use std::sync::Arc;
 
-use http_body_util::{Empty, Full};
-use hyper::{Method, Request, Response, StatusCode, body::Bytes, header};
+use http_body_util::Full;
+use hyper::{Response, StatusCode, body::Bytes, header};
 use deadpool_postgres::GenericClient;
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use uuid::Uuid;
 
 use crate::{
     App,
-    body::{FrameSender, ResBody, box_response, channel_body, send_file, send_incoming},
+    blobs::{BlobSlice, Location, stream_blob_range},
+    checksum::BlockLayout,
+    body::{FrameSender, ResBody, box_response, channel_body},
     s3::conditional::{Precondition, Preconditions, not_modified},
     s3::util::{format_s3_error, with_delete_marker, with_version_id},
     s3::versions::Versioning,
@@ -212,9 +212,9 @@ pub async fn get_object(
 
     // Select the parts overlapping the requested range and stream them (each over
     // its computed sub-range) through a channel-backed body: a background task
-    // pulls each from a replica (locally if that's us) and forwards its chunks. We
-    // set Content-Length, so a truncated stream (a part we can't serve) is detected
-    // by the client rather than read as a short-but-complete object.
+    // pulls each from a replica (locally if that's us), verifies it, and forwards
+    // it. We set Content-Length, so a truncated stream (a part we can't serve) is
+    // detected by the client rather than read as a short-but-complete object.
     let slices = select_parts_in_range(parts, range_start, range_end);
     let (sender, body) = channel_body();
     spawn_range_stream(app.clone(), slices, sender);
@@ -236,25 +236,34 @@ pub async fn get_object(
     Ok(with_version_id(builder.body(body).unwrap(), version_id.as_deref()))
 }
 
-/// One committed part of an object for streaming: its id, its size in bytes, and
-/// its candidate replica locations as (node_id, peer_url), freshest node first.
-pub(crate) type PartLocation = (Uuid, u64, Vec<(String, String)>);
+/// One part of an object for streaming: where its bytes live (a blob, the
+/// blob's block layout, and the offset in it), its size, and the blob's
+/// candidate replica locations, freshest node first.
+pub(crate) struct PartLocation {
+    pub blob_id: Uuid,
+    pub layout: Option<BlockLayout>,
+    pub blob_offset: u64,
+    pub size: u64,
+    pub locations: Vec<Location>,
+}
 
-/// Resolves an object version's committed parts in order, each with its size and its
-/// candidate replica locations (freshest node first). Runs within the caller's
-/// transaction, so the parts and their locations come from one consistent
-/// snapshot. Shared by GetObject (range streaming) and CopyObject (whole-object
-/// copy).
+/// Resolves an object version's parts in order, each with its blob and the
+/// blob's candidate replica locations (freshest node first). Runs within the
+/// caller's transaction, so the parts and their locations come from one
+/// consistent snapshot. Shared by GetObject (range streaming) and CopyObject
+/// (whole-object copy).
 pub(crate) async fn resolve_object_parts<C: GenericClient>(
     client: &C,
     object_id: i64,
 ) -> Result<Vec<PartLocation>, tokio_postgres::Error> {
     let rows = client
         .query(
-            "SELECT p.part_number, p.part_id, p.size, pl.node_id, n.peer_url
+            "SELECT p.part_number, p.blob_id, p.blob_offset, p.size, b.size, b.block_size,
+                    bl.node, n.peer_url
              FROM parts p
-             JOIN part_locations pl ON pl.part_id = p.part_id
-             JOIN nodes n ON n.node_id = pl.node_id
+             JOIN blobs b ON b.blob_id = p.blob_id
+             JOIN blob_locations bl ON bl.blob_id = p.blob_id
+             JOIN nodes n ON n.id = bl.node
              WHERE p.object_id = $1
              ORDER BY p.part_number, n.last_seen DESC",
             &[&object_id],
@@ -266,65 +275,67 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
     let mut current: Option<i32> = None;
     for row in &rows {
         let part_number: i32 = row.get(0);
-        let part_id: Uuid = row.get(1);
-        let part_size: i64 = row.get(2);
-        let node_id: String = row.get(3);
-        let peer_url: String = row.get(4);
         if current != Some(part_number) {
-            parts.push((part_id, part_size as u64, Vec::new()));
+            // A blob without a block size predates checksums.
+            let layout = row.get::<_, Option<i32>>(5).map(|block_size| BlockLayout {
+                block_size: block_size as u64,
+                blob_size: row.get::<_, i64>(4) as u64,
+            });
+            parts.push(PartLocation {
+                blob_id: row.get(1),
+                layout,
+                blob_offset: row.get::<_, i64>(2) as u64,
+                size: row.get::<_, i64>(3) as u64,
+                locations: Vec::new(),
+            });
             current = Some(part_number);
         }
-        parts.last_mut().unwrap().2.push((node_id, peer_url));
+        parts.last_mut().unwrap().locations.push((row.get(6), row.get(7)));
     }
     Ok(parts)
 }
 
-/// A slice of one part selected for streaming: its id, its candidate replica
-/// locations, and the (offset, length) to read from *within* the part.
-pub(crate) type PartSlice = (Uuid, Vec<(String, String)>, u64, u64);
-
 /// Selects the parts overlapping the half-open byte range [range_start, range_end)
-/// of the assembled object, each with the (offset, length) to read from within it.
-/// Parts entirely outside the range are dropped; `parts` must be in object order.
-/// Shared by GetObject (ranged reads) and the copy paths.
+/// of the assembled object, each as the slice of its blob to read. Parts entirely
+/// outside the range are dropped; `parts` must be in object order. Shared by
+/// GetObject (ranged reads) and the copy paths.
 pub(crate) fn select_parts_in_range(
     parts: Vec<PartLocation>,
     range_start: u64,
     range_end: u64,
-) -> Vec<PartSlice> {
+) -> Vec<BlobSlice> {
     // Track the object offset where each part begins, and intersect its span with
     // the requested range.
-    let mut slices: Vec<PartSlice> = Vec::new();
+    let mut slices: Vec<BlobSlice> = Vec::new();
     let mut cursor: u64 = 0;
-    for (part_id, part_size, locations) in parts {
+    for part in parts {
         let part_start = cursor;
-        let part_end = cursor + part_size;
+        let part_end = cursor + part.size;
         cursor = part_end;
         let overlap_start = range_start.max(part_start);
         let overlap_end = range_end.min(part_end);
         if overlap_start >= overlap_end {
             continue; // part lies entirely outside the requested range
         }
-        slices.push((
-            part_id,
-            locations,
-            overlap_start - part_start,  // offset within the part
-            overlap_end - overlap_start, // bytes to read from it
-        ));
+        slices.push(BlobSlice {
+            blob_id: part.blob_id,
+            layout: part.layout,
+            locations: part.locations,
+            offset: part.blob_offset + (overlap_start - part_start),
+            length: overlap_end - overlap_start,
+        });
     }
     slices
 }
 
-/// Spawns a background task that streams each selected part-slice to `sender`,
-/// pulling each from a replica (locally if that's us) via [`stream_part`]. If any
-/// slice can't be served the stream is faulted. Shared by GetObject and the copy
-/// paths.
-pub(crate) fn spawn_range_stream(app: Arc<App>, slices: Vec<PartSlice>, sender: FrameSender) {
-    let self_id = app.store.get_node_id().to_string();
+/// Spawns a background task that streams each selected blob slice to `sender`,
+/// verified and pulled from a replica (locally if that's us) by
+/// [`stream_blob_range`]. If any slice can't be served the stream is faulted.
+/// Shared by GetObject and the copy paths.
+pub(crate) fn spawn_range_stream(app: Arc<App>, slices: Vec<BlobSlice>, sender: FrameSender) {
     tokio::spawn(async move {
-        for (part_id, locations, offset, length) in slices {
-            let range = Some((offset, length));
-            if let Err(e) = stream_part(&app, part_id, range, &locations, &self_id, &sender).await {
+        for slice in slices {
+            if let Err(e) = stream_blob_range(&app, &slice, &sender).await {
                 let _ = sender.send(Err(e)).await;
                 return;
             }
@@ -378,68 +389,6 @@ pub(crate) fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64
         return Err(()); // start at/after the object end, or an empty range
     }
     Ok(Some((start, end)))
-}
-
-/// Streams one part to `tx` — the whole part, or just `range` (offset, length) of
-/// it — trying its locations in order (freshest first). Failover only happens
-/// before a source produces its first byte; once we start forwarding, a mid-stream
-/// failure faults the whole response (we can't unsend).
-async fn stream_part(
-    app: &App,
-    part_id: Uuid,
-    range: Option<(u64, u64)>,
-    locations: &[(String, String)],
-    self_id: &str,
-    tx: &FrameSender,
-) -> io::Result<()> {
-    for (node_id, peer_url) in locations {
-        if node_id == self_id {
-            // We hold it: stream from local disk (no peer server needed).
-            match app.store.open_part(part_id).await {
-                Ok(Some(file)) => return send_file(file, range, tx).await,
-                Ok(None) => continue,
-                Err(e) => {
-                    eprintln!("local open of part {part_id} failed: {e}");
-                    continue;
-                }
-            }
-        } else {
-            // `client` stays in scope across send_incoming, keeping the connection
-            // alive while we stream the response body.
-            let client = Client::builder(TokioExecutor::new()).build_http();
-            let uri = match range {
-                Some((offset, length)) => {
-                    format!("{peer_url}/parts/{part_id}?offset={offset}&length={length}")
-                }
-                None => format!("{peer_url}/parts/{part_id}"),
-            };
-            let req = match Request::builder()
-                .method(Method::GET)
-                .uri(uri)
-                .body(Empty::<Bytes>::new())
-            {
-                Ok(req) => req,
-                Err(_) => continue,
-            };
-            match client.request(req).await {
-                Ok(res) if res.status() == StatusCode::OK => {
-                    return send_incoming(res.into_body(), tx).await;
-                }
-                Ok(res) if res.status() == StatusCode::NOT_FOUND => continue,
-                Ok(res) => {
-                    eprintln!("replica {peer_url} returned {} for part {part_id}", res.status());
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("fetch of part {part_id} from {peer_url} failed: {e}");
-                    continue;
-                }
-            }
-        }
-    }
-    Err(io::Error::other(format!(
-        "no replica could serve part {part_id}"
-    )))
 }
 
 /// Metadata-only response for the key: answered straight from `objects`, never

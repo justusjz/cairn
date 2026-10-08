@@ -9,7 +9,7 @@ consistent.
 
 - A reachable **PostgreSQL** database (shared by every node). Cairn creates its
   own schema on first start.
-- A local **data directory** per node for storing part blobs.
+- A local **data directory** per node for storing blobs.
 
 The schema is created automatically; just point Cairn at an empty database.
 
@@ -73,8 +73,8 @@ s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
 | `--listen-client <ADDR>` | *required* | Bind address for the S3 API. |
 | `--listen-peer <ADDR>` | `127.0.0.1:9431` | Bind address for the peer endpoint (replica traffic + prune). Always runs. |
 | `--peer-url <URL>` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
-| `--replication-factor <N>` | `1` | How many distinct nodes each part is stored on. |
-| `--data-dir <PATH>` | *required* | Local directory for part blobs. |
+| `--replication-factor <N>` | `1` | How many distinct nodes each blob is stored on. |
+| `--data-dir <PATH>` | *required* | Local directory for blobs. |
 
 ## Running a highly-available cluster
 
@@ -84,7 +84,7 @@ For redundancy, run several nodes against the **same Postgres database** with a
 the peer endpoint must be reachable by the other nodes, set `--peer-url` to an
 address they can actually connect to.
 
-Example: a 3-node cluster with replication factor 2 (every part stored on 2 of
+Example: a 3-node cluster with replication factor 2 (every blob stored on 2 of
 the 3 nodes), where the nodes reach each other at `10.0.0.1`–`10.0.0.3`:
 
 ```sh
@@ -113,7 +113,7 @@ Nodes discover each other through Postgres (each heartbeats every 5 seconds), so
 there is no peer list to configure — just point them all at the same database.
 A node is considered live if it has been seen in the last 10 seconds. Clients
 can talk to any node; reads are transparently served from whichever replica
-holds the part.
+holds the data.
 
 With replication factor `N`, writes succeed as long as at least `N` nodes are
 live; if fewer than `N` are available, uploads are rejected (metadata operations
@@ -210,9 +210,23 @@ aws s3api copy-object --bucket my-bucket --key some/key \
 Old versions take up space until they're deleted. There are no lifecycle rules
 yet to expire them automatically.
 
+## Data integrity
+
+Every stored blob is checksummed (CRC32C per 64 KiB block), and every read is
+verified against those checksums before any byte reaches the client. If a
+replica serves a damaged block, or fails mid-read, the read carries on from the
+same block on another replica, so the client only ever gets intact data. If no
+replica has an intact copy of a block, the response is cut off there (its
+`Content-Length` tells the client it's incomplete), and the node logs a
+`CORRUPTION:` line naming the blob and node. Data written by earlier versions
+of Cairn has no checksums and is read unverified.
+
+When writing, each replica reports a checksum of what it stored, and the upload
+fails unless every replica stored exactly the bytes that were sent.
+
 ## Garbage collection
 
-Failed uploads and orphaned parts (e.g. left behind by a crash or re-balancing)
+Failed uploads and orphaned blobs (e.g. left behind by a crash or re-balancing)
 are reclaimed by the `prune` command, run **per node** against that node's peer
 endpoint. It is a manual repair operation.
 

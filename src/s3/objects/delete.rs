@@ -6,9 +6,9 @@ use hyper::{Response, StatusCode, body::Bytes};
 use tokio_postgres::{IsolationLevel, error::SqlState};
 
 use crate::{
-    App, ReapTarget,
+    App,
     auth::BodyChecksum,
-    reap_parts,
+    blobs::{ReapTarget, reap_blobs},
     s3::util::{format_s3_error, with_delete_marker, with_version_id, xml_escape, xml_ok},
     s3::versions::{Deleted, bucket_versioning, delete_key},
 };
@@ -31,7 +31,7 @@ enum DeleteStatus {
 
 /// One serializable attempt: read the bucket's versioning state (which doubles
 /// as the existence check), then delete each target the way that state dictates,
-/// capturing the removed parts' replica locations for immediate reaping. The raw
+/// capturing the freed blobs' replica locations for immediate reaping. The raw
 /// postgres error is returned so the caller can retry on a serialization failure.
 /// Runs at the same isolation as the put/complete/GC transactions that also touch
 /// `objects`/`parts`, so the delete can't undermine their guarantees — and the
@@ -61,7 +61,7 @@ async fn try_delete(
 
 /// Deletes `targets` from `bucket` in a serializable transaction, retrying on a
 /// serialization conflict (e.g. a concurrent overwrite or GC). On success, reaps
-/// the removed parts' files in the background.
+/// the freed blobs' files in the background.
 async fn delete_targets(
     app: &Arc<App>,
     bucket: &str,
@@ -71,7 +71,7 @@ async fn delete_targets(
     for _ in 0..MAX_DELETE_ATTEMPTS {
         match try_delete(&mut client, bucket, targets).await {
             Ok((status, reap)) => {
-                reap_parts(app, reap);
+                reap_blobs(app, reap);
                 return Ok(status);
             }
             Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,

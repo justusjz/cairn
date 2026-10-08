@@ -29,7 +29,7 @@ pub async fn create_multipart_upload(
         ));
     }
     // The content type is captured now and applied to the object at completion.
-    let upload_id = Uuid::new_v4();
+    let upload_id = Uuid::now_v7();
     client
         .execute(
             "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, initiated_at)

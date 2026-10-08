@@ -40,7 +40,7 @@ const MIGRATION_LOCK: i64 = 0x6361_6972_6e00; // "cairn\0"
 /// The schema, as an ordered list of steps. Migration `n` (1-based) is
 /// `MIGRATIONS[n - 1]`; `schema_migrations` records which have been applied.
 /// Only ever append: an applied step must never change.
-const MIGRATIONS: &[&str] = &[INITIAL_SCHEMA, VERSIONING, DELETE_VERSION_GRANT];
+const MIGRATIONS: &[&str] = &[INITIAL_SCHEMA, VERSIONING, DELETE_VERSION_GRANT, BLOBS];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
 /// the schema untouched. Refuses to run against a database migrated by a newer
@@ -257,4 +257,88 @@ ALTER TABLE role_grants
     DROP CONSTRAINT role_grants_permission_check,
     ADD CONSTRAINT role_grants_permission_check
         CHECK (permission IN ('read', 'write', 'delete-version'));
+"#;
+
+/// Migration 4: blobs. What's stored on disk is now a *blob*, and a part is a
+/// byte range of one: parts link objects to blobs, and blobs carry the replica
+/// locations and the pending/committed state that parts used to. Several parts
+/// may share a blob (packing small parts together, metadata-only copies), so a
+/// blob lives exactly as long as some part references it.
+///
+/// Each existing part becomes a blob with the same ID, so the files on disk keep
+/// their names. Those files have no checksum table (see `blob_file`); new blobs
+/// always do.
+const BLOBS: &str = r#"
+-- A compact number for each node, for blob_locations (which has a row per
+-- replica of every blob) to refer to it by. node_id stays its identity.
+ALTER TABLE nodes ADD COLUMN id INT GENERATED ALWAYS AS IDENTITY UNIQUE;
+
+-- A file stored on one or more nodes. `pending` while its replicas are being
+-- written; it's committed together with the first part that references it, so
+-- a committed blob that no part references is garbage.
+--
+-- The block checksums (CRC32C) live in a table inside the blob file, not here.
+-- The catalog records the block size (the file doesn't describe itself, so
+-- this is how readers know its layout) and the CRC64/NVME of the whole file
+-- as stored (data, checksum table and blob ID, identical on every replica),
+-- which a scrub checks the file against. A different algorithm than the blocks'
+-- on purpose, so it's an independent second check. Both are set at commit, and
+-- are NULL for a pending blob and for one written before checksums, whose file
+-- is bare data. CRCs are stored as their 64 bits, read as a signed BIGINT.
+CREATE TABLE blobs (
+    blob_id     UUID PRIMARY KEY,
+    size        BIGINT NOT NULL CHECK (size >= 0),
+    state       TEXT NOT NULL CHECK (state IN ('pending', 'committed')),
+    created_at  TIMESTAMPTZ NOT NULL,
+    block_size  INT CHECK (block_size > 0),
+    crc64nvme   BIGINT,
+    CHECK ((block_size IS NULL) = (crc64nvme IS NULL))
+);
+INSERT INTO blobs (blob_id, size, state, created_at)
+    SELECT part_id, size, state, created_at FROM parts;
+
+CREATE TABLE blob_locations (
+    blob_id     UUID NOT NULL REFERENCES blobs(blob_id) ON DELETE CASCADE,
+    node        INT NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    PRIMARY KEY (blob_id, node)
+);
+-- What a node holds, for prune (and later scrub and repair).
+CREATE INDEX blob_locations_node ON blob_locations (node);
+INSERT INTO blob_locations (blob_id, node)
+    SELECT pl.part_id, n.id FROM part_locations pl JOIN nodes n ON n.node_id = pl.node_id;
+DROP TABLE part_locations;
+
+-- A part now only exists once its data is committed, so it always has exactly
+-- one owner. Pending parts live on as pending blobs (reaped by `cairn prune`),
+-- as do committed parts that somehow lost their owner (unreferenced blobs, also
+-- reaped by prune).
+DELETE FROM parts WHERE state = 'pending' OR num_nonnulls(object_id, upload_id) = 0;
+
+-- The part's bytes are [blob_offset, blob_offset + size) of its blob. The FK
+-- has no cascade: a blob can't be deleted while a part still references it.
+-- `crc64nvme` is the CRC64/NVME of the part's own bytes, which stays valid
+-- wherever the part is moved; NULL for parts written before checksums. It's
+-- also the checksum S3 computes for objects by default. Nothing refers
+-- to a part by its ID, so the UUID gives way to a plain sequence.
+ALTER TABLE parts
+    ADD COLUMN blob_id UUID,
+    ADD COLUMN blob_offset BIGINT NOT NULL DEFAULT 0 CHECK (blob_offset >= 0),
+    ADD COLUMN crc64nvme BIGINT;
+UPDATE parts SET blob_id = part_id;
+ALTER TABLE parts
+    DROP COLUMN part_id,
+    ADD COLUMN id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    ALTER COLUMN blob_id SET NOT NULL,
+    ALTER COLUMN blob_offset DROP DEFAULT,
+    ALTER COLUMN etag SET NOT NULL,
+    ADD FOREIGN KEY (blob_id) REFERENCES blobs(blob_id),
+    ADD CHECK (size >= 0),
+    -- Replaces migration 2's "at most one owner" check.
+    DROP CONSTRAINT IF EXISTS parts_check,
+    ADD CONSTRAINT parts_one_owner CHECK (num_nonnulls(object_id, upload_id) = 1),
+    DROP COLUMN state,
+    DROP COLUMN created_at;
+-- Finding a blob's parts: is it still referenced, and (later) which parts to
+-- re-point when it's repacked.
+CREATE INDEX parts_blob ON parts (blob_id);
 "#;

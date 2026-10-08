@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use http_body_util::{BodyExt, Full, combinators::UnsyncBoxBody};
 use hyper::{
     Response,
-    body::{Body, Bytes, Frame, Incoming},
+    body::{Body, Bytes, Frame},
 };
 use tokio::{
     fs::File,
@@ -80,20 +80,6 @@ pub async fn send_file(
             .is_err()
         {
             break; // receiver gone (client hung up)
-        }
-    }
-    Ok(())
-}
-
-/// Forwards a response body's data frames to `tx`, until the body ends or the
-/// receiver is dropped.
-pub async fn send_incoming(mut body: Incoming, tx: &FrameSender) -> io::Result<()> {
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(io::Error::other)?;
-        if let Ok(data) = frame.into_data() {
-            if tx.send(Ok(Frame::data(data))).await.is_err() {
-                return Ok(());
-            }
         }
     }
     Ok(())

@@ -122,7 +122,7 @@ pub async fn copy_object(
     // a background task pulls each from a replica — locally if that's us — and
     // forwards its chunks, exactly as get_object does. That body is then fed to the
     // normal upload path, which replicates and commits it as the destination's part.
-    let total: u64 = parts.iter().map(|(_, size, _)| *size).sum();
+    let total: u64 = parts.iter().map(|part| part.size).sum();
     let (sender, source_body) = channel_body();
     spawn_range_stream(app.clone(), select_parts_in_range(parts, 0, total), sender);
 
