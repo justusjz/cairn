@@ -63,12 +63,15 @@ pub async fn bucket_versioning<C: GenericClient>(
         .map(|row| Versioning::from_db(row.get(0))))
 }
 
-/// A fresh, opaque version ID: 192 random bits as 32 URL-safe base64 characters,
-/// so it needs no escaping in a query string and can never be `null`.
+/// A fresh, opaque version ID: 192 random bits as 32 characters of letters,
+/// digits, `.` and `_` (URL-safe base64 with `-` swapped for `.`, which keeps it
+/// one-to-one). None of these need escaping in a query string, and unlike a
+/// leading `-`, none can make an ID look like a command-line option to a CLI.
+/// It can never be `null`.
 fn new_version_id() -> String {
     let mut bytes = [0u8; 24];
     getrandom::fill(&mut bytes).expect("the OS random number generator failed");
-    URL_SAFE_NO_PAD.encode(bytes)
+    URL_SAFE_NO_PAD.encode(bytes).replace('-', ".")
 }
 
 /// The ETag of the object a plain GET of the key would return: the current
@@ -275,4 +278,21 @@ async fn promote_newest<C: GenericClient>(
         )
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_ids_use_a_safe_alphabet() {
+        for _ in 0..1000 {
+            let id = new_version_id();
+            assert_eq!(id.len(), 32);
+            assert!(
+                id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'),
+                "{id}"
+            );
+        }
+    }
 }
