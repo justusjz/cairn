@@ -8,7 +8,8 @@ use tokio_postgres::{IsolationLevel, error::SqlState};
 use uuid::Uuid;
 
 use crate::{
-    App, ReapTarget, reap_parts, reap_targets,
+    App,
+    blobs::{ReapTarget, blob_ids, drop_unreferenced_blobs, reap_blobs},
     s3::conditional::Preconditions,
     s3::util::{format_s3_error, with_version_id, xml_escape, xml_ok},
     s3::versions::{Versioning, bucket_versioning, current_etag, put_version},
@@ -21,8 +22,8 @@ enum CompleteOutcome {
         bucket: String,
         key: String,
         etag: String,
-        /// Locations of the replaced version's parts and of the staged parts the
-        /// client left out, to reap after commit.
+        /// Locations of the blobs freed by replacing the old version and by
+        /// dropping the staged parts the client left out, to reap after commit.
         reap: Vec<ReapTarget>,
         /// The `x-amz-version-id` to report for the new version.
         version_id: Option<String>,
@@ -121,7 +122,7 @@ pub async fn complete_multipart_upload(
                 reap,
                 version_id,
             }) => {
-                reap_parts(app, reap);
+                reap_blobs(app, reap);
                 let body = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                      <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -263,20 +264,16 @@ async fn try_complete(
         &[&version.id, upload_id, &part_numbers],
     )
     .await?;
-    // Delete the upload, which cascades away any staged parts not included in the
-    // completed object. Those are the only parts still staged under it now, so
-    // capture their locations first to reap them along with the replaced ones.
+    // Delete the staged parts the client left out of the completed object (the
+    // only ones still staged under the upload now) and their blobs, then the
+    // upload itself.
     let unused = tx
         .query(
-            "SELECT pl.part_id, pl.node_id, n.peer_url
-             FROM parts p
-             JOIN part_locations pl ON pl.part_id = p.part_id
-             JOIN nodes n ON n.node_id = pl.node_id
-             WHERE p.upload_id = $1",
+            "DELETE FROM parts WHERE upload_id = $1 RETURNING blob_id",
             &[upload_id],
         )
         .await?;
-    reap.extend(reap_targets(&unused));
+    reap.extend(drop_unreferenced_blobs(&tx, &blob_ids(&unused)).await?);
     tx.execute(
         "DELETE FROM multipart_uploads WHERE upload_id = $1",
         &[upload_id],

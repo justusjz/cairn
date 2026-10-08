@@ -751,12 +751,12 @@ vput() {
 # vget_is <key> <expected-file> [version] — the (given version of the) key reads
 # back as exactly <expected-file>.
 vget_is() {
-    awss3 s3api get-object --bucket "$VBUCKET" --key "$1" ${3:+--version-id "$3"} \
+    awss3 s3api get-object --bucket "$VBUCKET" --key "$1" ${3:+--version-id="$3"} \
         "$WORK_DIR/vget.out" >/dev/null 2>&1 && cmp -s "$2" "$WORK_DIR/vget.out"
 }
 # vdel <key> [version] — DELETE, printing "<DeleteMarker>\t<VersionId>".
 vdel() {
-    awss3 s3api delete-object --bucket "$VBUCKET" --key "$1" ${2:+--version-id "$2"} \
+    awss3 s3api delete-object --bucket "$VBUCKET" --key "$1" ${2:+--version-id="$2"} \
         --query '[DeleteMarker,VersionId]' --output text 2>/dev/null
 }
 
@@ -786,7 +786,7 @@ versioned_overwrite_ok() {
     [ -n "$v1" ] && [ "$v1" != "None" ] && [ "$v1" != "null" ] && [ "$v1" != "$v2" ] || return 1
     vget_is ow "$NESTED" || return 1
     vget_is ow "$SMALL" "$v1" || return 1
-    [ "$(awss3 s3api head-object --bucket "$VBUCKET" --key ow --version-id "$v1" \
+    [ "$(awss3 s3api head-object --bucket "$VBUCKET" --key ow --version-id="$v1" \
         --query VersionId --output text 2>/dev/null)" = "$v1" ]
 }
 
@@ -804,7 +804,7 @@ delete_marker_ok() {
     [ "$(awss3 s3api list-objects-v2 --bucket "$VBUCKET" --prefix dm \
         --query 'length(Contents || `[]`)' --output text 2>/dev/null)" = "0" ] || return 1
     vget_is dm "$SMALL" "$v1" || return 1
-    awss3 s3api head-object --bucket "$VBUCKET" --key dm --version-id "$marker" 2>&1 | grep -q 405
+    awss3 s3api head-object --bucket "$VBUCKET" --key dm --version-id="$marker" 2>&1 | grep -q 405
 }
 
 # DELETE with a versionId removes that version for good; removing the current
@@ -867,7 +867,7 @@ delete_version_needs_grant_ok() {
     local w=(as_role writer writersecret) v req
     v=$("${w[@]}" s3api put-object --bucket "$VBUCKET" --key perm --body "$SMALL" \
         --query VersionId --output text 2>/dev/null) || return 1
-    ! "${w[@]}" s3api delete-object --bucket "$VBUCKET" --key perm --version-id "$v" >/dev/null 2>&1 || return 1
+    ! "${w[@]}" s3api delete-object --bucket "$VBUCKET" --key perm --version-id="$v" >/dev/null 2>&1 || return 1
     req="{\"Objects\":[{\"Key\":\"perm\",\"VersionId\":\"$v\"}]}"
     [ "$("${w[@]}" s3api delete-objects --bucket "$VBUCKET" --delete "$req" \
         --query 'Errors[0].Code' --output text 2>/dev/null)" = "AccessDenied" ] || return 1
@@ -1000,9 +1000,9 @@ versioned_bucket_not_empty_ok() {
         --query VersionId --output text 2>/dev/null) || return 1
     marker=$(awss3 s3api delete-object --bucket "$b" --key k \
         --query VersionId --output text 2>/dev/null) || return 1
-    awss3 s3api delete-object --bucket "$b" --key k --version-id "$v" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-object --bucket "$b" --key k --version-id="$v" >/dev/null 2>&1 || return 1
     awss3 s3api delete-bucket --bucket "$b" 2>&1 | grep -q BucketNotEmpty || return 1
-    awss3 s3api delete-object --bucket "$b" --key k --version-id "$marker" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-object --bucket "$b" --key k --version-id="$marker" >/dev/null 2>&1 || return 1
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 

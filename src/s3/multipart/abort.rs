@@ -4,11 +4,14 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 use uuid::Uuid;
 
-use crate::{App, reap_parts, reap_targets, s3::util::format_s3_error};
+use crate::{
+    App,
+    blobs::{blob_ids, drop_unreferenced_blobs, reap_blobs},
+    s3::util::format_s3_error,
+};
 
-/// AbortMultipartUpload: `DELETE /{bucket}/{key}?uploadId=U`. Drops the upload,
-/// cascading its staged parts (and their part_locations) away, then reaps their
-/// files. The live object is untouched. The upload must belong to `bucket`/`key`,
+/// AbortMultipartUpload: `DELETE /{bucket}/{key}?uploadId=U`. Drops the upload
+/// and its staged parts, then the parts' blobs, and reaps their files. The live object is untouched. The upload must belong to `bucket`/`key`,
 /// so a role can't reach an upload in another bucket by its ID.
 pub async fn abort_multipart_upload(
     app: &Arc<App>,
@@ -26,19 +29,17 @@ pub async fn abort_multipart_upload(
             ));
         }
     };
-    // Capture the staged parts' locations, then drop the upload, in one
+    // Delete the staged parts, the upload, and the freed blobs in one
     // transaction. A part committed to the upload in between is cascaded away
-    // without being captured; its file is simply left for `cairn prune`.
+    // with the upload, leaving its blob unreferenced; `cairn prune` drops it.
     let mut client = app.pool.get().await?;
     let tx = client.transaction().await?;
     let staged = tx
         .query(
-            "SELECT pl.part_id, pl.node_id, n.peer_url
-             FROM multipart_uploads u
-             JOIN parts p ON p.upload_id = u.upload_id
-             JOIN part_locations pl ON pl.part_id = p.part_id
-             JOIN nodes n ON n.node_id = pl.node_id
-             WHERE u.upload_id = $1 AND u.bucket = $2 AND u.key = $3",
+            "DELETE FROM parts p USING multipart_uploads u
+             WHERE p.upload_id = u.upload_id
+               AND u.upload_id = $1 AND u.bucket = $2 AND u.key = $3
+             RETURNING p.blob_id",
             &[&upload_id, &bucket, &key],
         )
         .await?;
@@ -48,8 +49,9 @@ pub async fn abort_multipart_upload(
             &[&upload_id, &bucket, &key],
         )
         .await?;
+    let reap = drop_unreferenced_blobs(&tx, &blob_ids(&staged)).await?;
     tx.commit().await?;
-    reap_parts(app, reap_targets(&staged));
+    reap_blobs(app, reap);
     if affected == 0 {
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,

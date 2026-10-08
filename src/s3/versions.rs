@@ -10,13 +10,14 @@
 //! version, for good.
 //!
 //! All of this runs inside the caller's serializable transaction. Removed
-//! versions' part locations are pushed onto a reap list for the caller to delete
-//! after commit; if it never gets to, `cairn prune` reclaims the files.
+//! versions' blobs are dropped once nothing references them, and their locations
+//! pushed onto a reap list for the caller to delete after commit; if it never
+//! gets to, `cairn prune` reclaims the files.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use deadpool_postgres::GenericClient;
 
-use crate::{ReapTarget, reap_targets};
+use crate::blobs::{ReapTarget, blob_ids, drop_unreferenced_blobs};
 
 /// A bucket's versioning state. A bucket starts out unversioned; once enabled,
 /// it only moves between enabled and suspended.
@@ -62,12 +63,15 @@ pub async fn bucket_versioning<C: GenericClient>(
         .map(|row| Versioning::from_db(row.get(0))))
 }
 
-/// A fresh, opaque version ID: 192 random bits as 32 URL-safe base64 characters,
-/// so it needs no escaping in a query string and can never be `null`.
+/// A fresh, opaque version ID: 192 random bits as 32 characters of letters,
+/// digits, `.` and `_` (URL-safe base64 with `-` swapped for `.`, which keeps it
+/// one-to-one). None of these need escaping in a query string, and unlike a
+/// leading `-`, none can make an ID look like a command-line option to a CLI.
+/// It can never be `null`.
 fn new_version_id() -> String {
     let mut bytes = [0u8; 24];
     getrandom::fill(&mut bytes).expect("the OS random number generator failed");
-    URL_SAFE_NO_PAD.encode(bytes)
+    URL_SAFE_NO_PAD.encode(bytes).replace('-', ".")
 }
 
 /// The ETag of the object a plain GET of the key would return: the current
@@ -96,8 +100,8 @@ pub struct NewVersion {
 }
 
 /// Writes a new object version as the key's current version, the way S3 lands a
-/// write in a bucket with the given versioning state. Locations of any parts it
-/// replaces are pushed onto `reap`.
+/// write in a bucket with the given versioning state. Locations of any blobs it
+/// frees are pushed onto `reap`.
 pub async fn put_version<C: GenericClient>(
     client: &C,
     bucket: &str,
@@ -145,7 +149,7 @@ pub struct Deleted {
 /// such version); if it was current, the next-newest version takes its place.
 /// Without one, an unversioned bucket drops the `null` version, while a versioned
 /// one stacks a delete marker on top (a suspended bucket's marker replaces the
-/// `null` version). Locations of removed parts are pushed onto `reap`.
+/// `null` version). Locations of freed blobs are pushed onto `reap`.
 pub async fn delete_key<C: GenericClient>(
     client: &C,
     bucket: &str,
@@ -223,27 +227,23 @@ async fn remove_null_version<C: GenericClient>(
     Ok(())
 }
 
-/// Removes the version with row id `id`, cascading its parts and part_locations
-/// away. Their locations are captured first, so the caller can reap the files.
+/// Removes the version with row id `id` and its parts, then drops the blobs
+/// those parts were the last users of, pushing their locations onto `reap`.
 async fn remove_version<C: GenericClient>(
     client: &C,
     id: i64,
     reap: &mut Vec<ReapTarget>,
 ) -> Result<(), tokio_postgres::Error> {
-    let located = client
+    let parts = client
         .query(
-            "SELECT pl.part_id, pl.node_id, n.peer_url
-             FROM parts p
-             JOIN part_locations pl ON pl.part_id = p.part_id
-             JOIN nodes n ON n.node_id = pl.node_id
-             WHERE p.object_id = $1",
+            "DELETE FROM parts WHERE object_id = $1 RETURNING blob_id",
             &[&id],
         )
         .await?;
-    reap.extend(reap_targets(&located));
     client
         .execute("DELETE FROM objects WHERE id = $1", &[&id])
         .await?;
+    reap.extend(drop_unreferenced_blobs(client, &blob_ids(&parts)).await?);
     Ok(())
 }
 
@@ -278,4 +278,21 @@ async fn promote_newest<C: GenericClient>(
         )
         .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_ids_use_a_safe_alphabet() {
+        for _ in 0..1000 {
+            let id = new_version_id();
+            assert_eq!(id.len(), 32);
+            assert!(
+                id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'),
+                "{id}"
+            );
+        }
+    }
 }

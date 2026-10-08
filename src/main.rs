@@ -16,7 +16,9 @@ use uuid::Uuid;
 
 use crate::auth::{ContentSha256, StreamingChunkVerifier, TrailerChecksum};
 use crate::aws_chunked::AwsChunkedDecoder;
+use crate::blobs::{Location, ReapTarget, blob_ids, drop_unreferenced_blobs, reap_blobs};
 use crate::body::{FrameSender, channel_body};
+use crate::checksum::BlobSummer;
 use crate::s3::{conditional::Preconditions, versions::Versioning};
 use crate::store::Store;
 use crate::writing::WritingSet;
@@ -25,7 +27,10 @@ mod peer;
 
 mod auth;
 mod aws_chunked;
+mod blob_file;
+mod blobs;
 mod body;
+mod checksum;
 mod db;
 mod prune;
 mod roles;
@@ -36,6 +41,8 @@ mod writing;
 pub struct App {
     pool: Pool,
     store: Store,
+    /// This node's number (`nodes.id`), which locations refer to it by.
+    node: i32,
     replication_factor: usize,
     writing: WritingSet,
 }
@@ -51,7 +58,7 @@ struct Cli {
 enum Command {
     /// Run a storage node.
     Serve(ServeArgs),
-    /// Reclaim orphaned and failed-upload parts on a node (manual repair).
+    /// Reclaim orphaned and failed-upload blobs on a node (manual repair).
     Prune(PruneArgs),
     /// Manage roles: S3 credentials and their bucket permissions.
     Role(roles::RoleArgs),
@@ -73,7 +80,7 @@ struct ServeArgs {
     /// only if the bind address isn't routable (e.g. 0.0.0.0).
     #[arg(long)]
     peer_url: Option<String>,
-    /// How many replicas every part is stored on.
+    /// How many replicas every blob is stored on.
     #[arg(long, default_value_t = 1)]
     replication_factor: usize,
     #[arg(long)]
@@ -104,12 +111,7 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     let pool = db::connect(&args.database).await?;
-    let app = Arc::new(App {
-        pool,
-        store: Store::new(args.data_dir)?,
-        replication_factor: args.replication_factor,
-        writing: WritingSet::default(),
-    });
+    let store = Store::new(args.data_dir)?;
     // The URL peers use to reach us: explicit if given, otherwise derived from
     // the (always-set) peer bind address.
     let peer_url = args
@@ -118,7 +120,14 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| format!("http://{}", args.listen_peer));
     // Register this node before serving traffic, then keep its heartbeat fresh in
     // the background.
-    register_node(&app, &peer_url).await?;
+    let node = register_node(&pool, &store, &peer_url).await?;
+    let app = Arc::new(App {
+        pool,
+        store,
+        node,
+        replication_factor: args.replication_factor,
+        writing: WritingSet::default(),
+    });
     tokio::spawn(heartbeat(app.clone(), peer_url));
 
     let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
@@ -161,30 +170,31 @@ async fn prune_main(args: PruneArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Upserts this node's row in `nodes`. Used both for the initial registration
-/// and for each heartbeat, since both are the same "I'm alive, here's my state"
-/// statement.
-async fn register_node(app: &App, peer_url: &str) -> anyhow::Result<()> {
-    let client = app.pool.get().await?;
-    let node_id = app.store.get_node_id().to_string();
-    let free_space = app.store.available_space()? as i64;
-    client
-        .execute(
+/// Upserts this node's row in `nodes`, returning its number. Used both for the
+/// initial registration and for each heartbeat, since both are the same "I'm
+/// alive, here's my state" statement.
+async fn register_node(pool: &Pool, store: &Store, peer_url: &str) -> anyhow::Result<i32> {
+    let client = pool.get().await?;
+    let node_id = store.get_node_id().to_string();
+    let free_space = store.available_space()? as i64;
+    let row = client
+        .query_one(
             "INSERT INTO nodes (node_id, peer_url, last_seen, free_space)
              VALUES ($1, $2, NOW(), $3)
              ON CONFLICT (node_id)
-             DO UPDATE SET peer_url = $2, last_seen = NOW(), free_space = $3",
+             DO UPDATE SET peer_url = $2, last_seen = NOW(), free_space = $3
+             RETURNING id",
             &[&node_id, &peer_url, &free_space],
         )
         .await?;
-    Ok(())
+    Ok(row.get(0))
 }
 
 async fn heartbeat(app: Arc<App>, peer_url: String) {
     let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
         interval.tick().await;
-        if let Err(e) = register_node(&app, &peer_url).await {
+        if let Err(e) = register_node(&app.pool, &app.store, &peer_url).await {
             eprintln!("heartbeat failed: {e}");
         }
     }
@@ -244,10 +254,10 @@ async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Resu
     }
 }
 
-async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<(String, String)>> {
+async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<Location>> {
     let nodes = client
         .query(
-            "SELECT node_id, peer_url FROM nodes WHERE last_seen > NOW() - INTERVAL '10 seconds' ORDER BY free_space DESC",
+            "SELECT id, peer_url FROM nodes WHERE last_seen > NOW() - INTERVAL '10 seconds' ORDER BY free_space DESC",
             &[],
         )
         .await?;
@@ -260,14 +270,15 @@ async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<(S
     }
     Ok(nodes[0..count]
         .iter()
-        .map(|n| (n.get("node_id"), n.get("peer_url")))
+        .map(|n| (n.get("id"), n.get("peer_url")))
         .collect())
 }
 
-/// Streams a part body to a single replica's peer endpoint. Generic over the
-/// body so the caller can hand us any stream (e.g. one side of a fan-out tee),
-/// not just the original client `Incoming`.
-async fn upload_to_replica<B>(peer_url: &str, part_id: Uuid, body: B) -> anyhow::Result<()>
+/// Streams a blob body to a single replica's peer endpoint, returning the
+/// CRC64/NVME the replica reports for the file it stored. Generic over the body so the
+/// caller can hand us any stream (e.g. one side of a fan-out tee), not just the
+/// original client `Incoming`.
+async fn upload_to_replica<B>(peer_url: &str, blob_id: Uuid, body: B) -> anyhow::Result<u64>
 where
     B: Body + Send + Unpin + 'static,
     B::Data: Send,
@@ -276,102 +287,68 @@ where
     let client = Client::builder(TokioExecutor::new()).build_http();
     let req = Request::builder()
         .method(Method::PUT)
-        .uri(format!("{peer_url}/parts/{part_id}"))
+        .uri(format!("{peer_url}/blobs/{blob_id}"))
         .body(body)?;
     let res = client.request(req).await?;
     if res.status() != StatusCode::OK {
         anyhow::bail!("replica {peer_url} returned status {}", res.status());
     }
-    Ok(())
+    let crc = res
+        .headers()
+        .get(peer::CRC64_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| u64::from_str_radix(v, 16).ok());
+    crc.ok_or_else(|| anyhow::anyhow!("replica {peer_url} didn't report a checksum"))
 }
 
-/// A part file to reap, and where it lives: (part_id, holder node_id, holder
-/// peer_url). One per replica.
-pub(crate) type ReapTarget = (Uuid, String, String);
-
-/// Maps location rows (part_id, node_id, peer_url) into reap targets.
-pub(crate) fn reap_targets(rows: &[tokio_postgres::Row]) -> Vec<ReapTarget> {
-    rows.iter()
-        .map(|r| (r.get::<_, Uuid>(0), r.get::<_, String>(1), r.get::<_, String>(2)))
-        .collect()
-}
-
-/// Best-effort: once a set of parts has been removed from the catalog (deleted or
-/// replaced), ask each holder to delete the file from disk *now* — locally if
-/// that's us, else via the peer's `DELETE /parts/{id}`. The rows are already gone,
-/// so any deletion that fails (peer down, network) is harmless: `cairn prune`
-/// reclaims the leftovers. Runs in the background so it never delays the response.
-pub(crate) fn reap_parts(app: &Arc<App>, targets: Vec<ReapTarget>) {
-    if targets.is_empty() {
-        return;
-    }
-    let app = app.clone();
-    tokio::spawn(async move {
-        let self_id = app.store.get_node_id().to_string();
-        for (part_id, node_id, peer_url) in targets {
-            let result = if node_id == self_id {
-                app.store.remove_part(part_id).await
-            } else {
-                delete_from_replica(&peer_url, part_id).await
-            };
-            if let Err(e) = result {
-                eprintln!("best-effort reap of part {part_id} on {peer_url} failed: {e}");
-            }
-        }
-    });
-}
-
-async fn delete_from_replica(peer_url: &str, part_id: Uuid) -> anyhow::Result<()> {
-    let client = Client::builder(TokioExecutor::new()).build_http();
-    let req = Request::builder()
-        .method(Method::DELETE)
-        .uri(format!("{peer_url}/parts/{part_id}"))
-        .body(Empty::<Bytes>::new())?;
-    let res = client.request(req).await?;
-    if res.status() != StatusCode::OK {
-        anyhow::bail!("replica {peer_url} returned status {}", res.status());
-    }
-    Ok(())
-}
-
-/// Streams a body to this node's local disk, fsyncs it, and records this node as
-/// a location for the part. Shared by the peer PUT endpoint (an `Incoming`) and
-/// the local-replica sink in `upload_part` (a channel-backed body) — hence the
-/// generic body.
-async fn write_part_streaming<B>(app: &App, part_id: Uuid, mut body: B) -> anyhow::Result<()>
+/// Streams a body to this node's local disk followed by its checksum table (see
+/// `blob_file`), fsyncs it, and records this node as a location for the blob.
+/// Returns the CRC64/NVME of the whole file written. Shared by
+/// the peer PUT endpoint (an `Incoming`) and the local-replica sink in
+/// `upload_part` (a channel-backed body) — hence the generic body.
+async fn write_blob_streaming<B>(app: &App, blob_id: Uuid, mut body: B) -> anyhow::Result<u64>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // Mark the part as being written for the whole write→announce window, so the
+    // Mark the blob as being written for the whole write→announce window, so the
     // GC's file sweep won't treat this in-flight file (no location yet) as an
     // orphan. The guard drops after the location insert below.
-    let _writing = app.writing.begin(part_id);
-    let mut file = app.store.create_part(part_id).await?;
+    let _writing = app.writing.begin(blob_id);
+    let mut file = app.store.create_blob(blob_id).await?;
+    // The checksums are computed from the bytes as received, before they hit
+    // the disk, so the table catches anything that goes wrong on the way down.
+    let mut summer = BlobSummer::new(checksum::BLOCK_SIZE);
+    let mut file_crc = crc64fast_nvme::Digest::new();
     while let Some(frame) = body.frame().await {
         if let Ok(chunk) = frame?.into_data() {
+            summer.update(&chunk);
+            file_crc.write(&chunk);
             file.write_all(&chunk).await?;
         }
     }
+    let trailer = blob_file::trailer(blob_id, &summer.finish());
+    file_crc.write(&trailer);
+    file.write_all(&trailer).await?;
     // fsync before announcing the location, so the bytes survive a crash by the
     // time the leader's commit can count this replica.
     file.sync_all().await?;
-    let node_id = app.store.get_node_id().to_string();
     let client = app.pool.get().await?;
     client
         .execute(
-            "INSERT INTO part_locations (part_id, node_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            &[&part_id, &node_id],
+            "INSERT INTO blob_locations (blob_id, node) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            &[&blob_id, &app.node],
         )
         .await?;
-    Ok(())
+    Ok(file_crc.sum64())
 }
 
-/// Where a freshly-committed part should be attached. The attach happens inside
-/// the same serializable transaction that flips the part to 'committed', so the
-/// invariant "committed implies referenced" holds with no orphan window.
-/// The size and ETag aren't carried here: they're computed by `upload_part` as
-/// the body streams, and passed to `try_commit_part` alongside the target.
+/// Where a freshly-uploaded part should be attached. The part row is inserted
+/// in the same serializable transaction that flips its blob to 'committed', so
+/// the invariant "a committed blob is referenced" holds with no orphan window.
+/// The size, ETag and CRC aren't carried here: they're computed by
+/// `upload_part` as the body streams, and passed to `try_commit_part` alongside
+/// the target.
 enum AttachTarget {
     /// A single-PUT object: point (bucket, key) at exactly this one part,
     /// replacing whatever it referenced before. `conditions` carries any
@@ -388,8 +365,6 @@ enum AttachTarget {
     MultipartPart { upload_id: Uuid, part_number: i32 },
 }
 
-/// Streams `body` into a fresh part replicated across the cluster — hashing it
-/// as it flows — then commits and attaches it to `attach`. Returns the ETag.
 /// The outcome of an upload: the committed part's ETag, or a rejection because
 /// the streamed body didn't match the client's `x-amz-content-sha256`.
 enum UploadResult {
@@ -420,36 +395,36 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     let client = app.pool.get().await?;
-    let part_id = Uuid::new_v4();
-    // 1. create the pending part. Its size isn't known until the body is fully
+    // Time-ordered, so new blobs land at the end of the indexes on blob_id.
+    let blob_id = Uuid::now_v7();
+    // 1. create the pending blob. Its size isn't known until the body is fully
     // streamed, so it starts at 0 and is set at commit.
     client
         .execute(
-            "INSERT INTO parts (part_id, size, state, created_at) VALUES ($1, 0, 'pending', NOW())",
-            &[&part_id],
+            "INSERT INTO blobs (blob_id, size, state, created_at) VALUES ($1, 0, 'pending', NOW())",
+            &[&blob_id],
         )
         .await?;
     // 2. choose replicas; give each (local or remote) a channel-backed body that
     // the tee loop below feeds. A replica that is ourselves writes straight to
     // local disk (no HTTP hop — and on a single host there's no peer server).
     let replicas = choose_replicas(&client, app.replication_factor).await?;
-    let node_ids: Vec<String> = replicas.iter().map(|(id, _)| id.clone()).collect();
+    let nodes: Vec<i32> = replicas.iter().map(|(node, _)| *node).collect();
     // Don't hold a pooled connection across the (potentially long) stream — the
     // local sink needs one to record its location, and concurrent uploads could
     // otherwise exhaust the pool and deadlock. Re-acquire one for the commit.
     drop(client);
-    let self_id = app.store.get_node_id().to_string();
     let mut senders: Vec<FrameSender> = Vec::new();
     let mut sinks = JoinSet::new();
-    for (node_id, peer_url) in replicas {
+    for (node, peer_url) in replicas {
         let (tx, part_body) = channel_body();
         senders.push(tx);
-        if node_id == self_id {
+        if node == app.node {
             let app = app.clone();
-            sinks.spawn(async move { write_part_streaming(&app, part_id, part_body).await });
+            sinks.spawn(async move { write_blob_streaming(&app, blob_id, part_body).await });
         } else {
             sinks.spawn(async move {
-                upload_to_replica(&peer_url, part_id, part_body)
+                upload_to_replica(&peer_url, blob_id, part_body)
                     .await
                     .map_err(|e| Unavailable(format!("replica {peer_url}: {e:#}")).into())
             });
@@ -458,6 +433,8 @@ where
     // 3. tee: read the client body once, hashing and fanning each chunk out to
     // every replica. The bounded channels apply backpressure at the slowest sink.
     let mut hasher = Md5::new();
+    let mut summer = BlobSummer::new(checksum::BLOCK_SIZE);
+    let mut crc = crc64fast_nvme::Digest::new();
     let mut size: i64 = 0;
     let mut read_err: Option<anyhow::Error> = None;
     // A streaming-signature upload arrives `aws-chunked` framed; decode it back to
@@ -508,6 +485,8 @@ where
                 };
                 for chunk in segments {
                     hasher.update(&chunk);
+                    summer.update(&chunk);
+                    crc.write(&chunk);
                     if let Some(h) = &mut content_hasher {
                         h.update(&chunk);
                     }
@@ -550,10 +529,12 @@ where
     drop(senders);
     // 4. wait for every replica to finish (or fail). When we deliberately faulted
     // the sinks above, their resulting error is expected — swallow it; otherwise a
-    // sink failure is a real durability problem.
+    // sink failure is a real durability problem. Each sink reports the CRC32C of
+    // what it stored, checked below.
+    let mut replica_crcs = Vec::new();
     while let Some(res) = sinks.join_next().await {
         match res {
-            Ok(Ok(())) => {}
+            Ok(Ok(replica_crc)) => replica_crcs.push(replica_crc),
             Ok(Err(e)) if !faulted => return Err(e),
             Ok(Err(_)) => {}
             Err(join_err) => return Err(join_err.into()),
@@ -568,7 +549,7 @@ where
     }
     // The body is fully read and replicated (but not yet committed). If the client
     // claimed a whole-body hash, check it now and refuse to commit on a mismatch —
-    // the pending part is left for the GC to reclaim.
+    // the pending blob is left for the GC to reclaim.
     if let (Some(h), ContentSha256::Single(expected)) = (content_hasher, &content_sha256) {
         let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
         if actual != *expected {
@@ -586,16 +567,31 @@ where
         }
     }
     let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    // Every replica must have stored exactly the file we expect: the bytes we
+    // sent, followed by the checksum table and blob ID they determine. A mismatch
+    // means a copy was damaged in transit or on its way to disk; the pending blob
+    // is left for the GC, and the client can retry.
+    // The part's CRC covers its data; the blob's carries on over the trailer.
+    let data_crc = crc.sum64();
+    crc.write(&blob_file::trailer(blob_id, &summer.finish()));
+    let file_crc = crc.sum64();
+    if replica_crcs.iter().any(|&replica_crc| replica_crc != file_crc) {
+        return Err(Unavailable(format!(
+            "blob {blob_id}: a replica stored different bytes than were sent"
+        ))
+        .into());
+    }
     // 5. commit + attach with the now-known size and ETag, under a serializable
     // transaction; retry on a serialization conflict (e.g. a concurrent GC).
     let mut client = app.pool.get().await?;
     let mut committed = None;
     let mut precondition_failed = false;
     for _ in 0..MAX_COMMIT_ATTEMPTS {
-        match try_commit_part(&mut client, part_id, &node_ids, attach, size, &etag).await {
+        let crcs = (file_crc, data_crc);
+        match try_commit_part(&mut client, blob_id, &nodes, attach, size, &etag, crcs).await {
             Ok(CommitResult::Committed { reap, version_id }) => {
-                // Reap the parts this overwrite displaced; their rows are gone.
-                reap_parts(app, reap);
+                // Reap the blobs this overwrite displaced; their rows are gone.
+                reap_blobs(app, reap);
                 committed = Some(version_id);
                 break;
             }
@@ -605,7 +601,7 @@ where
             }
             Ok(CommitResult::MissingLocations { present, required }) => {
                 return Err(Unavailable(format!(
-                    "part {part_id} not durable: only {present}/{required} replicas reported a location"
+                    "blob {blob_id} not durable: only {present}/{required} replicas reported a location"
                 ))
                 .into());
             }
@@ -613,14 +609,14 @@ where
             Err(e) => return Err(e.into()),
         }
     }
-    // The pending part left behind by a failed conditional write is reclaimed by
+    // The pending blob left behind by a failed conditional write is reclaimed by
     // the GC, exactly like the content-sha256 mismatch path above.
     if precondition_failed {
         return Ok(UploadResult::PreconditionFailed);
     }
     let Some(version_id) = committed else {
         anyhow::bail!(
-            "part {part_id}: commit aborted after {MAX_COMMIT_ATTEMPTS} serialization retries"
+            "blob {blob_id}: commit aborted after {MAX_COMMIT_ATTEMPTS} serialization retries"
         );
     };
     Ok(UploadResult::Committed { etag, version_id })
@@ -629,7 +625,7 @@ where
 const MAX_COMMIT_ATTEMPTS: usize = 10;
 
 enum CommitResult {
-    /// Committed; carries the replica locations of any parts this displaced
+    /// Committed; carries the replica locations of any blobs this displaced
     /// (an overwrite or part re-upload), for the caller to reap, and the
     /// version ID to report for an object write.
     Committed {
@@ -642,17 +638,20 @@ enum CommitResult {
 }
 
 /// Runs the commit transaction once under SERIALIZABLE isolation: confirms that
-/// all `node_ids` hold a location for `part_id`, and if so marks the part
-/// committed and attaches it to `attach` in the same transaction. The raw
-/// postgres error is returned unwrapped so the caller can distinguish a
-/// serialization failure (retry) from a real error (give up).
+/// all `nodes` hold a location for `blob_id`, and if so marks the blob committed
+/// (recording its size and the CRC64/NVME of its file) and attaches a part
+/// spanning it to `attach` (with the CRC64/NVME of its data), in the same
+/// transaction. The raw postgres error is returned unwrapped so the
+/// caller can distinguish a serialization failure (retry) from a real error
+/// (give up).
 async fn try_commit_part(
     client: &mut Object,
-    part_id: Uuid,
-    node_ids: &[String],
+    blob_id: Uuid,
+    nodes: &[i32],
     attach: &AttachTarget,
     size: i64,
     etag: &str,
+    (file_crc, data_crc): (u64, u64),
 ) -> Result<CommitResult, tokio_postgres::Error> {
     let tx = client
         .build_transaction()
@@ -661,26 +660,33 @@ async fn try_commit_part(
         .await?;
     let present: i64 = tx
         .query_one(
-            "SELECT count(*) FROM part_locations WHERE part_id = $1 AND node_id = ANY($2)",
-            &[&part_id, &node_ids],
+            "SELECT count(*) FROM blob_locations WHERE blob_id = $1 AND node = ANY($2)",
+            &[&blob_id, &nodes],
         )
         .await?
         .get(0);
-    if present as usize != node_ids.len() {
+    if present as usize != nodes.len() {
         // A location is missing; dropping `tx` here rolls the transaction back.
         return Ok(CommitResult::MissingLocations {
             present,
-            required: node_ids.len(),
+            required: nodes.len(),
         });
     }
-    // Capture the replica locations of the parts this commit displaces, before
-    // their rows (and, via cascade, their part_locations) are dropped — so the
-    // caller can reap the files immediately rather than leave them for GC.
-    const CAPTURE: &str = "SELECT pl.part_id, pl.node_id, n.peer_url
-         FROM parts p
-         JOIN part_locations pl ON pl.part_id = p.part_id
-         JOIN nodes n ON n.node_id = pl.node_id
-         WHERE ";
+    // The blob's CRC covers its whole file (for a scrub to check against); the
+    // part's covers just its data, and stays valid wherever it's moved later.
+    // Both are stored as the same 64 bits, read as a signed BIGINT.
+    let file_crc = file_crc as i64;
+    let crc = data_crc as i64;
+    let block_size = checksum::BLOCK_SIZE as i32;
+    tx.execute(
+        "UPDATE blobs SET state = 'committed', size = $2, crc64nvme = $3, block_size = $4
+         WHERE blob_id = $1",
+        &[&blob_id, &size, &file_crc, &block_size],
+    )
+    .await?;
+    const INSERT_PART: &str = "INSERT INTO parts
+             (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id, part_number)
+         VALUES ($1, 0, $2, $3, $4, $5, $6, $7)";
     let mut reap: Vec<ReapTarget> = Vec::new();
     let mut version_id = None;
     match attach {
@@ -714,12 +720,9 @@ async fn try_commit_part(
             )
             .await?;
             version_id = version.version_id;
-            // Commit this part and point it at the new version in one step.
             tx.execute(
-                "UPDATE parts
-                 SET state = 'committed', size = $1, etag = $2, object_id = $3, part_number = 1
-                 WHERE part_id = $4",
-                &[&size, &etag, &version.id, &part_id],
+                INSERT_PART,
+                &[&blob_id, &size, &etag, &crc, &Some(version.id), &None::<Uuid>, &1i32],
             )
             .await?;
         }
@@ -728,26 +731,19 @@ async fn try_commit_part(
             part_number,
         } => {
             // Displace any part previously uploaded at this number (S3 allows
-            // re-uploading a part number); the new part isn't staged yet, so it's
-            // not captured. Frees the (upload_id, part_number) slot.
+            // re-uploading a part number), freeing the (upload_id, part_number)
+            // slot, and drop its blob unless something else still uses it.
             let displaced = tx
                 .query(
-                    &format!("{CAPTURE} p.upload_id = $1 AND p.part_number = $2"),
+                    "DELETE FROM parts WHERE upload_id = $1 AND part_number = $2
+                     RETURNING blob_id",
                     &[upload_id, part_number],
                 )
                 .await?;
-            reap = reap_targets(&displaced);
+            reap = drop_unreferenced_blobs(&tx, &blob_ids(&displaced)).await?;
             tx.execute(
-                "DELETE FROM parts WHERE upload_id = $1 AND part_number = $2",
-                &[upload_id, part_number],
-            )
-            .await?;
-            // Commit this part and stage it under the upload in one step.
-            tx.execute(
-                "UPDATE parts
-                 SET state = 'committed', size = $1, etag = $2, upload_id = $3, part_number = $4
-                 WHERE part_id = $5",
-                &[&size, &etag, upload_id, part_number, &part_id],
+                INSERT_PART,
+                &[&blob_id, &size, &etag, &crc, &None::<i64>, &Some(*upload_id), part_number],
             )
             .await?;
         }
