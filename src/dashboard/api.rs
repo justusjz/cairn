@@ -1,5 +1,4 @@
-//! The admin UI's JSON API. Every route here needs a logged-in admin (see the
-//! module above); `route` gets the role's name.
+//! The dashboard's JSON API.
 //!
 //! The numbers come from the catalog, as of the request, and from each node's
 //! own metrics (see `metrics`), which every live node reports through its peer
@@ -45,7 +44,6 @@ fn invalid(message: impl Into<String>) -> anyhow::Error {
 pub(super) async fn route(
     req: Request<Incoming>,
     app: &Arc<App>,
-    role: &str,
     route: &str,
 ) -> anyhow::Result<Response<ResBody>> {
     let query = req.uri().query().unwrap_or("").to_owned();
@@ -56,7 +54,6 @@ pub(super) async fn route(
         .collect();
     let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
     match (req.method().clone(), segments.as_slice()) {
-        (Method::GET, ["session"]) => ok(json!({ "role": role, "node": app.node })),
         (Method::GET, ["cluster"]) => ok(cluster(app).await?),
         (Method::GET, ["storage"]) => ok(storage(app).await?),
         (Method::GET, ["buckets"]) => ok(buckets(app).await?),
@@ -93,9 +90,6 @@ pub(super) async fn route(
             ok(json!({ "name": name, "secret": secret }))
         }
         (Method::DELETE, ["roles", name]) => {
-            if *name == role {
-                return Err(invalid("you can't delete the role you're logged in as"));
-            }
             roles::delete(&app.pool.get().await?, name).await?;
             ok(json!({}))
         }
@@ -114,11 +108,6 @@ pub(super) async fn route(
             let Some(admin) = body["admin"].as_bool() else {
                 return Err(invalid("expected {\"admin\": true|false}"));
             };
-            if *name == role && !admin {
-                return Err(invalid(
-                    "you can't revoke admin from the role you're logged in as",
-                ));
-            }
             roles::update(&app.pool.get().await?, name, Some(admin), None).await?;
             ok(json!({}))
         }

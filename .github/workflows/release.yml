@@ -36,6 +36,16 @@ jobs:
             exit 1
           fi
 
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Check the dashboard UI
+        working-directory: ui
+        run: npm ci && npm run check
+
       - name: Unit tests
         run: cargo test --locked
 

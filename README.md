@@ -14,9 +14,10 @@ consistent.
 The schema is created automatically; just point Cairn at an empty database.
 
 > [!WARNING]
-> The peer endpoint (`--listen-peer`, default `:9431`) is unauthenticated and
-> can read and delete blobs. Only bind it to a trusted/private network — never
-> expose it to the public internet.
+> The peer endpoint (`--listen-peer`, default `:9431`) is unauthenticated: it
+> can read and delete blobs, and it serves the [dashboard](#dashboard), which
+> manages roles. Only bind it to a trusted/private network — never expose it to
+> the public internet.
 
 ## Installing
 
@@ -75,7 +76,6 @@ s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
 | `--peer-url <URL>` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
 | `--replication-factor <N>` | `1` | How many distinct nodes each blob is stored on. |
 | `--data-dir <PATH>` | *required* | Local directory for blobs. |
-| `--listen-admin <ADDR>` | *off* | Bind address for the [admin UI](#admin-ui). Not served unless set. |
 
 ## Running a highly-available cluster
 
@@ -171,17 +171,12 @@ clocks of nodes and clients in sync (e.g. NTP); otherwise requests fail with
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,
 > since it is part of the signature.
 
-## Admin UI
+## Dashboard
 
-Each node can serve a web UI for watching and managing the cluster. It's off
-unless you give `--listen-admin`:
-
-```sh
-cairn serve ... --listen-admin 127.0.0.1:9432
-```
-
-Open `http://127.0.0.1:9432/` and log in with the name and secret of an
-**admin** role. Any node's UI shows the whole cluster:
+Every node serves a web dashboard for watching and managing the cluster, on its
+peer endpoint: open the peer URL in a browser, e.g. `http://10.0.0.1:9431/`
+(or `http://127.0.0.1:9431/` with the default `--listen-peer`). Any node's
+dashboard shows the whole cluster:
 
 - **Overview:** which nodes are live, how full their disks are, and request
   rates, errors, throughput and latency over the last hour, by S3 operation.
@@ -196,17 +191,28 @@ Open `http://127.0.0.1:9432/` and log in with the name and secret of an
   revoke permissions, rotate secrets, and toggle admin.
 
 Request metrics are kept in memory by each node, so they start over when it
-restarts; everything else is read from the database. Other nodes' metrics are
-fetched from their peer endpoint (`/stats`).
+restarts; everything else is read from the database.
 
 > [!WARNING]
-> Through the UI, an admin role can manage roles, and so grant itself access
-> to any bucket's objects. With `--listen-admin` set, treat admin credentials
-> like access to the database. The UI speaks plain HTTP like the S3 API, so
-> bind it to a private address or put it behind a TLS-terminating proxy.
+> Like the rest of the peer endpoint, the dashboard has no authentication:
+> anyone who can reach it can read every object and manage every role. Keep
+> the peer endpoint on a trusted network.
 
-A login lasts 12 hours, or until the node restarts. Deleting the role, revoking
-its admin flag or changing its secret ends its sessions right away.
+### Building the dashboard
+
+The dashboard's UI lives in `ui/` (SolidJS and TypeScript, built with Vite)
+and is embedded into the binary when Cairn is built. Building Cairn doesn't
+need Node, but without a build of the UI the dashboard is only a placeholder
+page, so build it first:
+
+```sh
+(cd ui && npm ci && npm run build)
+cargo build --release
+```
+
+`./build-release.sh` does both. While working on the UI, `npm run dev` in
+`ui/` serves it with hot reloading, passing API requests on to the node at
+`CAIRN_URL` (default `http://127.0.0.1:9431`).
 
 ## Versioning
 

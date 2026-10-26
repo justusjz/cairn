@@ -1,6 +1,6 @@
-//! What a node keeps track of for the admin UI: the S3 requests it served, and
+//! What a node keeps track of for the dashboard: the S3 requests it served, and
 //! how its maintenance passes went. Kept in memory only, so it starts over when
-//! the node restarts, and each node only knows its own. The admin UI asks every
+//! the node restarts, and each node only knows its own. The dashboard asks every
 //! live node for its share (see `peer`'s `/stats`).
 
 use std::collections::VecDeque;
@@ -323,7 +323,7 @@ impl Metrics {
             .event("maintenance", true, message);
     }
 
-    /// Everything, as the admin API reports it.
+    /// Everything, as the dashboard reports it.
     pub fn to_json(&self) -> Value {
         let requests = self.requests.lock().unwrap();
         let ops: Vec<Value> = Op::ALL

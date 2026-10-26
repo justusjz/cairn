@@ -91,8 +91,6 @@ nav a {
 }
 nav a:hover { background: var(--panel-2); text-decoration: none; color: var(--text); }
 nav a.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
-.session { margin-left: auto; display: flex; align-items: center; gap: 10px; color: var(--muted); white-space: nowrap; }
-body.logged-out nav, body.logged-out .session { visibility: hidden; }
 
 main { max-width: 1400px; margin: 0 auto; padding: 20px 20px 60px; }
 
@@ -145,6 +143,10 @@ tbody tr:last-child td { border-bottom: none; }
 td.actions { text-align: right; white-space: nowrap; }
 td.actions > * + * { margin-left: 6px; }
 td.key { word-break: break-all; }
+td.disk { min-width: 200px; }
+td.share { min-width: 140px; }
+.parts { margin-top: 10px; }
+form.grant { margin-top: 6px; }
 .empty { color: var(--muted); padding: 18px 10px; text-align: center; }
 
 .badge {
@@ -230,12 +232,17 @@ label.check { display: inline-flex; align-items: center; gap: 5px; white-space: 
 .chart .grid-line { stroke: var(--border); stroke-width: 1; }
 .chart .axis-label { fill: var(--muted); font-size: 11px; }
 .chart .line { fill: none; stroke-width: 1.8; stroke-linejoin: round; }
-.chart .area { opacity: .12; }
+.chart .area { opacity: .12; stroke: none; }
+.chart .c1 { stroke: var(--series-1); } .chart .area.c1, .legend i.c1 { fill: var(--series-1); background: var(--series-1); }
+.chart .c2 { stroke: var(--series-2); } .chart .area.c2, .legend i.c2 { fill: var(--series-2); background: var(--series-2); }
+.chart .c3 { stroke: var(--series-3); } .chart .area.c3, .legend i.c3 { fill: var(--series-3); background: var(--series-3); }
+.chart .c4 { stroke: var(--series-4); } .chart .area.c4, .legend i.c4 { fill: var(--series-4); background: var(--series-4); }
 .chart .cursor { stroke: var(--muted); stroke-dasharray: 3 3; }
 .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); margin-top: 6px; }
 .legend i { display: inline-block; width: 10px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
 .tooltip {
   position: absolute;
+  top: 4px;
   pointer-events: none;
   background: var(--panel);
   border: 1px solid var(--border);
@@ -253,20 +260,6 @@ label.check { display: inline-flex; align-items: center; gap: 5px; white-space: 
 .events td.msg { word-break: break-word; }
 tr.error td { color: var(--bad); }
 
-.login-wrap { min-height: calc(100vh - 140px); display: grid; place-items: center; }
-.login {
-  width: min(380px, 100%);
-  background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 28px;
-}
-.login h1 { margin-top: 0; }
-.login label { display: block; font-size: 12px; color: var(--muted); margin: 12px 0 4px; }
-.login input { width: 100%; }
-.login button { width: 100%; justify-content: center; margin-top: 18px; padding: 8px; }
-.login .error { color: var(--bad); margin-top: 12px; min-height: 1.4em; }
-
 dialog {
   border: 1px solid var(--border);
   border-radius: 12px;
@@ -281,7 +274,7 @@ dialog .secret { display: flex; gap: 8px; margin: 12px 0; }
 dialog .secret input { flex: 1; font-family: var(--mono); }
 dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
 
-#toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
+.toasts { position: fixed; right: 16px; bottom: 16px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
 .toast {
   max-width: 420px;
   padding: 10px 14px;
@@ -307,7 +300,6 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
 
 @media (max-width: 700px) {
   .topbar { gap: 12px; padding: 0 12px; }
-  .session .who { display: none; }
   main { padding: 16px 12px 40px; }
   .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
 }

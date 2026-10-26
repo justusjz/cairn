@@ -25,13 +25,13 @@ use crate::writing::WritingSet;
 
 mod peer;
 
-mod admin;
 mod auth;
 mod aws_chunked;
 mod blob_file;
 mod blobs;
 mod body;
 mod checksum;
+mod dashboard;
 mod db;
 #[cfg(test)]
 mod e2e;
@@ -52,8 +52,6 @@ pub struct App {
     writing: WritingSet,
     pack: packer::Config,
     metrics: Arc<metrics::Metrics>,
-    /// Who is logged into the admin UI on this node.
-    sessions: admin::Sessions,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -95,10 +93,6 @@ struct ServeArgs {
     replication_factor: usize,
     #[arg(long)]
     data_dir: String,
-    /// Bind address for the admin UI, e.g. 127.0.0.1:9432. Off unless set.
-    /// Anyone who can log in with an admin role can manage roles there.
-    #[arg(long)]
-    listen_admin: Option<String>,
 }
 
 /// How often a node refreshes its `nodes` row (last_seen / free_space).
@@ -134,7 +128,6 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         writing: WritingSet::default(),
         pack: packer::Config::default(),
         metrics: Arc::default(),
-        sessions: admin::Sessions::default(),
         #[cfg(test)]
         pack_hook: None,
     });
@@ -143,22 +136,11 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
 
     let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
     let listen_peer_addr = SocketAddr::from_str(&args.listen_peer).unwrap();
-    let listen_admin_addr = args
-        .listen_admin
-        .as_deref()
-        .map(|addr| SocketAddr::from_str(addr).unwrap());
-    // The servers run and loop forever, so awaiting them keeps the process alive
+    // Both servers run and loop forever, so awaiting them keeps the process alive
     // until one errors out.
-    let admin = async {
-        match listen_admin_addr {
-            Some(addr) => serve(addr, app.clone(), ServeKind::Admin).await,
-            None => std::future::pending().await,
-        }
-    };
     tokio::try_join!(
         serve(listen_client_addr, app.clone(), ServeKind::Client),
         serve(listen_peer_addr, app.clone(), ServeKind::Peer),
-        admin,
     )?;
     Ok(())
 }
@@ -263,7 +245,6 @@ impl std::error::Error for Contended {}
 enum ServeKind {
     Client,
     Peer,
-    Admin,
 }
 
 async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Result<()> {
@@ -308,14 +289,12 @@ async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Resu
                             return Ok(hyper::Response::from_parts(parts, body));
                         }
                         ServeKind::Peer => peer::handle(req, app).await,
-                        ServeKind::Admin => admin::handle(req, app).await,
                     };
                     Ok::<_, std::convert::Infallible>(res.unwrap_or_else(|e| {
                         eprintln!("{what} failed: {e:#}");
                         match kind {
                             ServeKind::Client => s3::error_response(&e),
                             ServeKind::Peer => peer::error_response(&e),
-                            ServeKind::Admin => admin::error_response(&e),
                         }
                     }))
                 }

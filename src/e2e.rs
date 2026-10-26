@@ -63,7 +63,6 @@ pub async fn node_with(pack: Config, hook: Option<Hook>) -> Option<Arc<App>> {
         writing: WritingSet::default(),
         pack,
         metrics: Arc::default(),
-        sessions: crate::admin::Sessions::default(),
         pack_hook: hook,
     }))
 }

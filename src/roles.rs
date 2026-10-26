@@ -7,7 +7,7 @@
 //!
 //! Everything lives in Postgres, so every node sees a change immediately. The
 //! `cairn role …` subcommands manage it directly against the database, and the
-//! admin UI (see `admin`) through the same functions.
+//! dashboard (see `dashboard`) through the same functions.
 
 use std::collections::HashSet;
 

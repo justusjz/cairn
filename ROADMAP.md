@@ -21,7 +21,7 @@ Done:
   are cleaned up in the background; `cairn prune` is gone.
 - **Concurrent writes.** Conflicting requests are retried with backoff, and
   answered with 503 SlowDown if they still can't complete, instead of 500.
-- **Admin UI.** A web UI (`--listen-admin`) showing nodes, disks, request
+- **Dashboard.** A web UI on the peer endpoint showing nodes, disks, request
   rates, replica health and background jobs, with a bucket explorer and role
   management.
 - **Metadata-only copies.** CopyObject and UploadPartCopy point the new object
@@ -34,7 +34,7 @@ Done:
   instead of a `serve` flag that every node must agree on. Open: how existing
   clusters move over.
 - **Cluster status.** A `cairn status` command that shows which nodes are
-  down, and how much data is below the replication factor. (The admin UI's
+  down, and how much data is below the replication factor. (The dashboard's
   Storage page shows this already.)
 - **Replica repair.** Restoring copies lost with a node. Open: when it runs
   on its own (if ever), and when it waits for the operator to add a node, so
@@ -45,6 +45,11 @@ Done:
   background, and repairing damaged copies.
 - **CI.** Running the test suites (`db-test.sh`, `test.sh`, `ha-test.sh`) on
   every change.
+
+- **Dashboard users and isolation.** Logins for the dashboard, so that it can
+  leave the private network, and a way to divide a cluster between tenants
+  (projects, say), since a single kind of admin role isn't enough. Open: how
+  dashboard users relate to S3 roles.
 
 ## Later
 

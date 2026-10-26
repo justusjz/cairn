@@ -43,9 +43,9 @@ pub async fn handle(
         ));
     }
     if path == "/stats" {
-        // This node's own metrics, for the admin UI of whichever node it's
+        // This node's own metrics, for the dashboard of whichever node it's
         // open on.
-        let body = crate::admin::node_stats(&app).to_string();
+        let body = crate::dashboard::node_stats(&app).to_string();
         return Ok(box_response(
             Response::builder()
                 .status(StatusCode::OK)
@@ -141,7 +141,8 @@ pub async fn handle(
             _ => Ok(box_response(empty(StatusCode::METHOD_NOT_ALLOWED))),
         };
     }
-    Ok(box_response(empty(StatusCode::NOT_FOUND)))
+    // Everything else is the dashboard.
+    crate::dashboard::handle(req, app).await
 }
 
 fn empty(status: StatusCode) -> Response<Full<Bytes>> {

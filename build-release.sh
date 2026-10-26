@@ -9,6 +9,7 @@
 # Output: dist/cairn-v<version>-x86_64-unknown-linux-musl.tar.gz (+ .sha256)
 #
 # Requires the musl target:  rustup target add x86_64-unknown-linux-musl
+# and Node.js (with npm), to build the dashboard's UI.
 
 set -euo pipefail
 
@@ -20,6 +21,11 @@ cd "$SCRIPT_DIR"
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 PKG="cairn-v${VERSION}-${TARGET}"
 BIN="target/${TARGET}/release/cairn"
+
+# The dashboard's UI is embedded in the binary; without a build of it, the
+# binary would only serve a placeholder page.
+echo "Building the dashboard UI..."
+(cd ui && npm ci && npm run build)
 
 echo "Building cairn v${VERSION} for ${TARGET}..."
 cargo build --release --locked --target "$TARGET"
