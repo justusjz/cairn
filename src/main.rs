@@ -25,6 +25,7 @@ use crate::writing::WritingSet;
 
 mod peer;
 
+mod admin;
 mod auth;
 mod aws_chunked;
 mod blob_file;
@@ -35,6 +36,7 @@ mod db;
 #[cfg(test)]
 mod e2e;
 mod gc;
+mod metrics;
 mod packer;
 mod roles;
 mod s3;
@@ -49,6 +51,9 @@ pub struct App {
     replication_factor: usize,
     writing: WritingSet,
     pack: packer::Config,
+    metrics: Arc<metrics::Metrics>,
+    /// Who is logged into the admin UI on this node.
+    sessions: admin::Sessions,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -90,12 +95,16 @@ struct ServeArgs {
     replication_factor: usize,
     #[arg(long)]
     data_dir: String,
+    /// Bind address for the admin UI, e.g. 127.0.0.1:9432. Off unless set.
+    /// Anyone who can log in with an admin role can manage roles there.
+    #[arg(long)]
+    listen_admin: Option<String>,
 }
 
 /// How often a node refreshes its `nodes` row (last_seen / free_space).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How often a node runs its maintenance pass.
-const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -124,6 +133,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         replication_factor: args.replication_factor,
         writing: WritingSet::default(),
         pack: packer::Config::default(),
+        metrics: Arc::default(),
+        sessions: admin::Sessions::default(),
         #[cfg(test)]
         pack_hook: None,
     });
@@ -132,11 +143,22 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
 
     let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
     let listen_peer_addr = SocketAddr::from_str(&args.listen_peer).unwrap();
-    // Both servers run and loop forever, so awaiting them keeps the process alive
+    let listen_admin_addr = args
+        .listen_admin
+        .as_deref()
+        .map(|addr| SocketAddr::from_str(addr).unwrap());
+    // The servers run and loop forever, so awaiting them keeps the process alive
     // until one errors out.
+    let admin = async {
+        match listen_admin_addr {
+            Some(addr) => serve(addr, app.clone(), ServeKind::Admin).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::try_join!(
         serve(listen_client_addr, app.clone(), ServeKind::Client),
         serve(listen_peer_addr, app.clone(), ServeKind::Peer),
+        admin,
     )?;
     Ok(())
 }
@@ -147,26 +169,35 @@ async fn maintain(app: Arc<App>) {
     let mut sweep = gc::Sweep::new();
     loop {
         tokio::time::sleep(MAINTENANCE_INTERVAL).await;
-        let (app, scope) = (app.clone(), sweep.next_scope());
+        app.metrics.pass_started(sweep.position());
+        let (task_app, scope) = (app.clone(), sweep.next_scope());
         // A task of its own, so that a panic (a bug) fails this pass, rather
         // than ending maintenance on this node.
         let pass = tokio::spawn(async move {
+            let app = task_app;
             let report = gc::pass(&app, scope).await;
             if !report.is_empty() {
                 eprintln!("gc: {report}");
             }
+            app.metrics.gc_done(&report);
             match packer::pass(&app).await {
                 Ok(jobs) => {
                     for job in jobs {
                         eprintln!("packer: {job}");
+                        app.metrics.pack_done(&job);
                     }
                 }
-                Err(e) => eprintln!("packer: pass failed: {e:#}"),
+                Err(e) => {
+                    eprintln!("packer: pass failed: {e:#}");
+                    app.metrics.pack_failed(format!("pass failed: {e:#}"));
+                }
             }
         });
         if let Err(e) = pass.await {
             eprintln!("maintenance pass failed: {e}");
+            app.metrics.maintenance_failed(format!("pass failed: {e}"));
         }
+        app.metrics.pass_finished();
     }
 }
 
@@ -232,6 +263,7 @@ impl std::error::Error for Contended {}
 enum ServeKind {
     Client,
     Peer,
+    Admin,
 }
 
 async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Result<()> {
@@ -249,14 +281,41 @@ async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Resu
                     // clients take as a network fault and retry with backoff.
                     let what = format!("{} {}", req.method(), req.uri().path());
                     let res = match kind {
-                        ServeKind::Client => s3::handle(req, app).await,
+                        ServeKind::Client => {
+                            let started = std::time::Instant::now();
+                            let in_flight = app.metrics.begin();
+                            let op = metrics::Op::classify(
+                                req.method(),
+                                req.uri().path(),
+                                req.uri().query().unwrap_or(""),
+                                req.headers(),
+                            );
+                            let bytes_in = metrics::bytes_in(req.headers());
+                            let res = s3::handle(req, app.clone()).await;
+                            let res = res.unwrap_or_else(|e| {
+                                eprintln!("{what} failed: {e:#}");
+                                s3::error_response(&e)
+                            });
+                            let (parts, body) = res.into_parts();
+                            let body = app.metrics.record(
+                                op,
+                                parts.status,
+                                bytes_in,
+                                started.elapsed(),
+                                body,
+                                in_flight,
+                            );
+                            return Ok(hyper::Response::from_parts(parts, body));
+                        }
                         ServeKind::Peer => peer::handle(req, app).await,
+                        ServeKind::Admin => admin::handle(req, app).await,
                     };
                     Ok::<_, std::convert::Infallible>(res.unwrap_or_else(|e| {
                         eprintln!("{what} failed: {e:#}");
                         match kind {
                             ServeKind::Client => s3::error_response(&e),
                             ServeKind::Peer => peer::error_response(&e),
+                            ServeKind::Admin => admin::error_response(&e),
                         }
                     }))
                 }

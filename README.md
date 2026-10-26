@@ -75,6 +75,7 @@ s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
 | `--peer-url <URL>` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
 | `--replication-factor <N>` | `1` | How many distinct nodes each blob is stored on. |
 | `--data-dir <PATH>` | *required* | Local directory for blobs. |
+| `--listen-admin <ADDR>` | *off* | Bind address for the [admin UI](#admin-ui). Not served unless set. |
 
 ## Running a highly-available cluster
 
@@ -169,6 +170,43 @@ clocks of nodes and clients in sync (e.g. NTP); otherwise requests fail with
 > Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,
 > since it is part of the signature.
+
+## Admin UI
+
+Each node can serve a web UI for watching and managing the cluster. It's off
+unless you give `--listen-admin`:
+
+```sh
+cairn serve ... --listen-admin 127.0.0.1:9432
+```
+
+Open `http://127.0.0.1:9432/` and log in with the name and secret of an
+**admin** role. Any node's UI shows the whole cluster:
+
+- **Overview:** which nodes are live, how full their disks are, and request
+  rates, errors, throughput and latency over the last hour, by S3 operation.
+- **Storage:** how much data there is, how much of it has fewer live copies
+  than the replication factor, and what each node holds.
+- **Jobs:** how the background passes (garbage collection and packing) are
+  doing on each node, what they still have to do, and what they did recently.
+- **Buckets:** browse buckets by prefix, see every version of a key with the
+  blobs its parts are stored in and the nodes holding them, and download any
+  version. Buckets can be created and (when empty) deleted.
+- **Roles:** everything `cairn role` does: create and delete roles, grant and
+  revoke permissions, rotate secrets, and toggle admin.
+
+Request metrics are kept in memory by each node, so they start over when it
+restarts; everything else is read from the database. Other nodes' metrics are
+fetched from their peer endpoint (`/stats`).
+
+> [!WARNING]
+> Through the UI, an admin role can manage roles, and so grant itself access
+> to any bucket's objects. With `--listen-admin` set, treat admin credentials
+> like access to the database. The UI speaks plain HTTP like the S3 API, so
+> bind it to a private address or put it behind a TLS-terminating proxy.
+
+A login lasts 12 hours, or until the node restarts. Deleting the role, revoking
+its admin flag or changing its secret ends its sessions right away.
 
 ## Versioning
 

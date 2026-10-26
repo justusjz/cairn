@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cairn</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cellipse cx='16' cy='27' rx='12' ry='4' fill='%23577'/%3E%3Cellipse cx='16' cy='19' rx='9' ry='3.6' fill='%23799'/%3E%3Cellipse cx='16' cy='12' rx='6.5' ry='3' fill='%239bb'/%3E%3Cellipse cx='16' cy='6' rx='4' ry='2.4' fill='%23bdd'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="#/overview">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><ellipse cx="16" cy="27" rx="12" ry="4"/><ellipse cx="16" cy="19" rx="9" ry="3.6"/><ellipse cx="16" cy="12" rx="6.5" ry="3"/><ellipse cx="16" cy="6" rx="4" ry="2.4"/></svg>
+    Cairn
+  </a>
+  <nav id="nav">
+    <a href="#/overview" data-page="overview">Overview</a>
+    <a href="#/storage" data-page="storage">Storage</a>
+    <a href="#/jobs" data-page="jobs">Jobs</a>
+    <a href="#/buckets" data-page="buckets">Buckets</a>
+    <a href="#/roles" data-page="roles">Roles</a>
+  </nav>
+  <div class="session" id="session"></div>
+</header>
+<main id="main"></main>
+<div id="toasts" aria-live="polite"></div>
+</body>
+</html>

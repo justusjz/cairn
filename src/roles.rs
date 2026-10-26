@@ -6,13 +6,14 @@
 //! imply object access; that always needs an explicit grant.
 //!
 //! Everything lives in Postgres, so every node sees a change immediately. The
-//! `cairn role …` subcommands manage it directly against the database.
+//! `cairn role …` subcommands manage it directly against the database, and the
+//! admin UI (see `admin`) through the same functions.
 
 use std::collections::HashSet;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand, ValueEnum};
-use deadpool_postgres::{Object, Pool};
+use deadpool_postgres::Object;
 use tokio_postgres::error::SqlState;
 
 /// A bucket-level permission a role can be granted.
@@ -28,7 +29,13 @@ pub enum Permission {
 }
 
 impl Permission {
-    fn as_str(self) -> &'static str {
+    pub fn parse(s: &str) -> Option<Permission> {
+        [Permission::Read, Permission::Write, Permission::DeleteVersion]
+            .into_iter()
+            .find(|p| p.as_str() == s)
+    }
+
+    pub fn as_str(self) -> &'static str {
         match self {
             Permission::Read => "read",
             Permission::Write => "write",
@@ -150,12 +157,20 @@ enum RoleCommand {
 /// `cairn role …`: role management, straight against the database.
 pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
     let pool = crate::db::connect(&args.database).await?;
+    let client = pool.get().await?;
     match args.command {
         RoleCommand::Create {
             name,
             secret,
             admin,
-        } => create(&pool, &name, secret, admin).await,
+        } => {
+            let generated = secret.is_none();
+            let secret = create(&client, &name, secret, admin).await?;
+            println!("access key: {name}");
+            if generated {
+                println!("secret key: {secret}");
+            }
+        }
         RoleCommand::Update {
             name,
             admin,
@@ -166,31 +181,50 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
                 (true, _) => Some(generate_secret()?),
                 (false, s) => s,
             };
-            update(&pool, &name, admin, secret, rotate_secret).await
-        }
-        RoleCommand::Delete { name } => {
-            let client = pool.get().await?;
-            if client
-                .execute("DELETE FROM roles WHERE name = $1", &[&name])
-                .await?
-                == 0
-            {
-                anyhow::bail!("no role named {name:?}");
+            update(&client, &name, admin, secret.clone()).await?;
+            if rotate_secret && let Some(s) = secret {
+                println!("secret key: {s}");
             }
-            Ok(())
         }
-        RoleCommand::List => list(&pool).await,
+        RoleCommand::Delete { name } => delete(&client, &name).await?,
+        RoleCommand::List => {
+            for role in list(&client).await? {
+                let admin = if role.admin { " (admin)" } else { "" };
+                println!("{}{admin}", role.name);
+                for (bucket, permission) in role.grants {
+                    println!("  {bucket}:{permission}");
+                }
+            }
+        }
         RoleCommand::Grant {
             name,
             bucket,
             permissions,
-        } => grant(&pool, &name, &bucket, &permissions).await,
+        } => grant(&client, &name, &bucket, &permissions).await?,
         RoleCommand::Revoke {
             name,
             bucket,
             permissions,
-        } => revoke(&pool, &name, &bucket, &permissions).await,
+        } => revoke(&client, &name, &bucket, &permissions).await?,
     }
+    Ok(())
+}
+
+/// A request to change roles that can't be carried out as asked: a bad name, an
+/// unknown role, and the like. Its message is meant for whoever asked.
+#[derive(Debug)]
+pub struct Invalid(pub String);
+
+impl std::fmt::Display for Invalid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Invalid {}
+
+fn invalid(message: impl Into<String>) -> anyhow::Error {
+    Invalid(message.into()).into()
 }
 
 /// Role names travel inside the SigV4 `Credential=<name>/<date>/…` field, so they
@@ -201,7 +235,9 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
-        anyhow::bail!("role name must be non-empty and use only A-Z, a-z, 0-9, '-', '_', '.'");
+        return Err(invalid(
+            "role name must be non-empty and use only A-Z, a-z, 0-9, '-', '_', '.'",
+        ));
     }
     Ok(())
 }
@@ -209,34 +245,35 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
 /// minio-go clients (mcli, Mimir) refuse secrets shorter than 8 characters.
 fn validate_secret(secret: &str) -> anyhow::Result<()> {
     if secret.len() < 8 {
-        anyhow::bail!("secret must be at least 8 characters");
+        return Err(invalid("secret must be at least 8 characters"));
     }
     Ok(())
 }
 
 /// A random 40-character secret (240 bits, URL-safe base64), the same length as
 /// an AWS secret access key.
-fn generate_secret() -> anyhow::Result<String> {
+pub fn generate_secret() -> anyhow::Result<String> {
     let mut bytes = [0u8; 30];
     getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating secret: {e}"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-async fn create(
-    pool: &Pool,
+/// Creates a role, with `secret` or else a generated one, and returns its
+/// secret.
+pub async fn create(
+    client: &Object,
     name: &str,
     secret: Option<String>,
     admin: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
     validate_name(name)?;
-    let (secret, generated) = match secret {
+    let secret = match secret {
         Some(s) => {
             validate_secret(&s)?;
-            (s, false)
+            s
         }
-        None => (generate_secret()?, true),
+        None => generate_secret()?,
     };
-    let client = pool.get().await?;
     let inserted = client
         .execute(
             "INSERT INTO roles (name, secret, admin) VALUES ($1, $2, $3)
@@ -245,29 +282,26 @@ async fn create(
         )
         .await?;
     if inserted == 0 {
-        anyhow::bail!("a role named {name:?} already exists");
+        return Err(invalid(format!("a role named {name:?} already exists")));
     }
-    println!("access key: {name}");
-    if generated {
-        println!("secret key: {secret}");
-    }
-    Ok(())
+    Ok(secret)
 }
 
-async fn update(
-    pool: &Pool,
+/// Changes a role's admin flag and/or secret.
+pub async fn update(
+    client: &Object,
     name: &str,
     admin: Option<bool>,
     secret: Option<String>,
-    print_secret: bool,
 ) -> anyhow::Result<()> {
     if admin.is_none() && secret.is_none() {
-        anyhow::bail!("nothing to update; pass --admin, --secret, or --rotate-secret");
+        return Err(invalid(
+            "nothing to update; pass --admin, --secret, or --rotate-secret",
+        ));
     }
     if let Some(s) = &secret {
         validate_secret(s)?;
     }
-    let client = pool.get().await?;
     let updated = client
         .execute(
             "UPDATE roles SET admin = COALESCE($2, admin), secret = COALESCE($3, secret)
@@ -276,36 +310,59 @@ async fn update(
         )
         .await?;
     if updated == 0 {
-        anyhow::bail!("no role named {name:?}");
-    }
-    if print_secret && let Some(s) = secret {
-        println!("secret key: {s}");
+        return Err(invalid(format!("no role named {name:?}")));
     }
     Ok(())
 }
 
-async fn list(pool: &Pool) -> anyhow::Result<()> {
-    let client = pool.get().await?;
+/// Deletes a role and all its grants.
+pub async fn delete(client: &Object, name: &str) -> anyhow::Result<()> {
+    if client
+        .execute("DELETE FROM roles WHERE name = $1", &[&name])
+        .await?
+        == 0
+    {
+        return Err(invalid(format!("no role named {name:?}")));
+    }
+    Ok(())
+}
+
+/// A role as listed: never with its secret.
+pub struct RoleInfo {
+    pub name: String,
+    pub admin: bool,
+    /// When it was created, in seconds since the Unix epoch.
+    pub created_at: f64,
+    /// (bucket, permission), sorted.
+    pub grants: Vec<(String, String)>,
+}
+
+/// Every role, by name.
+pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
     let rows = client
         .query(
-            "SELECT r.name, r.admin,
-                    ARRAY(SELECT g.bucket || ':' || g.permission FROM role_grants g
+            "SELECT r.name, r.admin, extract(epoch FROM r.created_at)::float8,
+                    ARRAY(SELECT g.bucket FROM role_grants g
+                          WHERE g.role = r.name ORDER BY g.bucket, g.permission),
+                    ARRAY(SELECT g.permission FROM role_grants g
                           WHERE g.role = r.name ORDER BY g.bucket, g.permission)
              FROM roles r ORDER BY r.name",
             &[],
         )
         .await?;
-    for r in rows {
-        let name: String = r.get(0);
-        let admin: bool = r.get(1);
-        let grants: Vec<String> = r.get(2);
-        let admin = if admin { " (admin)" } else { "" };
-        println!("{name}{admin}");
-        for g in grants {
-            println!("  {g}");
-        }
-    }
-    Ok(())
+    Ok(rows
+        .iter()
+        .map(|r| RoleInfo {
+            name: r.get(0),
+            admin: r.get(1),
+            created_at: r.get(2),
+            grants: r
+                .get::<_, Vec<String>>(3)
+                .into_iter()
+                .zip(r.get::<_, Vec<String>>(4))
+                .collect(),
+        })
+        .collect())
 }
 
 /// Fails with a clear message if `name` isn't a role, so a grant/revoke on a
@@ -316,25 +373,25 @@ async fn require_role(client: &Object, name: &str) -> anyhow::Result<()> {
         .await?
         .is_none()
     {
-        anyhow::bail!("no role named {name:?}");
+        return Err(invalid(format!("no role named {name:?}")));
     }
     Ok(())
 }
 
-async fn grant(
-    pool: &Pool,
+/// Grants permissions on an existing bucket.
+pub async fn grant(
+    client: &Object,
     name: &str,
     bucket: &str,
     permissions: &[Permission],
 ) -> anyhow::Result<()> {
-    let client = pool.get().await?;
-    require_role(&client, name).await?;
+    require_role(client, name).await?;
     if client
         .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
         .await?
         .is_none()
     {
-        anyhow::bail!("no bucket named {bucket:?}; create it first");
+        return Err(invalid(format!("no bucket named {bucket:?}; create it first")));
     }
     for p in permissions {
         let res = client
@@ -348,21 +405,23 @@ async fn grant(
         if let Err(e) = &res
             && e.code() == Some(&SqlState::FOREIGN_KEY_VIOLATION)
         {
-            anyhow::bail!("role {name:?} or bucket {bucket:?} was just deleted");
+            return Err(invalid(format!(
+                "role {name:?} or bucket {bucket:?} was just deleted"
+            )));
         }
         res?;
     }
     Ok(())
 }
 
-async fn revoke(
-    pool: &Pool,
+/// Revokes permissions on a bucket; all of them if `permissions` is empty.
+pub async fn revoke(
+    client: &Object,
     name: &str,
     bucket: &str,
     permissions: &[Permission],
 ) -> anyhow::Result<()> {
-    let client = pool.get().await?;
-    require_role(&client, name).await?;
+    require_role(client, name).await?;
     let permissions: Vec<&str> = if permissions.is_empty() {
         vec!["read", "write", "delete-version"]
     } else {

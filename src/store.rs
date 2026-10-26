@@ -40,6 +40,12 @@ impl Store {
     /// unprivileged process may write). Reported in heartbeats for replica
     /// selection.
     pub fn available_space(&self) -> anyhow::Result<u64> {
+        Ok(self.disk_space()?.1)
+    }
+
+    /// The size of the filesystem backing the data dir, and how much of it is
+    /// available (as in `available_space`), in bytes.
+    pub fn disk_space(&self) -> anyhow::Result<(u64, u64)> {
         let path = CString::new(self.data_dir.as_os_str().as_bytes())?;
         // SAFETY: `path` is a valid NUL-terminated C string and `statvfs` only
         // writes into the zeroed-out `stat`.
@@ -47,7 +53,11 @@ impl Store {
         if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
             return Err(std::io::Error::last_os_error().into());
         }
-        Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+        let block = stat.f_frsize as u64;
+        Ok((
+            (stat.f_blocks as u64).saturating_mul(block),
+            (stat.f_bavail as u64).saturating_mul(block),
+        ))
     }
 
     /// The two-level shard directory of a blob, named after four random hex

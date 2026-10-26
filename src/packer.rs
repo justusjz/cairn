@@ -138,6 +138,13 @@ pub struct JobReport {
     outputs: Vec<Uuid>,
 }
 
+impl JobReport {
+    /// How many blobs the job packed, and how many parts and bytes it moved.
+    pub fn counts(&self) -> (usize, usize, u64) {
+        (self.sources, self.parts, self.bytes)
+    }
+}
+
 impl std::fmt::Display for JobReport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let kind = match self.kind {
@@ -179,7 +186,11 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
         };
         match run_job(app, kind, &sources).await {
             Ok(report) => reports.push(report),
-            Err(e) => eprintln!("packer: packing {} blobs failed: {e:#}", sources.len()),
+            Err(e) => {
+                let message = format!("packing {} blobs failed: {e:#}", sources.len());
+                eprintln!("packer: {message}");
+                app.metrics.pack_failed(message);
+            }
         }
     }
     Ok(reports)

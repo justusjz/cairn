@@ -42,6 +42,18 @@ pub async fn handle(
                 .unwrap(),
         ));
     }
+    if path == "/stats" {
+        // This node's own metrics, for the admin UI of whichever node it's
+        // open on.
+        let body = crate::admin::node_stats(&app).to_string();
+        return Ok(box_response(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "application/json")
+                .body(Full::new(Bytes::from(body)))
+                .unwrap(),
+        ));
+    }
     if let Some(blob_id) = path.strip_prefix("/blobs/") {
         // Parse the id up front: `blob_id` borrows `req` (via `path`), and
         // collecting the body below consumes `req`, so the borrow must end here.

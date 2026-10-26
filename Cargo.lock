@@ -134,6 +134,7 @@ dependencies = [
  "md-5",
  "percent-encoding",
  "roxmltree",
+ "serde_json",
  "sha2",
  "tokio",
  "tokio-postgres",
