@@ -30,7 +30,7 @@ pub async fn handle(
         // For tests: run a maintenance pass now (as the background one would,
         // but sweeping everything), and report what it did once it's done (a
         // failed packing job is only logged).
-        let mut report = format!("gc: {}\n", gc::pass(&app, gc::Scope::everything()).await?);
+        let mut report = format!("gc: {}\n", gc::pass(&app, gc::Scope::everything()).await);
         for job in packer::pass(&app).await? {
             report.push_str(&format!("packer: {job}\n"));
         }

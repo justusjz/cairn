@@ -232,9 +232,10 @@ minute, which keeps blobs large without wasting much space:
 
 - **Smaller objects are packed together.** Blobs up to 64 MiB are packed into
   blobs of 256 MiB, once there are enough of them to fill one. Packing writes
-  the data a second time, but only once: the packed blobs are too large to be
-  packed again. Lots of tiny objects are packed even
-  before they fill a blob, once 10,000 of them are waiting.
+  the data a second time, but normally only once: the packed blobs are too
+  large to be packed again. Lots of tiny objects are packed even before they
+  fill a blob, once 10,000 of them are waiting; such a blob may be packed again
+  later.
 - **Packed blobs are compacted.** Deleting an object that lives in a packed blob
   frees no disk space by itself. Once at least a quarter of a packed blob is
   garbage, its remaining data is rewritten, together with that

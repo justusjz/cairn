@@ -17,7 +17,7 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use deadpool_postgres::GenericClient;
 
-use crate::blobs::{ReapTarget, blob_ids, drop_unreferenced_blobs};
+use crate::blobs::{ReapTarget, deleted_parts, drop_blobs_of_deleted_parts};
 
 /// A bucket's versioning state. A bucket starts out unversioned; once enabled,
 /// it only moves between enabled and suspended.
@@ -236,14 +236,14 @@ async fn remove_version<C: GenericClient>(
 ) -> Result<(), tokio_postgres::Error> {
     let parts = client
         .query(
-            "DELETE FROM parts WHERE object_id = $1 RETURNING blob_id",
+            "DELETE FROM parts WHERE object_id = $1 RETURNING blob_id, size",
             &[&id],
         )
         .await?;
     client
         .execute("DELETE FROM objects WHERE id = $1", &[&id])
         .await?;
-    reap.extend(drop_unreferenced_blobs(client, &blob_ids(&parts)).await?);
+    reap.extend(drop_blobs_of_deleted_parts(client, &deleted_parts(&parts)).await?);
     Ok(())
 }
 

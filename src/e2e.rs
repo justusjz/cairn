@@ -21,7 +21,7 @@ use crate::{
     writing::WritingSet,
 };
 
-mod uploads;
+mod concurrency;
 
 /// The bucket every test node has.
 pub const BUCKET: &str = "bucket";

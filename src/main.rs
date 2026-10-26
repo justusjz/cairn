@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use crate::auth::{ContentSha256, StreamingChunkVerifier, TrailerChecksum};
 use crate::aws_chunked::AwsChunkedDecoder;
-use crate::blobs::{Location, ReapTarget, blob_ids, drop_unreferenced_blobs, reap_blobs};
+use crate::blobs::{Location, ReapTarget, deleted_parts, drop_blobs_of_deleted_parts, reap_blobs};
 use crate::body::{FrameSender, channel_body};
 use crate::checksum::BlobSummer;
 use crate::s3::{conditional::Preconditions, versions::Versioning};
@@ -147,18 +147,25 @@ async fn maintain(app: Arc<App>) {
     let mut sweep = gc::Sweep::new();
     loop {
         tokio::time::sleep(MAINTENANCE_INTERVAL).await;
-        match gc::pass(&app, sweep.next_scope()).await {
-            Ok(report) if !report.is_empty() => eprintln!("gc: {report}"),
-            Ok(_) => {}
-            Err(e) => eprintln!("gc: pass failed: {e:#}"),
-        }
-        match packer::pass(&app).await {
-            Ok(jobs) => {
-                for job in jobs {
-                    eprintln!("packer: {job}");
-                }
+        let (app, scope) = (app.clone(), sweep.next_scope());
+        // A task of its own, so that a panic (a bug) fails this pass, rather
+        // than ending maintenance on this node.
+        let pass = tokio::spawn(async move {
+            let report = gc::pass(&app, scope).await;
+            if !report.is_empty() {
+                eprintln!("gc: {report}");
             }
-            Err(e) => eprintln!("packer: pass failed: {e:#}"),
+            match packer::pass(&app).await {
+                Ok(jobs) => {
+                    for job in jobs {
+                        eprintln!("packer: {job}");
+                    }
+                }
+                Err(e) => eprintln!("packer: pass failed: {e:#}"),
+            }
+        });
+        if let Err(e) = pass.await {
+            eprintln!("maintenance pass failed: {e}");
         }
     }
 }
@@ -815,11 +822,11 @@ async fn try_commit_part(
             let displaced = tx
                 .query(
                     "DELETE FROM parts WHERE upload_id = $1 AND part_number = $2
-                     RETURNING blob_id",
+                     RETURNING blob_id, size",
                     &[upload_id, part_number],
                 )
                 .await?;
-            reap = drop_unreferenced_blobs(&tx, &blob_ids(&displaced)).await?;
+            reap = drop_blobs_of_deleted_parts(&tx, &deleted_parts(&displaced)).await?;
             tx.execute(
                 INSERT_PART,
                 &[&blob_id, &size, &etag, &crc, &None::<i64>, &Some(*upload_id), part_number],

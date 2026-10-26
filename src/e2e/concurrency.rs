@@ -1,4 +1,4 @@
-//! End-to-end tests of concurrent writes.
+//! End-to-end tests of concurrent writes and deletes.
 
 use std::sync::Arc;
 
@@ -6,10 +6,15 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use tokio::task::JoinSet;
 
-use super::{BUCKET, get, node_with};
+use tokio_postgres::IsolationLevel;
+
+use super::{BUCKET, get, node_with, put, query_i64};
 use crate::{
     App, AttachTarget, UploadResult, auth::ContentSha256, packer,
-    s3::conditional::Preconditions,
+    s3::{
+        conditional::Preconditions,
+        versions::{Versioning, delete_key},
+    },
 };
 
 /// Uploads `data` to `key`, returning the error a client would get.
@@ -69,4 +74,42 @@ async fn concurrent_uploads_to_one_key_all_succeed() {
     put_concurrently(&app, 30, |_| "same".to_owned(), |i| vec![i as u8; 100]).await;
     let read = get(&app, "same").await.unwrap();
     assert!((0..30).any(|i| read == vec![i as u8; 100]));
+}
+
+/// Deletes of different objects packed into the same blob don't conflict,
+/// though both transactions look at that blob's parts.
+#[tokio::test]
+async fn deletes_in_one_packed_blob_dont_conflict() {
+    let pack = packer::Config {
+        target_size: 100_000,
+        small_size: 25_000,
+        ..packer::Config::default()
+    };
+    let Some(app) = node_with(pack, None).await else { return };
+    for i in 0..100 {
+        put(&app, &format!("o{i}"), vec![i as u8; 1200]).await;
+    }
+    assert_eq!(packer::pass(&app).await.unwrap().len(), 1);
+    let blobs = "SELECT count(DISTINCT blob_id) FROM parts";
+    assert!(query_i64(&app, blobs).await <= 2);
+
+    // Each deletes one of the first two objects the packer moved, in the same
+    // blob, while the other's transaction is open.
+    let mut first = app.pool.get().await.unwrap();
+    let mut second = app.pool.get().await.unwrap();
+    let serializable = IsolationLevel::Serializable;
+    let t1 = first.build_transaction().isolation_level(serializable).start().await.unwrap();
+    let t2 = second.build_transaction().isolation_level(serializable).start().await.unwrap();
+    let mut reap = Vec::new();
+    delete_key(&t1, BUCKET, "o0", Versioning::Unversioned, None, &mut reap)
+        .await
+        .unwrap();
+    delete_key(&t2, BUCKET, "o1", Versioning::Unversioned, None, &mut reap)
+        .await
+        .unwrap();
+    t1.commit().await.unwrap();
+    t2.commit().await.unwrap();
+    assert!(reap.is_empty(), "the packed blob still holds other objects");
+    assert_eq!(get(&app, "o0").await, None);
+    assert_eq!(get(&app, "o2").await, Some(vec![2; 1200]));
 }

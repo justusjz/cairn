@@ -42,9 +42,55 @@ pub(crate) fn reap_targets(rows: &[tokio_postgres::Row]) -> Vec<ReapTarget> {
         .collect()
 }
 
-/// The `blob_id`s of `DELETE FROM parts … RETURNING blob_id` rows.
-pub(crate) fn blob_ids(rows: &[tokio_postgres::Row]) -> Vec<Uuid> {
-    rows.iter().map(|r| r.get(0)).collect()
+/// The blob and size of each part deleted by a `DELETE FROM parts …
+/// RETURNING blob_id, size`.
+pub(crate) fn deleted_parts(rows: &[tokio_postgres::Row]) -> Vec<(Uuid, i64)> {
+    rows.iter().map(|r| (r.get(0), r.get(1))).collect()
+}
+
+/// Deletes the blobs that `deleted` parts (the blob and size of each, just
+/// deleted in the same transaction) held on their own, unless something else
+/// still references them, cascading their locations away. Returns those
+/// locations, for the caller to reap after commit.
+///
+/// Only a blob the size of the deleted part can have held nothing else, so
+/// that's the only kind this checks for other parts. Checking a packed blob
+/// would read its other parts, and in a serializable transaction, that makes
+/// concurrent deletes of different parts in the blob conflict. A packed blob
+/// whose last part is deleted is dropped by compaction instead, which takes it
+/// once all of it is garbage.
+pub(crate) async fn drop_blobs_of_deleted_parts<C: GenericClient>(
+    client: &C,
+    deleted: &[(Uuid, i64)],
+) -> Result<Vec<ReapTarget>, tokio_postgres::Error> {
+    if deleted.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (blob_ids, sizes): (Vec<Uuid>, Vec<i64>) = deleted.iter().copied().unzip();
+    // Materialized, so that the size filter comes first, and the check for
+    // other parts only ever reads the blobs that pass it.
+    let rows = client
+        .query(
+            "WITH whole AS MATERIALIZED (
+                 SELECT b.blob_id
+                 FROM blobs b
+                 JOIN unnest($1::uuid[], $2::bigint[]) AS d(blob_id, size)
+                     ON d.blob_id = b.blob_id AND d.size = b.size
+             ),
+             gone AS (
+                 DELETE FROM blobs b USING whole
+                 WHERE b.blob_id = whole.blob_id
+                   AND NOT EXISTS (SELECT 1 FROM parts p WHERE p.blob_id = b.blob_id)
+                 RETURNING b.blob_id
+             )
+             SELECT bl.blob_id, bl.node, n.peer_url
+             FROM gone
+             JOIN blob_locations bl ON bl.blob_id = gone.blob_id
+             JOIN nodes n ON n.id = bl.node",
+            &[&blob_ids, &sizes],
+        )
+        .await?;
+    Ok(reap_targets(&rows))
 }
 
 /// Deletes those of `blob_ids` that no part references anymore (typically the

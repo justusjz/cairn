@@ -272,6 +272,68 @@ async fn source_vanished_mid_job_is_padded() {
     assert_objects(&app, 100, &[42]).await;
 }
 
+/// A source blob that no replica holds (its locations are gone) fails its
+/// job, without taking the rest of the pass down with it.
+#[tokio::test]
+async fn source_without_replicas_fails_its_job() {
+    let Some(app) = node(None).await else { return };
+    put_many(&app, 100).await;
+    let lost = blob_of(&app, &key(5)).await;
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute("DELETE FROM blob_locations WHERE blob_id = $1", &[&lost])
+        .await
+        .unwrap();
+    assert!(pass(&app).await.unwrap().is_empty());
+    // Nothing moved, and the job's new blobs are gone again.
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 100);
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs WHERE state = 'pending'").await, 0);
+    assert_eq!(get(&app, &key(6)).await, Some(data(6)));
+}
+
+/// A blob whose parts share bytes is left alone, and stays leased, so that
+/// passes don't keep claiming it.
+#[tokio::test]
+async fn blob_with_overlapping_parts_stays_leased() {
+    let Some(app) = node(None).await else { return };
+    put_many(&app, 100).await;
+    let shared = blob_of(&app, &key(0)).await;
+    // A second object with a part on the same bytes, as a copy would make.
+    let client = app.pool.get().await.unwrap();
+    client
+        .execute(
+            "WITH copy AS (
+                 INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
+                                      size, etag, content_type, last_modified)
+                 SELECT bucket, 'copy', version_id, true, false, size, etag, content_type, NOW()
+                 FROM objects WHERE bucket = $1 AND key = $2
+                 RETURNING id
+             )
+             INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id,
+                                part_number, created_at)
+             SELECT p.blob_id, p.blob_offset, p.size, p.etag, p.crc64nvme, copy.id, 1, p.created_at
+             FROM parts p, copy WHERE p.blob_id = $3",
+            &[&BUCKET, &key(0), &shared],
+        )
+        .await
+        .unwrap();
+    let reports = pass(&app).await.unwrap();
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].parts, 99);
+    assert_eq!(blob_of(&app, &key(0)).await, shared);
+    let leased = client
+        .query_one(
+            "SELECT pack_lease_until > NOW() FROM blobs WHERE blob_id = $1",
+            &[&shared],
+        )
+        .await
+        .unwrap();
+    assert!(leased.get::<_, bool>(0));
+    assert_eq!(get(&app, "copy").await, Some(data(0)));
+}
+
 /// A part whose bytes don't match its checksum after the copy stops the job:
 /// nothing moves, the new blob is deleted, and the sources stay leased.
 #[tokio::test]
@@ -396,7 +458,7 @@ async fn crash_mid_job_is_recoverable() {
         )
         .await
         .unwrap();
-    gc::pass(&app, gc::Scope::everything()).await.unwrap();
+    assert!(gc::pass(&app, gc::Scope::everything()).await.errors().is_empty());
     assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 100);
     assert_files(&app, 100).await;
 

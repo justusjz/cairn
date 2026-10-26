@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     App,
-    blobs::{blob_ids, drop_unreferenced_blobs, reap_blobs},
+    blobs::{deleted_parts, drop_blobs_of_deleted_parts, reap_blobs},
     s3::util::format_s3_error,
 };
 
@@ -39,7 +39,7 @@ pub async fn abort_multipart_upload(
             "DELETE FROM parts p USING multipart_uploads u
              WHERE p.upload_id = u.upload_id
                AND u.upload_id = $1 AND u.bucket = $2 AND u.key = $3
-             RETURNING p.blob_id",
+             RETURNING p.blob_id, p.size",
             &[&upload_id, &bucket, &key],
         )
         .await?;
@@ -49,7 +49,7 @@ pub async fn abort_multipart_upload(
             &[&upload_id, &bucket, &key],
         )
         .await?;
-    let reap = drop_unreferenced_blobs(&tx, &blob_ids(&staged)).await?;
+    let reap = drop_blobs_of_deleted_parts(&tx, &deleted_parts(&staged)).await?;
     tx.commit().await?;
     reap_blobs(app, reap);
     if affected == 0 {

@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     App,
-    blobs::{ReapTarget, blob_ids, drop_unreferenced_blobs, reap_blobs},
+    blobs::{ReapTarget, deleted_parts, drop_blobs_of_deleted_parts, reap_blobs},
     db,
     s3::conditional::Preconditions,
     s3::util::{format_s3_error, slow_down, with_version_id, xml_escape, xml_ok},
@@ -265,11 +265,11 @@ async fn try_complete(
     // upload itself.
     let unused = tx
         .query(
-            "DELETE FROM parts WHERE upload_id = $1 RETURNING blob_id",
+            "DELETE FROM parts WHERE upload_id = $1 RETURNING blob_id, size",
             &[upload_id],
         )
         .await?;
-    reap.extend(drop_unreferenced_blobs(&tx, &blob_ids(&unused)).await?);
+    reap.extend(drop_blobs_of_deleted_parts(&tx, &deleted_parts(&unused)).await?);
     tx.execute(
         "DELETE FROM multipart_uploads WHERE upload_id = $1",
         &[upload_id],

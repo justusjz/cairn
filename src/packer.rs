@@ -12,11 +12,12 @@
 //!
 //! - **Consolidation** packs blobs up to [`SMALL_SIZE`] together, once
 //!   there's enough of them to fill a blob. Packing costs a second write of the
-//!   data, so each byte is consolidated only once: the new blobs hold at least
+//!   data, so it's normally done once per byte: the new blobs hold at least
 //!   half a blob's worth, more than twice the size of a candidate. Only when as
 //!   many candidates wait as a job may take ([`Config::max_sources`]) are they
 //!   packed without filling a blob, so that lots of tiny files are packed long
-//!   before they add up to one.
+//!   before they add up to one. Such a blob can be small enough to be packed
+//!   again, together with others, once there are enough to fill one.
 //! - **Compaction** rewrites blobs once a large enough fraction of them is
 //!   garbage (a quarter, by default), to free that space. Bytes become garbage
 //!   when their part is deleted; `blobs.dead_size` counts them. A job takes
@@ -319,9 +320,16 @@ async fn pack(
     drop(client);
     // Parts must not overlap: each is copied on its own, and gets its own range
     // in the new blob. Parts never share bytes yet; should a blob hold any that
-    // do, it's left alone.
+    // do, it's left alone, and keeps its lease, so that passes don't keep
+    // claiming it. (Metadata-only copies will share ranges, and need a design
+    // for this, and for counting garbage in shared ranges.)
     let overlapping = overlapping_blobs(&parts);
     parts.retain(|p| !overlapping.contains(&p.blob_id));
+    let sources: Vec<Uuid> = sources
+        .iter()
+        .copied()
+        .filter(|s| !overlapping.contains(s))
+        .collect();
     let report = |parts: &[Part], written: &[Written]| JobReport {
         kind,
         sources: sources.len(),
@@ -330,9 +338,8 @@ async fn pack(
         outputs: written.iter().map(|w| w.blob_id).collect(),
     };
     if parts.is_empty() {
-        // Nothing left to move: the sources are garbage already (or all hold
-        // overlapping parts, which then just get their lease released).
-        commit(app, sources, &[], &[]).await?;
+        // Nothing left to move: the sources are garbage already.
+        commit(app, &sources, &[], &[]).await?;
         return Ok(report(&parts, &[]));
     }
     let runs = lay_out(&mut parts, app.pack.target_size);
@@ -347,8 +354,11 @@ async fn pack(
         let mut writer = BlobWriter::begin(app).await?;
         outputs.push(writer.blob_id);
         for run in output {
-            let (layout, locations) = &blobs[&run.blob_id];
-            match copy_run(app, run, *layout, locations, &mut writer).await {
+            // A source missing here was deleted after its parts were loaded,
+            // or has no replica left. Either way, reading it fails, and
+            // `copy_run` tells which.
+            let (layout, locations) = blobs.get(&run.blob_id).cloned().unwrap_or_default();
+            match copy_run(app, run, layout, &locations, &mut writer).await {
                 Ok(true) => {}
                 Ok(false) => vanished.push(run.parts.clone()),
                 Err(e) => {
@@ -370,7 +380,7 @@ async fn pack(
         verify(app, output, &parts[start..end]).await?;
     }
     reached(app, Stage::Verified).await;
-    commit(app, sources, &written, &parts).await?;
+    commit(app, &sources, &written, &parts).await?;
     Ok(report(&parts, &written))
 }
 
