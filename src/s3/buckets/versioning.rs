@@ -1,17 +1,15 @@
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use tokio_postgres::{IsolationLevel, error::SqlState};
+use tokio_postgres::IsolationLevel;
 
 use crate::{
     App,
     auth::BodyChecksum,
-    s3::util::{format_s3_error, xml_ok},
+    db,
+    s3::util::{format_s3_error, slow_down, xml_ok},
     s3::versions::{Versioning, bucket_versioning},
 };
-
-/// Bounded retry for the serializable update, mirroring the other write paths.
-const MAX_UPDATE_ATTEMPTS: usize = 10;
 
 /// GetBucketVersioning: `GET /{bucket}?versioning`. A bucket that has never been
 /// versioned reports an empty configuration, as in S3; otherwise its status.
@@ -138,19 +136,16 @@ pub async fn put_bucket_versioning(
             None => no_such_bucket(),
         });
     };
-    for _ in 0..MAX_UPDATE_ATTEMPTS {
+    for attempt in 0..db::MAX_TX_ATTEMPTS {
+        db::backoff(attempt).await;
         match try_update(&mut client, bucket, versioning).await {
             Ok(true) => return Ok(ok()),
             Ok(false) => return Ok(no_such_bucket()),
-            Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
+            Err(e) if db::is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(format_s3_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "ServiceUnavailable",
-        "update aborted after serialization retries",
-    ))
+    Ok(slow_down())
 }
 
 fn ok() -> Response<Full<Bytes>> {

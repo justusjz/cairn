@@ -374,7 +374,9 @@ pub async fn handle(
 /// down (retrying later can succeed), 500 otherwise. The details are logged, not
 /// sent, as they can name internal hosts.
 pub fn error_response(e: &anyhow::Error) -> Response<ResBody> {
-    let resp = if e.downcast_ref::<crate::Unavailable>().is_some() {
+    let resp = if e.downcast_ref::<crate::Contended>().is_some() {
+        util::slow_down()
+    } else if e.downcast_ref::<crate::Unavailable>().is_some() {
         format_s3_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "ServiceUnavailable",

@@ -48,11 +48,12 @@ use deadpool_postgres::Object;
 use hyper::body::Bytes;
 use md5::{Digest, Md5};
 use tokio::sync::mpsc;
-use tokio_postgres::{IsolationLevel, error::SqlState};
+use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use crate::{
     App, BlobWriter, Written,
+    db,
     blobs::{BlobSlice, Location, ReapTarget, drop_unreferenced_blobs, reap_blobs, stream_blob_range},
     checksum::{self, BlockLayout},
 };
@@ -67,7 +68,6 @@ const LEASE: Duration = Duration::from_secs(3600);
 /// The most jobs a pass runs, so that a pass ends even under a steady stream of
 /// new small blobs.
 const MAX_JOBS_PER_PASS: usize = 64;
-const MAX_COMMIT_ATTEMPTS: usize = 10;
 
 /// What to pack, and into what. Fixed, so that the rest of Cairn can be tuned
 /// for it; tests use smaller sizes. The sizes must keep a consolidation's new
@@ -727,22 +727,21 @@ async fn commit(
     parts: &[Part],
 ) -> anyhow::Result<()> {
     let mut client = app.pool.get().await?;
-    for _ in 0..MAX_COMMIT_ATTEMPTS {
+    for attempt in 0..db::MAX_TX_ATTEMPTS {
+        db::backoff(attempt).await;
         match try_commit(&mut client, sources, written, parts).await {
             Ok(reap) => {
                 reap_blobs(app, reap);
                 return Ok(());
             }
-            Err(CommitError::Db(e)) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => {
-                continue;
-            }
+            Err(CommitError::Db(e)) if db::is_conflict(&e) => continue,
             Err(CommitError::Db(e)) => return Err(e.into()),
             Err(CommitError::MissingLocations(present)) => {
                 anyhow::bail!("only {present} replicas of a new blob reported a location");
             }
         }
     }
-    anyhow::bail!("commit aborted after {MAX_COMMIT_ATTEMPTS} serialization retries")
+    anyhow::bail!("commit kept conflicting with concurrent ones")
 }
 
 enum CommitError {

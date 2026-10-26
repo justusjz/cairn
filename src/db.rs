@@ -33,6 +33,42 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
     }
 }
 
+/// How often a serializable transaction is attempted while it keeps failing
+/// with serialization conflicts. With the pauses of [`backoff`], that's up to
+/// about a second and a half of retrying.
+pub const MAX_TX_ATTEMPTS: usize = 20;
+
+/// Whether `e` is a conflict with a concurrent transaction, which the
+/// transaction may not hit again if it's retried. That's a serialization
+/// failure, or a unique violation: two writes that both find a key free (say,
+/// the first two uploads to it) both insert it, and Postgres may report the
+/// second one's failure as either. The transactions that retry on conflicts
+/// only insert unique keys after checking that they're free, so a unique
+/// violation can only come from such a race.
+pub fn is_conflict(e: &tokio_postgres::Error) -> bool {
+    use tokio_postgres::error::SqlState;
+    matches!(
+        e.code(),
+        Some(&SqlState::T_R_SERIALIZATION_FAILURE | &SqlState::UNIQUE_VIOLATION)
+    )
+}
+
+/// Waits before attempt `attempt` (counting from 0) of a transaction that hit
+/// a serialization conflict. The first attempt goes ahead right away. After
+/// that, the pause grows exponentially, from up to 1 ms to up to 100 ms, and is
+/// random within that, so that transactions that collided don't retry in step
+/// and collide again.
+pub async fn backoff(attempt: usize) {
+    if attempt == 0 {
+        return;
+    }
+    let max = Duration::from_millis(1 << (attempt - 1).min(7)).min(Duration::from_millis(100));
+    let mut random = [0u8; 8];
+    getrandom::fill(&mut random).expect("the OS random number generator failed");
+    let fraction = u64::from_le_bytes(random) as f64 / u64::MAX as f64;
+    tokio::time::sleep(max.mul_f64(fraction)).await;
+}
+
 /// Arbitrary key for the advisory lock that serializes migrations, so nodes
 /// starting at the same time don't race to apply the same step.
 const MIGRATION_LOCK: i64 = 0x6361_6972_6e00; // "cairn\0"

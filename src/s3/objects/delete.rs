@@ -3,18 +3,18 @@ use std::sync::Arc;
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use tokio_postgres::{IsolationLevel, error::SqlState};
+use tokio_postgres::IsolationLevel;
 
 use crate::{
     App,
     auth::BodyChecksum,
     blobs::{ReapTarget, reap_blobs},
-    s3::util::{format_s3_error, with_delete_marker, with_version_id, xml_escape, xml_ok},
+    db,
+    s3::util::{
+        format_s3_error, slow_down, with_delete_marker, with_version_id, xml_escape, xml_ok,
+    },
     s3::versions::{Deleted, bucket_versioning, delete_key},
 };
-
-/// Bounded retry for the serializable delete, mirroring the commit paths.
-const MAX_DELETE_ATTEMPTS: usize = 10;
 
 /// What a delete addresses: a key, and optionally one specific version of it.
 struct Target {
@@ -26,7 +26,8 @@ enum DeleteStatus {
     /// One outcome per target, in order.
     Deleted(Vec<Deleted>),
     NoSuchBucket,
-    Unavailable,
+    /// It kept conflicting with concurrent requests.
+    Contended,
 }
 
 /// One serializable attempt: read the bucket's versioning state (which doubles
@@ -68,17 +69,18 @@ async fn delete_targets(
     targets: &[Target],
 ) -> anyhow::Result<DeleteStatus> {
     let mut client = app.pool.get().await?;
-    for _ in 0..MAX_DELETE_ATTEMPTS {
+    for attempt in 0..db::MAX_TX_ATTEMPTS {
+        db::backoff(attempt).await;
         match try_delete(&mut client, bucket, targets).await {
             Ok((status, reap)) => {
                 reap_blobs(app, reap);
                 return Ok(status);
             }
-            Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
+            Err(e) if db::is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(DeleteStatus::Unavailable)
+    Ok(DeleteStatus::Contended)
 }
 
 /// DeleteObject: `DELETE /{bucket}/{key}`, optionally `?versionId=V` to remove one
@@ -115,11 +117,7 @@ pub async fn delete_object(
             "NoSuchBucket",
             "the specified bucket does not exist",
         )),
-        DeleteStatus::Unavailable => Ok(format_s3_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ServiceUnavailable",
-            "delete aborted after serialization retries",
-        )),
+        DeleteStatus::Contended => Ok(slow_down()),
     }
 }
 
@@ -227,13 +225,7 @@ pub async fn delete_objects(
                 "the specified bucket does not exist",
             ));
         }
-        DeleteStatus::Unavailable => {
-            return Ok(format_s3_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ServiceUnavailable",
-                "delete aborted after serialization retries",
-            ));
-        }
+        DeleteStatus::Contended => return Ok(slow_down()),
     };
 
     let mut out = String::from(

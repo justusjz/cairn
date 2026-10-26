@@ -4,18 +4,17 @@ use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 use md5::{Digest, Md5};
-use tokio_postgres::{IsolationLevel, error::SqlState};
+use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use crate::{
     App,
     blobs::{ReapTarget, blob_ids, drop_unreferenced_blobs, reap_blobs},
+    db,
     s3::conditional::Preconditions,
-    s3::util::{format_s3_error, with_version_id, xml_escape, xml_ok},
+    s3::util::{format_s3_error, slow_down, with_version_id, xml_escape, xml_ok},
     s3::versions::{Versioning, bucket_versioning, current_etag, put_version},
 };
-
-const MAX_COMPLETE_ATTEMPTS: usize = 10;
 
 enum CompleteOutcome {
     Done {
@@ -113,7 +112,8 @@ pub async fn complete_multipart_upload(
     }
 
     let mut client = app.pool.get().await?;
-    for _ in 0..MAX_COMPLETE_ATTEMPTS {
+    for attempt in 0..db::MAX_TX_ATTEMPTS {
+        db::backoff(attempt).await;
         match try_complete(&mut client, bucket, key, &upload_id, &requested, preconditions).await {
             Ok(CompleteOutcome::Done {
                 bucket,
@@ -155,15 +155,11 @@ pub async fn complete_multipart_upload(
                     "at least one of the preconditions you specified did not hold",
                 ));
             }
-            Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
+            Err(e) if db::is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
         }
     }
-    Ok(format_s3_error(
-        StatusCode::SERVICE_UNAVAILABLE,
-        "ServiceUnavailable",
-        "completion aborted after serialization retries",
-    ))
+    Ok(slow_down())
 }
 
 /// One attempt at the completion transaction, serializable like the part commit

@@ -19,12 +19,13 @@
 use std::{collections::HashSet, ops::Range, sync::Arc, time::Duration};
 
 use deadpool_postgres::Object;
-use tokio_postgres::{IsolationLevel, error::SqlState, types::ToSql};
+use tokio_postgres::{IsolationLevel, types::ToSql};
 use uuid::Uuid;
 
 use crate::{
     App,
     blobs::{ReapTarget, reap_blobs},
+    db,
     store::SHARDS,
 };
 
@@ -35,7 +36,6 @@ const PENDING_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
 const SHARDS_PER_PASS: u32 = SHARDS.div_ceil(24 * 60);
 /// How often the catalog is checked for unreferenced blobs.
 const UNREFERENCED_INTERVAL: Duration = Duration::from_secs(24 * 3600);
-const MAX_ATTEMPTS: usize = 5;
 
 /// What a pass covers.
 pub struct Scope {
@@ -182,6 +182,7 @@ async fn delete_blobs(
     );
     let mut attempt = 0;
     loop {
+        db::backoff(attempt).await;
         attempt += 1;
         let result: Result<_, tokio_postgres::Error> = async {
             let tx = client
@@ -195,12 +196,7 @@ async fn delete_blobs(
         }
         .await;
         let rows = match result {
-            Err(e)
-                if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE)
-                    && attempt < MAX_ATTEMPTS =>
-            {
-                continue;
-            }
+            Err(e) if db::is_conflict(&e) && attempt < db::MAX_TX_ATTEMPTS => continue,
             result => result?,
         };
         let deleted: HashSet<Uuid> = rows.iter().map(|r| r.get(0)).collect();

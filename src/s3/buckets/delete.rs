@@ -1,18 +1,19 @@
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use tokio_postgres::{IsolationLevel, error::SqlState};
+use tokio_postgres::IsolationLevel;
 
-use crate::{App, s3::util::format_s3_error};
-
-/// Bounded retry for the serializable delete, mirroring the object-delete path.
-const MAX_DELETE_ATTEMPTS: usize = 10;
+use crate::{
+    App, db,
+    s3::util::{format_s3_error, slow_down},
+};
 
 enum DeleteStatus {
     Deleted,
     NoSuchBucket,
     NotEmpty,
-    Unavailable,
+    /// It kept conflicting with concurrent requests.
+    Contended,
 }
 
 /// One serializable attempt: confirm the bucket exists and is empty (no live
@@ -60,14 +61,15 @@ async fn try_delete(
 
 pub async fn delete_bucket(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
     let mut client = app.pool.get().await?;
-    let mut status = DeleteStatus::Unavailable;
-    for _ in 0..MAX_DELETE_ATTEMPTS {
+    let mut status = DeleteStatus::Contended;
+    for attempt in 0..db::MAX_TX_ATTEMPTS {
+        db::backoff(attempt).await;
         match try_delete(&mut client, bucket).await {
             Ok(s) => {
                 status = s;
                 break;
             }
-            Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
+            Err(e) if db::is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
         }
     }
@@ -86,10 +88,6 @@ pub async fn delete_bucket(app: &App, bucket: &str) -> anyhow::Result<Response<F
             "BucketNotEmpty",
             "the bucket you tried to delete is not empty",
         )),
-        DeleteStatus::Unavailable => Ok(format_s3_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ServiceUnavailable",
-            "delete aborted after serialization retries",
-        )),
+        DeleteStatus::Contended => Ok(slow_down()),
     }
 }

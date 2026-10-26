@@ -21,6 +21,8 @@ use crate::{
     writing::WritingSet,
 };
 
+mod uploads;
+
 /// The bucket every test node has.
 pub const BUCKET: &str = "bucket";
 

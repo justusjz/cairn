@@ -125,6 +125,16 @@ pub fn format_s3_error(status: StatusCode, code: &str, message: &str) -> Respons
         .unwrap()
 }
 
+/// S3's 503 for a request that kept conflicting with concurrent ones and gave
+/// up. S3 clients back off and retry it.
+pub fn slow_down() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SlowDown",
+        "too many concurrent requests on the same data; please retry",
+    )
+}
+
 pub fn decode_path_param(param: &str) -> String {
     percent_decode_str(param).decode_utf8_lossy().into_owned()
 }

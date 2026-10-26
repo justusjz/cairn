@@ -11,7 +11,7 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor, rt::TokioIo};
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
-use tokio_postgres::{IsolationLevel, error::SqlState};
+use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use crate::auth::{ContentSha256, StreamingChunkVerifier, TrailerChecksum};
@@ -206,6 +206,20 @@ impl std::fmt::Display for Unavailable {
 }
 
 impl std::error::Error for Unavailable {}
+
+/// A transaction that kept failing with serialization conflicts against
+/// concurrent ones, and gave up. Answered with 503 SlowDown, so the client
+/// backs off and retries.
+#[derive(Debug)]
+pub struct Contended(pub String);
+
+impl std::fmt::Display for Contended {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Contended {}
 
 #[derive(Clone, Copy)]
 enum ServeKind {
@@ -663,11 +677,13 @@ where
     }
     let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
     // 5. commit + attach with the now-known size and ETag, under a serializable
-    // transaction; retry on a serialization conflict (e.g. a concurrent GC).
+    // transaction; retry on a serialization conflict (e.g. a concurrent upload
+    // to a neighbouring key).
     let mut client = app.pool.get().await?;
     let mut committed = None;
     let mut precondition_failed = false;
-    for _ in 0..MAX_COMMIT_ATTEMPTS {
+    for attempt in 0..db::MAX_TX_ATTEMPTS {
+        db::backoff(attempt).await;
         match try_commit_part(&mut client, &written, attach, &etag).await {
             Ok(CommitResult::Committed { reap, version_id }) => {
                 // Reap the blobs this overwrite displaced; their rows are gone.
@@ -685,7 +701,7 @@ where
                 ))
                 .into());
             }
-            Err(e) if e.code() == Some(&SqlState::T_R_SERIALIZATION_FAILURE) => continue,
+            Err(e) if db::is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
         }
     }
@@ -695,14 +711,13 @@ where
         return Ok(UploadResult::PreconditionFailed);
     }
     let Some(version_id) = committed else {
-        anyhow::bail!(
-            "blob {blob_id}: commit aborted after {MAX_COMMIT_ATTEMPTS} serialization retries"
-        );
+        return Err(Contended(format!(
+            "blob {blob_id}: commit kept conflicting with concurrent ones"
+        ))
+        .into());
     };
     Ok(UploadResult::Committed { etag, version_id })
 }
-
-const MAX_COMMIT_ATTEMPTS: usize = 10;
 
 enum CommitResult {
     /// Committed; carries the replica locations of any blobs this displaced
