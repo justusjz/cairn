@@ -46,6 +46,7 @@ const MIGRATIONS: &[&str] = &[
     DELETE_VERSION_GRANT,
     BLOBS,
     PACKING,
+    GC,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -395,4 +396,19 @@ $$;
 CREATE TRIGGER parts_garbage AFTER DELETE ON parts
     REFERENCING OLD TABLE AS gone
     FOR EACH STATEMENT EXECUTE FUNCTION log_blob_garbage();
+"#;
+
+/// Migration 6: automatic garbage collection (see `gc`).
+const GC: &str = r#"
+-- Finding the pending blobs that have been pending too long, every minute.
+CREATE INDEX blobs_pending ON blobs (created_at) WHERE state = 'pending';
+
+-- When some node last checked the whole catalog for unreferenced blobs. A node
+-- claims the next check by moving this forward, so it runs once a day, on one
+-- node. A single row.
+CREATE TABLE gc_runs (
+    id                  BOOLEAN PRIMARY KEY DEFAULT true CHECK (id),
+    unreferenced_check  TIMESTAMPTZ NOT NULL DEFAULT '-infinity'
+);
+INSERT INTO gc_runs DEFAULT VALUES;
 "#;

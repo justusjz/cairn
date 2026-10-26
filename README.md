@@ -15,8 +15,8 @@ The schema is created automatically; just point Cairn at an empty database.
 
 > [!WARNING]
 > The peer endpoint (`--listen-peer`, default `:9431`) is unauthenticated and
-> its prune action is destructive. Only bind it to a trusted/private network —
-> never expose it to the public internet.
+> can read and delete blobs. Only bind it to a trusted/private network — never
+> expose it to the public internet.
 
 ## Installing
 
@@ -71,7 +71,7 @@ s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
 | --- | --- | --- |
 | `--database <URL>` | *required* | PostgreSQL connection string. Shared by all nodes. |
 | `--listen-client <ADDR>` | *required* | Bind address for the S3 API. |
-| `--listen-peer <ADDR>` | `127.0.0.1:9431` | Bind address for the peer endpoint (replica traffic + prune). Always runs. |
+| `--listen-peer <ADDR>` | `127.0.0.1:9431` | Bind address for the peer endpoint (replica traffic between nodes). Always runs. |
 | `--peer-url <URL>` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
 | `--replication-factor <N>` | `1` | How many distinct nodes each blob is stored on. |
 | `--data-dir <PATH>` | *required* | Local directory for blobs. |
@@ -247,30 +247,19 @@ The nodes coordinate through the database, so each blob is packed only once.
 
 ## Garbage collection
 
-Failed uploads and orphaned blobs (e.g. left behind by a crash or re-balancing)
-are reclaimed by the `prune` command, run **per node** against that node's peer
-endpoint. It is a manual repair operation.
+Deleting data deletes its files right away. What a crash or a failed upload
+leaves behind is cleaned up in the background, as part of the same pass that
+packs data, once a minute on every node:
 
-Dry run — report what would be removed, change nothing (default):
+- Uploads that have been pending for a day are given up, and their data
+  deleted.
+- Each node checks its data directory for files the database doesn't know,
+  and deletes them. It checks a slice at a time, getting through all of it in
+  a day.
+- Once a day, one node checks the database for data that no object refers to
+  anymore, and deletes it.
 
-```sh
-cairn prune --peer http://10.0.0.1:9431
-```
-
-Actually delete:
-
-```sh
-cairn prune --peer http://10.0.0.1:9431 --apply
-```
-
-### `prune` flags
-
-| Flag | Default | Description |
-| --- | --- | --- |
-| `--peer <URL>` | `http://127.0.0.1:9431` | Peer URL of the node to prune. |
-| `--apply` | *(off)* | Actually delete. Without it, prune only reports (dry run). |
-
-Run `prune` against each node in turn to sweep the whole cluster.
+There's nothing to run or configure.
 
 ## License
 

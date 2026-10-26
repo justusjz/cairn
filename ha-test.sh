@@ -299,12 +299,12 @@ upload_to_pack_via() {
     done
 }
 
-# packed_via <instance> — runs packing passes on that node until every small
-# blob is packed (a background pass on any node may do it first).
+# packed_via <instance> — runs maintenance passes on that node until every
+# small blob is packed (a background pass on any node may do it first).
 packed_via() {
     local i
     for i in $(seq 1 60); do
-        curl -fsS -X POST "http://${SERVER_HOST}:$(peer_port "$1")/pack" >/dev/null 2>&1
+        curl -fsS -X POST "http://${SERVER_HOST}:$(peer_port "$1")/maintain" >/dev/null 2>&1
         [ "$(sql "SELECT count(*) $SMALL_BLOBS")" = 0 ] && return 0
         sleep 2
     done

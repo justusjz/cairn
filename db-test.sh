@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
 # db-test.sh — runs the unit tests together with the tests that need a database
-# (the packer's end-to-end tests), against a throwaway Postgres in a Podman
-# container. Plain `cargo test` skips the latter.
+# (the end-to-end tests of the packer and the GC), against a throwaway Postgres
+# in a Podman container. Plain `cargo test` skips the latter.
 #
 # Usage:  ./db-test.sh [cargo test args...]
 # e.g.    ./db-test.sh packer::e2e

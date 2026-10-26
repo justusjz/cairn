@@ -2,7 +2,7 @@ use std::{net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use clap::{Args, Parser, Subcommand};
 use deadpool_postgres::{Object, Pool};
-use http_body_util::{BodyExt, Empty};
+use http_body_util::BodyExt;
 use hyper::{
     Method, Request, StatusCode, body::Body, body::Bytes, body::Frame,
     server::conn::http1, service::service_fn,
@@ -32,8 +32,10 @@ mod blobs;
 mod body;
 mod checksum;
 mod db;
+#[cfg(test)]
+mod e2e;
+mod gc;
 mod packer;
-mod prune;
 mod roles;
 mod s3;
 mod store;
@@ -63,8 +65,6 @@ struct Cli {
 enum Command {
     /// Run a storage node.
     Serve(ServeArgs),
-    /// Reclaim orphaned and failed-upload blobs on a node (manual repair).
-    Prune(PruneArgs),
     /// Manage roles: S3 credentials and their bucket permissions.
     Role(roles::RoleArgs),
 }
@@ -75,7 +75,7 @@ struct ServeArgs {
     database: String,
     #[arg(long)]
     listen_client: String,
-    /// Bind address for the peer endpoint (replica traffic + the prune endpoint).
+    /// Bind address for the peer endpoint (replica traffic between nodes).
     /// It always runs; defaults to a loopback port. Override to bind externally,
     /// or to run several nodes on one host.
     #[arg(long, default_value = "127.0.0.1:9431")]
@@ -92,24 +92,15 @@ struct ServeArgs {
     data_dir: String,
 }
 
-#[derive(Args, Debug)]
-struct PruneArgs {
-    /// Peer URL of the node to prune.
-    #[arg(long, default_value = "http://127.0.0.1:9431")]
-    peer: String,
-    /// Actually delete; without this it's a dry run that only reports.
-    #[arg(long)]
-    apply: bool,
-}
-
 /// How often a node refreshes its `nodes` row (last_seen / free_space).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// How often a node runs its maintenance pass.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve_main(args).await,
-        Command::Prune(args) => prune_main(args).await,
         Command::Role(args) => roles::role_main(args).await,
     }
 }
@@ -137,7 +128,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         pack_hook: None,
     });
     tokio::spawn(heartbeat(app.clone(), peer_url));
-    tokio::spawn(packer::run(app.clone()));
+    tokio::spawn(maintain(app.clone()));
 
     let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
     let listen_peer_addr = SocketAddr::from_str(&args.listen_peer).unwrap();
@@ -150,33 +141,26 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `cairn prune`: triggers a prune on a node's peer endpoint and streams its
-/// report to stdout.
-async fn prune_main(args: PruneArgs) -> anyhow::Result<()> {
-    let http = Client::builder(TokioExecutor::new()).build_http();
-    let url = format!(
-        "{}/prune?apply={}",
-        args.peer.trim_end_matches('/'),
-        args.apply,
-    );
-    let req = Request::builder()
-        .method(Method::POST)
-        .uri(url)
-        .body(Empty::<Bytes>::new())?;
-    let res = http.request(req).await?;
-    if res.status() != StatusCode::OK {
-        anyhow::bail!("prune request to {} failed: {}", args.peer, res.status());
-    }
-    // Stream the report straight to stdout as the node produces it.
-    let mut body = res.into_body();
-    let mut stdout = tokio::io::stdout();
-    while let Some(frame) = body.frame().await {
-        if let Ok(data) = frame?.into_data() {
-            stdout.write_all(&data).await?;
+/// Background upkeep, on every node, once a minute: garbage collection, then
+/// packing. Both work in small steps, so that every pass is cheap.
+async fn maintain(app: Arc<App>) {
+    let mut sweep = gc::Sweep::new();
+    loop {
+        tokio::time::sleep(MAINTENANCE_INTERVAL).await;
+        match gc::pass(&app, sweep.next_scope()).await {
+            Ok(report) if !report.is_empty() => eprintln!("gc: {report}"),
+            Ok(_) => {}
+            Err(e) => eprintln!("gc: pass failed: {e:#}"),
+        }
+        match packer::pass(&app).await {
+            Ok(jobs) => {
+                for job in jobs {
+                    eprintln!("packer: {job}");
+                }
+            }
+            Err(e) => eprintln!("packer: pass failed: {e:#}"),
         }
     }
-    stdout.flush().await?;
-    Ok(())
 }
 
 /// Upserts this node's row in `nodes`, returning its number. Used both for the

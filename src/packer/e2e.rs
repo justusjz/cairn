@@ -1,9 +1,4 @@
-//! End-to-end tests of the packer against a real Postgres, on a single node.
-//!
-//! Each test gets a fresh database, created through the server that
-//! `CAIRN_TEST_DATABASE` points at (a URL naming any existing database, e.g.
-//! `postgres://user:pass@127.0.0.1:15432/postgres`). Without it, the tests skip
-//! themselves. `db-test.sh` runs them against a throwaway container.
+//! End-to-end tests of the packer (see `crate::e2e`).
 //!
 //! The races are staged with `App::pack_hook`, which runs a test's code at set
 //! points of a packing job.
@@ -15,25 +10,19 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
 };
 
-use http_body_util::{BodyExt, Full};
-use hyper::{StatusCode, body::Bytes};
-use tokio_postgres::NoTls;
+use http_body_util::BodyExt;
 use uuid::Uuid;
 
 use super::{Config, Hook, Kind, Stage, pass};
 use crate::{
-    App, AttachTarget, UploadResult,
-    auth::ContentSha256,
+    App,
     body::channel_body,
-    s3::{conditional::Preconditions, objects},
-    store::Store,
-    writing::WritingSet,
+    e2e::{BUCKET, assert_files, assert_reaped, delete, get, node_with, put, query_i64},
+    gc,
+    s3::objects,
 };
-
-const BUCKET: &str = "bucket";
 
 /// Packing on a small scale: new blobs of 100 KB, from blobs up to 25 KB. The
 /// first 100 test objects (`data`) add up to about 193 KB, so packing them
@@ -50,43 +39,6 @@ fn config() -> Config {
 /// there's no database to test against.
 async fn node(hook: Option<Hook>) -> Option<Arc<App>> {
     node_with(config(), hook).await
-}
-
-async fn node_with(pack: Config, hook: Option<Hook>) -> Option<Arc<App>> {
-    let Ok(url) = std::env::var("CAIRN_TEST_DATABASE") else {
-        eprintln!("skipped: set CAIRN_TEST_DATABASE to run the packer's end-to-end tests");
-        return None;
-    };
-    let (admin, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
-    tokio::spawn(connection);
-    let name = format!("cairn_test_{}", Uuid::new_v4().simple());
-    admin
-        .execute(&format!("CREATE DATABASE {name}"), &[])
-        .await
-        .unwrap();
-    let (server, _) = url.rsplit_once('/').expect("the URL names a database");
-    let pool = crate::db::connect(&format!("{server}/{name}")).await.unwrap();
-    let dir = std::env::temp_dir().join(format!("cairn-e2e-{}", Uuid::new_v4()));
-    let store = Store::new(dir.to_string_lossy().into_owned()).unwrap();
-    // A single node holds every blob, so peers never contact it.
-    let node = crate::register_node(&pool, &store, "http://127.0.0.1:1")
-        .await
-        .unwrap();
-    pool.get()
-        .await
-        .unwrap()
-        .execute("INSERT INTO buckets (name) VALUES ($1)", &[&BUCKET])
-        .await
-        .unwrap();
-    Some(Arc::new(App {
-        pool,
-        store,
-        node,
-        replication_factor: 1,
-        writing: WritingSet::default(),
-        pack,
-        pack_hook: hook,
-    }))
 }
 
 /// A hook that runs `f` at `stage`, the first time the stage is reached.
@@ -118,37 +70,11 @@ fn key(i: usize) -> String {
     format!("o{i}")
 }
 
-async fn put(app: &Arc<App>, key: &str, data: Vec<u8>) {
-    let attach = AttachTarget::Object {
-        bucket: BUCKET.to_owned(),
-        key: key.to_owned(),
-        content_type: "application/octet-stream".to_owned(),
-        conditions: Preconditions::default(),
-    };
-    let body = Full::new(Bytes::from(data));
-    let result = crate::upload_part(app, body, &attach, false, ContentSha256::Unsigned, None)
-        .await
-        .unwrap();
-    assert!(matches!(result, UploadResult::Committed { .. }));
-}
-
 /// Uploads objects 0..n.
 async fn put_many(app: &Arc<App>, n: usize) {
     for i in 0..n {
         put(app, &key(i), data(i)).await;
     }
-}
-
-/// Reads an object through GetObject; `None` if it doesn't exist.
-async fn get(app: &Arc<App>, key: &str) -> Option<Vec<u8>> {
-    let response = objects::get::get_object(app, BUCKET, key, None, None, &Preconditions::default())
-        .await
-        .unwrap();
-    if response.status() == StatusCode::NOT_FOUND {
-        return None;
-    }
-    assert_eq!(response.status(), StatusCode::OK);
-    Some(response.into_body().collect().await.unwrap().to_bytes().to_vec())
 }
 
 /// Every object 0..n except `deleted` reads back intact; the deleted are gone.
@@ -157,18 +83,6 @@ async fn assert_objects(app: &Arc<App>, n: usize, deleted: &[usize]) {
         let expected = (!deleted.contains(&i)).then(|| data(i));
         assert_eq!(get(app, &key(i)).await, expected, "object {i}");
     }
-}
-
-async fn delete(app: &Arc<App>, key: &str) {
-    let response = objects::delete::delete_object(app, BUCKET, key, None)
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-}
-
-async fn query_i64(app: &App, sql: &str) -> i64 {
-    let client = app.pool.get().await.unwrap();
-    client.query_one(sql, &[]).await.unwrap().get(0)
 }
 
 async fn blob_of(app: &App, key: &str) -> Uuid {
@@ -196,29 +110,6 @@ async fn assert_accounting(app: &App) {
     .await;
     let parts = query_i64(app, "SELECT coalesce(sum(size), 0)::bigint FROM parts").await;
     assert_eq!(blobs, parts, "live bytes in blobs vs. parts");
-}
-
-/// Waits for background reaps until exactly `n` blob files are left on disk.
-async fn assert_files(app: &App, n: usize) {
-    for _ in 0..100 {
-        if app.store.list_local_blobs().await.unwrap().len() == n {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    let left = app.store.list_local_blobs().await.unwrap().len();
-    panic!("expected {n} blob files, found {left}");
-}
-
-/// Waits for a background reap to delete a blob's file.
-async fn assert_reaped(app: &App, blob_id: Uuid) {
-    for _ in 0..100 {
-        if app.store.open_blob(blob_id).await.unwrap().is_none() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("blob {blob_id} wasn't reaped");
 }
 
 /// A blob that a packing job is writing.
@@ -494,7 +385,7 @@ async fn crash_mid_job_is_recoverable() {
     assert_objects(&app, 100, &[]).await;
     assert_files(&app, 102).await;
 
-    // Prune reclaims the dead job's blobs, once they're old enough.
+    // The GC reclaims the dead job's blobs, once they're old enough.
     app.pool
         .get()
         .await
@@ -505,10 +396,7 @@ async fn crash_mid_job_is_recoverable() {
         )
         .await
         .unwrap();
-    // Read the report while it's written: it's streamed through a small buffer.
-    let (tx, body) = channel_body();
-    let (_, report) = tokio::join!(crate::prune::run(app.clone(), true, tx), body.collect());
-    report.unwrap();
+    gc::pass(&app, gc::Scope::everything()).await.unwrap();
     assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 100);
     assert_files(&app, 100).await;
 

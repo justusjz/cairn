@@ -1,9 +1,12 @@
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use tokio::fs;
 use uuid::Uuid;
+
+/// How many shard directories blobs are spread over: 256 × 256.
+pub const SHARDS: u32 = 1 << 16;
 
 pub struct Store {
     node_id: Uuid,
@@ -69,11 +72,11 @@ impl Store {
         let blob_dir = self.get_blob_dir(blob_id);
         let blob_id = blob_id.to_string();
         let path = blob_dir.join(&blob_id);
-        // `create_dir_all` and `File::create` aren't atomic: a concurrent prune can
+        // `create_dir_all` and `File::create` aren't atomic: a concurrent GC can
         // rmdir the just-made (empty) shard between them, so the create can hit
         // NotFound. Recreate the dir and retry rather than failing the upload. A
-        // single prune pass touches a dir once, so one retry covers it; the bound
-        // guards against pathological overlapping prunes.
+        // single GC pass touches a dir once, so one retry covers it; the bound
+        // guards against pathological overlapping passes.
         let mut last_err = None;
         for _ in 0..4 {
             fs::create_dir_all(&blob_dir).await?;
@@ -114,8 +117,50 @@ impl Store {
         }
     }
 
-    /// Walks the sharded data directory and returns every blob_id with a local
-    /// file. Used only by the prune/repair full scan.
+    /// The directory of shard `shard` (`0..SHARDS`), named by its four hex
+    /// digits like a blob's (see `get_blob_dir`).
+    fn shard_dir(&self, shard: u32) -> PathBuf {
+        self.data_dir
+            .join(format!("{:02x}", shard >> 8))
+            .join(format!("{:02x}", shard & 0xff))
+    }
+
+    /// The blobs with a file in shard `shard`.
+    pub async fn list_shard(&self, shard: u32) -> anyhow::Result<Vec<Uuid>> {
+        let mut files = match fs::read_dir(self.shard_dir(shard)).await {
+            Ok(files) => files,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        let mut blobs = Vec::new();
+        while let Some(f) = files.next_entry().await? {
+            if let Some(id) = f.file_name().to_str().and_then(|n| Uuid::parse_str(n).ok()) {
+                blobs.push(id);
+            }
+        }
+        Ok(blobs)
+    }
+
+    /// Removes shard `shard`'s directory if it's empty, and then its parent if
+    /// that's empty too. Returns how many directories it removed.
+    ///
+    /// `rmdir` only removes an empty directory, so this never risks a blob: a
+    /// shard that isn't empty, or is repopulated meanwhile, just stays, and
+    /// `create_blob` recreates shards on demand.
+    pub async fn remove_shard_if_empty(&self, shard: u32) -> usize {
+        let dir = self.shard_dir(shard);
+        if fs::remove_dir(&dir).await.is_err() {
+            return 0;
+        }
+        match dir.parent() {
+            Some(parent) if fs::remove_dir(parent).await.is_ok() => 2,
+            _ => 1,
+        }
+    }
+
+    /// Every blob with a local file, for tests. Walks the directories that
+    /// exist, rather than listing every shard.
+    #[cfg(test)]
     pub async fn list_local_blobs(&self) -> anyhow::Result<Vec<Uuid>> {
         let mut blobs = Vec::new();
         let mut level1 = fs::read_dir(&self.data_dir).await?;
@@ -126,9 +171,6 @@ impl Store {
             }
             let mut level2 = fs::read_dir(e1.path()).await?;
             while let Some(e2) = level2.next_entry().await? {
-                if !e2.file_type().await?.is_dir() {
-                    continue;
-                }
                 let mut files = fs::read_dir(e2.path()).await?;
                 while let Some(f) = files.next_entry().await? {
                     if let Some(id) = f.file_name().to_str().and_then(|n| Uuid::parse_str(n).ok()) {
@@ -138,47 +180,6 @@ impl Store {
             }
         }
         Ok(blobs)
-    }
-
-    /// Reclaims empty shard directories (both sharding levels) left behind once
-    /// their blobs are gone. `apply` performs the removals; otherwise it only
-    /// reports which directories are empty. Returns the affected paths.
-    ///
-    /// `rmdir` is the safety net: it removes a directory *only* if it's empty, so
-    /// a blob is never at risk — a non-empty or concurrently-repopulated shard
-    /// simply isn't removed, and `create_blob` recreates shards on demand.
-    pub async fn prune_empty_dirs(&self, apply: bool) -> anyhow::Result<Vec<String>> {
-        let mut removed = Vec::new();
-        let mut level1 = fs::read_dir(&self.data_dir).await?;
-        while let Some(e1) = level1.next_entry().await? {
-            if !e1.file_type().await?.is_dir() {
-                continue; // skip the node_id file
-            }
-            let l1 = e1.path();
-            let mut level2 = fs::read_dir(&l1).await?;
-            while let Some(e2) = level2.next_entry().await? {
-                if e2.file_type().await?.is_dir() {
-                    self.try_rmdir(&e2.path(), apply, &mut removed).await?;
-                }
-            }
-            // With its leaf shards gone, the level-1 directory may now be empty too.
-            self.try_rmdir(&l1, apply, &mut removed).await?;
-        }
-        Ok(removed)
-    }
-
-    /// Removes `dir` if empty (apply), or records it as removable (dry-run).
-    async fn try_rmdir(&self, dir: &Path, apply: bool, removed: &mut Vec<String>) -> anyhow::Result<()> {
-        if apply {
-            // rmdir only succeeds on an empty directory, so this never risks a
-            // blob; a non-empty or concurrently-recreated dir just isn't removed.
-            if fs::remove_dir(dir).await.is_ok() {
-                removed.push(dir.display().to_string());
-            }
-        } else if fs::read_dir(dir).await?.next_entry().await?.is_none() {
-            removed.push(dir.display().to_string());
-        }
-        Ok(())
     }
 }
 
@@ -196,6 +197,7 @@ mod tests {
         assert_eq!(store.get_blob_dir(v4), PathBuf::from("/d/3f/2a"));
         let v7 = Uuid::parse_str("01a102b0-8108-7c42-b0c9-39a46612af32").unwrap();
         assert_eq!(store.get_blob_dir(v7), PathBuf::from("/d/af/32"));
+        assert_eq!(store.shard_dir(0xaf32), PathBuf::from("/d/af/32"));
         // Blobs created back to back still spread out.
         let dirs: std::collections::HashSet<_> =
             (0..64).map(|_| store.get_blob_dir(Uuid::now_v7())).collect();

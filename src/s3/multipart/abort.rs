@@ -31,7 +31,7 @@ pub async fn abort_multipart_upload(
     };
     // Delete the staged parts, the upload, and the freed blobs in one
     // transaction. A part committed to the upload in between is cascaded away
-    // with the upload, leaving its blob unreferenced; `cairn prune` drops it.
+    // with the upload, leaving its blob unreferenced; the GC drops it.
     let mut client = app.pool.get().await?;
     let tx = client.transaction().await?;
     let staged = tx

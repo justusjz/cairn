@@ -62,8 +62,6 @@ use crate::{
 pub(crate) const SMALL_SIZE: u64 = 64 * 1024 * 1024;
 /// How many new blobs' worth of live data a job takes at most.
 const OUTPUTS_PER_JOB: u64 = 4;
-/// How often a node runs a packing pass.
-const PASS_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a job may hold its source blobs.
 const LEASE: Duration = Duration::from_secs(3600);
 /// The most jobs a pass runs, so that a pass ends even under a steady stream of
@@ -125,21 +123,6 @@ async fn reached(app: &Arc<App>, stage: Stage) {
     }
     #[cfg(not(test))]
     let _ = (app, stage);
-}
-
-/// Runs a packing pass every [`PASS_INTERVAL`], forever.
-pub async fn run(app: Arc<App>) {
-    loop {
-        tokio::time::sleep(PASS_INTERVAL).await;
-        match pass(&app).await {
-            Ok(jobs) => {
-                for job in jobs {
-                    eprintln!("packer: {job}");
-                }
-            }
-            Err(e) => eprintln!("packer: pass failed: {e:#}"),
-        }
-    }
 }
 
 /// What a job did, for the log.

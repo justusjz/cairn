@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=76
+TOTAL=77
 STEP=0
 PASS=0
 FAIL=0
@@ -691,7 +691,7 @@ batch_delete_guards_ok() {
 }
 
 # Immediate part reaping: after deleting objects, their on-disk part files should
-# disappear WITHOUT running prune (the happy-path optimization). We can't map keys
+# disappear WITHOUT waiting for the GC (the happy-path optimization). We can't map keys
 # to part files, so we check the data-dir file count returns to its pre-upload
 # baseline (single node, RF=1, so the coordinator reaps its own files). Polls,
 # since the reap runs in the background.
@@ -709,7 +709,7 @@ immediate_reap_ok() {
 }
 
 # Multipart cleanup reaps too: an aborted upload's staged parts, and the staged
-# parts a completion leaves out, are deleted from disk without a prune. Stages two
+# parts a completion leaves out, are deleted from disk without the GC. Stages two
 # parts, aborts; stages two more, completes with only the first, deletes the
 # result; then waits for the part-file count to return to its starting point.
 multipart_reap_ok() {
@@ -1006,27 +1006,37 @@ versioned_bucket_not_empty_ok() {
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
-# Prune rmdir's empty shard directories. Upload then delete a batch of objects
-# (emptying their shard dirs), then run `prune --apply` against the peer endpoint
-# and confirm the directory count dropped. Live objects' shards stay (non-empty).
-prune_empty_dirs_ok() {
+# maintain_now — runs a maintenance pass (GC, then packing) on the server now,
+# as the background one (every minute) would, but sweeping all of the data dir.
+# The peer endpoint answers once the pass is done. The background pass may get
+# to the work first, so the tests check what was done, not which pass did it.
+maintain_now() { curl -fsS -X POST "http://${SERVER_HOST}:9431/maintain" >/dev/null 2>&1; }
+
+# The GC removes empty shard directories. Upload then delete a batch of objects
+# (emptying their shard dirs), run a maintenance pass, and confirm the
+# directory count dropped. Live objects' shards stay (non-empty).
+gc_empty_dirs_ok() {
     local datadir="$WORK_DIR/data" before after k
     for k in $(seq 1 8); do s3 put "$NESTED" "s3://${BUCKET}/dirs/o$k" >/dev/null 2>&1 || return 1; done
     for k in $(seq 1 8); do s3 del "s3://${BUCKET}/dirs/o$k" >/dev/null 2>&1 || return 1; done
     before=$(find "$datadir" -type d | wc -l)
-    # The peer endpoint (unauthenticated) defaults to :9431. curl blocks until the
-    # streamed prune report ends, i.e. until the prune has finished.
-    curl -fsS "http://${SERVER_HOST}:9431/prune?apply=true" >/dev/null 2>&1 || return 1
+    maintain_now || return 1
     after=$(find "$datadir" -type d | wc -l)
     [ "$after" -lt "$before" ]
 }
 
+# The GC deletes a file the catalog doesn't know (as a crash mid-upload leaves
+# behind), in a shard directory of its own.
+gc_orphan_ok() {
+    local id=0199aaaa-0000-7000-8000-00000000beef
+    mkdir -p "$WORK_DIR/data/be/ef"
+    printf 'orphan' >"$WORK_DIR/data/be/ef/$id"
+    maintain_now || return 1
+    [ ! -e "$WORK_DIR/data/be/ef/$id" ] && [ ! -e "$WORK_DIR/data/be/ef" ]
+}
+
 # ─── Packing ───
-# pack_now — runs a packing pass on the server now, as the background one
-# (every minute) would. The peer endpoint answers once the pass is done. The
-# background pass may get to the work first, so the tests check what packing
-# did, not which pass did it.
-pack_now() { curl -fsS -X POST "http://${SERVER_HOST}:9431/pack" >/dev/null 2>&1; }
+pack_now() { maintain_now; }
 
 # packed_until <cmd...> — runs packing passes until <cmd> holds (for up to two
 # minutes, while a background pass may still be busy with the work).
@@ -1330,8 +1340,8 @@ run_test    "Tear down pagination bucket"           teardown_pagination
 run_test    "Batch delete (DeleteObjects)"          batch_delete_ok
 run_test    "Batch delete guards (MD5 / bucket)"    batch_delete_guards_ok
 run_test    "DeleteBucket on non-empty bucket rejected" delete_nonempty_bucket_rejected
-run_test    "Deleted parts reaped without prune"    immediate_reap_ok
-run_test    "Multipart leftovers reaped without prune" multipart_reap_ok
+run_test    "Deleted parts reaped without the GC"   immediate_reap_ok
+run_test    "Multipart leftovers reaped without GC" multipart_reap_ok
 run_test    "Enable versioning (admin-only)"         versioning_enable_ok
 run_test    "Versioned overwrite keeps old version"  versioned_overwrite_ok
 run_test    "Delete adds a delete marker"            delete_marker_ok
@@ -1346,7 +1356,8 @@ run_test    "Copy from a named source version"       copy_source_version_ok
 run_test    "Unversioned bucket lists null versions" list_versions_unversioned_ok
 run_test    "Listing versions needs read"            list_versions_needs_read_ok
 run_test    "Delete markers keep a bucket non-empty" versioned_bucket_not_empty_ok
-run_test    "Prune removes empty shard dirs"         prune_empty_dirs_ok
+run_test    "GC removes empty shard dirs"            gc_empty_dirs_ok
+run_test    "GC deletes orphaned files"              gc_orphan_ok
 run_test    "Packer consolidates small blobs"        pack_consolidates_ok
 run_test    "Packer leaves too little alone"         pack_below_thresholds_ok
 run_test    "Packer compacts mostly-dead blobs"      pack_compacts_ok

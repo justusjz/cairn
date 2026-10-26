@@ -83,7 +83,7 @@ pub(crate) async fn drop_unreferenced_blobs<C: GenericClient>(
 /// Best-effort: once a set of blobs has been removed from the catalog, ask each
 /// holder to delete the file from disk *now*: locally if that's us, else via the
 /// peer's `DELETE /blobs/{id}`. The rows are already gone, so any deletion that
-/// fails (peer down, network) is harmless: `cairn prune` reclaims the leftovers.
+/// fails (peer down, network) is harmless: the GC reclaims the leftovers.
 /// Runs in the background so it never delays the response.
 pub(crate) fn reap_blobs(app: &Arc<App>, targets: Vec<ReapTarget>) {
     if targets.is_empty() {

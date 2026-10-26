@@ -12,7 +12,7 @@
 //! All of this runs inside the caller's serializable transaction. Removed
 //! versions' blobs are dropped once nothing references them, and their locations
 //! pushed onto a reap list for the caller to delete after commit; if it never
-//! gets to, `cairn prune` reclaims the files.
+//! gets to, the GC reclaims the files.
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use deadpool_postgres::GenericClient;

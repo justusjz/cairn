@@ -8,7 +8,7 @@ use crate::{
     App, blob_file,
     checksum::BlockLayout,
     body::{ResBody, box_response, channel_body, send_file},
-    packer, prune,
+    gc, packer,
 };
 
 /// The response for a failed peer request: a bare 500 (peers only check the
@@ -26,25 +26,13 @@ pub async fn handle(
     app: Arc<App>,
 ) -> anyhow::Result<Response<ResBody>> {
     let path = req.uri().path();
-    if path == "/prune" {
-        // Admin/repair: scan this node and stream a line-per-action report. The
-        // timers are node policy (hardcoded); the caller only chooses dry-run vs
-        // apply.
-        let apply = param(req.uri().query().unwrap_or(""), "apply").as_deref() == Some("true");
-        let (tx, body) = channel_body();
-        tokio::spawn(prune::run(app.clone(), apply, tx));
-        return Ok(Response::builder()
-            .status(StatusCode::OK)
-            .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-            .body(body)
-            .unwrap());
-    }
-    if path == "/pack" {
-        // For tests: run a packing pass now (as the background one would), and
-        // report what it did once it's done (a failed job is only logged).
-        let mut report = String::new();
+    if path == "/maintain" {
+        // For tests: run a maintenance pass now (as the background one would,
+        // but sweeping everything), and report what it did once it's done (a
+        // failed packing job is only logged).
+        let mut report = format!("gc: {}\n", gc::pass(&app, gc::Scope::everything()).await?);
         for job in packer::pass(&app).await? {
-            report.push_str(&format!("{job}\n"));
+            report.push_str(&format!("packer: {job}\n"));
         }
         return Ok(box_response(
             Response::builder()
