@@ -201,8 +201,8 @@ restarts; everything else is read from the database.
 ### Building the dashboard
 
 The dashboard's UI lives in `ui/` (SolidJS and TypeScript, built with Vite)
-and is embedded into the binary when Cairn is built. Building Cairn doesn't
-need Node, but without a build of the UI the dashboard is only a placeholder
+and is embedded into the binary when Cairn is built. Building the UI needs
+Node.js 26 or later. Building Cairn doesn't need Node, but without a build of the UI the dashboard is only a placeholder
 page, so build it first:
 
 ```sh

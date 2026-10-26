@@ -9,7 +9,7 @@
 # Output: dist/cairn-v<version>-x86_64-unknown-linux-musl.tar.gz (+ .sha256)
 #
 # Requires the musl target:  rustup target add x86_64-unknown-linux-musl
-# and Node.js (with npm), to build the dashboard's UI.
+# and Node.js 26 or later (with npm), to build the dashboard's UI.
 
 set -euo pipefail
 

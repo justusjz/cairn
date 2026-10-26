@@ -2,6 +2,9 @@
   "name": "cairn-dashboard",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
