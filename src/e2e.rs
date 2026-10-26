@@ -22,6 +22,7 @@ use crate::{
 };
 
 mod concurrency;
+mod copies;
 
 /// The bucket every test node has.
 pub const BUCKET: &str = "bucket";

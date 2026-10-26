@@ -5,10 +5,10 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use super::{Scope, Sweep, UNREFERENCED_BATCH, claim_unreferenced_check, pass};
+use super::{Scope, Sweep, pass};
 use crate::{
     App,
-    e2e::{assert_reaped, get, node_with, put, query_i64},
+    e2e::{assert_files, assert_reaped, get, node_with, put, query_i64},
     packer,
 };
 
@@ -123,73 +123,26 @@ async fn a_background_pass_sweeps_its_slice() {
     assert!(!file_exists(&app, orphan).await);
 }
 
-/// Committed blobs that no part references are deleted, but the whole catalog
-/// is only checked once a day, by one node.
+/// A blob whose last part is deleted any which way (here, by deleting objects
+/// in the catalog directly, so their parts go by cascade) is dropped by the
+/// next packing pass, which the garbage log points at it. Empty blobs too,
+/// which compaction never takes.
 #[tokio::test]
-async fn unreferenced_blobs_are_deleted_once_a_day() {
+async fn blobs_without_parts_are_dropped() {
     let Some(app) = node().await else { return };
+    put(&app, "full", b"some data".to_vec()).await;
+    put(&app, "empty", Vec::new()).await;
     put(&app, "kept", b"stored".to_vec()).await;
-    let first = leftover_blob(&app, "committed", "1 minute").await;
-    // A background pass's scope: the check is due, as it's never run.
-    let report = pass_ok(&app, Sweep::new().next_scope()).await;
-    assert_eq!(report.unreferenced, 1);
-    assert!(!blob_exists(&app, first).await);
-    assert_reaped(&app, first).await;
-
-    let second = leftover_blob(&app, "committed", "1 minute").await;
-    pass_ok(&app, Sweep::new().next_scope()).await;
-    assert!(blob_exists(&app, second).await, "checked again within a day");
-
     app.pool
         .get()
         .await
         .unwrap()
-        .execute(
-            "UPDATE gc_runs SET unreferenced_check = NOW() - INTERVAL '25 hours'",
-            &[],
-        )
+        .execute("DELETE FROM objects WHERE key IN ('full', 'empty')", &[])
         .await
         .unwrap();
-    pass_ok(&app, Sweep::new().next_scope()).await;
-    assert!(!blob_exists(&app, second).await);
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 3);
+    packer::pass(&app).await.unwrap();
     assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 1);
+    assert_files(&app, 1).await;
     assert_eq!(get(&app, "kept").await.as_deref(), Some(&b"stored"[..]));
-}
-
-/// The check for unreferenced blobs works through the catalog in batches, and
-/// gets through all of it.
-#[tokio::test]
-async fn unreferenced_blobs_are_found_across_batches() {
-    let Some(app) = node().await else { return };
-    put(&app, "kept", b"stored".to_vec()).await;
-    let leftovers = 2 * UNREFERENCED_BATCH + 500;
-    app.pool
-        .get()
-        .await
-        .unwrap()
-        .execute(
-            "INSERT INTO blobs (blob_id, size, state, created_at)
-             SELECT gen_random_uuid(), 1, 'committed', NOW() FROM generate_series(1, $1::bigint)",
-            &[&leftovers],
-        )
-        .await
-        .unwrap();
-    let report = pass_ok(&app, Scope::everything()).await;
-    assert_eq!(report.unreferenced as i64, leftovers);
-    assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 1);
-    assert_eq!(get(&app, "kept").await.as_deref(), Some(&b"stored"[..]));
-}
-
-/// A check that's claimed but never completes (its node died, or it failed) is
-/// due again within the hour, not only a day later.
-#[tokio::test]
-async fn an_unfinished_unreferenced_check_is_retried_soon() {
-    let Some(app) = node().await else { return };
-    let client = app.pool.get().await.unwrap();
-    assert!(claim_unreferenced_check(&client, false).await.unwrap());
-    assert!(!claim_unreferenced_check(&client, false).await.unwrap());
-    let due_in = "SELECT extract(epoch FROM unreferenced_check + INTERVAL '1 day' - NOW())::bigint
-                  FROM gc_runs";
-    let due_in = query_i64(&app, due_in).await;
-    assert!((3500..=3600).contains(&due_in), "due again in {due_in} seconds");
 }

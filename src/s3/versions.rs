@@ -9,15 +9,17 @@
 //! beneath it must stay hidden. A delete naming a version ID removes exactly that
 //! version, for good.
 //!
-//! All of this runs inside the caller's serializable transaction. Removed
-//! versions' blobs are dropped once nothing references them, and their locations
-//! pushed onto a reap list for the caller to delete after commit; if it never
-//! gets to, the GC reclaims the files.
+//! All of this runs inside the caller's serializable transaction. The parts of
+//! removed versions are pushed onto a list of freed parts, for the caller to
+//! drop their blobs with (`drop_blobs_of_deleted_parts`) at the end of the
+//! transaction: only then, after it has attached any parts of its own, does it
+//! know which blobs nothing references anymore. (A copy of an object onto
+//! itself replaces the version it references the data of.)
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use deadpool_postgres::GenericClient;
 
-use crate::blobs::{ReapTarget, deleted_parts, drop_blobs_of_deleted_parts};
+use crate::blobs::{FreedPart, deleted_parts};
 
 /// A bucket's versioning state. A bucket starts out unversioned; once enabled,
 /// it only moves between enabled and suspended.
@@ -100,8 +102,8 @@ pub struct NewVersion {
 }
 
 /// Writes a new object version as the key's current version, the way S3 lands a
-/// write in a bucket with the given versioning state. Locations of any blobs it
-/// frees are pushed onto `reap`.
+/// write in a bucket with the given versioning state. The parts of any version
+/// it removes are pushed onto `freed`.
 pub async fn put_version<C: GenericClient>(
     client: &C,
     bucket: &str,
@@ -110,13 +112,13 @@ pub async fn put_version<C: GenericClient>(
     size: i64,
     etag: &str,
     content_type: &str,
-    reap: &mut Vec<ReapTarget>,
+    freed: &mut Vec<FreedPart>,
 ) -> Result<NewVersion, tokio_postgres::Error> {
     let version_id = match versioning {
         Versioning::Enabled => new_version_id(),
         // The null version is replaced wherever it sits among the key's versions.
         Versioning::Unversioned | Versioning::Suspended => {
-            remove_null_version(client, bucket, key, reap).await?;
+            remove_null_version(client, bucket, key, freed).await?;
             "null".to_owned()
         }
     };
@@ -149,14 +151,14 @@ pub struct Deleted {
 /// such version); if it was current, the next-newest version takes its place.
 /// Without one, an unversioned bucket drops the `null` version, while a versioned
 /// one stacks a delete marker on top (a suspended bucket's marker replaces the
-/// `null` version). Locations of freed blobs are pushed onto `reap`.
+/// `null` version). The parts of removed versions are pushed onto `freed`.
 pub async fn delete_key<C: GenericClient>(
     client: &C,
     bucket: &str,
     key: &str,
     versioning: Versioning,
     version_id: Option<&str>,
-    reap: &mut Vec<ReapTarget>,
+    freed: &mut Vec<FreedPart>,
 ) -> Result<Deleted, tokio_postgres::Error> {
     if let Some(version_id) = version_id {
         let row = client
@@ -169,7 +171,7 @@ pub async fn delete_key<C: GenericClient>(
         let mut delete_marker = false;
         if let Some(row) = row {
             delete_marker = row.get(2);
-            remove_version(client, row.get(0), reap).await?;
+            remove_version(client, row.get(0), freed).await?;
             if row.get::<_, bool>(1) {
                 promote_newest(client, bucket, key).await?;
             }
@@ -181,7 +183,7 @@ pub async fn delete_key<C: GenericClient>(
     }
     let marker_id = match versioning {
         Versioning::Unversioned => {
-            remove_null_version(client, bucket, key, reap).await?;
+            remove_null_version(client, bucket, key, freed).await?;
             return Ok(Deleted {
                 version_id: None,
                 delete_marker: false,
@@ -189,7 +191,7 @@ pub async fn delete_key<C: GenericClient>(
         }
         Versioning::Enabled => new_version_id(),
         Versioning::Suspended => {
-            remove_null_version(client, bucket, key, reap).await?;
+            remove_null_version(client, bucket, key, freed).await?;
             "null".to_owned()
         }
     };
@@ -213,7 +215,7 @@ async fn remove_null_version<C: GenericClient>(
     client: &C,
     bucket: &str,
     key: &str,
-    reap: &mut Vec<ReapTarget>,
+    freed: &mut Vec<FreedPart>,
 ) -> Result<(), tokio_postgres::Error> {
     let row = client
         .query_opt(
@@ -222,17 +224,17 @@ async fn remove_null_version<C: GenericClient>(
         )
         .await?;
     if let Some(row) = row {
-        remove_version(client, row.get(0), reap).await?;
+        remove_version(client, row.get(0), freed).await?;
     }
     Ok(())
 }
 
-/// Removes the version with row id `id` and its parts, then drops the blobs
-/// those parts were the last users of, pushing their locations onto `reap`.
+/// Removes the version with row id `id` and its parts, pushing those onto
+/// `freed`.
 async fn remove_version<C: GenericClient>(
     client: &C,
     id: i64,
-    reap: &mut Vec<ReapTarget>,
+    freed: &mut Vec<FreedPart>,
 ) -> Result<(), tokio_postgres::Error> {
     let parts = client
         .query(
@@ -243,7 +245,7 @@ async fn remove_version<C: GenericClient>(
     client
         .execute("DELETE FROM objects WHERE id = $1", &[&id])
         .await?;
-    reap.extend(drop_blobs_of_deleted_parts(client, &deleted_parts(&parts)).await?);
+    freed.extend(deleted_parts(&parts));
     Ok(())
 }
 

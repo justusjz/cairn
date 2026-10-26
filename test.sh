@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=77
+TOTAL=78
 STEP=0
 PASS=0
 FAIL=0
@@ -367,6 +367,20 @@ copy_small_ok() {
         --copy-source "${BUCKET}/small.txt" >/dev/null 2>&1 || return 1
     check_roundtrip "$SMALL" "s3://${BUCKET}/copy/small.txt" || return 1
     awss3 s3api delete-object --bucket "$BUCKET" --key copy/small.txt >/dev/null 2>&1
+}
+
+# CopyObject only copies metadata: the copy shares the source's data, so no
+# file is written, and it reads back intact after the source is gone.
+copy_shares_data_ok() {
+    local before
+    s3 put "$BIG" "s3://${BUCKET}/copy/shared-src" >/dev/null 2>&1 || return 1
+    before=$(find "$WORK_DIR/data" -type f | wc -l)
+    awss3 s3api copy-object --bucket "$BUCKET" --key copy/shared \
+        --copy-source "${BUCKET}/copy/shared-src" >/dev/null 2>&1 || return 1
+    [ "$(find "$WORK_DIR/data" -type f | wc -l)" -eq "$before" ] || return 1
+    s3 del "s3://${BUCKET}/copy/shared-src" >/dev/null 2>&1 || return 1
+    check_roundtrip "$BIG" "s3://${BUCKET}/copy/shared" || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key copy/shared >/dev/null 2>&1
 }
 
 # CopyObject of a multipart-uploaded source produces a *normal* object: the
@@ -1060,13 +1074,16 @@ no_small_blobs() { [ "$(sql "SELECT count(*) $SMALL_BLOBS")" = 0 ]; }
 # The packed blobs.
 large_blobs() { sql "SELECT string_agg(blob_id::text, ',' ORDER BY blob_id) FROM blobs WHERE size > 67108864"; }
 
-# accounting_ok — every byte of every referenced blob is either a live part or
-# counted as garbage. Right after a pass, which folds the garbage log.
+# accounting_ok — every byte of every referenced blob is either live (some
+# part's; copies share bytes, so each counts once) or counted as garbage. Right
+# after a pass, which folds the garbage log.
 accounting_ok() {
     [ "$(sql "SELECT (SELECT coalesce(sum(b.size - b.dead_size), 0) FROM blobs b
                       WHERE b.state = 'committed'
                         AND EXISTS (SELECT 1 FROM parts p WHERE p.blob_id = b.blob_id))
-                   = (SELECT coalesce(sum(size), 0) FROM parts)")" = t ]
+                   = (SELECT coalesce(sum(upper(r) - lower(r)), 0)
+                      FROM (SELECT unnest(range_agg(int8range(blob_offset, blob_offset + size))) AS r
+                            FROM parts GROUP BY blob_id) AS ranges)")" = t ]
 }
 
 # bytes_at_most <n> — the data dir holds at most <n> bytes.
@@ -1318,6 +1335,7 @@ run_test    "Ranged GET (single part) matches"      range_ok big.bin 1000000 100
 run_test    "Ranged GET across multipart boundary"  range_ok multi.bin 5242875 5242884 "$MULTIPART"
 expect_fail "Unsatisfiable range is rejected"       awss3 s3api get-object --bucket "${BUCKET}" --key big.bin --range "bytes=99999999-100000000" "$WORK_DIR/x416"
 run_test    "CopyObject (small object)"             copy_small_ok
+run_test    "CopyObject shares the source's data"   copy_shares_data_ok
 run_test    "CopyObject of multipart src is normal" copy_multipart_source_normal_ok
 run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok
 expect_fail "Self-copy without REPLACE rejected"    awss3 s3api copy-object --bucket "$BUCKET" --key big.bin --copy-source "${BUCKET}/big.bin"

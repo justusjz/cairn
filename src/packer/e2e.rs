@@ -98,7 +98,8 @@ async fn blob_of(app: &App, key: &str) -> Uuid {
         .get(0)
 }
 
-/// Every byte of every referenced blob is a live part or counted as garbage.
+/// Every byte of every referenced blob is live (some part's) or counted as
+/// garbage.
 /// Holds right after a pass, which folds the garbage log.
 async fn assert_accounting(app: &App) {
     let blobs = query_i64(
@@ -108,7 +109,14 @@ async fn assert_accounting(app: &App) {
            AND EXISTS (SELECT 1 FROM parts p WHERE p.blob_id = b.blob_id)",
     )
     .await;
-    let parts = query_i64(app, "SELECT coalesce(sum(size), 0)::bigint FROM parts").await;
+    // Parts may share bytes, so count each byte once.
+    let parts = query_i64(
+        app,
+        "SELECT coalesce(sum(upper(r) - lower(r)), 0)::bigint
+         FROM (SELECT unnest(range_agg(int8range(blob_offset, blob_offset + size))) AS r
+               FROM parts GROUP BY blob_id) AS ranges",
+    )
+    .await;
     assert_eq!(blobs, parts, "live bytes in blobs vs. parts");
 }
 
@@ -293,10 +301,11 @@ async fn source_without_replicas_fails_its_job() {
     assert_eq!(get(&app, &key(6)).await, Some(data(6)));
 }
 
-/// A blob whose parts share bytes is left alone, and stays leased, so that
-/// passes don't keep claiming it.
+/// Two parts on the same bytes, as a copy makes, are packed once and stay
+/// shared. Deleting one leaves those bytes live, so they aren't counted as
+/// garbage.
 #[tokio::test]
-async fn blob_with_overlapping_parts_stays_leased() {
+async fn shared_bytes_are_packed_once() {
     let Some(app) = node(None).await else { return };
     put_many(&app, 100).await;
     let shared = blob_of(&app, &key(0)).await;
@@ -321,17 +330,21 @@ async fn blob_with_overlapping_parts_stays_leased() {
         .unwrap();
     let reports = pass(&app).await.unwrap();
     assert_eq!(reports.len(), 1);
-    assert_eq!(reports[0].parts, 99);
-    assert_eq!(blob_of(&app, &key(0)).await, shared);
-    let leased = client
-        .query_one(
-            "SELECT pack_lease_until > NOW() FROM blobs WHERE blob_id = $1",
-            &[&shared],
-        )
-        .await
-        .unwrap();
-    assert!(leased.get::<_, bool>(0));
+    assert_eq!(reports[0].parts, 101);
+    let unique: u64 = (0..100).map(|i| data(i).len() as u64).sum();
+    assert_eq!(reports[0].bytes, unique);
+    let place = "SELECT blob_id::text || ':' || blob_offset FROM parts p
+                 JOIN objects o ON o.id = p.object_id WHERE o.key = $1";
+    let original: String = client.query_one(place, &[&key(0)]).await.unwrap().get(0);
+    let copy: String = client.query_one(place, &[&"copy"]).await.unwrap().get(0);
+    assert_eq!(original, copy);
     assert_eq!(get(&app, "copy").await, Some(data(0)));
+    assert_accounting(&app).await;
+
+    delete(&app, "copy").await;
+    pass(&app).await.unwrap();
+    assert_eq!(query_i64(&app, "SELECT sum(dead_size)::bigint FROM blobs").await, 0);
+    assert_eq!(get(&app, &key(0)).await, Some(data(0)));
 }
 
 /// A part whose bytes don't match its checksum after the copy stops the job:

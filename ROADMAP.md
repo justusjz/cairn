@@ -21,13 +21,9 @@ Done:
   are cleaned up in the background; `cairn prune` is gone.
 - **Concurrent writes.** Conflicting requests are retried with backoff, and
   answered with 503 SlowDown if they still can't complete, instead of 500.
-
-To do:
-
 - **Metadata-only copies.** CopyObject and UploadPartCopy point the new object
-  at the existing data instead of copying it. Needs a design for parts that
-  share bytes: the packer currently skips blobs whose parts overlap, and
-  deleting one of two parts that share bytes would count them as garbage.
+  at the existing data instead of copying it. (A part copied from a range that
+  spans several parts of its source is still copied as data.)
 
 ## Next
 

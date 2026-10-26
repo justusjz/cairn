@@ -10,7 +10,9 @@ use tokio_postgres::IsolationLevel;
 
 use super::{BUCKET, get, node_with, put, query_i64};
 use crate::{
-    App, AttachTarget, UploadResult, auth::ContentSha256, packer,
+    App, AttachTarget, UploadResult, auth::ContentSha256,
+    blobs::drop_blobs_of_deleted_parts,
+    packer,
     s3::{
         conditional::Preconditions,
         versions::{Versioning, delete_key},
@@ -100,16 +102,18 @@ async fn deletes_in_one_packed_blob_dont_conflict() {
     let serializable = IsolationLevel::Serializable;
     let t1 = first.build_transaction().isolation_level(serializable).start().await.unwrap();
     let t2 = second.build_transaction().isolation_level(serializable).start().await.unwrap();
-    let mut reap = Vec::new();
-    delete_key(&t1, BUCKET, "o0", Versioning::Unversioned, None, &mut reap)
+    let (mut freed1, mut freed2) = (Vec::new(), Vec::new());
+    delete_key(&t1, BUCKET, "o0", Versioning::Unversioned, None, &mut freed1)
         .await
         .unwrap();
-    delete_key(&t2, BUCKET, "o1", Versioning::Unversioned, None, &mut reap)
+    delete_key(&t2, BUCKET, "o1", Versioning::Unversioned, None, &mut freed2)
         .await
         .unwrap();
+    let reap1 = drop_blobs_of_deleted_parts(&t1, &freed1).await.unwrap();
+    let reap2 = drop_blobs_of_deleted_parts(&t2, &freed2).await.unwrap();
     t1.commit().await.unwrap();
     t2.commit().await.unwrap();
-    assert!(reap.is_empty(), "the packed blob still holds other objects");
+    assert!(reap1.is_empty() && reap2.is_empty(), "the packed blob holds other objects");
     assert_eq!(get(&app, "o0").await, None);
     assert_eq!(get(&app, "o2").await, Some(vec![2; 1200]));
 }

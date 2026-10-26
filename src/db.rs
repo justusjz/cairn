@@ -83,6 +83,7 @@ const MIGRATIONS: &[&str] = &[
     BLOBS,
     PACKING,
     GC,
+    UNREFERENCED_BY_LOG,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -447,4 +448,28 @@ CREATE TABLE gc_runs (
     unreferenced_check  TIMESTAMPTZ NOT NULL DEFAULT '-infinity'
 );
 INSERT INTO gc_runs DEFAULT VALUES;
+"#;
+
+/// Migration 7: unreferenced blobs are found through the garbage log alone. The
+/// packer drops the blobs it logs once no part references them (see
+/// `packer::fold_garbage`), so the daily check for them, and its table, go.
+const UNREFERENCED_BY_LOG: &str = r#"
+DROP TABLE gc_runs;
+
+-- Log every blob a part is deleted from, an empty part's too: its blob may be
+-- left unreferenced just the same.
+CREATE OR REPLACE FUNCTION log_blob_garbage() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO blob_garbage (blob_id, size)
+        SELECT blob_id, sum(size) FROM gone GROUP BY blob_id;
+    RETURN NULL;
+END
+$$;
+
+-- Blobs that became unreferenced before the garbage log existed (migration 5)
+-- were never logged. Logging them now hands them to the packer too.
+INSERT INTO blob_garbage (blob_id, size)
+    SELECT b.blob_id, b.size FROM blobs b
+    WHERE b.state = 'committed'
+      AND NOT EXISTS (SELECT 1 FROM parts p WHERE p.blob_id = b.blob_id);
 "#;

@@ -239,6 +239,7 @@ pub async fn get_object(
 /// One part of an object for streaming: where its bytes live (a blob, the
 /// blob's block layout, and the offset in it), its size, and the blob's
 /// candidate replica locations, freshest node first.
+#[derive(Clone)]
 pub(crate) struct PartLocation {
     pub id: i64,
     pub blob_id: Uuid,

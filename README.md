@@ -257,8 +257,9 @@ packs data, once a minute on every node:
 - Each node checks its data directory for files the database doesn't know,
   and deletes them. It checks a slice at a time, getting through all of it in
   a day.
-- Once a day, one node checks the database for data that no object refers to
-  anymore, and deletes it.
+- Data that no object refers to anymore (because its last object was
+  deleted while other data shared its file, or a crash got in the way) is
+  deleted on the next pass.
 
 There's nothing to run or configure.
 

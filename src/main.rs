@@ -773,7 +773,8 @@ async fn try_commit_part(
              (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id, part_number,
               created_at)
          VALUES ($1, 0, $2, $3, $4, $5, $6, $7, NOW())";
-    let mut reap: Vec<ReapTarget> = Vec::new();
+    // Parts this transaction deletes; their blobs are dropped at its end.
+    let mut freed = Vec::new();
     let mut version_id = None;
     match attach {
         AttachTarget::Object {
@@ -802,7 +803,7 @@ async fn try_commit_part(
                 .await?
                 .unwrap_or(Versioning::Unversioned);
             let version = s3::versions::put_version(
-                &tx, bucket, key, versioning, size, etag, content_type, &mut reap,
+                &tx, bucket, key, versioning, size, etag, content_type, &mut freed,
             )
             .await?;
             version_id = version.version_id;
@@ -818,7 +819,7 @@ async fn try_commit_part(
         } => {
             // Displace any part previously uploaded at this number (S3 allows
             // re-uploading a part number), freeing the (upload_id, part_number)
-            // slot, and drop its blob unless something else still uses it.
+            // slot.
             let displaced = tx
                 .query(
                     "DELETE FROM parts WHERE upload_id = $1 AND part_number = $2
@@ -826,7 +827,7 @@ async fn try_commit_part(
                     &[upload_id, part_number],
                 )
                 .await?;
-            reap = drop_blobs_of_deleted_parts(&tx, &deleted_parts(&displaced)).await?;
+            freed.extend(deleted_parts(&displaced));
             tx.execute(
                 INSERT_PART,
                 &[&blob_id, &size, &etag, &crc, &None::<i64>, &Some(*upload_id), part_number],
@@ -834,6 +835,7 @@ async fn try_commit_part(
             .await?;
         }
     }
+    let reap = drop_blobs_of_deleted_parts(&tx, &freed).await?;
     tx.commit().await?;
     Ok(CommitResult::Committed { reap, version_id })
 }

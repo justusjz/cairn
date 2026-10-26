@@ -55,7 +55,10 @@ use uuid::Uuid;
 use crate::{
     App, BlobWriter, Written,
     db,
-    blobs::{BlobSlice, Location, ReapTarget, drop_unreferenced_blobs, reap_blobs, stream_blob_range},
+    blobs::{
+        BlobSlice, Location, ReapTarget, drop_unreferenced_blobs, reap_blobs, refresh_dead_size,
+        stream_blob_range,
+    },
     checksum::{self, BlockLayout},
 };
 
@@ -182,19 +185,31 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
     Ok(reports)
 }
 
-/// Adds the garbage logged since the last fold to `blobs.dead_size`. Folds
-/// running concurrently on several nodes each take different log rows.
-async fn fold_garbage(app: &App) -> anyhow::Result<()> {
-    let client = app.pool.get().await?;
-    client
-        .execute(
-            "WITH taken AS (DELETE FROM blob_garbage RETURNING blob_id, size),
-                  sums AS (SELECT blob_id, sum(size)::bigint AS size FROM taken GROUP BY blob_id)
-             UPDATE blobs b SET dead_size = b.dead_size + sums.size
-             FROM sums WHERE b.blob_id = sums.blob_id",
-            &[],
-        )
-        .await?;
+/// Takes the garbage log: the blobs that parts were deleted from since the
+/// last fold. Drops those that no part references anymore, and updates the
+/// `dead_size` of the rest. Folds running concurrently on several nodes each
+/// take different log rows.
+///
+/// This is how a blob is dropped when its last part is deleted by a path that
+/// leaves it (a packed blob), or a crash gets in the way. Every deleted part is
+/// logged, by the trigger, so nothing else needs to look for such blobs. Should
+/// a part be attached to a blob being dropped meanwhile (a copy of it), the
+/// parts FK fails the fold, which rolls back, and the next pass tries again.
+async fn fold_garbage(app: &Arc<App>) -> anyhow::Result<()> {
+    let mut client = app.pool.get().await?;
+    let tx = client.transaction().await?;
+    let logged: Vec<Uuid> = tx
+        .query("DELETE FROM blob_garbage RETURNING blob_id", &[])
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let reap = drop_unreferenced_blobs(&tx, &logged).await?;
+    // The log's sizes would count bytes that another part still shares as
+    // garbage, so the blobs' garbage is worked out afresh.
+    refresh_dead_size(&tx, &logged).await?;
+    tx.commit().await?;
+    reap_blobs(app, reap);
     Ok(())
 }
 
@@ -275,14 +290,28 @@ struct Part {
     /// The new blob it goes to (the job's first, second, ...), and where.
     output: usize,
     new_offset: u64,
+    /// The run it's copied with.
+    run: usize,
     /// The part's CRC64/NVME, or for a part from before checksums, its MD5
     /// (which is its ETag).
     crc64nvme: Option<u64>,
     etag: String,
 }
 
-/// A contiguous range of a source blob, copied in one read: one or more parts
-/// that sit back to back in the source and stay that way in a new blob.
+/// A byte range of a source blob that's copied as a whole: the bytes its parts
+/// point at, combined where two parts point at the same bytes (as a copy's part
+/// and its source's do). So those bytes are copied once, and both parts point
+/// at the one copy afterwards.
+struct Extent {
+    blob_id: Uuid,
+    offset: u64,
+    length: u64,
+    /// The first of its parts, in the order the parts are laid out by.
+    first: usize,
+}
+
+/// A contiguous range of a source blob, copied in one read: one or more
+/// extents that sit back to back in the source and stay that way in a new blob.
 struct Run {
     output: usize,
     blob_id: Uuid,
@@ -318,29 +347,17 @@ async fn pack(
     let mut parts = load_parts(&client, sources).await?;
     let blobs = load_blobs(&client, app.node, sources).await?;
     drop(client);
-    // Parts must not overlap: each is copied on its own, and gets its own range
-    // in the new blob. Parts never share bytes yet; should a blob hold any that
-    // do, it's left alone, and keeps its lease, so that passes don't keep
-    // claiming it. (Metadata-only copies will share ranges, and need a design
-    // for this, and for counting garbage in shared ranges.)
-    let overlapping = overlapping_blobs(&parts);
-    parts.retain(|p| !overlapping.contains(&p.blob_id));
-    let sources: Vec<Uuid> = sources
-        .iter()
-        .copied()
-        .filter(|s| !overlapping.contains(s))
-        .collect();
-    let report = |parts: &[Part], written: &[Written]| JobReport {
+    let report = |parts: &[Part], runs: &[Run], written: &[Written]| JobReport {
         kind,
         sources: sources.len(),
         parts: parts.len(),
-        bytes: parts.iter().map(|p| p.size).sum(),
+        bytes: runs.iter().map(|r| r.length).sum(),
         outputs: written.iter().map(|w| w.blob_id).collect(),
     };
     if parts.is_empty() {
         // Nothing left to move: the sources are garbage already.
-        commit(app, &sources, &[], &[]).await?;
-        return Ok(report(&parts, &[]));
+        commit(app, sources, &[], &[]).await?;
+        return Ok(report(&parts, &[], &[]));
     }
     let runs = lay_out(&mut parts, app.pack.target_size);
     reached(app, Stage::Loaded).await;
@@ -380,8 +397,8 @@ async fn pack(
         verify(app, output, &parts[start..end]).await?;
     }
     reached(app, Stage::Verified).await;
-    commit(app, &sources, &written, &parts).await?;
-    Ok(report(&parts, &written))
+    commit(app, sources, &written, &parts).await?;
+    Ok(report(&parts, &runs, &written))
 }
 
 /// Loads the parts of `sources` in the order they're to be laid out: by age
@@ -411,6 +428,7 @@ async fn load_parts(client: &Object, sources: &[Uuid]) -> anyhow::Result<Vec<Par
             size: r.get::<_, i64>(3) as u64,
             output: 0,
             new_offset: 0,
+            run: 0,
             crc64nvme: r.get::<_, Option<i64>>(4).map(|crc| crc as u64),
             etag: r.get(5),
         })
@@ -449,68 +467,93 @@ async fn load_blobs(
     Ok(blobs)
 }
 
-/// The blobs in which two of `parts` overlap.
-fn overlapping_blobs(parts: &[Part]) -> Vec<Uuid> {
-    let mut ranges: Vec<(Uuid, u64, u64)> = parts
-        .iter()
-        .map(|p| (p.blob_id, p.offset, p.offset + p.size))
-        .collect();
-    ranges.sort();
-    let mut overlapping: Vec<Uuid> = ranges
-        .windows(2)
-        .filter(|w| w[0].0 == w[1].0 && w[1].1 < w[0].2)
-        .map(|w| w[0].0)
-        .collect();
-    overlapping.dedup();
-    overlapping
-}
-
-/// Splits `parts`, in their order, among as few new blobs as hold them at
-/// `target` bytes each, about the same amount in each, and gives each part its
-/// place: back to back in its new blob. Groups them into runs that can each be
-/// copied in one read.
+/// Lays out `parts`, given in the order to lay them out by. Combines the byte
+/// ranges they point at into extents, and splits those, in the order of their first parts, among as few
+/// new blobs as hold them at `target` bytes each, about the same amount in each,
+/// back to back. Each part keeps its distance from its extent's start. Groups
+/// the extents into runs that can each be copied in one read, and sorts the
+/// parts by run, and so by new blob and place in it.
 fn lay_out(parts: &mut [Part], target: u64) -> Vec<Run> {
-    let total: u64 = parts.iter().map(|p| p.size).sum();
-    let shares = total.div_ceil(target).max(1);
-    let mut runs: Vec<Run> = Vec::new();
-    // Where the part starts in all the data back to back, which equal share of
-    // it that is, and which new blob that share went to. A part goes to the
-    // share it starts in, so the blobs differ in size by at most a part. A part
-    // larger than a share leaves the next one empty, so a blob can hold more
-    // than one share.
-    let mut start = 0;
-    let mut share = 0;
-    let mut output = 0;
-    let mut cursor = 0;
-    for (i, part) in parts.iter_mut().enumerate() {
-        // Empty parts at the very end start at `total`, past the last share.
-        let part_share = (start * shares / total.max(1)).min(shares - 1);
-        if part_share != share {
-            share = part_share;
-            output += 1;
-            cursor = 0;
-        }
-        part.output = output;
-        part.new_offset = cursor;
-        cursor += part.size;
-        start += part.size;
-        match runs.last_mut() {
-            Some(run)
-                if run.output == output
-                    && run.blob_id == part.blob_id
-                    && run.offset + run.length == part.offset =>
-            {
-                run.length += part.size;
-                run.parts.end = i + 1;
+    // Each blob's parts, by offset; the ranges of those that overlap are
+    // combined into one extent.
+    let mut by_offset: Vec<usize> = (0..parts.len()).collect();
+    by_offset.sort_by_key(|&i| (parts[i].blob_id, parts[i].offset));
+    let mut extents: Vec<Extent> = Vec::new();
+    let mut extent_of = vec![0; parts.len()];
+    for i in by_offset {
+        let part = &parts[i];
+        match extents.last_mut() {
+            Some(e) if e.blob_id == part.blob_id && part.offset < e.offset + e.length => {
+                e.length = e.length.max(part.offset + part.size - e.offset);
+                e.first = e.first.min(i);
             }
-            _ => runs.push(Run {
-                output,
+            _ => extents.push(Extent {
                 blob_id: part.blob_id,
                 offset: part.offset,
                 length: part.size,
-                parts: i..i + 1,
+                first: i,
             }),
         }
+        extent_of[i] = extents.len() - 1;
+    }
+    let mut order: Vec<usize> = (0..extents.len()).collect();
+    order.sort_by_key(|&e| extents[e].first);
+
+    let total: u64 = extents.iter().map(|e| e.length).sum();
+    let shares = total.div_ceil(target).max(1);
+    let mut runs: Vec<Run> = Vec::new();
+    // Each extent's run, and its new place.
+    let mut placed = vec![(0, 0); extents.len()];
+    // Where the extent starts in all the data back to back, which equal share
+    // of it that is, and which new blob that share went to. An extent goes to
+    // the share it starts in, so the blobs differ in size by at most an extent.
+    // One larger than a share leaves the next one empty, so a blob can hold more
+    // than one share.
+    let (mut start, mut share, mut output, mut cursor) = (0, 0, 0, 0);
+    for e in order {
+        let extent = &extents[e];
+        // Empty extents at the very end start at `total`, past the last share.
+        let extent_share = (start * shares / total.max(1)).min(shares - 1);
+        if extent_share != share {
+            share = extent_share;
+            output += 1;
+            cursor = 0;
+        }
+        match runs.last_mut() {
+            Some(run)
+                if run.output == output
+                    && run.blob_id == extent.blob_id
+                    && run.offset + run.length == extent.offset =>
+            {
+                run.length += extent.length;
+            }
+            _ => runs.push(Run {
+                output,
+                blob_id: extent.blob_id,
+                offset: extent.offset,
+                length: extent.length,
+                parts: 0..0,
+            }),
+        }
+        placed[e] = (runs.len() - 1, cursor);
+        cursor += extent.length;
+        start += extent.length;
+    }
+    for (i, part) in parts.iter_mut().enumerate() {
+        let e = extent_of[i];
+        let (run, new_offset) = placed[e];
+        part.run = run;
+        part.output = runs[run].output;
+        part.new_offset = new_offset + (part.offset - extents[e].offset);
+    }
+    parts.sort_by_key(|p| (p.run, p.new_offset, p.size));
+    let mut next = 0;
+    for (r, run) in runs.iter_mut().enumerate() {
+        let first = next;
+        while parts.get(next).is_some_and(|p| p.run == r) {
+            next += 1;
+        }
+        run.parts = first..next;
     }
     runs
 }
@@ -610,14 +653,17 @@ async fn verify(app: &App, written: &Written, parts: &[Part]) -> anyhow::Result<
 }
 
 /// Checks the parts in a stream of the new blob's bytes. The parts must be in
-/// order of their new offsets, and not overlap.
+/// order of their new offsets; they may overlap.
 struct Verifier<'a> {
     parts: &'a [Part],
-    /// The next part to check, and the hash of what's been seen of it.
+    /// The next part to start checking.
     next: usize,
-    hash: PartHash,
+    /// The parts being checked, and the hash of what's been seen of each.
+    open: Vec<(usize, PartHash)>,
     /// Offset of the next byte in the blob.
     pos: u64,
+    /// The part that failed its check, if one has.
+    failed: Option<usize>,
 }
 
 enum PartHash {
@@ -659,68 +705,67 @@ impl<'a> Verifier<'a> {
         Verifier {
             parts,
             next: 0,
-            hash: PartHash::new(parts.first()),
+            open: Vec::new(),
             pos: 0,
+            failed: None,
         }
     }
 
-    fn update(&mut self, mut data: &[u8]) {
-        if self.failed() {
+    /// Takes the next `data` of the blob.
+    fn update(&mut self, data: &[u8]) {
+        if self.failed.is_some() {
             return;
         }
-        while let Some(part) = self.parts.get(self.next) {
-            // Skip to the part's start (past padding).
-            let skip = (part.new_offset.saturating_sub(self.pos)).min(data.len() as u64);
-            self.pos += skip;
-            data = &data[skip as usize..];
-            if self.pos < part.new_offset {
-                return;
-            }
-            let take = (part.new_offset + part.size - self.pos).min(data.len() as u64);
-            self.hash.update(&data[..take as usize]);
-            self.pos += take;
-            data = &data[take as usize..];
-            if self.pos < part.new_offset + part.size {
-                return;
-            }
-            self.end_part();
-            if self.failed() {
-                return;
-            }
-        }
-    }
-
-    fn end_part(&mut self) {
-        let hash = std::mem::replace(&mut self.hash, PartHash::new(self.parts.get(self.next + 1)));
-        if hash.matches(&self.parts[self.next]) {
+        let parts = self.parts;
+        let (start, end) = (self.pos, self.pos + data.len() as u64);
+        // Open the parts that start by the end of `data` (an empty part at its
+        // very end too, so that it ends here).
+        while let Some(part) = parts.get(self.next)
+            && part.new_offset <= end
+        {
+            self.open.push((self.next, PartHash::new(Some(part))));
             self.next += 1;
-        } else {
-            // Stop checking; `finish` reports this part.
-            self.parts = &self.parts[..=self.next];
-            self.pos = u64::MAX;
         }
-    }
-
-    fn failed(&self) -> bool {
-        self.pos == u64::MAX
+        for (i, hash) in &mut self.open {
+            let part = &parts[*i];
+            let from = part.new_offset.max(start);
+            let to = (part.new_offset + part.size).min(end);
+            if from < to {
+                hash.update(&data[(from - start) as usize..(to - start) as usize]);
+            }
+        }
+        // Check the parts that end by the end of `data`.
+        let mut k = 0;
+        while k < self.open.len() {
+            let part = &parts[self.open[k].0];
+            if part.new_offset + part.size > end {
+                k += 1;
+                continue;
+            }
+            let (i, hash) = self.open.remove(k);
+            if !hash.matches(part) {
+                self.failed = Some(i);
+                return;
+            }
+        }
+        self.pos = end;
     }
 
     fn finish(mut self) -> Result<(), String> {
         // Empty parts at the very end see no data, so they end here.
-        while !self.failed()
-            && let Some(part) = self.parts.get(self.next)
-            && part.size == 0
-            && part.new_offset == self.pos
-        {
-            self.end_part();
-        }
-        match self.parts.get(self.next) {
-            None => Ok(()),
-            Some(part) if self.failed() => Err(format!(
+        self.update(&[]);
+        if let Some(i) = self.failed {
+            let part = &self.parts[i];
+            return Err(format!(
                 "part {} doesn't match its checksum at offset {}",
                 part.id, part.new_offset
-            )),
-            Some(part) => Err(format!("part {} is cut short", part.id)),
+            ));
+        }
+        match self.open.first().map(|(i, _)| *i).or_else(|| {
+            (self.next < self.parts.len()).then_some(self.next)
+        }) {
+            None => Ok(()),
+            Some(i) => Err(format!("part {} is cut short", self.parts[i].id)),
         }
     }
 }
@@ -728,8 +773,8 @@ impl<'a> Verifier<'a> {
 /// The transaction that ends a job: commits the new blobs, moves each part
 /// that's still where the job found it into its new blob, and drops the sources
 /// and new blobs that nothing references anymore. A source that something
-/// still references (nothing can, yet) keeps the bytes that moved out of it as
-/// garbage. Releases the leases on the sources that remain.
+/// still references (a copy made meanwhile) keeps the bytes that moved out of
+/// it as garbage. Releases the leases on the sources that remain.
 async fn commit(
     app: &Arc<App>,
     sources: &[Uuid],
@@ -784,49 +829,23 @@ async fn try_commit(
     let old_offsets: Vec<i64> = parts.iter().map(|p| p.offset as i64).collect();
     let new_blobs: Vec<Uuid> = parts.iter().map(|p| written[p.output].blob_id).collect();
     let new_offsets: Vec<i64> = parts.iter().map(|p| p.new_offset as i64).collect();
-    let moved = tx
-        .query(
-            "UPDATE parts p SET blob_id = m.new_blob, blob_offset = m.new_offset
-             FROM unnest($1::bigint[], $2::uuid[], $3::bigint[], $4::uuid[], $5::bigint[])
-                 AS m(id, old_blob, old_offset, new_blob, new_offset)
-             WHERE p.id = m.id AND p.blob_id = m.old_blob AND p.blob_offset = m.old_offset
-             RETURNING m.old_blob, m.new_blob, p.size",
-            &[&ids, &old_blobs, &old_offsets, &new_blobs, &new_offsets],
-        )
-        .await?;
-    let mut moved_from: HashMap<Uuid, i64> = HashMap::new();
-    let mut moved_to: HashMap<Uuid, i64> = HashMap::new();
-    for row in &moved {
-        let size: i64 = row.get(2);
-        *moved_from.entry(row.get(0)).or_default() += size;
-        *moved_to.entry(row.get(1)).or_default() += size;
-    }
-    // In the new blobs, whatever didn't move in (its part was deleted
-    // meanwhile) is garbage.
-    let new_ids: Vec<Uuid> = written.iter().map(|w| w.blob_id).collect();
-    let live: Vec<i64> = new_ids
-        .iter()
-        .map(|id| moved_to.get(id).copied().unwrap_or(0))
-        .collect();
     tx.execute(
-        "UPDATE blobs b SET dead_size = b.size - m.live
-         FROM unnest($1::uuid[], $2::bigint[]) AS m(blob_id, live)
-         WHERE b.blob_id = m.blob_id",
-        &[&new_ids, &live],
+        "UPDATE parts p SET blob_id = m.new_blob, blob_offset = m.new_offset
+         FROM unnest($1::bigint[], $2::uuid[], $3::bigint[], $4::uuid[], $5::bigint[])
+             AS m(id, old_blob, old_offset, new_blob, new_offset)
+         WHERE p.id = m.id AND p.blob_id = m.old_blob AND p.blob_offset = m.old_offset",
+        &[&ids, &old_blobs, &old_offsets, &new_blobs, &new_offsets],
     )
     .await?;
-    let mut unreferenced = sources.to_vec();
-    unreferenced.extend(&new_ids);
-    let reap = drop_unreferenced_blobs(&tx, &unreferenced).await?;
-    let moved: Vec<i64> = sources
-        .iter()
-        .map(|s| moved_from.get(s).copied().unwrap_or(0))
-        .collect();
+    // Whatever didn't move into a new blob (its part was deleted meanwhile) is
+    // garbage there, and so is whatever moved out of a source that remains.
+    let mut touched = sources.to_vec();
+    touched.extend(written.iter().map(|w| w.blob_id));
+    refresh_dead_size(&tx, &touched).await?;
+    let reap = drop_unreferenced_blobs(&tx, &touched).await?;
     tx.execute(
-        "UPDATE blobs b SET dead_size = b.dead_size + m.moved, pack_lease_until = NULL
-         FROM unnest($1::uuid[], $2::bigint[]) AS m(blob_id, moved)
-         WHERE b.blob_id = m.blob_id",
-        &[&sources, &moved],
+        "UPDATE blobs SET pack_lease_until = NULL WHERE blob_id = ANY($1)",
+        &[&sources],
     )
     .await?;
     tx.commit().await?;
@@ -871,6 +890,7 @@ mod tests {
             size: data.len() as u64,
             output: 0,
             new_offset: 0,
+            run: 0,
             crc64nvme: (!md5).then(|| crc.sum64()),
             etag: Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect(),
         }
@@ -936,14 +956,39 @@ mod tests {
     }
 
     #[test]
-    fn overlaps_are_found_per_blob() {
-        let parts = vec![
-            part(1, 1, 0, b"aaaa", false),
-            part(2, 1, 4, b"bb", false),
-            part(3, 2, 0, b"aaaa", false),
-            part(4, 2, 3, b"bb", false),
+    fn shared_bytes_are_laid_out_once() {
+        // Part 2 is a copy of part 1, and part 3 of the end of it.
+        let mut parts = vec![
+            part(1, 1, 0, b"abcd", false),
+            part(4, 2, 0, b"xyz", false),
+            part(2, 1, 0, b"abcd", false),
+            part(3, 1, 2, b"cd", false),
         ];
-        assert_eq!(overlapping_blobs(&parts), [Uuid::from_u128(2)]);
+        let runs = lay_out(&mut parts, 100);
+        let placed: Vec<(i64, u64)> = parts.iter().map(|p| (p.id, p.new_offset)).collect();
+        // Sorted by place; the copies share the bytes of part 1.
+        assert_eq!(placed, [(1, 0), (2, 0), (3, 2), (4, 4)]);
+        let shape: Vec<(u128, u64, u64, std::ops::Range<usize>)> = runs
+            .iter()
+            .map(|r| (r.blob_id.as_u128(), r.offset, r.length, r.parts.clone()))
+            .collect();
+        assert_eq!(shape, [(1, 0, 4, 0..3), (2, 0, 3, 3..4)]);
+    }
+
+    #[test]
+    fn verifier_checks_overlapping_parts() {
+        let mut parts = vec![
+            part(1, 1, 0, b"abcd", false),
+            part(2, 1, 0, b"abcd", true),
+            part(3, 1, 2, b"cd", false),
+            part(4, 2, 0, b"xyz", false),
+        ];
+        lay_out(&mut parts, 100);
+        for chunk in [1, 2, 3, 100] {
+            assert_eq!(check(&parts, b"abcdxyz", chunk), Ok(()), "chunk {chunk}");
+        }
+        assert!(check(&parts, b"abcexyz", 2).unwrap_err().contains("doesn't match"));
+        assert!(check(&parts, b"abcdxy", 2).unwrap_err().contains("cut short"));
     }
 
     /// Lays `parts` out and feeds the resulting blob (with `data` as the

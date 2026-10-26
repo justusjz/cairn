@@ -37,7 +37,7 @@ use crate::{
 
 mod buckets;
 pub(crate) mod conditional;
-mod multipart;
+pub(crate) mod multipart;
 pub(crate) mod objects;
 mod util;
 pub(crate) mod versions;

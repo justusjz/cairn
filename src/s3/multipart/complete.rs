@@ -241,7 +241,7 @@ async fn try_complete(
     let versioning = bucket_versioning(&tx, &bucket)
         .await?
         .unwrap_or(Versioning::Unversioned);
-    let mut reap = Vec::new();
+    let mut freed = Vec::new();
     let version = put_version(
         &tx,
         &bucket,
@@ -250,7 +250,7 @@ async fn try_complete(
         total_size,
         &final_etag,
         &content_type,
-        &mut reap,
+        &mut freed,
     )
     .await?;
     let part_numbers: Vec<i32> = requested.iter().map(|(pn, _)| *pn).collect();
@@ -269,7 +269,8 @@ async fn try_complete(
             &[upload_id],
         )
         .await?;
-    reap.extend(drop_blobs_of_deleted_parts(&tx, &deleted_parts(&unused)).await?);
+    freed.extend(deleted_parts(&unused));
+    let reap = drop_blobs_of_deleted_parts(&tx, &freed).await?;
     tx.execute(
         "DELETE FROM multipart_uploads WHERE upload_id = $1",
         &[upload_id],

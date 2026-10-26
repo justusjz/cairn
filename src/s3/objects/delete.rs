@@ -8,7 +8,7 @@ use tokio_postgres::IsolationLevel;
 use crate::{
     App,
     auth::BodyChecksum,
-    blobs::{ReapTarget, reap_blobs},
+    blobs::{ReapTarget, drop_blobs_of_deleted_parts, reap_blobs},
     db,
     s3::util::{
         format_s3_error, slow_down, with_delete_marker, with_version_id, xml_escape, xml_ok,
@@ -50,12 +50,13 @@ async fn try_delete(
     let Some(versioning) = bucket_versioning(&tx, bucket).await? else {
         return Ok((DeleteStatus::NoSuchBucket, Vec::new())); // tx rolls back on drop
     };
-    let mut reap = Vec::new();
+    let mut freed = Vec::new();
     let mut outcomes = Vec::with_capacity(targets.len());
     for t in targets {
         let version_id = t.version_id.as_deref();
-        outcomes.push(delete_key(&tx, bucket, &t.key, versioning, version_id, &mut reap).await?);
+        outcomes.push(delete_key(&tx, bucket, &t.key, versioning, version_id, &mut freed).await?);
     }
+    let reap = drop_blobs_of_deleted_parts(&tx, &freed).await?;
     tx.commit().await?;
     Ok((DeleteStatus::Deleted(outcomes), reap))
 }

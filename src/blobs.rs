@@ -42,15 +42,20 @@ pub(crate) fn reap_targets(rows: &[tokio_postgres::Row]) -> Vec<ReapTarget> {
         .collect()
 }
 
+/// A part deleted in a transaction: its blob, and its size. At the end of
+/// the transaction, `drop_blobs_of_deleted_parts` drops the blobs that held
+/// nothing else.
+pub(crate) type FreedPart = (Uuid, i64);
+
 /// The blob and size of each part deleted by a `DELETE FROM parts …
 /// RETURNING blob_id, size`.
-pub(crate) fn deleted_parts(rows: &[tokio_postgres::Row]) -> Vec<(Uuid, i64)> {
+pub(crate) fn deleted_parts(rows: &[tokio_postgres::Row]) -> Vec<FreedPart> {
     rows.iter().map(|r| (r.get(0), r.get(1))).collect()
 }
 
-/// Deletes the blobs that `deleted` parts (the blob and size of each, just
-/// deleted in the same transaction) held on their own, unless something else
-/// still references them, cascading their locations away. Returns those
+/// Deletes the blobs that `deleted` parts (just deleted in the same
+/// transaction) held on their own, unless something else still references them
+/// (another object's copy, say), cascading their locations away. Returns those
 /// locations, for the caller to reap after commit.
 ///
 /// Only a blob the size of the deleted part can have held nothing else, so
@@ -61,7 +66,7 @@ pub(crate) fn deleted_parts(rows: &[tokio_postgres::Row]) -> Vec<(Uuid, i64)> {
 /// once all of it is garbage.
 pub(crate) async fn drop_blobs_of_deleted_parts<C: GenericClient>(
     client: &C,
-    deleted: &[(Uuid, i64)],
+    deleted: &[FreedPart],
 ) -> Result<Vec<ReapTarget>, tokio_postgres::Error> {
     if deleted.is_empty() {
         return Ok(Vec::new());
@@ -124,6 +129,33 @@ pub(crate) async fn drop_unreferenced_blobs<C: GenericClient>(
         )
         .await?;
     Ok(reap_targets(&rows))
+}
+
+/// Sets the `dead_size` of `blob_ids` to exactly the bytes that no part
+/// references: a blob's size, less the union of its parts' byte ranges. (Parts
+/// can share bytes, through copies, so their sizes can't just be added up.)
+pub(crate) async fn refresh_dead_size<C: GenericClient>(
+    client: &C,
+    blob_ids: &[Uuid],
+) -> Result<(), tokio_postgres::Error> {
+    client
+        .execute(
+            "UPDATE blobs b SET dead_size = b.size - coalesce(live.bytes, 0)
+             FROM (SELECT DISTINCT unnest($1::uuid[]) AS blob_id) AS t
+             LEFT JOIN (
+                 SELECT blob_id, sum(upper(r) - lower(r))::bigint AS bytes
+                 FROM (
+                     SELECT blob_id, unnest(range_agg(int8range(blob_offset, blob_offset + size))) AS r
+                     FROM parts WHERE blob_id = ANY($1)
+                     GROUP BY blob_id
+                 ) AS ranges
+                 GROUP BY blob_id
+             ) AS live ON live.blob_id = t.blob_id
+             WHERE b.blob_id = t.blob_id",
+            &[&blob_ids],
+        )
+        .await?;
+    Ok(())
 }
 
 /// Best-effort: once a set of blobs has been removed from the catalog, ask each
