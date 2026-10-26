@@ -97,6 +97,12 @@ impl Store {
         }
     }
 
+    /// Where a blob's file lives, for tests that tamper with it.
+    #[cfg(test)]
+    pub fn blob_path(&self, blob_id: Uuid) -> PathBuf {
+        self.get_blob_dir(blob_id).join(blob_id.to_string())
+    }
+
     /// Deletes a blob's on-disk file. Idempotent: a missing file is not an error.
     pub async fn remove_blob(&self, blob_id: Uuid) -> anyhow::Result<()> {
         let blob_dir = self.get_blob_dir(blob_id);

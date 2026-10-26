@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=73
+TOTAL=76
 STEP=0
 PASS=0
 FAIL=0
@@ -1021,6 +1021,186 @@ prune_empty_dirs_ok() {
     [ "$after" -lt "$before" ]
 }
 
+# ─── Packing ───
+# pack_now — runs a packing pass on the server now, as the background one
+# (every minute) would. The peer endpoint answers once the pass is done. The
+# background pass may get to the work first, so the tests check what packing
+# did, not which pass did it.
+pack_now() { curl -fsS -X POST "http://${SERVER_HOST}:9431/pack" >/dev/null 2>&1; }
+
+# packed_until <cmd...> — runs packing passes until <cmd> holds (for up to two
+# minutes, while a background pass may still be busy with the work).
+packed_until() {
+    local i
+    for i in $(seq 1 60); do
+        pack_now
+        "$@" && return 0
+        sleep 2
+    done
+    return 1
+}
+
+# sql <query> — runs a query against the catalog, printing the bare result.
+sql() { podman exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$1"; }
+
+# Blobs small enough to be packed (up to 64 MiB).
+SMALL_BLOBS="FROM blobs WHERE state = 'committed' AND size <= 67108864"
+small_waiting() { sql "SELECT coalesce(sum(size), 0) $SMALL_BLOBS"; }
+no_small_blobs() { [ "$(sql "SELECT count(*) $SMALL_BLOBS")" = 0 ]; }
+# The packed blobs.
+large_blobs() { sql "SELECT string_agg(blob_id::text, ',' ORDER BY blob_id) FROM blobs WHERE size > 67108864"; }
+
+# accounting_ok — every byte of every referenced blob is either a live part or
+# counted as garbage. Right after a pass, which folds the garbage log.
+accounting_ok() {
+    [ "$(sql "SELECT (SELECT coalesce(sum(b.size - b.dead_size), 0) FROM blobs b
+                      WHERE b.state = 'committed'
+                        AND EXISTS (SELECT 1 FROM parts p WHERE p.blob_id = b.blob_id))
+                   = (SELECT coalesce(sum(size), 0) FROM parts)")" = t ]
+}
+
+# bytes_at_most <n> — the data dir holds at most <n> bytes.
+bytes_at_most() { [ "$(du -sb "$WORK_DIR/data" | cut -f1)" -le "$1" ]; }
+
+PACK_DIR="$WORK_DIR/pack"
+PACK_VBUCKET="packver-$(date +%s)"
+
+# Uploads 120 small objects of different sizes, two versions of an object in a
+# versioned bucket and two staged parts of a multipart upload, then objects of
+# 63 MiB until the small blobs waiting (these, and the others stored so far, like
+# the parts of multi.bin) fill a 256 MiB blob. Packing can't start before the
+# last of them lands, so all of them are consolidated, into two blobs.
+# Everything reads back intact: whole, ranged, the old version, and the upload
+# once it's completed.
+pack_consolidates_ok() {
+    local dir="$PACK_DIR" i v1 v2 uid e1 e2 fills=0
+    mkdir -p "$dir/up"
+    for i in $(seq 1 120); do head -c $((i * 1024)) /dev/urandom >"$dir/up/o$i"; done
+    for i in v1 v2 p1 p2; do head -c 3000 /dev/urandom >"$dir/$i"; done
+    awss3 s3 cp --recursive "$dir/up" "s3://${BUCKET}/pack/" >/dev/null 2>&1 || return 1
+    mb_granted "$PACK_VBUCKET" >/dev/null 2>&1 || return 1
+    cairn_role grant "$ACCESS_KEY" "$PACK_VBUCKET" delete-version >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-versioning --bucket "$PACK_VBUCKET" \
+        --versioning-configuration Status=Enabled >/dev/null 2>&1 || return 1
+    v1=$(awss3 s3api put-object --bucket "$PACK_VBUCKET" --key k --body "$dir/v1" \
+        --query VersionId --output text 2>/dev/null) || return 1
+    v2=$(awss3 s3api put-object --bucket "$PACK_VBUCKET" --key k --body "$dir/v2" \
+        --query VersionId --output text 2>/dev/null) || return 1
+    uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key pack-mpu \
+        --query UploadId --output text 2>/dev/null) || return 1
+    e1=$(awss3 s3api upload-part --bucket "$BUCKET" --key pack-mpu --upload-id "$uid" \
+        --part-number 1 --body "$dir/p1" --query ETag --output text 2>/dev/null) || return 1
+    e2=$(awss3 s3api upload-part --bucket "$BUCKET" --key pack-mpu --upload-id "$uid" \
+        --part-number 2 --body "$dir/p2" --query ETag --output text 2>/dev/null) || return 1
+    # One at a time, and each in a single PUT, so the blob only fills once the
+    # last one is complete.
+    while [ "$(small_waiting)" -lt 268435456 ]; do
+        fills=$((fills + 1))
+        [ "$fills" -le 6 ] || return 1
+        head -c $((63 * 1024 * 1024)) /dev/urandom >"$dir/up/fill$fills"
+        awss3 s3api put-object --bucket "$BUCKET" --key "pack/fill$fills" \
+            --body "$dir/up/fill$fills" >/dev/null 2>&1 || return 1
+    done
+
+    packed_until no_small_blobs || return 1
+    [ "$(sql "SELECT count(*) FROM blobs WHERE state = 'committed'")" = 2 ] || return 1
+    accounting_ok || return 1
+
+    awss3 s3 cp --recursive "s3://${BUCKET}/pack/" "$dir/down" >/dev/null 2>&1 || return 1
+    diff -r "$dir/up" "$dir/down" >/dev/null || return 1
+    range_ok pack/o100 1000 1999 "$dir/up/o100" || return 1
+    check_roundtrip "$MULTIPART" "s3://${BUCKET}/multi.bin" || return 1
+    for i in v1 v2; do
+        awss3 s3api get-object --bucket "$PACK_VBUCKET" --key k --version-id="${!i}" \
+            "$dir/$i.dl" >/dev/null 2>&1 || return 1
+        cmp -s "$dir/$i" "$dir/$i.dl" || return 1
+    done
+    awss3 s3api complete-multipart-upload --bucket "$BUCKET" --key pack-mpu --upload-id "$uid" \
+        --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":${e1}},{\"PartNumber\":2,\"ETag\":${e2}}]}" \
+        >/dev/null 2>&1 || return 1
+    cat "$dir/p1" "$dir/p2" >"$dir/mpu"
+    check_roundtrip "$dir/mpu" "s3://${BUCKET}/pack-mpu" || return 1
+
+    for i in "$v1" "$v2"; do
+        awss3 s3api delete-object --bucket "$PACK_VBUCKET" --key k --version-id="$i" \
+            >/dev/null 2>&1 || return 1
+    done
+    awss3 s3api delete-bucket --bucket "$PACK_VBUCKET" >/dev/null 2>&1 || return 1
+    s3 del "s3://${BUCKET}/pack-mpu" >/dev/null 2>&1
+}
+
+# Small blobs that don't fill a blob aren't worth packing yet, and a packed
+# blob with a little garbage isn't worth rewriting: packing leaves both alone.
+pack_below_thresholds_ok() {
+    local dir="$PACK_DIR" i packed
+    mkdir -p "$dir/few"
+    for i in $(seq 1 50); do head -c 1000 /dev/urandom >"$dir/few/f$i"; done
+    awss3 s3 cp --recursive "$dir/few" "s3://${BUCKET}/pack-few/" >/dev/null 2>&1 || return 1
+    # o1-o5 are the smallest packed objects: well under a quarter of a blob.
+    for i in 1 2 3 4 5; do
+        s3 del "s3://${BUCKET}/pack/o$i" >/dev/null 2>&1 || return 1
+        rm "$dir/up/o$i"
+    done
+    packed=$(large_blobs)
+    pack_now || return 1
+    [ "$(sql "SELECT count(*) $SMALL_BLOBS")" = 50 ] || return 1
+    [ "$(large_blobs)" = "$packed" ] || return 1
+    accounting_ok || return 1
+    awss3 s3 rm --recursive "s3://${BUCKET}/pack-few/" >/dev/null 2>&1
+}
+
+# no_sparse_blobs — no blob is a quarter garbage or more. Right after a pass.
+no_sparse_blobs() {
+    [ "$(sql "SELECT count(*) FROM blobs WHERE dead_size > 0 AND dead_size >= size / 4")" = 0 ]
+}
+
+# disk_matches_catalog — the data dir holds no more than the blobs in the
+# catalog (plus their checksum tables, and the directories): the files of
+# dropped blobs are gone.
+disk_matches_catalog() {
+    local blobs dirs
+    blobs=$(sql "SELECT coalesce(sum(size), 0) FROM blobs")
+    dirs=$(find "$WORK_DIR/data" -type d | wc -l)
+    bytes_at_most $((blobs + blobs / 1000 + dirs * 4096 + 1048576))
+}
+
+# Deletes the large objects and the larger half of the small ones, so most of
+# the packed blobs is garbage: they're compacted until none is a quarter
+# garbage anymore, and the space is freed. What's left still reads back intact,
+# and the deleted objects stay gone.
+pack_compacts_ok() {
+    local dir="$PACK_DIR" i keys packed before fills
+    # Tests run in subshells, so count the 63 MiB objects the packing test made.
+    fills=$(find "$dir/up" -name 'fill*' | wc -l)
+    keys=$(for i in $(seq 61 120); do printf '{"Key":"pack/o%s"},' "$i"; done
+           for i in $(seq 1 "$fills"); do printf '{"Key":"pack/fill%s"},' "$i"; done)
+    packed=$(large_blobs)
+    before=$(sql "SELECT sum(size) FROM blobs")
+    awss3 s3api delete-objects --bucket "$BUCKET" \
+        --delete "{\"Objects\":[${keys%,}]}" >/dev/null 2>&1 || return 1
+    # Deleting objects from packed blobs frees nothing until they're compacted.
+    packed_until eval '[ "$(large_blobs)" != "$packed" ] && no_sparse_blobs' || {
+        echo "not compacted: $(sql "SELECT blob_id, size, dead_size FROM blobs WHERE size > 67108864")"
+        return 1
+    }
+    [ "$(sql "SELECT sum(size) FROM blobs")" -le $((before - fills * 63 * 1024 * 1024)) ] || {
+        echo "blobs shrank from $before to $(sql "SELECT sum(size) FROM blobs") bytes only"
+        return 1
+    }
+    packed_until disk_matches_catalog || {
+        echo "data dir: $(du -sb "$WORK_DIR/data" | cut -f1) bytes, blobs: $(sql "SELECT sum(size) FROM blobs")"
+        return 1
+    }
+    accounting_ok || return 1
+    for i in $(seq 61 120); do rm "$dir/up/o$i"; done
+    rm "$dir"/up/fill*
+    rm -rf "$dir/down"
+    awss3 s3 cp --recursive "s3://${BUCKET}/pack/" "$dir/down" >/dev/null 2>&1 || return 1
+    diff -r "$dir/up" "$dir/down" >/dev/null || return 1
+    check_roundtrip "$MULTIPART" "s3://${BUCKET}/multi.bin" || return 1
+    awss3 s3 rm --recursive "s3://${BUCKET}/pack/" >/dev/null 2>&1
+}
+
 echo ""
 echo "${BOLD}Running tests against s3://${BUCKET}${RESET}"
 echo ""
@@ -1167,6 +1347,9 @@ run_test    "Unversioned bucket lists null versions" list_versions_unversioned_o
 run_test    "Listing versions needs read"            list_versions_needs_read_ok
 run_test    "Delete markers keep a bucket non-empty" versioned_bucket_not_empty_ok
 run_test    "Prune removes empty shard dirs"         prune_empty_dirs_ok
+run_test    "Packer consolidates small blobs"        pack_consolidates_ok
+run_test    "Packer leaves too little alone"         pack_below_thresholds_ok
+run_test    "Packer compacts mostly-dead blobs"      pack_compacts_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets

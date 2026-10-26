@@ -61,7 +61,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=15
+TOTAL=19
 STEP=0
 PASS=0
 FAIL=0
@@ -266,6 +266,10 @@ FILE_A="$WORK_DIR/a.txt";  printf 'object A: uploaded while all nodes were up\n'
 FILE_B="$WORK_DIR/b.bin";  dd if=/dev/urandom of="$FILE_B" bs=1M count=4 status=none
 FILE_C="$WORK_DIR/c.txt";  printf 'object C: uploaded with one node down\n' >"$FILE_C"
 FILE_D="$WORK_DIR/d.txt";  printf 'object D: uploaded after recovery\n' >"$FILE_D"
+# Small objects to pack. Objects of 63 MiB are added while uploading, until
+# the small blobs fill a 256 MiB blob.
+PACK_DIR="$WORK_DIR/pack"; mkdir -p "$PACK_DIR"
+for i in $(seq 1 120); do head -c $((i * 256)) /dev/urandom >"$PACK_DIR/o$i"; done
 
 roundtrip_via() {  # roundtrip_via <instance> <localfile> <s3uri>
     local n="$1" src="$2" uri="$3" dst="$WORK_DIR/dl.$RANDOM"
@@ -275,6 +279,42 @@ roundtrip_via() {  # roundtrip_via <instance> <localfile> <s3uri>
 
 list_contains_via() {  # list_contains_via <instance> <s3 ls target> <needle>
     s3i "$1" ls "$2" 2>/dev/null | grep -qF "$3"
+}
+
+sql() { podman exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$1"; }
+SMALL_BLOBS="FROM blobs WHERE state = 'committed' AND size <= 67108864"
+
+# upload_to_pack_via <instance> — uploads the small objects, then objects of
+# 63 MiB, one at a time and each in a single PUT, until the small blobs fill a
+# 256 MiB blob. So packing can't start before the last of them lands.
+upload_to_pack_via() {
+    local n=0
+    s3i "$1" sync "$PACK_DIR/" "s3://${BUCKET}/pack/" >/dev/null 2>&1 || return 1
+    while [ "$(sql "SELECT coalesce(sum(size), 0) $SMALL_BLOBS")" -lt 268435456 ]; do
+        n=$((n + 1))
+        [ "$n" -le 6 ] || return 1
+        head -c $((63 * 1024 * 1024)) /dev/urandom >"$PACK_DIR/fill$n"
+        s3i "$1" --disable-multipart put "$PACK_DIR/fill$n" "s3://${BUCKET}/pack/fill$n" \
+            >/dev/null 2>&1 || return 1
+    done
+}
+
+# packed_via <instance> — runs packing passes on that node until every small
+# blob is packed (a background pass on any node may do it first).
+packed_via() {
+    local i
+    for i in $(seq 1 60); do
+        curl -fsS -X POST "http://${SERVER_HOST}:$(peer_port "$1")/pack" >/dev/null 2>&1
+        [ "$(sql "SELECT count(*) $SMALL_BLOBS")" = 0 ] && return 0
+        sleep 2
+    done
+    return 1
+}
+
+packed_roundtrip_via() {  # packed_roundtrip_via <instance> — the packed objects read back intact
+    local dst="$WORK_DIR/packdl.$RANDOM"
+    s3i "$1" sync "s3://${BUCKET}/pack/" "$dst/" >/dev/null 2>&1 || return 1
+    diff -r "$PACK_DIR" "$dst" >/dev/null
 }
 
 echo ""
@@ -289,12 +329,16 @@ run_test "Download A via node 3 matches"            roundtrip_via 3 "$FILE_A" "s
 run_test "Listing via node 2 shows A"               list_contains_via 2 "s3://${BUCKET}" "a.txt"
 run_test "Upload 4 MiB binary B via node 2"         s3i 2 put "$FILE_B" "s3://${BUCKET}/b.bin"
 run_test "Download B via node 1 matches"            roundtrip_via 1 "$FILE_B" "s3://${BUCKET}/b.bin"
+run_test "Upload objects to pack via node 1"        upload_to_pack_via 1
+run_test "They're packed (passes on node 3)"        packed_via 3
+run_test "Packed objects read back via node 2"      packed_roundtrip_via 2
 
 # ─── 6. Phase B: one node down (within tolerance) ────────────────────────────
 phase "Phase B: node 3 crashed — cluster must keep working"
 kill_instance 3
 run_test "Download A via node 1 still matches"      roundtrip_via 1 "$FILE_A" "s3://${BUCKET}/a.txt"
 run_test "Download B via node 2 still matches"      roundtrip_via 2 "$FILE_B" "s3://${BUCKET}/b.bin"
+run_test "Packed objects still read back via node 1" packed_roundtrip_via 1
 run_test "Upload C via node 2 still works"          s3i 2 put "$FILE_C" "s3://${BUCKET}/c.txt"
 run_test "Download C via node 1 matches"            roundtrip_via 1 "$FILE_C" "s3://${BUCKET}/c.txt"
 

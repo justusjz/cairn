@@ -863,6 +863,9 @@ async fn abandon(app: &Arc<App>, blob_id: Uuid) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
+mod e2e;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
