@@ -224,6 +224,27 @@ of Cairn has no checksums and is read unverified.
 When writing, each replica reports a checksum of what it stored, and the upload
 fails unless every replica stored exactly the bytes that were sent.
 
+## Packing
+
+Every blob takes up rows in the database (one per replica), and is the unit
+data is moved around in. So every node runs a packer in the background, once a
+minute, which keeps blobs large without wasting much space:
+
+- **Smaller objects are packed together.** Blobs up to 64 MiB are packed into
+  blobs of 256 MiB, once there are enough of them to fill one. Packing writes
+  the data a second time, but only once: the packed blobs are too large to be
+  packed again. Lots of tiny objects are packed even
+  before they fill a blob, once 10,000 of them are waiting.
+- **Packed blobs are compacted.** Deleting an object that lives in a packed blob
+  frees no disk space by itself. Once at least a quarter of a packed blob is
+  garbage, its remaining data is rewritten, together with that
+  of other such blobs, into as few new blobs as hold it.
+
+Data is laid out by age, so data that is likely to be deleted together is
+stored together. Packed data is verified against its checksums before it
+replaces the original, and reads in progress follow the data to its new blob.
+The nodes coordinate through the database, so each blob is packed only once.
+
 ## Garbage collection
 
 Failed uploads and orphaned blobs (e.g. left behind by a crash or re-balancing)

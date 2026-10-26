@@ -126,6 +126,10 @@ pub(crate) struct BlobSlice {
     pub locations: Vec<Location>,
     pub offset: u64,
     pub length: u64,
+    /// The part whose bytes these are (`parts.id`) and its offset in this blob,
+    /// to find them again if the packer moves the part to another blob while
+    /// they're being read.
+    pub part: Option<(i64, u64)>,
 }
 
 /// Streams `slice` to `tx`, verifying it against the blob's block checksums.
@@ -138,9 +142,11 @@ pub(crate) struct BlobSlice {
 /// sees the bad bytes. A corrupt block is logged loudly; repairing it is left to
 /// a future scrub/repair job. Blobs written before checksums existed are
 /// streamed unverified, but still with failover.
+///
+/// On failure, `slice` is narrowed to the bytes that weren't forwarded.
 pub(crate) async fn stream_blob_range(
     app: &App,
-    slice: &BlobSlice,
+    slice: &mut BlobSlice,
     tx: &FrameSender,
 ) -> io::Result<()> {
     let blob_id = slice.blob_id;
@@ -192,6 +198,8 @@ pub(crate) async fn stream_blob_range(
         }
         failed_here = if pos > before { 1 } else { failed_here + 1 };
     }
+    slice.offset = pos;
+    slice.length = end - pos;
     Err(io::Error::other(format!(
         "no replica could serve blob {blob_id} from offset {pos}"
     )))

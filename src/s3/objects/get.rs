@@ -240,6 +240,7 @@ pub async fn get_object(
 /// blob's block layout, and the offset in it), its size, and the blob's
 /// candidate replica locations, freshest node first.
 pub(crate) struct PartLocation {
+    pub id: i64,
     pub blob_id: Uuid,
     pub layout: Option<BlockLayout>,
     pub blob_offset: u64,
@@ -259,7 +260,7 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
     let rows = client
         .query(
             "SELECT p.part_number, p.blob_id, p.blob_offset, p.size, b.size, b.block_size,
-                    bl.node, n.peer_url
+                    bl.node, n.peer_url, p.id
              FROM parts p
              JOIN blobs b ON b.blob_id = p.blob_id
              JOIN blob_locations bl ON bl.blob_id = p.blob_id
@@ -282,6 +283,7 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
                 blob_size: row.get::<_, i64>(4) as u64,
             });
             parts.push(PartLocation {
+                id: row.get(8),
                 blob_id: row.get(1),
                 layout,
                 blob_offset: row.get::<_, i64>(2) as u64,
@@ -323,6 +325,7 @@ pub(crate) fn select_parts_in_range(
             locations: part.locations,
             offset: part.blob_offset + (overlap_start - part_start),
             length: overlap_end - overlap_start,
+            part: Some((part.id, part.blob_offset)),
         });
     }
     slices
@@ -332,15 +335,77 @@ pub(crate) fn select_parts_in_range(
 /// verified and pulled from a replica (locally if that's us) by
 /// [`stream_blob_range`]. If any slice can't be served the stream is faulted.
 /// Shared by GetObject and the copy paths.
+///
+/// The packer may move a part to another blob after it was resolved, and reap
+/// the old one mid-read. So when a slice can't be served, its part is looked up
+/// again, and the rest is read from wherever it lives now.
 pub(crate) fn spawn_range_stream(app: Arc<App>, slices: Vec<BlobSlice>, sender: FrameSender) {
     tokio::spawn(async move {
-        for slice in slices {
-            if let Err(e) = stream_blob_range(&app, &slice, &sender).await {
-                let _ = sender.send(Err(e)).await;
-                return;
+        for mut slice in slices {
+            let mut moves = 0;
+            while let Err(e) = stream_blob_range(&app, &mut slice, &sender).await {
+                match relocate(&app, &slice).await {
+                    Ok(Some(moved)) if moves < MAX_RELOCATIONS => {
+                        slice = moved;
+                        moves += 1;
+                    }
+                    Ok(_) => {
+                        let _ = sender.send(Err(e)).await;
+                        return;
+                    }
+                    Err(lookup) => {
+                        eprintln!("looking up part of blob {} failed: {lookup:#}", slice.blob_id);
+                        let _ = sender.send(Err(e)).await;
+                        return;
+                    }
+                }
             }
         }
     });
+}
+
+/// How often a single read follows its part to a new blob before giving up.
+const MAX_RELOCATIONS: usize = 3;
+
+/// The rest of `slice` in the blob its part lives in now, or `None` if the part
+/// hasn't moved (so there's nowhere else to read it from) or is gone.
+async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSlice>> {
+    let Some((part_id, old_offset)) = slice.part else {
+        return Ok(None);
+    };
+    let client = app.pool.get().await?;
+    let rows = client
+        .query(
+            "SELECT p.blob_id, p.blob_offset, b.size, b.block_size, bl.node, n.peer_url
+             FROM parts p
+             JOIN blobs b ON b.blob_id = p.blob_id
+             JOIN blob_locations bl ON bl.blob_id = p.blob_id
+             JOIN nodes n ON n.id = bl.node
+             WHERE p.id = $1
+             ORDER BY n.last_seen DESC",
+            &[&part_id],
+        )
+        .await?;
+    let Some(row) = rows.first() else {
+        return Ok(None);
+    };
+    let blob_id: Uuid = row.get(0);
+    if blob_id == slice.blob_id {
+        return Ok(None);
+    }
+    let blob_offset = row.get::<_, i64>(1) as u64;
+    Ok(Some(BlobSlice {
+        blob_id,
+        layout: row.get::<_, Option<i32>>(3).map(|block_size| BlockLayout {
+            block_size: block_size as u64,
+            blob_size: row.get::<_, i64>(2) as u64,
+        }),
+        locations: rows.iter().map(|r| (r.get(4), r.get(5))).collect(),
+        // The slice keeps its offset within the part.
+        offset: blob_offset + (slice.offset - old_offset),
+        length: slice.length,
+        part: Some((part_id, blob_offset)),
+    }))
 }
 
 /// Parses a single-range `Range: bytes=…` header against the object `size` into a

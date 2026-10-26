@@ -8,7 +8,7 @@ use crate::{
     App, blob_file,
     checksum::BlockLayout,
     body::{ResBody, box_response, channel_body, send_file},
-    prune,
+    packer, prune,
 };
 
 /// The response for a failed peer request: a bare 500 (peers only check the
@@ -38,6 +38,21 @@ pub async fn handle(
             .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
             .body(body)
             .unwrap());
+    }
+    if path == "/pack" {
+        // For tests: run a packing pass now (as the background one would), and
+        // report what it did once it's done (a failed job is only logged).
+        let mut report = String::new();
+        for job in packer::pass(&app).await? {
+            report.push_str(&format!("{job}\n"));
+        }
+        return Ok(box_response(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
+                .body(Full::new(Bytes::from(report)))
+                .unwrap(),
+        ));
     }
     if let Some(blob_id) = path.strip_prefix("/blobs/") {
         // Parse the id up front: `blob_id` borrows `req` (via `path`), and

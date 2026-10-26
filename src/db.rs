@@ -40,7 +40,13 @@ const MIGRATION_LOCK: i64 = 0x6361_6972_6e00; // "cairn\0"
 /// The schema, as an ordered list of steps. Migration `n` (1-based) is
 /// `MIGRATIONS[n - 1]`; `schema_migrations` records which have been applied.
 /// Only ever append: an applied step must never change.
-const MIGRATIONS: &[&str] = &[INITIAL_SCHEMA, VERSIONING, DELETE_VERSION_GRANT, BLOBS];
+const MIGRATIONS: &[&str] = &[
+    INITIAL_SCHEMA,
+    VERSIONING,
+    DELETE_VERSION_GRANT,
+    BLOBS,
+    PACKING,
+];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
 /// the schema untouched. Refuses to run against a database migrated by a newer
@@ -341,4 +347,52 @@ ALTER TABLE parts
 -- Finding a blob's parts: is it still referenced, and (later) which parts to
 -- re-point when it's repacked.
 CREATE INDEX parts_blob ON parts (blob_id);
+"#;
+
+/// Migration 5: packing (see `packer`). Parts get their age, which the packer
+/// groups them by, and blobs get what the packer needs to pick and claim them:
+/// how many of their bytes are garbage, and a lease.
+pub(crate) const PACKING: &str = r#"
+-- When the part was created. It stays the same when the packer moves the part
+-- to another blob, so it's the age of the data, not of the blob holding it.
+-- Existing parts get their blob's creation time: until now, every blob was
+-- written for exactly one part.
+ALTER TABLE parts ADD COLUMN created_at TIMESTAMPTZ;
+UPDATE parts p SET created_at = b.created_at FROM blobs b WHERE b.blob_id = p.blob_id;
+ALTER TABLE parts ALTER COLUMN created_at SET NOT NULL;
+
+-- `dead_size`: bytes of the blob that no part references anymore, as of the
+-- packer's last fold of `blob_garbage`. Only packed blobs ever have any: a blob
+-- written for one part is dropped together with it.
+-- `pack_lease_until`: set while a packer is moving the blob's parts elsewhere,
+-- so other packers leave it alone. Expires on its own if that packer dies.
+ALTER TABLE blobs
+    ADD COLUMN dead_size BIGINT NOT NULL DEFAULT 0 CHECK (dead_size >= 0),
+    ADD COLUMN pack_lease_until TIMESTAMPTZ;
+
+-- Candidates for consolidation (up to `packer::SMALL_SIZE`, which must match),
+-- oldest first, and for compaction.
+CREATE INDEX blobs_small ON blobs (created_at)
+    WHERE state = 'committed' AND size <= 67108864;
+CREATE INDEX blobs_sparse ON blobs (blob_id) WHERE dead_size > 0;
+
+-- A log of bytes that became garbage: the sizes of deleted parts, per blob.
+-- The packer folds it into `blobs.dead_size`. Deleting parts only appends here,
+-- instead of updating the blob row directly, so that concurrent deletes of
+-- parts in the same packed blob don't conflict with each other. A trigger,
+-- since parts are also deleted by cascades (an object or upload going away).
+CREATE TABLE blob_garbage (
+    blob_id     UUID NOT NULL,
+    size        BIGINT NOT NULL
+);
+CREATE FUNCTION log_blob_garbage() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO blob_garbage (blob_id, size)
+        SELECT blob_id, sum(size) FROM gone GROUP BY blob_id HAVING sum(size) > 0;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER parts_garbage AFTER DELETE ON parts
+    REFERENCING OLD TABLE AS gone
+    FOR EACH STATEMENT EXECUTE FUNCTION log_blob_garbage();
 "#;

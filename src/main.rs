@@ -32,6 +32,7 @@ mod blobs;
 mod body;
 mod checksum;
 mod db;
+mod packer;
 mod prune;
 mod roles;
 mod s3;
@@ -45,6 +46,10 @@ pub struct App {
     node: i32,
     replication_factor: usize,
     writing: WritingSet,
+    pack: packer::Config,
+    /// Lets a test step in at set points of a packing job.
+    #[cfg(test)]
+    pack_hook: Option<packer::Hook>,
 }
 
 #[derive(Parser, Debug)]
@@ -127,8 +132,12 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         node,
         replication_factor: args.replication_factor,
         writing: WritingSet::default(),
+        pack: packer::Config::default(),
+        #[cfg(test)]
+        pack_hook: None,
     });
     tokio::spawn(heartbeat(app.clone(), peer_url));
+    tokio::spawn(packer::run(app.clone()));
 
     let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
     let listen_peer_addr = SocketAddr::from_str(&args.listen_peer).unwrap();
@@ -343,6 +352,169 @@ where
     Ok(file_crc.sum64())
 }
 
+/// A new blob being written to its replicas: a pending blob row, and a sink per
+/// replica (local or remote) fed through a bounded channel, so the slowest one
+/// applies backpressure. Computes the blob's checksums as the data passes.
+/// Shared by uploads and the packer.
+pub(crate) struct BlobWriter {
+    pub blob_id: Uuid,
+    pub replicas: Vec<Location>,
+    senders: Vec<FrameSender>,
+    sinks: JoinSet<anyhow::Result<u64>>,
+    summer: BlobSummer,
+    crc: crc64fast_nvme::Digest,
+    size: u64,
+}
+
+impl BlobWriter {
+    /// Creates the pending blob and starts a sink on each of its replicas.
+    pub(crate) async fn begin(app: &Arc<App>) -> anyhow::Result<BlobWriter> {
+        let client = app.pool.get().await?;
+        // Time-ordered, so new blobs land at the end of the indexes on blob_id.
+        let blob_id = Uuid::now_v7();
+        // Its size isn't known until all the data has passed, so it starts at 0
+        // and is set at commit.
+        client
+            .execute(
+                "INSERT INTO blobs (blob_id, size, state, created_at) VALUES ($1, 0, 'pending', NOW())",
+                &[&blob_id],
+            )
+            .await?;
+        let replicas = choose_replicas(&client, app.replication_factor).await?;
+        // Don't hold a pooled connection across the (potentially long) write: the
+        // local sink needs one to record its location, and concurrent writes could
+        // otherwise exhaust the pool and deadlock.
+        drop(client);
+        let mut senders = Vec::new();
+        let mut sinks = JoinSet::new();
+        for (node, peer_url) in replicas.clone() {
+            let (tx, body) = channel_body();
+            senders.push(tx);
+            // A replica that is ourselves writes straight to local disk (no HTTP
+            // hop, and on a single host there's no peer server).
+            if node == app.node {
+                let app = app.clone();
+                sinks.spawn(async move { write_blob_streaming(&app, blob_id, body).await });
+            } else {
+                sinks.spawn(async move {
+                    upload_to_replica(&peer_url, blob_id, body)
+                        .await
+                        .map_err(|e| Unavailable(format!("replica {peer_url}: {e:#}")).into())
+                });
+            }
+        }
+        Ok(BlobWriter {
+            blob_id,
+            replicas,
+            senders,
+            sinks,
+            summer: BlobSummer::new(checksum::BLOCK_SIZE),
+            crc: crc64fast_nvme::Digest::new(),
+            size: 0,
+        })
+    }
+
+    /// Appends `chunk` to the blob on every replica.
+    pub(crate) async fn write(&mut self, chunk: Bytes) {
+        self.summer.update(&chunk);
+        self.crc.write(&chunk);
+        self.size += chunk.len() as u64;
+        for tx in &self.senders {
+            // A dropped receiver means that sink's task failed; its real error
+            // surfaces in `finish`.
+            let _ = tx.send(Ok(Frame::data(chunk.clone()))).await;
+        }
+    }
+
+    /// Gives up on the blob: faults the sinks, so no replica durably stores the
+    /// truncated data, and waits for them. The pending blob is left for the GC.
+    pub(crate) async fn abort(mut self, reason: &str) {
+        for tx in &self.senders {
+            let _ = tx.send(Err(std::io::Error::other(reason.to_owned()))).await;
+        }
+        self.senders.clear();
+        // Their resulting errors are expected.
+        while self.sinks.join_next().await.is_some() {}
+    }
+
+    /// Ends the blob and waits for every replica to store it. Fails if one
+    /// couldn't, or if one stored different bytes than were sent.
+    pub(crate) async fn finish(mut self) -> anyhow::Result<Written> {
+        self.senders.clear();
+        let mut replica_crcs = Vec::new();
+        while let Some(res) = self.sinks.join_next().await {
+            replica_crcs.push(res??);
+        }
+        // Every replica must have stored exactly the file we expect: the bytes we
+        // sent, followed by the checksum table and blob ID they determine. A
+        // mismatch means a copy was damaged in transit or on its way to disk; the
+        // pending blob is left for the GC, and the write can be retried.
+        // The data's CRC covers just the data; the file's carries on over the
+        // trailer.
+        let blob_id = self.blob_id;
+        let data_crc = self.crc.sum64();
+        self.crc.write(&blob_file::trailer(blob_id, &self.summer.finish()));
+        let file_crc = self.crc.sum64();
+        if replica_crcs.iter().any(|&replica_crc| replica_crc != file_crc) {
+            return Err(Unavailable(format!(
+                "blob {blob_id}: a replica stored different bytes than were sent"
+            ))
+            .into());
+        }
+        Ok(Written {
+            blob_id,
+            nodes: self.replicas.iter().map(|(node, _)| *node).collect(),
+            replicas: self.replicas,
+            size: self.size,
+            data_crc,
+            file_crc,
+        })
+    }
+}
+
+/// A blob fully written to its replicas, but still pending.
+pub(crate) struct Written {
+    pub blob_id: Uuid,
+    pub nodes: Vec<i32>,
+    pub replicas: Vec<Location>,
+    pub size: u64,
+    /// CRC64/NVME of the data, and of the whole file as stored.
+    pub data_crc: u64,
+    pub file_crc: u64,
+}
+
+impl Written {
+    /// Commits the blob, as part of the caller's (serializable) transaction,
+    /// which must also attach a part to it. Confirms first that every replica
+    /// recorded its location; if not, returns how many did, and changes nothing.
+    pub(crate) async fn commit(
+        &self,
+        tx: &tokio_postgres::Transaction<'_>,
+    ) -> Result<Result<(), i64>, tokio_postgres::Error> {
+        let present: i64 = tx
+            .query_one(
+                "SELECT count(*) FROM blob_locations WHERE blob_id = $1 AND node = ANY($2)",
+                &[&self.blob_id, &self.nodes],
+            )
+            .await?
+            .get(0);
+        if present as usize != self.nodes.len() {
+            return Ok(Err(present));
+        }
+        // The CRC covers the blob's whole file, for a scrub to check against.
+        // Stored as its 64 bits, read as a signed BIGINT.
+        let file_crc = self.file_crc as i64;
+        let block_size = checksum::BLOCK_SIZE as i32;
+        tx.execute(
+            "UPDATE blobs SET state = 'committed', size = $2, crc64nvme = $3, block_size = $4
+             WHERE blob_id = $1",
+            &[&self.blob_id, &(self.size as i64), &file_crc, &block_size],
+        )
+        .await?;
+        Ok(Ok(()))
+    }
+}
+
 /// Where a freshly-uploaded part should be attached. The part row is inserted
 /// in the same serializable transaction that flips its blob to 'committed', so
 /// the invariant "a committed blob is referenced" holds with no orphan window.
@@ -394,48 +566,12 @@ where
     B: Body<Data = Bytes> + Unpin + Send,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    let client = app.pool.get().await?;
-    // Time-ordered, so new blobs land at the end of the indexes on blob_id.
-    let blob_id = Uuid::now_v7();
-    // 1. create the pending blob. Its size isn't known until the body is fully
-    // streamed, so it starts at 0 and is set at commit.
-    client
-        .execute(
-            "INSERT INTO blobs (blob_id, size, state, created_at) VALUES ($1, 0, 'pending', NOW())",
-            &[&blob_id],
-        )
-        .await?;
-    // 2. choose replicas; give each (local or remote) a channel-backed body that
-    // the tee loop below feeds. A replica that is ourselves writes straight to
-    // local disk (no HTTP hop — and on a single host there's no peer server).
-    let replicas = choose_replicas(&client, app.replication_factor).await?;
-    let nodes: Vec<i32> = replicas.iter().map(|(node, _)| *node).collect();
-    // Don't hold a pooled connection across the (potentially long) stream — the
-    // local sink needs one to record its location, and concurrent uploads could
-    // otherwise exhaust the pool and deadlock. Re-acquire one for the commit.
-    drop(client);
-    let mut senders: Vec<FrameSender> = Vec::new();
-    let mut sinks = JoinSet::new();
-    for (node, peer_url) in replicas {
-        let (tx, part_body) = channel_body();
-        senders.push(tx);
-        if node == app.node {
-            let app = app.clone();
-            sinks.spawn(async move { write_blob_streaming(&app, blob_id, part_body).await });
-        } else {
-            sinks.spawn(async move {
-                upload_to_replica(&peer_url, blob_id, part_body)
-                    .await
-                    .map_err(|e| Unavailable(format!("replica {peer_url}: {e:#}")).into())
-            });
-        }
-    }
-    // 3. tee: read the client body once, hashing and fanning each chunk out to
-    // every replica. The bounded channels apply backpressure at the slowest sink.
+    // 1-2. create the pending blob and start writing it to its replicas.
+    let mut writer = BlobWriter::begin(app).await?;
+    let blob_id = writer.blob_id;
+    // 3. tee: read the client body once, hashing it and fanning each chunk out
+    // to every replica.
     let mut hasher = Md5::new();
-    let mut summer = BlobSummer::new(checksum::BLOCK_SIZE);
-    let mut crc = crc64fast_nvme::Digest::new();
-    let mut size: i64 = 0;
     let mut read_err: Option<anyhow::Error> = None;
     // A streaming-signature upload arrives `aws-chunked` framed; decode it back to
     // the raw object bytes before hashing/sizing/teeing, so the ETag and size
@@ -485,20 +621,13 @@ where
                 };
                 for chunk in segments {
                     hasher.update(&chunk);
-                    summer.update(&chunk);
-                    crc.write(&chunk);
                     if let Some(h) = &mut content_hasher {
                         h.update(&chunk);
                     }
                     if let Some(c) = &mut trailer_checksum {
                         c.update(&chunk);
                     }
-                    size += chunk.len() as i64;
-                    for tx in &senders {
-                        // A dropped receiver means that sink's task failed; we'll
-                        // surface its real error when we drain the JoinSet.
-                        let _ = tx.send(Ok(Frame::data(chunk.clone()))).await;
-                    }
+                    writer.write(chunk).await;
                 }
             }
             Some(Err(e)) => {
@@ -518,35 +647,17 @@ where
             }
         }
     }
-    // On a client read error, fault the sinks so they don't durably store a
-    // truncated part; then close the channels so the bodies finish.
-    let faulted = read_err.is_some();
-    if let Some(e) = &read_err {
-        for tx in &senders {
-            let _ = tx.send(Err(std::io::Error::other(e.to_string()))).await;
-        }
-    }
-    drop(senders);
-    // 4. wait for every replica to finish (or fail). When we deliberately faulted
-    // the sinks above, their resulting error is expected — swallow it; otherwise a
-    // sink failure is a real durability problem. Each sink reports the CRC32C of
-    // what it stored, checked below.
-    let mut replica_crcs = Vec::new();
-    while let Some(res) = sinks.join_next().await {
-        match res {
-            Ok(Ok(replica_crc)) => replica_crcs.push(replica_crc),
-            Ok(Err(e)) if !faulted => return Err(e),
-            Ok(Err(_)) => {}
-            Err(join_err) => return Err(join_err.into()),
-        }
-    }
-    // A bad chunk signature (mode 4) is a client error, not a server fault.
-    if chunk_failed {
-        return Ok(UploadResult::ChunkSignatureMismatch);
-    }
+    // 4. wait for every replica to finish. On a client read error, fault the
+    // sinks instead, so they don't durably store a truncated part.
     if let Some(e) = read_err {
+        writer.abort(&e.to_string()).await;
+        // A bad chunk signature (mode 4) is a client error, not a server fault.
+        if chunk_failed {
+            return Ok(UploadResult::ChunkSignatureMismatch);
+        }
         return Err(e);
     }
+    let written = writer.finish().await?;
     // The body is fully read and replicated (but not yet committed). If the client
     // claimed a whole-body hash, check it now and refuse to commit on a mismatch —
     // the pending blob is left for the GC to reclaim.
@@ -567,28 +678,13 @@ where
         }
     }
     let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    // Every replica must have stored exactly the file we expect: the bytes we
-    // sent, followed by the checksum table and blob ID they determine. A mismatch
-    // means a copy was damaged in transit or on its way to disk; the pending blob
-    // is left for the GC, and the client can retry.
-    // The part's CRC covers its data; the blob's carries on over the trailer.
-    let data_crc = crc.sum64();
-    crc.write(&blob_file::trailer(blob_id, &summer.finish()));
-    let file_crc = crc.sum64();
-    if replica_crcs.iter().any(|&replica_crc| replica_crc != file_crc) {
-        return Err(Unavailable(format!(
-            "blob {blob_id}: a replica stored different bytes than were sent"
-        ))
-        .into());
-    }
     // 5. commit + attach with the now-known size and ETag, under a serializable
     // transaction; retry on a serialization conflict (e.g. a concurrent GC).
     let mut client = app.pool.get().await?;
     let mut committed = None;
     let mut precondition_failed = false;
     for _ in 0..MAX_COMMIT_ATTEMPTS {
-        let crcs = (file_crc, data_crc);
-        match try_commit_part(&mut client, blob_id, &nodes, attach, size, &etag, crcs).await {
+        match try_commit_part(&mut client, &written, attach, &etag).await {
             Ok(CommitResult::Committed { reap, version_id }) => {
                 // Reap the blobs this overwrite displaced; their rows are gone.
                 reap_blobs(app, reap);
@@ -646,47 +742,31 @@ enum CommitResult {
 /// (give up).
 async fn try_commit_part(
     client: &mut Object,
-    blob_id: Uuid,
-    nodes: &[i32],
+    written: &Written,
     attach: &AttachTarget,
-    size: i64,
     etag: &str,
-    (file_crc, data_crc): (u64, u64),
 ) -> Result<CommitResult, tokio_postgres::Error> {
     let tx = client
         .build_transaction()
         .isolation_level(IsolationLevel::Serializable)
         .start()
         .await?;
-    let present: i64 = tx
-        .query_one(
-            "SELECT count(*) FROM blob_locations WHERE blob_id = $1 AND node = ANY($2)",
-            &[&blob_id, &nodes],
-        )
-        .await?
-        .get(0);
-    if present as usize != nodes.len() {
+    if let Err(present) = written.commit(&tx).await? {
         // A location is missing; dropping `tx` here rolls the transaction back.
         return Ok(CommitResult::MissingLocations {
             present,
-            required: nodes.len(),
+            required: written.nodes.len(),
         });
     }
-    // The blob's CRC covers its whole file (for a scrub to check against); the
-    // part's covers just its data, and stays valid wherever it's moved later.
-    // Both are stored as the same 64 bits, read as a signed BIGINT.
-    let file_crc = file_crc as i64;
-    let crc = data_crc as i64;
-    let block_size = checksum::BLOCK_SIZE as i32;
-    tx.execute(
-        "UPDATE blobs SET state = 'committed', size = $2, crc64nvme = $3, block_size = $4
-         WHERE blob_id = $1",
-        &[&blob_id, &size, &file_crc, &block_size],
-    )
-    .await?;
+    let blob_id = written.blob_id;
+    let size = written.size as i64;
+    // The part's CRC covers just its data, and stays valid wherever it's moved
+    // later. Stored as its 64 bits, read as a signed BIGINT.
+    let crc = written.data_crc as i64;
     const INSERT_PART: &str = "INSERT INTO parts
-             (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id, part_number)
-         VALUES ($1, 0, $2, $3, $4, $5, $6, $7)";
+             (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id, part_number,
+              created_at)
+         VALUES ($1, 0, $2, $3, $4, $5, $6, $7, NOW())";
     let mut reap: Vec<ReapTarget> = Vec::new();
     let mut version_id = None;
     match attach {
