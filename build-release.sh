@@ -22,8 +22,8 @@ VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 PKG="cairn-v${VERSION}-${TARGET}"
 BIN="target/${TARGET}/release/cairn"
 
-# The dashboard's UI is embedded in the binary; without a build of it, the
-# binary would only serve a placeholder page.
+# The dashboard's UI is embedded in the binary, which doesn't build without it.
+# A fresh build, so that the release never ships a stale one.
 echo "Building the dashboard UI..."
 (cd ui && npm ci && npm run build)
 

@@ -201,9 +201,10 @@ restarts; everything else is read from the database.
 ### Building the dashboard
 
 The dashboard's UI lives in `ui/` (SolidJS and TypeScript, built with Vite)
-and is embedded into the binary when Cairn is built. Building the UI needs
-Node.js 26 or later. Building Cairn doesn't need Node, but without a build of the UI the dashboard is only a placeholder
-page, so build it first:
+and is embedded into the binary when Cairn is built, so build it first (with
+Node.js 26 or later). Cargo doesn't run npm itself: without a build of the UI,
+building Cairn (or running its tests) fails and says how to build it, and it
+warns when the build is older than the UI's sources.
 
 ```sh
 (cd ui && npm ci && npm run build)

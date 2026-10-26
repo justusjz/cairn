@@ -42,9 +42,10 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
-      - name: Check the dashboard UI
+      # The binary embeds it, so it's needed to build (and test) Cairn.
+      - name: Build the dashboard UI
         working-directory: ui
-        run: npm ci && npm run check
+        run: npm ci && npm run build
 
       - name: Unit tests
         run: cargo test --locked

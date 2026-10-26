@@ -3,7 +3,7 @@
 //! unauthenticated, and for the private network only.
 //!
 //! The UI is a single-page app (`ui/`, SolidJS), built to `ui/dist` and
-//! embedded in the binary by `build.rs`. It talks to the JSON API under
+//! embedded in the binary by `build.rs`, which requires it. It talks to the JSON API under
 //! `/api/`, which `api` implements. Paths that aren't an API route or a file
 //! of the app serve the app's `index.html`, so it can be reloaded at any of
 //! its own routes.
@@ -45,7 +45,7 @@ struct Asset {
     body: &'static [u8],
 }
 
-// `ASSETS`: every file in `ui/dist`, or a placeholder page if it wasn't built.
+// `ASSETS`: every file in `ui/dist`.
 include!(concat!(env!("OUT_DIR"), "/dashboard_assets.rs"));
 
 pub async fn handle(req: Request<Incoming>, app: Arc<App>) -> anyhow::Result<Response<ResBody>> {
