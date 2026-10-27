@@ -1,5 +1,5 @@
 import { For, Show, createMemo } from "solid-js";
-import { type Cluster, type Event, type Storage, api, statsOf } from "../api";
+import { type Cluster, type Event, type Storage, api, statsError, statsOf } from "../api";
 import { Badge, Card, LiveDot, Loading, Panel, Table, poll } from "../components/ui";
 import { ago, bytes, date, duration, hex, now, num, pct } from "../format";
 
@@ -25,7 +25,7 @@ function View(props: { cluster: Cluster; storage: Storage }) {
     }
     return all.sort((x, y) => y.time - x.time).slice(0, 200);
   });
-  const old = (t: number | null) => t !== null && now() - t > 3600;
+  const old = (t: number | null | undefined) => t != null && now() - t > 3600;
 
   return (
     <>
@@ -91,7 +91,7 @@ function View(props: { cluster: Cluster; storage: Storage }) {
                     when={st()}
                     fallback={
                       <td colspan={7} class="subtle">
-                        {!n.live ? "down" : n.stats && "error" in n.stats ? n.stats.error : "no data"}
+                        {!n.live ? "down" : (statsError(n) ?? "no data")}
                       </td>
                     }
                   >

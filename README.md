@@ -146,6 +146,9 @@ the bucket (with any S3 client), then you grant roles access. Deleting a bucket
 removes its grants, so a bucket re-created under the same name starts with no
 access for anyone.
 
+Bucket names follow S3's rules: 3 to 63 lowercase letters, digits, dots and
+hyphens, starting and ending with a letter or digit.
+
 Manage roles with `cairn role --database <URL> <command>`:
 
 | Command | Description |
@@ -174,9 +177,10 @@ clocks of nodes and clients in sync (e.g. NTP); otherwise requests fail with
 ## Dashboard
 
 Every node serves a web dashboard for watching and managing the cluster, on its
-peer endpoint: open the peer URL in a browser, e.g. `http://10.0.0.1:9431/`
-(or `http://127.0.0.1:9431/` with the default `--listen-peer`). Any node's
-dashboard shows the whole cluster:
+peer endpoint, under `/_dashboard`: open the peer URL in a browser, e.g.
+`http://10.0.0.1:9431/` (or `http://127.0.0.1:9431/` with the default
+`--listen-peer`), which leads there. Any node's dashboard shows the whole
+cluster:
 
 - **Overview:** which nodes are live, how full their disks are, and request
   rates, errors, throughput and latency over the last hour, by S3 operation.
@@ -192,6 +196,9 @@ dashboard shows the whole cluster:
 
 Request metrics are kept in memory by each node, so they start over when it
 restarts; everything else is read from the database.
+
+The dashboard's JSON API is under `/_dashboard/api/`, described by an OpenAPI
+spec at `/_dashboard/api/openapi.json` (also committed as `ui/openapi.json`).
 
 > [!WARNING]
 > Like the rest of the peer endpoint, the dashboard has no authentication:
@@ -214,6 +221,18 @@ cargo build --release
 `./build-release.sh` does both. While working on the UI, `npm run dev` in
 `ui/` serves it with hot reloading, passing API requests on to the node at
 `CAIRN_URL` (default `http://127.0.0.1:9431`).
+
+The UI's types come from the API's OpenAPI spec, which is generated from the
+Rust code (with [utoipa](https://github.com/juhaku/utoipa)): `ui/openapi.json`
+is committed, and `npm run build` turns it into TypeScript types for
+[openapi-fetch](https://openapi-ts.dev/openapi-fetch/). A test fails when the
+committed spec no longer matches the API; after changing the API, update it
+and rebuild the UI:
+
+```sh
+CAIRN_UPDATE_OPENAPI=1 cargo test openapi
+(cd ui && npm run build)
+```
 
 ## Versioning
 

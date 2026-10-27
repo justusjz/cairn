@@ -22,8 +22,9 @@ use deadpool_postgres::GenericClient;
 use crate::blobs::{FreedPart, deleted_parts};
 
 /// A bucket's versioning state. A bucket starts out unversioned; once enabled,
-/// it only moves between enabled and suspended.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// it only moves between enabled and suspended. Serialized as it's stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
 pub enum Versioning {
     Unversioned,
     Enabled,

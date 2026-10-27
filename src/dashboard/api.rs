@@ -1,27 +1,42 @@
-//! The dashboard's JSON API.
+//! The dashboard's JSON API. Every handler is registered through
+//! `utoipa_axum::routes!`, so the router and the OpenAPI spec are built from
+//! the same annotations: a route can't be served without being in the spec.
 //!
 //! The numbers come from the catalog, as of the request, and from each node's
 //! own metrics (see `metrics`), which every live node reports through its peer
 //! endpoint. Some of the catalog's numbers take a scan of a whole table, which
 //! is fine for a page an operator looks at, but not for anything that runs on
-//! its own.
+//! its own. Times are seconds since the Unix epoch.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::{
+    Json,
+    body::Body,
+    extract::{Path, Query, State},
+    http::{HeaderValue, StatusCode, header},
+    response::Response,
+};
 use http_body_util::{BodyExt, Empty, Limited};
-use hyper::{Method, Request, Response, StatusCode, body::Incoming, header};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
-use percent_encoding::{NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
-use serde_json::{Value, json};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
+use utoipa::{IntoParams, OpenApi as _, ToSchema};
+use utoipa_axum::{router::OpenApiRouter, routes};
 
-use super::{error, json_response, node_stats, read_json};
+use super::{ApiError, ErrorBody, NodeStats, node_stats};
 use crate::{
     App,
-    body::ResBody,
-    roles::{self, Invalid, Permission},
-    s3::{conditional::Preconditions, util::query_param},
+    roles::{self, Permission},
+    s3::{
+        buckets::{create, list as bucket_list},
+        conditional::Preconditions,
+        objects::list::{ListEntry, ListQuery},
+        versions::Versioning,
+    },
 };
 
 /// How long another node may take to report its metrics.
@@ -33,123 +48,75 @@ const PAGE: i64 = 200;
 /// How many versions of a key are shown.
 const MAX_VERSIONS: i64 = 200;
 
-fn ok(value: Value) -> anyhow::Result<Response<ResBody>> {
-    Ok(json_response(StatusCode::OK, &value))
+type Result<T> = std::result::Result<T, ApiError>;
+type AppState = State<Arc<App>>;
+
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    info(title = "Cairn dashboard", description = "The API of Cairn's dashboard."),
+    servers((url = "/_dashboard/api")),
+    components(schemas(ErrorBody))
+)]
+struct Doc;
+
+pub(super) fn router() -> OpenApiRouter<Arc<App>> {
+    OpenApiRouter::with_openapi(Doc::openapi())
+        .routes(routes!(get_cluster))
+        .routes(routes!(get_storage))
+        .routes(routes!(list_buckets, create_bucket))
+        .routes(routes!(delete_bucket))
+        .routes(routes!(list_objects))
+        .routes(routes!(get_object))
+        .routes(routes!(download))
+        .routes(routes!(list_roles, create_role))
+        .routes(routes!(delete_role))
+        .routes(routes!(rotate_secret))
+        .routes(routes!(set_admin))
+        .routes(routes!(grant, revoke))
 }
 
-fn invalid(message: impl Into<String>) -> anyhow::Error {
-    Invalid(message.into()).into()
+/// The API's OpenAPI spec, as committed in `ui/openapi.json`.
+pub fn openapi() -> utoipa::openapi::OpenApi {
+    router().split_for_parts().1
 }
 
-pub(super) async fn route(
-    req: Request<Incoming>,
-    app: &Arc<App>,
-    route: &str,
-) -> anyhow::Result<Response<ResBody>> {
-    let query = req.uri().query().unwrap_or("").to_owned();
-    let param = |name: &str| query_param(&query, name);
-    let segments: Vec<String> = route
-        .split('/')
-        .map(|s| percent_decode_str(s).decode_utf8_lossy().into_owned())
-        .collect();
-    let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
-    match (req.method().clone(), segments.as_slice()) {
-        (Method::GET, ["cluster"]) => ok(cluster(app).await?),
-        (Method::GET, ["storage"]) => ok(storage(app).await?),
-        (Method::GET, ["buckets"]) => ok(buckets(app).await?),
-        (Method::POST, ["buckets"]) => {
-            let body = read_json(req).await?.unwrap_or_default();
-            create_bucket(app, body["name"].as_str().unwrap_or("")).await?;
-            ok(json!({}))
-        }
-        (Method::DELETE, ["buckets", bucket]) => {
-            delete_bucket(app, bucket).await?;
-            ok(json!({}))
-        }
-        (Method::GET, ["buckets", bucket, "objects"]) => {
-            let prefix = param("prefix").unwrap_or_default();
-            let after = param("after").unwrap_or_default();
-            let deleted = param("deleted").is_some_and(|v| v == "1");
-            ok(list_objects(app, bucket, &prefix, &after, deleted).await?)
-        }
-        (Method::GET, ["buckets", bucket, "object"]) => {
-            ok(object(app, bucket, &param("key").unwrap_or_default()).await?)
-        }
-        (Method::GET, ["buckets", bucket, "download"]) => {
-            let key = param("key").unwrap_or_default();
-            download(app, bucket, &key, param("version").as_deref()).await
-        }
-        (Method::GET, ["roles"]) => ok(list_roles(app).await?),
-        (Method::POST, ["roles"]) => {
-            let body = read_json(req).await?.unwrap_or_default();
-            let name = body["name"].as_str().unwrap_or("");
-            let secret = body["secret"].as_str().filter(|s| !s.is_empty());
-            let admin = body["admin"].as_bool().unwrap_or(false);
-            let client = app.pool.get().await?;
-            let secret = roles::create(&client, name, secret.map(str::to_owned), admin).await?;
-            ok(json!({ "name": name, "secret": secret }))
-        }
-        (Method::DELETE, ["roles", name]) => {
-            roles::delete(&app.pool.get().await?, name).await?;
-            ok(json!({}))
-        }
-        (Method::POST, ["roles", name, "secret"]) => {
-            let body = read_json(req).await?.unwrap_or_default();
-            let secret = match body["secret"].as_str().filter(|s| !s.is_empty()) {
-                Some(s) => s.to_owned(),
-                None => roles::generate_secret()?,
-            };
-            let client = app.pool.get().await?;
-            roles::update(&client, name, None, Some(secret.clone())).await?;
-            ok(json!({ "name": name, "secret": secret }))
-        }
-        (Method::POST, ["roles", name, "admin"]) => {
-            let body = read_json(req).await?.unwrap_or_default();
-            let Some(admin) = body["admin"].as_bool() else {
-                return Err(invalid("expected {\"admin\": true|false}"));
-            };
-            roles::update(&app.pool.get().await?, name, Some(admin), None).await?;
-            ok(json!({}))
-        }
-        (Method::POST, ["roles", name, "grants"]) => {
-            let body = read_json(req).await?.unwrap_or_default();
-            let bucket = body["bucket"].as_str().unwrap_or("");
-            let permissions = permissions(&body["permissions"])?;
-            if permissions.is_empty() {
-                return Err(invalid("pick at least one permission"));
-            }
-            roles::grant(&app.pool.get().await?, name, bucket, &permissions).await?;
-            ok(json!({}))
-        }
-        (Method::DELETE, ["roles", name, "grants"]) => {
-            let bucket = param("bucket").unwrap_or_default();
-            let permissions = match param("permission") {
-                Some(p) => permissions(&json!([p]))?,
-                None => Vec::new(),
-            };
-            roles::revoke(&app.pool.get().await?, name, &bucket, &permissions).await?;
-            ok(json!({}))
-        }
-        _ => Ok(error(StatusCode::NOT_FOUND, "no such API route")),
-    }
+// ─── Cluster ─────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, ToSchema)]
+pub(super) struct Cluster {
+    /// The node answering.
+    this_node: i32,
+    replication_factor: usize,
+    now: f64,
+    nodes: Vec<ClusterNode>,
 }
 
-fn permissions(value: &Value) -> anyhow::Result<Vec<Permission>> {
-    let Some(names) = value.as_array() else {
-        return Err(invalid("expected a list of permissions"));
-    };
-    names
-        .iter()
-        .map(|p| {
-            p.as_str()
-                .and_then(Permission::parse)
-                .ok_or_else(|| invalid(format!("no permission named {p}")))
-        })
-        .collect()
+#[derive(Serialize, ToSchema)]
+pub(super) struct ClusterNode {
+    id: i32,
+    node_id: String,
+    peer_url: String,
+    last_seen: f64,
+    /// As of its last heartbeat.
+    free_space: i64,
+    /// Seen within the last 10 seconds.
+    live: bool,
+    /// What the node reported, if it's live and answered.
+    stats: Option<NodeStats>,
+    /// Why a live node's stats are missing.
+    stats_error: Option<String>,
 }
 
 /// The nodes, each with the metrics it reports, if it's live.
-async fn cluster(app: &Arc<App>) -> anyhow::Result<Value> {
+#[utoipa::path(get, path = "/cluster", responses(
+    (status = 200, body = Cluster),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn get_cluster(State(app): AppState) -> Result<Json<Cluster>> {
+    Ok(Json(cluster(&app).await?))
+}
+
+pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
     let client = app.pool.get().await?;
     // Live as `choose_replicas` counts it: seen within the last 10 seconds.
     let rows = client
@@ -161,46 +128,44 @@ async fn cluster(app: &Arc<App>) -> anyhow::Result<Value> {
         )
         .await?;
     drop(client);
+    let mut nodes: Vec<ClusterNode> = rows
+        .iter()
+        .map(|r| ClusterNode {
+            id: r.get(0),
+            node_id: r.get(1),
+            peer_url: r.get(2),
+            last_seen: r.get(3),
+            free_space: r.get(4),
+            live: r.get(5),
+            stats: None,
+            stats_error: None,
+        })
+        .collect();
     let mut fetches = JoinSet::new();
-    for (index, row) in rows.iter().enumerate() {
-        let (id, peer_url, live): (i32, String, bool) = (row.get(0), row.get(2), row.get(5));
-        if id == app.node {
-            let stats = node_stats(app);
-            fetches.spawn(async move { (index, Ok(stats)) });
-        } else if live {
+    for (index, node) in nodes.iter_mut().enumerate() {
+        if node.id == app.node {
+            node.stats = Some(node_stats(app));
+        } else if node.live {
+            let peer_url = node.peer_url.clone();
             fetches.spawn(async move { (index, fetch_stats(&peer_url).await) });
         }
     }
-    let mut stats = vec![None; rows.len()];
     while let Some(result) = fetches.join_next().await {
-        let (index, result) = result?;
-        stats[index] = Some(result.unwrap_or_else(|e| json!({ "error": format!("{e:#}") })));
+        match result? {
+            (index, Ok(stats)) => nodes[index].stats = Some(stats),
+            (index, Err(e)) => nodes[index].stats_error = Some(format!("{e:#}")),
+        }
     }
-    let nodes: Vec<Value> = rows
-        .iter()
-        .zip(stats)
-        .map(|(row, stats)| {
-            json!({
-                "id": row.get::<_, i32>(0),
-                "node_id": row.get::<_, String>(1),
-                "peer_url": row.get::<_, String>(2),
-                "last_seen": row.get::<_, f64>(3),
-                "free_space": row.get::<_, i64>(4),
-                "live": row.get::<_, bool>(5),
-                "stats": stats,
-            })
-        })
-        .collect();
-    Ok(json!({
-        "this_node": app.node,
-        "replication_factor": app.replication_factor,
-        "now": crate::metrics::now_secs(),
-        "nodes": nodes,
-    }))
+    Ok(Cluster {
+        this_node: app.node,
+        replication_factor: app.replication_factor,
+        now: crate::metrics::now_secs(),
+        nodes,
+    })
 }
 
 /// Asks another node for its metrics, through its peer endpoint.
-async fn fetch_stats(peer_url: &str) -> anyhow::Result<Value> {
+async fn fetch_stats(peer_url: &str) -> anyhow::Result<NodeStats> {
     let client = Client::builder(TokioExecutor::new()).build_http::<Empty<hyper::body::Bytes>>();
     let fetch = async {
         let res = client.get(format!("{peer_url}/stats").parse()?).await?;
@@ -218,11 +183,95 @@ async fn fetch_stats(peer_url: &str) -> anyhow::Result<Value> {
         .map_err(|_| anyhow::anyhow!("{peer_url} didn't answer in time"))?
 }
 
+// ─── Storage ─────────────────────────────────────────────────────────────────
+
 /// What's stored where, how well it's replicated, and what the background jobs
 /// still have to do.
-async fn storage(app: &App) -> anyhow::Result<Value> {
+#[derive(Serialize, ToSchema)]
+pub(super) struct Storage {
+    replication_factor: usize,
+    nodes: Vec<NodeHolding>,
+    replicas: Vec<ReplicaGroup>,
+    blobs: BlobTotals,
+    objects: ObjectTotals,
+    backlog: Backlog,
+    packer: PackerSettings,
+}
+
+/// The committed blobs a node holds a copy of.
+#[derive(Serialize, ToSchema)]
+struct NodeHolding {
+    node: i32,
+    blobs: i64,
+    bytes: i64,
+}
+
+/// The committed blobs with `copies` copies, `live` of them on live nodes.
+#[derive(Serialize, ToSchema)]
+struct ReplicaGroup {
+    live: i64,
+    copies: i64,
+    blobs: i64,
+    bytes: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct BlobTotals {
+    committed: i64,
+    bytes: i64,
+    /// Bytes of packed blobs that no part references anymore.
+    garbage_bytes: i64,
+    pending: i64,
+    oldest_pending: Option<f64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ObjectTotals {
+    buckets: i64,
+    current: i64,
+    current_bytes: i64,
+    noncurrent: i64,
+    noncurrent_bytes: i64,
+    delete_markers: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct Backlog {
+    /// Blobs leased by packing jobs, right now.
+    packing: i64,
+    packing_bytes: i64,
+    /// Blobs small enough to be consolidated.
+    consolidate: i64,
+    consolidate_bytes: i64,
+    /// Blobs with enough garbage to be compacted.
+    compact: i64,
+    compact_garbage_bytes: i64,
+    /// Deleted parts the packer hasn't folded yet.
+    garbage_log: i64,
+    uploads: i64,
+    oldest_upload: Option<f64>,
+    upload_bytes: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PackerSettings {
+    target_size: u64,
+    small_size: u64,
+    compact_threshold: f64,
+    max_sources: i64,
+}
+
+#[utoipa::path(get, path = "/storage", responses(
+    (status = 200, body = Storage),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn get_storage(State(app): AppState) -> Result<Json<Storage>> {
+    Ok(Json(storage(&app).await?))
+}
+
+pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
     let client = app.pool.get().await?;
-    let per_node: Vec<Value> = client
+    let nodes = client
         .query(
             "SELECT l.node, count(*), coalesce(sum(b.size), 0)::bigint
              FROM blob_locations l JOIN blobs b USING (blob_id)
@@ -232,11 +281,15 @@ async fn storage(app: &App) -> anyhow::Result<Value> {
         )
         .await?
         .iter()
-        .map(|r| json!({ "node": r.get::<_, i32>(0), "blobs": r.get::<_, i64>(1), "bytes": r.get::<_, i64>(2) }))
+        .map(|r| NodeHolding {
+            node: r.get(0),
+            blobs: r.get(1),
+            bytes: r.get(2),
+        })
         .collect();
     // How many copies each committed blob has, and how many of them are on
     // live nodes.
-    let replicas: Vec<Value> = client
+    let replicas = client
         .query(
             "SELECT live, copies, count(*), coalesce(sum(size), 0)::bigint FROM (
                  SELECT b.size, count(l.node) AS copies,
@@ -253,13 +306,11 @@ async fn storage(app: &App) -> anyhow::Result<Value> {
         )
         .await?
         .iter()
-        .map(|r| {
-            json!({
-                "live": r.get::<_, i64>(0),
-                "copies": r.get::<_, i64>(1),
-                "blobs": r.get::<_, i64>(2),
-                "bytes": r.get::<_, i64>(3),
-            })
+        .map(|r| ReplicaGroup {
+            live: r.get(0),
+            copies: r.get(1),
+            blobs: r.get(2),
+            bytes: r.get(3),
         })
         .collect();
     let small_size = app.pack.small_size as i64;
@@ -308,202 +359,331 @@ async fn storage(app: &App) -> anyhow::Result<Value> {
             &[],
         )
         .await?;
-    Ok(json!({
-        "replication_factor": app.replication_factor,
-        "nodes": per_node,
-        "replicas": replicas,
-        "blobs": {
-            "committed": b.get::<_, i64>(0),
-            "bytes": b.get::<_, i64>(1),
-            "garbage_bytes": b.get::<_, i64>(2),
-            "pending": b.get::<_, i64>(3),
-            "oldest_pending": b.get::<_, Option<f64>>(4),
+    Ok(Storage {
+        replication_factor: app.replication_factor,
+        nodes,
+        replicas,
+        blobs: BlobTotals {
+            committed: b.get(0),
+            bytes: b.get(1),
+            garbage_bytes: b.get(2),
+            pending: b.get(3),
+            oldest_pending: b.get(4),
         },
-        "objects": {
-            "buckets": m.get::<_, i64>(4),
-            "current": o.get::<_, i64>(0),
-            "current_bytes": o.get::<_, i64>(1),
-            "noncurrent": o.get::<_, i64>(2),
-            "noncurrent_bytes": o.get::<_, i64>(3),
-            "delete_markers": o.get::<_, i64>(4),
+        objects: ObjectTotals {
+            buckets: m.get(4),
+            current: o.get(0),
+            current_bytes: o.get(1),
+            noncurrent: o.get(2),
+            noncurrent_bytes: o.get(3),
+            delete_markers: o.get(4),
         },
-        "backlog": {
-            "packing": b.get::<_, i64>(5),
-            "packing_bytes": b.get::<_, i64>(6),
-            "consolidate": b.get::<_, i64>(7),
-            "consolidate_bytes": b.get::<_, i64>(8),
-            "compact": b.get::<_, i64>(9),
-            "compact_garbage_bytes": b.get::<_, i64>(10),
-            "garbage_log": m.get::<_, i64>(3),
-            "uploads": m.get::<_, i64>(0),
-            "oldest_upload": m.get::<_, Option<f64>>(1),
-            "upload_bytes": m.get::<_, i64>(2),
+        backlog: Backlog {
+            packing: b.get(5),
+            packing_bytes: b.get(6),
+            consolidate: b.get(7),
+            consolidate_bytes: b.get(8),
+            compact: b.get(9),
+            compact_garbage_bytes: b.get(10),
+            garbage_log: m.get(3),
+            uploads: m.get(0),
+            oldest_upload: m.get(1),
+            upload_bytes: m.get(2),
         },
-        "packer": {
-            "target_size": app.pack.target_size,
-            "small_size": app.pack.small_size,
-            "compact_threshold": app.pack.compact_threshold,
-            "max_sources": app.pack.max_sources,
+        packer: PackerSettings {
+            target_size: app.pack.target_size,
+            small_size: app.pack.small_size,
+            compact_threshold: app.pack.compact_threshold,
+            max_sources: app.pack.max_sources,
         },
-    }))
+    })
 }
 
-async fn buckets(app: &App) -> anyhow::Result<Value> {
-    let rows = app
-        .pool
-        .get()
-        .await?
+// ─── Buckets ─────────────────────────────────────────────────────────────────
+
+#[derive(Serialize, ToSchema)]
+pub(super) struct BucketSummary {
+    name: String,
+    created_at: f64,
+    versioning: Versioning,
+    /// Current versions that aren't delete markers.
+    objects: i64,
+    bytes: i64,
+    /// Every version, delete markers too.
+    versions: i64,
+    version_bytes: i64,
+    uploads: i64,
+    /// Roles with a grant on the bucket.
+    roles: i64,
+}
+
+#[utoipa::path(get, path = "/buckets", responses(
+    (status = 200, body = Vec<BucketSummary>),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn list_buckets(State(app): AppState) -> Result<Json<Vec<BucketSummary>>> {
+    Ok(Json(buckets(&app).await?))
+}
+
+/// Every bucket (as ListBuckets lists them), with what's in it.
+pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
+    let buckets = bucket_list::buckets(app).await?;
+    let client = app.pool.get().await?;
+    let mut objects: HashMap<String, [i64; 4]> = client
         .query(
-            "SELECT b.name, extract(epoch FROM b.created_at)::float8, b.versioning,
-                    count(o.id) FILTER (WHERE o.is_latest AND NOT o.is_delete_marker),
-                    coalesce(sum(o.size) FILTER (WHERE o.is_latest AND NOT o.is_delete_marker),
+            "SELECT bucket,
+                    count(*) FILTER (WHERE is_latest AND NOT is_delete_marker),
+                    coalesce(sum(size) FILTER (WHERE is_latest AND NOT is_delete_marker),
                              0)::bigint,
-                    count(o.id),
-                    coalesce(sum(o.size), 0)::bigint,
-                    (SELECT count(*) FROM multipart_uploads m WHERE m.bucket = b.name),
-                    (SELECT count(DISTINCT g.role) FROM role_grants g WHERE g.bucket = b.name)
-             FROM buckets b LEFT JOIN objects o ON o.bucket = b.name
-             GROUP BY b.name ORDER BY b.name",
+                    count(*),
+                    coalesce(sum(size), 0)::bigint
+             FROM objects GROUP BY bucket",
             &[],
         )
-        .await?;
-    let buckets: Vec<Value> = rows
+        .await?
         .iter()
-        .map(|r| {
-            json!({
-                "name": r.get::<_, String>(0),
-                "created_at": r.get::<_, f64>(1),
-                "versioning": r.get::<_, String>(2),
-                "objects": r.get::<_, i64>(3),
-                "bytes": r.get::<_, i64>(4),
-                "versions": r.get::<_, i64>(5),
-                "version_bytes": r.get::<_, i64>(6),
-                "uploads": r.get::<_, i64>(7),
-                "roles": r.get::<_, i64>(8),
-            })
-        })
+        .map(|r| (r.get(0), [r.get(1), r.get(2), r.get(3), r.get(4)]))
         .collect();
-    Ok(json!({ "buckets": buckets }))
-}
-
-/// Whether `name` is a valid S3 bucket name: 3 to 63 lowercase letters, digits,
-/// dots and hyphens, starting and ending with a letter or digit.
-fn valid_bucket_name(name: &str) -> bool {
-    let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
-    (3..=63).contains(&name.len())
-        && name
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-')
-        && edge(name.chars().next())
-        && edge(name.chars().last())
-        && !name.contains("..")
-}
-
-async fn create_bucket(app: &App, name: &str) -> anyhow::Result<()> {
-    if !valid_bucket_name(name) {
-        return Err(invalid(
-            "a bucket name has 3 to 63 lowercase letters, digits, dots and hyphens, \
-             and starts and ends with a letter or digit",
-        ));
-    }
-    let inserted = app
-        .pool
-        .get()
-        .await?
-        .execute(
-            "INSERT INTO buckets (name) VALUES ($1) ON CONFLICT DO NOTHING",
-            &[&name],
-        )
-        .await?;
-    if inserted == 0 {
-        return Err(invalid(format!("a bucket named {name:?} already exists")));
-    }
-    Ok(())
-}
-
-async fn delete_bucket(app: &App, name: &str) -> anyhow::Result<()> {
-    let resp = crate::s3::buckets::delete::delete_bucket(app, name).await?;
-    match resp.status() {
-        StatusCode::NO_CONTENT => Ok(()),
-        StatusCode::NOT_FOUND => Err(invalid(format!("no bucket named {name:?}"))),
-        StatusCode::CONFLICT => Err(invalid(format!(
-            "bucket {name:?} isn't empty: delete its objects, versions and uploads first"
-        ))),
-        _ => Err(crate::Contended(format!("deleting bucket {name:?}")).into()),
-    }
-}
-
-/// A page of a bucket's keys under `prefix`, rolled up at the next `/` like a
-/// directory listing, after the key `after`. With `deleted`, keys whose current
-/// version is a delete marker are listed too.
-async fn list_objects(
-    app: &App,
-    bucket: &str,
-    prefix: &str,
-    after: &str,
-    deleted: bool,
-) -> anyhow::Result<Value> {
-    let client = app.pool.get().await?;
-    if client
-        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
-        .await?
-        .is_none()
-    {
-        return Err(invalid(format!("no bucket named {bucket:?}")));
-    }
-    // As in ListObjects (see `s3::objects::list`), with `/` as the delimiter.
-    let rows = client
-        .query(
-            "SELECT token, bool_or(is_prefix), max(key), count(*), sum(size)::bigint, max(etag),
-                    extract(epoch FROM max(last_modified))::float8, bool_or(is_delete_marker)
-             FROM (
-                 SELECT key, size, etag, last_modified, is_delete_marker,
-                        CASE WHEN position('/' IN substr(key, length($2) + 1)) > 0
-                             THEN $2 || substr(substr(key, length($2) + 1), 1,
-                                               position('/' IN substr(key, length($2) + 1)))
-                             ELSE key
-                        END AS token,
-                        position('/' IN substr(key, length($2) + 1)) > 0 AS is_prefix
-                 FROM objects
-                 WHERE bucket = $1 AND is_latest AND (NOT is_delete_marker OR $5)
-                   AND starts_with(key, $2) AND key > $3
-             ) t
-             GROUP BY token
-             ORDER BY token
-             LIMIT $4",
-            &[&bucket, &prefix, &after, &(PAGE + 1), &deleted],
-        )
-        .await?;
-    let truncated = rows.len() as i64 > PAGE;
-    let rows = &rows[..rows.len().min(PAGE as usize)];
-    let entries: Vec<Value> = rows
-        .iter()
-        .map(|r| {
-            if r.get::<_, bool>(1) {
-                json!({
-                    "prefix": r.get::<_, String>(0),
-                    "objects": r.get::<_, i64>(3),
-                    "bytes": r.get::<_, i64>(4),
-                    "last_modified": r.get::<_, f64>(6),
-                })
-            } else {
-                json!({
-                    "key": r.get::<_, String>(0),
-                    "size": r.get::<_, i64>(4),
-                    "etag": r.get::<_, Option<String>>(5),
-                    "last_modified": r.get::<_, f64>(6),
-                    "delete_marker": r.get::<_, bool>(7),
-                })
+    let counts = |sql: &str| {
+        let client = &client;
+        let sql = sql.to_owned();
+        async move {
+            let rows = client.query(&sql, &[]).await?;
+            anyhow::Ok(
+                rows.iter()
+                    .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
+                    .collect::<HashMap<_, _>>(),
+            )
+        }
+    };
+    let uploads = counts("SELECT bucket, count(*) FROM multipart_uploads GROUP BY bucket").await?;
+    let roles =
+        counts("SELECT bucket, count(DISTINCT role) FROM role_grants GROUP BY bucket").await?;
+    Ok(buckets
+        .into_iter()
+        .map(|b| {
+            let [objects, bytes, versions, version_bytes] =
+                objects.remove(&b.name).unwrap_or_default();
+            BucketSummary {
+                uploads: uploads.get(&b.name).copied().unwrap_or(0),
+                roles: roles.get(&b.name).copied().unwrap_or(0),
+                name: b.name,
+                created_at: b.created_at.epoch,
+                versioning: b.versioning,
+                objects,
+                bytes,
+                versions,
+                version_bytes,
             }
         })
-        .collect();
-    let next = truncated.then(|| rows.last().map(|r| r.get::<_, String>(2)));
-    Ok(json!({ "entries": entries, "next": next.flatten() }))
+        .collect())
 }
 
-/// Every version of a key, newest first, each with its parts and where their
+#[derive(Deserialize, ToSchema)]
+struct NewBucket {
+    name: String,
+}
+
+#[utoipa::path(post, path = "/buckets", request_body = NewBucket, responses(
+    (status = 201, description = "Created"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_bucket(State(app): AppState, Json(body): Json<NewBucket>) -> Result<StatusCode> {
+    match create::create(&app, &body.name).await? {
+        create::Creation::Created => Ok(StatusCode::CREATED),
+        create::Creation::Exists => Err(ApiError::Conflict(format!(
+            "a bucket named {:?} already exists",
+            body.name
+        ))),
+        create::Creation::InvalidName => Err(ApiError::BadRequest(
+            "a bucket name has 3 to 63 lowercase letters, digits, dots and hyphens, \
+             and starts and ends with a letter or digit"
+                .into(),
+        )),
+    }
+}
+
+/// Deletes an empty bucket.
+#[utoipa::path(delete, path = "/buckets/{bucket}", params(("bucket" = String, Path)), responses(
+    (status = 204, description = "Deleted"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_bucket(State(app): AppState, Path(bucket): Path<String>) -> Result<StatusCode> {
+    let resp = crate::s3::buckets::delete::delete_bucket(&app, &bucket).await?;
+    match resp.status() {
+        StatusCode::NO_CONTENT => Ok(StatusCode::NO_CONTENT),
+        StatusCode::NOT_FOUND => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+        StatusCode::CONFLICT => Err(ApiError::Conflict(format!(
+            "bucket {bucket:?} isn't empty: delete its objects, versions and uploads first"
+        ))),
+        _ => Err(crate::Contended(format!("deleting bucket {bucket:?}")).into()),
+    }
+}
+
+// ─── Objects ─────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct ListParams {
+    /// List what's under this prefix.
+    prefix: Option<String>,
+    /// Resume after this key (a page's `next`).
+    after: Option<String>,
+    /// Also list keys whose current version is a delete marker.
+    deleted: Option<bool>,
+}
+
+/// A page of a bucket's keys, rolled up at `/` like a directory listing.
+#[derive(Serialize, ToSchema)]
+pub(super) struct Listing {
+    entries: Vec<Entry>,
+    /// What to pass as `after` for the next page, if there is one.
+    next: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+enum Entry {
+    /// A "directory": the keys whose names continue past the prefix with `/`.
+    Prefix {
+        prefix: String,
+        objects: i64,
+        bytes: i64,
+        last_modified: f64,
+    },
+    /// A key's current version.
+    Object {
+        key: String,
+        size: i64,
+        etag: Option<String>,
+        last_modified: f64,
+        delete_marker: bool,
+    },
+}
+
+#[utoipa::path(get, path = "/buckets/{bucket}/objects", params(("bucket" = String, Path), ListParams),
+    responses(
+        (status = 200, body = Listing),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn list_objects(
+    State(app): AppState,
+    Path(bucket): Path<String>,
+    Query(params): Query<ListParams>,
+) -> Result<Json<Listing>> {
+    let query = ListQuery {
+        prefix: params.prefix.as_deref().unwrap_or(""),
+        delimiter: Some("/"),
+        marker: params.after.as_deref().unwrap_or(""),
+        max_keys: PAGE,
+        delete_markers: params.deleted.unwrap_or(false),
+    };
+    Ok(Json(listing(&app, &bucket, &query).await?))
+}
+
+/// A page of `list`, for the dashboard.
+pub(super) async fn listing(app: &App, bucket: &str, query: &ListQuery<'_>) -> Result<Listing> {
+    let Some(listing) = crate::s3::objects::list::list(app, bucket, query).await? else {
+        return Err(ApiError::NotFound(format!("no bucket named {bucket:?}")));
+    };
+    let entries = listing
+        .entries
+        .into_iter()
+        .map(|e| match e {
+            ListEntry::Prefix {
+                prefix,
+                objects,
+                bytes,
+                last_modified,
+            } => Entry::Prefix {
+                prefix,
+                objects,
+                bytes,
+                last_modified: last_modified.epoch,
+            },
+            ListEntry::Object {
+                key,
+                size,
+                etag,
+                last_modified,
+                delete_marker,
+            } => Entry::Object {
+                key,
+                size,
+                etag,
+                last_modified: last_modified.epoch,
+                delete_marker,
+            },
+        })
+        .collect();
+    Ok(Listing {
+        entries,
+        next: listing.next_marker,
+    })
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct KeyParams {
+    key: String,
+}
+
+/// Every version of a key (the newest 200), each with its parts and where their
 /// blobs are stored.
-async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result<Value> {
+#[derive(Serialize, ToSchema)]
+pub(super) struct ObjectInfo {
+    bucket: String,
+    key: String,
+    /// Newest first; empty if there's no such key.
+    versions: Vec<VersionInfo>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct VersionInfo {
+    version_id: String,
+    latest: bool,
+    delete_marker: bool,
+    size: i64,
+    etag: Option<String>,
+    content_type: Option<String>,
+    last_modified: f64,
+    parts: Vec<PartInfo>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct PartInfo {
+    number: i32,
+    size: i64,
+    etag: String,
+    /// The CRC64/NVME of the part's bytes, in hex; none for old data.
+    crc64nvme: Option<String>,
+    blob_id: String,
+    /// Where in the blob the part's bytes start.
+    blob_offset: i64,
+    blob_size: i64,
+    blob_state: String,
+    created_at: f64,
+    /// The nodes holding a copy of the blob.
+    nodes: Vec<i32>,
+}
+
+#[utoipa::path(get, path = "/buckets/{bucket}/object", params(("bucket" = String, Path), KeyParams),
+    responses(
+        (status = 200, body = ObjectInfo),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn get_object(
+    State(app): AppState,
+    Path(bucket): Path<String>,
+    Query(params): Query<KeyParams>,
+) -> Result<Json<ObjectInfo>> {
+    Ok(Json(object(&app, &bucket, &params.key).await?))
+}
+
+pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {
     let client = app.pool.get().await?;
     let versions = client
         .query(
@@ -515,7 +695,8 @@ async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result<Value> {
         )
         .await?;
     let ids: Vec<i64> = versions.iter().map(|r| r.get(0)).collect();
-    let parts = client
+    let mut parts: HashMap<i64, Vec<PartInfo>> = HashMap::new();
+    for p in client
         .query(
             "SELECT p.object_id, p.part_number, p.size, p.etag, p.crc64nvme, p.blob_id,
                     p.blob_offset, b.size, b.state, extract(epoch FROM p.created_at)::float8,
@@ -526,179 +707,576 @@ async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result<Value> {
              ORDER BY p.object_id, p.part_number",
             &[&ids],
         )
-        .await?;
-    let versions: Vec<Value> = versions
+        .await?
+    {
+        parts.entry(p.get(0)).or_default().push(PartInfo {
+            number: p.get(1),
+            size: p.get(2),
+            etag: p.get(3),
+            crc64nvme: p
+                .get::<_, Option<i64>>(4)
+                .map(|c| format!("{:016x}", c as u64)),
+            blob_id: p.get::<_, uuid::Uuid>(5).to_string(),
+            blob_offset: p.get(6),
+            blob_size: p.get(7),
+            blob_state: p.get(8),
+            created_at: p.get(9),
+            nodes: p.get(10),
+        });
+    }
+    let versions = versions
         .iter()
-        .map(|v| {
-            let id: i64 = v.get(0);
-            let parts: Vec<Value> = parts
-                .iter()
-                .filter(|p| p.get::<_, i64>(0) == id)
-                .map(|p| {
-                    json!({
-                        "number": p.get::<_, i32>(1),
-                        "size": p.get::<_, i64>(2),
-                        "etag": p.get::<_, String>(3),
-                        "crc64nvme": p.get::<_, Option<i64>>(4)
-                            .map(|c| format!("{:016x}", c as u64)),
-                        "blob_id": p.get::<_, uuid::Uuid>(5).to_string(),
-                        "blob_offset": p.get::<_, i64>(6),
-                        "blob_size": p.get::<_, i64>(7),
-                        "blob_state": p.get::<_, String>(8),
-                        "created_at": p.get::<_, f64>(9),
-                        "nodes": p.get::<_, Vec<i32>>(10),
-                    })
-                })
-                .collect();
-            json!({
-                "version_id": v.get::<_, String>(1),
-                "latest": v.get::<_, bool>(2),
-                "delete_marker": v.get::<_, bool>(3),
-                "size": v.get::<_, i64>(4),
-                "etag": v.get::<_, Option<String>>(5),
-                "content_type": v.get::<_, Option<String>>(6),
-                "last_modified": v.get::<_, f64>(7),
-                "parts": parts,
-            })
+        .map(|v| VersionInfo {
+            version_id: v.get(1),
+            latest: v.get(2),
+            delete_marker: v.get(3),
+            size: v.get(4),
+            etag: v.get(5),
+            content_type: v.get(6),
+            last_modified: v.get(7),
+            parts: parts.remove(&v.get::<_, i64>(0)).unwrap_or_default(),
         })
         .collect();
-    Ok(json!({ "bucket": bucket, "key": key, "versions": versions }))
+    Ok(ObjectInfo {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        versions,
+    })
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct DownloadParams {
+    key: String,
+    /// The version to download; the current one if not given.
+    version: Option<String>,
 }
 
 /// An object's data, as a file to save. It's always sent as an attachment of
 /// no particular type, so that a browser never renders it as part of the UI.
+#[utoipa::path(get, path = "/buckets/{bucket}/download", params(("bucket" = String, Path), DownloadParams),
+    responses(
+        (status = 200, description = "The object's data", content_type = "application/octet-stream"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
 async fn download(
-    app: &Arc<App>,
-    bucket: &str,
-    key: &str,
-    version: Option<&str>,
-) -> anyhow::Result<Response<ResBody>> {
-    let preconditions = Preconditions::default();
-    let resp = crate::s3::objects::get::get_object(app, bucket, key, version, None, &preconditions)
-        .await?;
+    State(app): AppState,
+    Path(bucket): Path<String>,
+    Query(params): Query<DownloadParams>,
+) -> Result<Response> {
+    let resp = crate::s3::objects::get::get_object(
+        &app,
+        &bucket,
+        &params.key,
+        params.version.as_deref(),
+        None,
+        &Preconditions::default(),
+    )
+    .await?;
     if resp.status() != StatusCode::OK {
-        return Ok(error(resp.status(), "the object can't be read"));
+        return Err(ApiError::NotFound("the object can't be read".into()));
     }
     let (mut parts, body) = resp.into_parts();
-    let name = key
+    let name = params
+        .key
         .rsplit('/')
         .next()
         .filter(|n| !n.is_empty())
         .unwrap_or("download");
+    let disposition = format!(
+        "attachment; filename*=UTF-8''{}",
+        utf8_percent_encode(name, NON_ALPHANUMERIC)
+    );
     let headers = &mut parts.headers;
-    headers.insert(header::CONTENT_TYPE, "application/octet-stream".parse()?);
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/octet-stream"),
+    );
     headers.insert(
         header::CONTENT_DISPOSITION,
-        format!(
-            "attachment; filename*=UTF-8''{}",
-            utf8_percent_encode(name, NON_ALPHANUMERIC)
-        )
-        .parse()?,
+        HeaderValue::from_str(&disposition)?,
     );
-    headers.insert("content-security-policy", "sandbox".parse()?);
-    headers.insert("x-content-type-options", "nosniff".parse()?);
-    Ok(Response::from_parts(parts, body))
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
+    );
+    Ok(Response::from_parts(parts, Body::new(body)))
 }
 
-async fn list_roles(app: &App) -> anyhow::Result<Value> {
-    let roles: Vec<Value> = roles::list(&app.pool.get().await?)
+// ─── Roles ───────────────────────────────────────────────────────────────────
+
+/// A role, never with its secret.
+#[derive(Serialize, ToSchema)]
+pub(super) struct RoleSummary {
+    name: String,
+    admin: bool,
+    created_at: f64,
+    grants: Vec<Grant>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct Grant {
+    bucket: String,
+    permission: Permission,
+}
+
+#[utoipa::path(get, path = "/roles", responses(
+    (status = 200, body = Vec<RoleSummary>),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn list_roles(State(app): AppState) -> Result<Json<Vec<RoleSummary>>> {
+    let roles = roles::list(&app.pool.get().await?)
         .await?
         .into_iter()
-        .map(|r| {
-            let grants: Vec<Value> = r
+        .map(|r| RoleSummary {
+            name: r.name,
+            admin: r.admin,
+            created_at: r.created_at,
+            grants: r
                 .grants
                 .into_iter()
-                .map(|(bucket, permission)| json!({ "bucket": bucket, "permission": permission }))
-                .collect();
-            json!({
-                "name": r.name,
-                "admin": r.admin,
-                "created_at": r.created_at,
-                "grants": grants,
-            })
+                .map(|(bucket, permission)| Grant { bucket, permission })
+                .collect(),
         })
         .collect();
-    Ok(json!({ "roles": roles }))
+    Ok(Json(roles))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Deserialize, ToSchema)]
+struct NewRole {
+    name: String,
+    /// At least 8 characters; one is generated if not given.
+    secret: Option<String>,
+    #[serde(default)]
+    admin: bool,
+}
 
-    #[test]
-    fn validates_bucket_names() {
-        for name in ["abc", "my-bucket", "my.bucket.2", &"a".repeat(63)] {
-            assert!(valid_bucket_name(name), "{name}");
-        }
-        for name in [
-            "ab",
-            "My-Bucket",
-            "-abc",
-            "abc-",
-            "a..b",
-            "a_b",
-            "a/b",
-            &"a".repeat(64),
-        ] {
-            assert!(!valid_bucket_name(name), "{name}");
-        }
+/// A role's secret, which is shown only this once.
+#[derive(Serialize, ToSchema)]
+struct Secret {
+    name: String,
+    secret: String,
+}
+
+#[utoipa::path(post, path = "/roles", request_body = NewRole, responses(
+    (status = 201, body = Secret),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_role(
+    State(app): AppState,
+    Json(body): Json<NewRole>,
+) -> Result<(StatusCode, Json<Secret>)> {
+    let client = app.pool.get().await?;
+    let secret = body.secret.filter(|s| !s.is_empty());
+    let secret = roles::create(&client, &body.name, secret, body.admin).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(Secret {
+            name: body.name,
+            secret,
+        }),
+    ))
+}
+
+#[utoipa::path(delete, path = "/roles/{role}", params(("role" = String, Path)), responses(
+    (status = 204, description = "Deleted, with its grants"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_role(State(app): AppState, Path(role): Path<String>) -> Result<StatusCode> {
+    roles::delete(&app.pool.get().await?, &role).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, ToSchema)]
+struct NewSecret {
+    /// At least 8 characters; one is generated if not given.
+    secret: Option<String>,
+}
+
+/// Replaces a role's secret.
+#[utoipa::path(post, path = "/roles/{role}/secret", params(("role" = String, Path)),
+    request_body = NewSecret, responses(
+        (status = 200, body = Secret),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn rotate_secret(
+    State(app): AppState,
+    Path(role): Path<String>,
+    Json(body): Json<NewSecret>,
+) -> Result<Json<Secret>> {
+    let secret = match body.secret.filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => roles::generate_secret()?,
+    };
+    roles::update(&app.pool.get().await?, &role, None, Some(secret.clone())).await?;
+    Ok(Json(Secret { name: role, secret }))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct AdminFlag {
+    admin: bool,
+}
+
+/// Makes a role an admin, or not.
+#[utoipa::path(put, path = "/roles/{role}/admin", params(("role" = String, Path)),
+    request_body = AdminFlag, responses(
+        (status = 204, description = "Changed"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn set_admin(
+    State(app): AppState,
+    Path(role): Path<String>,
+    Json(body): Json<AdminFlag>,
+) -> Result<StatusCode> {
+    roles::update(&app.pool.get().await?, &role, Some(body.admin), None).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, ToSchema)]
+struct NewGrant {
+    bucket: String,
+    permissions: Vec<Permission>,
+}
+
+/// Grants permissions on an existing bucket.
+#[utoipa::path(post, path = "/roles/{role}/grants", params(("role" = String, Path)),
+    request_body = NewGrant, responses(
+        (status = 204, description = "Granted"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn grant(
+    State(app): AppState,
+    Path(role): Path<String>,
+    Json(body): Json<NewGrant>,
+) -> Result<StatusCode> {
+    if body.permissions.is_empty() {
+        return Err(ApiError::BadRequest("pick at least one permission".into()));
     }
+    roles::grant(
+        &app.pool.get().await?,
+        &role,
+        &body.bucket,
+        &body.permissions,
+    )
+    .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct RevokeParams {
+    bucket: String,
+    /// The permission to revoke; all of them on the bucket if not given.
+    permission: Option<Permission>,
+}
+
+#[utoipa::path(delete, path = "/roles/{role}/grants", params(("role" = String, Path), RevokeParams),
+    responses(
+        (status = 204, description = "Revoked"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn revoke(
+    State(app): AppState,
+    Path(role): Path<String>,
+    Query(params): Query<RevokeParams>,
+) -> Result<StatusCode> {
+    let permissions: Vec<Permission> = params.permission.into_iter().collect();
+    roles::revoke(&app.pool.get().await?, &role, &params.bucket, &permissions).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]
 mod e2e {
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use serde_json::{Value, json};
+    use tower::ServiceExt;
+
     use super::*;
     use crate::e2e::{BUCKET, delete, node_with, put};
 
+    async fn node() -> Option<Arc<App>> {
+        node_with(crate::packer::Config::default(), None).await
+    }
+
     #[tokio::test]
     async fn reports_the_catalog() {
-        let Some(app) = node_with(crate::packer::Config::default(), None).await else {
-            return;
-        };
+        let Some(app) = node().await else { return };
         put(&app, "a/one", vec![1; 10]).await;
         put(&app, "a/two", vec![2; 20]).await;
         put(&app, "b", vec![3; 30]).await;
         put(&app, "gone", vec![4; 40]).await;
         delete(&app, "gone").await;
 
-        let storage = storage(&app).await.unwrap();
-        assert_eq!(storage["objects"]["current"], 3);
-        assert_eq!(storage["objects"]["current_bytes"], 60);
-        assert_eq!(storage["blobs"]["committed"], 3);
+        let s = serde_json::to_value(storage(&app).await.unwrap()).unwrap();
+        assert_eq!(s["objects"]["current"], 3);
+        assert_eq!(s["objects"]["current_bytes"], 60);
+        assert_eq!(s["blobs"]["committed"], 3);
         assert_eq!(
-            storage["replicas"],
+            s["replicas"],
             json!([{ "live": 1, "copies": 1, "blobs": 3, "bytes": 60 }])
         );
-        assert_eq!(storage["nodes"][0]["bytes"], 60);
-        assert_eq!(storage["backlog"]["consolidate"], 3);
+        assert_eq!(s["nodes"][0]["bytes"], 60);
+        assert_eq!(s["backlog"]["consolidate"], 3);
 
-        let buckets = buckets(&app).await.unwrap();
-        assert_eq!(buckets["buckets"][0]["name"], BUCKET);
-        assert_eq!(buckets["buckets"][0]["objects"], 3);
+        let b = serde_json::to_value(buckets(&app).await.unwrap()).unwrap();
+        assert_eq!(b[0]["name"], BUCKET);
+        assert_eq!(b[0]["objects"], 3);
+        assert_eq!(b[0]["versioning"], "unversioned");
 
         // Rolled up at `/`, with each directory's count and size.
-        let listing = list_objects(&app, BUCKET, "", "", false).await.unwrap();
-        let entries = listing["entries"].as_array().unwrap();
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0]["prefix"], "a/");
-        assert_eq!(entries[0]["objects"], 2);
-        assert_eq!(entries[0]["bytes"], 30);
-        assert_eq!(entries[1]["key"], "b");
-        assert!(listing["next"].is_null());
-        let listing = list_objects(&app, BUCKET, "a/", "a/one", false)
+        let query = |prefix, marker, delete_markers| ListQuery {
+            prefix,
+            delimiter: Some("/"),
+            marker,
+            max_keys: PAGE,
+            delete_markers,
+        };
+        let l = serde_json::to_value(listing(&app, BUCKET, &query("", "", false)).await.unwrap())
+            .unwrap();
+        assert_eq!(l["entries"].as_array().unwrap().len(), 2);
+        assert_eq!(l["entries"][0]["kind"], "prefix");
+        assert_eq!(l["entries"][0]["prefix"], "a/");
+        assert_eq!(l["entries"][0]["objects"], 2);
+        assert_eq!(l["entries"][0]["bytes"], 30);
+        assert_eq!(l["entries"][1]["kind"], "object");
+        assert_eq!(l["entries"][1]["key"], "b");
+        assert!(l["next"].is_null());
+        let l = serde_json::to_value(
+            listing(&app, BUCKET, &query("a/", "a/one", false))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(l["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(l["entries"][0]["key"], "a/two");
+        // A deleted key shows up only when asked for.
+        let l = serde_json::to_value(listing(&app, BUCKET, &query("g", "", true)).await.unwrap())
+            .unwrap();
+        assert_eq!(
+            l["entries"].as_array().unwrap().len(),
+            0,
+            "unversioned: the delete removed it"
+        );
+        assert!(matches!(
+            listing(&app, "nope", &query("", "", false)).await,
+            Err(ApiError::NotFound(_))
+        ));
+
+        let o = serde_json::to_value(object(&app, BUCKET, "a/two").await.unwrap()).unwrap();
+        assert_eq!(o["versions"].as_array().unwrap().len(), 1);
+        assert_eq!(o["versions"][0]["parts"][0]["size"], 20);
+        assert_eq!(o["versions"][0]["parts"][0]["nodes"], json!([app.node]));
+
+        let c = serde_json::to_value(cluster(&app).await.unwrap()).unwrap();
+        assert_eq!(c["nodes"][0]["stats"]["node"], app.node);
+        assert!(c["nodes"][0]["stats"]["requests"]["ops"].is_array());
+    }
+
+    /// Sends a request through the whole peer endpoint.
+    async fn send(
+        app: &Arc<App>,
+        req: Request<axum::body::Body>,
+    ) -> (StatusCode, HeaderMap, Vec<u8>) {
+        let resp = crate::peer::router(app.clone()).oneshot(req).await.unwrap();
+        let (parts, body) = resp.into_parts();
+        let body = body.collect().await.unwrap().to_bytes().to_vec();
+        (parts.status, parts.headers, body)
+    }
+
+    fn request(method: &str, uri: &str, body: Option<Value>) -> Request<axum::body::Body> {
+        let builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("x-cairn-ui", "1")
+            .header("content-type", "application/json");
+        let body = body.map(|b| b.to_string()).unwrap_or_default();
+        builder.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    fn error_of(body: &[u8]) -> String {
+        serde_json::from_slice::<Value>(body).unwrap()["error"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    use axum::http::HeaderMap;
+
+    #[tokio::test]
+    async fn serves_the_dashboard() {
+        let Some(app) = node().await else { return };
+        put(&app, "dir/file.txt", b"hello".to_vec()).await;
+        let api = "/_dashboard/api";
+
+        let (status, headers, body) =
+            send(&app, request("GET", &format!("{api}/cluster"), None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "application/json");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert!(headers.contains_key("content-security-policy"));
+        let cluster: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(cluster["this_node"], app.node);
+
+        // Changes need the header.
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("{api}/buckets"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(r#"{"name":"new-bucket"}"#))
+            .unwrap();
+        let (status, _, body) = send(&app, req).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error_of(&body), "missing x-cairn-ui header");
+
+        let create = |name: &str| {
+            request(
+                "POST",
+                &format!("{api}/buckets"),
+                Some(json!({ "name": name })),
+            )
+        };
+        assert_eq!(
+            send(&app, create("new-bucket")).await.0,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            send(&app, create("new-bucket")).await.0,
+            StatusCode::CONFLICT
+        );
+        let (status, _, body) = send(&app, create("Bad_Name")).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error_of(&body).contains("bucket name"));
+        let delete = |name: &str| request("DELETE", &format!("{api}/buckets/{name}"), None);
+        assert_eq!(
+            send(&app, delete("new-bucket")).await.0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(
+            send(&app, delete("new-bucket")).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(send(&app, delete(BUCKET)).await.0, StatusCode::CONFLICT);
+
+        let uri = format!("{api}/buckets/{BUCKET}/objects?prefix=dir%2F&deleted=false");
+        let (status, _, body) = send(&app, request("GET", &uri, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        let listing: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listing["entries"][0]["key"], "dir/file.txt");
+
+        let uri = format!("{api}/buckets/{BUCKET}/download?key=dir%2Ffile.txt");
+        let (status, headers, body) = send(&app, request("GET", &uri, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, b"hello");
+        assert_eq!(headers["content-type"], "application/octet-stream");
+        assert_eq!(
+            headers["content-disposition"],
+            "attachment; filename*=UTF-8''file%2Etxt"
+        );
+        assert_eq!(headers["content-security-policy"], "sandbox");
+        let uri = format!("{api}/buckets/{BUCKET}/download?key=nope");
+        assert_eq!(
+            send(&app, request("GET", &uri, None)).await.0,
+            StatusCode::NOT_FOUND
+        );
+
+        let new_role = json!({ "name": "ui-role", "admin": false });
+        let (status, _, body) = send(
+            &app,
+            request("POST", &format!("{api}/roles"), Some(new_role)),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let secret: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(secret["secret"].as_str().unwrap().len(), 40);
+        let grant = json!({ "bucket": BUCKET, "permissions": ["read", "delete-version"] });
+        let uri = format!("{api}/roles/ui-role/grants");
+        assert_eq!(
+            send(&app, request("POST", &uri, Some(grant))).await.0,
+            StatusCode::NO_CONTENT
+        );
+        let bad = json!({ "bucket": BUCKET, "permissions": ["admin"] });
+        assert!(
+            send(&app, request("POST", &uri, Some(bad)))
+                .await
+                .0
+                .is_client_error()
+        );
+        let (_, _, body) = send(&app, request("GET", &format!("{api}/roles"), None)).await;
+        let roles: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            roles[0]["grants"],
+            json!([
+                { "bucket": BUCKET, "permission": "delete-version" },
+                { "bucket": BUCKET, "permission": "read" },
+            ])
+        );
+        let uri = format!("{api}/roles/nobody");
+        let (status, _, body) = send(&app, request("DELETE", &uri, None)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_of(&body), "no role named \"nobody\"");
+
+        // Unknown API routes are JSON 404s; everything else is the UI.
+        let (status, _, body) = send(&app, request("GET", &format!("{api}/nope"), None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(error_of(&body), "no such API route");
+        let (status, headers, _) = send(&app, request("GET", "/_dashboard/buckets/x", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+        let (status, _, _) = send(&app, request("GET", "/_dashboard/assets/nope.js", None)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        for path in ["/", "/_dashboard/"] {
+            let (status, headers, _) = send(&app, request("GET", path, None)).await;
+            assert!(status.is_redirection(), "{path}");
+            assert_eq!(headers["location"], "/_dashboard");
+        }
+        let (status, headers, _) = send(&app, request("GET", "/_dashboard", None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+        let (_, _, body) = send(&app, request("GET", &format!("{api}/openapi.json"), None)).await;
+        assert_eq!(
+            serde_json::from_slice::<Value>(&body).unwrap()["servers"][0]["url"],
+            api
+        );
+
+        // The peer routes are as before.
+        assert_eq!(
+            send(&app, request("GET", "/stats", None)).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&app, request("GET", "/blobs/nope", None)).await.0,
+            StatusCode::BAD_REQUEST
+        );
+        let missing = format!("/blobs/{}", uuid::Uuid::new_v4());
+        assert_eq!(
+            send(&app, request("GET", &missing, None)).await.0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    /// S3's CreateBucket checks names the same way.
+    #[tokio::test]
+    async fn s3_refuses_invalid_bucket_names() {
+        let Some(app) = node().await else { return };
+        let resp = crate::s3::buckets::create::create_bucket(&app, "Bad_Name")
             .await
             .unwrap();
-        assert_eq!(listing["entries"], json!([listing["entries"][0]]));
-        assert_eq!(listing["entries"][0]["key"], "a/two");
-        assert!(list_objects(&app, "nope", "", "", false).await.is_err());
-
-        let object = object(&app, BUCKET, "a/two").await.unwrap();
-        let versions = object["versions"].as_array().unwrap();
-        assert_eq!(versions.len(), 1);
-        assert_eq!(versions[0]["parts"][0]["size"], 20);
-        assert_eq!(versions[0]["parts"][0]["nodes"], json!([app.node]));
-
-        let cluster = cluster(&app).await.unwrap();
-        assert_eq!(cluster["nodes"][0]["stats"]["node"], app.node);
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = crate::s3::buckets::create::create_bucket(&app, BUCKET)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "re-creating a bucket succeeds"
+        );
     }
 }

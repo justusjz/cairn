@@ -139,8 +139,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     // Both servers run and loop forever, so awaiting them keeps the process alive
     // until one errors out.
     tokio::try_join!(
-        serve(listen_client_addr, app.clone(), ServeKind::Client),
-        serve(listen_peer_addr, app.clone(), ServeKind::Peer),
+        serve_client(listen_client_addr, app.clone()),
+        serve_peer(listen_peer_addr, app.clone()),
     )?;
     Ok(())
 }
@@ -241,13 +241,8 @@ impl std::fmt::Display for Contended {
 
 impl std::error::Error for Contended {}
 
-#[derive(Clone, Copy)]
-enum ServeKind {
-    Client,
-    Peer,
-}
-
-async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Result<()> {
+/// Serves the S3 API, counting every request in the node's metrics.
+async fn serve_client(addr: SocketAddr, app: Arc<App>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (stream, _peer_addr) = listener.accept().await?;
@@ -257,46 +252,28 @@ async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Resu
             let service = service_fn(move |req| {
                 let app = app.clone();
                 async move {
+                    let what = format!("{} {}", req.method(), req.uri().path());
+                    let started = std::time::Instant::now();
+                    let in_flight = app.metrics.begin();
+                    let op = metrics::Op::classify(
+                        req.method(),
+                        req.uri().path(),
+                        req.uri().query().unwrap_or(""),
+                        req.headers(),
+                    );
+                    let bytes_in = metrics::bytes_in(req.headers());
                     // A handler error must still produce a response: returning
                     // it to hyper would drop the connection without one, which
                     // clients take as a network fault and retry with backoff.
-                    let what = format!("{} {}", req.method(), req.uri().path());
-                    let res = match kind {
-                        ServeKind::Client => {
-                            let started = std::time::Instant::now();
-                            let in_flight = app.metrics.begin();
-                            let op = metrics::Op::classify(
-                                req.method(),
-                                req.uri().path(),
-                                req.uri().query().unwrap_or(""),
-                                req.headers(),
-                            );
-                            let bytes_in = metrics::bytes_in(req.headers());
-                            let res = s3::handle(req, app.clone()).await;
-                            let res = res.unwrap_or_else(|e| {
-                                eprintln!("{what} failed: {e:#}");
-                                s3::error_response(&e)
-                            });
-                            let (parts, body) = res.into_parts();
-                            let body = app.metrics.record(
-                                op,
-                                parts.status,
-                                bytes_in,
-                                started.elapsed(),
-                                body,
-                                in_flight,
-                            );
-                            return Ok(hyper::Response::from_parts(parts, body));
-                        }
-                        ServeKind::Peer => peer::handle(req, app).await,
-                    };
-                    Ok::<_, std::convert::Infallible>(res.unwrap_or_else(|e| {
+                    let res = s3::handle(req, app.clone()).await.unwrap_or_else(|e| {
                         eprintln!("{what} failed: {e:#}");
-                        match kind {
-                            ServeKind::Client => s3::error_response(&e),
-                            ServeKind::Peer => peer::error_response(&e),
-                        }
-                    }))
+                        s3::error_response(&e)
+                    });
+                    let (parts, body) = res.into_parts();
+                    let body =
+                        app.metrics
+                            .record(op, parts.status, bytes_in, started.elapsed(), body, in_flight);
+                    Ok::<_, std::convert::Infallible>(hyper::Response::from_parts(parts, body))
                 }
             });
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
@@ -304,6 +281,13 @@ async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Resu
             }
         });
     }
+}
+
+/// Serves the peer endpoint (see `peer`).
+async fn serve_peer(addr: SocketAddr, app: Arc<App>) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    axum::serve(listener, peer::router(app)).await?;
+    Ok(())
 }
 
 async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<Location>> {

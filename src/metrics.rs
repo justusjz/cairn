@@ -16,7 +16,8 @@ use hyper::{
     HeaderMap, Method, StatusCode,
     body::{Body, Bytes, Frame, SizeHint},
 };
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::body::ResBody;
 
@@ -116,17 +117,17 @@ impl Op {
 }
 
 /// Counts of requests, by how they ended, and of what they moved.
-#[derive(Clone, Copy, Default)]
-struct Counts {
-    requests: u64,
+#[derive(Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+pub struct Counts {
+    pub requests: u64,
     /// Answered with a 4xx: the client's fault (including denied requests).
-    client_errors: u64,
+    pub client_errors: u64,
     /// Answered with a 5xx: a fault, or too few nodes.
-    server_errors: u64,
-    bytes_in: u64,
-    bytes_out: u64,
+    pub server_errors: u64,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
     /// The sum of the times until the response's head was ready.
-    latency_us: u64,
+    pub latency_us: u64,
 }
 
 impl Counts {
@@ -139,17 +140,6 @@ impl Counts {
         }
         self.bytes_in += bytes_in;
         self.latency_us += latency.as_micros() as u64;
-    }
-
-    fn to_json(self) -> Value {
-        json!({
-            "requests": self.requests,
-            "client_errors": self.client_errors,
-            "server_errors": self.server_errors,
-            "bytes_in": self.bytes_in,
-            "bytes_out": self.bytes_out,
-            "latency_us": self.latency_us,
-        })
     }
 }
 
@@ -324,68 +314,150 @@ impl Metrics {
     }
 
     /// Everything, as the dashboard reports it.
-    pub fn to_json(&self) -> Value {
+    pub fn report(&self) -> MetricsReport {
         let requests = self.requests.lock().unwrap();
-        let ops: Vec<Value> = Op::ALL
+        let ops = Op::ALL
             .iter()
             .zip(&requests.ops)
-            .map(|(op, counts)| {
-                let mut v = counts.to_json();
-                v["op"] = op.name().into();
-                v
+            .map(|(op, &counts)| OpCounts {
+                op: op.name().to_owned(),
+                counts,
             })
             .collect();
-        let history: Vec<Value> = requests
+        let history = requests
             .history
             .iter()
-            .map(|&(slot, counts)| {
-                let mut v = counts.to_json();
-                v["t"] = (slot * SLOT.as_secs()).into();
-                v
+            .map(|&(slot, counts)| SlotCounts {
+                t: slot * SLOT.as_secs(),
+                counts,
             })
             .collect();
         drop(requests);
         let m = self.maintenance.lock().unwrap();
-        let events: Vec<Value> = m
+        let events = m
             .events
             .iter()
-            .map(|e| {
-                json!({"time": e.time, "source": e.source, "error": e.error, "message": e.message})
+            .map(|e| EventReport {
+                time: e.time,
+                source: e.source.to_owned(),
+                error: e.error,
+                message: e.message.clone(),
             })
             .collect();
-        json!({
-            "started_at": self.started,
-            "in_flight": self.in_flight.load(Ordering::Relaxed),
-            "requests": {
-                "slot_secs": SLOT.as_secs(),
-                "ops": ops,
-                "history": history,
+        MetricsReport {
+            started_at: self.started,
+            in_flight: self.in_flight.load(Ordering::Relaxed),
+            requests: RequestsReport {
+                slot_secs: SLOT.as_secs(),
+                ops,
+                history,
             },
-            "maintenance": {
-                "interval_secs": crate::MAINTENANCE_INTERVAL.as_secs(),
-                "passes": m.passes,
-                "running_since": m.running_since,
-                "last_started": m.last_started,
-                "last_duration": m.last_duration,
-                "sweep_shard": m.sweep_shard,
-                "shards": crate::store::SHARDS,
-                "gc": {
-                    "pending": m.gc_pending,
-                    "files": m.gc_files,
-                    "dirs": m.gc_dirs,
-                    "errors": m.gc_errors,
+            maintenance: MaintenanceReport {
+                interval_secs: crate::MAINTENANCE_INTERVAL.as_secs(),
+                passes: m.passes,
+                running_since: m.running_since,
+                last_started: m.last_started,
+                last_duration: m.last_duration,
+                sweep_shard: m.sweep_shard,
+                shards: crate::store::SHARDS,
+                gc: GcTotals {
+                    pending: m.gc_pending,
+                    files: m.gc_files,
+                    dirs: m.gc_dirs,
+                    errors: m.gc_errors,
                 },
-                "packer": {
-                    "jobs": m.pack_jobs,
-                    "failed": m.pack_failed,
-                    "blobs": m.pack_blobs,
-                    "parts": m.pack_parts,
-                    "bytes": m.pack_bytes,
+                packer: PackerTotals {
+                    jobs: m.pack_jobs,
+                    failed: m.pack_failed,
+                    blobs: m.pack_blobs,
+                    parts: m.pack_parts,
+                    bytes: m.pack_bytes,
                 },
-                "events": events,
+                events,
             },
-        })
+        }
     }
+}
+
+/// A node's metrics. Times are seconds since the Unix epoch.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct MetricsReport {
+    pub started_at: f64,
+    /// Requests whose response hasn't been sent in full yet.
+    pub in_flight: i64,
+    pub requests: RequestsReport,
+    pub maintenance: MaintenanceReport,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct RequestsReport {
+    /// How many seconds a slot of `history` covers.
+    pub slot_secs: u64,
+    /// Since the node started, by operation.
+    pub ops: Vec<OpCounts>,
+    /// The last hour's slots that had requests, oldest first.
+    pub history: Vec<SlotCounts>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct OpCounts {
+    pub op: String,
+    #[serde(flatten)]
+    pub counts: Counts,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct SlotCounts {
+    /// When the slot starts. The same on every node, so slots add up.
+    pub t: u64,
+    #[serde(flatten)]
+    pub counts: Counts,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct MaintenanceReport {
+    pub interval_secs: u64,
+    pub passes: u64,
+    /// When the pass that's running started.
+    pub running_since: Option<f64>,
+    pub last_started: Option<f64>,
+    /// How many seconds the last pass took.
+    pub last_duration: Option<f64>,
+    /// Where the GC's file sweep is, of `shards`.
+    pub sweep_shard: u32,
+    pub shards: u32,
+    pub gc: GcTotals,
+    pub packer: PackerTotals,
+    /// The most recent things a pass did or failed at, oldest first.
+    pub events: Vec<EventReport>,
+}
+
+/// What garbage collection deleted since the node started.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct GcTotals {
+    pub pending: u64,
+    pub files: u64,
+    pub dirs: u64,
+    pub errors: u64,
+}
+
+/// What the packer did since the node started.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PackerTotals {
+    pub jobs: u64,
+    pub failed: u64,
+    pub blobs: u64,
+    pub parts: u64,
+    pub bytes: u64,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct EventReport {
+    pub time: f64,
+    /// `gc`, `packer` or `maintenance`.
+    pub source: String,
+    pub error: bool,
+    pub message: String,
 }
 
 impl Maintenance {
@@ -515,13 +587,13 @@ mod tests {
         assert_eq!(metrics.in_flight.load(Ordering::Relaxed), 1);
         assert_eq!(body.collect().await.unwrap().to_bytes(), "hello");
         assert_eq!(metrics.in_flight.load(Ordering::Relaxed), 0);
-        let json = metrics.to_json();
-        let get = &json["requests"]["ops"][2];
-        assert_eq!(get["op"], "GetObject");
-        assert_eq!(get["requests"], 1);
-        assert_eq!(get["bytes_in"], 3);
-        assert_eq!(get["bytes_out"], 5);
-        assert_eq!(get["latency_us"], 2000);
-        assert_eq!(json["requests"]["history"][0]["bytes_out"], 5);
+        let report = metrics.report();
+        let get = &report.requests.ops[2];
+        assert_eq!(get.op, "GetObject");
+        assert_eq!(get.counts.requests, 1);
+        assert_eq!(get.counts.bytes_in, 3);
+        assert_eq!(get.counts.bytes_out, 5);
+        assert_eq!(get.counts.latency_us, 2000);
+        assert_eq!(report.requests.history[0].counts.bytes_out, 5);
     }
 }

@@ -149,7 +149,7 @@ export function BucketBrowser() {
       const page = await api.objects(bucket(), prefix(), after, deleted());
       if (current !== listing) return;
       setEntries((e) => [...e, ...page.entries]);
-      setNext(page.next);
+      setNext(page.next ?? null);
       setLoaded(true);
     } catch (e) {
       if (current === listing) setError((e as Error).message);
@@ -199,7 +199,7 @@ export function BucketBrowser() {
           >
             <For each={entries()}>
               {(e) =>
-                "prefix" in e ? (
+                e.kind === "prefix" ? (
                   <tr>
                     <td class="key">
                       <A href={bucketUrl(bucket(), e.prefix, deleted())}>📁 {e.prefix.slice(prefix().length)}</A>

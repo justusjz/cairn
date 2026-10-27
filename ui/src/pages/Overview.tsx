@@ -1,5 +1,5 @@
 import { For, Show, createMemo, createSignal } from "solid-js";
-import { type Cluster, api, diskOf, statsOf } from "../api";
+import { type Cluster, api, diskOf, statsError, statsOf } from "../api";
 import { LineChart } from "../components/LineChart";
 import { Badge, Bar, Card, LiveDot, Loading, Panel, Table, poll } from "../components/ui";
 import { ago, bytes, duration, num, pct, rate } from "../format";
@@ -166,9 +166,7 @@ function View(props: { cluster: Cluster }) {
                           ? "last seen " + ago(n.last_seen)
                           : st()
                             ? "up " + duration(st()!.now - st()!.started_at)
-                            : n.stats && "error" in n.stats
-                              ? n.stats.error
-                              : ""}
+                            : (statsError(n) ?? "")}
                       </div>
                     </td>
                     <td>

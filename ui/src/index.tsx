@@ -57,7 +57,7 @@ function NotFound() {
 render(
   () => (
     // Plain links (downloads) are left to the browser; only <A> navigates.
-    <Router root={Layout} explicitLinks>
+    <Router root={Layout} base="/_dashboard" explicitLinks>
       <Route path="/" component={Overview} />
       <Route path="/storage" component={Storage} />
       <Route path="/jobs" component={Jobs} />

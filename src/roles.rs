@@ -17,7 +17,10 @@ use deadpool_postgres::Object;
 use tokio_postgres::error::SqlState;
 
 /// A bucket-level permission a role can be granted.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
+)]
+#[serde(rename_all = "kebab-case")]
 pub enum Permission {
     /// GetObject, HeadObject, ListObjects; the source side of a copy.
     Read,
@@ -29,10 +32,13 @@ pub enum Permission {
 }
 
 impl Permission {
-    pub fn parse(s: &str) -> Option<Permission> {
-        [Permission::Read, Permission::Write, Permission::DeleteVersion]
-            .into_iter()
-            .find(|p| p.as_str() == s)
+    /// The permission a `role_grants.permission` names.
+    fn from_db(s: &str) -> Permission {
+        match s {
+            "read" => Permission::Read,
+            "write" => Permission::Write,
+            _ => Permission::DeleteVersion,
+        }
     }
 
     pub fn as_str(self) -> &'static str {
@@ -192,7 +198,7 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
                 let admin = if role.admin { " (admin)" } else { "" };
                 println!("{}{admin}", role.name);
                 for (bucket, permission) in role.grants {
-                    println!("  {bucket}:{permission}");
+                    println!("  {bucket}:{}", permission.as_str());
                 }
             }
         }
@@ -334,7 +340,7 @@ pub struct RoleInfo {
     /// When it was created, in seconds since the Unix epoch.
     pub created_at: f64,
     /// (bucket, permission), sorted.
-    pub grants: Vec<(String, String)>,
+    pub grants: Vec<(String, Permission)>,
 }
 
 /// Every role, by name.
@@ -359,7 +365,7 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
             grants: r
                 .get::<_, Vec<String>>(3)
                 .into_iter()
-                .zip(r.get::<_, Vec<String>>(4))
+                .zip(r.get::<_, Vec<String>>(4).iter().map(|p| Permission::from_db(p)))
                 .collect(),
         })
         .collect())

@@ -17,7 +17,7 @@ export default function Roles() {
     const n = name().trim();
     const res = await act(() => api.createRole(n, newSecret(), admin()), `Created role ${n}`);
     if (!res) return;
-    if (!newSecret()) setSecret(res);
+    if (!newSecret()) setSecret(res.value);
     setName("");
     setNewSecret("");
     setAdmin(false);
@@ -105,7 +105,7 @@ function RoleRow(props: {
   const rotate = async () => {
     if (!confirm(`Replace the secret of "${r().name}"? Clients using the old one stop working.`)) return;
     const res = await act(() => api.rotateSecret(r().name));
-    if (res) props.showSecret(res);
+    if (res) props.showSecret(res.value);
   };
   const remove = async () => {
     if (!confirm(`Delete role "${r().name}" and all its grants? Clients using it stop working.`)) return;

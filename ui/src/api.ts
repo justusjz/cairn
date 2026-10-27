@@ -1,163 +1,34 @@
-// The dashboard's JSON API (`src/dashboard/api.rs`), and the shapes it answers
-// with. Times are seconds since the Unix epoch.
+// The dashboard's JSON API (`src/dashboard/api.rs`), through openapi-fetch.
+// Its types are generated from `openapi.json`, the spec the API itself is
+// built from (`npm run gen` writes `schema.d.ts`), so paths, parameters and
+// responses are all checked against it. Times are seconds since the Unix epoch.
 
-export interface Counts {
-  requests: number;
-  client_errors: number;
-  server_errors: number;
-  bytes_in: number;
-  bytes_out: number;
-  latency_us: number;
-}
+import createClient from "openapi-fetch";
+import type { components, paths } from "./schema";
 
-export interface OpCounts extends Counts {
-  op: string;
-}
+type Schemas = components["schemas"];
+export type Cluster = Schemas["Cluster"];
+export type ClusterNode = Schemas["ClusterNode"];
+export type NodeStats = Schemas["NodeStats"];
+export type Counts = Schemas["Counts"];
+export type OpCounts = Schemas["OpCounts"];
+export type Event = Schemas["EventReport"];
+export type Storage = Schemas["Storage"];
+export type Bucket = Schemas["BucketSummary"];
+export type Entry = Schemas["Entry"];
+export type ObjectInfo = Schemas["ObjectInfo"];
+export type Role = Schemas["RoleSummary"];
+export type Permission = Schemas["Permission"];
 
-/** A slot of request history, starting at `t`. */
-export interface Slot extends Counts {
-  t: number;
-}
+/** Where the API is; also in the spec's `servers`. */
+const BASE = "/_dashboard/api";
 
-export interface Event {
-  time: number;
-  source: string;
-  error: boolean;
-  message: string;
-}
-
-export interface Maintenance {
-  interval_secs: number;
-  passes: number;
-  running_since: number | null;
-  last_started: number | null;
-  last_duration: number | null;
-  sweep_shard: number;
-  shards: number;
-  gc: { pending: number; files: number; dirs: number; errors: number };
-  packer: { jobs: number; failed: number; blobs: number; parts: number; bytes: number };
-  events: Event[];
-}
-
-/** What a node reports about itself. */
-export interface NodeStats {
-  node: number;
-  node_id: string;
-  version: string;
-  replication_factor: number;
-  now: number;
-  started_at: number;
-  in_flight: number;
-  disk: { total: number; available: number } | { error: string };
-  requests: { slot_secs: number; ops: OpCounts[]; history: Slot[] };
-  maintenance: Maintenance;
-}
-
-export interface ClusterNode {
-  id: number;
-  node_id: string;
-  peer_url: string;
-  last_seen: number;
-  free_space: number;
-  live: boolean;
-  /** What the node reported; null if it's down. */
-  stats: NodeStats | { error: string } | null;
-}
-
-export interface Cluster {
-  this_node: number;
-  replication_factor: number;
-  now: number;
-  nodes: ClusterNode[];
-}
-
-export interface Storage {
-  replication_factor: number;
-  nodes: { node: number; blobs: number; bytes: number }[];
-  replicas: { live: number; copies: number; blobs: number; bytes: number }[];
-  blobs: { committed: number; bytes: number; garbage_bytes: number; pending: number; oldest_pending: number | null };
-  objects: {
-    buckets: number;
-    current: number;
-    current_bytes: number;
-    noncurrent: number;
-    noncurrent_bytes: number;
-    delete_markers: number;
-  };
-  backlog: {
-    packing: number;
-    packing_bytes: number;
-    consolidate: number;
-    consolidate_bytes: number;
-    compact: number;
-    compact_garbage_bytes: number;
-    garbage_log: number;
-    uploads: number;
-    oldest_upload: number | null;
-    upload_bytes: number;
-  };
-  packer: { target_size: number; small_size: number; compact_threshold: number; max_sources: number };
-}
-
-export interface Bucket {
-  name: string;
-  created_at: number;
-  versioning: "unversioned" | "enabled" | "suspended";
-  objects: number;
-  bytes: number;
-  versions: number;
-  version_bytes: number;
-  uploads: number;
-  roles: number;
-}
-
-export type Entry =
-  | { prefix: string; objects: number; bytes: number; last_modified: number }
-  | { key: string; size: number; etag: string | null; last_modified: number; delete_marker: boolean };
-
-export interface Listing {
-  entries: Entry[];
-  next: string | null;
-}
-
-export interface Part {
-  number: number;
-  size: number;
-  etag: string;
-  crc64nvme: string | null;
-  blob_id: string;
-  blob_offset: number;
-  blob_size: number;
-  blob_state: string;
-  created_at: number;
-  nodes: number[];
-}
-
-export interface Version {
-  version_id: string;
-  latest: boolean;
-  delete_marker: boolean;
-  size: number;
-  etag: string | null;
-  content_type: string | null;
-  last_modified: number;
-  parts: Part[];
-}
-
-export interface ObjectInfo {
-  bucket: string;
-  key: string;
-  versions: Version[];
-}
-
-export type Permission = "read" | "write" | "delete-version";
-
-export interface Role {
-  name: string;
-  admin: boolean;
-  created_at: number;
-  grants: { bucket: string; permission: Permission }[];
-}
+const client = createClient<paths>({
+  baseUrl: BASE,
+  // Marks requests as the dashboard's own: the API refuses changes without
+  // it, so that other sites can't make them.
+  headers: { "x-cairn-ui": "1" },
+});
 
 export class ApiError extends Error {
   constructor(
@@ -168,64 +39,68 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
-  // The header marks the request as the dashboard's own: the API refuses
-  // changes without it, so that other sites can't make them.
-  const headers: Record<string, string> = { "x-cairn-ui": "1" };
-  const init: RequestInit = { method, headers };
-  if (body !== undefined) {
-    headers["content-type"] = "application/json";
-    init.body = JSON.stringify(body);
+/** The data of a response, or its error thrown. */
+async function ok<T>(
+  request: Promise<{ data?: T; error?: { error: string } | unknown; response: Response }>,
+): Promise<T> {
+  const { data, error, response } = await request;
+  if (error !== undefined || !response.ok) {
+    const message = (error as { error?: string } | undefined)?.error;
+    throw new ApiError(response.status, message ?? `request failed (${response.status})`);
   }
-  const res = await fetch("/api/" + path, init);
-  let data: any = {};
-  try {
-    data = await res.json();
-  } catch {
-    // Not JSON: the status says enough.
-  }
-  if (!res.ok) throw new ApiError(res.status, data.error ?? `request failed (${res.status})`);
   return data as T;
 }
 
-const enc = encodeURIComponent;
+const bucketPath = (bucket: string) => ({ path: { bucket } });
+const rolePath = (role: string) => ({ path: { role } });
 
 export const api = {
-  cluster: () => request<Cluster>("GET", "cluster"),
-  storage: () => request<Storage>("GET", "storage"),
-  buckets: () => request<{ buckets: Bucket[] }>("GET", "buckets").then((r) => r.buckets),
-  createBucket: (name: string) => request("POST", "buckets", { name }),
-  deleteBucket: (name: string) => request("DELETE", `buckets/${enc(name)}`),
+  cluster: () => ok(client.GET("/cluster")),
+  storage: () => ok(client.GET("/storage")),
+  buckets: () => ok(client.GET("/buckets")),
+  createBucket: (name: string) => ok(client.POST("/buckets", { body: { name } })),
+  deleteBucket: (bucket: string) => ok(client.DELETE("/buckets/{bucket}", { params: bucketPath(bucket) })),
   objects: (bucket: string, prefix: string, after: string, deleted: boolean) =>
-    request<Listing>(
-      "GET",
-      `buckets/${enc(bucket)}/objects?prefix=${enc(prefix)}&after=${enc(after)}` + (deleted ? "&deleted=1" : ""),
+    ok(
+      client.GET("/buckets/{bucket}/objects", {
+        params: { ...bucketPath(bucket), query: { prefix, after, deleted } },
+      }),
     ),
-  object: (bucket: string, key: string) => request<ObjectInfo>("GET", `buckets/${enc(bucket)}/object?key=${enc(key)}`),
-  roles: () => request<{ roles: Role[] }>("GET", "roles").then((r) => r.roles),
+  object: (bucket: string, key: string) =>
+    ok(client.GET("/buckets/{bucket}/object", { params: { ...bucketPath(bucket), query: { key } } })),
+  roles: () => ok(client.GET("/roles")),
   createRole: (name: string, secret: string, admin: boolean) =>
-    request<{ name: string; secret: string }>("POST", "roles", { name, secret, admin }),
-  deleteRole: (name: string) => request("DELETE", `roles/${enc(name)}`),
-  rotateSecret: (name: string) => request<{ name: string; secret: string }>("POST", `roles/${enc(name)}/secret`, {}),
-  setAdmin: (name: string, admin: boolean) => request("POST", `roles/${enc(name)}/admin`, { admin }),
-  grant: (name: string, bucket: string, permissions: Permission[]) =>
-    request("POST", `roles/${enc(name)}/grants`, { bucket, permissions }),
-  revoke: (name: string, bucket: string, permission: Permission) =>
-    request("DELETE", `roles/${enc(name)}/grants?bucket=${enc(bucket)}&permission=${enc(permission)}`),
+    ok(client.POST("/roles", { body: { name, secret: secret || null, admin } })),
+  deleteRole: (role: string) => ok(client.DELETE("/roles/{role}", { params: rolePath(role) })),
+  rotateSecret: (role: string) => ok(client.POST("/roles/{role}/secret", { params: rolePath(role), body: {} })),
+  setAdmin: (role: string, admin: boolean) =>
+    ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
+  grant: (role: string, bucket: string, permissions: Permission[]) =>
+    ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
+  revoke: (role: string, bucket: string, permission: Permission) =>
+    ok(client.DELETE("/roles/{role}/grants", { params: { ...rolePath(role), query: { bucket, permission } } })),
 };
 
-/** Where to download a version of an object from. */
+/** Where to download a version of an object from. It's a plain link, so the
+ * browser saves the file itself. */
 export function downloadUrl(bucket: string, key: string, version?: string): string {
-  return `/api/buckets/${enc(bucket)}/download?key=${enc(key)}` + (version ? "&version=" + enc(version) : "");
+  const query = new URLSearchParams({ key });
+  if (version) query.set("version", version);
+  return `${BASE}/buckets/${encodeURIComponent(bucket)}/download?${query}`;
 }
 
 /** The stats of a node that reported them. */
 export function statsOf(node: ClusterNode): NodeStats | null {
-  return node.stats && !("error" in node.stats) ? node.stats : null;
+  return node.stats ?? null;
 }
 
 /** A node's disk, if it reported one. */
 export function diskOf(node: ClusterNode): { total: number; available: number } | null {
-  const disk = statsOf(node)?.disk;
-  return disk && "total" in disk && disk.total ? disk : null;
+  const disk = node.stats?.disk;
+  return disk && disk.total ? disk : null;
+}
+
+/** Why a live node's stats are missing, if they are. */
+export function statsError(node: ClusterNode): string | null {
+  return node.stats_error ?? null;
 }

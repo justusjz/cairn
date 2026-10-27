@@ -45,13 +45,13 @@ export function toast(message: string, error = false) {
   setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), error ? 7000 : 3500);
 }
 
-/** Runs an action, telling the user how it went. Resolves to its result, or
- * undefined if it failed. */
-export async function act<T>(fn: () => Promise<T>, success?: string): Promise<T | undefined> {
+/** Runs an action, telling the user how it went. Resolves to its result
+ * wrapped (an action may have none, e.g. a 204), or undefined if it failed. */
+export async function act<T>(fn: () => Promise<T>, success?: string): Promise<{ value: T } | undefined> {
   try {
-    const result = await fn();
+    const value = await fn();
     if (success) toast(success);
-    return result;
+    return { value };
   } catch (e) {
     toast((e as Error).message, true);
     return undefined;

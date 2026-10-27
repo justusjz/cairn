@@ -6,9 +6,11 @@ import solid from "vite-plugin-solid";
 const node = process.env.CAIRN_URL ?? "http://127.0.0.1:9431";
 
 export default defineConfig({
+  // Where the node serves the dashboard (`dashboard::PREFIX`).
+  base: "/_dashboard/",
   plugins: [solid()],
   server: {
-    proxy: { "/api": { target: node, changeOrigin: true } },
+    proxy: { "/_dashboard/api": { target: node, changeOrigin: true } },
   },
   build: {
     target: "es2022",
