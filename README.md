@@ -14,9 +14,10 @@ consistent.
 The schema is created automatically; just point Cairn at an empty database.
 
 > [!WARNING]
-> The peer endpoint (`--listen-peer`, default `:9431`) is unauthenticated and
-> can read and delete blobs. Only bind it to a trusted/private network — never
-> expose it to the public internet.
+> The peer endpoint (`--listen-peer`, default `:9431`) is unauthenticated: it
+> can read and delete blobs, and it serves the [dashboard](#dashboard), which
+> manages roles. Only bind it to a trusted/private network — never expose it to
+> the public internet.
 
 ## Installing
 
@@ -145,6 +146,9 @@ the bucket (with any S3 client), then you grant roles access. Deleting a bucket
 removes its grants, so a bucket re-created under the same name starts with no
 access for anyone.
 
+Bucket names follow S3's rules: 3 to 63 lowercase letters, digits, dots and
+hyphens, starting and ending with a letter or digit.
+
 Manage roles with `cairn role --database <URL> <command>`:
 
 | Command | Description |
@@ -169,6 +173,75 @@ clocks of nodes and clients in sync (e.g. NTP); otherwise requests fail with
 > Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,
 > since it is part of the signature.
+
+## Dashboard
+
+Every node serves a web dashboard for watching and managing the cluster, on its
+peer endpoint, under `/_dashboard`: open the peer URL in a browser, e.g.
+`http://10.0.0.1:9431/` (or `http://127.0.0.1:9431/` with the default
+`--listen-peer`), which leads there. Any node's dashboard shows the whole
+cluster:
+
+- **Overview:** which nodes are live, how full their disks are, and request
+  rates, errors, throughput and latency over the last hour, by S3 operation.
+- **Storage:** how much data there is, how much of it has fewer live copies
+  than the replication factor, and what each node holds.
+- **Jobs:** how the background passes (garbage collection and packing) are
+  doing on each node, what they still have to do, and what they did recently.
+- **Buckets:** browse buckets by prefix, see every version of a key with the
+  blobs its parts are stored in and the nodes holding them, and download any
+  version. Buckets can be created and (when empty) deleted.
+- **Roles:** everything `cairn role` does: create and delete roles, grant and
+  revoke permissions, rotate secrets, and toggle admin.
+
+To keep other websites from reaching it through DNS rebinding, the dashboard
+only answers when it's opened by IP address, as `localhost`, or by the host of
+the node's `--peer-url`.
+
+Request metrics are kept in memory by each node, so they start over when it
+restarts; everything else is read from the database.
+
+The dashboard's JSON API is under `/_dashboard/api/`, described by an OpenAPI
+spec at `/_dashboard/api/openapi.json` (also committed as `ui/openapi.json`).
+
+> [!WARNING]
+> Like the rest of the peer endpoint, the dashboard has no authentication:
+> anyone who can reach it can read every object and manage every role. Keep
+> the peer endpoint on a trusted network.
+
+### Building the dashboard
+
+The dashboard's UI lives in `ui/` (SolidJS and TypeScript, built with Vite)
+and is embedded into the binary when Cairn is built, so build it first (with
+Node.js 26 or later). Cargo doesn't run npm itself: without a build of the UI,
+building Cairn (or running its tests) fails and says how to build it, and it
+warns when the build is older than the UI's sources.
+
+```sh
+(cd ui && npm ci && npm run build)
+cargo build --release
+```
+
+`./build-release.sh` does both. While working on the UI, `npm run dev` in
+`ui/` serves it with hot reloading, passing API requests on to the node at
+`CAIRN_URL` (default `http://127.0.0.1:9431`).
+
+The UI's types come from the API's OpenAPI spec, which is generated from the
+Rust code (with [utoipa](https://github.com/juhaku/utoipa)). Both the spec
+(`ui/openapi.json`) and the TypeScript types made from it for
+[openapi-fetch](https://openapi-ts.dev/openapi-fetch/) (`ui/src/schema.d.ts`)
+are committed, so building needs neither generator. A test fails when the
+committed spec no longer matches the API; after changing the API, regenerate
+both:
+
+```sh
+CAIRN_UPDATE_OPENAPI=1 cargo test openapi
+(cd ui && npm run gen)
+```
+
+`npm run gen` runs [openapi-typescript](https://openapi-ts.dev/) through `npx`,
+with pinned versions and the TypeScript 5 it needs (the UI itself uses
+TypeScript 7), so it needs network access.
 
 ## Versioning
 

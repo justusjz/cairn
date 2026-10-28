@@ -35,11 +35,11 @@ use crate::{
     },
 };
 
-mod buckets;
+pub(crate) mod buckets;
 pub(crate) mod conditional;
 pub(crate) mod multipart;
 pub(crate) mod objects;
-mod util;
+pub(crate) mod util;
 pub(crate) mod versions;
 
 pub async fn handle(

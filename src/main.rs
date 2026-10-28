@@ -31,10 +31,12 @@ mod blob_file;
 mod blobs;
 mod body;
 mod checksum;
+mod dashboard;
 mod db;
 #[cfg(test)]
 mod e2e;
 mod gc;
+mod metrics;
 mod packer;
 mod roles;
 mod s3;
@@ -49,6 +51,8 @@ pub struct App {
     replication_factor: usize,
     writing: WritingSet,
     pack: packer::Config,
+    metrics: Arc<metrics::Metrics>,
+    dashboard: dashboard::Dashboard,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -95,7 +99,7 @@ struct ServeArgs {
 /// How often a node refreshes its `nodes` row (last_seen / free_space).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How often a node runs its maintenance pass.
-const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
+pub(crate) const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -124,6 +128,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         replication_factor: args.replication_factor,
         writing: WritingSet::default(),
         pack: packer::Config::default(),
+        metrics: Arc::default(),
+        dashboard: dashboard::Dashboard::new(&peer_url),
         #[cfg(test)]
         pack_hook: None,
     });
@@ -135,8 +141,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     // Both servers run and loop forever, so awaiting them keeps the process alive
     // until one errors out.
     tokio::try_join!(
-        serve(listen_client_addr, app.clone(), ServeKind::Client),
-        serve(listen_peer_addr, app.clone(), ServeKind::Peer),
+        serve_client(listen_client_addr, app.clone()),
+        serve_peer(listen_peer_addr, app.clone()),
     )?;
     Ok(())
 }
@@ -147,26 +153,35 @@ async fn maintain(app: Arc<App>) {
     let mut sweep = gc::Sweep::new();
     loop {
         tokio::time::sleep(MAINTENANCE_INTERVAL).await;
-        let (app, scope) = (app.clone(), sweep.next_scope());
+        app.metrics.pass_started(sweep.position());
+        let (task_app, scope) = (app.clone(), sweep.next_scope());
         // A task of its own, so that a panic (a bug) fails this pass, rather
         // than ending maintenance on this node.
         let pass = tokio::spawn(async move {
+            let app = task_app;
             let report = gc::pass(&app, scope).await;
             if !report.is_empty() {
                 eprintln!("gc: {report}");
             }
+            app.metrics.gc_done(&report);
             match packer::pass(&app).await {
                 Ok(jobs) => {
                     for job in jobs {
                         eprintln!("packer: {job}");
+                        app.metrics.pack_done(&job);
                     }
                 }
-                Err(e) => eprintln!("packer: pass failed: {e:#}"),
+                Err(e) => {
+                    eprintln!("packer: pass failed: {e:#}");
+                    app.metrics.pack_failed(format!("pass failed: {e:#}"));
+                }
             }
         });
         if let Err(e) = pass.await {
             eprintln!("maintenance pass failed: {e}");
+            app.metrics.maintenance_failed(format!("pass failed: {e}"));
         }
+        app.metrics.pass_finished();
     }
 }
 
@@ -228,13 +243,8 @@ impl std::fmt::Display for Contended {
 
 impl std::error::Error for Contended {}
 
-#[derive(Clone, Copy)]
-enum ServeKind {
-    Client,
-    Peer,
-}
-
-async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Result<()> {
+/// Serves the S3 API, counting every request in the node's metrics.
+async fn serve_client(addr: SocketAddr, app: Arc<App>) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     loop {
         let (stream, _peer_addr) = listener.accept().await?;
@@ -244,21 +254,28 @@ async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Resu
             let service = service_fn(move |req| {
                 let app = app.clone();
                 async move {
+                    let what = format!("{} {}", req.method(), req.uri().path());
+                    let started = std::time::Instant::now();
+                    let in_flight = app.metrics.begin();
+                    let op = metrics::Op::classify(
+                        req.method(),
+                        req.uri().path(),
+                        req.uri().query().unwrap_or(""),
+                        req.headers(),
+                    );
+                    let bytes_in = metrics::bytes_in(req.headers());
                     // A handler error must still produce a response: returning
                     // it to hyper would drop the connection without one, which
                     // clients take as a network fault and retry with backoff.
-                    let what = format!("{} {}", req.method(), req.uri().path());
-                    let res = match kind {
-                        ServeKind::Client => s3::handle(req, app).await,
-                        ServeKind::Peer => peer::handle(req, app).await,
-                    };
-                    Ok::<_, std::convert::Infallible>(res.unwrap_or_else(|e| {
+                    let res = s3::handle(req, app.clone()).await.unwrap_or_else(|e| {
                         eprintln!("{what} failed: {e:#}");
-                        match kind {
-                            ServeKind::Client => s3::error_response(&e),
-                            ServeKind::Peer => peer::error_response(&e),
-                        }
-                    }))
+                        s3::error_response(&e)
+                    });
+                    let (parts, body) = res.into_parts();
+                    let body =
+                        app.metrics
+                            .record(op, parts.status, bytes_in, started.elapsed(), body, in_flight);
+                    Ok::<_, std::convert::Infallible>(hyper::Response::from_parts(parts, body))
                 }
             });
             if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
@@ -266,6 +283,13 @@ async fn serve(addr: SocketAddr, app: Arc<App>, kind: ServeKind) -> anyhow::Resu
             }
         });
     }
+}
+
+/// Serves the peer endpoint (see `peer`).
+async fn serve_peer(addr: SocketAddr, app: Arc<App>) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    axum::serve(listener, peer::router(app)).await?;
+    Ok(())
 }
 
 async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<Location>> {

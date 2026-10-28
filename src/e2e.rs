@@ -46,7 +46,8 @@ pub async fn node_with(pack: Config, hook: Option<Hook>) -> Option<Arc<App>> {
     let dir = std::env::temp_dir().join(format!("cairn-e2e-{}", Uuid::new_v4()));
     let store = Store::new(dir.to_string_lossy().into_owned()).unwrap();
     // A single node holds every blob, so peers never contact it.
-    let node = crate::register_node(&pool, &store, "http://127.0.0.1:1")
+    let peer_url = "http://127.0.0.1:1";
+    let node = crate::register_node(&pool, &store, peer_url)
         .await
         .unwrap();
     pool.get()
@@ -62,6 +63,8 @@ pub async fn node_with(pack: Config, hook: Option<Hook>) -> Option<Arc<App>> {
         replication_factor: 1,
         writing: WritingSet::default(),
         pack,
+        metrics: Arc::default(),
+        dashboard: crate::dashboard::Dashboard::new(peer_url),
         pack_hook: hook,
     }))
 }

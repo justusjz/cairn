@@ -1,142 +1,167 @@
+//! The peer endpoint: blob traffic between nodes, each node's metrics, and
+//! the dashboard. Unauthenticated, for the private network only.
+
 use std::sync::Arc;
 
-use http_body_util::Full;
-use hyper::{Request, Response, StatusCode, body::Bytes, body::Frame};
+use axum::{
+    Router,
+    body::Body,
+    extract::{Path, RawQuery, State},
+    http::{HeaderValue, StatusCode, header},
+    response::{IntoResponse, Redirect, Response},
+    routing::{any, get},
+};
+use hyper::body::{Bytes, Frame};
 use uuid::Uuid;
 
 use crate::{
     App, blob_file,
+    body::{channel_body, send_file},
     checksum::BlockLayout,
-    body::{ResBody, box_response, channel_body, send_file},
     gc, packer,
 };
 
-/// The response for a failed peer request: a bare 500 (peers only check the
-/// status; the error itself is logged by the caller).
 /// Response header of a blob PUT: the hex CRC64/NVME of the file the replica
 /// stored (the data plus its checksum table and blob ID).
 pub const CRC64_HEADER: &str = "x-cairn-crc64nvme";
 
-pub fn error_response(_e: &anyhow::Error) -> Response<ResBody> {
-    box_response(empty(StatusCode::INTERNAL_SERVER_ERROR))
+/// A failed peer request: a bare 500, since peers only check the status. The
+/// error itself is logged.
+struct Failed(anyhow::Error);
+
+impl IntoResponse for Failed {
+    fn into_response(self) -> Response {
+        eprintln!("peer request failed: {:#}", self.0);
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    }
 }
 
-pub async fn handle(
-    req: Request<hyper::body::Incoming>,
-    app: Arc<App>,
-) -> anyhow::Result<Response<ResBody>> {
-    let path = req.uri().path();
-    if path == "/maintain" {
-        // For tests: run a maintenance pass now (as the background one would,
-        // but sweeping everything), and report what it did once it's done (a
-        // failed packing job is only logged).
-        let mut report = format!("gc: {}\n", gc::pass(&app, gc::Scope::everything()).await);
-        for job in packer::pass(&app).await? {
-            report.push_str(&format!("packer: {job}\n"));
-        }
-        return Ok(box_response(
-            Response::builder()
-                .status(StatusCode::OK)
-                .header(hyper::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                .body(Full::new(Bytes::from(report)))
-                .unwrap(),
-        ));
+impl<E: Into<anyhow::Error>> From<E> for Failed {
+    fn from(e: E) -> Self {
+        Failed(e.into())
     }
-    if let Some(blob_id) = path.strip_prefix("/blobs/") {
-        // Parse the id up front: `blob_id` borrows `req` (via `path`), and
-        // collecting the body below consumes `req`, so the borrow must end here.
-        let blob_id = match Uuid::parse_str(blob_id) {
-            Ok(id) => id,
-            Err(_) => return Ok(box_response(empty(StatusCode::BAD_REQUEST))),
-        };
-        // Clone the method so the PUT arm can still consume `req`'s body.
-        return match req.method().clone() {
-            hyper::Method::GET => {
-                // Dumb data plane: stream whatever bytes we hold from disk — the
-                // whole blob, or just `?offset=&length=` of it — or 404 so the
-                // reader can fall through to another replica. For a block-aligned
-                // range of a checksummed blob, the reader sends the blob's size and
-                // block size from the catalog (`?blob_size=&block_size=`); we check
-                // our file against them and send the range's block checksums from
-                // the file first. The reader verifies the bytes against them, so we
-                // don't have to.
-                let query = req.uri().query().unwrap_or("");
-                let range = parse_range(query);
-                let layout = parse_layout(query);
-                match app.store.open_blob(blob_id).await? {
-                    Some(mut file) => {
-                        let crcs = match (layout, range) {
-                            (Some(layout), Some((offset, length))) => {
-                                match blob_file::open_range(
-                                    &mut file, blob_id, layout, offset, length,
-                                )
-                                .await
-                                {
-                                    Ok(crcs) => Some(crcs),
-                                    Err(e) => {
-                                        if e.kind() == std::io::ErrorKind::InvalidData {
-                                            eprintln!("CORRUPTION: blob {blob_id}: {e}");
-                                        }
-                                        return Err(e.into());
-                                    }
-                                }
-                            }
-                            (Some(_), None) => {
-                                return Ok(box_response(empty(StatusCode::BAD_REQUEST)));
-                            }
-                            (None, _) => None,
-                        };
-                        let (tx, body) = channel_body();
-                        tokio::spawn(async move {
-                            if let Some(crcs) = crcs
-                                && tx.send(Ok(Frame::data(Bytes::from(crcs)))).await.is_err()
-                            {
-                                return;
-                            }
-                            if let Err(e) = send_file(file, range, &tx).await {
-                                let _ = tx.send(Err(e)).await;
-                            }
-                        });
-                        Ok(Response::builder()
-                            .status(StatusCode::OK)
-                            .body(body)
-                            .unwrap())
+}
+
+pub fn router(app: Arc<App>) -> Router {
+    Router::new()
+        .route("/maintain", any(maintain))
+        .route("/stats", get(stats))
+        .route(
+            "/blobs/{blob_id}",
+            get(get_blob).put(put_blob).delete(delete_blob),
+        )
+        .nest(
+            crate::dashboard::PREFIX,
+            crate::dashboard::router(app.clone()),
+        )
+        // `nest` doesn't match the prefix with a trailing slash.
+        .route("/", get(to_dashboard))
+        .route(&format!("{}/", crate::dashboard::PREFIX), get(to_dashboard))
+        .with_state(app)
+}
+
+async fn to_dashboard() -> Redirect {
+    Redirect::to(crate::dashboard::PREFIX)
+}
+
+/// For tests: runs a maintenance pass now (as the background one would, but
+/// sweeping everything), and reports what it did once it's done (a failed
+/// packing job is only logged).
+async fn maintain(State(app): State<Arc<App>>) -> Result<Response, Failed> {
+    let mut report = format!("gc: {}\n", gc::pass(&app, gc::Scope::everything()).await);
+    for job in packer::pass(&app).await? {
+        report.push_str(&format!("packer: {job}\n"));
+    }
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        report,
+    )
+        .into_response())
+}
+
+/// This node's own metrics, for the dashboard of whichever node it's open on.
+async fn stats(State(app): State<Arc<App>>) -> axum::Json<crate::dashboard::NodeStats> {
+    axum::Json(crate::dashboard::node_stats(&app))
+}
+
+/// Dumb data plane: streams whatever bytes we hold from disk — the whole blob,
+/// or just `?offset=&length=` of it — or 404 so the reader can fall through to
+/// another replica. For a block-aligned range of a checksummed blob, the reader
+/// sends the blob's size and block size from the catalog
+/// (`?blob_size=&block_size=`); we check our file against them and send the
+/// range's block checksums from the file first. The reader verifies the bytes
+/// against them, so we don't have to.
+async fn get_blob(
+    State(app): State<Arc<App>>,
+    Path(blob_id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Response, Failed> {
+    let Ok(blob_id) = Uuid::parse_str(&blob_id) else {
+        return Ok(StatusCode::BAD_REQUEST.into_response());
+    };
+    let query = query.unwrap_or_default();
+    let range = parse_range(&query);
+    let layout = parse_layout(&query);
+    let Some(mut file) = app.store.open_blob(blob_id).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    let crcs = match (layout, range) {
+        (Some(layout), Some((offset, length))) => {
+            match blob_file::open_range(&mut file, blob_id, layout, offset, length).await {
+                Ok(crcs) => Some(crcs),
+                Err(e) => {
+                    if e.kind() == std::io::ErrorKind::InvalidData {
+                        eprintln!("CORRUPTION: blob {blob_id}: {e}");
                     }
-                    None => Ok(box_response(empty(StatusCode::NOT_FOUND))),
+                    return Err(e.into());
                 }
             }
-            hyper::Method::PUT => {
-                // Stream the body straight to disk (and announce the location),
-                // without buffering the whole blob in memory. Answer with the
-                // CRC of the file we stored, so the writer can check that we got
-                // exactly the bytes it sent.
-                let crc = crate::write_blob_streaming(&app, blob_id, req.into_body()).await?;
-                Ok(box_response(
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header(CRC64_HEADER, format!("{crc:016x}"))
-                        .body(Full::new(Bytes::new()))
-                        .unwrap(),
-                ))
-            }
-            hyper::Method::DELETE => {
-                // Best-effort happy-path reap: the coordinator dropped this blob's
-                // catalog rows and is asking us to delete the file now (idempotent;
-                // a missing file is fine). The GC is the backstop if this is missed.
-                app.store.remove_blob(blob_id).await?;
-                Ok(box_response(empty(StatusCode::OK)))
-            }
-            _ => Ok(box_response(empty(StatusCode::METHOD_NOT_ALLOWED))),
-        };
-    }
-    Ok(box_response(empty(StatusCode::NOT_FOUND)))
+        }
+        (Some(_), None) => return Ok(StatusCode::BAD_REQUEST.into_response()),
+        (None, _) => None,
+    };
+    let (tx, body) = channel_body();
+    tokio::spawn(async move {
+        if let Some(crcs) = crcs
+            && tx.send(Ok(Frame::data(Bytes::from(crcs)))).await.is_err()
+        {
+            return;
+        }
+        if let Err(e) = send_file(file, range, &tx).await {
+            let _ = tx.send(Err(e)).await;
+        }
+    });
+    Ok(Body::new(body).into_response())
 }
 
-fn empty(status: StatusCode) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .body(Full::new(Bytes::new()))
-        .unwrap()
+/// Streams the body straight to disk (and announces the location), without
+/// buffering the whole blob in memory. Answers with the CRC of the file we
+/// stored, so the writer can check that we got exactly the bytes it sent.
+async fn put_blob(
+    State(app): State<Arc<App>>,
+    Path(blob_id): Path<String>,
+    body: Body,
+) -> Result<Response, Failed> {
+    let Ok(blob_id) = Uuid::parse_str(&blob_id) else {
+        return Ok(StatusCode::BAD_REQUEST.into_response());
+    };
+    let crc = crate::write_blob_streaming(&app, blob_id, body).await?;
+    let crc = HeaderValue::from_str(&format!("{crc:016x}"))?;
+    Ok(([(CRC64_HEADER, crc)], ()).into_response())
+}
+
+/// Best-effort happy-path reap: the coordinator dropped this blob's catalog
+/// rows and is asking us to delete the file now (idempotent; a missing file is
+/// fine). The GC is the backstop if this is missed.
+async fn delete_blob(
+    State(app): State<Arc<App>>,
+    Path(blob_id): Path<String>,
+) -> Result<Response, Failed> {
+    let Ok(blob_id) = Uuid::parse_str(&blob_id) else {
+        return Ok(StatusCode::BAD_REQUEST.into_response());
+    };
+    app.store.remove_blob(blob_id).await?;
+    Ok(StatusCode::OK.into_response())
 }
 
 /// Reads a raw (undecoded) query parameter — peer params are simple

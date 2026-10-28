@@ -3,6 +3,20 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes, header::HeaderValue};
 use percent_encoding::percent_decode_str;
 
+/// A time, as S3 writes it in XML and as seconds since the Unix epoch.
+pub struct Timestamp {
+    pub iso: String,
+    pub epoch: f64,
+}
+
+/// SQL for a `TIMESTAMPTZ` column's [`Timestamp`]: its ISO text, then its epoch.
+pub fn timestamp_sql(column: &str) -> String {
+    format!(
+        "to_char({column} AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'), \
+         extract(epoch FROM {column})::float8"
+    )
+}
+
 pub fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")

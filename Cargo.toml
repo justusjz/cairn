@@ -19,6 +19,7 @@ hyper-util = { version = "0.1.20", features = ["full"] }
 libc = "0.2"
 percent-encoding = "2.3.2"
 roxmltree = "0.21"
+serde_json = "1"
 sha2 = "0.11"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-postgres = { version = "0.7.17", features = ["with-uuid-1"] }
@@ -27,3 +28,10 @@ uuid = { version = "1.23.3", features = ["v4", "v7"] }
 getrandom = "0.4"
 crc32c = "0.6.8"
 crc64fast-nvme = "1.2.1"
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+serde = { version = "1", features = ["derive"] }
+utoipa = "6"
+utoipa-axum = "0.3"
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

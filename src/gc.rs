@@ -69,6 +69,11 @@ impl Sweep {
         self.next = end % SHARDS;
         Scope { shards: start..end }
     }
+
+    /// The shard the next pass starts at.
+    pub fn position(&self) -> u32 {
+        self.next
+    }
 }
 
 /// What a pass reclaimed, and what went wrong.
@@ -83,6 +88,16 @@ pub struct Report {
 impl Report {
     pub fn is_empty(&self) -> bool {
         self.pending + self.files + self.dirs == 0 && self.errors.is_empty()
+    }
+
+    /// How many stale pending blobs, orphaned files and empty directories the
+    /// pass deleted.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        (self.pending, self.files, self.dirs)
+    }
+
+    pub fn error_count(&self) -> usize {
+        self.errors.len()
     }
 
     #[cfg(test)]
