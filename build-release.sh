@@ -44,9 +44,12 @@ cargo build --release --locked --target "$TARGET"
 
 # A musl build links crt-static by default, so the result should have no dynamic
 # dependencies. Verify it, since a non-static binary defeats the whole point.
-if ! ldd "$BIN" 2>&1 | grep -q "statically linked\|not a dynamic executable"; then
+# ldd's exit status can't tell: on aarch64, it fails for a static binary ("not
+# a dynamic executable"), so only its output is checked.
+LDD="$(ldd "$BIN" 2>&1 || true)"
+if ! grep -q "statically linked\|not a dynamic executable" <<< "$LDD"; then
     echo "ERROR: $BIN is not statically linked:" >&2
-    ldd "$BIN" >&2 || true
+    echo "$LDD" >&2
     exit 1
 fi
 
