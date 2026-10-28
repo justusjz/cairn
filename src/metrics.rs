@@ -250,6 +250,7 @@ impl Metrics {
             inner: body,
             metrics: self.clone(),
             op: index,
+            sent: 0,
             _guard: guard,
         }
         .boxed_unsync()
@@ -483,12 +484,23 @@ impl Drop for InFlight {
     }
 }
 
-/// A response body that counts the bytes it sends.
+/// A response body that counts the bytes it sends. It adds them to the
+/// metrics once it's done (sent in full, or dropped), rather than take the
+/// lock for every frame, so they count toward the slot the response ends in.
 struct CountedBody {
     inner: ResBody,
     metrics: Arc<Metrics>,
     op: usize,
+    sent: u64,
     _guard: InFlight,
+}
+
+impl Drop for CountedBody {
+    fn drop(&mut self) {
+        if self.sent > 0 {
+            self.metrics.sent(self.op, self.sent);
+        }
+    }
 }
 
 impl Body for CountedBody {
@@ -504,7 +516,7 @@ impl Body for CountedBody {
         if let Poll::Ready(Some(Ok(frame))) = &poll
             && let Some(data) = frame.data_ref()
         {
-            this.metrics.sent(this.op, data.len() as u64);
+            this.sent += data.len() as u64;
         }
         poll
     }

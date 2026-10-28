@@ -33,11 +33,12 @@ pub enum Permission {
 
 impl Permission {
     /// The permission a `role_grants.permission` names.
-    fn from_db(s: &str) -> Permission {
+    fn from_db(s: &str) -> anyhow::Result<Permission> {
         match s {
-            "read" => Permission::Read,
-            "write" => Permission::Write,
-            _ => Permission::DeleteVersion,
+            "read" => Ok(Permission::Read),
+            "write" => Ok(Permission::Write),
+            "delete-version" => Ok(Permission::DeleteVersion),
+            _ => anyhow::bail!("unknown permission {s:?} in role_grants"),
         }
     }
 
@@ -356,19 +357,22 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
             &[],
         )
         .await?;
-    Ok(rows
-        .iter()
-        .map(|r| RoleInfo {
-            name: r.get(0),
-            admin: r.get(1),
-            created_at: r.get(2),
-            grants: r
-                .get::<_, Vec<String>>(3)
-                .into_iter()
-                .zip(r.get::<_, Vec<String>>(4).iter().map(|p| Permission::from_db(p)))
-                .collect(),
+    rows.iter()
+        .map(|r| {
+            let buckets = r.get::<_, Vec<String>>(3);
+            let permissions = r.get::<_, Vec<String>>(4);
+            Ok(RoleInfo {
+                name: r.get(0),
+                admin: r.get(1),
+                created_at: r.get(2),
+                grants: buckets
+                    .into_iter()
+                    .zip(permissions.iter())
+                    .map(|(bucket, p)| Ok((bucket, Permission::from_db(p)?)))
+                    .collect::<anyhow::Result<_>>()?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// Fails with a clear message if `name` isn't a role, so a grant/revoke on a

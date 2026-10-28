@@ -194,6 +194,10 @@ cluster:
 - **Roles:** everything `cairn role` does: create and delete roles, grant and
   revoke permissions, rotate secrets, and toggle admin.
 
+To keep other websites from reaching it through DNS rebinding, the dashboard
+only answers when it's opened by IP address, as `localhost`, or by the host of
+the node's `--peer-url`.
+
 Request metrics are kept in memory by each node, so they start over when it
 restarts; everything else is read from the database.
 

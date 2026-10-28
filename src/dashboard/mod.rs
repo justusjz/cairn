@@ -19,13 +19,21 @@
 //! an `x-cairn-ui` header, which a cross-site form can't set, and which
 //! `fetch` can only set cross-site after a CORS preflight that this endpoint
 //! never allows.
+//!
+//! That leaves DNS rebinding: a page whose domain is made to resolve to a node
+//! is the node's origin as far as the browser is concerned, and can do and
+//! read anything. So the dashboard only answers requests whose `Host` is one
+//! no attacker can point at it: an IP address, `localhost`, or the host of the
+//! node's own `--peer-url`.
 
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
+use std::time::Instant;
 
 use axum::{
     Json, Router,
     body::Body,
-    extract::Request,
+    extract::{Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -38,12 +46,35 @@ use crate::{App, metrics::MetricsReport, metrics::now_secs};
 
 mod api;
 
-use api::openapi;
+use api::{Storage, openapi};
 
 /// Where the dashboard lives.
 pub const PREFIX: &str = "/_dashboard";
 /// The header that every request changing something must carry.
 const CSRF_HEADER: &str = "x-cairn-ui";
+
+/// The dashboard's own state, part of [`App`].
+pub struct Dashboard {
+    /// The host of the node's peer URL: besides IP addresses and `localhost`,
+    /// the one host the dashboard answers to.
+    peer_host: Option<String>,
+    /// The last `/storage` report, and when it was made. It takes scans of
+    /// whole tables, so every page polling it shares one report a while.
+    storage: tokio::sync::Mutex<Option<(Instant, Storage)>>,
+}
+
+impl Dashboard {
+    pub fn new(peer_url: &str) -> Dashboard {
+        let peer_host = peer_url
+            .parse::<Uri>()
+            .ok()
+            .and_then(|uri| uri.host().map(str::to_ascii_lowercase));
+        Dashboard {
+            peer_host,
+            storage: tokio::sync::Mutex::default(),
+        }
+    }
+}
 
 /// A file of the built UI.
 struct Asset {
@@ -56,7 +87,7 @@ struct Asset {
 include!(concat!(env!("OUT_DIR"), "/dashboard_assets.rs"));
 
 /// The dashboard, to nest under [`PREFIX`].
-pub fn router() -> Router<Arc<App>> {
+pub fn router(app: Arc<App>) -> Router<Arc<App>> {
     let (api, _) = api::router().split_for_parts();
     let api = api
         .route("/openapi.json", get(|| async { Json(openapi()) }))
@@ -70,6 +101,47 @@ pub fn router() -> Router<Arc<App>> {
         .nest("/api", api)
         .fallback(static_file)
         .layer(middleware::map_response(security_headers))
+        .layer(middleware::from_fn_with_state(app, require_known_host))
+}
+
+/// Refuses requests for a host that might be a rebound name (see the module's
+/// docs).
+async fn require_known_host(State(app): State<Arc<App>>, req: Request, next: Next) -> Response {
+    let host = req
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+    if !known_host(host, app.dashboard.peer_host.as_deref()) {
+        return ApiError::Forbidden(
+            "the dashboard only answers to an IP address, localhost, or the node's --peer-url"
+                .into(),
+        )
+        .into_response();
+    }
+    next.run(req).await
+}
+
+/// Whether `host` (a `Host` header, maybe with a port) is an IP address,
+/// `localhost` (or a name under it, which browsers resolve to loopback
+/// themselves), or `peer_host`.
+fn known_host(host: &str, peer_host: Option<&str>) -> bool {
+    let name = match host.strip_prefix('[') {
+        // An IPv6 address, which must be in brackets.
+        Some(rest) => {
+            return rest.split_once(']').is_some_and(|(ip, port)| {
+                (port.is_empty() || port.starts_with(':')) && ip.parse::<Ipv6Addr>().is_ok()
+            });
+        }
+        None => host.split_once(':').map_or(host, |(name, _)| name),
+    };
+    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    let peer_host = peer_host.map(|p| p.strip_suffix('.').unwrap_or(p));
+    !name.is_empty()
+        && (name.parse::<IpAddr>().is_ok()
+            || name == "localhost"
+            || name.ends_with(".localhost")
+            || peer_host == Some(&name))
 }
 
 /// Refuses requests that change something unless they come from the page.
@@ -234,6 +306,36 @@ pub fn node_stats(app: &App) -> NodeStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn knows_hosts_that_cant_be_rebound() {
+        for host in [
+            "10.0.0.1",
+            "10.0.0.1:9431",
+            "[::1]:9431",
+            "[fe80::1]",
+            "localhost:9431",
+            "LocalHost",
+            "app.localhost",
+            "node-a.internal:9431",
+            "node-a.internal.",
+        ] {
+            assert!(known_host(host, Some("node-a.internal")), "{host}");
+        }
+        for host in [
+            "",
+            "evil.example",
+            "evil.example:9431",
+            "localhost.evil.example",
+            "node-a.internal.evil.example",
+            "[::1",
+            "[evil.example]",
+            "[::1]evil",
+        ] {
+            assert!(!known_host(host, Some("node-a.internal")), "{host}");
+        }
+        assert!(!known_host("node-a.internal", None));
+    }
 
     #[test]
     fn has_an_index() {

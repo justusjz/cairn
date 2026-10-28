@@ -52,6 +52,7 @@ pub struct App {
     writing: WritingSet,
     pack: packer::Config,
     metrics: Arc<metrics::Metrics>,
+    dashboard: dashboard::Dashboard,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -128,6 +129,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         writing: WritingSet::default(),
         pack: packer::Config::default(),
         metrics: Arc::default(),
+        dashboard: dashboard::Dashboard::new(&peer_url),
         #[cfg(test)]
         pack_hook: None,
     });

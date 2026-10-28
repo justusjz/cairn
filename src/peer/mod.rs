@@ -50,7 +50,10 @@ pub fn router(app: Arc<App>) -> Router {
             "/blobs/{blob_id}",
             get(get_blob).put(put_blob).delete(delete_blob),
         )
-        .nest(crate::dashboard::PREFIX, crate::dashboard::router())
+        .nest(
+            crate::dashboard::PREFIX,
+            crate::dashboard::router(app.clone()),
+        )
         // `nest` doesn't match the prefix with a trailing slash.
         .route("/", get(to_dashboard))
         .route(&format!("{}/", crate::dashboard::PREFIX), get(to_dashboard))

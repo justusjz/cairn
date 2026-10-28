@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::{
     Json,
@@ -43,6 +43,8 @@ use crate::{
 const STATS_TIMEOUT: Duration = Duration::from_secs(2);
 /// The most a node's metrics may take up.
 const MAX_STATS: usize = 4 * 1024 * 1024;
+/// How long a `/storage` report is served before it's made again.
+const STORAGE_TTL: Duration = Duration::from_secs(10);
 /// How many entries a page of a bucket listing has.
 const PAGE: i64 = 200;
 /// How many versions of a key are shown.
@@ -187,7 +189,7 @@ async fn fetch_stats(peer_url: &str) -> anyhow::Result<NodeStats> {
 
 /// What's stored where, how well it's replicated, and what the background jobs
 /// still have to do.
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 pub(super) struct Storage {
     replication_factor: usize,
     nodes: Vec<NodeHolding>,
@@ -199,7 +201,7 @@ pub(super) struct Storage {
 }
 
 /// The committed blobs a node holds a copy of.
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 struct NodeHolding {
     node: i32,
     blobs: i64,
@@ -207,7 +209,7 @@ struct NodeHolding {
 }
 
 /// The committed blobs with `copies` copies, `live` of them on live nodes.
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 struct ReplicaGroup {
     live: i64,
     copies: i64,
@@ -215,7 +217,7 @@ struct ReplicaGroup {
     bytes: i64,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 struct BlobTotals {
     committed: i64,
     bytes: i64,
@@ -225,7 +227,7 @@ struct BlobTotals {
     oldest_pending: Option<f64>,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 struct ObjectTotals {
     buckets: i64,
     current: i64,
@@ -235,7 +237,7 @@ struct ObjectTotals {
     delete_markers: i64,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 struct Backlog {
     /// Blobs leased by packing jobs, right now.
     packing: i64,
@@ -253,7 +255,7 @@ struct Backlog {
     upload_bytes: i64,
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Clone, Serialize, ToSchema)]
 struct PackerSettings {
     target_size: u64,
     small_size: u64,
@@ -266,7 +268,17 @@ struct PackerSettings {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn get_storage(State(app): AppState) -> Result<Json<Storage>> {
-    Ok(Json(storage(&app).await?))
+    // Requests that come in while a report is being made wait for it, rather
+    // than make their own.
+    let mut cached = app.dashboard.storage.lock().await;
+    if let Some((made, storage)) = &*cached
+        && made.elapsed() < STORAGE_TTL
+    {
+        return Ok(Json(storage.clone()));
+    }
+    let storage = storage(&app).await?;
+    *cached = Some((Instant::now(), storage.clone()));
+    Ok(Json(storage))
 }
 
 pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
@@ -1095,6 +1107,7 @@ mod e2e {
         let builder = Request::builder()
             .method(method)
             .uri(uri)
+            .header("host", "127.0.0.1:9431")
             .header("x-cairn-ui", "1")
             .header("content-type", "application/json");
         let body = body.map(|b| b.to_string()).unwrap_or_default();
@@ -1129,12 +1142,30 @@ mod e2e {
         let req = Request::builder()
             .method("POST")
             .uri(format!("{api}/buckets"))
+            .header("host", "127.0.0.1:9431")
             .header("content-type", "application/json")
             .body(axum::body::Body::from(r#"{"name":"new-bucket"}"#))
             .unwrap();
         let (status, _, body) = send(&app, req).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(error_of(&body), "missing x-cairn-ui header");
+
+        // Nothing of the dashboard answers to a name that could have been
+        // rebound to the node; the peer routes don't care.
+        let rebound = |path: &str| {
+            let mut req = request("GET", path, None);
+            req.headers_mut()
+                .insert("host", "evil.example:9431".parse().unwrap());
+            req
+        };
+        for path in [&format!("{api}/roles"), "/_dashboard"] {
+            assert_eq!(
+                send(&app, rebound(path)).await.0,
+                StatusCode::FORBIDDEN,
+                "{path}"
+            );
+        }
+        assert_eq!(send(&app, rebound("/stats")).await.0, StatusCode::OK);
 
         let create = |name: &str| {
             request(
