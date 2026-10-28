@@ -223,16 +223,21 @@ cargo build --release
 `CAIRN_URL` (default `http://127.0.0.1:9431`).
 
 The UI's types come from the API's OpenAPI spec, which is generated from the
-Rust code (with [utoipa](https://github.com/juhaku/utoipa)): `ui/openapi.json`
-is committed, and `npm run build` turns it into TypeScript types for
-[openapi-fetch](https://openapi-ts.dev/openapi-fetch/). A test fails when the
-committed spec no longer matches the API; after changing the API, update it
-and rebuild the UI:
+Rust code (with [utoipa](https://github.com/juhaku/utoipa)). Both the spec
+(`ui/openapi.json`) and the TypeScript types made from it for
+[openapi-fetch](https://openapi-ts.dev/openapi-fetch/) (`ui/src/schema.d.ts`)
+are committed, so building needs neither generator. A test fails when the
+committed spec no longer matches the API; after changing the API, regenerate
+both:
 
 ```sh
 CAIRN_UPDATE_OPENAPI=1 cargo test openapi
-(cd ui && npm run build)
+(cd ui && npm run gen)
 ```
+
+`npm run gen` runs [openapi-typescript](https://openapi-ts.dev/) through `npx`,
+with pinned versions and the TypeScript 5 it needs (the UI itself uses
+TypeScript 7), so it needs network access.
 
 ## Versioning
 

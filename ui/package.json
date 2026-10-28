@@ -6,10 +6,10 @@
     "node": ">=26"
   },
   "scripts": {
-    "gen": "openapi-typescript openapi.json --output src/schema.d.ts",
-    "dev": "npm run gen && vite",
-    "build": "npm run gen && tsc --noEmit && vite build",
-    "check": "npm run gen && tsc --noEmit"
+    "gen": "npx --yes -p typescript@5.9.3 -p openapi-typescript@7.13.0 openapi-typescript openapi.json --output src/schema.d.ts",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "check": "tsc --noEmit"
   },
   "dependencies": {
     "@solidjs/router": "^1.0.0",
@@ -18,8 +18,7 @@
   },
   "devDependencies": {
     "@types/node": "^26.6.5",
-    "openapi-typescript": "^7.13.0",
-    "typescript": "^5.9.3",
+    "typescript": "^7.0.2",
     "vite": "^8.3.5",
     "vite-plugin-solid": "^2.11.14"
   }

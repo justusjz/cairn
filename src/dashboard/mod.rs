@@ -254,7 +254,7 @@ mod tests {
         assert!(
             committed == spec,
             "ui/openapi.json is out of date: run `CAIRN_UPDATE_OPENAPI=1 cargo test openapi`, \
-             then `npm run build` in ui/"
+             then `npm run gen` in ui/"
         );
     }
 }

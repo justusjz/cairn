@@ -42,6 +42,12 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
+      # The UI's types are generated from ui/openapi.json (which the unit
+      # tests check against the API) and committed; check they match it.
+      - name: Check the dashboard UI's API types
+        working-directory: ui
+        run: npm run gen && git diff --exit-code src/schema.d.ts
+
       # The binary embeds it, so it's needed to build (and test) Cairn.
       - name: Build the dashboard UI
         working-directory: ui
