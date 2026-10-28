@@ -23,15 +23,35 @@ The schema is created automatically; just point Cairn at an empty database.
 
 Download the static binary from the
 [releases page](https://github.com/justusjz/cairn/releases) and extract it
-(replace `<version>` with the release you downloaded, e.g. `0.3.0`):
+(replace `<version>` with the release you downloaded, e.g. `0.3.0`, and
+`x86_64` with `aarch64` on 64-bit ARM):
 
 ```sh
 tar xzf cairn-v<version>-x86_64-unknown-linux-musl.tar.gz
 sudo install -m755 cairn-v<version>-x86_64-unknown-linux-musl/cairn /usr/local/bin/cairn
 ```
 
-It is statically linked (musl), so it runs on any x86-64 Linux with no
+It is statically linked (musl), so it runs on any x86-64 or ARM64 Linux with no
 dependencies.
+
+### Docker
+
+Every release is also published as an image, for amd64 and arm64:
+`ghcr.io/justusjz/cairn:<version>` (and `:latest`). It runs `cairn serve`,
+configured through the [environment](#serve-flags), with these defaults:
+the S3 API on `0.0.0.0:9000`, the peer endpoint on `0.0.0.0:9431`, and data in
+the volume `/var/lib/cairn`. Only the database has to be set:
+
+```sh
+docker run -d --name cairn -p 9000:9000 \
+    -e CAIRN_DATABASE="postgres://user:pass@db.internal:5432/cairn" \
+    -v cairn-data:/var/lib/cairn \
+    ghcr.io/justusjz/cairn:<version>
+docker exec cairn cairn role create admin --admin
+```
+
+For a cluster, also set `CAIRN_PEER_URL` to an address the other nodes can
+reach this container at, and `CAIRN_REPLICATION_FACTOR`.
 
 ## Running a single node
 

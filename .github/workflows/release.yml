@@ -1,8 +1,13 @@
-# Builds the static musl release bundle with build-release.sh and attaches it
-# (the .tar.gz and its .sha256) to the GitHub release that triggered the run.
+# Builds the static musl release bundles with build-release.sh, for x86_64 and
+# aarch64, each on a runner of its own architecture, and attaches them (the
+# .tar.gz files and their .sha256) to the GitHub release that triggered the
+# run. It also pushes the Docker image of the same binaries, for amd64 and
+# arm64, to ghcr.io/justusjz/cairn, tagged with the version (e.g. 0.3.0), a
+# sha-<commit> tag, and latest unless it's a pre-release.
 #
 # Run it manually (workflow_dispatch) to try the build without a release; the
-# bundle is then uploaded as a workflow artifact instead.
+# bundles are then uploaded as workflow artifacts, and the image is built but
+# not pushed.
 name: Release
 
 on:
@@ -11,17 +16,24 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write # to upload release assets
+  contents: read
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-musl
+          targets: ${{ matrix.target }}
 
       # The bundle is named after the Cargo.toml version, so a tag that doesn't
       # match would attach e.g. a v0.1.4 bundle to a v0.1.5 release.
@@ -59,17 +71,74 @@ jobs:
       - name: Build release bundle
         run: ./build-release.sh
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cairn-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+
+  attach:
+    needs: build
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # to upload release assets
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: cairn-*
+          path: dist/
+          merge-multiple: true
+
       - name: Attach to release
-        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber
+        run: gh release upload "$TAG" dist/*.tar.gz dist/*.tar.gz.sha256 --clobber --repo "$GITHUB_REPOSITORY"
 
-      - name: Upload as workflow artifact
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v7
+  image:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # to push to ghcr.io
+    steps:
+      - uses: actions/checkout@v7
+
+      # Both architectures' binaries, in dist/<amd64|arm64>/cairn, where the
+      # Dockerfile takes them from. (Artifacts drop the executable bit; the
+      # Dockerfile sets it.)
+      - uses: actions/download-artifact@v8
         with:
-          name: cairn-release
+          pattern: cairn-*
           path: dist/
-          if-no-files-found: error
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - uses: docker/login-action@v4
+        if: github.event_name == 'release'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      # Also sets the OCI labels, among them org.opencontainers.image.source
+      # (which links the package to this repository) and .revision.
+      - id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=sha
+
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'release' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          sbom: true

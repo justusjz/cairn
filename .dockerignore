@@ -1,0 +1,8 @@
+# The image only needs the binaries build-release.sh leaves in dist/, and the
+# license files.
+*
+!dist/amd64/cairn
+!dist/arm64/cairn
+!LICENSE
+!NOTICE
+!README.md
