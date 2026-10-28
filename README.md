@@ -80,6 +80,11 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on. |
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
 
+On SIGTERM or Ctrl-C, a node stops accepting connections and finishes the
+requests in flight before it exits; a second signal exits right away. Anything
+cut off is cleaned up by [garbage collection](#garbage-collection), as after a
+crash.
+
 ## Running a highly-available cluster
 
 For redundancy, run several nodes against the **same Postgres database** with a

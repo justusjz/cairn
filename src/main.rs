@@ -7,7 +7,9 @@ use hyper::{
     Method, Request, StatusCode, body::Body, body::Bytes, body::Frame,
     server::conn::http1, service::service_fn,
 };
-use hyper_util::{client::legacy::Client, rt::TokioExecutor, rt::TokioIo};
+use hyper_util::{
+    client::legacy::Client, rt::TokioExecutor, rt::TokioIo, server::graceful::GracefulShutdown,
+};
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
@@ -144,13 +146,45 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
 
     let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
     let listen_peer_addr = SocketAddr::from_str(&args.listen_peer).unwrap();
-    // Both servers run and loop forever, so awaiting them keeps the process alive
-    // until one errors out.
-    tokio::try_join!(
-        serve_client(listen_client_addr, app.clone()),
-        serve_peer(listen_peer_addr, app.clone()),
-    )?;
+    // Both servers run until SIGTERM or Ctrl-C (or until one errors out). Then
+    // the S3 API stops accepting connections and finishes the requests in
+    // flight, and only after that does the peer endpoint, since those requests
+    // may still be reading and writing replicas through it, ours included.
+    // Whatever is cut off anyway is left for GC, as after a crash.
+    let (stop_peer, peer_stopped) = tokio::sync::oneshot::channel::<()>();
+    let client = async {
+        let result = serve_client(listen_client_addr, app.clone(), shutdown_signal()).await;
+        let _ = stop_peer.send(());
+        result
+    };
+    let peer = serve_peer(listen_peer_addr, app.clone(), async {
+        let _ = peer_stopped.await;
+    });
+    tokio::try_join!(client, peer)?;
+    eprintln!("shut down");
     Ok(())
+}
+
+/// Resolves on the first SIGTERM (what `docker stop`, Kubernetes and systemd
+/// send) or SIGINT (Ctrl-C). A second one exits right away, without waiting
+/// for the requests in flight.
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut term = signal(SignalKind::terminate()).expect("failed to listen for SIGTERM");
+    let mut int = signal(SignalKind::interrupt()).expect("failed to listen for SIGINT");
+    tokio::select! {
+        _ = term.recv() => {}
+        _ = int.recv() => {}
+    }
+    eprintln!("shutting down: finishing the requests in flight (signal again to exit now)");
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        eprintln!("exiting without waiting for the requests in flight");
+        std::process::exit(1);
+    });
 }
 
 /// Background upkeep, on every node, once a minute: garbage collection, then
@@ -249,13 +283,24 @@ impl std::fmt::Display for Contended {
 
 impl std::error::Error for Contended {}
 
-/// Serves the S3 API, counting every request in the node's metrics.
-async fn serve_client(addr: SocketAddr, app: Arc<App>) -> anyhow::Result<()> {
+/// Serves the S3 API, counting every request in the node's metrics, until
+/// `shutdown` resolves; then waits for the requests in flight to finish.
+async fn serve_client(
+    addr: SocketAddr,
+    app: Arc<App>,
+    shutdown: impl Future<Output = ()>,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
+    let graceful = GracefulShutdown::new();
+    tokio::pin!(shutdown);
     loop {
-        let (stream, _peer_addr) = listener.accept().await?;
+        let (stream, _peer_addr) = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            () = &mut shutdown => break,
+        };
         let io = TokioIo::new(stream);
         let app = app.clone();
+        let watcher = graceful.watcher();
         tokio::task::spawn(async move {
             let service = service_fn(move |req| {
                 let app = app.clone();
@@ -284,17 +329,26 @@ async fn serve_client(addr: SocketAddr, app: Arc<App>) -> anyhow::Result<()> {
                     Ok::<_, std::convert::Infallible>(hyper::Response::from_parts(parts, body))
                 }
             });
-            if let Err(err) = http1::Builder::new().serve_connection(io, service).await {
+            let conn = http1::Builder::new().serve_connection(io, service);
+            if let Err(err) = watcher.watch(conn).await {
                 eprintln!("Error serving connection: {:?}", err);
             }
         });
     }
+    drop(listener);
+    graceful.shutdown().await;
+    Ok(())
 }
 
-/// Serves the peer endpoint (see `peer`).
-async fn serve_peer(addr: SocketAddr, app: Arc<App>) -> anyhow::Result<()> {
+/// Serves the peer endpoint (see `peer`) until `shutdown` resolves; then waits
+/// for the requests in flight to finish.
+async fn serve_peer(
+    addr: SocketAddr,
+    app: Arc<App>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    axum::serve(listener, peer::router(app)).await?;
+    axum::serve(listener, peer::router(app)).with_graceful_shutdown(shutdown).await?;
     Ok(())
 }
 
