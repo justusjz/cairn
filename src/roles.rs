@@ -108,7 +108,7 @@ impl Principal {
 #[derive(Args, Debug)]
 pub struct RoleArgs {
     /// PostgreSQL connection string (the same one the nodes use).
-    #[arg(long)]
+    #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
     database: String,
     #[command(subcommand)]
     command: RoleCommand,

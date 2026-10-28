@@ -68,14 +68,17 @@ s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
 
 ### `serve` flags
 
-| Flag | Default | Description |
-| --- | --- | --- |
-| `--database <URL>` | *required* | PostgreSQL connection string. Shared by all nodes. |
-| `--listen-client <ADDR>` | *required* | Bind address for the S3 API. |
-| `--listen-peer <ADDR>` | `127.0.0.1:9431` | Bind address for the peer endpoint (replica traffic between nodes). Always runs. |
-| `--peer-url <URL>` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
-| `--replication-factor <N>` | `1` | How many distinct nodes each blob is stored on. |
-| `--data-dir <PATH>` | *required* | Local directory for blobs. |
+Every flag can also be set through its environment variable; a flag on the
+command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
+
+| Flag | Environment | Default | Description |
+| --- | --- | --- | --- |
+| `--database <URL>` | `CAIRN_DATABASE` | *required* | PostgreSQL connection string. Shared by all nodes. |
+| `--listen-client <ADDR>` | `CAIRN_LISTEN_CLIENT` | *required* | Bind address for the S3 API. |
+| `--listen-peer <ADDR>` | `CAIRN_LISTEN_PEER` | `127.0.0.1:9431` | Bind address for the peer endpoint (replica traffic between nodes). Always runs. |
+| `--peer-url <URL>` | `CAIRN_PEER_URL` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
+| `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on. |
+| `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
 
 ## Running a highly-available cluster
 

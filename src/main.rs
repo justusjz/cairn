@@ -73,26 +73,32 @@ enum Command {
     Role(roles::RoleArgs),
 }
 
+// Every flag can also be set through the environment variable named in its
+// help, e.g. `CAIRN_DATA_DIR` for `--data-dir`; a flag given on the command line
+// wins.
 #[derive(Args, Debug)]
 struct ServeArgs {
-    #[arg(long)]
+    /// PostgreSQL connection string, shared by all nodes.
+    #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
     database: String,
-    #[arg(long)]
+    /// Bind address for the S3 API.
+    #[arg(long, env = "CAIRN_LISTEN_CLIENT")]
     listen_client: String,
     /// Bind address for the peer endpoint (replica traffic between nodes).
     /// It always runs; defaults to a loopback port. Override to bind externally,
     /// or to run several nodes on one host.
-    #[arg(long, default_value = "127.0.0.1:9431")]
+    #[arg(long, env = "CAIRN_LISTEN_PEER", default_value = "127.0.0.1:9431")]
     listen_peer: String,
     /// URL other nodes use to reach this node's peer endpoint, e.g.
     /// http://10.0.0.1:9431. Defaults to http://<listen-peer>; set it explicitly
     /// only if the bind address isn't routable (e.g. 0.0.0.0).
-    #[arg(long)]
+    #[arg(long, env = "CAIRN_PEER_URL")]
     peer_url: Option<String>,
     /// How many replicas every blob is stored on.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, env = "CAIRN_REPLICATION_FACTOR", default_value_t = 1)]
     replication_factor: usize,
-    #[arg(long)]
+    /// Local directory for blobs.
+    #[arg(long, env = "CAIRN_DATA_DIR")]
     data_dir: String,
 }
 
