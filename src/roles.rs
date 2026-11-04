@@ -15,6 +15,7 @@ use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand, ValueEnum};
 use deadpool_postgres::Object;
 use tokio_postgres::error::SqlState;
+use crate::db::Cached;
 
 /// A bucket-level permission a role can be granted.
 #[derive(
@@ -64,7 +65,7 @@ impl Principal {
     /// Loads the role whose name is `access_key`, or `None` if there is none.
     pub async fn load(client: &Object, access_key: &str) -> anyhow::Result<Option<Self>> {
         let row = client
-            .query_opt(
+            .query_opt_cached(
                 "SELECT r.secret, r.admin,
                         ARRAY(SELECT bucket FROM role_grants
                               WHERE role = r.name AND permission = 'read'),
@@ -282,7 +283,7 @@ pub async fn create(
         None => generate_secret()?,
     };
     let inserted = client
-        .execute(
+        .execute_cached(
             "INSERT INTO roles (name, secret, admin) VALUES ($1, $2, $3)
              ON CONFLICT DO NOTHING",
             &[&name, &secret, &admin],
@@ -310,7 +311,7 @@ pub async fn update(
         validate_secret(s)?;
     }
     let updated = client
-        .execute(
+        .execute_cached(
             "UPDATE roles SET admin = COALESCE($2, admin), secret = COALESCE($3, secret)
              WHERE name = $1",
             &[&name, &admin, &secret],
@@ -325,7 +326,7 @@ pub async fn update(
 /// Deletes a role and all its grants.
 pub async fn delete(client: &Object, name: &str) -> anyhow::Result<()> {
     if client
-        .execute("DELETE FROM roles WHERE name = $1", &[&name])
+        .execute_cached("DELETE FROM roles WHERE name = $1", &[&name])
         .await?
         == 0
     {
@@ -347,7 +348,7 @@ pub struct RoleInfo {
 /// Every role, by name.
 pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
     let rows = client
-        .query(
+        .query_cached(
             "SELECT r.name, r.admin, extract(epoch FROM r.created_at)::float8,
                     ARRAY(SELECT g.bucket FROM role_grants g
                           WHERE g.role = r.name ORDER BY g.bucket, g.permission),
@@ -379,7 +380,7 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
 /// typo'd name doesn't silently do nothing (or trip the FK with a raw error).
 async fn require_role(client: &Object, name: &str) -> anyhow::Result<()> {
     if client
-        .query_opt("SELECT 1 FROM roles WHERE name = $1", &[&name])
+        .query_opt_cached("SELECT 1 FROM roles WHERE name = $1", &[&name])
         .await?
         .is_none()
     {
@@ -397,7 +398,7 @@ pub async fn grant(
 ) -> anyhow::Result<()> {
     require_role(client, name).await?;
     if client
-        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
         .await?
         .is_none()
     {
@@ -405,7 +406,7 @@ pub async fn grant(
     }
     for p in permissions {
         let res = client
-            .execute(
+            .execute_cached(
                 "INSERT INTO role_grants (role, bucket, permission) VALUES ($1, $2, $3)
                  ON CONFLICT DO NOTHING",
                 &[&name, &bucket, &p.as_str()],
@@ -438,7 +439,7 @@ pub async fn revoke(
         permissions.iter().map(|p| p.as_str()).collect()
     };
     client
-        .execute(
+        .execute_cached(
             "DELETE FROM role_grants WHERE role = $1 AND bucket = $2 AND permission = ANY($3)",
             &[&name, &bucket, &permissions],
         )

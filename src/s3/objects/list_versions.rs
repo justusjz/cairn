@@ -1,6 +1,7 @@
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 
+use crate::db::Cached;
 use crate::{
     App,
     s3::util::{format_s3_error, xml_escape, xml_ok},
@@ -43,7 +44,7 @@ pub async fn list_object_versions(
             ));
         }
         Some(v) => match tx
-            .query_opt(
+            .query_opt_cached(
                 "SELECT id FROM objects WHERE bucket = $1 AND key = $2 AND version_id = $3",
                 &[&bucket, &key_marker, &v],
             )
@@ -67,7 +68,7 @@ pub async fn list_object_versions(
     let limit = max_keys + 1;
     let delim = delimiter.unwrap_or("");
     let rows = tx
-        .query(
+        .query_cached(
             "WITH t AS (
                  SELECT id, key, version_id, is_latest, is_delete_marker, size, etag,
                         to_char(last_modified AT TIME ZONE 'UTC',

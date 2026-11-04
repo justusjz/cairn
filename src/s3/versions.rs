@@ -19,6 +19,7 @@
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use deadpool_postgres::GenericClient;
+use crate::db::Cached;
 
 /// A bucket's versioning state. A bucket starts out unversioned; once enabled,
 /// it only moves between enabled and suspended. Serialized as it's stored.
@@ -60,7 +61,7 @@ pub async fn bucket_versioning<C: GenericClient>(
     bucket: &str,
 ) -> Result<Option<Versioning>, tokio_postgres::Error> {
     Ok(client
-        .query_opt("SELECT versioning FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached("SELECT versioning FROM buckets WHERE name = $1", &[&bucket])
         .await?
         .map(|row| Versioning::from_db(row.get(0))))
 }
@@ -86,7 +87,7 @@ pub async fn current_etag<C: GenericClient>(
     key: &str,
 ) -> Result<Option<String>, tokio_postgres::Error> {
     Ok(client
-        .query_opt(
+        .query_opt_cached(
             "SELECT etag FROM objects
              WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
             &[&bucket, &key],

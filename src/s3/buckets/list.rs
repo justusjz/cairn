@@ -1,6 +1,7 @@
 use http_body_util::Full;
 use hyper::{Response, body::Bytes};
 
+use crate::db::Cached;
 use crate::{
     App,
     roles::Principal,
@@ -18,7 +19,7 @@ pub struct BucketInfo {
 pub async fn buckets(app: &App) -> anyhow::Result<Vec<BucketInfo>> {
     let client = app.pool.get().await?;
     let rows = client
-        .query(
+        .query_cached(
             &format!(
                 "SELECT name, versioning, {} FROM buckets ORDER BY name",
                 timestamp_sql("created_at")

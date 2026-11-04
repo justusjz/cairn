@@ -5,6 +5,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 use tokio_postgres::IsolationLevel;
 
+use crate::db::Cached;
 use crate::{
     App,
     auth::BodyChecksum,
@@ -52,7 +53,7 @@ async fn try_delete(
     // A fresh version ID for each target, should it need a delete marker.
     let marker_ids: Vec<String> = targets.iter().map(|_| new_version_id()).collect();
     let row = tx
-        .query_one(
+        .query_one_cached(
             "SELECT status, version_ids, delete_markers, reap_blob, reap_node, reap_peer
              FROM pg_temp.cairn_delete_objects($1, $2, $3, $4)",
             &[&bucket, &keys, &version_ids, &marker_ids],

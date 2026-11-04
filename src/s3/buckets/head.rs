@@ -1,6 +1,7 @@
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 
+use crate::db::Cached;
 use crate::App;
 
 /// HeadBucket: `HEAD /{bucket}`. 200 if the bucket exists, 404 otherwise; no body.
@@ -8,7 +9,7 @@ use crate::App;
 pub async fn head_bucket(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     let exists = client
-        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
         .await?
         .is_some();
     let status = if exists {

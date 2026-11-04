@@ -5,6 +5,7 @@ use hyper::{Response, StatusCode, body::Bytes, header};
 use deadpool_postgres::GenericClient;
 use uuid::Uuid;
 
+use crate::db::Cached;
 use crate::{
     App,
     blobs::{BlobSlice, Location, stream_blob_range},
@@ -91,7 +92,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
     version_id: Option<&str>,
 ) -> Result<Result<ObjectVersion, Missing>, tokio_postgres::Error> {
     let row = client
-        .query_opt(
+        .query_opt_cached(
             "SELECT o.id, o.etag, o.content_type, o.size,
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
@@ -259,7 +260,7 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
     object_id: i64,
 ) -> Result<Vec<PartLocation>, tokio_postgres::Error> {
     let rows = client
-        .query(
+        .query_cached(
             "SELECT p.part_number, p.blob_id, p.blob_offset, p.size, b.size, b.block_size,
                     bl.node, n.peer_url, p.id
              FROM parts p
@@ -376,7 +377,7 @@ async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSli
     };
     let client = app.pool.get().await?;
     let rows = client
-        .query(
+        .query_cached(
             "SELECT p.blob_id, p.blob_offset, b.size, b.block_size, bl.node, n.peer_url
              FROM parts p
              JOIN blobs b ON b.blob_id = p.blob_id

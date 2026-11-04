@@ -16,6 +16,7 @@ use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
+use crate::db::Cached;
 use crate::auth::{ContentSha256, StreamingChunkVerifier, TrailerChecksum};
 use crate::aws_chunked::AwsChunkedDecoder;
 use crate::blobs::{Location, ReapTarget, reap_blobs};
@@ -233,7 +234,7 @@ async fn register_node(pool: &Pool, store: &Store, peer_url: &str) -> anyhow::Re
     let node_id = store.get_node_id().to_string();
     let free_space = store.available_space()? as i64;
     let row = client
-        .query_one(
+        .query_one_cached(
             "INSERT INTO nodes (node_id, peer_url, last_seen, free_space)
              VALUES ($1, $2, NOW(), $3)
              ON CONFLICT (node_id)
@@ -354,7 +355,7 @@ async fn serve_peer(
 
 async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<Location>> {
     let nodes = client
-        .query(
+        .query_cached(
             "SELECT id, peer_url FROM nodes WHERE last_seen > NOW() - INTERVAL '10 seconds' ORDER BY free_space DESC",
             &[],
         )
@@ -433,7 +434,7 @@ where
     file.sync_all().await?;
     let client = app.pool.get().await?;
     client
-        .execute(
+        .execute_cached(
             "INSERT INTO blob_locations (blob_id, node) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             &[&blob_id, &app.node],
         )
@@ -464,7 +465,7 @@ impl BlobWriter {
         // Its size isn't known until all the data has passed, so it starts at 0
         // and is set at commit.
         client
-            .execute(
+            .execute_cached(
                 "INSERT INTO blobs (blob_id, size, state, created_at) VALUES ($1, 0, 'pending', NOW())",
                 &[&blob_id],
             )
@@ -819,7 +820,7 @@ async fn try_commit_part(
         } => {
             let (if_match, if_none_match) = conditions.write_conditions();
             let row = tx
-                .query_one(
+                .query_one_cached(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                                                       $11, $12, $13)",
@@ -847,7 +848,7 @@ async fn try_commit_part(
             part_number,
         } => {
             let row = tx
-                .query_one(
+                .query_one_cached(
                     "SELECT status, present, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_commit_upload_part($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                     &[

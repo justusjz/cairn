@@ -6,6 +6,7 @@ use hyper::{Response, StatusCode, body::Bytes};
 use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
+use crate::db::Cached;
 use crate::{
     App,
     blobs::{ReapTarget, reap_blobs, reap_columns},
@@ -173,7 +174,7 @@ async fn try_complete(
         requested.iter().map(|(n, etag)| (*n, etag.as_str())).unzip();
     let (if_match, if_none_match) = preconditions.write_conditions();
     let row = tx
-        .query_one(
+        .query_one_cached(
             "SELECT status, etag, version_id, reap_blob, reap_node, reap_peer
              FROM pg_temp.cairn_complete_upload($1, $2, $3, $4, $5, $6, $7, $8)",
             &[

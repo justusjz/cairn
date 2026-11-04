@@ -1,6 +1,7 @@
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 
+use crate::db::Cached;
 use crate::{
     App,
     s3::util::{Timestamp, encode_continuation_token, format_s3_error, xml_escape, xml_ok},
@@ -73,7 +74,7 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
     let tx = client.transaction().await?;
 
     let exists = tx
-        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
         .await?;
     if exists.is_none() {
         return Ok(None);
@@ -98,7 +99,7 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
     let limit = q.max_keys + 1;
     let delim = q.delimiter.unwrap_or("");
     let rows = tx
-        .query(
+        .query_cached(
             "SELECT token,
                     bool_or(is_prefix),
                     max(key),

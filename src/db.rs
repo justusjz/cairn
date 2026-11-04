@@ -1,8 +1,8 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Pool};
-use tokio_postgres::NoTls;
+use deadpool_postgres::{GenericClient, Hook, HookError, Manager, ManagerConfig, Pool};
+use tokio_postgres::{Error, NoTls, Row, types::ToSql};
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_ATTEMPTS: u32 = 60;
@@ -59,6 +59,38 @@ async fn install_functions(client: &tokio_postgres::Client) -> Result<(), tokio_
         .await?;
     client.batch_execute(CATALOG_FUNCTIONS).await
 }
+
+/// Running statements as prepared statements, prepared once per connection and
+/// cached by their text. A statement run as plain text is prepared anew every
+/// time, which costs a round trip to Postgres of its own; a cached one runs in
+/// one. Every statement Cairn runs repeatedly goes through these.
+pub(crate) trait Cached: GenericClient {
+    async fn query_cached(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, Error> {
+        let statement = self.prepare_cached(sql).await?;
+        self.query(&statement, params).await
+    }
+
+    async fn query_one_cached(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Row, Error> {
+        let statement = self.prepare_cached(sql).await?;
+        self.query_one(&statement, params).await
+    }
+
+    async fn query_opt_cached(
+        &self,
+        sql: &str,
+        params: &[&(dyn ToSql + Sync)],
+    ) -> Result<Option<Row>, Error> {
+        let statement = self.prepare_cached(sql).await?;
+        self.query_opt(&statement, params).await
+    }
+
+    async fn execute_cached(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, Error> {
+        let statement = self.prepare_cached(sql).await?;
+        self.execute(&statement, params).await
+    }
+}
+
+impl<C: GenericClient> Cached for C {}
 
 /// How often a transaction is attempted while it keeps failing with conflicts.
 /// With the pauses of [`backoff`], that's up to about a second and a half of

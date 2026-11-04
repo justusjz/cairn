@@ -3,6 +3,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 use tokio_postgres::IsolationLevel;
 
+use crate::db::Cached;
 use crate::{
     App, db,
     s3::util::{format_s3_error, slow_down},
@@ -37,7 +38,7 @@ async fn try_delete(
         .start()
         .await?;
     let status = tx
-        .query_one("SELECT pg_temp.cairn_delete_bucket($1)", &[&bucket])
+        .query_one_cached("SELECT pg_temp.cairn_delete_bucket($1)", &[&bucket])
         .await?;
     // On anything but a delete, the function changed nothing; dropping `tx`
     // rolls it back.

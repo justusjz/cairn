@@ -7,6 +7,7 @@ use md5::{Digest, Md5};
 use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
+use crate::db::Cached;
 use crate::{
     App, AttachTarget, Contended, UploadResult,
     auth::ContentSha256,
@@ -101,7 +102,7 @@ pub async fn copy_object(
     }
     let client = app.pool.get().await?;
     if client
-        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&dest_bucket])
+        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&dest_bucket])
         .await?
         .is_none()
     {
@@ -146,7 +147,7 @@ pub async fn copy_object(
         // An unversioned bucket's only version is `null`.
         let client = app.pool.get().await?;
         let last_modified: String = client
-            .query_one(
+            .query_one_cached(
                 "SELECT to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"')
                  FROM objects WHERE bucket = $1 AND key = $2 AND version_id = $3",
                 &[&dest_bucket, &dest_key, &version_id.as_deref().unwrap_or("null")],
@@ -198,7 +199,7 @@ async fn commit_object_copy(
                 .start()
                 .await?;
             let row = tx
-                .query_one(
+                .query_one_cached(
                     "SELECT status, version_id, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                     &[
@@ -288,7 +289,7 @@ pub async fn copy_part(
     // request's bucket/key — as put_part does.
     let client = app.pool.get().await?;
     if client
-        .query_opt(
+        .query_opt_cached(
             "SELECT 1 FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
             &[&upload_id, &bucket, &key],
         )
@@ -405,7 +406,7 @@ async fn commit_part_copy(
                 .start()
                 .await?;
             let row = tx
-                .query_one(
+                .query_one_cached(
                     "SELECT status, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_part($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                     &[
@@ -524,7 +525,7 @@ async fn source_parts<C: GenericClient>(
     object_id: i64,
 ) -> Result<Vec<SourcePart>, tokio_postgres::Error> {
     let rows = client
-        .query(
+        .query_cached(
             "SELECT id, size, etag, crc64nvme FROM parts
              WHERE object_id = $1 ORDER BY part_number",
             &[&object_id],

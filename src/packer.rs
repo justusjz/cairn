@@ -52,6 +52,7 @@ use tokio::sync::mpsc;
 use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
+use crate::db::Cached;
 use crate::{
     App, BlobWriter, Written,
     db,
@@ -209,7 +210,7 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
 async fn fold_garbage(app: &Arc<App>) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     let row = client
-        .query_one(
+        .query_one_cached(
             "SELECT reap_blob, reap_node, reap_peer FROM pg_temp.cairn_fold_garbage()",
             &[],
         )
@@ -231,7 +232,7 @@ async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
         .pool
         .get()
         .await?
-        .query_one(
+        .query_one_cached(
             "SELECT pg_temp.cairn_claim($1, $2, $3, $4, $5, $6, $7)",
             &[
                 &kind,
@@ -376,7 +377,7 @@ async fn load_parts(client: &Object, sources: &[Uuid]) -> anyhow::Result<Vec<Par
     // the parts younger than two minutes, the next those up to four, and so on.
     // The last keys keep a blob's parts together when they're the same age.
     let rows = client
-        .query(
+        .query_cached(
             "SELECT p.id, p.blob_id, p.blob_offset, p.size, p.crc64nvme, p.etag
              FROM parts p
              LEFT JOIN objects o ON o.id = p.object_id
@@ -411,7 +412,7 @@ async fn load_blobs(
     sources: &[Uuid],
 ) -> anyhow::Result<HashMap<Uuid, (Option<BlockLayout>, Vec<Location>)>> {
     let rows = client
-        .query(
+        .query_cached(
             "SELECT b.blob_id, b.size, b.block_size, bl.node, n.peer_url
              FROM blobs b
              JOIN blob_locations bl ON bl.blob_id = b.blob_id
@@ -567,7 +568,7 @@ async fn copy_run(
     };
     let client = app.pool.get().await?;
     let exists = client
-        .query_opt("SELECT 1 FROM blobs WHERE blob_id = $1", &[&run.blob_id])
+        .query_opt_cached("SELECT 1 FROM blobs WHERE blob_id = $1", &[&run.blob_id])
         .await?
         .is_some();
     if exists {
@@ -803,7 +804,7 @@ async fn try_commit(
     let new_blobs: Vec<Uuid> = parts.iter().map(|p| written[p.output].blob_id).collect();
     let new_offsets: Vec<i64> = parts.iter().map(|p| p.new_offset as i64).collect();
     let row = tx
-        .query_one(
+        .query_one_cached(
             "SELECT status, present, reap_blob, reap_node, reap_peer
              FROM pg_temp.cairn_pack_commit($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             &[
@@ -839,7 +840,7 @@ async fn abandon(app: &Arc<App>, blob_id: Uuid) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     // The outer SELECT still sees the locations that the DELETE cascades away.
     let rows = client
-        .query(
+        .query_cached(
             "WITH gone AS (
                  DELETE FROM blobs WHERE blob_id = $1 AND state = 'pending' RETURNING blob_id
              )

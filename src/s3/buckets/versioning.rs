@@ -3,6 +3,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 use tokio_postgres::IsolationLevel;
 
+use crate::db::Cached;
 use crate::{
     App,
     auth::BodyChecksum,
@@ -83,7 +84,7 @@ async fn try_update(
         .start()
         .await?;
     let exists: bool = tx
-        .query_one(
+        .query_one_cached(
             "SELECT pg_temp.cairn_set_versioning($1, $2)",
             &[&bucket, &versioning.as_db()],
         )

@@ -4,6 +4,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
 use uuid::Uuid;
 
+use crate::db::Cached;
 use crate::{
     App, AttachTarget, UploadResult,
     auth::{ContentSha256, StreamingChunkVerifier},
@@ -49,7 +50,7 @@ pub async fn put_part(
     // belong to the request's bucket/key: authorization only checked that bucket.
     let client = app.pool.get().await?;
     if client
-        .query_opt(
+        .query_opt_cached(
             "SELECT 1 FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
             &[&upload_id, &bucket, &key],
         )

@@ -24,6 +24,7 @@ use deadpool_postgres::Object;
 use tokio_postgres::{IsolationLevel, types::ToSql};
 use uuid::Uuid;
 
+use crate::db::Cached;
 use crate::{
     App,
     blobs::{ReapTarget, reap_blobs},
@@ -189,7 +190,7 @@ async fn delete_blobs(
                 .isolation_level(IsolationLevel::ReadCommitted)
                 .start()
                 .await?;
-            let rows = tx.query(&sql, params).await?;
+            let rows = tx.query_cached(&sql, params).await?;
             tx.commit().await?;
             Ok(rows)
         }
@@ -232,7 +233,7 @@ async fn sweep_shard(app: &App, shard: u32, report: &mut Report) -> anyhow::Resu
 async fn delete_orphans(app: &App, files: Vec<Uuid>, report: &mut Report) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     let held: HashSet<Uuid> = client
-        .query(
+        .query_cached(
             "SELECT blob_id FROM blob_locations WHERE node = $1 AND blob_id = ANY($2)",
             &[&app.node, &files],
         )

@@ -3,6 +3,7 @@ use std::sync::Arc;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
 
+use crate::db::Cached;
 use crate::{
     App, AttachTarget, UploadResult,
     auth::{ContentSha256, StreamingChunkVerifier},
@@ -27,7 +28,7 @@ pub async fn put_object(
     // FK as a backstop against a concurrent bucket delete.)
     let client = app.pool.get().await?;
     if client
-        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
         .await?
         .is_none()
     {

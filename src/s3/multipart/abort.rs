@@ -4,6 +4,7 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 use uuid::Uuid;
 
+use crate::db::Cached;
 use crate::{
     App,
     blobs::{reap_blobs, reap_columns},
@@ -36,7 +37,7 @@ pub async fn abort_multipart_upload(
         .pool
         .get()
         .await?
-        .query_one(
+        .query_one_cached(
             "SELECT existed, reap_blob, reap_node, reap_peer
              FROM pg_temp.cairn_abort_upload($1, $2, $3)",
             &[&upload_id, &bucket, &key],

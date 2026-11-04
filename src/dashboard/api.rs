@@ -28,6 +28,7 @@ use utoipa::{IntoParams, OpenApi as _, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
 use super::{ApiError, ErrorBody, NodeStats, node_stats};
+use crate::db::Cached;
 use crate::{
     App,
     roles::{self, Permission},
@@ -122,7 +123,7 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
     let client = app.pool.get().await?;
     // Live as `choose_replicas` counts it: seen within the last 10 seconds.
     let rows = client
-        .query(
+        .query_cached(
             "SELECT id, node_id, peer_url, extract(epoch FROM last_seen)::float8, free_space,
                     last_seen > NOW() - INTERVAL '10 seconds'
              FROM nodes ORDER BY id",
@@ -284,7 +285,7 @@ async fn get_storage(State(app): AppState) -> Result<Json<Storage>> {
 pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
     let client = app.pool.get().await?;
     let nodes = client
-        .query(
+        .query_cached(
             "SELECT l.node, count(*), coalesce(sum(b.size), 0)::bigint
              FROM blob_locations l JOIN blobs b USING (blob_id)
              WHERE b.state = 'committed'
@@ -302,7 +303,7 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
     // How many copies each committed blob has, and how many of them are on
     // live nodes.
     let replicas = client
-        .query(
+        .query_cached(
             "SELECT live, copies, count(*), coalesce(sum(size), 0)::bigint FROM (
                  SELECT b.size, count(l.node) AS copies,
                         count(l.node) FILTER (WHERE n.last_seen > NOW() - INTERVAL '10 seconds')
@@ -328,7 +329,7 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
     let small_size = app.pack.small_size as i64;
     let threshold = app.pack.compact_threshold;
     let b = client
-        .query_one(
+        .query_one_cached(
             "SELECT count(*) FILTER (WHERE state = 'committed'),
                     coalesce(sum(size) FILTER (WHERE state = 'committed'), 0)::bigint,
                     coalesce(sum(dead_size), 0)::bigint,
@@ -350,7 +351,7 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
         )
         .await?;
     let o = client
-        .query_one(
+        .query_one_cached(
             "SELECT count(*) FILTER (WHERE is_latest AND NOT is_delete_marker),
                     coalesce(sum(size) FILTER (WHERE is_latest AND NOT is_delete_marker), 0)::bigint,
                     count(*) FILTER (WHERE NOT is_latest AND NOT is_delete_marker),
@@ -362,7 +363,7 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
         )
         .await?;
     let m = client
-        .query_one(
+        .query_one_cached(
             "SELECT (SELECT count(*) FROM multipart_uploads),
                     (SELECT extract(epoch FROM min(initiated_at))::float8 FROM multipart_uploads),
                     (SELECT coalesce(sum(size), 0)::bigint FROM parts WHERE upload_id IS NOT NULL),
@@ -442,7 +443,7 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
     let buckets = bucket_list::buckets(app).await?;
     let client = app.pool.get().await?;
     let mut objects: HashMap<String, [i64; 4]> = client
-        .query(
+        .query_cached(
             "SELECT bucket,
                     count(*) FILTER (WHERE is_latest AND NOT is_delete_marker),
                     coalesce(sum(size) FILTER (WHERE is_latest AND NOT is_delete_marker),
@@ -460,7 +461,7 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         let client = &client;
         let sql = sql.to_owned();
         async move {
-            let rows = client.query(&sql, &[]).await?;
+            let rows = client.query_cached(&sql, &[]).await?;
             anyhow::Ok(
                 rows.iter()
                     .map(|r| (r.get::<_, String>(0), r.get::<_, i64>(1)))
@@ -698,7 +699,7 @@ async fn get_object(
 pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {
     let client = app.pool.get().await?;
     let versions = client
-        .query(
+        .query_cached(
             "SELECT id, version_id, is_latest, is_delete_marker, size, etag, content_type,
                     extract(epoch FROM last_modified)::float8
              FROM objects WHERE bucket = $1 AND key = $2
@@ -709,7 +710,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
     let ids: Vec<i64> = versions.iter().map(|r| r.get(0)).collect();
     let mut parts: HashMap<i64, Vec<PartInfo>> = HashMap::new();
     for p in client
-        .query(
+        .query_cached(
             "SELECT p.object_id, p.part_number, p.size, p.etag, p.crc64nvme, p.blob_id,
                     p.blob_offset, b.size, b.state, extract(epoch FROM p.created_at)::float8,
                     ARRAY(SELECT l.node FROM blob_locations l

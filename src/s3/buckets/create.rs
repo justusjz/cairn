@@ -1,6 +1,7 @@
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 
+use crate::db::Cached;
 use crate::{App, s3::util::format_s3_error};
 
 pub enum Creation {
@@ -34,7 +35,7 @@ pub async fn create(app: &App, name: &str) -> anyhow::Result<Creation> {
         .pool
         .get()
         .await?
-        .execute(
+        .execute_cached(
             "INSERT INTO buckets (name) VALUES ($1) ON CONFLICT DO NOTHING",
             &[&name],
         )
