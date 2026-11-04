@@ -97,21 +97,27 @@ impl<C: GenericClient> Cached for C {}
 /// retrying.
 pub const MAX_TX_ATTEMPTS: usize = 20;
 
+/// How many deadlocks `is_conflict` has seen. There should be none.
+pub static DEADLOCKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// Whether `e` is a conflict with a concurrent transaction, which the
 /// transaction may not hit again if it's retried:
 ///
 /// - A deadlock, which Postgres resolves by aborting one of the transactions.
-///   The lock protocol (see `catalog.sql`) takes locks in a fixed order where
-///   it can, but not everywhere, and doesn't rely on it.
-/// - A unique violation: two uploads of the same part number both find it
-///   free and insert it. The transactions that retry on conflicts only insert
-///   unique keys after checking that they're free, under locks where it
-///   matters, so a unique violation can only come from such a race.
-/// - A serialization failure. The catalog's transactions are READ COMMITTED,
-///   so they can't fail like that, but should one run at a stricter level, a
-///   retry is still the right answer.
+///   The lock protocol (see `catalog.sql`) rules them out, except against a
+///   migration's DDL, so one is logged as a bug (and counted, in
+///   `DEADLOCKS`), but still retried.
+/// - A serialization failure: a transaction found a part moved by the packer
+///   between reading it and locking its blob (rule C in `catalog.sql`).
+/// - A unique violation, which the lock protocol rules out too, since every
+///   insert of a unique key happens under the lock that guards it. It's
+///   retried all the same, as a backstop.
 pub fn is_conflict(e: &tokio_postgres::Error) -> bool {
     use tokio_postgres::error::SqlState;
+    if e.code() == Some(&SqlState::T_R_DEADLOCK_DETECTED) {
+        DEADLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("BUG: deadlock, which the lock protocol should rule out (unless a migration ran): {e}");
+    }
     matches!(
         e.code(),
         Some(
@@ -141,6 +147,11 @@ pub async fn backoff(attempt: usize) {
 /// Arbitrary key for the advisory lock that serializes migrations, so nodes
 /// starting at the same time don't race to apply the same step.
 const MIGRATION_LOCK: i64 = 0x6361_6972_6e00; // "cairn\0"
+
+/// The advisory lock that keeps garbage folds from running concurrently (see
+/// `cairn_fold_garbage`, which repeats it as a literal).
+#[cfg(test)]
+const FOLD_LOCK: i64 = MIGRATION_LOCK + 1; // "cairn\1"
 
 /// The schema, as an ordered list of steps. Migration `n` (1-based) is
 /// `MIGRATIONS[n - 1]`; `schema_migrations` records which have been applied.
@@ -542,3 +553,12 @@ INSERT INTO blob_garbage (blob_id, size)
     WHERE b.state = 'committed'
       AND NOT EXISTS (SELECT 1 FROM parts p WHERE p.blob_id = b.blob_id);
 "#;
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn the_fold_lock_matches_the_catalog() {
+        let call = format!("pg_try_advisory_xact_lock({})", super::FOLD_LOCK);
+        assert!(super::CATALOG_FUNCTIONS.contains(&call));
+    }
+}

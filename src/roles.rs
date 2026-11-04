@@ -14,7 +14,6 @@ use std::collections::HashSet;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand, ValueEnum};
 use deadpool_postgres::Object;
-use tokio_postgres::error::SqlState;
 use crate::db::Cached;
 
 /// A bucket-level permission a role can be granted.
@@ -325,11 +324,13 @@ pub async fn update(
 
 /// Deletes a role and all its grants.
 pub async fn delete(client: &Object, name: &str) -> anyhow::Result<()> {
-    if client
-        .execute_cached("DELETE FROM roles WHERE name = $1", &[&name])
+    // Its grants are locked in the lock protocol's order first (see
+    // `cairn_delete_role`).
+    let deleted: bool = client
+        .query_one_cached("SELECT pg_temp.cairn_delete_role($1)", &[&name])
         .await?
-        == 0
-    {
+        .get(0);
+    if !deleted {
         return Err(invalid(format!("no role named {name:?}")));
     }
     Ok(())
@@ -389,40 +390,24 @@ async fn require_role(client: &Object, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Grants permissions on an existing bucket.
+/// Grants permissions on an existing bucket (`cairn_grant`, which locks the
+/// bucket and the role in the lock protocol's order before inserting).
 pub async fn grant(
     client: &Object,
     name: &str,
     bucket: &str,
     permissions: &[Permission],
 ) -> anyhow::Result<()> {
-    require_role(client, name).await?;
-    if client
-        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
-        .await?
-        .is_none()
-    {
-        return Err(invalid(format!("no bucket named {bucket:?}; create it first")));
+    let permissions: Vec<&str> = permissions.iter().map(|p| p.as_str()).collect();
+    let status = client
+        .query_one_cached("SELECT pg_temp.cairn_grant($1, $2, $3)", &[&name, &bucket, &permissions])
+        .await?;
+    match status.get::<_, &str>(0) {
+        "granted" => Ok(()),
+        "no_such_role" => Err(invalid(format!("no role named {name:?}"))),
+        "no_such_bucket" => Err(invalid(format!("no bucket named {bucket:?}; create it first"))),
+        status => unreachable!("cairn_grant: unknown status {status}"),
     }
-    for p in permissions {
-        let res = client
-            .execute_cached(
-                "INSERT INTO role_grants (role, bucket, permission) VALUES ($1, $2, $3)
-                 ON CONFLICT DO NOTHING",
-                &[&name, &bucket, &p.as_str()],
-            )
-            .await;
-        // The role or bucket was deleted between the checks above and here.
-        if let Err(e) = &res
-            && e.code() == Some(&SqlState::FOREIGN_KEY_VIOLATION)
-        {
-            return Err(invalid(format!(
-                "role {name:?} or bucket {bucket:?} was just deleted"
-            )));
-        }
-        res?;
-    }
-    Ok(())
 }
 
 /// Revokes permissions on a bucket; all of them if `permissions` is empty.
@@ -440,7 +425,7 @@ pub async fn revoke(
     };
     client
         .execute_cached(
-            "DELETE FROM role_grants WHERE role = $1 AND bucket = $2 AND permission = ANY($3)",
+            "SELECT pg_temp.cairn_revoke($1, $2, $3)",
             &[&name, &bucket, &permissions],
         )
         .await?;

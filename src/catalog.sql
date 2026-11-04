@@ -7,9 +7,8 @@
 -- Callers run each function as a statement of its own, which is then its own
 -- transaction: one round trip. So every function either succeeds, or reports
 -- why it didn't (a `status`) without having changed anything; it checks all
--- it needs to before its first write. Freed parts are passed around as two parallel arrays (their
--- blobs and sizes), and the locations of the blobs to reap after commit as
--- three (blob, node, peer URL).
+-- it needs to before its first write. The locations of the blobs to reap
+-- after commit come back as three parallel arrays (blob, node, peer URL).
 --
 -- PL/pgSQL throughout: unlike SQL functions, their bodies aren't checked
 -- against the schema when they're created, which happens before migrations
@@ -36,26 +35,33 @@
 --     parts ...). So a condition on other rows is always checked in a later
 --     statement than the one that takes the lock.
 --
--- Postgres detects deadlocks and aborts one of the transactions, which the
--- callers retry (`db::is_conflict`), so the lock order (bucket, upload, keys
--- by lock id, blobs by id) only matters for speed, never for correctness.
---
 -- The locks. The shared mode is always FOR KEY SHARE, the mode the FK checks
 -- take anyway. It conflicts with FOR UPDATE and DELETE, but not with plain
 -- UPDATEs (FOR NO KEY UPDATE), so the exclusive mode is always an explicit
--- SELECT ... FOR UPDATE.
+-- SELECT ... FOR UPDATE. In the order they're taken (see "Deadlocks"):
 --
 --   B(b)    The bucket's row. Shared: writing objects or uploads in it,
 --           reading its versioning state. Exclusive: changing the versioning
 --           state, deleting the bucket.
---   K(b,k)  The advisory lock `cairn_lock_key`. Taken (exclusive) by every
---           change to the versions of key k. Bucket names can't contain '/',
---           so 'b/k' identifies the key; keys whose hashes collide merely
---           share a lock.
 --   U(u)    The upload's row. Shared: attaching a part to it. Exclusive:
 --           completing or aborting it.
---   X(x)    The blob's row. Shared: creating a reference to it (a part on
---           it). Exclusive: committing it, deleting it, removing a location.
+--   P(u,n)  An advisory lock per part number of an upload
+--           (`cairn_lock_part_number`), in the two-key space. Taken by every
+--           attach to that part number.
+--   K(b,k)  An advisory lock per key (`cairn_lock_keys`), in the one-key
+--           space. Taken by every change to the versions of key k. Bucket
+--           names can't contain '/', so 'b/k' identifies the key.
+--   G(g)    The role_grants rows. Locked (exclusively, in primary-key order)
+--           before they're deleted.
+--   R(r)    The role's row. Shared: granting it a permission. Exclusive (by
+--           deleting it): deleting the role.
+--   X(x)    The blob's row. Shared: referencing it, or changing or deleting
+--           a part on it. Exclusive: committing it, deleting it, removing a
+--           location, moving parts off or onto it (the packer). All of a
+--           transaction's blobs are locked by one call of `cairn_lock_blobs`.
+--
+-- Advisory locks whose ids collide (two keys hashing alike) merely share a
+-- lock, which is still taken in the same place in the order.
 --
 -- The invariants, and how each is kept:
 --
@@ -78,35 +84,73 @@
 --     ETag and size from, and no part is attached to an upload being or
 --     already completed or aborted. Guard: U(u): exclusive for complete and
 --     abort, before they read the staged parts; shared for attaching, before
---     checking the upload exists. Two attaches to the same part number are
---     ordered by the unique index: the second fails, and its retry displaces
---     the first.
+--     checking the upload exists. Attaches to the same part number are
+--     serialized by P(u,n), so the part an attach displaces stays put.
 -- I5. A part only references an existing, committed blob; a blob is only
 --     deleted when no part references it; a blob is only committed with all
 --     of its replicas' locations present. Guard: X(x).
 --     - Referencing (copies): lock the source parts' blobs shared, then
 --       re-read the source parts, and check they're still the same parts, on
---       those blobs (`cairn_lock_source`, `cairn_source_parts`).
+--       those blobs (`cairn_source_parts`).
 --     - Deleting: lock the candidates exclusively, then delete those without
---       parts in a later statement (`cairn_lock_blobs`, `cairn_drop_*`).
+--       parts in a later statement (`cairn_drop_unreferenced_blobs`).
 --     - Committing: lock exclusively, then check it's pending and count its
---       locations (`cairn_lock_pending`). Locations are only removed together
---       with their blob, or (in the future) under X(x) exclusive.
---     - Deleting a pending blob (GC, the packer's abandon): one DELETE whose
---       condition is on the blob row only, so F2 re-checks it after waiting
---       for a committer.
+--       locations. Locations are only removed together with their blob, or
+--       (in the future) under X(x) exclusive.
+--     - Deleting a pending blob (GC, the packer's abandon): the GC locks the
+--       stale ones with SKIP LOCKED, re-checking that they're pending (F2),
+--       and so never touches one being committed; the abandon is a single
+--       DELETE whose condition is on the blob row only, re-checked (F2).
 --     The parts FKs remain as a backstop; with this protocol, they can't fail.
 -- I6. Every unreferenced committed blob is dropped eventually. A blob becomes
 --     unreferenced only by its parts being deleted, which the parts_garbage
 --     trigger logs in the same transaction, or moved by the packer, which
---     checks its sources itself. `cairn_fold_garbage` takes each log row
---     exactly once (concurrent folds wait for each other's rows, then skip
---     them, F2).
+--     checks its sources itself. Folds run one at a time (an advisory lock),
+--     so each log row is taken exactly once.
 -- I7. The packer moves a part only if it's still where the job read it from:
---     a compare-and-swap on the part row, re-checked after waiting (F2). Its
---     sources and new blobs are locked exclusively up front.
+--     a compare-and-swap on the part row. Its sources and new blobs are
+--     locked exclusively up front, so no one else changes those part rows
+--     while it does.
 -- I8. `dead_size` and the packer's leases are heuristics: nothing depends on
 --     them for correctness.
+--
+-- DEADLOCKS
+--
+-- There are none, by three rules, which every transaction follows:
+--
+-- A. All of a transaction's locks are taken up front, in one global order:
+--    B, U, P, K (by lock id), G (by primary key), R, X (by blob id), each blob
+--    in its final mode (exclusive wins over shared). A transaction that waits
+--    for a lock therefore only ever waits for one that comes later in the
+--    order than all it holds, so no cycle of waits can form.
+-- B. No statement waits for anything else. Every row a transaction changes,
+--    deletes or locks implicitly (through an FK check, a unique index, a
+--    cascade) is covered by a lock it already holds, and so is every
+--    conflicting holder of that row: object rows are only changed under
+--    their key's K, part rows under their blob's X (and their key's K or
+--    their upload's U), blob rows under their X, grant rows under G, bucket
+--    and upload rows under B and U. The rows that new objects, parts and
+--    locations reference (their bucket, upload, blob) are locked first.
+-- C. Read, lock, verify. Which blobs to lock is only known from reading
+--    parts, so a transaction reads them first. What it read is stable under
+--    its earlier locks (the key's versions under K, an upload's parts under U
+--    or P), except for the blob a part is on: the packer may move the part
+--    in between. So after locking, `cairn_check_on` checks the parts are
+--    still on locked blobs, and if not, raises a serialization failure, which
+--    rolls the transaction back for the caller to retry (`db::is_conflict`).
+--    A copy's source parts may also be replaced or deleted (no lock of ours
+--    covers the source key): then the copy starts over ('source_changed').
+--
+-- Statements that run on their own (the pending blob and location inserts,
+-- CreateMultipartUpload, role creation and updates, the heartbeat) hold
+-- nothing that anyone waits for while they wait, so they can't be part of a
+-- cycle either. (A location insert's FK checks lock its node's row shared,
+-- but nothing ever locks a node's row exclusively.) An insert whose FK checks
+-- would lock rows out of order (a grant's: the role, then the bucket) is a
+-- function that locks them in order first (`cairn_grant`). The GC
+-- and the packer's claim use SKIP LOCKED, so they never wait at all. What
+-- remains is DDL (migrations), whose table locks a running cluster can
+-- deadlock with; the retry covers that.
 
 -- Whether an If-Match / If-None-Match value matches `etag`. A value is NULL
 -- when the header is absent, empty for `*`, and else its entity-tags (see
@@ -148,8 +192,24 @@ BEGIN
 END
 $$;
 
--- K(b,k) for each of the keys, in the order of their lock ids, so that
--- transactions taking several don't deadlock (I1).
+-- U(u), shared: whether the upload exists (I4).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_lock_upload(p_upload uuid)
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM multipart_uploads WHERE upload_id = p_upload FOR KEY SHARE;
+    RETURN FOUND;
+END
+$$;
+
+-- P(u,n) (I4).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_lock_part_number(p_upload uuid, p_part_number int)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_advisory_xact_lock(hashtext(p_upload::text), p_part_number);
+END
+$$;
+
+-- K(b,k) for each of the keys, in the order of their lock ids (I1).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_lock_keys(p_bucket text, p_keys text[])
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
@@ -164,51 +224,78 @@ BEGIN
 END
 $$;
 
--- U(u), shared: whether the upload exists (I4).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_lock_upload(p_upload uuid)
-RETURNS boolean LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM 1 FROM multipart_uploads WHERE upload_id = p_upload FOR KEY SHARE;
-    RETURN FOUND;
-END
-$$;
-
--- X(x), exclusive, for each of the blobs that exist, in order of their ids
--- (I5).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_lock_blobs(p_blobs uuid[])
-RETURNS void LANGUAGE plpgsql AS $$
-BEGIN
-    -- The rows are locked as they come out of the sort.
-    PERFORM 1 FROM blobs WHERE blob_id = ANY(p_blobs) ORDER BY blob_id FOR UPDATE;
-END
-$$;
-
--- X(x), exclusive, for a blob about to be committed: whether it's still
--- pending (else it's gone: deleted by the GC as stale, say) (I5).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_lock_pending(p_blob uuid)
-RETURNS boolean LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM 1 FROM blobs WHERE blob_id = p_blob AND state = 'pending' FOR UPDATE;
-    RETURN FOUND;
-END
-$$;
-
--- X(x), shared, for the blobs of the parts of a copy's source version, which
--- the copy is about to reference (I5). Returns the blobs it locked; a blob
--- deleted meanwhile isn't among them.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_lock_source(p_object bigint)
+-- X(x) for each of the blobs that exist, in order of their ids, exclusively
+-- where `p_exclusive` says so for any of its entries, else shared (I5, rule
+-- A). Returns the blobs it locked; one deleted meanwhile isn't among them.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_lock_blobs(p_blobs uuid[], p_exclusive boolean[])
 RETURNS uuid[] LANGUAGE plpgsql AS $$
 DECLARE
-    result uuid[];
+    v_locked uuid[] := '{}';
+    r record;
 BEGIN
-    SELECT coalesce(array_agg(s.blob_id), '{}') INTO result
-    FROM (
-        SELECT b.blob_id FROM blobs b
-        WHERE b.blob_id IN (SELECT p.blob_id FROM parts p WHERE p.object_id = p_object)
-        ORDER BY b.blob_id
-        FOR KEY SHARE
-    ) AS s;
-    RETURN result;
+    IF NOT false = ANY(p_exclusive) THEN
+        -- All exclusive: one statement, which locks the rows as they come out
+        -- of the sort.
+        SELECT coalesce(array_agg(s.blob_id), '{}') INTO v_locked FROM (
+            SELECT blob_id FROM blobs WHERE blob_id = ANY(p_blobs) ORDER BY blob_id FOR UPDATE
+        ) AS s;
+        RETURN v_locked;
+    END IF;
+    FOR r IN
+        SELECT t.blob_id, bool_or(t.exclusive) AS exclusive
+        FROM unnest(p_blobs, p_exclusive) AS t(blob_id, exclusive)
+        GROUP BY t.blob_id ORDER BY t.blob_id
+    LOOP
+        IF r.exclusive THEN
+            PERFORM 1 FROM blobs WHERE blob_id = r.blob_id FOR UPDATE;
+        ELSE
+            PERFORM 1 FROM blobs WHERE blob_id = r.blob_id FOR KEY SHARE;
+        END IF;
+        IF FOUND THEN
+            v_locked := v_locked || r.blob_id;
+        END IF;
+    END LOOP;
+    RETURN v_locked;
+END
+$$;
+
+-- What deleting these parts needs locked: each one's blob, exclusively if
+-- the part may be all it holds (it's the blob's size), since the blob may
+-- then have to be dropped; else shared. A packed blob whose last part is
+-- deleted is dropped by the packer instead (see `cairn_fold_garbage`), so
+-- deletes of different parts in a packed blob don't wait for each other.
+-- A blob's size doesn't change once it's committed, and parts only reference
+-- committed blobs.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_freeable(
+    p_parts bigint[], OUT blobs uuid[], OUT exclusive boolean[]
+) LANGUAGE plpgsql AS $$
+BEGIN
+    SELECT coalesce(array_agg(p.blob_id), '{}'), coalesce(array_agg(b.size = p.size), '{}')
+    INTO blobs, exclusive
+    FROM parts p JOIN blobs b ON b.blob_id = p.blob_id
+    WHERE p.id = ANY(p_parts);
+END
+$$;
+
+-- The blobs of `p_blobs` that `p_exclusive` marks: the ones to try dropping.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_exclusive(p_blobs uuid[], p_exclusive boolean[])
+RETURNS uuid[] LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    RETURN ARRAY(SELECT t.blob_id FROM unnest(p_blobs, p_exclusive) AS t(blob_id, exclusive)
+                 WHERE t.exclusive);
+END
+$$;
+
+-- Rule C: raises a serialization failure, for the caller to retry, unless
+-- all of the parts are on blobs in `p_locked` (the packer may have moved one
+-- between reading it and locking its blob).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_check_on(p_parts bigint[], p_locked uuid[])
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM parts WHERE id = ANY(p_parts) AND NOT blob_id = ANY(p_locked)) THEN
+        RAISE EXCEPTION 'cairn: a part moved to another blob while its blob was being locked'
+            USING ERRCODE = 'serialization_failure';
+    END IF;
 END
 $$;
 
@@ -224,12 +311,18 @@ BEGIN
 END
 $$;
 
--- How many of `nodes` hold a location for the blob. Under X(x) exclusive.
+-- How many of `nodes` hold a location for the blob, if it's still pending;
+-- 0 if it isn't (it's gone: deleted by the GC as stale, say). Under X(x)
+-- exclusive.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_locations_present(p_blob uuid, p_nodes int[])
 RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
     result bigint;
 BEGIN
+    PERFORM 1 FROM blobs WHERE blob_id = p_blob AND state = 'pending';
+    IF NOT FOUND THEN
+        RETURN 0;
+    END IF;
     SELECT count(*) INTO result FROM blob_locations WHERE blob_id = p_blob AND node = ANY(p_nodes);
     RETURN result;
 END
@@ -248,45 +341,16 @@ BEGIN
 END
 $$;
 
--- Deletes the blobs that deleted parts (of these blobs and sizes, deleted in
--- the same transaction) held on their own, unless something else still
--- references them (another object's copy, say), cascading their locations
--- away; returns those locations.
---
--- Only a blob the size of the deleted part can have held nothing else, so
--- that's the only kind this locks and checks for other parts. That keeps
--- concurrent deletes of different parts in a packed blob from waiting for
--- each other. A packed blob whose last part is deleted is dropped by the
--- packer instead (see `cairn_fold_garbage`).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_drop_blobs_of_deleted_parts(
-    p_blobs uuid[], p_sizes bigint[],
-    OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
-) LANGUAGE plpgsql AS $$
-DECLARE
-    v_whole uuid[];
-BEGIN
-    -- A blob's size doesn't change once it's committed, and a part only
-    -- references committed blobs.
-    SELECT coalesce(array_agg(DISTINCT b.blob_id), '{}') INTO v_whole
-    FROM blobs b
-    JOIN unnest(p_blobs, p_sizes) AS d(blob_id, size)
-        ON d.blob_id = b.blob_id AND d.size = b.size;
-    SELECT * INTO reap_blob, reap_node, reap_peer
-    FROM pg_temp.cairn_drop_unreferenced_blobs(v_whole);
-END
-$$;
-
 -- Deletes those of the blobs that no part references anymore (typically the
 -- blobs of parts just deleted or moved in the same transaction), cascading
--- their locations away; returns those locations. I5: the blobs are locked
--- first, and checked for parts in a later statement, which therefore sees
--- every part that a transaction holding a blob's shared lock attached.
+-- their locations away; returns those locations. The caller holds X(x)
+-- exclusive on all of them (I5), so this sees every part that a holder of a
+-- shared lock attached (F1), and no one can attach one now.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_drop_unreferenced_blobs(
     p_blobs uuid[],
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 BEGIN
-    PERFORM pg_temp.cairn_lock_blobs(p_blobs);
     -- All parts of a statement see the same snapshot, so the outer SELECT
     -- still sees the locations that the DELETE cascades away.
     WITH gone AS (
@@ -306,7 +370,7 @@ $$;
 
 -- Sets the blobs' `dead_size` to exactly the bytes that no part references:
 -- the size, less the union of the parts' byte ranges (parts can share bytes,
--- through copies).
+-- through copies). Under X(x) exclusive.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_refresh_dead_size(p_blobs uuid[])
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
@@ -325,34 +389,67 @@ BEGIN
 END
 $$;
 
--- Removes the version with row id `p_id` and its parts, returning those.
--- Under K(b,k).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_remove_version(
-    p_id bigint, OUT freed_blobs uuid[], OUT freed_sizes bigint[]
-) LANGUAGE plpgsql AS $$
+-- The parts of the object version with row id `p_id`.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_version_parts(p_id bigint)
+RETURNS bigint[] LANGUAGE plpgsql AS $$
 BEGIN
-    WITH gone AS (DELETE FROM parts WHERE object_id = p_id RETURNING blob_id, size)
-    SELECT coalesce(array_agg(blob_id), '{}'), coalesce(array_agg(size), '{}')
-    INTO freed_blobs, freed_sizes
-    FROM gone;
+    RETURN ARRAY(SELECT id FROM parts WHERE object_id = p_id);
+END
+$$;
+
+-- The parts that writing a new version of the key would remove: those of its
+-- null version, unless the bucket is versioned (see `cairn_put_version`).
+-- Under K(b,k), so they stay the key's.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_freed_by_put(p_bucket text, p_key text, p_versioning text)
+RETURNS bigint[] LANGUAGE plpgsql AS $$
+BEGIN
+    IF p_versioning = 'enabled' THEN
+        RETURN '{}';
+    END IF;
+    RETURN ARRAY(
+        SELECT p.id FROM objects o JOIN parts p ON p.object_id = o.id
+        WHERE o.bucket = p_bucket AND o.key = p_key AND o.version_id = 'null'
+    );
+END
+$$;
+
+-- The parts that deleting the key (or the named version of it) may remove
+-- (see `cairn_delete_key`). Under K(b,k).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_freed_by_delete(
+    p_bucket text, p_key text, p_versioning text, p_version_id text
+) RETURNS bigint[] LANGUAGE plpgsql AS $$
+BEGIN
+    IF p_version_id IS NOT NULL THEN
+        RETURN ARRAY(
+            SELECT p.id FROM objects o JOIN parts p ON p.object_id = o.id
+            WHERE o.bucket = p_bucket AND o.key = p_key AND o.version_id = p_version_id
+        );
+    END IF;
+    RETURN pg_temp.cairn_freed_by_put(p_bucket, p_key, p_versioning);
+END
+$$;
+
+-- Removes the version with row id `p_id` and its parts. Under K(b,k), and
+-- X(x) on the parts' blobs.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_remove_version(p_id bigint)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    DELETE FROM parts WHERE object_id = p_id;
     DELETE FROM objects WHERE id = p_id;
 END
 $$;
 
--- Removes the key's `null` version, if it has one, returning its parts.
--- Under K(b,k).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_remove_null_version(
-    p_bucket text, p_key text, OUT freed_blobs uuid[], OUT freed_sizes bigint[]
-) LANGUAGE plpgsql AS $$
+-- Removes the key's `null` version, if it has one. Under K(b,k), and X(x) on
+-- its parts' blobs.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_remove_null_version(p_bucket text, p_key text)
+RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     v_id bigint;
 BEGIN
-    freed_blobs := '{}';
-    freed_sizes := '{}';
     SELECT id INTO v_id FROM objects
     WHERE bucket = p_bucket AND key = p_key AND version_id = 'null';
     IF FOUND THEN
-        SELECT * INTO freed_blobs, freed_sizes FROM pg_temp.cairn_remove_version(v_id);
+        PERFORM pg_temp.cairn_remove_version(v_id);
     END IF;
 END
 $$;
@@ -379,24 +476,22 @@ $$;
 -- Writes a new object version as the key's current version, the way S3 lands
 -- a write in a bucket with the given versioning state. `p_new_version_id` is
 -- the fresh version ID to use if the bucket is versioned. Returns the new
--- row's id, the version ID to report (NULL in an unversioned bucket), and the
--- parts of the version it removed. The caller holds B(b) shared (which gave it
--- the versioning state) and K(b,k).
+-- row's id, and the version ID to report (NULL in an unversioned bucket). The
+-- caller holds B(b) shared (which gave it the versioning state), K(b,k), and
+-- X(x) on the blobs of the parts `cairn_freed_by_put` names.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
     p_content_type text, p_new_version_id text,
-    OUT id bigint, OUT version_id text, OUT freed_blobs uuid[], OUT freed_sizes bigint[]
+    OUT id bigint, OUT version_id text
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_version_id text;
 BEGIN
-    freed_blobs := '{}';
-    freed_sizes := '{}';
     IF p_versioning = 'enabled' THEN
         v_version_id := p_new_version_id;
     ELSE
         -- The null version is replaced wherever it sits among the key's versions.
-        SELECT * INTO freed_blobs, freed_sizes FROM pg_temp.cairn_remove_null_version(p_bucket, p_key);
+        PERFORM pg_temp.cairn_remove_null_version(p_bucket, p_key);
         v_version_id := 'null';
     END IF;
     PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
@@ -412,27 +507,24 @@ $$;
 -- a named version for good, else the null version (unversioned) or by
 -- stacking a delete marker (versioned; it replaces the null version in a
 -- suspended bucket). `p_marker_id` is the fresh version ID of a marker in an
--- enabled bucket. Returns the version ID to report, whether it concerns a
--- delete marker, and the parts it removed. The caller holds B(b) shared and
--- K(b,k).
+-- enabled bucket. Returns the version ID to report, and whether it concerns a
+-- delete marker. The caller holds B(b) shared, K(b,k), and X(x) on the blobs
+-- of the parts `cairn_freed_by_delete` names.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_key(
     p_bucket text, p_key text, p_versioning text, p_version_id text, p_marker_id text,
-    OUT version_id text, OUT delete_marker boolean,
-    OUT freed_blobs uuid[], OUT freed_sizes bigint[]
+    OUT version_id text, OUT delete_marker boolean
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_row record;
     v_marker text;
 BEGIN
-    freed_blobs := '{}';
-    freed_sizes := '{}';
     delete_marker := false;
     IF p_version_id IS NOT NULL THEN
         SELECT o.id, o.is_latest, o.is_delete_marker INTO v_row FROM objects o
         WHERE o.bucket = p_bucket AND o.key = p_key AND o.version_id = p_version_id;
         IF FOUND THEN
             delete_marker := v_row.is_delete_marker;
-            SELECT * INTO freed_blobs, freed_sizes FROM pg_temp.cairn_remove_version(v_row.id);
+            PERFORM pg_temp.cairn_remove_version(v_row.id);
             IF v_row.is_latest THEN
                 PERFORM pg_temp.cairn_promote_newest(p_bucket, p_key);
             END IF;
@@ -441,13 +533,13 @@ BEGIN
         RETURN;
     END IF;
     IF p_versioning = 'unversioned' THEN
-        SELECT * INTO freed_blobs, freed_sizes FROM pg_temp.cairn_remove_null_version(p_bucket, p_key);
+        PERFORM pg_temp.cairn_remove_null_version(p_bucket, p_key);
         version_id := NULL;
         RETURN;
     ELSIF p_versioning = 'enabled' THEN
         v_marker := p_marker_id;
     ELSE
-        SELECT * INTO freed_blobs, freed_sizes FROM pg_temp.cairn_remove_null_version(p_bucket, p_key);
+        PERFORM pg_temp.cairn_remove_null_version(p_bucket, p_key);
         v_marker := 'null';
     END IF;
     PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
@@ -460,11 +552,11 @@ END
 $$;
 
 -- T1: commits an uploaded blob as a single-part object at (bucket, key).
--- Takes B(b) shared, K(b,k), X(blob) exclusive. Checks that the bucket exists
--- ('no_such_bucket'), the conditional-write guard ('precondition_failed') and
--- that every replica recorded its location ('missing_locations', with how
--- many did), then commits the blob, writes the version and attaches the part
--- ('committed').
+-- Takes B(b) shared, K(b,k), then X: the blob exclusively, and the blobs of
+-- the version it replaces. Checks that the bucket exists ('no_such_bucket'),
+-- the conditional-write guard ('precondition_failed') and that every replica
+-- recorded its location ('missing_locations', with how many did), then
+-- commits the blob, writes the version and attaches the part ('committed').
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_blob uuid, p_nodes int[], p_size bigint, p_file_crc bigint, p_block_size int,
     p_data_crc bigint, p_etag text,
@@ -475,6 +567,9 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_versioning text;
+    v_freed bigint[];
+    f record;
+    v_locked uuid[];
     v record;
 BEGIN
     reap_blob := '{}';
@@ -492,11 +587,11 @@ BEGIN
         status := 'precondition_failed';
         RETURN;
     END IF;
-    IF pg_temp.cairn_lock_pending(p_blob) THEN
-        present := pg_temp.cairn_locations_present(p_blob, p_nodes);
-    ELSE
-        present := 0;
-    END IF;
+    v_freed := pg_temp.cairn_freed_by_put(p_bucket, p_key, v_versioning);
+    SELECT * INTO f FROM pg_temp.cairn_freeable(v_freed);
+    v_locked := pg_temp.cairn_lock_blobs(p_blob || f.blobs, true || f.exclusive);
+    PERFORM pg_temp.cairn_check_on(v_freed, v_locked);
+    present := pg_temp.cairn_locations_present(p_blob, p_nodes);
     IF present <> cardinality(p_nodes) THEN
         status := 'missing_locations';
         RETURN;
@@ -509,14 +604,15 @@ BEGIN
                        part_number, created_at)
     VALUES (p_blob, 0, p_size, p_etag, p_data_crc, v.id, NULL, 1, NOW());
     SELECT * INTO reap_blob, reap_node, reap_peer
-    FROM pg_temp.cairn_drop_blobs_of_deleted_parts(v.freed_blobs, v.freed_sizes);
+    FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'committed';
 END
 $$;
 
 -- T2: commits an uploaded blob as part `p_part_number` of a multipart upload,
 -- displacing any part uploaded at that number before. Takes U(u) shared,
--- X(blob) exclusive. Or 'no_such_upload', or 'missing_locations'.
+-- P(u,n), then X: the blob exclusively, and the displaced part's blob. Or
+-- 'no_such_upload', or 'missing_locations'.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_upload_part(
     p_blob uuid, p_nodes int[], p_size bigint, p_file_crc bigint, p_block_size int,
     p_data_crc bigint, p_etag text,
@@ -525,8 +621,9 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_upload_part(
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
-    v_blobs uuid[];
-    v_sizes bigint[];
+    v_displaced bigint[];
+    f record;
+    v_locked uuid[];
 BEGIN
     reap_blob := '{}';
     reap_node := '{}';
@@ -535,40 +632,45 @@ BEGIN
         status := 'no_such_upload';
         RETURN;
     END IF;
-    IF pg_temp.cairn_lock_pending(p_blob) THEN
-        present := pg_temp.cairn_locations_present(p_blob, p_nodes);
-    ELSE
-        present := 0;
-    END IF;
+    PERFORM pg_temp.cairn_lock_part_number(p_upload, p_part_number);
+    v_displaced := ARRAY(SELECT id FROM parts
+                         WHERE upload_id = p_upload AND part_number = p_part_number);
+    SELECT * INTO f FROM pg_temp.cairn_freeable(v_displaced);
+    v_locked := pg_temp.cairn_lock_blobs(p_blob || f.blobs, true || f.exclusive);
+    PERFORM pg_temp.cairn_check_on(v_displaced, v_locked);
+    present := pg_temp.cairn_locations_present(p_blob, p_nodes);
     IF present <> cardinality(p_nodes) THEN
         status := 'missing_locations';
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_mark_committed(p_blob, p_size, p_file_crc, p_block_size);
-    -- A concurrent upload of the same part number that commits first makes the
-    -- INSERT below fail with a unique violation; the retry displaces it.
-    WITH displaced AS (
-        DELETE FROM parts WHERE upload_id = p_upload AND part_number = p_part_number
-        RETURNING blob_id, size
-    )
-    SELECT coalesce(array_agg(blob_id), '{}'), coalesce(array_agg(size), '{}')
-    INTO v_blobs, v_sizes FROM displaced;
+    DELETE FROM parts WHERE id = ANY(v_displaced);
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
                        part_number, created_at)
     VALUES (p_blob, 0, p_size, p_etag, p_data_crc, NULL, p_upload, p_part_number, NOW());
     SELECT * INTO reap_blob, reap_node, reap_peer
-    FROM pg_temp.cairn_drop_blobs_of_deleted_parts(v_blobs, v_sizes);
+    FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'committed';
 END
 $$;
 
+-- The blobs of the parts of a copy's source version, as read now: the ones
+-- the copy is to lock (shared). Not locked themselves; `cairn_source_parts`
+-- checks after locking.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_source_blobs(p_object bigint)
+RETURNS uuid[] LANGUAGE plpgsql AS $$
+BEGIN
+    RETURN ARRAY(SELECT blob_id FROM parts WHERE object_id = p_object);
+END
+$$;
+
 -- The current parts of a copy's source version, in order, if they're still
--- the ones (by id and size) the copy read, and all on blobs in `p_locked`
--- (which the caller holds X(x) shared on); NULL arrays if not. A part's bytes
--- never change, so the same parts mean the same data, though the packer may
--- have moved them to another blob since (and then they aren't on the locked
--- ones). A deleted version takes its parts with it, and every object has at
--- least one, so a deleted source shows here too.
+-- the ones (by id and size) the copy read; NULL arrays if not. A part's bytes
+-- never change, so the same parts mean the same data. A deleted version
+-- takes its parts with it, and every object has at least one, so a deleted
+-- source shows here too. If they're the same parts, but one has moved off the
+-- blobs in `p_locked` (the packer), this raises a serialization failure
+-- (rule C).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_source_parts(
     p_object bigint, p_part_ids bigint[], p_part_sizes bigint[], p_locked uuid[],
     OUT blob_ids uuid[], OUT offsets bigint[], OUT sizes bigint[],
@@ -585,20 +687,23 @@ BEGIN
            coalesce(array_agg(p.crc64nvme ORDER BY p.part_number), '{}')
     INTO v_ids, blob_ids, offsets, sizes, etags, crcs
     FROM parts p WHERE p.object_id = p_object;
-    IF v_ids <> p_part_ids OR sizes <> p_part_sizes OR NOT blob_ids <@ p_locked THEN
+    IF v_ids <> p_part_ids OR sizes <> p_part_sizes THEN
         blob_ids := NULL;
         offsets := NULL;
         sizes := NULL;
         etags := NULL;
         crcs := NULL;
+        RETURN;
     END IF;
+    PERFORM pg_temp.cairn_check_on(v_ids, p_locked);
 END
 $$;
 
 -- T3: CopyObject's commit: a new version at (bucket, key) with parts on the
 -- source version's bytes ('committed'), unless the source changed since the
 -- copy read it ('source_changed') or the bucket is gone ('no_such_bucket').
--- Takes B(b) shared, K(b,k), X(x) shared on the source's blobs.
+-- Takes B(b) shared, K(b,k), then X: the source's blobs shared, and those of
+-- the version it replaces.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_source bigint, p_part_ids bigint[], p_part_sizes bigint[],
     p_bucket text, p_key text, p_size bigint, p_etag text, p_content_type text,
@@ -608,6 +713,9 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_versioning text;
+    v_sources uuid[];
+    v_freed bigint[];
+    f record;
     v_locked uuid[];
     s record;
     v record;
@@ -621,7 +729,12 @@ BEGIN
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
-    v_locked := pg_temp.cairn_lock_source(p_source);
+    v_sources := pg_temp.cairn_source_blobs(p_source);
+    v_freed := pg_temp.cairn_freed_by_put(p_bucket, p_key, v_versioning);
+    SELECT * INTO f FROM pg_temp.cairn_freeable(v_freed);
+    v_locked := pg_temp.cairn_lock_blobs(
+        v_sources || f.blobs, array_fill(false, ARRAY[cardinality(v_sources)]) || f.exclusive);
+    PERFORM pg_temp.cairn_check_on(v_freed, v_locked);
     -- Read after the locks (F1), and before the new version is written: a
     -- copy onto its own source replaces the version whose bytes it shares.
     SELECT * INTO s FROM pg_temp.cairn_source_parts(p_source, p_part_ids, p_part_sizes, v_locked);
@@ -639,7 +752,7 @@ BEGIN
         WITH ORDINALITY AS t(blob_id, blob_offset, size, etag, crc, n);
     -- After inserting the new parts, so that a self-copy keeps its bytes.
     SELECT * INTO reap_blob, reap_node, reap_peer
-    FROM pg_temp.cairn_drop_blobs_of_deleted_parts(v.freed_blobs, v.freed_sizes);
+    FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'committed';
 END
 $$;
@@ -647,8 +760,8 @@ $$;
 -- T4: UploadPartCopy's commit: stages `p_length` bytes of source part
 -- `p_index` (1-based), from `p_within` in it, as part `p_part_number` of the
 -- upload, displacing any part uploaded at that number before ('committed').
--- Or 'no_such_upload', or 'source_changed'. Takes U(u) shared, X(x) shared on
--- the source's blobs.
+-- Or 'no_such_upload', or 'source_changed'. Takes U(u) shared, P(u,n), then
+-- X: the source's blobs shared, and the displaced part's blob.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_part(
     p_source bigint, p_part_ids bigint[], p_part_sizes bigint[],
     p_index int, p_within bigint, p_length bigint, p_etag text, p_crc bigint,
@@ -657,10 +770,11 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_part(
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
+    v_sources uuid[];
+    v_displaced bigint[];
+    f record;
     v_locked uuid[];
     s record;
-    v_blobs uuid[];
-    v_sizes bigint[];
 BEGIN
     reap_blob := '{}';
     reap_node := '{}';
@@ -669,35 +783,39 @@ BEGIN
         status := 'no_such_upload';
         RETURN;
     END IF;
-    v_locked := pg_temp.cairn_lock_source(p_source);
+    PERFORM pg_temp.cairn_lock_part_number(p_upload, p_part_number);
+    v_sources := pg_temp.cairn_source_blobs(p_source);
+    v_displaced := ARRAY(SELECT id FROM parts
+                         WHERE upload_id = p_upload AND part_number = p_part_number);
+    SELECT * INTO f FROM pg_temp.cairn_freeable(v_displaced);
+    v_locked := pg_temp.cairn_lock_blobs(
+        v_sources || f.blobs, array_fill(false, ARRAY[cardinality(v_sources)]) || f.exclusive);
+    PERFORM pg_temp.cairn_check_on(v_displaced, v_locked);
     -- Read after the locks (F1).
     SELECT * INTO s FROM pg_temp.cairn_source_parts(p_source, p_part_ids, p_part_sizes, v_locked);
     IF s.blob_ids IS NULL THEN
         status := 'source_changed';
         RETURN;
     END IF;
-    WITH displaced AS (
-        DELETE FROM parts WHERE upload_id = p_upload AND part_number = p_part_number
-        RETURNING blob_id, size
-    )
-    SELECT coalesce(array_agg(blob_id), '{}'), coalesce(array_agg(size), '{}')
-    INTO v_blobs, v_sizes FROM displaced;
+    DELETE FROM parts WHERE id = ANY(v_displaced);
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
                        part_number, created_at)
     VALUES (s.blob_ids[p_index], s.offsets[p_index] + p_within, p_length, p_etag, p_crc,
             NULL, p_upload, p_part_number, NOW());
     SELECT * INTO reap_blob, reap_node, reap_peer
-    FROM pg_temp.cairn_drop_blobs_of_deleted_parts(v_blobs, v_sizes);
+    FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'committed';
 END
 $$;
 
--- T5: CompleteMultipartUpload. Takes B(b) shared, U(u) exclusive, K(b,k).
--- Checks that the upload exists and belongs to (bucket, key)
--- ('no_such_upload'), that every listed part is staged with the listed ETag
--- ('invalid_part'), and the conditional-write guard ('precondition_failed').
--- Then publishes the listed parts as the key's new version, deletes the staged
--- parts left out, and the upload ('done', with the object's ETag).
+-- T5: CompleteMultipartUpload. Takes B(b) shared, U(u) exclusive, K(b,k),
+-- then X: the blobs of the listed parts (shared), the left-out staged parts
+-- and the replaced version's parts. Checks that the upload exists and belongs
+-- to (bucket, key) ('no_such_upload'), that every listed part is staged with
+-- the listed ETag ('invalid_part'), and the conditional-write guard
+-- ('precondition_failed'). Then publishes the listed parts as the key's new
+-- version, deletes the staged parts left out, and the upload ('done', with
+-- the object's ETag).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_complete_upload(
     p_upload uuid, p_bucket text, p_key text, p_part_numbers int[], p_etags text[],
     p_if_match text[], p_if_none_match text[], p_new_version_id text,
@@ -707,12 +825,15 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_complete_upload(
 DECLARE
     v_versioning text;
     v_content_type text;
-    v_matched bigint;
+    v_listed bigint[];
+    v_listed_blobs uuid[];
     v_total bigint;
     v_combined text;
+    v_unused bigint[];
+    v_freed bigint[];
+    f record;
+    v_locked uuid[];
     v record;
-    v_blobs uuid[];
-    v_sizes bigint[];
 BEGIN
     reap_blob := '{}';
     reap_node := '{}';
@@ -731,12 +852,13 @@ BEGIN
     PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
     -- The object's ETag is the MD5 of the listed parts' binary MD5s, then the
     -- part count. The part numbers are distinct (the caller checked their order).
-    SELECT count(*), sum(p.size), md5(string_agg(decode(p.etag, 'hex'), ''::bytea ORDER BY r.n))
-    INTO v_matched, v_total, v_combined
+    SELECT coalesce(array_agg(p.id), '{}'), coalesce(array_agg(p.blob_id), '{}'), sum(p.size),
+           md5(string_agg(decode(p.etag, 'hex'), ''::bytea ORDER BY r.n))
+    INTO v_listed, v_listed_blobs, v_total, v_combined
     FROM unnest(p_part_numbers, p_etags) WITH ORDINALITY AS r(part_number, etag, n)
     JOIN parts p ON p.upload_id = p_upload AND p.part_number = r.part_number
                 AND p.etag = r.etag;
-    IF v_matched <> cardinality(p_part_numbers) THEN
+    IF cardinality(v_listed) <> cardinality(p_part_numbers) THEN
         status := 'invalid_part';
         RETURN;
     END IF;
@@ -746,35 +868,38 @@ BEGIN
         status := 'precondition_failed';
         RETURN;
     END IF;
+    v_unused := ARRAY(SELECT id FROM parts WHERE upload_id = p_upload AND NOT id = ANY(v_listed));
+    v_freed := pg_temp.cairn_freed_by_put(p_bucket, p_key, v_versioning);
+    SELECT * INTO f FROM pg_temp.cairn_freeable(v_unused || v_freed);
+    v_locked := pg_temp.cairn_lock_blobs(
+        v_listed_blobs || f.blobs,
+        array_fill(false, ARRAY[cardinality(v_listed_blobs)]) || f.exclusive);
+    PERFORM pg_temp.cairn_check_on(v_listed || v_unused || v_freed, v_locked);
     etag := v_combined || '-' || cardinality(p_part_numbers);
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, v_total, etag, v_content_type, p_new_version_id);
     version_id := v.version_id;
-    UPDATE parts SET upload_id = NULL, object_id = v.id
-    WHERE upload_id = p_upload AND part_number = ANY(p_part_numbers);
-    -- The staged parts left out of the object are the only ones still staged.
-    WITH unused AS (DELETE FROM parts WHERE upload_id = p_upload RETURNING blob_id, size)
-    SELECT coalesce(array_agg(blob_id), '{}'), coalesce(array_agg(size), '{}')
-    INTO v_blobs, v_sizes FROM unused;
+    UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);
+    DELETE FROM parts WHERE id = ANY(v_unused);
     SELECT * INTO reap_blob, reap_node, reap_peer
-    FROM pg_temp.cairn_drop_blobs_of_deleted_parts(v.freed_blobs || v_blobs,
-                                                   v.freed_sizes || v_sizes);
+    FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     DELETE FROM multipart_uploads WHERE upload_id = p_upload;
     status := 'done';
 END
 $$;
 
--- T6: AbortMultipartUpload. Takes U(u) exclusive. Deletes the upload (if it
--- belongs to bucket and key), its staged parts, and their blobs. `existed` is
--- whether there was one.
+-- T6: AbortMultipartUpload. Takes U(u) exclusive, then X on the staged parts'
+-- blobs. Deletes the upload (if it belongs to bucket and key), its staged
+-- parts, and their blobs. `existed` is whether there was one.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_abort_upload(
     p_upload uuid, p_bucket text, p_key text,
     OUT existed boolean,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
-    v_blobs uuid[];
-    v_sizes bigint[];
+    v_staged bigint[];
+    f record;
+    v_locked uuid[];
 BEGIN
     reap_blob := '{}';
     reap_node := '{}';
@@ -786,21 +911,23 @@ BEGIN
     IF NOT existed THEN
         RETURN;
     END IF;
-    WITH staged AS (DELETE FROM parts WHERE upload_id = p_upload RETURNING blob_id, size)
-    SELECT coalesce(array_agg(blob_id), '{}'), coalesce(array_agg(size), '{}')
-    INTO v_blobs, v_sizes FROM staged;
+    v_staged := ARRAY(SELECT id FROM parts WHERE upload_id = p_upload);
+    SELECT * INTO f FROM pg_temp.cairn_freeable(v_staged);
+    v_locked := pg_temp.cairn_lock_blobs(f.blobs, f.exclusive);
+    PERFORM pg_temp.cairn_check_on(v_staged, v_locked);
+    DELETE FROM parts WHERE id = ANY(v_staged);
     DELETE FROM multipart_uploads WHERE upload_id = p_upload;
     SELECT * INTO reap_blob, reap_node, reap_peer
-    FROM pg_temp.cairn_drop_blobs_of_deleted_parts(v_blobs, v_sizes);
+    FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
 END
 $$;
 
--- T8: DeleteObject(s). Takes B(b) shared and K(b,k) for every key. Deletes
--- each target (a key, and a version ID or NULL) the way the bucket's
--- versioning state dictates ('deleted', with each one's version ID to report
--- and whether it concerns a delete marker), or reports 'no_such_bucket'.
--- `p_marker_ids` holds a fresh version ID per target, for a delete marker in
--- an enabled bucket.
+-- T8: DeleteObject(s). Takes B(b) shared and K(b,k) for every key, then X on
+-- the blobs of every part the deletes may remove. Deletes each target (a key,
+-- and a version ID or NULL) the way the bucket's versioning state dictates
+-- ('deleted', with each one's version ID to report and whether it concerns a
+-- delete marker), or reports 'no_such_bucket'. `p_marker_ids` holds a fresh
+-- version ID per target, for a delete marker in an enabled bucket.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_objects(
     p_bucket text, p_keys text[], p_version_ids text[], p_marker_ids text[],
     OUT status text, OUT version_ids text[], OUT delete_markers boolean[],
@@ -808,8 +935,9 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_objects(
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_versioning text;
-    v_blobs uuid[] := '{}';
-    v_sizes bigint[] := '{}';
+    v_freed bigint[] := '{}';
+    f record;
+    v_locked uuid[];
     d record;
 BEGIN
     reap_blob := '{}';
@@ -823,23 +951,30 @@ BEGIN
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_lock_keys(p_bucket, p_keys);
+    -- Every version the targets name or may remove exists now, under the
+    -- keys' locks; the deletes only add delete markers, which have no parts.
+    FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP
+        v_freed := v_freed || pg_temp.cairn_freed_by_delete(
+            p_bucket, p_keys[i], v_versioning, p_version_ids[i]);
+    END LOOP;
+    SELECT * INTO f FROM pg_temp.cairn_freeable(v_freed);
+    v_locked := pg_temp.cairn_lock_blobs(f.blobs, f.exclusive);
+    PERFORM pg_temp.cairn_check_on(v_freed, v_locked);
     FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP
         SELECT * INTO d FROM pg_temp.cairn_delete_key(
             p_bucket, p_keys[i], v_versioning, p_version_ids[i], p_marker_ids[i]);
         version_ids := version_ids || d.version_id;
         delete_markers := delete_markers || d.delete_marker;
-        v_blobs := v_blobs || d.freed_blobs;
-        v_sizes := v_sizes || d.freed_sizes;
     END LOOP;
     SELECT * INTO reap_blob, reap_node, reap_peer
-    FROM pg_temp.cairn_drop_blobs_of_deleted_parts(v_blobs, v_sizes);
+    FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'deleted';
 END
 $$;
 
--- T9: DeleteBucket. Takes B(b) exclusive. Only an empty bucket (no objects,
--- no uploads) is deleted: the cascades from it must never delete data.
--- Returns 'deleted', 'no_such_bucket' or 'not_empty'.
+-- T9: DeleteBucket. Takes B(b) exclusive, then G on the bucket's grants. Only
+-- an empty bucket (no objects, no uploads) is deleted: the cascades from it
+-- must never delete data. Returns 'deleted', 'no_such_bucket' or 'not_empty'.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_bucket(p_bucket text)
 RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
@@ -851,6 +986,9 @@ BEGIN
        OR EXISTS (SELECT 1 FROM multipart_uploads WHERE bucket = p_bucket) THEN
         RETURN 'not_empty';
     END IF;
+    -- The grants go with the bucket (a cascade); locked first, in order.
+    PERFORM 1 FROM role_grants WHERE bucket = p_bucket
+    ORDER BY role, bucket, permission FOR UPDATE;
     DELETE FROM buckets WHERE name = p_bucket;
     RETURN 'deleted';
 END
@@ -871,17 +1009,79 @@ BEGIN
 END
 $$;
 
+-- Deletes a role. Takes G on the role's grants (in order), which go with it
+-- (a cascade), then R (by deleting the row). Returns whether there was one.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_role(p_role text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    v_deleted bigint;
+BEGIN
+    PERFORM 1 FROM role_grants WHERE role = p_role
+    ORDER BY role, bucket, permission FOR UPDATE;
+    DELETE FROM roles WHERE name = p_role;
+    GET DIAGNOSTICS v_deleted = ROW_COUNT;
+    RETURN v_deleted > 0;
+END
+$$;
+
+-- Revokes a role's permissions on a bucket. Takes G on those grants (in
+-- order).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_revoke(p_role text, p_bucket text, p_permissions text[])
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM role_grants
+    WHERE role = p_role AND bucket = p_bucket AND permission = ANY(p_permissions)
+    ORDER BY role, bucket, permission FOR UPDATE;
+    DELETE FROM role_grants
+    WHERE role = p_role AND bucket = p_bucket AND permission = ANY(p_permissions);
+END
+$$;
+
+-- Grants a role permissions on a bucket. Takes B(b) shared, then R(r) shared,
+-- which the inserts' FK checks would otherwise take the other way round.
+-- Returns 'granted', 'no_such_role' or 'no_such_bucket'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_grant(p_role text, p_bucket text, p_permissions text[])
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_bucket boolean;
+BEGIN
+    PERFORM 1 FROM buckets WHERE name = p_bucket FOR KEY SHARE;
+    v_bucket := FOUND;
+    PERFORM 1 FROM roles WHERE name = p_role FOR KEY SHARE;
+    -- A missing role is reported first.
+    IF NOT FOUND THEN
+        RETURN 'no_such_role';
+    ELSIF NOT v_bucket THEN
+        RETURN 'no_such_bucket';
+    END IF;
+    INSERT INTO role_grants (role, bucket, permission)
+    SELECT p_role, p_bucket, p FROM unnest(p_permissions) AS p
+    ON CONFLICT DO NOTHING;
+    RETURN 'granted';
+END
+$$;
+
 -- T13: takes the garbage log: drops the logged blobs that no part references
 -- anymore, and refreshes the `dead_size` of the rest (see
--- `packer::fold_garbage`). Takes X(x) exclusive on the logged blobs.
+-- `packer::fold_garbage`). Takes X exclusive on the logged blobs. Folds run
+-- one at a time (I6): if another one is running, this returns right away,
+-- leaving the log to it (it's taken after the lock, so it sees all of it).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_fold_garbage(
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_logged uuid[];
 BEGIN
+    reap_blob := '{}';
+    reap_node := '{}';
+    reap_peer := '{}';
+    -- `db::FOLD_LOCK`, which a test checks against this.
+    IF NOT pg_try_advisory_xact_lock(109270032084481) THEN
+        RETURN;
+    END IF;
     WITH taken AS (DELETE FROM blob_garbage RETURNING blob_id)
     SELECT coalesce(array_agg(DISTINCT blob_id), '{}') INTO v_logged FROM taken;
+    PERFORM pg_temp.cairn_lock_blobs(v_logged, array_fill(true, ARRAY[cardinality(v_logged)]));
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(v_logged);
     -- The log's sizes would count bytes that another part still shares as
@@ -892,9 +1092,10 @@ $$;
 
 -- T14: claims the source blobs for a packing job, if there's one worth
 -- running (see `packer::claim`): `p_kind` is 'compact' or 'consolidate'.
--- Takes candidates, skipping those a concurrent claim has locked, until their
--- live bytes would exceed `p_budget`, and leases them. Returns them, or an
--- empty array if the job isn't worth it. The lease is a heuristic (I8).
+-- Takes candidates, skipping those another transaction has locked (it never
+-- waits), until their live bytes would exceed `p_budget`, and leases them.
+-- Returns them, or an empty array if the job isn't worth it. The lease is a
+-- heuristic (I8).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_claim(
     p_kind text, p_compact_threshold float8, p_max_sources bigint, p_small_size bigint,
     p_target_size bigint, p_budget bigint, p_lease_secs float8
@@ -945,7 +1146,7 @@ BEGIN
 END
 $$;
 
--- T15: the commit that ends a packing job (see `packer::commit`). Takes X(x)
+-- T15: the commit that ends a packing job (see `packer::commit`). Takes X
 -- exclusive on its sources and new blobs. Checks that the new blobs are still
 -- pending and every replica of each recorded its location
 -- ('missing_locations', with how many of one blob's did). Then commits the new
@@ -973,17 +1174,12 @@ BEGIN
     reap_node := '{}';
     reap_peer := '{}';
     v_touched := p_sources || p_out_blobs;
-    PERFORM pg_temp.cairn_lock_blobs(v_touched);
+    PERFORM pg_temp.cairn_lock_blobs(v_touched, array_fill(true, ARRAY[cardinality(v_touched)]));
     FOR i IN 1 .. coalesce(cardinality(p_out_blobs), 0) LOOP
         SELECT coalesce(array_agg(l.node), '{}') INTO v_nodes
         FROM unnest(p_loc_blobs, p_loc_nodes) AS l(blob_id, node)
         WHERE l.blob_id = p_out_blobs[i];
-        PERFORM 1 FROM blobs WHERE blob_id = p_out_blobs[i] AND state = 'pending';
-        IF FOUND THEN
-            present := pg_temp.cairn_locations_present(p_out_blobs[i], v_nodes);
-        ELSE
-            present := 0;
-        END IF;
+        present := pg_temp.cairn_locations_present(p_out_blobs[i], v_nodes);
         IF present <> cardinality(v_nodes) THEN
             status := 'missing_locations';
             RETURN;
@@ -993,6 +1189,8 @@ BEGIN
         PERFORM pg_temp.cairn_mark_committed(p_out_blobs[i], p_out_sizes[i], p_out_crcs[i],
                                              p_block_size);
     END LOOP;
+    -- Only parts on the sources match, and their rows are covered by the
+    -- sources' locks (rule B).
     UPDATE parts p SET blob_id = m.new_blob, blob_offset = m.new_offset
     FROM unnest(p_part_ids, p_old_blobs, p_old_offsets, p_new_blobs, p_new_offsets)
         AS m(id, old_blob, old_offset, new_blob, new_offset)

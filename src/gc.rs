@@ -145,8 +145,9 @@ async fn delete_stale_pending(app: &Arc<App>, report: &mut Report) -> anyhow::Re
     let mut client = app.pool.get().await?;
     // Deleting a pending blob row is guarded by its still being pending. A
     // commit holds the row locked while it counts the locations and commits
-    // it, and the DELETE re-checks the condition once it gets the row, so it
-    // never deletes a committed blob (I5 in `catalog.sql`). An upload still
+    // it, and the GC skips locked rows, and re-checks the condition on the
+    // rows it locks, so it never deletes a committed blob (I5 in
+    // `catalog.sql`). An upload still
     // writing to it fails to record its location once the row is gone, and its
     // file is swept as an orphan.
     let pending_secs = PENDING_TIMEOUT.as_secs_f64();
@@ -162,9 +163,11 @@ async fn delete_stale_pending(app: &Arc<App>, report: &mut Report) -> anyhow::Re
 }
 
 /// Deletes the blobs matching `condition` (on `blobs b`, and only on its own
-/// columns: it's re-checked after waiting for a lock, but subqueries aren't),
-/// retried on a conflict. Returns how many it deleted, and their
-/// locations, to reap.
+/// columns: it's re-checked when a row is locked, but subqueries aren't),
+/// retried on a conflict. Returns how many it deleted, and their locations,
+/// to reap. Blobs that another transaction has locked (a commit, say) are
+/// skipped, and left to a later pass: the GC never waits for a lock, so it
+/// can't deadlock (see `catalog.sql`).
 async fn delete_blobs(
     client: &mut Object,
     condition: &str,
@@ -174,7 +177,14 @@ async fn delete_blobs(
     // sees the locations that the DELETE cascades away. A blob without any
     // still counts.
     let sql = format!(
-        "WITH gone AS (DELETE FROM blobs b WHERE {condition} RETURNING b.blob_id)
+        "WITH doomed AS (
+             SELECT b.blob_id FROM blobs b WHERE {condition}
+             ORDER BY b.blob_id FOR UPDATE SKIP LOCKED
+         ),
+         gone AS (
+             DELETE FROM blobs b USING doomed WHERE b.blob_id = doomed.blob_id
+             RETURNING b.blob_id
+         )
          SELECT gone.blob_id, bl.node, n.peer_url
          FROM gone
          LEFT JOIN blob_locations bl ON bl.blob_id = gone.blob_id

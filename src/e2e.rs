@@ -23,6 +23,7 @@ use crate::{
 
 mod concurrency;
 mod copies;
+mod deadlocks;
 mod locking;
 
 /// The bucket every test node has.
