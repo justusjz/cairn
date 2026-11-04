@@ -142,10 +142,12 @@ pub async fn pass(app: &Arc<App>, scope: Scope) -> Report {
 
 async fn delete_stale_pending(app: &Arc<App>, report: &mut Report) -> anyhow::Result<()> {
     let mut client = app.pool.get().await?;
-    // Deleting a pending blob row is guarded by its still being pending, and
-    // serializable, so that it's ordered against a commit that counts its
-    // locations. An upload still writing to it fails to record its location
-    // once the row is gone, and its file is swept as an orphan.
+    // Deleting a pending blob row is guarded by its still being pending. A
+    // commit holds the row locked while it counts the locations and commits
+    // it, and the DELETE re-checks the condition once it gets the row, so it
+    // never deletes a committed blob (I5 in `catalog.sql`). An upload still
+    // writing to it fails to record its location once the row is gone, and its
+    // file is swept as an orphan.
     let pending_secs = PENDING_TIMEOUT.as_secs_f64();
     let (count, reap) = delete_blobs(
         &mut client,
@@ -158,8 +160,9 @@ async fn delete_stale_pending(app: &Arc<App>, report: &mut Report) -> anyhow::Re
     Ok(())
 }
 
-/// Deletes the blobs matching `condition` (on `blobs b`) in a serializable
-/// transaction, retried on a conflict. Returns how many it deleted, and their
+/// Deletes the blobs matching `condition` (on `blobs b`, and only on its own
+/// columns: it's re-checked after waiting for a lock, but subqueries aren't),
+/// retried on a conflict. Returns how many it deleted, and their
 /// locations, to reap.
 async fn delete_blobs(
     client: &mut Object,
@@ -183,7 +186,7 @@ async fn delete_blobs(
         let result: Result<_, tokio_postgres::Error> = async {
             let tx = client
                 .build_transaction()
-                .isolation_level(IsolationLevel::Serializable)
+                .isolation_level(IsolationLevel::ReadCommitted)
                 .start()
                 .await?;
             let rows = tx.query(&sql, params).await?;

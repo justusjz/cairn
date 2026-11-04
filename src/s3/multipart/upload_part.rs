@@ -94,11 +94,16 @@ pub async fn put_part(
             "SignatureDoesNotMatch",
             "the request signature we calculated does not match the signature you provided",
         )),
-        // UploadPart carries no conditional-write guard, so this can't occur.
-        UploadResult::PreconditionFailed => Ok(format_s3_error(
-            StatusCode::PRECONDITION_FAILED,
-            "PreconditionFailed",
-            "at least one of the preconditions you specified did not hold",
+        // The upload was completed or aborted while the body streamed.
+        UploadResult::NoSuchUpload => Ok(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchUpload",
+            "the specified multipart upload does not exist",
         )),
+        // UploadPart carries no conditional-write guard, and has no bucket to
+        // check (its upload is checked instead), so these can't occur.
+        UploadResult::PreconditionFailed | UploadResult::NoSuchBucket => {
+            unreachable!("UploadPart has no conditions, and no bucket check")
+        }
     }
 }

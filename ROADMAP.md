@@ -62,4 +62,3 @@ Smaller improvements, done when they're needed:
 
 - Compacting more eagerly as disks fill up.
 - Preferring locally held data when packing.
-- Per-key locking for writes, if very busy buckets still see SlowDown.

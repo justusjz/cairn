@@ -202,9 +202,10 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
 ///
 /// This is how a blob is dropped when its last part is deleted by a path that
 /// leaves it (a packed blob), or a crash gets in the way. Every deleted part is
-/// logged, by the trigger, so nothing else needs to look for such blobs. Should
-/// a part be attached to a blob being dropped meanwhile (a copy of it), the
-/// parts FK fails the fold, which rolls back, and the next pass tries again.
+/// logged, by the trigger, so nothing else needs to look for such blobs. The
+/// fold locks the blobs before it checks them for parts, so a copy attaching a
+/// part to one meanwhile either went first (and the blob stays) or finds it
+/// gone afterwards (and starts over); see I5 and I6 in `catalog.sql`.
 async fn fold_garbage(app: &Arc<App>) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     let row = client
@@ -785,7 +786,7 @@ async fn try_commit(
 ) -> Result<Vec<ReapTarget>, CommitError> {
     let tx = client
         .build_transaction()
-        .isolation_level(IsolationLevel::Serializable)
+        .isolation_level(IsolationLevel::ReadCommitted)
         .start()
         .await?;
     // The new blobs. CRCs are stored as their 64 bits, read as a signed BIGINT.

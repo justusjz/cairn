@@ -31,11 +31,7 @@ pub async fn put_object(
         .await?
         .is_none()
     {
-        return Ok(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchBucket",
-            "the specified bucket does not exist",
-        ));
+        return Ok(no_such_bucket());
     }
     // Fast-fail a conditional write (If-Match / If-None-Match) before streaming the
     // body, so a client "create if absent" against an existing key doesn't upload
@@ -79,7 +75,18 @@ pub async fn put_object(
         )),
         // A concurrent writer won the race between the fast-fail check and commit.
         UploadResult::PreconditionFailed => Ok(precondition_failed()),
+        // The bucket was deleted while the body streamed.
+        UploadResult::NoSuchBucket => Ok(no_such_bucket()),
+        UploadResult::NoSuchUpload => unreachable!("an object write has no upload"),
     }
+}
+
+fn no_such_bucket() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "the specified bucket does not exist",
+    )
 }
 
 /// The 412 returned when a conditional-write guard (If-Match / If-None-Match)

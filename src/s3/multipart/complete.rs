@@ -154,10 +154,8 @@ pub async fn complete_multipart_upload(
     Ok(slow_down())
 }
 
-/// One attempt at the completion transaction (`cairn_complete_upload`),
-/// serializable like the part commit (it writes objects + parts and races
-/// overwrites/GC). The raw postgres error is returned so the caller can retry
-/// on a serialization failure.
+/// One attempt at the completion transaction (`cairn_complete_upload`). The
+/// raw postgres error is returned so the caller can retry on a conflict.
 async fn try_complete(
     client: &mut Object,
     bucket: &str,
@@ -168,7 +166,7 @@ async fn try_complete(
 ) -> Result<CompleteOutcome, tokio_postgres::Error> {
     let tx = client
         .build_transaction()
-        .isolation_level(IsolationLevel::Serializable)
+        .isolation_level(IsolationLevel::ReadCommitted)
         .start()
         .await?;
     let (part_numbers, etags): (Vec<i32>, Vec<&str>) =

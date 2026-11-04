@@ -30,13 +30,13 @@ enum DeleteStatus {
     Contended,
 }
 
-/// One serializable attempt: read the bucket's versioning state (which doubles
-/// as the existence check), then delete each target the way that state dictates,
-/// capturing the freed blobs' replica locations for immediate reaping. The raw
-/// postgres error is returned so the caller can retry on a serialization failure.
-/// Runs at the same isolation as the put/complete/GC transactions that also touch
-/// `objects`/`parts`, so the delete can't undermine their guarantees — and the
-/// bucket check shares the snapshot, so there's no check-then-delete race.
+/// One attempt (`cairn_delete_objects`): read the bucket's versioning state
+/// (which doubles as the existence check), then delete each target the way
+/// that state dictates, capturing the freed blobs' replica locations for
+/// immediate reaping. It follows the same lock protocol as the writes that also
+/// touch `objects`/`parts` (see `catalog.sql`), so the delete can't undermine
+/// their guarantees. The raw postgres error is returned so the caller can retry
+/// on a conflict.
 async fn try_delete(
     client: &mut Object,
     bucket: &str,
@@ -44,7 +44,7 @@ async fn try_delete(
 ) -> Result<(DeleteStatus, Vec<ReapTarget>), tokio_postgres::Error> {
     let tx = client
         .build_transaction()
-        .isolation_level(IsolationLevel::Serializable)
+        .isolation_level(IsolationLevel::ReadCommitted)
         .start()
         .await?;
     let keys: Vec<&str> = targets.iter().map(|t| t.key.as_str()).collect();
@@ -79,8 +79,8 @@ async fn try_delete(
     Ok((DeleteStatus::Deleted(outcomes), reap))
 }
 
-/// Deletes `targets` from `bucket` in a serializable transaction, retrying on a
-/// serialization conflict (e.g. a concurrent overwrite or GC). On success, reaps
+/// Deletes `targets` from `bucket` in one transaction, retrying on a conflict
+/// (a deadlock, say). On success, reaps
 /// the freed blobs' files in the background.
 async fn delete_targets(
     app: &Arc<App>,
@@ -227,7 +227,7 @@ pub async fn delete_objects(
         ));
     }
 
-    // One serializable transaction deletes every permitted target. Absent keys and
+    // One transaction deletes every permitted target. Absent keys and
     // versions are no-ops, so — like the single-key delete — every permitted
     // target is reported deleted (delete is idempotent).
     let (permitted, denied): (Vec<Target>, Vec<Target>) =

@@ -6,7 +6,6 @@ use http_body_util::Full;
 use hyper::body::Bytes;
 use tokio::task::JoinSet;
 
-use tokio_postgres::IsolationLevel;
 
 use super::{BUCKET, get, node_with, put, query_i64};
 use uuid::Uuid;
@@ -75,8 +74,8 @@ async fn concurrent_uploads_to_one_key_all_succeed() {
     assert!((0..30).any(|i| read == vec![i as u8; 100]));
 }
 
-/// Deletes of different objects packed into the same blob don't conflict,
-/// though both transactions look at that blob's parts.
+/// Deletes of different objects packed into the same blob don't wait for each
+/// other: neither locks the packed blob.
 #[tokio::test]
 async fn deletes_in_one_packed_blob_dont_conflict() {
     let pack = packer::Config {
@@ -96,9 +95,8 @@ async fn deletes_in_one_packed_blob_dont_conflict() {
     // blob, while the other's transaction is open.
     let mut first = app.pool.get().await.unwrap();
     let mut second = app.pool.get().await.unwrap();
-    let serializable = IsolationLevel::Serializable;
-    let t1 = first.build_transaction().isolation_level(serializable).start().await.unwrap();
-    let t2 = second.build_transaction().isolation_level(serializable).start().await.unwrap();
+    let t1 = first.transaction().await.unwrap();
+    let t2 = second.transaction().await.unwrap();
     let delete = "SELECT reap_blob FROM pg_temp.cairn_delete_objects($1, $2, '{NULL}', '{x}')";
     let bucket = BUCKET;
     let reap1: Vec<Uuid> = t1.query_one(delete, &[&bucket, &vec!["o0"]]).await.unwrap().get(0);

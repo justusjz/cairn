@@ -68,10 +68,10 @@ fn parse_versioning(body: &str) -> Option<Requested> {
     }
 }
 
-/// One serializable attempt at the update. Serializable, so it's ordered against
-/// the writes and deletes that read the bucket's state in their own transactions:
-/// each lands entirely before or entirely after the change. Returns whether the
-/// bucket exists.
+/// One attempt at the update (`cairn_set_versioning`). It locks the bucket
+/// row, which every write and delete in the bucket holds while it reads the
+/// state and lands, so each lands entirely before or entirely after the change
+/// (I2 in `catalog.sql`). Returns whether the bucket exists.
 async fn try_update(
     client: &mut Object,
     bucket: &str,
@@ -79,17 +79,18 @@ async fn try_update(
 ) -> Result<bool, tokio_postgres::Error> {
     let tx = client
         .build_transaction()
-        .isolation_level(IsolationLevel::Serializable)
+        .isolation_level(IsolationLevel::ReadCommitted)
         .start()
         .await?;
-    let updated = tx
-        .execute(
-            "UPDATE buckets SET versioning = $2 WHERE name = $1",
+    let exists: bool = tx
+        .query_one(
+            "SELECT pg_temp.cairn_set_versioning($1, $2)",
             &[&bucket, &versioning.as_db()],
         )
-        .await?;
+        .await?
+        .get(0);
     tx.commit().await?;
-    Ok(updated == 1)
+    Ok(exists)
 }
 
 /// PutBucketVersioning: `PUT /{bucket}?versioning` with a

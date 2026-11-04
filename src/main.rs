@@ -269,8 +269,8 @@ impl std::fmt::Display for Unavailable {
 
 impl std::error::Error for Unavailable {}
 
-/// A transaction that kept failing with serialization conflicts against
-/// concurrent ones, and gave up. Answered with 503 SlowDown, so the client
+/// A transaction that kept failing with conflicts against concurrent ones
+/// (deadlocks, say), and gave up. Answered with 503 SlowDown, so the client
 /// backs off and retries.
 #[derive(Debug)]
 pub struct Contended(pub String);
@@ -573,7 +573,7 @@ pub(crate) struct Written {
 }
 
 /// Where a freshly-uploaded part should be attached. The part row is inserted
-/// in the same serializable transaction that flips its blob to 'committed', so
+/// in the same transaction that flips its blob to 'committed', so
 /// the invariant "a committed blob is referenced" holds with no orphan window.
 /// The size, ETag and CRC aren't carried here: they're computed by
 /// `upload_part` as the body streams, and passed to `try_commit_part` alongside
@@ -609,6 +609,11 @@ enum UploadResult {
     /// A conditional-write guard (If-Match / If-None-Match) didn't hold against
     /// the object currently at the target key.
     PreconditionFailed,
+    /// The target bucket was deleted while the body streamed.
+    NoSuchBucket,
+    /// The target multipart upload was completed or aborted while the body
+    /// streamed.
+    NoSuchUpload,
 }
 
 async fn upload_part<B>(
@@ -735,25 +740,23 @@ where
         }
     }
     let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    // 5. commit + attach with the now-known size and ETag, under a serializable
-    // transaction; retry on a serialization conflict (e.g. a concurrent upload
-    // to a neighbouring key).
+    // 5. commit + attach with the now-known size and ETag, in one transaction;
+    // retry on a conflict (e.g. a concurrent upload of the same part number).
+    // The pending blob left behind by a rejected commit (a failed conditional
+    // write, a target that's gone) is reclaimed by the GC, exactly like the
+    // content-sha256 mismatch path above.
     let mut client = app.pool.get().await?;
-    let mut committed = None;
-    let mut precondition_failed = false;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         match try_commit_part(&mut client, &written, attach, &etag).await {
             Ok(CommitResult::Committed { reap, version_id }) => {
                 // Reap the blobs this overwrite displaced; their rows are gone.
                 reap_blobs(app, reap);
-                committed = Some(version_id);
-                break;
+                return Ok(UploadResult::Committed { etag, version_id });
             }
-            Ok(CommitResult::PreconditionFailed) => {
-                precondition_failed = true;
-                break;
-            }
+            Ok(CommitResult::PreconditionFailed) => return Ok(UploadResult::PreconditionFailed),
+            Ok(CommitResult::NoSuchBucket) => return Ok(UploadResult::NoSuchBucket),
+            Ok(CommitResult::NoSuchUpload) => return Ok(UploadResult::NoSuchUpload),
             Ok(CommitResult::MissingLocations { present, required }) => {
                 return Err(Unavailable(format!(
                     "blob {blob_id} not durable: only {present}/{required} replicas reported a location"
@@ -764,18 +767,7 @@ where
             Err(e) => return Err(e.into()),
         }
     }
-    // The pending blob left behind by a failed conditional write is reclaimed by
-    // the GC, exactly like the content-sha256 mismatch path above.
-    if precondition_failed {
-        return Ok(UploadResult::PreconditionFailed);
-    }
-    let Some(version_id) = committed else {
-        return Err(Contended(format!(
-            "blob {blob_id}: commit kept conflicting with concurrent ones"
-        ))
-        .into());
-    };
-    Ok(UploadResult::Committed { etag, version_id })
+    Err(Contended(format!("blob {blob_id}: commit kept conflicting with concurrent ones")).into())
 }
 
 enum CommitResult {
@@ -789,16 +781,17 @@ enum CommitResult {
     MissingLocations { present: i64, required: usize },
     /// A conditional-write guard didn't hold; nothing was written.
     PreconditionFailed,
+    NoSuchBucket,
+    NoSuchUpload,
 }
 
-/// Runs the commit transaction once under SERIALIZABLE isolation
-/// (`cairn_commit_object` or `cairn_commit_upload_part`): confirms that all of
-/// the blob's replicas recorded their locations, and if so marks the blob
-/// committed (recording its size and the CRC64/NVME of its file) and attaches
-/// a part spanning it to `attach` (with the CRC64/NVME of its data), in the
-/// same transaction. The raw postgres error is returned unwrapped so the
-/// caller can distinguish a serialization failure (retry) from a real error
-/// (give up).
+/// Runs the commit transaction once (`cairn_commit_object` or
+/// `cairn_commit_upload_part`): confirms that all of the blob's replicas
+/// recorded their locations, and if so marks the blob committed (recording its
+/// size and the CRC64/NVME of its file) and attaches a part spanning it to
+/// `attach` (with the CRC64/NVME of its data), in the same transaction. The
+/// raw postgres error is returned unwrapped so the caller can distinguish a
+/// conflict (retry) from a real error (give up).
 async fn try_commit_part(
     client: &mut Object,
     written: &Written,
@@ -807,7 +800,7 @@ async fn try_commit_part(
 ) -> Result<CommitResult, tokio_postgres::Error> {
     let tx = client
         .build_transaction()
-        .isolation_level(IsolationLevel::Serializable)
+        .isolation_level(IsolationLevel::ReadCommitted)
         .start()
         .await?;
     // CRCs are stored as their 64 bits, read as a signed BIGINT. The part's
@@ -884,6 +877,8 @@ async fn try_commit_part(
             });
         }
         "precondition_failed" => return Ok(CommitResult::PreconditionFailed),
+        "no_such_bucket" => return Ok(CommitResult::NoSuchBucket),
+        "no_such_upload" => return Ok(CommitResult::NoSuchUpload),
         status => unreachable!("cairn_commit_*: unknown status {status}"),
     }
     let version_id = version_column.and_then(|c| row.get(c));

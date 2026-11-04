@@ -105,11 +105,7 @@ pub async fn copy_object(
         .await?
         .is_none()
     {
-        return Ok(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchBucket",
-            "the specified bucket does not exist",
-        ));
+        return Ok(no_such_bucket());
     }
     drop(client);
 
@@ -136,11 +132,14 @@ pub async fn copy_object(
         } else {
             &version.content_type
         };
-        let Some(version_id) =
-            commit_object_copy(app, &source, dest_bucket, dest_key, &etag, content_type).await?
-        else {
-            continue; // the source changed meanwhile: copy what it is now
-        };
+        let version_id =
+            match commit_object_copy(app, &source, dest_bucket, dest_key, &etag, content_type)
+                .await?
+            {
+                ObjectCopy::Committed(version_id) => version_id,
+                ObjectCopy::SourceChanged => continue, // copy what it is now
+                ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
+            };
 
         // CopyObject reports the result in the body (not just the ETag header):
         // read back the new version's freshly-stamped last-modified in ISO 8601.
@@ -169,9 +168,17 @@ pub async fn copy_object(
     Err(Contended("the copy source kept changing".to_owned()).into())
 }
 
+enum ObjectCopy {
+    /// Committed, with the version ID to report.
+    Committed(Option<String>),
+    /// The source changed since it was read.
+    SourceChanged,
+    /// The destination bucket was deleted meanwhile.
+    NoSuchBucket,
+}
+
 /// The transaction that makes a copy of `source` at `bucket`/`key`: a new
-/// version with parts on the source's bytes. Returns its version ID to report,
-/// or `None` if the source changed since it was read.
+/// version with parts on the source's bytes.
 async fn commit_object_copy(
     app: &Arc<App>,
     source: &Source,
@@ -179,7 +186,7 @@ async fn commit_object_copy(
     key: &str,
     etag: &str,
     content_type: &str,
-) -> anyhow::Result<Option<Option<String>>> {
+) -> anyhow::Result<ObjectCopy> {
     let (part_ids, part_sizes) = source.part_keys();
     let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
@@ -187,7 +194,7 @@ async fn commit_object_copy(
         let result: Result<_, tokio_postgres::Error> = async {
             let tx = client
                 .build_transaction()
-                .isolation_level(IsolationLevel::Serializable)
+                .isolation_level(IsolationLevel::ReadCommitted)
                 .start()
                 .await?;
             let row = tx
@@ -207,24 +214,24 @@ async fn commit_object_copy(
                     ],
                 )
                 .await?;
+            // On anything but a commit, the function changed nothing; dropping
+            // `tx` rolls it back.
             match row.get::<_, &str>(0) {
                 "committed" => {}
-                // The function changed nothing; dropping `tx` rolls it back.
-                "source_changed" => return Ok(None),
+                "source_changed" => return Ok((ObjectCopy::SourceChanged, Vec::new())),
+                "no_such_bucket" => return Ok((ObjectCopy::NoSuchBucket, Vec::new())),
                 status => unreachable!("cairn_copy_object: unknown status {status}"),
             }
-            let version_id: Option<String> = row.get(1);
             let reap = reap_columns(&row, 2);
             tx.commit().await?;
-            Ok(Some((version_id, reap)))
+            Ok((ObjectCopy::Committed(row.get(1)), reap))
         }
         .await;
         match result {
-            Ok(Some((version_id, reap))) => {
+            Ok((outcome, reap)) => {
                 reap_blobs(app, reap);
-                return Ok(Some(version_id));
+                return Ok(outcome);
             }
-            Ok(None) => return Ok(None),
             Err(e) if db::is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
         }
@@ -328,8 +335,12 @@ pub async fn copy_part(
             with_copy_source_version_id(resp, version.version_id.as_deref())
         };
         let Some((index, within)) = part_holding(&source.parts, start, end) else {
-            let etag = stream_part_copy(app, &source, start, end, upload_id, part_number).await?;
-            return Ok(respond(&etag));
+            return Ok(
+                match stream_part_copy(app, &source, start, end, upload_id, part_number).await? {
+                    Some(etag) => respond(&etag),
+                    None => no_such_upload(),
+                },
+            );
         };
         let part = &source.parts[index];
         let length = (end - start) as i64;
@@ -390,7 +401,7 @@ async fn commit_part_copy(
         let result: Result<_, tokio_postgres::Error> = async {
             let tx = client
                 .build_transaction()
-                .isolation_level(IsolationLevel::Serializable)
+                .isolation_level(IsolationLevel::ReadCommitted)
                 .start()
                 .await?;
             let row = tx
@@ -439,6 +450,7 @@ async fn commit_part_copy(
 /// Copies bytes [start, end) of `source` as data into a new part staged
 /// under the upload, through the normal upload path (which works out the
 /// part's ETag as it streams). For a range over several parts of the source.
+/// `None` if the upload was completed or aborted meanwhile.
 async fn stream_part_copy(
     app: &Arc<App>,
     source: &Source,
@@ -446,7 +458,7 @@ async fn stream_part_copy(
     end: u64,
     upload_id: Uuid,
     part_number: i32,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<Option<String>> {
     let (sender, source_body) = channel_body();
     let slices = select_parts_in_range(source.locations.clone(), start, end);
     spawn_range_stream(app.clone(), slices, sender);
@@ -458,10 +470,12 @@ async fn stream_part_copy(
     // content-sha256 claim and no aws-chunked framing: only Committed is
     // reachable.
     match crate::upload_part(app, source_body, &attach, false, ContentSha256::Unsigned, None).await? {
-        UploadResult::Committed { etag, .. } => Ok(etag),
+        UploadResult::Committed { etag, .. } => Ok(Some(etag)),
+        UploadResult::NoSuchUpload => Ok(None),
         UploadResult::ContentSha256Mismatch
         | UploadResult::ChunkSignatureMismatch
-        | UploadResult::PreconditionFailed => {
+        | UploadResult::PreconditionFailed
+        | UploadResult::NoSuchBucket => {
             anyhow::bail!("the copy of a source range failed an integrity check")
         }
     }
@@ -565,6 +579,14 @@ async fn hash_range(
     anyhow::ensure!(read == end - start, "the copy source was cut short");
     let md5: String = md5.finalize().iter().map(|b| format!("{b:02x}")).collect();
     Ok((md5, crc.sum64()))
+}
+
+fn no_such_bucket() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchBucket",
+        "the specified bucket does not exist",
+    )
 }
 
 fn no_such_upload() -> Response<Full<Bytes>> {

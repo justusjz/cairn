@@ -48,32 +48,50 @@ const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
 /// Every connection does this once, when it's opened, so the functions are
 /// always this binary's version of them, whatever other nodes run. They live
 /// as long as the session, which is why the pool must never reset sessions.
+///
+/// It also pins the session's default isolation level to READ COMMITTED,
+/// which the functions' lock protocol is built on (see `catalog.sql`), so that
+/// a server configured otherwise can't change it for the statements that run
+/// on their own, outside an explicit transaction.
 async fn install_functions(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    client
+        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .await?;
     client.batch_execute(CATALOG_FUNCTIONS).await
 }
 
-/// How often a serializable transaction is attempted while it keeps failing
-/// with serialization conflicts. With the pauses of [`backoff`], that's up to
-/// about a second and a half of retrying.
+/// How often a transaction is attempted while it keeps failing with conflicts.
+/// With the pauses of [`backoff`], that's up to about a second and a half of
+/// retrying.
 pub const MAX_TX_ATTEMPTS: usize = 20;
 
 /// Whether `e` is a conflict with a concurrent transaction, which the
-/// transaction may not hit again if it's retried. That's a serialization
-/// failure, or a unique violation: two writes that both find a key free (say,
-/// the first two uploads to it) both insert it, and Postgres may report the
-/// second one's failure as either. The transactions that retry on conflicts
-/// only insert unique keys after checking that they're free, so a unique
-/// violation can only come from such a race.
+/// transaction may not hit again if it's retried:
+///
+/// - A deadlock, which Postgres resolves by aborting one of the transactions.
+///   The lock protocol (see `catalog.sql`) takes locks in a fixed order where
+///   it can, but not everywhere, and doesn't rely on it.
+/// - A unique violation: two uploads of the same part number both find it
+///   free and insert it. The transactions that retry on conflicts only insert
+///   unique keys after checking that they're free, under locks where it
+///   matters, so a unique violation can only come from such a race.
+/// - A serialization failure. The catalog's transactions are READ COMMITTED,
+///   so they can't fail like that, but should one run at a stricter level, a
+///   retry is still the right answer.
 pub fn is_conflict(e: &tokio_postgres::Error) -> bool {
     use tokio_postgres::error::SqlState;
     matches!(
         e.code(),
-        Some(&SqlState::T_R_SERIALIZATION_FAILURE | &SqlState::UNIQUE_VIOLATION)
+        Some(
+            &SqlState::T_R_DEADLOCK_DETECTED
+                | &SqlState::T_R_SERIALIZATION_FAILURE
+                | &SqlState::UNIQUE_VIOLATION
+        )
     )
 }
 
 /// Waits before attempt `attempt` (counting from 0) of a transaction that hit
-/// a serialization conflict. The first attempt goes ahead right away. After
+/// a conflict. The first attempt goes ahead right away. After
 /// that, the pause grows exponentially, from up to 1 ms to up to 100 ms, and is
 /// random within that, so that transactions that collided don't retry in step
 /// and collide again.
