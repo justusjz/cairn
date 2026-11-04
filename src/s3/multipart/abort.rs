@@ -6,7 +6,7 @@ use uuid::Uuid;
 
 use crate::{
     App,
-    blobs::{deleted_parts, drop_blobs_of_deleted_parts, reap_blobs},
+    blobs::{reap_blobs, reap_columns},
     s3::util::format_s3_error,
 };
 
@@ -32,27 +32,20 @@ pub async fn abort_multipart_upload(
     // Delete the staged parts, the upload, and the freed blobs in one
     // transaction. A part committed to the upload in between is cascaded away
     // with the upload, leaving its blob unreferenced; the GC drops it.
-    let mut client = app.pool.get().await?;
-    let tx = client.transaction().await?;
-    let staged = tx
-        .query(
-            "DELETE FROM parts p USING multipart_uploads u
-             WHERE p.upload_id = u.upload_id
-               AND u.upload_id = $1 AND u.bucket = $2 AND u.key = $3
-             RETURNING p.blob_id, p.size",
+    let row = app
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT existed, reap_blob, reap_node, reap_peer
+             FROM pg_temp.cairn_abort_upload($1, $2, $3)",
             &[&upload_id, &bucket, &key],
         )
         .await?;
-    let affected = tx
-        .execute(
-            "DELETE FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
-            &[&upload_id, &bucket, &key],
-        )
-        .await?;
-    let reap = drop_blobs_of_deleted_parts(&tx, &deleted_parts(&staged)).await?;
-    tx.commit().await?;
+    let existed: bool = row.get(0);
+    let reap = reap_columns(&row, 1);
     reap_blobs(app, reap);
-    if affected == 0 {
+    if !existed {
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchUpload",

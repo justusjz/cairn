@@ -113,6 +113,17 @@ impl Preconditions {
         }
         true
     }
+
+    /// The write preconditions (If-Match, If-None-Match) in the form the
+    /// catalog functions take them (see `cairn_allows_write`): `None` for an
+    /// absent header, an empty list for `*`, and else the entity-tags, without
+    /// weak indicators and quotes (our stored ETags are unquoted).
+    pub fn write_conditions(&self) -> (Option<Vec<String>>, Option<Vec<String>>) {
+        (
+            self.if_match.as_deref().map(etag_list),
+            self.if_none_match.as_deref().map(etag_list),
+        )
+    }
 }
 
 fn header(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -122,20 +133,30 @@ fn header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether `header` (an If-[None-]Match value: `*`, or a comma-separated list of
-/// possibly weak, quoted entity-tags) matches the resource's `etag`.
-fn etag_matches(header: &str, etag: &str) -> bool {
+/// An If-[None-]Match value (`*`, or a comma-separated list of possibly weak,
+/// quoted entity-tags) as a list of bare entity-tags; empty for `*`.
+fn etag_list(header: &str) -> Vec<String> {
     let header = header.trim();
     if header == "*" {
-        return true;
+        return Vec::new();
     }
-    header.split(',').any(|candidate| {
-        // Strip an optional weak indicator and the surrounding quotes; our stored
-        // etags are unquoted, so a quoted `"9a…"` (or `"9a…-3"`) compares equal.
-        let c = candidate.trim();
-        let c = c.strip_prefix("W/").unwrap_or(c);
-        c.trim_matches('"') == etag
-    })
+    header
+        .split(',')
+        .map(|candidate| {
+            let c = candidate.trim();
+            let c = c.strip_prefix("W/").unwrap_or(c);
+            c.trim_matches('"').to_owned()
+        })
+        .collect()
+}
+
+/// Whether `header` (an If-[None-]Match value: `*`, or a comma-separated list of
+/// possibly weak, quoted entity-tags) matches the resource's `etag`. Stated in
+/// terms of `etag_list`, exactly as `cairn_etag_matches` does, so that the
+/// catalog functions evaluate conditions the same way.
+fn etag_matches(header: &str, etag: &str) -> bool {
+    let tags = etag_list(header);
+    tags.is_empty() || tags.iter().any(|t| t == etag)
 }
 
 /// Parses an RFC 1123 HTTP-date (`Sun, 06 Nov 1994 08:49:37 GMT`) into Unix

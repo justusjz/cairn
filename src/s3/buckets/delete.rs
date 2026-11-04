@@ -35,26 +35,17 @@ async fn try_delete(
         .isolation_level(IsolationLevel::Serializable)
         .start()
         .await?;
-    if tx
-        .query_opt("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
-        .await?
-        .is_none()
-    {
-        return Ok(DeleteStatus::NoSuchBucket); // tx rolls back on drop
-    }
-    let non_empty = tx
-        .query_opt(
-            "SELECT 1 WHERE EXISTS (SELECT 1 FROM objects WHERE bucket = $1)
-                          OR EXISTS (SELECT 1 FROM multipart_uploads WHERE bucket = $1)",
-            &[&bucket],
-        )
-        .await?
-        .is_some();
-    if non_empty {
-        return Ok(DeleteStatus::NotEmpty); // tx rolls back on drop
-    }
-    tx.execute("DELETE FROM buckets WHERE name = $1", &[&bucket])
+    let status = tx
+        .query_one("SELECT pg_temp.cairn_delete_bucket($1)", &[&bucket])
         .await?;
+    // On anything but a delete, the function changed nothing; dropping `tx`
+    // rolls it back.
+    match status.get::<_, &str>(0) {
+        "deleted" => {}
+        "no_such_bucket" => return Ok(DeleteStatus::NoSuchBucket),
+        "not_empty" => return Ok(DeleteStatus::NotEmpty),
+        status => unreachable!("cairn_delete_bucket: unknown status {status}"),
+    }
     tx.commit().await?;
     Ok(DeleteStatus::Deleted)
 }

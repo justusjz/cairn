@@ -56,8 +56,7 @@ use crate::{
     App, BlobWriter, Written,
     db,
     blobs::{
-        BlobSlice, Location, ReapTarget, drop_unreferenced_blobs, reap_blobs, refresh_dead_size,
-        stream_blob_range,
+        BlobSlice, Location, ReapTarget, reap_blobs, reap_columns, stream_blob_range,
     },
     checksum::{self, BlockLayout},
 };
@@ -207,20 +206,14 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
 /// a part be attached to a blob being dropped meanwhile (a copy of it), the
 /// parts FK fails the fold, which rolls back, and the next pass tries again.
 async fn fold_garbage(app: &Arc<App>) -> anyhow::Result<()> {
-    let mut client = app.pool.get().await?;
-    let tx = client.transaction().await?;
-    let logged: Vec<Uuid> = tx
-        .query("DELETE FROM blob_garbage RETURNING blob_id", &[])
-        .await?
-        .iter()
-        .map(|r| r.get(0))
-        .collect();
-    let reap = drop_unreferenced_blobs(&tx, &logged).await?;
-    // The log's sizes would count bytes that another part still shares as
-    // garbage, so the blobs' garbage is worked out afresh.
-    refresh_dead_size(&tx, &logged).await?;
-    tx.commit().await?;
-    reap_blobs(app, reap);
+    let client = app.pool.get().await?;
+    let row = client
+        .query_one(
+            "SELECT reap_blob, reap_node, reap_peer FROM pg_temp.cairn_fold_garbage()",
+            &[],
+        )
+        .await?;
+    reap_blobs(app, reap_columns(&row, 0));
     Ok(())
 }
 
@@ -228,67 +221,30 @@ async fn fold_garbage(app: &Arc<App>) -> anyhow::Result<()> {
 /// as many candidates as fit into one new blob, by their live bytes.
 async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
     let config = &app.pack;
-    let mut client = app.pool.get().await?;
-    let tx = client.transaction().await?;
-    // Skip blobs that a concurrent claim has locked: it's about to lease them.
-    let rows = match kind {
-        // Least live data first: that's the cheapest space to free.
-        Kind::Compact => {
-            tx.query(
-                "SELECT blob_id, size - dead_size FROM blobs
-                 WHERE dead_size > 0 AND state = 'committed' AND dead_size >= size * $1::float8
-                   AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
-                 ORDER BY size - dead_size
-                 LIMIT $2 FOR UPDATE SKIP LOCKED",
-                &[&config.compact_threshold, &config.max_sources],
-            )
-            .await?
-        }
-        // Oldest first. The index's size bound is repeated as a literal, so
-        // that the planner can use the partial index.
-        Kind::Consolidate => {
-            tx.query(
-                &format!(
-                    "SELECT blob_id, size FROM blobs
-                     WHERE state = 'committed' AND size <= {SMALL_SIZE} AND size <= $1
-                       AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
-                     ORDER BY created_at
-                     LIMIT $2 FOR UPDATE SKIP LOCKED"
-                ),
-                &[&(config.small_size as i64), &config.max_sources],
-            )
-            .await?
-        }
+    let kind = match kind {
+        Kind::Compact => "compact",
+        Kind::Consolidate => "consolidate",
     };
     let budget = OUTPUTS_PER_JOB * config.target_size;
-    let mut sources = Vec::new();
-    let mut total = 0;
-    for row in &rows {
-        let live = row.get::<_, i64>(1) as u64;
-        if total + live > budget && !sources.is_empty() {
-            break;
-        }
-        total += live;
-        sources.push(row.get::<_, Uuid>(0));
-    }
-    let worth_it = match kind {
-        Kind::Compact => !sources.is_empty(),
-        Kind::Consolidate => {
-            total >= config.target_size || sources.len() as i64 >= config.max_sources
-        }
-    };
-    if !worth_it {
-        // Dropping `tx` rolls it back, releasing the row locks.
-        return Ok(None);
-    }
-    tx.execute(
-        "UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => $2)
-         WHERE blob_id = ANY($1)",
-        &[&sources, &LEASE.as_secs_f64()],
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(Some(sources))
+    let sources: Vec<Uuid> = app
+        .pool
+        .get()
+        .await?
+        .query_one(
+            "SELECT pg_temp.cairn_claim($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                &kind,
+                &config.compact_threshold,
+                &config.max_sources,
+                &(config.small_size as i64),
+                &(config.target_size as i64),
+                &(budget as i64),
+                &LEASE.as_secs_f64(),
+            ],
+        )
+        .await?
+        .get(0);
+    Ok((!sources.is_empty()).then_some(sources))
 }
 
 /// A live part to move: where it is, where it's going, and the checksum that
@@ -832,33 +788,46 @@ async fn try_commit(
         .isolation_level(IsolationLevel::Serializable)
         .start()
         .await?;
-    for output in written {
-        output.commit(&tx).await?.map_err(CommitError::MissingLocations)?;
-    }
+    // The new blobs. CRCs are stored as their 64 bits, read as a signed BIGINT.
+    let out_blobs: Vec<Uuid> = written.iter().map(|w| w.blob_id).collect();
+    let out_sizes: Vec<i64> = written.iter().map(|w| w.size as i64).collect();
+    let out_crcs: Vec<i64> = written.iter().map(|w| w.file_crc as i64).collect();
+    let (loc_blobs, loc_nodes): (Vec<Uuid>, Vec<i32>) = written
+        .iter()
+        .flat_map(|w| w.nodes.iter().map(|&node| (w.blob_id, node)))
+        .unzip();
     let ids: Vec<i64> = parts.iter().map(|p| p.id).collect();
     let old_blobs: Vec<Uuid> = parts.iter().map(|p| p.blob_id).collect();
     let old_offsets: Vec<i64> = parts.iter().map(|p| p.offset as i64).collect();
     let new_blobs: Vec<Uuid> = parts.iter().map(|p| written[p.output].blob_id).collect();
     let new_offsets: Vec<i64> = parts.iter().map(|p| p.new_offset as i64).collect();
-    tx.execute(
-        "UPDATE parts p SET blob_id = m.new_blob, blob_offset = m.new_offset
-         FROM unnest($1::bigint[], $2::uuid[], $3::bigint[], $4::uuid[], $5::bigint[])
-             AS m(id, old_blob, old_offset, new_blob, new_offset)
-         WHERE p.id = m.id AND p.blob_id = m.old_blob AND p.blob_offset = m.old_offset",
-        &[&ids, &old_blobs, &old_offsets, &new_blobs, &new_offsets],
-    )
-    .await?;
-    // Whatever didn't move into a new blob (its part was deleted meanwhile) is
-    // garbage there, and so is whatever moved out of a source that remains.
-    let mut touched = sources.to_vec();
-    touched.extend(written.iter().map(|w| w.blob_id));
-    refresh_dead_size(&tx, &touched).await?;
-    let reap = drop_unreferenced_blobs(&tx, &touched).await?;
-    tx.execute(
-        "UPDATE blobs SET pack_lease_until = NULL WHERE blob_id = ANY($1)",
-        &[&sources],
-    )
-    .await?;
+    let row = tx
+        .query_one(
+            "SELECT status, present, reap_blob, reap_node, reap_peer
+             FROM pg_temp.cairn_pack_commit($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+            &[
+                &sources,
+                &out_blobs,
+                &out_sizes,
+                &out_crcs,
+                &(checksum::BLOCK_SIZE as i32),
+                &loc_blobs,
+                &loc_nodes,
+                &ids,
+                &old_blobs,
+                &old_offsets,
+                &new_blobs,
+                &new_offsets,
+            ],
+        )
+        .await?;
+    match row.get::<_, &str>(0) {
+        "committed" => {}
+        // The function changed nothing; dropping `tx` rolls it back.
+        "missing_locations" => return Err(CommitError::MissingLocations(row.get(1))),
+        status => unreachable!("cairn_pack_commit: unknown status {status}"),
+    }
+    let reap = reap_columns(&row, 2);
     tx.commit().await?;
     Ok(reap)
 }
@@ -911,6 +880,9 @@ mod tests {
     fn small_size_matches_the_index() {
         let index = format!("size <= {SMALL_SIZE};");
         assert!(crate::db::PACKING.contains(&index));
+        // `cairn_claim` repeats the bound, for the planner.
+        let claim = format!("size <= {SMALL_SIZE} AND");
+        assert!(include_str!("catalog.sql").contains(&claim));
     }
 
     #[test]

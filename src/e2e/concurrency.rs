@@ -9,14 +9,11 @@ use tokio::task::JoinSet;
 use tokio_postgres::IsolationLevel;
 
 use super::{BUCKET, get, node_with, put, query_i64};
+use uuid::Uuid;
+
 use crate::{
-    App, AttachTarget, UploadResult, auth::ContentSha256,
-    blobs::drop_blobs_of_deleted_parts,
-    packer,
-    s3::{
-        conditional::Preconditions,
-        versions::{Versioning, delete_key},
-    },
+    App, AttachTarget, UploadResult, auth::ContentSha256, packer,
+    s3::conditional::Preconditions,
 };
 
 /// Uploads `data` to `key`, returning the error a client would get.
@@ -102,15 +99,10 @@ async fn deletes_in_one_packed_blob_dont_conflict() {
     let serializable = IsolationLevel::Serializable;
     let t1 = first.build_transaction().isolation_level(serializable).start().await.unwrap();
     let t2 = second.build_transaction().isolation_level(serializable).start().await.unwrap();
-    let (mut freed1, mut freed2) = (Vec::new(), Vec::new());
-    delete_key(&t1, BUCKET, "o0", Versioning::Unversioned, None, &mut freed1)
-        .await
-        .unwrap();
-    delete_key(&t2, BUCKET, "o1", Versioning::Unversioned, None, &mut freed2)
-        .await
-        .unwrap();
-    let reap1 = drop_blobs_of_deleted_parts(&t1, &freed1).await.unwrap();
-    let reap2 = drop_blobs_of_deleted_parts(&t2, &freed2).await.unwrap();
+    let delete = "SELECT reap_blob FROM pg_temp.cairn_delete_objects($1, $2, '{NULL}', '{x}')";
+    let bucket = BUCKET;
+    let reap1: Vec<Uuid> = t1.query_one(delete, &[&bucket, &vec!["o0"]]).await.unwrap().get(0);
+    let reap2: Vec<Uuid> = t2.query_one(delete, &[&bucket, &vec!["o1"]]).await.unwrap().get(0);
     t1.commit().await.unwrap();
     t2.commit().await.unwrap();
     assert!(reap1.is_empty() && reap2.is_empty(), "the packed blob holds other objects");

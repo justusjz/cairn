@@ -1,7 +1,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
-use deadpool_postgres::{Manager, ManagerConfig, Pool};
+use deadpool_postgres::{Hook, HookError, Manager, ManagerConfig, Pool};
 use tokio_postgres::NoTls;
 
 const RETRY_INTERVAL: Duration = Duration::from_secs(1);
@@ -13,10 +13,18 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
         conf,
         NoTls,
         ManagerConfig {
+            // Not `Clean`: its DISCARD ALL would drop the session's functions.
             recycling_method: deadpool_postgres::RecyclingMethod::Fast,
         },
     );
-    let pool = Pool::builder(mgr).max_size(16).build()?;
+    let pool = Pool::builder(mgr)
+        .max_size(16)
+        .post_create(Hook::async_fn(|client, _| {
+            Box::pin(async move {
+                install_functions(client).await.map_err(HookError::Backend)
+            })
+        }))
+        .build()?;
     // Postgres may not be up yet (e.g. started alongside us), so retry the initial
     // connect + schema for a while before giving up rather than crashing on boot.
     let mut attempt = 0;
@@ -31,6 +39,17 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
             }
         }
     }
+}
+
+/// The catalog's transactions, as functions (see `catalog.sql`).
+const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
+
+/// Creates the catalog's functions in the connection's own `pg_temp` schema.
+/// Every connection does this once, when it's opened, so the functions are
+/// always this binary's version of them, whatever other nodes run. They live
+/// as long as the session, which is why the pool must never reset sessions.
+async fn install_functions(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
+    client.batch_execute(CATALOG_FUNCTIONS).await
 }
 
 /// How often a serializable transaction is attempted while it keeps failing

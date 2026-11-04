@@ -18,10 +18,10 @@ use uuid::Uuid;
 
 use crate::auth::{ContentSha256, StreamingChunkVerifier, TrailerChecksum};
 use crate::aws_chunked::AwsChunkedDecoder;
-use crate::blobs::{Location, ReapTarget, deleted_parts, drop_blobs_of_deleted_parts, reap_blobs};
+use crate::blobs::{Location, ReapTarget, reap_blobs};
 use crate::body::{FrameSender, channel_body};
 use crate::checksum::BlobSummer;
-use crate::s3::{conditional::Preconditions, versions::Versioning};
+use crate::s3::conditional::Preconditions;
 use crate::store::Store;
 use crate::writing::WritingSet;
 
@@ -572,38 +572,6 @@ pub(crate) struct Written {
     pub file_crc: u64,
 }
 
-impl Written {
-    /// Commits the blob, as part of the caller's (serializable) transaction,
-    /// which must also attach a part to it. Confirms first that every replica
-    /// recorded its location; if not, returns how many did, and changes nothing.
-    pub(crate) async fn commit(
-        &self,
-        tx: &tokio_postgres::Transaction<'_>,
-    ) -> Result<Result<(), i64>, tokio_postgres::Error> {
-        let present: i64 = tx
-            .query_one(
-                "SELECT count(*) FROM blob_locations WHERE blob_id = $1 AND node = ANY($2)",
-                &[&self.blob_id, &self.nodes],
-            )
-            .await?
-            .get(0);
-        if present as usize != self.nodes.len() {
-            return Ok(Err(present));
-        }
-        // The CRC covers the blob's whole file, for a scrub to check against.
-        // Stored as its 64 bits, read as a signed BIGINT.
-        let file_crc = self.file_crc as i64;
-        let block_size = checksum::BLOCK_SIZE as i32;
-        tx.execute(
-            "UPDATE blobs SET state = 'committed', size = $2, crc64nvme = $3, block_size = $4
-             WHERE blob_id = $1",
-            &[&self.blob_id, &(self.size as i64), &file_crc, &block_size],
-        )
-        .await?;
-        Ok(Ok(()))
-    }
-}
-
 /// Where a freshly-uploaded part should be attached. The part row is inserted
 /// in the same serializable transaction that flips its blob to 'committed', so
 /// the invariant "a committed blob is referenced" holds with no orphan window.
@@ -823,11 +791,12 @@ enum CommitResult {
     PreconditionFailed,
 }
 
-/// Runs the commit transaction once under SERIALIZABLE isolation: confirms that
-/// all `nodes` hold a location for `blob_id`, and if so marks the blob committed
-/// (recording its size and the CRC64/NVME of its file) and attaches a part
-/// spanning it to `attach` (with the CRC64/NVME of its data), in the same
-/// transaction. The raw postgres error is returned unwrapped so the
+/// Runs the commit transaction once under SERIALIZABLE isolation
+/// (`cairn_commit_object` or `cairn_commit_upload_part`): confirms that all of
+/// the blob's replicas recorded their locations, and if so marks the blob
+/// committed (recording its size and the CRC64/NVME of its file) and attaches
+/// a part spanning it to `attach` (with the CRC64/NVME of its data), in the
+/// same transaction. The raw postgres error is returned unwrapped so the
 /// caller can distinguish a serialization failure (retry) from a real error
 /// (give up).
 async fn try_commit_part(
@@ -841,85 +810,84 @@ async fn try_commit_part(
         .isolation_level(IsolationLevel::Serializable)
         .start()
         .await?;
-    if let Err(present) = written.commit(&tx).await? {
-        // A location is missing; dropping `tx` here rolls the transaction back.
-        return Ok(CommitResult::MissingLocations {
-            present,
-            required: written.nodes.len(),
-        });
-    }
-    let blob_id = written.blob_id;
+    // CRCs are stored as their 64 bits, read as a signed BIGINT. The part's
+    // covers just its data, and stays valid wherever it's moved later; the
+    // blob's covers its whole file, for a scrub to check against.
     let size = written.size as i64;
-    // The part's CRC covers just its data, and stays valid wherever it's moved
-    // later. Stored as its 64 bits, read as a signed BIGINT.
-    let crc = written.data_crc as i64;
-    const INSERT_PART: &str = "INSERT INTO parts
-             (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id, part_number,
-              created_at)
-         VALUES ($1, 0, $2, $3, $4, $5, $6, $7, NOW())";
-    // Parts this transaction deletes; their blobs are dropped at its end.
-    let mut freed = Vec::new();
-    let mut version_id = None;
-    match attach {
+    let file_crc = written.file_crc as i64;
+    let block_size = checksum::BLOCK_SIZE as i32;
+    let data_crc = written.data_crc as i64;
+    let (row, version_column, reap_column) = match attach {
         AttachTarget::Object {
             bucket,
             key,
             content_type,
             conditions,
         } => {
-            // Conditional write: evaluate If-Match / If-None-Match against the
-            // object currently at the key, inside this serializable transaction so
-            // the guard is atomic with the overwrite below (a pre-check would race
-            // a concurrent writer). Skipped when no write conditions are set.
-            if conditions.has_write_conditions() {
-                let current = s3::versions::current_etag(&tx, bucket, key).await?;
-                if !conditions.allows_write(current.as_deref()) {
-                    // Dropping `tx` here rolls the transaction back.
-                    return Ok(CommitResult::PreconditionFailed);
-                }
-            }
-            // Insert the new version first, so the part's owner FK target exists.
-            // Reading the bucket's versioning state in this transaction orders the
-            // write against a concurrent PutBucketVersioning. A bucket deleted
-            // meanwhile reads as unversioned; the objects -> buckets FK then
-            // rejects the insert.
-            let versioning = s3::versions::bucket_versioning(&tx, bucket)
-                .await?
-                .unwrap_or(Versioning::Unversioned);
-            let version = s3::versions::put_version(
-                &tx, bucket, key, versioning, size, etag, content_type, &mut freed,
-            )
-            .await?;
-            version_id = version.version_id;
-            tx.execute(
-                INSERT_PART,
-                &[&blob_id, &size, &etag, &crc, &Some(version.id), &None::<Uuid>, &1i32],
-            )
-            .await?;
+            let (if_match, if_none_match) = conditions.write_conditions();
+            let row = tx
+                .query_one(
+                    "SELECT status, present, version_id, reap_blob, reap_node, reap_peer
+                     FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
+                                                      $11, $12, $13)",
+                    &[
+                        &written.blob_id,
+                        &written.nodes,
+                        &size,
+                        &file_crc,
+                        &block_size,
+                        &data_crc,
+                        &etag,
+                        bucket,
+                        key,
+                        content_type,
+                        &if_match,
+                        &if_none_match,
+                        &s3::versions::new_version_id(),
+                    ],
+                )
+                .await?;
+            (row, Some(2), 3)
         }
         AttachTarget::MultipartPart {
             upload_id,
             part_number,
         } => {
-            // Displace any part previously uploaded at this number (S3 allows
-            // re-uploading a part number), freeing the (upload_id, part_number)
-            // slot.
-            let displaced = tx
-                .query(
-                    "DELETE FROM parts WHERE upload_id = $1 AND part_number = $2
-                     RETURNING blob_id, size",
-                    &[upload_id, part_number],
+            let row = tx
+                .query_one(
+                    "SELECT status, present, reap_blob, reap_node, reap_peer
+                     FROM pg_temp.cairn_commit_upload_part($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    &[
+                        &written.blob_id,
+                        &written.nodes,
+                        &size,
+                        &file_crc,
+                        &block_size,
+                        &data_crc,
+                        &etag,
+                        upload_id,
+                        part_number,
+                    ],
                 )
                 .await?;
-            freed.extend(deleted_parts(&displaced));
-            tx.execute(
-                INSERT_PART,
-                &[&blob_id, &size, &etag, &crc, &None::<i64>, &Some(*upload_id), part_number],
-            )
-            .await?;
+            (row, None, 2)
         }
+    };
+    // On anything but a commit, the function changed nothing; dropping `tx`
+    // rolls it back.
+    match row.get::<_, &str>(0) {
+        "committed" => {}
+        "missing_locations" => {
+            return Ok(CommitResult::MissingLocations {
+                present: row.get(1),
+                required: written.nodes.len(),
+            });
+        }
+        "precondition_failed" => return Ok(CommitResult::PreconditionFailed),
+        status => unreachable!("cairn_commit_*: unknown status {status}"),
     }
-    let reap = drop_blobs_of_deleted_parts(&tx, &freed).await?;
+    let version_id = version_column.and_then(|c| row.get(c));
+    let reap = blobs::reap_columns(&row, reap_column);
     tx.commit().await?;
     Ok(CommitResult::Committed { reap, version_id })
 }

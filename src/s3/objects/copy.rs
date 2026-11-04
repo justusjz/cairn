@@ -10,7 +10,7 @@ use uuid::Uuid;
 use crate::{
     App, AttachTarget, Contended, UploadResult,
     auth::ContentSha256,
-    blobs::{deleted_parts, drop_blobs_of_deleted_parts, reap_blobs},
+    blobs::{reap_blobs, reap_columns},
     body::channel_body,
     db,
     s3::{
@@ -20,7 +20,7 @@ use crate::{
             resolve_object_parts, select_parts_in_range, spawn_range_stream,
         },
         util::{decode_path_param, format_s3_error, query_param, with_version_id, xml_ok},
-        versions::{Versioning, bucket_versioning, put_version},
+        versions::new_version_id,
     },
 };
 
@@ -39,8 +39,6 @@ const MAX_SOURCE_ATTEMPTS: usize = 5;
 /// A part of a copy's source, as the catalog has it.
 struct SourcePart {
     id: i64,
-    blob_id: Uuid,
-    offset: i64,
     size: i64,
     etag: String,
     crc64nvme: Option<i64>,
@@ -182,6 +180,7 @@ async fn commit_object_copy(
     etag: &str,
     content_type: &str,
 ) -> anyhow::Result<Option<Option<String>>> {
+    let (part_ids, part_sizes) = source.part_keys();
     let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
@@ -191,31 +190,33 @@ async fn commit_object_copy(
                 .isolation_level(IsolationLevel::Serializable)
                 .start()
                 .await?;
-            let Some(parts) = current_parts(&tx, source).await? else {
-                return Ok(None);
-            };
-            // Reading the bucket's versioning state in this transaction orders
-            // the write against a concurrent PutBucketVersioning. A bucket deleted
-            // meanwhile reads as unversioned; the objects -> buckets FK then
-            // rejects the insert.
-            let versioning = bucket_versioning(&tx, bucket)
-                .await?
-                .unwrap_or(Versioning::Unversioned);
-            let mut freed = Vec::new();
-            let size = source.version.size;
-            let version =
-                put_version(&tx, bucket, key, versioning, size, etag, content_type, &mut freed)
-                    .await?;
-            for (number, part) in (1..).zip(&parts) {
-                let (etag, crc) = (&part.etag, part.crc64nvme);
-                insert_part(&tx, part, 0, part.size, etag, crc, Some(version.id), None, number)
-                    .await?;
+            let row = tx
+                .query_one(
+                    "SELECT status, version_id, reap_blob, reap_node, reap_peer
+                     FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                    &[
+                        &source.version.id,
+                        &part_ids,
+                        &part_sizes,
+                        &bucket,
+                        &key,
+                        &source.version.size,
+                        &etag,
+                        &content_type,
+                        &new_version_id(),
+                    ],
+                )
+                .await?;
+            match row.get::<_, &str>(0) {
+                "committed" => {}
+                // The function changed nothing; dropping `tx` rolls it back.
+                "source_changed" => return Ok(None),
+                status => unreachable!("cairn_copy_object: unknown status {status}"),
             }
-            // After inserting the new parts: a copy onto its own source replaces
-            // the version whose bytes it shares.
-            let reap = drop_blobs_of_deleted_parts(&tx, &freed).await?;
+            let version_id: Option<String> = row.get(1);
+            let reap = reap_columns(&row, 2);
             tx.commit().await?;
-            Ok(Some((version.version_id, reap)))
+            Ok(Some((version_id, reap)))
         }
         .await;
         match result {
@@ -380,6 +381,9 @@ async fn commit_part_copy(
     upload_id: Uuid,
     part_number: i32,
 ) -> anyhow::Result<PartCopy> {
+    let (part_ids, part_sizes) = source.part_keys();
+    // The function's part index counts from 1.
+    let index = new_part.index as i32 + 1;
     let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
@@ -389,38 +393,35 @@ async fn commit_part_copy(
                 .isolation_level(IsolationLevel::Serializable)
                 .start()
                 .await?;
-            let Some(parts) = current_parts(&tx, source).await? else {
-                return Ok((PartCopy::SourceChanged, Vec::new()));
-            };
-            let upload = tx
-                .query_opt("SELECT 1 FROM multipart_uploads WHERE upload_id = $1", &[&upload_id])
-                .await?;
-            if upload.is_none() {
-                return Ok((PartCopy::NoSuchUpload, Vec::new()));
-            }
-            let displaced = tx
-                .query(
-                    "DELETE FROM parts WHERE upload_id = $1 AND part_number = $2
-                     RETURNING blob_id, size",
-                    &[&upload_id, &part_number],
+            let row = tx
+                .query_one(
+                    "SELECT status, reap_blob, reap_node, reap_peer
+                     FROM pg_temp.cairn_copy_part($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                    &[
+                        &source.version.id,
+                        &part_ids,
+                        &part_sizes,
+                        &index,
+                        &new_part.within,
+                        &new_part.length,
+                        &new_part.etag,
+                        &new_part.crc,
+                        &upload_id,
+                        &part_number,
+                    ],
                 )
                 .await?;
-            let part = &parts[new_part.index];
-            insert_part(
-                &tx,
-                part,
-                new_part.within,
-                new_part.length,
-                new_part.etag,
-                new_part.crc,
-                None,
-                Some(upload_id),
-                part_number,
-            )
-            .await?;
-            let reap = drop_blobs_of_deleted_parts(&tx, &deleted_parts(&displaced)).await?;
+            // On anything but a commit, the function changed nothing; dropping
+            // `tx` rolls it back.
+            let outcome = match row.get::<_, &str>(0) {
+                "committed" => PartCopy::Committed,
+                "source_changed" => return Ok((PartCopy::SourceChanged, Vec::new())),
+                "no_such_upload" => return Ok((PartCopy::NoSuchUpload, Vec::new())),
+                status => unreachable!("cairn_copy_part: unknown status {status}"),
+            };
+            let reap = reap_columns(&row, 1);
             tx.commit().await?;
-            Ok((PartCopy::Committed, reap))
+            Ok((outcome, reap))
         }
         .await;
         match result {
@@ -495,6 +496,14 @@ async fn read_source(
     }))
 }
 
+impl Source {
+    /// The ids and sizes of the source's parts, in order, by which a copy's
+    /// commit tells whether they're still the same (see `cairn_source_parts`).
+    fn part_keys(&self) -> (Vec<i64>, Vec<i64>) {
+        self.parts.iter().map(|p| (p.id, p.size)).unzip()
+    }
+}
+
 /// The parts of the object version with row id `object_id`, in order.
 async fn source_parts<C: GenericClient>(
     client: &C,
@@ -502,7 +511,7 @@ async fn source_parts<C: GenericClient>(
 ) -> Result<Vec<SourcePart>, tokio_postgres::Error> {
     let rows = client
         .query(
-            "SELECT id, blob_id, blob_offset, size, etag, crc64nvme FROM parts
+            "SELECT id, size, etag, crc64nvme FROM parts
              WHERE object_id = $1 ORDER BY part_number",
             &[&object_id],
         )
@@ -511,65 +520,11 @@ async fn source_parts<C: GenericClient>(
         .iter()
         .map(|r| SourcePart {
             id: r.get(0),
-            blob_id: r.get(1),
-            offset: r.get(2),
-            size: r.get(3),
-            etag: r.get(4),
-            crc64nvme: r.get(5),
+            size: r.get(1),
+            etag: r.get(2),
+            crc64nvme: r.get(3),
         })
         .collect())
-}
-
-/// The source's parts as they are now, in the copy's transaction, or `None` if
-/// the source isn't what the copy read anymore. A part's bytes never change, so
-/// the same parts mean the same data, though the packer may have moved them to
-/// another blob since. A deleted version takes its parts with it, and every
-/// object has at least one, so a deleted source shows here too.
-async fn current_parts<C: GenericClient>(
-    client: &C,
-    source: &Source,
-) -> Result<Option<Vec<SourcePart>>, tokio_postgres::Error> {
-    let parts = source_parts(client, source.version.id).await?;
-    let same = parts.len() == source.parts.len()
-        && parts
-            .iter()
-            .zip(&source.parts)
-            .all(|(now, then)| now.id == then.id && now.size == then.size);
-    Ok(same.then_some(parts))
-}
-
-/// Inserts a part on `length` bytes of the source part `on`, from `within` it.
-#[allow(clippy::too_many_arguments)]
-async fn insert_part<C: GenericClient>(
-    client: &C,
-    on: &SourcePart,
-    within: i64,
-    length: i64,
-    etag: &str,
-    crc64nvme: Option<i64>,
-    object_id: Option<i64>,
-    upload_id: Option<Uuid>,
-    part_number: i32,
-) -> Result<(), tokio_postgres::Error> {
-    client
-        .execute(
-            "INSERT INTO parts
-                 (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id, part_number,
-                  created_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())",
-            &[
-                &on.blob_id,
-                &(on.offset + within),
-                &length,
-                &etag,
-                &crc64nvme,
-                &object_id,
-                &upload_id,
-                &part_number,
-            ],
-        )
-        .await?;
-    Ok(())
 }
 
 /// The part of `parts` (in object order) that holds all of [start, end), and

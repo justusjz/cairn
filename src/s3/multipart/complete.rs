@@ -1,19 +1,18 @@
-use std::{collections::HashMap, sync::Arc};
+use std::sync::Arc;
 
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use md5::{Digest, Md5};
 use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use crate::{
     App,
-    blobs::{ReapTarget, deleted_parts, drop_blobs_of_deleted_parts, reap_blobs},
+    blobs::{ReapTarget, reap_blobs, reap_columns},
     db,
     s3::conditional::Preconditions,
     s3::util::{format_s3_error, slow_down, with_version_id, xml_escape, xml_ok},
-    s3::versions::{Versioning, bucket_versioning, current_etag, put_version},
+    s3::versions::new_version_id,
 };
 
 enum CompleteOutcome {
@@ -56,13 +55,6 @@ fn parse_complete_request(body: &str) -> Option<Vec<(i32, String)>> {
         parts.push((part_number, etag));
     }
     Some(parts)
-}
-
-/// Decodes a hex string into bytes (our part ETags are 32-char hex MD5s).
-fn hex_to_bytes(hex: &str) -> Vec<u8> {
-    (0..hex.len() / 2)
-        .filter_map(|i| u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok())
-        .collect()
 }
 
 /// CompleteMultipartUpload: `POST /{bucket}/{key}?uploadId=U` with a part-list
@@ -162,9 +154,10 @@ pub async fn complete_multipart_upload(
     Ok(slow_down())
 }
 
-/// One attempt at the completion transaction, serializable like the part commit
-/// (it writes objects + parts and races overwrites/GC). The raw postgres error
-/// is returned so the caller can retry on a serialization failure.
+/// One attempt at the completion transaction (`cairn_complete_upload`),
+/// serializable like the part commit (it writes objects + parts and races
+/// overwrites/GC). The raw postgres error is returned so the caller can retry
+/// on a serialization failure.
 async fn try_complete(
     client: &mut Object,
     bucket: &str,
@@ -178,110 +171,41 @@ async fn try_complete(
         .isolation_level(IsolationLevel::Serializable)
         .start()
         .await?;
-    // The upload defines the target object's content type. It must belong to
-    // the request's bucket/key: authorization only checked that bucket.
-    let upload = tx
-        .query_opt(
-            "SELECT content_type FROM multipart_uploads
-             WHERE upload_id = $1 AND bucket = $2 AND key = $3",
-            &[upload_id, &bucket, &key],
+    let (part_numbers, etags): (Vec<i32>, Vec<&str>) =
+        requested.iter().map(|(n, etag)| (*n, etag.as_str())).unzip();
+    let (if_match, if_none_match) = preconditions.write_conditions();
+    let row = tx
+        .query_one(
+            "SELECT status, etag, version_id, reap_blob, reap_node, reap_peer
+             FROM pg_temp.cairn_complete_upload($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                upload_id,
+                &bucket,
+                &key,
+                &part_numbers,
+                &etags,
+                &if_match,
+                &if_none_match,
+                &new_version_id(),
+            ],
         )
         .await?;
-    let content_type: String = match upload {
-        Some(row) => row.get(0),
-        None => return Ok(CompleteOutcome::NoSuchUpload),
+    // On anything but completion, the function changed nothing; dropping `tx`
+    // rolls it back, leaving the upload intact for the client to retry or abort.
+    match row.get::<_, &str>(0) {
+        "done" => {}
+        "no_such_upload" => return Ok(CompleteOutcome::NoSuchUpload),
+        "invalid_part" => return Ok(CompleteOutcome::InvalidPart),
+        "precondition_failed" => return Ok(CompleteOutcome::PreconditionFailed),
+        status => unreachable!("cairn_complete_upload: unknown status {status}"),
+    }
+    let outcome = CompleteOutcome::Done {
+        bucket: bucket.to_owned(),
+        key: key.to_owned(),
+        etag: row.get(1),
+        version_id: row.get(2),
+        reap: reap_columns(&row, 3),
     };
-    let (bucket, key) = (bucket.to_owned(), key.to_owned());
-    // Index the staged parts by number, then validate each requested part while
-    // summing the total size and folding the binary MD5s for the combined ETag.
-    let staged = tx
-        .query(
-            "SELECT part_number, etag, size FROM parts WHERE upload_id = $1",
-            &[upload_id],
-        )
-        .await?;
-    let mut by_number: HashMap<i32, (String, i64)> = HashMap::new();
-    for row in &staged {
-        by_number.insert(row.get(0), (row.get(1), row.get(2)));
-    }
-    let mut hasher = Md5::new();
-    let mut total_size: i64 = 0;
-    for (part_number, req_etag) in requested {
-        match by_number.get(part_number) {
-            Some((etag, size)) if etag == req_etag => {
-                total_size += size;
-                hasher.update(hex_to_bytes(etag));
-            }
-            _ => return Ok(CompleteOutcome::InvalidPart),
-        }
-    }
-    let combined: String = hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let final_etag = format!("{combined}-{}", requested.len());
-
-    // Conditional completion: honour If-Match / If-None-Match against the object
-    // currently at the key, inside this serializable transaction so the guard is
-    // atomic with the swap below (matching conditional PutObject).
-    if preconditions.has_write_conditions() {
-        let current = current_etag(&tx, &bucket, &key).await?;
-        if !preconditions.allows_write(current.as_deref()) {
-            // Dropping `tx` here rolls the transaction back, leaving the upload
-            // intact for the client to retry or abort.
-            return Ok(CompleteOutcome::PreconditionFailed);
-        }
-    }
-
-    // Publish atomically: the new version (replacing the old one and its parts),
-    // re-point the chosen staged parts to it, then delete the upload (cascading
-    // away the staged parts the client didn't include).
-    // The upload's FK guarantees the bucket exists.
-    let versioning = bucket_versioning(&tx, &bucket)
-        .await?
-        .unwrap_or(Versioning::Unversioned);
-    let mut freed = Vec::new();
-    let version = put_version(
-        &tx,
-        &bucket,
-        &key,
-        versioning,
-        total_size,
-        &final_etag,
-        &content_type,
-        &mut freed,
-    )
-    .await?;
-    let part_numbers: Vec<i32> = requested.iter().map(|(pn, _)| *pn).collect();
-    tx.execute(
-        "UPDATE parts SET upload_id = NULL, object_id = $1
-         WHERE upload_id = $2 AND part_number = ANY($3)",
-        &[&version.id, upload_id, &part_numbers],
-    )
-    .await?;
-    // Delete the staged parts the client left out of the completed object (the
-    // only ones still staged under the upload now) and their blobs, then the
-    // upload itself.
-    let unused = tx
-        .query(
-            "DELETE FROM parts WHERE upload_id = $1 RETURNING blob_id, size",
-            &[upload_id],
-        )
-        .await?;
-    freed.extend(deleted_parts(&unused));
-    let reap = drop_blobs_of_deleted_parts(&tx, &freed).await?;
-    tx.execute(
-        "DELETE FROM multipart_uploads WHERE upload_id = $1",
-        &[upload_id],
-    )
-    .await?;
     tx.commit().await?;
-    Ok(CompleteOutcome::Done {
-        bucket,
-        key,
-        etag: final_etag,
-        reap,
-        version_id: version.version_id,
-    })
+    Ok(outcome)
 }

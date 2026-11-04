@@ -8,12 +8,12 @@ use tokio_postgres::IsolationLevel;
 use crate::{
     App,
     auth::BodyChecksum,
-    blobs::{ReapTarget, drop_blobs_of_deleted_parts, reap_blobs},
+    blobs::{ReapTarget, reap_blobs, reap_columns},
     db,
     s3::util::{
         format_s3_error, slow_down, with_delete_marker, with_version_id, xml_escape, xml_ok,
     },
-    s3::versions::{Deleted, bucket_versioning, delete_key},
+    s3::versions::{Deleted, new_version_id},
 };
 
 /// What a delete addresses: a key, and optionally one specific version of it.
@@ -47,16 +47,34 @@ async fn try_delete(
         .isolation_level(IsolationLevel::Serializable)
         .start()
         .await?;
-    let Some(versioning) = bucket_versioning(&tx, bucket).await? else {
-        return Ok((DeleteStatus::NoSuchBucket, Vec::new())); // tx rolls back on drop
-    };
-    let mut freed = Vec::new();
-    let mut outcomes = Vec::with_capacity(targets.len());
-    for t in targets {
-        let version_id = t.version_id.as_deref();
-        outcomes.push(delete_key(&tx, bucket, &t.key, versioning, version_id, &mut freed).await?);
+    let keys: Vec<&str> = targets.iter().map(|t| t.key.as_str()).collect();
+    let version_ids: Vec<Option<&str>> = targets.iter().map(|t| t.version_id.as_deref()).collect();
+    // A fresh version ID for each target, should it need a delete marker.
+    let marker_ids: Vec<String> = targets.iter().map(|_| new_version_id()).collect();
+    let row = tx
+        .query_one(
+            "SELECT status, version_ids, delete_markers, reap_blob, reap_node, reap_peer
+             FROM pg_temp.cairn_delete_objects($1, $2, $3, $4)",
+            &[&bucket, &keys, &version_ids, &marker_ids],
+        )
+        .await?;
+    match row.get::<_, &str>(0) {
+        "deleted" => {}
+        // The function changed nothing; dropping `tx` rolls it back.
+        "no_such_bucket" => return Ok((DeleteStatus::NoSuchBucket, Vec::new())),
+        status => unreachable!("cairn_delete_objects: unknown status {status}"),
     }
-    let reap = drop_blobs_of_deleted_parts(&tx, &freed).await?;
+    let version_ids: Vec<Option<String>> = row.get(1);
+    let delete_markers: Vec<bool> = row.get(2);
+    let outcomes = version_ids
+        .into_iter()
+        .zip(delete_markers)
+        .map(|(version_id, delete_marker)| Deleted {
+            version_id,
+            delete_marker,
+        })
+        .collect();
+    let reap = reap_columns(&row, 3);
     tx.commit().await?;
     Ok((DeleteStatus::Deleted(outcomes), reap))
 }

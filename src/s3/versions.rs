@@ -9,17 +9,16 @@
 //! beneath it must stay hidden. A delete naming a version ID removes exactly that
 //! version, for good.
 //!
-//! All of this runs inside the caller's serializable transaction. The parts of
-//! removed versions are pushed onto a list of freed parts, for the caller to
-//! drop their blobs with (`drop_blobs_of_deleted_parts`) at the end of the
-//! transaction: only then, after it has attached any parts of its own, does it
-//! know which blobs nothing references anymore. (A copy of an object onto
-//! itself replaces the version it references the data of.)
+//! The writes and deletes themselves are catalog functions (`cairn_put_version`
+//! and `cairn_delete_key` in `catalog.sql`), which run inside the caller's
+//! transaction. They hand the parts of removed versions back as freed parts,
+//! for the transaction to drop their blobs with at its end: only then, after it
+//! has attached any parts of its own, does it know which blobs nothing
+//! references anymore. (A copy of an object onto itself replaces the version it
+//! references the data of.)
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use deadpool_postgres::GenericClient;
-
-use crate::blobs::{FreedPart, deleted_parts};
 
 /// A bucket's versioning state. A bucket starts out unversioned; once enabled,
 /// it only moves between enabled and suspended. Serialized as it's stored.
@@ -66,12 +65,13 @@ pub async fn bucket_versioning<C: GenericClient>(
         .map(|row| Versioning::from_db(row.get(0))))
 }
 
-/// A fresh, opaque version ID: 192 random bits as 32 characters of letters,
+/// A fresh, opaque version ID, which callers hand to the catalog functions
+/// that may need one: 192 random bits as 32 characters of letters,
 /// digits, `.` and `_` (URL-safe base64 with `-` swapped for `.`, which keeps it
 /// one-to-one). None of these need escaping in a query string, and unlike a
 /// leading `-`, none can make an ID look like a command-line option to a CLI.
 /// It can never be `null`.
-fn new_version_id() -> String {
+pub(crate) fn new_version_id() -> String {
     let mut bytes = [0u8; 24];
     getrandom::fill(&mut bytes).expect("the OS random number generator failed");
     URL_SAFE_NO_PAD.encode(bytes).replace('-', ".")
@@ -95,192 +95,11 @@ pub async fn current_etag<C: GenericClient>(
         .map(|row| row.get(0)))
 }
 
-/// A version just written: its row id (to attach parts to) and the
-/// `x-amz-version-id` to report for it.
-pub struct NewVersion {
-    pub id: i64,
-    pub version_id: Option<String>,
-}
-
-/// Writes a new object version as the key's current version, the way S3 lands a
-/// write in a bucket with the given versioning state. The parts of any version
-/// it removes are pushed onto `freed`.
-pub async fn put_version<C: GenericClient>(
-    client: &C,
-    bucket: &str,
-    key: &str,
-    versioning: Versioning,
-    size: i64,
-    etag: &str,
-    content_type: &str,
-    freed: &mut Vec<FreedPart>,
-) -> Result<NewVersion, tokio_postgres::Error> {
-    let version_id = match versioning {
-        Versioning::Enabled => new_version_id(),
-        // The null version is replaced wherever it sits among the key's versions.
-        Versioning::Unversioned | Versioning::Suspended => {
-            remove_null_version(client, bucket, key, freed).await?;
-            "null".to_owned()
-        }
-    };
-    demote_current(client, bucket, key).await?;
-    let id: i64 = client
-        .query_one(
-            "INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
-                                  size, etag, content_type, last_modified)
-             VALUES ($1, $2, $3, true, false, $4, $5, $6, NOW())
-             RETURNING id",
-            &[&bucket, &key, &version_id, &size, &etag, &content_type],
-        )
-        .await?
-        .get(0);
-    Ok(NewVersion {
-        id,
-        version_id: versioning.reported(&version_id),
-    })
-}
-
 /// The outcome of a delete: the `x-amz-version-id` to report, and whether the
 /// version it concerns is a delete marker (one just created, or the one removed).
 pub struct Deleted {
     pub version_id: Option<String>,
     pub delete_marker: bool,
-}
-
-/// Deletes `key` the way S3 does in a bucket with the given versioning state.
-/// With a `version_id`, that version is removed for good (a no-op if there's no
-/// such version); if it was current, the next-newest version takes its place.
-/// Without one, an unversioned bucket drops the `null` version, while a versioned
-/// one stacks a delete marker on top (a suspended bucket's marker replaces the
-/// `null` version). The parts of removed versions are pushed onto `freed`.
-pub async fn delete_key<C: GenericClient>(
-    client: &C,
-    bucket: &str,
-    key: &str,
-    versioning: Versioning,
-    version_id: Option<&str>,
-    freed: &mut Vec<FreedPart>,
-) -> Result<Deleted, tokio_postgres::Error> {
-    if let Some(version_id) = version_id {
-        let row = client
-            .query_opt(
-                "SELECT id, is_latest, is_delete_marker FROM objects
-                 WHERE bucket = $1 AND key = $2 AND version_id = $3",
-                &[&bucket, &key, &version_id],
-            )
-            .await?;
-        let mut delete_marker = false;
-        if let Some(row) = row {
-            delete_marker = row.get(2);
-            remove_version(client, row.get(0), freed).await?;
-            if row.get::<_, bool>(1) {
-                promote_newest(client, bucket, key).await?;
-            }
-        }
-        return Ok(Deleted {
-            version_id: Some(version_id.to_owned()),
-            delete_marker,
-        });
-    }
-    let marker_id = match versioning {
-        Versioning::Unversioned => {
-            remove_null_version(client, bucket, key, freed).await?;
-            return Ok(Deleted {
-                version_id: None,
-                delete_marker: false,
-            });
-        }
-        Versioning::Enabled => new_version_id(),
-        Versioning::Suspended => {
-            remove_null_version(client, bucket, key, freed).await?;
-            "null".to_owned()
-        }
-    };
-    demote_current(client, bucket, key).await?;
-    client
-        .execute(
-            "INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
-                                  size, etag, content_type, last_modified)
-             VALUES ($1, $2, $3, true, true, 0, NULL, NULL, NOW())",
-            &[&bucket, &key, &marker_id],
-        )
-        .await?;
-    Ok(Deleted {
-        version_id: Some(marker_id),
-        delete_marker: true,
-    })
-}
-
-/// Removes the key's `null` version, if it has one.
-async fn remove_null_version<C: GenericClient>(
-    client: &C,
-    bucket: &str,
-    key: &str,
-    freed: &mut Vec<FreedPart>,
-) -> Result<(), tokio_postgres::Error> {
-    let row = client
-        .query_opt(
-            "SELECT id FROM objects WHERE bucket = $1 AND key = $2 AND version_id = 'null'",
-            &[&bucket, &key],
-        )
-        .await?;
-    if let Some(row) = row {
-        remove_version(client, row.get(0), freed).await?;
-    }
-    Ok(())
-}
-
-/// Removes the version with row id `id` and its parts, pushing those onto
-/// `freed`.
-async fn remove_version<C: GenericClient>(
-    client: &C,
-    id: i64,
-    freed: &mut Vec<FreedPart>,
-) -> Result<(), tokio_postgres::Error> {
-    let parts = client
-        .query(
-            "DELETE FROM parts WHERE object_id = $1 RETURNING blob_id, size",
-            &[&id],
-        )
-        .await?;
-    client
-        .execute("DELETE FROM objects WHERE id = $1", &[&id])
-        .await?;
-    freed.extend(deleted_parts(&parts));
-    Ok(())
-}
-
-/// Clears the current-version flag of the key, ahead of inserting a new current
-/// version.
-async fn demote_current<C: GenericClient>(
-    client: &C,
-    bucket: &str,
-    key: &str,
-) -> Result<(), tokio_postgres::Error> {
-    client
-        .execute(
-            "UPDATE objects SET is_latest = false WHERE bucket = $1 AND key = $2 AND is_latest",
-            &[&bucket, &key],
-        )
-        .await?;
-    Ok(())
-}
-
-/// Makes the key's newest remaining version current, after the current one was
-/// removed. A key with no versions left simply ceases to exist.
-async fn promote_newest<C: GenericClient>(
-    client: &C,
-    bucket: &str,
-    key: &str,
-) -> Result<(), tokio_postgres::Error> {
-    client
-        .execute(
-            "UPDATE objects SET is_latest = true
-             WHERE id = (SELECT max(id) FROM objects WHERE bucket = $1 AND key = $2)",
-            &[&bucket, &key],
-        )
-        .await?;
-    Ok(())
 }
 
 #[cfg(test)]
