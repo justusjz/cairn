@@ -3,7 +3,6 @@ use std::sync::Arc;
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use crate::db::Cached;
@@ -165,15 +164,10 @@ async fn try_complete(
     requested: &[(i32, String)],
     preconditions: &Preconditions,
 ) -> Result<CompleteOutcome, tokio_postgres::Error> {
-    let tx = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await?;
     let (part_numbers, etags): (Vec<i32>, Vec<&str>) =
         requested.iter().map(|(n, etag)| (*n, etag.as_str())).unzip();
     let (if_match, if_none_match) = preconditions.write_conditions();
-    let row = tx
+    let row = client
         .query_one_cached(
             "SELECT status, etag, version_id, reap_blob, reap_node, reap_peer
              FROM pg_temp.cairn_complete_upload($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -189,8 +183,8 @@ async fn try_complete(
             ],
         )
         .await?;
-    // On anything but completion, the function changed nothing; dropping `tx`
-    // rolls it back, leaving the upload intact for the client to retry or abort.
+    // On anything but completion, the function changed nothing, leaving the
+    // upload intact for the client to retry or abort.
     match row.get::<_, &str>(0) {
         "done" => {}
         "no_such_upload" => return Ok(CompleteOutcome::NoSuchUpload),
@@ -205,6 +199,5 @@ async fn try_complete(
         version_id: row.get(2),
         reap: reap_columns(&row, 3),
     };
-    tx.commit().await?;
     Ok(outcome)
 }

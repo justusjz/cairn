@@ -13,7 +13,6 @@ use hyper_util::{
 use md5::{Digest, Md5};
 use sha2::Sha256;
 use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
-use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use crate::db::Cached;
@@ -459,18 +458,45 @@ pub(crate) struct BlobWriter {
 impl BlobWriter {
     /// Creates the pending blob and starts a sink on each of its replicas.
     pub(crate) async fn begin(app: &Arc<App>) -> anyhow::Result<BlobWriter> {
+        let writer = Self::start(app, None).await?;
+        Ok(writer.expect("only a bucket can be missing"))
+    }
+
+    /// Like `begin`, for an upload into `bucket`: `None` if there's no such
+    /// bucket, and then there's no pending blob either. Saves the upload a
+    /// round trip to Postgres for checking the bucket first. (The commit checks
+    /// again, since the bucket may be deleted while the body streams.)
+    pub(crate) async fn begin_in_bucket(
+        app: &Arc<App>,
+        bucket: &str,
+    ) -> anyhow::Result<Option<BlobWriter>> {
+        Self::start(app, Some(bucket)).await
+    }
+
+    async fn start(app: &Arc<App>, bucket: Option<&str>) -> anyhow::Result<Option<BlobWriter>> {
         let client = app.pool.get().await?;
         // Time-ordered, so new blobs land at the end of the indexes on blob_id.
         let blob_id = Uuid::now_v7();
         // Its size isn't known until all the data has passed, so it starts at 0
-        // and is set at commit.
-        client
-            .execute_cached(
-                "INSERT INTO blobs (blob_id, size, state, created_at) VALUES ($1, 0, 'pending', NOW())",
-                &[&blob_id],
-            )
-            .await?;
-        let replicas = choose_replicas(&client, app.replication_factor).await?;
+        // and is set at commit. Created only if the bucket exists, when there's
+        // one to check.
+        let insert = async {
+            client
+                .execute_cached(
+                    "INSERT INTO blobs (blob_id, size, state, created_at)
+                     SELECT $1, 0, 'pending', NOW()
+                     WHERE $2::text IS NULL OR EXISTS (SELECT 1 FROM buckets WHERE name = $2)",
+                    &[&blob_id, &bucket],
+                )
+                .await
+        };
+        // Independent of each other, so they're sent together, and take one
+        // round trip between them.
+        let (inserted, replicas) = tokio::join!(insert, choose_replicas(&client, app.replication_factor));
+        if inserted? == 0 {
+            return Ok(None);
+        }
+        let replicas = replicas?;
         // Don't hold a pooled connection across the (potentially long) write: the
         // local sink needs one to record its location, and concurrent writes could
         // otherwise exhaust the pool and deadlock.
@@ -493,7 +519,7 @@ impl BlobWriter {
                 });
             }
         }
-        Ok(BlobWriter {
+        Ok(Some(BlobWriter {
             blob_id,
             replicas,
             senders,
@@ -501,7 +527,7 @@ impl BlobWriter {
             summer: BlobSummer::new(checksum::BLOCK_SIZE),
             crc: crc64fast_nvme::Digest::new(),
             size: 0,
-        })
+        }))
     }
 
     /// Appends `chunk` to the blob on every replica.
@@ -610,7 +636,7 @@ enum UploadResult {
     /// A conditional-write guard (If-Match / If-None-Match) didn't hold against
     /// the object currently at the target key.
     PreconditionFailed,
-    /// The target bucket was deleted while the body streamed.
+    /// The target bucket doesn't exist, or was deleted while the body streamed.
     NoSuchBucket,
     /// The target multipart upload was completed or aborted while the body
     /// streamed.
@@ -629,8 +655,15 @@ where
     B: Body<Data = Bytes> + Unpin + Send,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
-    // 1-2. create the pending blob and start writing it to its replicas.
-    let mut writer = BlobWriter::begin(app).await?;
+    // 1-2. create the pending blob and start writing it to its replicas. An
+    // object's bucket is checked on the way.
+    let mut writer = match attach {
+        AttachTarget::Object { bucket, .. } => match BlobWriter::begin_in_bucket(app, bucket).await? {
+            Some(writer) => writer,
+            None => return Ok(UploadResult::NoSuchBucket),
+        },
+        AttachTarget::MultipartPart { .. } => BlobWriter::begin(app).await?,
+    };
     let blob_id = writer.blob_id;
     // 3. tee: read the client body once, hashing it and fanning each chunk out
     // to every replica.
@@ -790,8 +823,8 @@ enum CommitResult {
 /// `cairn_commit_upload_part`): confirms that all of the blob's replicas
 /// recorded their locations, and if so marks the blob committed (recording its
 /// size and the CRC64/NVME of its file) and attaches a part spanning it to
-/// `attach` (with the CRC64/NVME of its data), in the same transaction. The
-/// raw postgres error is returned unwrapped so the caller can distinguish a
+/// `attach` (with the CRC64/NVME of its data), all in one statement, and so
+/// one transaction. The raw postgres error is returned unwrapped so the caller can distinguish a
 /// conflict (retry) from a real error (give up).
 async fn try_commit_part(
     client: &mut Object,
@@ -799,11 +832,6 @@ async fn try_commit_part(
     attach: &AttachTarget,
     etag: &str,
 ) -> Result<CommitResult, tokio_postgres::Error> {
-    let tx = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await?;
     // CRCs are stored as their 64 bits, read as a signed BIGINT. The part's
     // covers just its data, and stays valid wherever it's moved later; the
     // blob's covers its whole file, for a scrub to check against.
@@ -819,7 +847,7 @@ async fn try_commit_part(
             conditions,
         } => {
             let (if_match, if_none_match) = conditions.write_conditions();
-            let row = tx
+            let row = client
                 .query_one_cached(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
@@ -847,7 +875,7 @@ async fn try_commit_part(
             upload_id,
             part_number,
         } => {
-            let row = tx
+            let row = client
                 .query_one_cached(
                     "SELECT status, present, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_commit_upload_part($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -867,8 +895,7 @@ async fn try_commit_part(
             (row, None, 2)
         }
     };
-    // On anything but a commit, the function changed nothing; dropping `tx`
-    // rolls it back.
+    // On anything but a commit, the function changed nothing.
     match row.get::<_, &str>(0) {
         "committed" => {}
         "missing_locations" => {
@@ -884,6 +911,5 @@ async fn try_commit_part(
     }
     let version_id = version_column.and_then(|c| row.get(c));
     let reap = blobs::reap_columns(&row, reap_column);
-    tx.commit().await?;
     Ok(CommitResult::Committed { reap, version_id })
 }

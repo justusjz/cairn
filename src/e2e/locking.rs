@@ -441,3 +441,23 @@ async fn the_packer_keeps_a_blob_that_a_copy_references() {
     let left = format!("SELECT count(*) FROM blobs WHERE blob_id = '{source_blob}'");
     assert_eq!(query_i64(&app, &left).await, 0);
 }
+
+/// A PUT into a bucket that doesn't exist is rejected before anything is
+/// written: not even a pending blob is left for the GC.
+#[tokio::test]
+async fn a_put_into_a_missing_bucket_writes_nothing() {
+    let Some(app) = node().await else { return };
+    let attach = AttachTarget::Object {
+        bucket: "missing".to_owned(),
+        key: "k".to_owned(),
+        content_type: "text/plain".to_owned(),
+        conditions: crate::s3::conditional::Preconditions::default(),
+    };
+    let body = http_body_util::Full::new(hyper::body::Bytes::from_static(b"data"));
+    let result = crate::upload_part(&app, body, &attach, false, ContentSha256::Unsigned, None)
+        .await
+        .unwrap();
+    assert!(matches!(result, UploadResult::NoSuchBucket));
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 0);
+    assert!(app.store.list_local_blobs().await.unwrap().is_empty());
+}

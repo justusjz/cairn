@@ -4,9 +4,10 @@
 -- they're always the version of the binary that calls them, and they're
 -- called (and call each other) as `pg_temp.cairn_…`.
 --
--- Every function either succeeds, or reports why it didn't (a `status`)
--- without having changed anything, so the caller may commit or roll back
--- either way. Freed parts are passed around as two parallel arrays (their
+-- Callers run each function as a statement of its own, which is then its own
+-- transaction: one round trip. So every function either succeeds, or reports
+-- why it didn't (a `status`) without having changed anything; it checks all
+-- it needs to before its first write. Freed parts are passed around as two parallel arrays (their
 -- blobs and sizes), and the locations of the blobs to reap after commit as
 -- three (blob, node, peer URL).
 --

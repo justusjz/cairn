@@ -3,7 +3,6 @@ use std::sync::Arc;
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use tokio_postgres::IsolationLevel;
 
 use crate::db::Cached;
 use crate::{
@@ -43,16 +42,11 @@ async fn try_delete(
     bucket: &str,
     targets: &[Target],
 ) -> Result<(DeleteStatus, Vec<ReapTarget>), tokio_postgres::Error> {
-    let tx = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await?;
     let keys: Vec<&str> = targets.iter().map(|t| t.key.as_str()).collect();
     let version_ids: Vec<Option<&str>> = targets.iter().map(|t| t.version_id.as_deref()).collect();
     // A fresh version ID for each target, should it need a delete marker.
     let marker_ids: Vec<String> = targets.iter().map(|_| new_version_id()).collect();
-    let row = tx
+    let row = client
         .query_one_cached(
             "SELECT status, version_ids, delete_markers, reap_blob, reap_node, reap_peer
              FROM pg_temp.cairn_delete_objects($1, $2, $3, $4)",
@@ -61,7 +55,7 @@ async fn try_delete(
         .await?;
     match row.get::<_, &str>(0) {
         "deleted" => {}
-        // The function changed nothing; dropping `tx` rolls it back.
+        // The function changed nothing.
         "no_such_bucket" => return Ok((DeleteStatus::NoSuchBucket, Vec::new())),
         status => unreachable!("cairn_delete_objects: unknown status {status}"),
     }
@@ -76,7 +70,6 @@ async fn try_delete(
         })
         .collect();
     let reap = reap_columns(&row, 3);
-    tx.commit().await?;
     Ok((DeleteStatus::Deleted(outcomes), reap))
 }
 

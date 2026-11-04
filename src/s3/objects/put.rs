@@ -23,28 +23,26 @@ pub async fn put_object(
     chunk_verifier: Option<StreamingChunkVerifier>,
     conditions: &Preconditions,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    // Reject up front if the bucket doesn't exist, so we don't replicate a part
-    // only to fail the FK at commit time. (There's still the objects -> buckets
-    // FK as a backstop against a concurrent bucket delete.)
-    let client = app.pool.get().await?;
-    if client
-        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
-        .await?
-        .is_none()
-    {
-        return Ok(no_such_bucket());
-    }
     // Fast-fail a conditional write (If-Match / If-None-Match) before streaming the
     // body, so a client "create if absent" against an existing key doesn't upload
     // the whole object just to be rejected. This is only an optimization — the
-    // authoritative, race-free check runs inside the commit transaction.
+    // authoritative, race-free check runs inside the commit transaction. A
+    // missing bucket takes precedence. (Without conditions, `upload_part`
+    // checks the bucket as it starts, before it replicates anything.)
     if conditions.has_write_conditions() {
-        let current = current_etag(&client, bucket, key).await?;
-        if !conditions.allows_write(current.as_deref()) {
+        let client = app.pool.get().await?;
+        // Independent, so they're sent together: one round trip.
+        let (exists, current) = tokio::join!(
+            async { client.query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket]).await },
+            current_etag(&client, bucket, key),
+        );
+        if exists?.is_none() {
+            return Ok(no_such_bucket());
+        }
+        if !conditions.allows_write(current?.as_deref()) {
             return Ok(precondition_failed());
         }
     }
-    drop(client);
 
     // Stream the body into one replicated, committed part and atomically point
     // (bucket, key) at it. `upload_part` computes the ETag (hex MD5) as it streams.
@@ -76,7 +74,7 @@ pub async fn put_object(
         )),
         // A concurrent writer won the race between the fast-fail check and commit.
         UploadResult::PreconditionFailed => Ok(precondition_failed()),
-        // The bucket was deleted while the body streamed.
+        // There's no such bucket, or it was deleted while the body streamed.
         UploadResult::NoSuchBucket => Ok(no_such_bucket()),
         UploadResult::NoSuchUpload => unreachable!("an object write has no upload"),
     }

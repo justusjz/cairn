@@ -49,7 +49,6 @@ use deadpool_postgres::Object;
 use hyper::body::Bytes;
 use md5::{Digest, Md5};
 use tokio::sync::mpsc;
-use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
 
 use crate::db::Cached;
@@ -785,11 +784,6 @@ async fn try_commit(
     written: &[Written],
     parts: &[Part],
 ) -> Result<Vec<ReapTarget>, CommitError> {
-    let tx = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await?;
     // The new blobs. CRCs are stored as their 64 bits, read as a signed BIGINT.
     let out_blobs: Vec<Uuid> = written.iter().map(|w| w.blob_id).collect();
     let out_sizes: Vec<i64> = written.iter().map(|w| w.size as i64).collect();
@@ -803,7 +797,7 @@ async fn try_commit(
     let old_offsets: Vec<i64> = parts.iter().map(|p| p.offset as i64).collect();
     let new_blobs: Vec<Uuid> = parts.iter().map(|p| written[p.output].blob_id).collect();
     let new_offsets: Vec<i64> = parts.iter().map(|p| p.new_offset as i64).collect();
-    let row = tx
+    let row = client
         .query_one_cached(
             "SELECT status, present, reap_blob, reap_node, reap_peer
              FROM pg_temp.cairn_pack_commit($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
@@ -825,12 +819,11 @@ async fn try_commit(
         .await?;
     match row.get::<_, &str>(0) {
         "committed" => {}
-        // The function changed nothing; dropping `tx` rolls it back.
+        // The function changed nothing.
         "missing_locations" => return Err(CommitError::MissingLocations(row.get(1))),
         status => unreachable!("cairn_pack_commit: unknown status {status}"),
     }
     let reap = reap_columns(&row, 2);
-    tx.commit().await?;
     Ok(reap)
 }
 

@@ -21,7 +21,7 @@
 use std::{collections::HashSet, ops::Range, sync::Arc, time::Duration};
 
 use deadpool_postgres::Object;
-use tokio_postgres::{IsolationLevel, types::ToSql};
+use tokio_postgres::types::ToSql;
 use uuid::Uuid;
 
 use crate::db::Cached;
@@ -184,18 +184,8 @@ async fn delete_blobs(
     loop {
         db::backoff(attempt).await;
         attempt += 1;
-        let result: Result<_, tokio_postgres::Error> = async {
-            let tx = client
-                .build_transaction()
-                .isolation_level(IsolationLevel::ReadCommitted)
-                .start()
-                .await?;
-            let rows = tx.query_cached(&sql, params).await?;
-            tx.commit().await?;
-            Ok(rows)
-        }
-        .await;
-        let rows = match result {
+        // One statement, and so its own transaction.
+        let rows = match client.query_cached(&sql, params).await {
             Err(e) if db::is_conflict(&e) && attempt < db::MAX_TX_ATTEMPTS => continue,
             result => result?,
         };

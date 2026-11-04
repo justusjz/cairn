@@ -1,7 +1,6 @@
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use tokio_postgres::IsolationLevel;
 
 use crate::db::Cached;
 use crate::{
@@ -32,23 +31,16 @@ async fn try_delete(
     client: &mut Object,
     bucket: &str,
 ) -> Result<DeleteStatus, tokio_postgres::Error> {
-    let tx = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await?;
-    let status = tx
+    let status = client
         .query_one_cached("SELECT pg_temp.cairn_delete_bucket($1)", &[&bucket])
         .await?;
-    // On anything but a delete, the function changed nothing; dropping `tx`
-    // rolls it back.
+    // On anything but a delete, the function changed nothing.
     match status.get::<_, &str>(0) {
         "deleted" => {}
         "no_such_bucket" => return Ok(DeleteStatus::NoSuchBucket),
         "not_empty" => return Ok(DeleteStatus::NotEmpty),
         status => unreachable!("cairn_delete_bucket: unknown status {status}"),
     }
-    tx.commit().await?;
     Ok(DeleteStatus::Deleted)
 }
 

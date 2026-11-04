@@ -189,16 +189,11 @@ async fn commit_object_copy(
     content_type: &str,
 ) -> anyhow::Result<ObjectCopy> {
     let (part_ids, part_sizes) = source.part_keys();
-    let mut client = app.pool.get().await?;
+    let client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         let result: Result<_, tokio_postgres::Error> = async {
-            let tx = client
-                .build_transaction()
-                .isolation_level(IsolationLevel::ReadCommitted)
-                .start()
-                .await?;
-            let row = tx
+            let row = client
                 .query_one_cached(
                     "SELECT status, version_id, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -215,8 +210,7 @@ async fn commit_object_copy(
                     ],
                 )
                 .await?;
-            // On anything but a commit, the function changed nothing; dropping
-            // `tx` rolls it back.
+            // On anything but a commit, the function changed nothing.
             match row.get::<_, &str>(0) {
                 "committed" => {}
                 "source_changed" => return Ok((ObjectCopy::SourceChanged, Vec::new())),
@@ -224,7 +218,6 @@ async fn commit_object_copy(
                 status => unreachable!("cairn_copy_object: unknown status {status}"),
             }
             let reap = reap_columns(&row, 2);
-            tx.commit().await?;
             Ok((ObjectCopy::Committed(row.get(1)), reap))
         }
         .await;
@@ -396,16 +389,11 @@ async fn commit_part_copy(
     let (part_ids, part_sizes) = source.part_keys();
     // The function's part index counts from 1.
     let index = new_part.index as i32 + 1;
-    let mut client = app.pool.get().await?;
+    let client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         let result: Result<_, tokio_postgres::Error> = async {
-            let tx = client
-                .build_transaction()
-                .isolation_level(IsolationLevel::ReadCommitted)
-                .start()
-                .await?;
-            let row = tx
+            let row = client
                 .query_one_cached(
                     "SELECT status, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_part($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
@@ -423,8 +411,7 @@ async fn commit_part_copy(
                     ],
                 )
                 .await?;
-            // On anything but a commit, the function changed nothing; dropping
-            // `tx` rolls it back.
+            // On anything but a commit, the function changed nothing.
             let outcome = match row.get::<_, &str>(0) {
                 "committed" => PartCopy::Committed,
                 "source_changed" => return Ok((PartCopy::SourceChanged, Vec::new())),
@@ -432,7 +419,6 @@ async fn commit_part_copy(
                 status => unreachable!("cairn_copy_part: unknown status {status}"),
             };
             let reap = reap_columns(&row, 1);
-            tx.commit().await?;
             Ok((outcome, reap))
         }
         .await;

@@ -1,7 +1,6 @@
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
-use tokio_postgres::IsolationLevel;
 
 use crate::db::Cached;
 use crate::{
@@ -78,19 +77,13 @@ async fn try_update(
     bucket: &str,
     versioning: Versioning,
 ) -> Result<bool, tokio_postgres::Error> {
-    let tx = client
-        .build_transaction()
-        .isolation_level(IsolationLevel::ReadCommitted)
-        .start()
-        .await?;
-    let exists: bool = tx
+    let exists: bool = client
         .query_one_cached(
             "SELECT pg_temp.cairn_set_versioning($1, $2)",
             &[&bucket, &versioning.as_db()],
         )
         .await?
         .get(0);
-    tx.commit().await?;
     Ok(exists)
 }
 
