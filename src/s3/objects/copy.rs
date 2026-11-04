@@ -125,7 +125,12 @@ pub async fn copy_object(
             [part] => part.etag.clone(),
             _ => {
                 let size = version.size as u64;
-                hash_range(app, source.locations.clone(), 0, size).await?.0
+                match hash_range(app, source.locations.clone(), 0, size).await {
+                    Ok((md5, _)) => md5,
+                    // Its data went with it: copy what it is now.
+                    Err(_) if source.changed(app).await? => continue,
+                    Err(e) => return Err(e),
+                }
             }
         };
         let content_type = if replace {
@@ -341,7 +346,12 @@ pub async fn copy_part(
         let (etag, crc) = if within == 0 && length == part.size {
             (part.etag.clone(), part.crc64nvme)
         } else {
-            let (md5, crc) = hash_range(app, source.locations.clone(), start, end).await?;
+            let (md5, crc) = match hash_range(app, source.locations.clone(), start, end).await {
+                Ok(hashes) => hashes,
+                // Its data went with it: copy what it is now.
+                Err(_) if source.changed(app).await? => continue,
+                Err(e) => return Err(e),
+            };
             (md5, Some(crc as i64))
         };
         let new_part = NewPart {
@@ -502,6 +512,17 @@ impl Source {
     /// commit tells whether they're still the same (see `cairn_source_parts`).
     fn part_keys(&self) -> (Vec<i64>, Vec<i64>) {
         self.parts.iter().map(|p| (p.id, p.size)).unzip()
+    }
+
+    /// Whether the source version has been replaced or deleted since it was
+    /// read (its parts aren't the same anymore). Its bytes may be gone then,
+    /// so a failure to read them is a reason to start over, not an error.
+    async fn changed(&self, app: &App) -> anyhow::Result<bool> {
+        let client = app.pool.get().await?;
+        let now = source_parts(&client, self.version.id).await?;
+        let same = now.len() == self.parts.len()
+            && now.iter().zip(&self.parts).all(|(a, b)| a.id == b.id && a.size == b.size);
+        Ok(!same)
     }
 }
 
