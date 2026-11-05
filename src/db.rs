@@ -177,6 +177,7 @@ const MIGRATIONS: &[&str] = &[
     GC,
     UNREFERENCED_BY_LOG,
     PROTOCOL_GATE,
+    BYTEWISE_KEYS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -611,6 +612,31 @@ CREATE TRIGGER roles_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON r
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER role_grants_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON role_grants
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 9: keys compare byte by byte, as S3 orders them. They used the
+/// database's default collation, which sorts by locale rules (`en_US.utf8`
+/// puts `a` before `B`, and ignores punctuation at first), so listings came
+/// out in a different order than S3's, and a listing's markers compared that
+/// way too. In a UTF-8 database, the `C` collation's byte order is S3's
+/// order (UTF-8 bytes sort as their code points do), so the migration
+/// refuses any other encoding.
+///
+/// Only the collation changes, so the table isn't rewritten, but the indexes
+/// on `key` are rebuilt, under a lock that holds up every request on objects
+/// while they are. Equality is the same under both collations (Postgres's are
+/// deterministic), so no unique index can find duplicates.
+const BYTEWISE_KEYS: &str = r#"
+DO $$
+BEGIN
+    IF (SELECT pg_encoding_to_char(encoding) FROM pg_database
+        WHERE datname = current_database()) <> 'UTF8' THEN
+        RAISE EXCEPTION 'Cairn needs a database with UTF8 encoding, to order keys as S3 does';
+    END IF;
+END
+$$;
+ALTER TABLE objects ALTER COLUMN key TYPE text COLLATE "C";
+ALTER TABLE multipart_uploads ALTER COLUMN key TYPE text COLLATE "C";
 "#;
 
 #[cfg(test)]

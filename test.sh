@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=84
+TOTAL=85
 STEP=0
 PASS=0
 FAIL=0
@@ -662,6 +662,21 @@ mc_trailer_ok() {
         check_roundtrip "$BIG" "s3://${BUCKET}/mc-trailer.bin" || return 1
     done
     mcli --config-dir "$MCFG" rm "good/${BUCKET}/mc-trailer.bin" >/dev/null 2>&1
+}
+
+# Keys are listed in UTF-8 byte order, as S3 lists them, not by the database's
+# locale (which would put "a" before "B", and "a b" after "a1").
+byte_order_listing_ok() {
+    local k got
+    for k in "ord/a" "ord/B" "ord/_x" "ord/a b" "ord/a1" "ord/é"; do
+        s3 put "$SMALL" "s3://${BUCKET}/${k}" >/dev/null 2>&1 || return 1
+    done
+    got=$(awss3 s3api list-objects-v2 --bucket "$BUCKET" --prefix ord/ \
+        --query 'Contents[].Key' --output text 2>/dev/null | tr '\t' '|')
+    for k in "ord/a" "ord/B" "ord/_x" "ord/a b" "ord/a1" "ord/é"; do
+        awss3 s3api delete-object --bucket "$BUCKET" --key "$k" >/dev/null 2>&1
+    done
+    [ "$got" = "ord/B|ord/_x|ord/a|ord/a b|ord/a1|ord/é" ]
 }
 
 # ─── Pagination: signed GETs (scurl) so we control max-keys/tokens precisely ──
@@ -1451,6 +1466,7 @@ run_test    "Signed trailer checksums via mcli"     mc_trailer_ok
 run_test    "Replayed request with another body refused" replayed_body_rejected
 run_test    "Upload Content-MD5/checksum headers checked" upload_checksums_ok
 run_test    "Oversized XML body refused"            oversized_body_rejected
+run_test    "Keys listed in byte order"             byte_order_listing_ok
 run_test    "Set up pagination fixtures"            setup_pagination
 run_test    "ListObjectsV2 paginates leaves"        v2_leaves_ok
 run_test    "ListObjects (v1) paginates leaves"     v1_leaves_ok
