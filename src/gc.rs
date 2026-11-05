@@ -1,6 +1,8 @@
-//! Garbage collection: reclaims what a crash or a failed upload left behind.
+//! Garbage collection: reclaims what a crash left behind, or a cleanup that
+//! failed itself.
 //!
-//! Every path that deletes data deletes its blobs, and their files, right away.
+//! Every path that deletes data deletes its blobs, and their files, right away,
+//! and so does every upload or packing job that fails.
 //! GC is the backstop that makes sure anything left over is reclaimed in the
 //! end, wherever a node died. It runs on every node, as part of its maintenance
 //! pass once a minute, in two parts, so that no single pass is expensive:
@@ -148,8 +150,9 @@ async fn delete_stale_pending(app: &Arc<App>, report: &mut Report) -> anyhow::Re
     // it, and the GC skips locked rows, and re-checks the condition on the
     // rows it locks, so it never deletes a committed blob (I5 in
     // `catalog.sql`). An upload still
-    // writing to it fails to record its location once the row is gone, and its
-    // file is swept as an orphan.
+    // writing to it fails to record its location once the row is gone, and
+    // deletes its file itself (left to the sweep only if its connection to the
+    // database broke, since the location may have been recorded then).
     let pending_secs = PENDING_TIMEOUT.as_secs_f64();
     let (count, reap) = delete_blobs(
         &mut client,

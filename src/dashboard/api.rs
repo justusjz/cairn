@@ -249,7 +249,8 @@ struct Backlog {
     /// Blobs with enough garbage to be compacted.
     compact: i64,
     compact_garbage_bytes: i64,
-    /// Deleted parts the packer hasn't folded yet.
+    /// Entries of the garbage log the packer hasn't folded yet: one per blob
+    /// that a statement deleted parts from.
     garbage_log: i64,
     uploads: i64,
     oldest_upload: Option<f64>,

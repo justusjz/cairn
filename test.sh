@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# s3-smoke-test.sh — self-contained smoke test for a Postgres-backed S3 server.
+# test.sh — self-contained smoke test for a Postgres-backed S3 server.
 #
 # What it does:
 #   1. Starts a throwaway Postgres in a Podman container
@@ -10,7 +10,7 @@
 #      produce, and an unsigned curl proves authentication is enforced.
 #   4. Prints a pass/fail progress report and tears everything down
 #
-# Usage:  ./s3-smoke-test.sh
+# Usage:  ./test.sh
 # Exit code is 0 only if every test passes.
 #
 # ─── Configuration — adjust these to match your server ──────────────────────

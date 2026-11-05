@@ -98,7 +98,9 @@
 --     its cascades must never delete data. Guard: B(b): DeleteBucket holds it
 --     exclusively and checks afterwards; every inserter of objects holds it
 --     shared (and CreateMultipartUpload's insert, through its FK check). An
---     inserter that finds the row gone reports NoSuchBucket.
+--     inserter that finds the row gone reports NoSuchBucket
+--     (CompleteMultipartUpload reports NoSuchUpload: an upload's bucket
+--     outlives it).
 -- I4. CompleteMultipartUpload publishes exactly the parts it computed the
 --     ETag and size from, and no part is attached to an upload being or
 --     already completed or aborted. Guard: U(u): exclusive for complete and
@@ -116,10 +118,11 @@
 --     - Committing: lock exclusively, then check it's pending and count its
 --       locations. Locations are only removed together with their blob, or
 --       (in the future) under X(x) exclusive.
---     - Deleting a pending blob (GC, the packer's abandon): the GC locks the
---       stale ones with SKIP LOCKED, re-checking that they're pending (F2),
---       and so never touches one being committed; the abandon is a single
---       DELETE whose condition is on the blob row only, re-checked (F2).
+--     - Deleting a pending blob (GC, and `blobs::abandon` for failed uploads
+--       and packing jobs): the GC locks the stale ones with SKIP LOCKED,
+--       re-checking that they're pending (F2), and so never touches one being
+--       committed; the abandon is a single DELETE whose condition is on the
+--       blob row only, re-checked (F2).
 --     The parts FKs remain as a backstop; with this protocol, they can't fail.
 -- I6. Every unreferenced committed blob is dropped eventually. A blob becomes
 --     unreferenced only by its parts being deleted, which the parts_garbage

@@ -708,7 +708,7 @@
           "garbage_log": {
             "type": "integer",
             "format": "int64",
-            "description": "Deleted parts the packer hasn't folded yet."
+            "description": "Entries of the garbage log the packer hasn't folded yet: one per blob\nthat a statement deleted parts from."
           },
           "oldest_upload": {
             "type": [

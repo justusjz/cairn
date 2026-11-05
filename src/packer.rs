@@ -205,8 +205,8 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
 
 /// Takes the garbage log, in batches: the blobs that parts were deleted from
 /// since the last fold. Drops those that no part references anymore, and updates the
-/// `dead_size` of the rest. Folds running concurrently on several nodes each
-/// take different log rows.
+/// `dead_size` of the rest. Folds run one at a time across the cluster: while
+/// one runs, the others skip theirs.
 ///
 /// This is how a blob is dropped when its last part is deleted by a path that
 /// leaves it (a packed blob), or a crash gets in the way. Every deleted part is
@@ -234,7 +234,8 @@ async fn fold_garbage(app: &Arc<App>) -> anyhow::Result<()> {
 }
 
 /// Claims the source blobs for a job of `kind`, if there's one worth running:
-/// as many candidates as fit into one new blob, by their live bytes.
+/// as many candidates as fit into `OUTPUTS_PER_JOB` new blobs, by their live
+/// bytes.
 async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
     let config = &app.pack;
     let kind = match kind {

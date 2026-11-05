@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# cairn-ha-test.sh — high-availability test for cairn (Postgres-backed S3 server).
+# ha-test.sh — high-availability test for cairn (Postgres-backed S3 server).
 #
 # What it does:
 #   1. Starts a throwaway Postgres in a Podman container
@@ -14,7 +14,7 @@
 #      (replication factor 2 cannot be satisfied with one node)
 #   6. Phase D: restarts a killed instance, verifies uploads work again
 #
-# Usage:  ./cairn-ha-test.sh
+# Usage:  ./ha-test.sh
 # Exit code is 0 only if every test passes.
 #
 # ─── Configuration — adjust these to match your server ──────────────────────
@@ -42,7 +42,7 @@ DATA_DIR_FLAG="--data-dir"
 
 EXTRA_SERVER_ARGS=()             # appended to every instance's command line
 STARTUP_TIMEOUT=60               # seconds to wait for postgres / each server
-FAILURE_DETECT_WAIT=3            # seconds to let survivors notice a dead peer
+FAILURE_DETECT_WAIT=11           # seconds for a dead node to stop counting as live (10 s after its last heartbeat)
 # ─────────────────────────────────────────────────────────────────────────────
 
 set -u

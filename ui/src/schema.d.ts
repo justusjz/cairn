@@ -229,7 +229,8 @@ export interface components {
             consolidate_bytes: number;
             /**
              * Format: int64
-             * @description Deleted parts the packer hasn't folded yet.
+             * @description Entries of the garbage log the packer hasn't folded yet: one per blob
+             *     that a statement deleted parts from.
              */
             garbage_log: number;
             /** Format: double */

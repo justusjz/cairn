@@ -7,17 +7,18 @@ consistent.
 
 ## Requirements
 
-- A reachable **PostgreSQL** database (shared by every node). Cairn creates its
+- A reachable **PostgreSQL** database (shared by every node), with UTF-8
+  encoding (the default), so that keys sort as S3 sorts them. Cairn creates its
   own schema on first start.
 - A local **data directory** per node for storing blobs.
 
 The schema is created automatically; just point Cairn at an empty database.
 
 > [!WARNING]
-> The peer endpoint (`--listen-peer`, default `:9431`) is unauthenticated: it
-> can read and delete blobs, and it serves the [dashboard](#dashboard), which
-> manages roles. Only bind it to a trusted/private network — never expose it to
-> the public internet.
+> The peer endpoint (`--listen-peer`, default `127.0.0.1:9431`) is
+> unauthenticated: it can read and delete blobs, and it serves the
+> [dashboard](#dashboard), which manages roles. Only bind it to a
+> trusted/private network — never expose it to the public internet.
 
 ## Installing
 
@@ -322,8 +323,13 @@ replica has an intact copy of a block, the response is cut off there (its
 `CORRUPTION:` line naming the blob and node. Data written by earlier versions
 of Cairn has no checksums and is read unverified.
 
-When writing, each replica reports a checksum of what it stored, and the upload
-fails unless every replica stored exactly the bytes that were sent.
+Every request body is checked against everything the request claims about it,
+as S3 checks it: the SHA-256 it's signed with (`x-amz-content-sha256`), the
+signatures of its chunks, `Content-MD5`, and `x-amz-checksum-*` checksums, in
+a header or a trailer. A body that doesn't match is refused before any of it
+is stored. When writing, each replica reports a checksum of what it stored,
+and the upload fails unless every replica stored exactly the bytes that were
+sent.
 
 ## Packing
 
@@ -349,12 +355,14 @@ The nodes coordinate through the database, so each blob is packed only once.
 
 ## Garbage collection
 
-Deleting data deletes its files right away. What a crash or a failed upload
-leaves behind is cleaned up in the background, as part of the same pass that
-packs data, once a minute on every node:
+Deleting data deletes its files right away, and so does an upload that fails.
+What a crash leaves behind (or a cleanup that failed itself) is cleaned up in
+the background, as part of the same pass that packs data, once a minute on
+every node:
 
-- Uploads that have been pending for a day are given up, and their data
-  deleted.
+- Data whose upload has been unfinished for a day is deleted: its upload (or
+  packing job) has died. Multipart uploads that were never completed are kept
+  until they're aborted.
 - Each node checks its data directory for files the database doesn't know,
   and deletes them. It checks a slice at a time, getting through all of it in
   a day.
