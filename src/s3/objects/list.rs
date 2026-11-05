@@ -45,13 +45,19 @@ pub enum ListEntry {
         delete_marker: bool,
     },
     /// The keys whose names continue past `prefix` with the delimiter, rolled
-    /// up: how many there are, their total size, and when the last changed.
+    /// up, and their totals, if the query asked for them.
     Prefix {
         prefix: String,
-        objects: i64,
-        bytes: i64,
-        last_modified: Timestamp,
+        totals: Option<PrefixTotals>,
     },
+}
+
+/// What a common prefix holds: how many keys, their total size, and when the
+/// last of them changed.
+pub struct PrefixTotals {
+    pub objects: i64,
+    pub bytes: i64,
+    pub last_modified: Timestamp,
 }
 
 /// What to list.
@@ -65,6 +71,9 @@ pub struct ListQuery<'a> {
     /// Also list the keys whose current version is a delete marker (which S3
     /// leaves out).
     pub delete_markers: bool,
+    /// Work out each common prefix's totals, which costs reading all of its
+    /// keys (the dashboard shows them; S3 doesn't).
+    pub totals: bool,
 }
 
 /// A page of the current versions in `bucket`, or `None` if there's no such
@@ -80,52 +89,18 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
         return Ok(None);
     }
 
-    // Build the listing as one sorted, deduped, paginated stream of "tokens". A
-    // token is the key itself (a leaf) or, when a delimiter is set and the key's
-    // post-prefix remainder contains it, the rolled-up folder `prefix + (remainder
-    // through the first delimiter)` (a common prefix). GROUP BY collapses each
-    // folder's keys into a single row, so a folder counts as exactly one item
-    // toward max-keys and is never split across a page boundary.
-    //
-    // `resume_key = max(key)` is the cursor we hand back: for a leaf it's the key;
-    // for a folder it's that folder's greatest key. Feeding it back as `key >
-    // marker` skips the whole exhausted folder (no duplicate) yet lets a mid-group
-    // `start-after` re-show the folder — see the cursor handling in the router.
-    //
-    // `key > $4` resumes after the cursor; the empty delimiter ($3) disables
-    // rollup (note: `position('' IN …)` is 1 in Postgres, so the `$3 <> ''` guard
-    // is load-bearing). We fetch one extra row (LIMIT max_keys + 1) purely to
-    // detect truncation. For a leaf, the aggregates are just its own values.
-    let limit = q.max_keys + 1;
+    // One page, as `cairn_list_current` walks it, plus one entry to tell
+    // whether there's more. Markers work as in MinIO: the next page resumes
+    // after this one's last entry, a key or a common prefix.
+    let limit = (q.max_keys + 1) as i32;
     let delim = q.delimiter.unwrap_or("");
     let rows = tx
         .query_cached(
-            "SELECT token,
-                    bool_or(is_prefix),
-                    max(key),
-                    count(*),
-                    sum(size)::bigint,
-                    max(etag),
-                    to_char(max(last_modified) AT TIME ZONE 'UTC',
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-                    extract(epoch FROM max(last_modified))::float8,
-                    bool_or(is_delete_marker)
-             FROM (
-                 SELECT key, size, etag, last_modified, is_delete_marker,
-                        CASE WHEN $3 <> '' AND position($3 IN substr(key, length($2) + 1)) > 0
-                             THEN $2 || substr(substr(key, length($2) + 1), 1,
-                                               position($3 IN substr(key, length($2) + 1)) + length($3) - 1)
-                             ELSE key
-                        END AS token,
-                        ($3 <> '' AND position($3 IN substr(key, length($2) + 1)) > 0) AS is_prefix
-                 FROM objects
-                 WHERE bucket = $1 AND is_latest AND (NOT is_delete_marker OR $6)
-                   AND starts_with(key, $2) AND key > $4
-             ) t
-             GROUP BY token
-             ORDER BY token
-             LIMIT $5",
-            &[&bucket, &q.prefix, &delim, &q.marker, &limit, &q.delete_markers],
+            "SELECT name, is_prefix, objects, size, etag,
+                    to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
+                    extract(epoch FROM last_modified)::float8, is_delete_marker
+             FROM pg_temp.cairn_list_current($1, $2, $3, $4, $5, $6, $7)",
+            &[&bucket, &q.prefix, &delim, &q.marker, &limit, &q.delete_markers, &q.totals],
         )
         .await?;
     tx.commit().await?;
@@ -135,34 +110,39 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
     let truncated = rows.len() as i64 > q.max_keys;
     let kept = &rows[..(q.max_keys as usize).min(rows.len())];
 
-    // The next cursor is the last kept item's resume_key. An empty page
-    // (max_keys == 0) can't advance on its own, so reuse the incoming marker.
+    // The next marker is the last kept entry. An empty page (max_keys == 0)
+    // can't advance on its own, so it reuses the incoming marker.
     let next_marker = truncated.then(|| {
         kept.last()
-            .map(|r| r.get::<_, String>(2))
+            .map(|r| r.get::<_, String>(0))
             .unwrap_or_else(|| q.marker.to_string())
     });
+    let timestamp = |r: &tokio_postgres::Row| {
+        Some(Timestamp {
+            iso: r.get::<_, Option<String>>(5)?,
+            epoch: r.get::<_, Option<f64>>(6)?,
+        })
+    };
     let entries = kept
         .iter()
         .map(|r| {
-            let last_modified = Timestamp {
-                iso: r.get(6),
-                epoch: r.get(7),
-            };
             if r.get::<_, bool>(1) {
+                let totals = timestamp(r).map(|last_modified| PrefixTotals {
+                    objects: r.get(2),
+                    bytes: r.get(3),
+                    last_modified,
+                });
                 ListEntry::Prefix {
                     prefix: r.get(0),
-                    objects: r.get(3),
-                    bytes: r.get(4),
-                    last_modified,
+                    totals,
                 }
             } else {
                 ListEntry::Object {
                     key: r.get(0),
-                    size: r.get(4),
-                    etag: r.get(5),
-                    last_modified,
-                    delete_marker: r.get(8),
+                    size: r.get(3),
+                    etag: r.get(4),
+                    last_modified: timestamp(r).expect("a key has a last-modified time"),
+                    delete_marker: r.get(7),
                 }
             }
         })
@@ -190,6 +170,7 @@ pub async fn list_objects(
         marker,
         max_keys,
         delete_markers: false,
+        totals: false,
     };
     let Some(listing) = list(app, bucket, &query).await? else {
         return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", ""));

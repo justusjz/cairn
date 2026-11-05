@@ -1265,3 +1265,262 @@ BEGIN
     status := 'committed';
 END
 $$;
+
+-- LISTINGS
+--
+-- ListObjects(V2) and ListObjectVersions walk the keys in order, instead of
+-- reading every key under the prefix: they read a range of the index until a
+-- key rolls up into a common prefix, and then jump past all of that prefix's
+-- keys at once (see `cairn_prefix_end`), to read on from there. So a page
+-- costs a range as long as the page, and a lookup for each common prefix on
+-- it, whatever the delimiter, and however many keys there are. They read, so
+-- they take no locks; each runs as one statement, and so sees one snapshot.
+--
+-- Keys compare as bytes (their C collation, migration 9), which is S3's order.
+-- Everything compared with them is given the same collation, explicitly. A
+-- function called with C-collated arguments sees all of its text parameters
+-- as C, the bucket's too, so the bucket is compared in its own collation
+-- explicitly: else no index on (bucket, key) can serve the lookups.
+--
+-- Markers work as in MinIO: an entry, a key or a common prefix, is listed only
+-- if it sorts after the marker, and a page's next marker is its last entry.
+-- So a marker that names a common prefix resumes past all of its keys.
+
+-- The least text that sorts after every text starting with `p`, or NULL if
+-- there's none: `p` with its last character incremented, after dropping
+-- trailing characters that can't be (U+10FFFF). The surrogates, which text
+-- can't hold, are skipped. Byte order is code point order in UTF-8, so this
+-- is right for the C collation.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_prefix_end(p text)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    v text COLLATE "C" := p;
+    c int;
+BEGIN
+    WHILE v <> '' LOOP
+        c := ascii(right(v, 1));
+        IF c < 1114111 THEN
+            IF c + 1 BETWEEN 55296 AND 57343 THEN
+                RETURN left(v, -1) || chr(57344);
+            END IF;
+            RETURN left(v, -1) || chr(c + 1);
+        END IF;
+        v := left(v, -1);
+    END LOOP;
+    RETURN NULL;
+END
+$$;
+
+-- Where a walk starts: at the prefix, or just after the marker, whichever is
+-- later. The least text after `m` is `m` with U+0001 appended, since text
+-- can't hold U+0000.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_walk_start(p_prefix text, p_marker text)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    IF p_marker = '' THEN
+        RETURN p_prefix;
+    END IF;
+    RETURN greatest(p_prefix COLLATE "C", (p_marker || chr(1)) COLLATE "C");
+END
+$$;
+
+-- The common prefix that `p_key` rolls up into under `p_prefix` and
+-- `p_delimiter`, or NULL if it's listed as a key.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_common_prefix(p_key text, p_prefix text, p_delimiter text)
+RETURNS text LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    v_rest text := substr(p_key, length(p_prefix) + 1);
+    v_pos int;
+BEGIN
+    IF p_delimiter = '' THEN
+        RETURN NULL;
+    END IF;
+    v_pos := strpos(v_rest, p_delimiter);
+    IF v_pos = 0 THEN
+        RETURN NULL;
+    END IF;
+    RETURN p_prefix || substr(v_rest, 1, v_pos + length(p_delimiter) - 1);
+END
+$$;
+
+-- A page of up to `p_limit` entries of ListObjects(V2): the current versions
+-- of the keys under `p_prefix` (and the delete markers too, if
+-- `p_delete_markers`), rolled up at `p_delimiter` ('' for none), after
+-- `p_marker`. A common prefix comes with how many keys it holds, their total
+-- size and when the last changed, if `p_totals` (which costs reading them all).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_list_current(
+    p_bucket text, p_prefix text, p_delimiter text, p_marker text, p_limit int,
+    p_delete_markers boolean, p_totals boolean,
+    OUT name text, OUT is_prefix boolean, OUT objects bigint, OUT size bigint, OUT etag text,
+    OUT last_modified timestamptz, OUT is_delete_marker boolean
+) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_pfx text COLLATE "C" := p_prefix;
+    v_marker text COLLATE "C" := p_marker;
+    v_delim text COLLATE "C" := p_delimiter;
+    v_from text COLLATE "C" := pg_temp.cairn_walk_start(p_prefix, p_marker);
+    v_end text COLLATE "C" := pg_temp.cairn_prefix_end(p_prefix);
+    v_count int := 0;
+    v_cp text COLLATE "C";
+    v_past text COLLATE "C";
+    c refcursor;
+    r record;
+BEGIN
+    LOOP
+        -- The keys from v_from on, in order: a range of `objects_latest`, read
+        -- until it reaches a key that rolls up into a common prefix. (Every key
+        -- in [v_from, v_end) starts with the prefix.)
+        IF v_end IS NULL THEN
+            OPEN c FOR
+                SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker FROM objects o
+                WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_from
+                  AND (p_delete_markers OR NOT o.is_delete_marker)
+                ORDER BY o.key LIMIT p_limit - v_count;
+        ELSE
+            OPEN c FOR
+                SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker FROM objects o
+                WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_from
+                  AND o.key < v_end AND (p_delete_markers OR NOT o.is_delete_marker)
+                ORDER BY o.key LIMIT p_limit - v_count;
+        END IF;
+        v_cp := NULL;
+        LOOP
+            FETCH c INTO r;
+            EXIT WHEN NOT FOUND;
+            v_cp := pg_temp.cairn_common_prefix(r.key, v_pfx, v_delim);
+            EXIT WHEN v_cp IS NOT NULL;
+            name := r.key;
+            is_prefix := false;
+            objects := 1;
+            size := r.size;
+            etag := r.etag;
+            last_modified := r.last_modified;
+            is_delete_marker := r.is_delete_marker;
+            RETURN NEXT;
+            v_count := v_count + 1;
+        END LOOP;
+        CLOSE c;
+        -- The keys ran out, or the page is full.
+        EXIT WHEN v_cp IS NULL;
+        -- Past every key the common prefix holds.
+        v_past := pg_temp.cairn_prefix_end(v_cp);
+        IF v_cp > v_marker THEN
+            name := v_cp;
+            is_prefix := true;
+            objects := NULL;
+            size := NULL;
+            etag := NULL;
+            last_modified := NULL;
+            is_delete_marker := false;
+            IF p_totals AND v_past IS NULL THEN
+                SELECT count(*), coalesce(sum(o.size), 0), max(o.last_modified)
+                INTO objects, size, last_modified
+                FROM objects o
+                WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_cp
+                  AND (p_delete_markers OR NOT o.is_delete_marker);
+            ELSIF p_totals THEN
+                SELECT count(*), coalesce(sum(o.size), 0), max(o.last_modified)
+                INTO objects, size, last_modified
+                FROM objects o
+                WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_cp
+                  AND o.key < v_past AND (p_delete_markers OR NOT o.is_delete_marker);
+            END IF;
+            RETURN NEXT;
+            v_count := v_count + 1;
+        END IF;
+        EXIT WHEN v_past IS NULL OR v_count >= p_limit;
+        v_from := v_past;
+    END LOOP;
+END
+$$;
+
+-- A page of up to `p_limit` entries of ListObjectVersions: every version of
+-- the keys under `p_prefix`, newest first, rolled up at `p_delimiter` ('' for
+-- none), after the version with row id `p_id_marker` of `p_key_marker` (or,
+-- if that's NULL, after all versions of `p_key_marker`).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_list_versions(
+    p_bucket text, p_prefix text, p_delimiter text, p_key_marker text, p_id_marker bigint,
+    p_limit int,
+    OUT name text, OUT is_prefix boolean, OUT version_id text, OUT is_latest boolean,
+    OUT is_delete_marker boolean, OUT size bigint, OUT etag text, OUT last_modified timestamptz
+) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_pfx text COLLATE "C" := p_prefix;
+    v_marker text COLLATE "C" := p_key_marker;
+    v_delim text COLLATE "C" := p_delimiter;
+    v_from text COLLATE "C" := pg_temp.cairn_walk_start(p_prefix, p_key_marker);
+    v_end text COLLATE "C" := pg_temp.cairn_prefix_end(p_prefix);
+    v_count int := 0;
+    v_cp text COLLATE "C";
+    c refcursor;
+    r record;
+BEGIN
+    -- The versions of the marker's own key older than the version marker come
+    -- first, if that key is listed as a key.
+    IF p_id_marker IS NOT NULL AND starts_with(v_marker, v_pfx)
+       AND pg_temp.cairn_common_prefix(v_marker, v_pfx, v_delim) IS NULL THEN
+        RETURN QUERY
+            SELECT o.key::text, false, o.version_id, o.is_latest, o.is_delete_marker, o.size,
+                   o.etag, o.last_modified
+            FROM objects o
+            WHERE o.bucket = p_bucket COLLATE "default" AND o.key = v_marker
+              AND o.id < p_id_marker
+            ORDER BY o.id DESC LIMIT p_limit;
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+    END IF;
+    WHILE v_count < p_limit LOOP
+        -- The versions from v_from on, in order: a range of `objects_versions`,
+        -- read until it reaches a key that rolls up into a common prefix.
+        IF v_end IS NULL THEN
+            OPEN c FOR
+                SELECT o.key, o.version_id, o.is_latest, o.is_delete_marker, o.size, o.etag,
+                       o.last_modified
+                FROM objects o
+                WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from
+                ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
+        ELSE
+            OPEN c FOR
+                SELECT o.key, o.version_id, o.is_latest, o.is_delete_marker, o.size, o.etag,
+                       o.last_modified
+                FROM objects o
+                WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from AND o.key < v_end
+                ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
+        END IF;
+        v_cp := NULL;
+        LOOP
+            FETCH c INTO r;
+            EXIT WHEN NOT FOUND;
+            v_cp := pg_temp.cairn_common_prefix(r.key, v_pfx, v_delim);
+            EXIT WHEN v_cp IS NOT NULL;
+            name := r.key;
+            is_prefix := false;
+            version_id := r.version_id;
+            is_latest := r.is_latest;
+            is_delete_marker := r.is_delete_marker;
+            size := r.size;
+            etag := r.etag;
+            last_modified := r.last_modified;
+            RETURN NEXT;
+            v_count := v_count + 1;
+        END LOOP;
+        CLOSE c;
+        -- The versions ran out, or the page is full.
+        EXIT WHEN v_cp IS NULL;
+        IF v_cp > v_marker THEN
+            name := v_cp;
+            is_prefix := true;
+            version_id := NULL;
+            is_latest := NULL;
+            is_delete_marker := NULL;
+            size := NULL;
+            etag := NULL;
+            last_modified := NULL;
+            RETURN NEXT;
+            v_count := v_count + 1;
+        END IF;
+        -- Past every key the common prefix holds.
+        v_from := pg_temp.cairn_prefix_end(v_cp);
+        EXIT WHEN v_from IS NULL;
+    END LOOP;
+END
+$$;

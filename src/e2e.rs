@@ -25,6 +25,7 @@ mod concurrency;
 mod cleanup;
 mod copies;
 mod deadlocks;
+mod listing;
 mod locking;
 
 /// The bucket every test node has.

@@ -593,6 +593,7 @@ async fn list_objects(
         marker: params.after.as_deref().unwrap_or(""),
         max_keys: PAGE,
         delete_markers: params.deleted.unwrap_or(false),
+        totals: true,
     };
     Ok(Json(listing(&app, &bucket, &query).await?))
 }
@@ -606,17 +607,16 @@ pub(super) async fn listing(app: &App, bucket: &str, query: &ListQuery<'_>) -> R
         .entries
         .into_iter()
         .map(|e| match e {
-            ListEntry::Prefix {
-                prefix,
-                objects,
-                bytes,
-                last_modified,
-            } => Entry::Prefix {
-                prefix,
-                objects,
-                bytes,
-                last_modified: last_modified.epoch,
-            },
+            // The query asks for totals, and a common prefix holds a key.
+            ListEntry::Prefix { prefix, totals } => {
+                let totals = totals.expect("the dashboard's listings ask for totals");
+                Entry::Prefix {
+                    prefix,
+                    objects: totals.objects,
+                    bytes: totals.bytes,
+                    last_modified: totals.last_modified.epoch,
+                }
+            }
             ListEntry::Object {
                 key,
                 size,
@@ -1051,6 +1051,7 @@ mod e2e {
             marker,
             max_keys: PAGE,
             delete_markers,
+            totals: true,
         };
         let l = serde_json::to_value(listing(&app, BUCKET, &query("", "", false)).await.unwrap())
             .unwrap();

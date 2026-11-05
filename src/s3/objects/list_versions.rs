@@ -55,45 +55,19 @@ pub async fn list_object_versions(
         },
     };
 
-    // One sorted, paginated stream of entries: each version or delete marker of
-    // a leaf key is an entry of its own, while all versions under a common prefix
-    // collapse into a single entry (so a folder counts once toward max-keys and
-    // is never split across pages). Tokens are computed as in ListObjects; see
-    // there for the delimiter handling. A folder's `key` is its greatest key, the
-    // cursor that skips the whole folder when handed back as the key-marker.
-    //
-    // The cursor is (key > marker) or, within the marker's own key, (id below the
-    // version marker's): versions of a key are ordered newest (highest id) first.
-    // We fetch one extra row (LIMIT max_keys + 1) purely to detect truncation.
-    let limit = max_keys + 1;
+    // One page, as `cairn_list_versions` walks it, plus one entry to tell
+    // whether there's more. Each version or delete marker of a key is an entry
+    // of its own, while a common prefix is one entry for all of its keys'
+    // versions. Markers work as in MinIO: the next page resumes after this
+    // one's last entry, a version of a key or a common prefix.
+    let limit = (max_keys + 1) as i32;
     let delim = delimiter.unwrap_or("");
     let rows = tx
         .query_cached(
-            "WITH t AS (
-                 SELECT id, key, version_id, is_latest, is_delete_marker, size, etag,
-                        to_char(last_modified AT TIME ZONE 'UTC',
-                                'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_modified,
-                        CASE WHEN $3 <> '' AND position($3 IN substr(key, length($2) + 1)) > 0
-                             THEN $2 || substr(substr(key, length($2) + 1), 1,
-                                               position($3 IN substr(key, length($2) + 1)) + length($3) - 1)
-                             ELSE key
-                        END AS token,
-                        ($3 <> '' AND position($3 IN substr(key, length($2) + 1)) > 0) AS is_prefix
-                 FROM objects
-                 WHERE bucket = $1 AND starts_with(key, $2)
-                   AND (key > $4 OR (key = $4 AND id < $5))
-             )
-             SELECT token, true AS is_prefix, max(key) AS key, NULL::bigint AS id,
-                    NULL::text AS version_id, NULL::bool AS is_latest,
-                    NULL::bool AS is_delete_marker, NULL::bigint AS size,
-                    NULL::text AS etag, NULL::text AS last_modified
-             FROM t WHERE is_prefix GROUP BY token
-             UNION ALL
-             SELECT token, false, key, id, version_id, is_latest, is_delete_marker, size,
-                    etag, last_modified
-             FROM t WHERE NOT is_prefix
-             ORDER BY token, id DESC NULLS FIRST
-             LIMIT $6",
+            "SELECT name AS key, is_prefix, version_id, is_latest, is_delete_marker, size, etag,
+                    to_char(last_modified AT TIME ZONE 'UTC',
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_modified
+             FROM pg_temp.cairn_list_versions($1, $2, $3, $4, $5, $6)",
             &[&bucket, &prefix, &delim, &key_marker, &marker_id, &limit],
         )
         .await?;
@@ -110,7 +84,7 @@ pub async fn list_object_versions(
         if row.get::<_, bool>("is_prefix") {
             prefixes.push_str(&format!(
                 "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
-                xml_escape(row.get("token"))
+                xml_escape(row.get("key"))
             ));
             continue;
         }
@@ -154,8 +128,9 @@ pub async fn list_object_versions(
     body.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
     body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
     // The next page resumes after the last entry kept: after that version of its
-    // key, or past a whole folder. An empty page (max_keys == 0) can't advance on
-    // its own, so it hands back the incoming markers.
+    // key, or past a whole common prefix, which is then the key marker. An empty
+    // page (max_keys == 0) can't advance on its own, so it hands back the
+    // incoming markers.
     if truncated {
         let (next_key, next_version) = match kept.last() {
             Some(row) if row.get::<_, bool>("is_prefix") => (row.get("key"), None),
