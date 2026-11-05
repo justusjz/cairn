@@ -88,9 +88,30 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
                 "copy {a} -> {b}: {status} {body}"
             );
         }
-        9..=11 => {
+        9 | 10 => {
             let status = delete_object(app, BUCKET, &a, None).await?.status();
             anyhow::ensure!(status == StatusCode::NO_CONTENT, "delete {a}: {status}");
+        }
+        // A DeleteObjects of a few keys (locked one by one) or of many
+        // (locked by stripe), with repeats.
+        11 => {
+            let keys: Vec<String> = (0..1 + rng.below(16)).map(|_| key(rng.below(2 * KEYS))).collect();
+            let versions: Vec<Option<&str>> = keys.iter().map(|_| None).collect();
+            let markers: Vec<String> = keys.iter().map(|_| crate::s3::versions::new_version_id()).collect();
+            let client = app.pool.get().await?;
+            loop {
+                match client
+                    .query_one(
+                        "SELECT status FROM pg_temp.cairn_delete_objects($1, $2, $3, $4)",
+                        &[&BUCKET, &keys, &versions, &markers],
+                    )
+                    .await
+                {
+                    Ok(_) => break,
+                    Err(e) if db::is_conflict(&e) => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
         }
         // Part re-uploads racing each other, then a complete or an abort.
         12..=16 => {

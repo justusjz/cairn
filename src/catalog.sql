@@ -48,9 +48,17 @@
 --   P(u,n)  An advisory lock per part number of an upload
 --           (`cairn_lock_part_number`), in the two-key space. Taken by every
 --           attach to that part number.
---   K(b,k)  An advisory lock per key (`cairn_lock_keys`), in the one-key
---           space. Taken by every change to the versions of key k. Bucket
---           names can't contain '/', so 'b/k' identifies the key.
+--   S(b,s)  An advisory lock per stripe of a bucket's keys: each key falls in
+--           one of 16 stripes, by its hash. Shared: changing the versions of a
+--           few keys (which then also take their K). Exclusive: changing the
+--           versions of many keys at once (a large DeleteObjects), instead of
+--           taking their K. See `cairn_lock_keys`.
+--   K(b,k)  An advisory lock per key, in the one-key space. Taken by every
+--           change to the versions of key k that doesn't hold its stripe
+--           exclusively. Bucket names can't contain '/', so 'b/k' identifies
+--           the key. Together, S and K make every two writers of a key
+--           conflict: both take K, or one holds S exclusively, which conflicts
+--           with the other's S in either mode.
 --   G(g)    The role_grants rows. Locked (exclusively, in primary-key order)
 --           before they're deleted.
 --   R(r)    The role's row. Shared: granting it a permission. Exclusive (by
@@ -63,11 +71,18 @@
 -- Advisory locks whose ids collide (two keys hashing alike) merely share a
 -- lock, which is still taken in the same place in the order.
 --
+-- Advisory locks live in Postgres's shared lock table, which holds about
+-- `max_locks_per_transaction` (64 by default) per connection, and every
+-- transaction needs some of that for its table and index locks too. So no
+-- transaction takes more than 16 advisory locks (stripes and keys), and
+-- however many run at once, they can't fill it.
+--
 -- The invariants, and how each is kept:
 --
 -- I1. A key's versions: at most one current version, which is the newest (by
 --     id); at most one null version; a conditional write is evaluated against
---     the current version as of the write. Guard: K(b,k), taken by every
+--     the current version as of the write. Guard: K(b,k) (or its stripe's
+--     S(b,s) exclusively, see above), taken by every
 --     writer of a key's versions (`cairn_put_version` and `cairn_delete_key`
 --     callers) before reading them. So writes to a key are serialized, and a
 --     new version's id (drawn after the lock) grows with commit order. The
@@ -119,7 +134,8 @@
 -- There are none, by three rules, which every transaction follows:
 --
 -- A. All of a transaction's locks are taken up front, in one global order:
---    B, U, P, K (by lock id), G (by primary key), R, X (by blob id), each blob
+--    B, U, P, S (by stripe), K (by lock id), G (by primary key), R, X (by
+--    blob id), each stripe in one mode, each blob
 --    in its final mode (exclusive wins over shared). A transaction that waits
 --    for a lock therefore only ever waits for one that comes later in the
 --    order than all it holds, so no cycle of waits can form.
@@ -209,12 +225,37 @@ BEGIN
 END
 $$;
 
--- K(b,k) for each of the keys, in the order of their lock ids (I1).
+-- How many distinct keys a transaction locks one by one (S shared, K for
+-- each); with more, it locks their stripes exclusively instead. Either way, a
+-- transaction takes at most 16 advisory locks. Mirrored by
+-- `e2e::locking::MAX_KEY_LOCKS`.
+--
+-- K(b,k), under S(b,s), for each of the keys (I1): the stripes in order of
+-- their numbers, then the keys in order of their lock ids. A stripe's lock id
+-- is the hash of 'b/' seeded with the stripe's number plus one, and a key's
+-- the hash of 'b/k' seeded with 0; keys are never empty, so the two never
+-- name the same text.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_lock_keys(p_bucket text, p_keys text[])
 RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
+    v_few boolean;
+    v_stripe int;
     v_id bigint;
 BEGIN
+    v_few := (SELECT count(DISTINCT k) FROM unnest(p_keys) AS k) <= 8;
+    FOR v_stripe IN
+        SELECT DISTINCT hashtext(k) & 15 AS stripe FROM unnest(p_keys) AS k ORDER BY stripe
+    LOOP
+        v_id := hashtextextended(p_bucket || '/', v_stripe + 1);
+        IF v_few THEN
+            PERFORM pg_advisory_xact_lock_shared(v_id);
+        ELSE
+            PERFORM pg_advisory_xact_lock(v_id);
+        END IF;
+    END LOOP;
+    IF NOT v_few THEN
+        RETURN;
+    END IF;
     FOR v_id IN
         SELECT DISTINCT hashtextextended(p_bucket || '/' || k, 0) AS id
         FROM unnest(p_keys) AS k ORDER BY id

@@ -461,3 +461,74 @@ async fn a_put_into_a_missing_bucket_writes_nothing() {
     assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 0);
     assert!(app.store.list_local_blobs().await.unwrap().is_empty());
 }
+
+/// The most advisory locks a transaction may take (see `cairn_lock_keys`).
+const MAX_KEY_LOCKS: i64 = 16;
+
+/// How many advisory locks `tx` holds.
+async fn advisory_locks(tx: &Transaction<'_>) -> i64 {
+    tx.query_one(
+        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()",
+        &[],
+    )
+    .await
+    .unwrap()
+    .get(0)
+}
+
+/// Runs `cairn_delete_objects` for `keys` in `tx`, returning its status.
+async fn delete_keys(tx: &Transaction<'_>, keys: &[String]) -> String {
+    let versions: Vec<Option<&str>> = keys.iter().map(|_| None).collect();
+    let markers: Vec<String> = keys.iter().map(|_| crate::s3::versions::new_version_id()).collect();
+    tx.query_one(
+        "SELECT status FROM pg_temp.cairn_delete_objects($1, $2, $3, $4)",
+        &[&BUCKET, &keys, &versions, &markers],
+    )
+    .await
+    .unwrap()
+    .get(0)
+}
+
+/// I1: a DeleteObjects of many keys locks their stripes instead of each key,
+/// so it takes few locks however many keys it has, and still holds every one
+/// of its keys against a write.
+#[tokio::test]
+async fn a_large_delete_takes_few_locks_and_holds_its_keys() {
+    let Some(app) = node().await else { return };
+    let keys: Vec<String> = (0..1000).map(|i| format!("k{i}")).collect();
+    let mut held = connection(&app).await;
+    let tx = held.transaction().await.unwrap();
+    assert_eq!(delete_keys(&tx, &keys).await, "deleted");
+    assert!(advisory_locks(&tx).await <= MAX_KEY_LOCKS);
+
+    let app2 = app.clone();
+    let putting = tokio::spawn(async move { put(&app2, "k500", b"data".to_vec()).await });
+    assert_waits(&putting).await;
+    tx.commit().await.unwrap();
+    putting.await.unwrap();
+    assert_eq!(get(&app, "k500").await, Some(b"data".to_vec()));
+}
+
+/// I1: a DeleteObjects of a few keys locks just those, so writes to other
+/// keys go ahead, even in the same stripes, while it holds them.
+#[tokio::test]
+async fn a_small_delete_locks_only_its_keys() {
+    let Some(app) = node().await else { return };
+    let keys: Vec<String> = (0..8).map(|i| format!("k{i}")).collect();
+    let mut held = connection(&app).await;
+    let tx = held.transaction().await.unwrap();
+    assert_eq!(delete_keys(&tx, &keys).await, "deleted");
+    assert!(advisory_locks(&tx).await <= MAX_KEY_LOCKS);
+
+    // Forty other keys cover every stripe.
+    for i in 100..140 {
+        tokio::time::timeout(WAIT * 10, put(&app, &format!("k{i}"), b"x".to_vec()))
+            .await
+            .expect("it shouldn't wait");
+    }
+    let app2 = app.clone();
+    let putting = tokio::spawn(async move { put(&app2, "k3", b"data".to_vec()).await });
+    assert_waits(&putting).await;
+    tx.commit().await.unwrap();
+    putting.await.unwrap();
+}
