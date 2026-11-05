@@ -567,3 +567,28 @@ async fn an_old_session_cant_write() {
     }
     assert_eq!(get(&app, "k").await, Some(b"data".to_vec()));
 }
+
+/// A fold takes the garbage log in batches of the size it's given, and says
+/// whether there may be more.
+#[tokio::test]
+async fn folds_take_the_garbage_log_in_batches() {
+    let Some(app) = node().await else { return };
+    for i in 0..5 {
+        put(&app, &format!("k{i}"), vec![i; 10]).await;
+    }
+    let client = connection(&app).await;
+    client
+        .execute("INSERT INTO blob_garbage (blob_id, size) SELECT blob_id, 0 FROM blobs", &[])
+        .await
+        .unwrap();
+    for (more, left) in [(true, 3), (true, 1), (false, 0)] {
+        let row = client
+            .query_one("SELECT more FROM pg_temp.cairn_fold_garbage(2)", &[])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<_, bool>(0), more);
+        assert_eq!(query_i64(&app, "SELECT count(*) FROM blob_garbage").await, left);
+    }
+    // They're all still referenced, so they stay.
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM blobs").await, 5);
+}

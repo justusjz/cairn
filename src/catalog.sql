@@ -1105,17 +1105,23 @@ BEGIN
 END
 $$;
 
--- T13: takes the garbage log: drops the logged blobs that no part references
--- anymore, and refreshes the `dead_size` of the rest (see
--- `packer::fold_garbage`). Takes X exclusive on the logged blobs. Folds run
--- one at a time (I6): if another one is running, this returns right away,
--- leaving the log to it (it's taken after the lock, so it sees all of it).
+-- T13: takes up to `p_limit` rows of the garbage log: drops the logged blobs
+-- that no part references anymore, and refreshes the `dead_size` of the rest
+-- (see `packer::fold_garbage`). Takes X exclusive on the logged blobs. `more`
+-- is whether there may be more rows to take. In batches, so that a large log
+-- (after deleting many objects) doesn't make for one huge transaction that
+-- holds the locks of all its blobs; a blob logged in several batches is just
+-- looked at several times. Folds run one at a time (I6): if another one is
+-- running, this returns right away, leaving the log to it.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_fold_garbage(
-    OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
+    p_limit int,
+    OUT more boolean, OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_logged uuid[];
+    v_taken bigint;
 BEGIN
+    more := false;
     reap_blob := '{}';
     reap_node := '{}';
     reap_peer := '{}';
@@ -1123,8 +1129,15 @@ BEGIN
     IF NOT pg_try_advisory_xact_lock(109270032084481) THEN
         RETURN;
     END IF;
-    WITH taken AS (DELETE FROM blob_garbage RETURNING blob_id)
-    SELECT coalesce(array_agg(DISTINCT blob_id), '{}') INTO v_logged FROM taken;
+    -- Only folds delete log rows, and they run one at a time, so the rows
+    -- picked stay where they are until they're deleted.
+    WITH taken AS (
+        DELETE FROM blob_garbage
+        WHERE ctid IN (SELECT ctid FROM blob_garbage LIMIT p_limit)
+        RETURNING blob_id
+    )
+    SELECT coalesce(array_agg(DISTINCT blob_id), '{}'), count(*) INTO v_logged, v_taken FROM taken;
+    more := v_taken >= p_limit;
     PERFORM pg_temp.cairn_lock_blobs(v_logged, array_fill(true, ARRAY[cardinality(v_logged)]));
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(v_logged);

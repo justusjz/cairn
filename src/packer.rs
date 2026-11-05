@@ -68,6 +68,10 @@ pub(crate) const SMALL_SIZE: u64 = 64 * 1024 * 1024;
 const OUTPUTS_PER_JOB: u64 = 4;
 /// How long a job may hold its source blobs.
 const LEASE: Duration = Duration::from_secs(3600);
+/// How many rows of the garbage log a fold takes per transaction, and how many
+/// such batches a pass folds at most.
+const FOLD_BATCH: i32 = 10_000;
+const MAX_FOLD_BATCHES: usize = 100;
 /// The most jobs a pass runs, so that a pass ends even under a steady stream of
 /// new small blobs.
 const MAX_JOBS_PER_PASS: usize = 64;
@@ -195,8 +199,8 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
     Ok(reports)
 }
 
-/// Takes the garbage log: the blobs that parts were deleted from since the
-/// last fold. Drops those that no part references anymore, and updates the
+/// Takes the garbage log, in batches: the blobs that parts were deleted from
+/// since the last fold. Drops those that no part references anymore, and updates the
 /// `dead_size` of the rest. Folds running concurrently on several nodes each
 /// take different log rows.
 ///
@@ -208,13 +212,20 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
 /// gone afterwards (and starts over); see I5 and I6 in `catalog.sql`.
 async fn fold_garbage(app: &Arc<App>) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
-    let row = client
-        .query_one_cached(
-            "SELECT reap_blob, reap_node, reap_peer FROM pg_temp.cairn_fold_garbage()",
-            &[],
-        )
-        .await?;
-    reap_blobs(app, reap_columns(&row, 0));
+    // Bounded, so that a pass ends even while parts keep being deleted; the
+    // next pass goes on with the rest.
+    for _ in 0..MAX_FOLD_BATCHES {
+        let row = client
+            .query_one_cached(
+                "SELECT more, reap_blob, reap_node, reap_peer FROM pg_temp.cairn_fold_garbage($1)",
+                &[&FOLD_BATCH],
+            )
+            .await?;
+        reap_blobs(app, reap_columns(&row, 1));
+        if !row.get::<_, bool>(0) {
+            break;
+        }
+    }
     Ok(())
 }
 
