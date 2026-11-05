@@ -1157,6 +1157,12 @@ $$;
 -- waits), until their live bytes would exceed `p_budget`, and leases them.
 -- Returns them, or an empty array if the job isn't worth it. The lease is a
 -- heuristic (I8).
+--
+-- Every node claims every minute, so a claim must be cheap when there's
+-- nothing to do. Compaction reads its candidates off the `blobs_compactable`
+-- index, least live data first, and stops once it has enough; consolidation
+-- first adds its candidates up without locking them, and only locks them once
+-- they're worth a job, since a row lock is a write.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_claim(
     p_kind text, p_compact_threshold float8, p_max_sources bigint, p_small_size bigint,
     p_target_size bigint, p_budget bigint, p_lease_secs float8
@@ -1164,13 +1170,34 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_claim(
 DECLARE
     v_sources uuid[] := '{}';
     v_total bigint := 0;
+    v_count bigint;
     r record;
 BEGIN
-    IF p_kind = 'compact' THEN
-        -- Least live data first: that's the cheapest space to free.
+    IF p_kind = 'compact' AND p_compact_threshold >= 0.25 THEN
+        -- Least live data first: that's the cheapest space to free. The
+        -- threshold of `blobs_compactable` (`packer::COMPACT_THRESHOLD`, which
+        -- a test checks against this) is repeated as a literal, so that the
+        -- planner can use the partial index.
         FOR r IN
             SELECT blob_id, size - dead_size AS live FROM blobs
-            WHERE dead_size > 0 AND state = 'committed' AND dead_size >= size * p_compact_threshold
+            WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * 0.25
+              AND dead_size >= size * p_compact_threshold
+              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+            ORDER BY size - dead_size
+            LIMIT p_max_sources FOR UPDATE SKIP LOCKED
+        LOOP
+            EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
+            v_total := v_total + r.live;
+            v_sources := v_sources || r.blob_id;
+        END LOOP;
+        IF cardinality(v_sources) = 0 THEN
+            RETURN '{}';
+        END IF;
+    ELSIF p_kind = 'compact' THEN
+        -- A lower threshold than the index's (tests): the same, without it.
+        FOR r IN
+            SELECT blob_id, size - dead_size AS live FROM blobs
+            WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * p_compact_threshold
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
             ORDER BY size - dead_size
             LIMIT p_max_sources FOR UPDATE SKIP LOCKED
@@ -1183,6 +1210,20 @@ BEGIN
             RETURN '{}';
         END IF;
     ELSE
+        -- Whether the candidates are worth a job at all, without locking them.
+        -- Blobs that others have locked count too, so this can only be too
+        -- hopeful, which the locked count below then corrects.
+        SELECT coalesce(sum(c.size), 0), count(*) INTO v_total, v_count FROM (
+            SELECT size FROM blobs
+            WHERE state = 'committed' AND size <= 67108864 AND size <= p_small_size
+              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+            ORDER BY created_at
+            LIMIT p_max_sources
+        ) AS c;
+        IF v_total < p_target_size AND v_count < p_max_sources THEN
+            RETURN '{}';
+        END IF;
+        v_total := 0;
         -- Oldest first. The `blobs_small` index's size bound
         -- (`packer::SMALL_SIZE`, which a test checks against this) is repeated
         -- as a literal, so that the planner can use the partial index.

@@ -178,6 +178,7 @@ const MIGRATIONS: &[&str] = &[
     UNREFERENCED_BY_LOG,
     PROTOCOL_GATE,
     BYTEWISE_KEYS,
+    COMPACTABLE,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -637,6 +638,18 @@ END
 $$;
 ALTER TABLE objects ALTER COLUMN key TYPE text COLLATE "C";
 ALTER TABLE multipart_uploads ALTER COLUMN key TYPE text COLLATE "C";
+"#;
+
+/// Migration 10: the packer's compaction candidates, least live data first,
+/// so that each node's claim (once a minute) reads the few it takes off an
+/// index, rather than sorting every blob with any garbage. The threshold
+/// (`packer::COMPACT_THRESHOLD`, which must match) is part of the index, so
+/// that blobs with a little garbage aren't in it. `blobs_sparse` served only
+/// the claim's old query.
+pub(crate) const COMPACTABLE: &str = r#"
+CREATE INDEX blobs_compactable ON blobs ((size - dead_size))
+    WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * 0.25;
+DROP INDEX blobs_sparse;
 "#;
 
 #[cfg(test)]

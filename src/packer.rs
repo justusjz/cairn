@@ -64,6 +64,10 @@ use crate::{
 /// Blobs up to this size are consolidated. Must match the `blobs_small` index
 /// (migration 5), which covers the candidates; tests may only lower it.
 pub(crate) const SMALL_SIZE: u64 = 64 * 1024 * 1024;
+/// Compact a blob once this fraction of it is garbage. Must match the
+/// `blobs_compactable` index (migration 10); tests may lower it, at the cost of
+/// the index.
+pub(crate) const COMPACT_THRESHOLD: f64 = 0.25;
 /// How many new blobs' worth of live data a job takes at most.
 const OUTPUTS_PER_JOB: u64 = 4;
 /// How long a job may hold its source blobs.
@@ -100,7 +104,7 @@ impl Default for Config {
         Config {
             target_size: 256 * 1024 * 1024,
             small_size: SMALL_SIZE,
-            compact_threshold: 0.25,
+            compact_threshold: COMPACT_THRESHOLD,
             max_sources: 10_000,
         }
     }
@@ -859,6 +863,16 @@ mod tests {
             crc64nvme: (!md5).then(|| crc.sum64()),
             etag: Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect(),
         }
+    }
+
+    #[test]
+    fn compact_threshold_matches_the_index() {
+        let condition = format!("dead_size >= size * {COMPACT_THRESHOLD}");
+        assert!(crate::db::COMPACTABLE.contains(&condition));
+        // `cairn_claim` repeats it, for the planner.
+        let catalog = include_str!("catalog.sql");
+        assert!(catalog.contains(&format!("{condition}\n")));
+        assert!(catalog.contains(&format!("p_compact_threshold >= {COMPACT_THRESHOLD} THEN")));
     }
 
     #[test]
