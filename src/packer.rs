@@ -296,7 +296,7 @@ async fn run_job(app: &Arc<App>, kind: Kind, sources: &[Uuid]) -> anyhow::Result
     let result = pack(app, kind, sources, &mut outputs).await;
     if result.is_err() {
         for blob_id in outputs {
-            if let Err(e) = abandon(app, blob_id).await {
+            if let Err(e) = crate::blobs::abandon(app, blob_id).await {
                 eprintln!("packer: deleting abandoned blob {blob_id} failed: {e:#}");
             }
         }
@@ -825,27 +825,6 @@ async fn try_commit(
     }
     let reap = reap_columns(&row, 2);
     Ok(reap)
-}
-
-/// Deletes a failed job's new blob, while it's still pending, and reaps its
-/// files.
-async fn abandon(app: &Arc<App>, blob_id: Uuid) -> anyhow::Result<()> {
-    let client = app.pool.get().await?;
-    // The outer SELECT still sees the locations that the DELETE cascades away.
-    let rows = client
-        .query_cached(
-            "WITH gone AS (
-                 DELETE FROM blobs WHERE blob_id = $1 AND state = 'pending' RETURNING blob_id
-             )
-             SELECT bl.blob_id, bl.node, n.peer_url
-             FROM gone
-             JOIN blob_locations bl ON bl.blob_id = gone.blob_id
-             JOIN nodes n ON n.id = bl.node",
-            &[&blob_id],
-        )
-        .await?;
-    reap_blobs(app, crate::blobs::reap_targets(&rows));
-    Ok(())
 }
 
 #[cfg(test)]

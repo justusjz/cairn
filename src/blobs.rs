@@ -21,6 +21,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::db::Cached;
 use crate::{
     App, blob_file,
     body::FrameSender,
@@ -53,6 +54,41 @@ pub(crate) fn reap_columns(row: &tokio_postgres::Row, first: usize) -> Vec<ReapT
         .zip(peers)
         .map(|((blob, node), peer)| (blob, node, peer))
         .collect()
+}
+
+/// Deletes a blob whose write was given up, if it's still pending, and reaps
+/// its files. A committed blob is never touched (the condition is re-checked
+/// once a concurrent commit lets go of the row), so this is safe whatever the
+/// outcome of an attempt to commit it was, even an unknown one. The GC is the
+/// backstop for blobs that a crash keeps from getting here.
+///
+/// A replica that records its location after this has deleted the row fails
+/// its FK check, and deletes its file itself (`write_blob_streaming`).
+pub(crate) async fn abandon(app: &Arc<App>, blob_id: Uuid) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
+    // The outer SELECT still sees the locations that the DELETE cascades away.
+    let rows = client
+        .query_cached(
+            "WITH gone AS (
+                 DELETE FROM blobs WHERE blob_id = $1 AND state = 'pending' RETURNING blob_id
+             )
+             SELECT bl.blob_id, bl.node, n.peer_url
+             FROM gone
+             JOIN blob_locations bl ON bl.blob_id = gone.blob_id
+             JOIN nodes n ON n.id = bl.node",
+            &[&blob_id],
+        )
+        .await?;
+    reap_blobs(app, reap_targets(&rows));
+    Ok(())
+}
+
+/// Like `abandon`, for a caller with nothing better to do on failure than to
+/// leave the blob to the GC: logs the error instead of returning it.
+pub(crate) async fn discard(app: &Arc<App>, blob_id: Uuid) {
+    if let Err(e) = abandon(app, blob_id).await {
+        eprintln!("deleting the given-up blob {blob_id} failed, leaving it to the GC: {e:#}");
+    }
 }
 
 /// Best-effort: once a set of blobs has been removed from the catalog, ask each

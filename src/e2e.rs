@@ -22,6 +22,7 @@ use crate::{
 };
 
 mod concurrency;
+mod cleanup;
 mod copies;
 mod deadlocks;
 mod locking;
@@ -32,6 +33,16 @@ pub const BUCKET: &str = "bucket";
 /// A node of its own, on a fresh database, with the packer's `pack` config and
 /// test `hook`. `None` if there's no database to test against.
 pub async fn node_with(pack: Config, hook: Option<Hook>) -> Option<Arc<App>> {
+    node_replicating(pack, hook, 1).await
+}
+
+/// Like `node_with`, writing `replication_factor` replicas of every blob. The
+/// test has to register the other nodes.
+pub async fn node_replicating(
+    pack: Config,
+    hook: Option<Hook>,
+    replication_factor: usize,
+) -> Option<Arc<App>> {
     let Ok(url) = std::env::var("CAIRN_TEST_DATABASE") else {
         eprintln!("skipped: set CAIRN_TEST_DATABASE to run the end-to-end tests");
         return None;
@@ -62,7 +73,7 @@ pub async fn node_with(pack: Config, hook: Option<Hook>) -> Option<Arc<App>> {
         pool,
         store,
         node,
-        replication_factor: 1,
+        replication_factor,
         writing: WritingSet::default(),
         pack,
         metrics: Arc::default(),

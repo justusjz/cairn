@@ -404,7 +404,7 @@ where
 /// Returns the CRC64/NVME of the whole file written. Shared by
 /// the peer PUT endpoint (an `Incoming`) and the local-replica sink in
 /// `upload_part` (a channel-backed body) — hence the generic body.
-async fn write_blob_streaming<B>(app: &App, blob_id: Uuid, mut body: B) -> anyhow::Result<u64>
+async fn write_blob_streaming<B>(app: &App, blob_id: Uuid, body: B) -> anyhow::Result<u64>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -413,6 +413,43 @@ where
     // GC's file sweep won't treat this in-flight file (no location yet) as an
     // orphan. The guard drops after the location insert below.
     let _writing = app.writing.begin(blob_id);
+    match write_and_announce(app, blob_id, body).await {
+        Ok(crc) => Ok(crc),
+        Err(failure) => {
+            // Delete the file right away, unless its location may have been
+            // recorded after all: then a commit may count on it, and it's left
+            // to the GC to judge. That's only after a lost connection: an
+            // error Postgres reports means the insert was rolled back.
+            if !failure.maybe_announced {
+                let _ = app.store.remove_blob(blob_id).await;
+            }
+            Err(failure.error)
+        }
+    }
+}
+
+/// Why a replica failed to store a blob, and whether its location might have
+/// been recorded nonetheless.
+struct WriteFailure {
+    error: anyhow::Error,
+    maybe_announced: bool,
+}
+
+impl<E: Into<anyhow::Error>> From<E> for WriteFailure {
+    fn from(e: E) -> Self {
+        WriteFailure {
+            error: e.into(),
+            maybe_announced: false,
+        }
+    }
+}
+
+/// The body of `write_blob_streaming`.
+async fn write_and_announce<B>(app: &App, blob_id: Uuid, mut body: B) -> Result<u64, WriteFailure>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let mut file = app.store.create_blob(blob_id).await?;
     // The checksums are computed from the bytes as received, before they hit
     // the disk, so the table catches anything that goes wrong on the way down.
@@ -432,12 +469,20 @@ where
     // time the leader's commit can count this replica.
     file.sync_all().await?;
     let client = app.pool.get().await?;
-    client
+    // The blob may be gone (its upload given up): then this fails its FK check.
+    if let Err(e) = client
         .execute_cached(
             "INSERT INTO blob_locations (blob_id, node) VALUES ($1, $2) ON CONFLICT DO NOTHING",
             &[&blob_id, &app.node],
         )
-        .await?;
+        .await
+    {
+        let maybe_announced = e.code().is_none();
+        return Err(WriteFailure {
+            error: e.into(),
+            maybe_announced,
+        });
+    }
     Ok(file_crc.sum64())
 }
 
@@ -446,6 +491,7 @@ where
 /// applies backpressure. Computes the blob's checksums as the data passes.
 /// Shared by uploads and the packer.
 pub(crate) struct BlobWriter {
+    app: Arc<App>,
     pub blob_id: Uuid,
     pub replicas: Vec<Location>,
     senders: Vec<FrameSender>,
@@ -496,11 +542,18 @@ impl BlobWriter {
         if inserted? == 0 {
             return Ok(None);
         }
-        let replicas = replicas?;
-        // Don't hold a pooled connection across the (potentially long) write: the
-        // local sink needs one to record its location, and concurrent writes could
-        // otherwise exhaust the pool and deadlock.
         drop(client);
+        let replicas = match replicas {
+            Ok(replicas) => replicas,
+            Err(e) => {
+                // No sink has started, so there are only the row's to delete.
+                blobs::discard(app, blob_id).await;
+                return Err(e);
+            }
+        };
+        // The pooled connection was dropped above, before the (potentially long)
+        // write: the local sink needs one to record its location, and concurrent
+        // writes could otherwise exhaust the pool and deadlock.
         let mut senders = Vec::new();
         let mut sinks = JoinSet::new();
         for (node, peer_url) in replicas.clone() {
@@ -520,6 +573,7 @@ impl BlobWriter {
             }
         }
         Ok(Some(BlobWriter {
+            app: app.clone(),
             blob_id,
             replicas,
             senders,
@@ -543,7 +597,8 @@ impl BlobWriter {
     }
 
     /// Gives up on the blob: faults the sinks, so no replica durably stores the
-    /// truncated data, and waits for them. The pending blob is left for the GC.
+    /// truncated data, waits for them, and deletes the pending blob and
+    /// whatever its replicas stored.
     pub(crate) async fn abort(mut self, reason: &str) {
         for tx in &self.senders {
             let _ = tx.send(Err(std::io::Error::other(reason.to_owned()))).await;
@@ -551,20 +606,32 @@ impl BlobWriter {
         self.senders.clear();
         // Their resulting errors are expected.
         while self.sinks.join_next().await.is_some() {}
+        blobs::discard(&self.app, self.blob_id).await;
     }
 
     /// Ends the blob and waits for every replica to store it. Fails if one
-    /// couldn't, or if one stored different bytes than were sent.
+    /// couldn't, or if one stored different bytes than were sent, and then
+    /// deletes the pending blob and whatever its replicas stored.
     pub(crate) async fn finish(mut self) -> anyhow::Result<Written> {
         self.senders.clear();
+        // Every sink is waited for, also after one failed, so that none is still
+        // writing when the blob is deleted.
         let mut replica_crcs = Vec::new();
+        let mut failure = None;
         while let Some(res) = self.sinks.join_next().await {
-            replica_crcs.push(res??);
+            match res.map_err(anyhow::Error::from).and_then(|r| r) {
+                Ok(crc) => replica_crcs.push(crc),
+                Err(e) => failure = failure.or(Some(e)),
+            }
+        }
+        if let Some(e) = failure {
+            blobs::discard(&self.app, self.blob_id).await;
+            return Err(e);
         }
         // Every replica must have stored exactly the file we expect: the bytes we
         // sent, followed by the checksum table and blob ID they determine. A
         // mismatch means a copy was damaged in transit or on its way to disk; the
-        // pending blob is left for the GC, and the write can be retried.
+        // write can be retried.
         // The data's CRC covers just the data; the file's carries on over the
         // trailer.
         let blob_id = self.blob_id;
@@ -572,6 +639,7 @@ impl BlobWriter {
         self.crc.write(&blob_file::trailer(blob_id, &self.summer.finish()));
         let file_crc = self.crc.sum64();
         if replica_crcs.iter().any(|&replica_crc| replica_crc != file_crc) {
+            blobs::discard(&self.app, blob_id).await;
             return Err(Unavailable(format!(
                 "blob {blob_id}: a replica stored different bytes than were sent"
             ))
@@ -753,55 +821,63 @@ where
         }
         return Err(e);
     }
+    // On failure, `finish` deletes what the replicas stored itself.
     let written = writer.finish().await?;
-    // The body is fully read and replicated (but not yet committed). If the client
-    // claimed a whole-body hash, check it now and refuse to commit on a mismatch —
-    // the pending blob is left for the GC to reclaim.
-    if let (Some(h), ContentSha256::Single(expected)) = (content_hasher, &content_sha256) {
-        let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-        if actual != *expected {
-            return Ok(UploadResult::ContentSha256Mismatch);
-        }
-    }
-    // For a trailer body, compare our checksum to the value the body carried in
-    // its trailer (captured by the decoder). A missing/garbled trailer fails too.
-    if let (Some(c), ContentSha256::StreamingTrailer { trailer }) =
-        (trailer_checksum, &content_sha256)
-    {
-        let claimed = decoder.as_ref().and_then(|d| d.trailer(trailer));
-        if claimed.as_deref() != Some(c.finish_base64().as_str()) {
-            return Ok(UploadResult::ContentSha256Mismatch);
-        }
-    }
-    let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    // 5. commit + attach with the now-known size and ETag, in one transaction;
-    // retry on a conflict (e.g. a concurrent upload of the same part number).
-    // The pending blob left behind by a rejected commit (a failed conditional
-    // write, a target that's gone) is reclaimed by the GC, exactly like the
-    // content-sha256 mismatch path above.
-    let mut client = app.pool.get().await?;
-    for attempt in 0..db::MAX_TX_ATTEMPTS {
-        db::backoff(attempt).await;
-        match try_commit_part(&mut client, &written, attach, &etag).await {
-            Ok(CommitResult::Committed { reap, version_id }) => {
-                // Reap the blobs this overwrite displaced; their rows are gone.
-                reap_blobs(app, reap);
-                return Ok(UploadResult::Committed { etag, version_id });
+    // Whatever keeps the upload from committing from here on, the blob is
+    // deleted with its files right away; only a crash leaves it to the GC.
+    let result = async {
+        // The body is fully read and replicated (but not yet committed). If the client
+        // claimed a whole-body hash, check it now and refuse to commit on a mismatch.
+        if let (Some(h), ContentSha256::Single(expected)) = (content_hasher, &content_sha256) {
+            let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+            if actual != *expected {
+                return Ok(UploadResult::ContentSha256Mismatch);
             }
-            Ok(CommitResult::PreconditionFailed) => return Ok(UploadResult::PreconditionFailed),
-            Ok(CommitResult::NoSuchBucket) => return Ok(UploadResult::NoSuchBucket),
-            Ok(CommitResult::NoSuchUpload) => return Ok(UploadResult::NoSuchUpload),
-            Ok(CommitResult::MissingLocations { present, required }) => {
-                return Err(Unavailable(format!(
-                    "blob {blob_id} not durable: only {present}/{required} replicas reported a location"
-                ))
-                .into());
-            }
-            Err(e) if db::is_conflict(&e) => continue,
-            Err(e) => return Err(e.into()),
         }
+        // For a trailer body, compare our checksum to the value the body carried in
+        // its trailer (captured by the decoder). A missing/garbled trailer fails too.
+        if let (Some(c), ContentSha256::StreamingTrailer { trailer }) =
+            (trailer_checksum, &content_sha256)
+        {
+            let claimed = decoder.as_ref().and_then(|d| d.trailer(trailer));
+            if claimed.as_deref() != Some(c.finish_base64().as_str()) {
+                return Ok(UploadResult::ContentSha256Mismatch);
+            }
+        }
+        let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        // 5. commit + attach with the now-known size and ETag, in one transaction;
+        // retry on a conflict.
+        let mut client = app.pool.get().await?;
+        for attempt in 0..db::MAX_TX_ATTEMPTS {
+            db::backoff(attempt).await;
+            match try_commit_part(&mut client, &written, attach, &etag).await {
+                Ok(CommitResult::Committed { reap, version_id }) => {
+                    // Reap the blobs this overwrite displaced; their rows are gone.
+                    reap_blobs(app, reap);
+                    return Ok(UploadResult::Committed { etag, version_id });
+                }
+                Ok(CommitResult::PreconditionFailed) => return Ok(UploadResult::PreconditionFailed),
+                Ok(CommitResult::NoSuchBucket) => return Ok(UploadResult::NoSuchBucket),
+                Ok(CommitResult::NoSuchUpload) => return Ok(UploadResult::NoSuchUpload),
+                Ok(CommitResult::MissingLocations { present, required }) => {
+                    return Err(Unavailable(format!(
+                        "blob {blob_id} not durable: only {present}/{required} replicas reported a location"
+                    ))
+                    .into());
+                }
+                Err(e) if db::is_conflict(&e) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(Contended(format!("blob {blob_id}: commit kept conflicting with concurrent ones")).into())
     }
-    Err(Contended(format!("blob {blob_id}: commit kept conflicting with concurrent ones")).into())
+    .await;
+    if !matches!(result, Ok(UploadResult::Committed { .. })) {
+        // Safe even if a commit attempt's outcome is unknown: a committed blob
+        // isn't touched.
+        blobs::discard(app, written.blob_id).await;
+    }
+    result
 }
 
 enum CommitResult {
