@@ -28,12 +28,16 @@
 -- F1. Every statement, including each statement of a VOLATILE function, sees
 --     everything committed before it started. So a check in a statement after
 --     a lock was acquired sees all that the lock's previous holders committed.
--- F2. An UPDATE, DELETE or SELECT ... FOR ... that waits for a row lock
---     re-evaluates its WHERE clause on the row's newest version once it gets
---     the lock, but only conditions on that row (and rows joined to it in the
---     same statement), not subqueries such as NOT EXISTS (SELECT ... FROM
---     parts ...). So a condition on other rows is always checked in a later
---     statement than the one that takes the lock.
+-- F2. When an UPDATE, DELETE or SELECT ... FOR ... finds its target row
+--     changed by a transaction that committed after the statement's snapshot
+--     was taken, it waits for that transaction, and then re-evaluates its
+--     WHERE clause on the row's newest version (and skips the row if it was
+--     deleted). But only the target row is re-read: everything else the
+--     clause looks at (other tables' rows, joined or in subqueries such as
+--     NOT EXISTS (SELECT ... FROM parts ...)) still comes from the snapshot
+--     taken before the wait. So only conditions on the target row's own
+--     columns are re-checked reliably, and a condition on other rows is
+--     always checked in a later statement than the one that takes the lock.
 --
 -- The locks. The shared mode is always FOR KEY SHARE, the mode the FK checks
 -- take anyway. It conflicts with FOR UPDATE and DELETE, but not with plain

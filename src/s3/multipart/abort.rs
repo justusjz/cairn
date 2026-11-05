@@ -32,9 +32,9 @@ pub async fn abort_multipart_upload(
         }
     };
     // Delete the staged parts, the upload, and the freed blobs in one
-    // transaction. A part committed to the upload in between is cascaded away
-    // with the upload, leaving its blob unreferenced; the GC drops it.
-    // Retried on a conflict: a staged part moved by the packer meanwhile.
+    // transaction (`cairn_abort_upload`). It locks the upload first, so no part
+    // can be attached to it meanwhile (I4 in `catalog.sql`). Retried on a
+    // conflict: a staged part moved by the packer meanwhile (rule C).
     let client = app.pool.get().await?;
     let mut attempt = 0;
     let row = loop {
