@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=85
+TOTAL=86
 STEP=0
 PASS=0
 FAIL=0
@@ -662,6 +662,20 @@ mc_trailer_ok() {
         check_roundtrip "$BIG" "s3://${BUCKET}/mc-trailer.bin" || return 1
     done
     mcli --config-dir "$MCFG" rm "good/${BUCKET}/mc-trailer.bin" >/dev/null 2>&1
+}
+
+# A key must be valid UTF-8 without NUL (as in MinIO; invalid UTF-8 used to
+# be stored mangled, and NUL failed with a 500), and at most 1024 bytes long, as
+# in S3.
+malformed_keys_rejected() {
+    local long1024 long1025
+    long1024=$(printf 'k%.0s' {1..1024}); long1025="${long1024}k"
+    [ "$(scurl PUT "/${BUCKET}/bad%FFkey" UNSIGNED-PAYLOAD "$SMALL")" = 400 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/bad%00key" UNSIGNED-PAYLOAD "$SMALL")" = 400 ] || return 1
+    [ "$(scurl GET "/${BUCKET}?list-type=2&prefix=%FF" "$EMPTY_SHA256" -)" = 400 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/${long1025}" UNSIGNED-PAYLOAD "$SMALL")" = 400 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/${long1024}" UNSIGNED-PAYLOAD "$SMALL")" = 200 ] || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key "$long1024" >/dev/null 2>&1
 }
 
 # Keys are listed in UTF-8 byte order, as S3 lists them, not by the database's
@@ -1467,6 +1481,7 @@ run_test    "Replayed request with another body refused" replayed_body_rejected
 run_test    "Upload Content-MD5/checksum headers checked" upload_checksums_ok
 run_test    "Oversized XML body refused"            oversized_body_rejected
 run_test    "Keys listed in byte order"             byte_order_listing_ok
+run_test    "Malformed and over-long keys refused"  malformed_keys_rejected
 run_test    "Set up pagination fixtures"            setup_pagination
 run_test    "ListObjectsV2 paginates leaves"        v2_leaves_ok
 run_test    "ListObjects (v1) paginates leaves"     v1_leaves_ok

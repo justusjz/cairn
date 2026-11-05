@@ -20,7 +20,10 @@ use crate::{
             Missing, ObjectVersion, PartLocation, lookup_version, no_such_version, parse_range,
             resolve_object_parts, select_parts_in_range, spawn_range_stream,
         },
-        util::{decode_path_param, format_s3_error, query_param, with_version_id, xml_ok},
+        util::{
+            decode_path_param, format_s3_error, is_well_formed, query_param, with_version_id,
+            xml_ok,
+        },
         versions::{invalid_version_id, is_version_id, new_version_id},
     },
 };
@@ -643,12 +646,16 @@ fn with_copy_source_version_id(
 /// with a "?versionId=…" suffix, percent-encoded) into (bucket, key, version ID).
 /// Strips a leading slash and splits off the query, then splits bucket/key at the
 /// first slash and decodes each half — mirroring how the request path is parsed.
-/// Returns None if malformed (no key separator, or an empty component).
+/// Returns None if malformed (no key separator, an empty component, or one that
+/// isn't well-formed, see `is_well_formed`).
 pub(crate) fn parse_copy_source(copy_source: &str) -> Option<(String, String, Option<String>)> {
     let raw = copy_source.trim_start_matches('/');
     let (raw, query) = raw.split_once('?').unwrap_or((raw, ""));
     let version_id = query_param(query, "versionId");
     let (bucket, key) = raw.split_once('/')?;
+    if !is_well_formed(bucket) || !is_well_formed(key) || !is_well_formed(query) {
+        return None;
+    }
     let (bucket, key) = (decode_path_param(bucket), decode_path_param(key));
     if bucket.is_empty() || key.is_empty() {
         return None;

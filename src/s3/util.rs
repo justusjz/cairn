@@ -175,6 +175,31 @@ pub fn decode_path_param(param: &str) -> String {
     percent_decode_str(param).decode_utf8_lossy().into_owned()
 }
 
+/// Whether a percent-encoded path segment or query value names something S3
+/// keys can be: valid UTF-8 without NUL characters. S3 keys are UTF-8 strings;
+/// one that isn't valid UTF-8 would be mangled by `decode_path_param` (two
+/// such keys could become the same one), and a NUL can't be stored. MinIO
+/// refuses both too.
+pub fn is_well_formed(param: &str) -> bool {
+    percent_decode_str(param)
+        .decode_utf8()
+        .is_ok_and(|decoded| !decoded.contains('\0'))
+}
+
+/// The longest key S3 allows, in bytes of its UTF-8.
+pub const MAX_KEY_LENGTH: usize = 1024;
+
+/// The error for a request whose path or query isn't well-formed (see
+/// `is_well_formed`). S3 has no error for it, since it takes NUL (and can't be
+/// sent invalid UTF-8 in XML); this is MinIO's message.
+pub fn unsupported_characters() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        "Object name contains unsupported characters.",
+    )
+}
+
 /// Mints a ListObjectsV2 `continuation-token` carrying `marker` (the key to
 /// resume after). URL-safe base64 has no `+`/`/`/`=`, so the token survives
 /// `query_param` untouched on the way back. Inverse of
@@ -198,4 +223,19 @@ pub fn query_param(query: &str, name: &str) -> Option<String> {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         (k == name).then(|| decode_path_param(&v.replace('+', " ")))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_utf8_without_nul_is_well_formed() {
+        for good in ["", "a/b", "caf%C3%A9", "%01", "a%20b", "%E2%82%AC"] {
+            assert!(is_well_formed(good), "{good}");
+        }
+        for bad in ["%FF", "caf%C3", "a%00b", "%C0%80"] {
+            assert!(!is_well_formed(bad), "{bad}");
+        }
+    }
 }

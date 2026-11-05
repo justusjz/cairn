@@ -72,6 +72,13 @@ pub async fn handle(
     ) {
         return Ok(box_response(util::rejection_response(&rejection)));
     }
+    // Every key, prefix, marker and delimiter must be well-formed, so check the
+    // whole path and query once, before anything decodes them.
+    let mut query_values =
+        req.uri().query().unwrap_or("").split('&').map(|p| p.split_once('=').map_or("", |(_, v)| v));
+    if !util::is_well_formed(req.uri().path()) || !query_values.all(util::is_well_formed) {
+        return Ok(box_response(util::unsupported_characters()));
+    }
     let path = req.uri().path().trim_start_matches('/');
     if path.is_empty() {
         let resp = match req.method() {
@@ -89,6 +96,13 @@ pub async fn handle(
         .get("x-amz-copy-source")
         .and_then(|v| v.to_str().ok());
     let query = req.uri().query().unwrap_or("");
+    if key.len() > util::MAX_KEY_LENGTH {
+        return Ok(box_response(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "KeyTooLongError",
+            "Your key is too long",
+        )));
+    }
     if !authorize(&principal, req.method(), &bucket, &key, query, copy_source_header) {
         return Ok(forbidden("AccessDenied", "Access Denied"));
     }
