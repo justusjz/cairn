@@ -532,3 +532,38 @@ async fn a_small_delete_locks_only_its_keys() {
     tx.commit().await.unwrap();
     putting.await.unwrap();
 }
+
+/// A session that doesn't follow the lock protocol (a node of an older
+/// Cairn) can still read the catalog, but not write a thing to it.
+#[tokio::test]
+async fn an_old_session_cant_write() {
+    let Some(app) = node().await else { return };
+    put(&app, "k", b"data".to_vec()).await;
+    let database: String = connection(&app)
+        .await
+        .query_one("SELECT current_database()", &[])
+        .await
+        .unwrap()
+        .get(0);
+    let url = std::env::var("CAIRN_TEST_DATABASE").unwrap();
+    let (server, _) = url.rsplit_once('/').unwrap();
+    let (old, connection) = tokio_postgres::connect(&format!("{server}/{database}"), tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(connection);
+
+    let objects: i64 = old.query_one("SELECT count(*) FROM objects", &[]).await.unwrap().get(0);
+    assert_eq!(objects, 1);
+    for write in [
+        "UPDATE buckets SET versioning = 'enabled'",
+        "DELETE FROM objects",
+        "INSERT INTO blobs (blob_id, size, state, created_at) VALUES (gen_random_uuid(), 0, 'pending', NOW())",
+        "UPDATE nodes SET last_seen = NOW()",
+        // Even a statement that changes no rows.
+        "DELETE FROM parts WHERE false",
+    ] {
+        let e = old.batch_execute(write).await.unwrap_err();
+        assert!(format!("{e:?}").contains("too old"), "{write}: {e:?}");
+    }
+    assert_eq!(get(&app, "k").await, Some(b"data".to_vec()));
+}

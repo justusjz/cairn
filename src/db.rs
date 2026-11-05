@@ -41,6 +41,13 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
     }
 }
 
+/// The version of the lock protocol (see `catalog.sql`) that this Cairn's
+/// sessions follow, which `PROTOCOL_GATE` requires of every session that
+/// writes to the catalog. Changing the protocol in a way that's unsafe to run
+/// alongside the old one means bumping this, in a new migration that requires
+/// the new version.
+const PROTOCOL: &str = "2";
+
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
 
@@ -52,10 +59,15 @@ const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
 /// It also pins the session's default isolation level to READ COMMITTED,
 /// which the functions' lock protocol is built on (see `catalog.sql`), so that
 /// a server configured otherwise can't change it for the statements that run
-/// on their own, outside an explicit transaction.
+/// on their own, outside an explicit transaction. And it declares the lock
+/// protocol the session follows, without which the catalog refuses its writes
+/// (see `PROTOCOL_GATE`).
 async fn install_functions(client: &tokio_postgres::Client) -> Result<(), tokio_postgres::Error> {
     client
-        .batch_execute("SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .batch_execute(&format!(
+            "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED;
+             SET cairn.protocol = '{PROTOCOL}'"
+        ))
         .await?;
     client.batch_execute(CATALOG_FUNCTIONS).await
 }
@@ -164,6 +176,7 @@ const MIGRATIONS: &[&str] = &[
     PACKING,
     GC,
     UNREFERENCED_BY_LOG,
+    PROTOCOL_GATE,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -554,8 +567,79 @@ INSERT INTO blob_garbage (blob_id, size)
       AND NOT EXISTS (SELECT 1 FROM parts p WHERE p.blob_id = b.blob_id);
 "#;
 
+/// Migration 8: only sessions that follow lock protocol 2 (see `catalog.sql`)
+/// may write to the catalog. Cairn 0.4.0 ran every catalog transaction at
+/// SERIALIZABLE, and takes none of the protocol's locks; SSI doesn't see the
+/// protocol's READ COMMITTED transactions, so the two must never write side
+/// by side: a 0.4.0 node enabling versioning, say, could make a new node's
+/// PUT delete a null version for good. 0.4.0 refuses a schema newer than it
+/// knows, but only when it starts, so nodes already running would carry on.
+///
+/// Instead, every statement that writes to a catalog table now checks that
+/// its session declared the protocol (`install_functions` does), and fails
+/// otherwise. Creating the triggers waits for the transactions that have
+/// written to the tables to finish, so from the moment this commits, no old
+/// session writes anything: each old transaction either ended before, or
+/// fails. Their reads keep working.
+const PROTOCOL_GATE: &str = r#"
+CREATE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '2' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER nodes_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON nodes
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER buckets_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON buckets
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER objects_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON objects
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER multipart_uploads_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON multipart_uploads
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER parts_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON parts
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER blobs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON blobs
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER blob_locations_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON blob_locations
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER blob_garbage_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON blob_garbage
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER roles_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON roles
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER role_grants_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON role_grants
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gate_requires_this_protocol() {
+        let check = format!("IS DISTINCT FROM '{}'", super::PROTOCOL);
+        assert!(super::PROTOCOL_GATE.contains(&check));
+    }
+
+    /// Every table in the schema is gated, or listed here as not needing it.
+    #[test]
+    fn every_table_is_gated() {
+        let schema = super::MIGRATIONS.concat();
+        let dropped = ["part_locations", "gc_runs"];
+        // Written only under the migrations' own lock, by Cairns that check
+        // the schema's version first.
+        let ungated = ["schema_migrations"];
+        for line in schema.lines() {
+            let Some(rest) = line.strip_prefix("CREATE TABLE ") else { continue };
+            let table = rest.trim_start_matches("IF NOT EXISTS ").split([' ', '(']).next().unwrap();
+            if dropped.contains(&table) || ungated.contains(&table) {
+                continue;
+            }
+            let trigger = format!("CREATE TRIGGER {table}_protocol ");
+            assert!(super::PROTOCOL_GATE.contains(&trigger), "{table} isn't gated");
+        }
+    }
+
     #[test]
     fn the_fold_lock_matches_the_catalog() {
         let call = format!("pg_try_advisory_xact_lock({})", super::FOLD_LOCK);
