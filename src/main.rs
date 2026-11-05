@@ -498,6 +498,9 @@ pub(crate) struct BlobWriter {
     summer: BlobSummer,
     crc: crc64fast_nvme::Digest,
     size: u64,
+    /// Whether the blob has been handed on (`finish`) or deleted (`abort`).
+    /// Until then, dropping the writer deletes it (see `Drop`).
+    settled: bool,
 }
 
 impl BlobWriter {
@@ -535,10 +538,16 @@ impl BlobWriter {
                 )
                 .await
         };
+        // If this future is dropped before the writer exists (whose `Drop`
+        // takes over), the pending blob is deleted in the background. Armed
+        // before the insert, since that may have happened by then; if the
+        // insert is still underway when the discard runs, the GC has the row.
+        let mut pending = blobs::DiscardOnDrop::new(app, blob_id);
         // Independent of each other, so they're sent together, and take one
         // round trip between them.
         let (inserted, replicas) = tokio::join!(insert, choose_replicas(&client, app.replication_factor));
         if inserted? == 0 {
+            pending.disarm();
             return Ok(None);
         }
         drop(client);
@@ -547,6 +556,7 @@ impl BlobWriter {
             Err(e) => {
                 // No sink has started, so there are only the row's to delete.
                 blobs::discard(app, blob_id).await;
+                pending.disarm();
                 return Err(e);
             }
         };
@@ -572,6 +582,7 @@ impl BlobWriter {
                 });
             }
         }
+        pending.disarm();
         Ok(Some(BlobWriter {
             app: app.clone(),
             blob_id,
@@ -581,6 +592,7 @@ impl BlobWriter {
             summer: BlobSummer::new(checksum::BLOCK_SIZE),
             crc: crc64fast_nvme::Digest::new(),
             size: 0,
+            settled: false,
         }))
     }
 
@@ -600,13 +612,9 @@ impl BlobWriter {
     /// truncated data, waits for them, and deletes the pending blob and
     /// whatever its replicas stored.
     pub(crate) async fn abort(mut self, reason: &str) {
-        for tx in &self.senders {
-            let _ = tx.send(Err(std::io::Error::other(reason.to_owned()))).await;
-        }
-        self.senders.clear();
-        // Their resulting errors are expected.
-        while self.sinks.join_next().await.is_some() {}
-        blobs::discard(&self.app, self.blob_id).await;
+        let (senders, sinks) = (std::mem::take(&mut self.senders), std::mem::take(&mut self.sinks));
+        give_up(&self.app, self.blob_id, senders, sinks, reason).await;
+        self.settled = true;
     }
 
     /// Ends the blob and waits for every replica to store it. Fails if one
@@ -626,6 +634,7 @@ impl BlobWriter {
         }
         if let Some(e) = failure {
             blobs::discard(&self.app, self.blob_id).await;
+            self.settled = true;
             return Err(e);
         }
         // Every replica must have stored exactly the file we expect: the bytes we
@@ -636,24 +645,66 @@ impl BlobWriter {
         // trailer.
         let blob_id = self.blob_id;
         let data_crc = self.crc.sum64();
-        self.crc.write(&blob_file::trailer(blob_id, &self.summer.finish()));
+        let summer = std::mem::replace(&mut self.summer, BlobSummer::new(checksum::BLOCK_SIZE));
+        self.crc.write(&blob_file::trailer(blob_id, &summer.finish()));
         let file_crc = self.crc.sum64();
         if replica_crcs.iter().any(|&replica_crc| replica_crc != file_crc) {
             blobs::discard(&self.app, blob_id).await;
+            self.settled = true;
             return Err(Unavailable(format!(
                 "blob {blob_id}: a replica stored different bytes than were sent"
             ))
             .into());
         }
+        // From here on, the caller sees to the blob.
+        self.settled = true;
         Ok(Written {
             blob_id,
             nodes: self.replicas.iter().map(|(node, _)| *node).collect(),
-            replicas: self.replicas,
+            replicas: std::mem::take(&mut self.replicas),
             size: self.size,
             data_crc,
             file_crc,
         })
     }
+}
+
+/// A writer dropped before `finish` or `abort` settled its blob (the future
+/// of its request was dropped, as hyper does when the client hangs up) gives
+/// the blob up all the same, in the background, as `abort` would. A writer
+/// dropped within `finish` has no senders left, so its sinks complete the
+/// blob, which is then deleted.
+impl Drop for BlobWriter {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        let (app, blob_id) = (self.app.clone(), self.blob_id);
+        let (senders, sinks) = (std::mem::take(&mut self.senders), std::mem::take(&mut self.sinks));
+        tokio::spawn(async move {
+            give_up(&app, blob_id, senders, sinks, "the upload was given up").await;
+        });
+    }
+}
+
+/// Gives up on a blob being written: faults the sinks still being fed, so no
+/// replica durably stores the truncated data, waits for every sink (so that
+/// none is still writing when the blob is deleted), and deletes the pending
+/// blob and whatever its replicas stored.
+async fn give_up(
+    app: &Arc<App>,
+    blob_id: Uuid,
+    senders: Vec<FrameSender>,
+    mut sinks: JoinSet<anyhow::Result<u64>>,
+    reason: &str,
+) {
+    for tx in &senders {
+        let _ = tx.send(Err(std::io::Error::other(reason.to_owned()))).await;
+    }
+    drop(senders);
+    // Their resulting errors are expected.
+    while sinks.join_next().await.is_some() {}
+    blobs::discard(app, blob_id).await;
 }
 
 /// A blob fully written to its replicas, but still pending.
@@ -771,6 +822,9 @@ where
     }
     // On failure, `finish` deletes what the replicas stored itself.
     let written = writer.finish().await?;
+    // If this future is dropped before the blob is committed or discarded, the
+    // blob is deleted in the background.
+    let mut pending = blobs::DiscardOnDrop::new(app, written.blob_id);
     // Whatever keeps the upload from committing from here on, the blob is
     // deleted with its files right away; only a crash leaves it to the GC.
     let result = async {
@@ -807,6 +861,7 @@ where
         // isn't touched.
         blobs::discard(app, written.blob_id).await;
     }
+    pending.disarm();
     result
 }
 

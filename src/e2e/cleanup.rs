@@ -154,3 +154,90 @@ async fn a_replica_of_a_given_up_blob_deletes_its_file() {
     assert!(result.is_err(), "there's no such blob to record a location for");
     assert_left(&app, 0).await;
 }
+
+/// Waits for a background discard to delete every blob.
+async fn eventually_no_blobs(app: &App) {
+    for _ in 0..250 {
+        if query_i64(app, "SELECT count(*) FROM blobs").await == 0 {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("the blob was never discarded");
+}
+
+/// An upload whose request is dropped (the client hung up) while its body
+/// streams: the writer, dropped, gives the blob up in the background.
+#[tokio::test]
+async fn an_upload_dropped_while_streaming_leaves_nothing() {
+    let Some(app) = node().await else { return };
+    let (tx, body) = channel_body();
+    let uploading = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let attach = object("k", Preconditions::default());
+            crate::upload_part(&app, body, &attach, Payload::unchecked()).await
+        })
+    };
+    tx.send(Ok(Frame::data(Bytes::from_static(b"the start")))).await.unwrap();
+    // The blob exists, and its replica is being written.
+    while query_i64(&app, "SELECT count(*) FROM blobs").await == 0 {
+        tokio::task::yield_now().await;
+    }
+    uploading.abort();
+    let _ = uploading.await;
+    eventually_no_blobs(&app).await;
+    assert_left(&app, 0).await;
+}
+
+/// A blob written for an upload whose request is dropped before its commit:
+/// the guard that `upload_part` holds over it discards it.
+#[tokio::test]
+async fn a_written_blob_dropped_before_its_commit_is_discarded() {
+    let Some(app) = node().await else { return };
+    let mut writer = crate::BlobWriter::begin(&app).await.unwrap();
+    writer.write(Bytes::from_static(b"data")).await;
+    let written = writer.finish().await.unwrap();
+    assert_left(&app, 1).await;
+    drop(crate::blobs::DiscardOnDrop::new(&app, written.blob_id));
+    eventually_no_blobs(&app).await;
+    assert_left(&app, 0).await;
+}
+
+/// An upload whose request is dropped while its commit statement runs: the
+/// discard and the commit race, and whichever wins, what's left is
+/// consistent. Either the object is committed, with its blob, or neither is
+/// there. (The discard usually loses: it gets the dropped commit's connection
+/// from the pool, and so waits for the statement already sent on it.)
+#[tokio::test]
+async fn an_upload_dropped_while_committing_leaves_nothing_unreferenced() {
+    let Some(app) = node().await else { return };
+    // Hold the key's lock (K in `catalog.sql`), so the commit waits for it.
+    let key = format!("{BUCKET}/k");
+    let holder = app.pool.get().await.unwrap();
+    holder.execute("SELECT pg_advisory_lock(hashtextextended($1, 0))", &[&key]).await.unwrap();
+    let uploading = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            upload(&app, &object("k", Preconditions::default()), b"data", Payload::unchecked()).await
+        })
+    };
+    let waiting = "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted";
+    while query_i64(&app, waiting).await == 0 {
+        tokio::task::yield_now().await;
+    }
+    uploading.abort();
+    let _ = uploading.await;
+    holder.execute("SELECT pg_advisory_unlock(hashtextextended($1, 0))", &[&key]).await.unwrap();
+    // Until the commit and the discard are through.
+    let busy = "SELECT count(*) FROM pg_stat_activity
+                WHERE datname = current_database() AND state = 'active'
+                  AND pid <> pg_backend_pid()";
+    while query_i64(&app, busy).await > 0 {
+        tokio::task::yield_now().await;
+    }
+    let objects = query_i64(&app, "SELECT count(*) FROM objects").await;
+    let committed = query_i64(&app, "SELECT count(*) FROM blobs WHERE state = 'committed'").await;
+    assert_eq!(committed, objects, "a committed object has its blob, and only then");
+    assert_left(&app, objects).await;
+}

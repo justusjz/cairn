@@ -88,6 +88,39 @@ pub(crate) async fn discard(app: &Arc<App>, blob_id: Uuid) {
     }
 }
 
+/// Discards a pending blob in the background when dropped, unless `disarm`ed:
+/// for the stretch between a blob being written and its commit, so that a
+/// dropped request (a client hanging up) doesn't leave the blob to the GC.
+/// Safe even if a commit is underway: a committed blob isn't touched, and a
+/// commit that comes after finds the blob gone, and commits nothing.
+pub(crate) struct DiscardOnDrop {
+    app: Arc<App>,
+    blob_id: Option<Uuid>,
+}
+
+impl DiscardOnDrop {
+    pub(crate) fn new(app: &Arc<App>, blob_id: Uuid) -> DiscardOnDrop {
+        DiscardOnDrop {
+            app: app.clone(),
+            blob_id: Some(blob_id),
+        }
+    }
+
+    /// The blob has been committed, or discarded: there's nothing left to do.
+    pub(crate) fn disarm(&mut self) {
+        self.blob_id = None;
+    }
+}
+
+impl Drop for DiscardOnDrop {
+    fn drop(&mut self) {
+        if let Some(blob_id) = self.blob_id.take() {
+            let app = self.app.clone();
+            tokio::spawn(async move { discard(&app, blob_id).await });
+        }
+    }
+}
+
 /// Best-effort: once a set of blobs has been removed from the catalog, ask each
 /// holder to delete the file from disk *now*: locally if that's us, else via the
 /// peer's `DELETE /blobs/{id}`. The rows are already gone, so any deletion that
