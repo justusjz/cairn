@@ -266,3 +266,27 @@ async fn copies_racing_deletes_of_their_source_stay_whole() {
         assert_files(&app, 0).await;
     }
 }
+
+/// CopyObject reports the new version's last-modified time, as the catalog
+/// has it.
+#[tokio::test]
+async fn a_copy_reports_its_last_modified_time() {
+    let Some(app) = node().await else { return };
+    put(&app, "src", b"data".to_vec()).await;
+    let source = format!("{BUCKET}/src");
+    let response = copy_object(&app, BUCKET, "dst", &source, None, "text/plain", &Preconditions::default())
+        .await
+        .unwrap();
+    let reported = xml_field(&body_text(response).await, "LastModified");
+    let client = app.pool.get().await.unwrap();
+    let stored: String = client
+        .query_one(
+            "SELECT to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"')
+             FROM objects WHERE key = 'dst'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(reported, stored);
+}

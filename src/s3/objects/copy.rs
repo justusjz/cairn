@@ -138,27 +138,18 @@ pub async fn copy_object(
         } else {
             &version.content_type
         };
-        let version_id =
+        // CopyObject reports the new version's last-modified time in the body
+        // (not just the ETag header). It comes from the commit itself: read
+        // afterwards, a concurrent write to the key could have replaced the
+        // version already.
+        let (version_id, last_modified) =
             match commit_object_copy(app, &source, dest_bucket, dest_key, &etag, content_type)
                 .await?
             {
-                ObjectCopy::Committed(version_id) => version_id,
+                ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
                 ObjectCopy::SourceChanged => continue, // copy what it is now
                 ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
             };
-
-        // CopyObject reports the result in the body (not just the ETag header):
-        // read back the new version's freshly-stamped last-modified in ISO 8601.
-        // An unversioned bucket's only version is `null`.
-        let client = app.pool.get().await?;
-        let last_modified: String = client
-            .query_one_cached(
-                "SELECT to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\".000Z\"')
-                 FROM objects WHERE bucket = $1 AND key = $2 AND version_id = $3",
-                &[&dest_bucket, &dest_key, &version_id.as_deref().unwrap_or("null")],
-            )
-            .await?
-            .get(0);
         let resp = with_version_id(
             xml_ok(format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -175,8 +166,12 @@ pub async fn copy_object(
 }
 
 enum ObjectCopy {
-    /// Committed, with the version ID to report.
-    Committed(Option<String>),
+    /// Committed, with the version ID to report, and the new version's
+    /// last-modified time in ISO 8601.
+    Committed {
+        version_id: Option<String>,
+        last_modified: String,
+    },
     /// The source changed since it was read.
     SourceChanged,
     /// The destination bucket was deleted meanwhile.
@@ -200,7 +195,7 @@ async fn commit_object_copy(
         let result: Result<_, tokio_postgres::Error> = async {
             let row = client
                 .query_one_cached(
-                    "SELECT status, version_id, reap_blob, reap_node, reap_peer
+                    "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9)",
                     &[
                         &source.version.id,
@@ -222,8 +217,12 @@ async fn commit_object_copy(
                 "no_such_bucket" => return Ok((ObjectCopy::NoSuchBucket, Vec::new())),
                 status => unreachable!("cairn_copy_object: unknown status {status}"),
             }
-            let reap = reap_columns(&row, 2);
-            Ok((ObjectCopy::Committed(row.get(1)), reap))
+            let reap = reap_columns(&row, 3);
+            let committed = ObjectCopy::Committed {
+                version_id: row.get(1),
+                last_modified: row.get(2),
+            };
+            Ok((committed, reap))
         }
         .await;
         match result {

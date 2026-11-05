@@ -741,7 +741,8 @@ END
 $$;
 
 -- T3: CopyObject's commit: a new version at (bucket, key) with parts on the
--- source version's bytes ('committed'), unless the source changed since the
+-- source version's bytes ('committed', with the new version's last-modified
+-- time in ISO 8601, as CopyObject reports it), unless the source changed since the
 -- copy read it ('source_changed') or the bucket is gone ('no_such_bucket').
 -- Takes B(b) shared, K(b,k), then X: the source's blobs shared, and those of
 -- the version it replaces.
@@ -749,7 +750,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_source bigint, p_part_ids bigint[], p_part_sizes bigint[],
     p_bucket text, p_key text, p_size bigint, p_etag text, p_content_type text,
     p_new_version_id text,
-    OUT status text, OUT version_id text,
+    OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -786,6 +787,8 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_new_version_id);
     version_id := v.version_id;
+    SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
+    INTO last_modified FROM objects o WHERE o.id = v.id;
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
                        part_number, created_at)
     SELECT t.blob_id, t.blob_offset, t.size, t.etag, t.crc, v.id, NULL, t.n, NOW()
