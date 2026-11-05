@@ -360,15 +360,33 @@ pub async fn handle(
     Ok(box_response(resp))
 }
 
+/// The most a request body that's handled whole may hold. Such a body is an
+/// XML document, which is kept in memory; the largest real one, a
+/// CompleteMultipartUpload of 10,000 parts with their checksums, is a few MiB.
+const MAX_WHOLE_BODY: usize = 8 << 20;
+
 /// Reads a request body that's handled whole (an XML document), checked
 /// against what the request claims about it, as an upload's is (see
-/// `Payload`). `checksum_headers` says whether its `x-amz-checksum-*` header
-/// is one of the body. `Err` holds why it was refused.
+/// `Payload`), and refused if it's larger than `MAX_WHOLE_BODY`, as S3
+/// refuses one too large. `checksum_headers` says whether its
+/// `x-amz-checksum-*` header is one of the body. `Err` holds why it was
+/// refused.
 async fn read_body(
     req: Request<hyper::body::Incoming>,
     secret: &str,
     checksum_headers: bool,
 ) -> anyhow::Result<Result<hyper::body::Bytes, Rejection>> {
+    let too_big = || {
+        Rejection::new(StatusCode::BAD_REQUEST, "MaxMessageLengthExceeded", "Your request was too big.")
+    };
+    let declared = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if declared.is_some_and(|length| length > MAX_WHOLE_BODY as u64) {
+        return Ok(Err(too_big()));
+    }
     let mut payload = match Payload::new(req.headers(), secret, checksum_headers) {
         Ok(payload) => payload,
         Err(rejection) => return Ok(Err(rejection)),
@@ -380,6 +398,11 @@ async fn read_body(
         match payload.decode(chunk) {
             Ok(pieces) => pieces.iter().for_each(|piece| data.extend_from_slice(piece)),
             Err(rejection) => return Ok(Err(rejection)),
+        }
+        // Without a Content-Length (chunked transfer encoding), or with an
+        // aws-chunked body, the length is only known as it arrives.
+        if data.len() > MAX_WHOLE_BODY {
+            return Ok(Err(too_big()));
         }
     }
     Ok(payload.finish().map(|()| data.into()))

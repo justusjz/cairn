@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=82
+TOTAL=83
 STEP=0
 PASS=0
 FAIL=0
@@ -573,6 +573,19 @@ replayed_body_rejected() {
     [ "$(scurl POST "/${BUCKET}?delete" "$sha" "$list" "Content-MD5: ${md5}")" = 400 ] || return 1
     check_roundtrip "$SMALL" "s3://${BUCKET}/swap-keep.txt" || return 1
     awss3 s3api delete-object --bucket "$BUCKET" --key swap-keep.txt >/dev/null 2>&1
+}
+
+# A body that's read whole (here PutBucketVersioning's) is refused once it's
+# larger than 8 MiB (400), rather than kept in memory, whether it declares its
+# length or arrives in HTTP chunks. The document is valid, and names no bucket,
+# so the same one, read, gets a 404.
+oversized_body_rejected() {
+    local doc="$WORK_DIR/versioning.xml" big="$WORK_DIR/huge.xml" path="/no-such-bucket-cap?versioning"
+    printf '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>' >"$doc"
+    { cat "$doc"; head -c $((9 * 1024 * 1024)) /dev/zero | tr '\0' ' '; } >"$big"
+    [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$doc")" = 404 ] || return 1
+    [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$big")" = 400 ] || return 1
+    [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$big" "Transfer-Encoding: chunked")" = 400 ]
 }
 
 # Content-MD5 and x-amz-checksum-* headers are checked against an upload's
@@ -1419,6 +1432,7 @@ run_test    "Signed streaming upload via mcli (mode 4)" mc_streaming_ok
 run_test    "Signed trailer checksums via mcli"     mc_trailer_ok
 run_test    "Replayed request with another body refused" replayed_body_rejected
 run_test    "Upload Content-MD5/checksum headers checked" upload_checksums_ok
+run_test    "Oversized XML body refused"            oversized_body_rejected
 run_test    "Set up pagination fixtures"            setup_pagination
 run_test    "ListObjectsV2 paginates leaves"        v2_leaves_ok
 run_test    "ListObjects (v1) paginates leaves"     v1_leaves_ok
