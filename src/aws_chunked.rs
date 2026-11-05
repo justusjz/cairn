@@ -1,4 +1,5 @@
-//! Decoder for AWS SigV4 *streaming* uploads (`Content-Encoding: aws-chunked`).
+//! Decoder for AWS SigV4 *streaming* uploads (`x-amz-content-sha256:
+//! STREAMING-…`, sent with `Content-Encoding: aws-chunked`).
 //!
 //! When an S3 client uploads with a streaming signature, the request body isn't
 //! the raw object — it's framed into chunks:
@@ -18,28 +19,26 @@
 //! [`StreamingChunkVerifier`], each chunk's signature is also verified as it's
 //! decoded (mode 4), faulting the stream on a mismatch.
 
-use std::io;
-
-use hyper::{HeaderMap, body::Bytes, header};
+use hyper::body::Bytes;
 use sha2::{Digest, Sha256};
 
 use crate::auth::{EMPTY_SHA256, StreamingChunkVerifier};
 
-/// True if the request body is `aws-chunked` framed and must be decoded before
-/// storage. Signalled by a streaming `x-amz-content-sha256`
-/// (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`, `…-TRAILER`, or the unsigned variant),
-/// or by an explicit `Content-Encoding: aws-chunked`.
-pub fn is_aws_chunked(headers: &HeaderMap) -> bool {
-    let streaming_sha = headers
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.starts_with("STREAMING-"));
-    let chunked_encoding = headers
-        .get(header::CONTENT_ENCODING)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.split(',').any(|e| e.trim() == "aws-chunked"));
-    streaming_sha || chunked_encoding
+/// Why an `aws-chunked` body was refused.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ChunkError {
+    /// A chunk's (or the trailer's) signature didn't verify.
+    Signature,
+    /// A signed chunk other than the last data chunk was smaller than S3's
+    /// minimum, [`MIN_SIGNED_CHUNK`].
+    TooSmall,
+    /// The framing is malformed.
+    Malformed(&'static str),
 }
+
+/// The smallest a signed chunk may be, unless it's the last one with data. As
+/// in S3, which answers a smaller one with InvalidChunkSizeError.
+pub const MIN_SIGNED_CHUNK: u64 = 8192;
 
 /// Cap on a single chunk-size line, so a malformed stream can't make us buffer
 /// without bound. Real headers are well under 100 bytes (hex size + signature).
@@ -72,6 +71,9 @@ pub struct AwsChunkedDecoder {
     chunk_hasher: Option<Sha256>,
     /// The current chunk header's `chunk-signature=` value, while verifying.
     chunk_signature: String,
+    /// The size of the last chunk with data, while verifying: only the last
+    /// of them may be smaller than [`MIN_SIGNED_CHUNK`].
+    last_size: Option<u64>,
 }
 
 impl AwsChunkedDecoder {
@@ -83,13 +85,15 @@ impl AwsChunkedDecoder {
             verifier,
             chunk_hasher: None,
             chunk_signature: String::new(),
+            last_size: None,
         }
     }
 
     /// Feeds one body chunk through the decoder, returning the decoded payload
     /// segments it produced. Segments are zero-copy slices of `input`, so no
-    /// payload bytes are duplicated. Errors on a malformed frame.
-    pub fn decode(&mut self, input: Bytes) -> io::Result<Vec<Bytes>> {
+    /// payload bytes are duplicated. Errors on a malformed frame, or a chunk
+    /// that fails verification.
+    pub fn decode(&mut self, input: Bytes) -> Result<Vec<Bytes>, ChunkError> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < input.len() {
@@ -100,15 +104,21 @@ impl AwsChunkedDecoder {
                     if self.header.ends_with(b"\r\n") {
                         let (size, signature) = parse_chunk_header(&self.header)?;
                         self.header.clear();
+                        if self.verifier.is_some() && size > 0 {
+                            // Another chunk follows, so the one before wasn't
+                            // the last.
+                            if self.last_size.is_some_and(|last| last < MIN_SIGNED_CHUNK) {
+                                return Err(ChunkError::TooSmall);
+                            }
+                            self.last_size = Some(size);
+                        }
                         if size == 0 {
                             // The terminating chunk is itself signed, over the
                             // empty-payload hash; verify it before finishing.
                             if let Some(v) = self.verifier.as_mut()
                                 && !v.verify_chunk(EMPTY_SHA256, &signature)
                             {
-                                return Err(io::Error::other(
-                                    "aws-chunked: chunk signature mismatch",
-                                ));
+                                return Err(ChunkError::Signature);
                             }
                             self.state = State::Trailer;
                         } else {
@@ -117,7 +127,7 @@ impl AwsChunkedDecoder {
                             self.state = State::Data(size);
                         }
                     } else if self.header.len() > MAX_HEADER_LINE {
-                        return Err(io::Error::other("aws-chunked: chunk header too long"));
+                        return Err(ChunkError::Malformed("chunk header too long"));
                     }
                 }
                 State::Data(ref mut n) => {
@@ -141,9 +151,7 @@ impl AwsChunkedDecoder {
                                 .map(|h| h.finalize().iter().map(|b| format!("{b:02x}")).collect())
                                 .unwrap_or_default();
                             if !v.verify_chunk(&data_hash, &self.chunk_signature) {
-                                return Err(io::Error::other(
-                                    "aws-chunked: chunk signature mismatch",
-                                ));
+                                return Err(ChunkError::Signature);
                             }
                         }
                         self.state = State::DataCrlf(2);
@@ -157,9 +165,7 @@ impl AwsChunkedDecoder {
                         // silently swallow payload bytes.
                         let expected = if *rem == 2 { b'\r' } else { b'\n' };
                         if input[i] != expected {
-                            return Err(io::Error::other(
-                                "aws-chunked: missing CRLF after chunk data",
-                            ));
+                            return Err(ChunkError::Malformed("missing CRLF after chunk data"));
                         }
                         i += 1;
                         *rem -= 1;
@@ -171,7 +177,7 @@ impl AwsChunkedDecoder {
                 State::Trailer => {
                     let rest = &input[i..];
                     if self.trailer.len() + rest.len() > MAX_TRAILER {
-                        return Err(io::Error::other("aws-chunked: trailer too long"));
+                        return Err(ChunkError::Malformed("trailer too long"));
                     }
                     self.trailer.extend_from_slice(rest);
                     i = input.len();
@@ -194,10 +200,47 @@ impl AwsChunkedDecoder {
         })
     }
 
-    /// Whether the terminating zero-size chunk has been seen. A stream that ends
-    /// without it is truncated, and storing it would silently corrupt the object.
+    /// Verifies the signature of the trailer (`x-amz-trailer-signature`), which
+    /// a signed streaming body with a trailer
+    /// (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER`) ends with. It covers the
+    /// trailer's other lines, each exactly as sent and ended by `\n`, chained
+    /// from the terminating chunk's signature (as MinIO checks it too). Only
+    /// meaningful once the body is fully read (`is_complete`).
+    pub fn verify_trailer_signature(&self) -> Result<(), ChunkError> {
+        let Some(verifier) = &self.verifier else {
+            return Err(ChunkError::Signature);
+        };
+        let text = std::str::from_utf8(&self.trailer)
+            .map_err(|_| ChunkError::Malformed("non-UTF-8 trailer"))?;
+        let mut signature = None;
+        let mut canonical = String::new();
+        for line in text.lines().filter(|line| !line.trim().is_empty()) {
+            let (name, value) = line
+                .split_once(':')
+                .ok_or(ChunkError::Malformed("trailer line without a colon"))?;
+            if name.trim().eq_ignore_ascii_case("x-amz-trailer-signature") {
+                signature = Some(value.trim());
+            } else {
+                canonical.push_str(line);
+                canonical.push('\n');
+            }
+        }
+        let signature = signature.ok_or(ChunkError::Signature)?;
+        let hash: String =
+            Sha256::digest(canonical.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        if verifier.verify_trailer(&hash, signature) {
+            Ok(())
+        } else {
+            Err(ChunkError::Signature)
+        }
+    }
+
+    /// Whether the terminating zero-size chunk has been seen, and the trailer
+    /// section after it ends with a line break. A stream that ends without
+    /// them is truncated, and storing it would silently corrupt the object (or
+    /// check it against a cut-off trailer).
     pub fn is_complete(&self) -> bool {
-        matches!(self.state, State::Trailer)
+        matches!(self.state, State::Trailer) && self.trailer.ends_with(b"\n")
     }
 }
 
@@ -209,14 +252,14 @@ impl Default for AwsChunkedDecoder {
 
 /// Parses a `<hex-size>[;chunk-signature=<sig>]\r\n` line into the chunk size and
 /// the chunk signature (empty if unsigned, e.g. mode 3).
-fn parse_chunk_header(line: &[u8]) -> io::Result<(u64, String)> {
+fn parse_chunk_header(line: &[u8]) -> Result<(u64, String), ChunkError> {
     let line = &line[..line.len() - 2]; // strip the trailing \r\n
-    let line = std::str::from_utf8(line)
-        .map_err(|_| io::Error::other("aws-chunked: non-utf8 chunk header"))?;
+    let line =
+        std::str::from_utf8(line).map_err(|_| ChunkError::Malformed("non-UTF-8 chunk header"))?;
     let mut parts = line.split(';');
     let hex = parts.next().unwrap_or("").trim();
-    let size = u64::from_str_radix(hex, 16)
-        .map_err(|_| io::Error::other("aws-chunked: invalid chunk size"))?;
+    let size =
+        u64::from_str_radix(hex, 16).map_err(|_| ChunkError::Malformed("invalid chunk size"))?;
     let signature = parts
         .find_map(|p| p.trim().strip_prefix("chunk-signature="))
         .unwrap_or("")

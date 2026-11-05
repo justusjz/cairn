@@ -5,7 +5,6 @@ use hyper::{Response, StatusCode, body::Bytes};
 use crate::db::Cached;
 use crate::{
     App,
-    auth::BodyChecksum,
     db,
     s3::util::{format_s3_error, slow_down, xml_ok},
     s3::versions::{Versioning, bucket_versioning},
@@ -90,20 +89,12 @@ async fn try_update(
 /// PutBucketVersioning: `PUT /{bucket}?versioning` with a
 /// `<VersioningConfiguration>` body. Enables or suspends versioning. Suspending
 /// keeps every existing version; it only changes how new writes and deletes land.
-/// An integrity header (Content-MD5 / x-amz-checksum-*) is verified if present.
+/// The body has been checked against its integrity headers (see `Payload`).
 pub async fn put_bucket_versioning(
     app: &App,
     bucket: &str,
     body: Bytes,
-    checksum: BodyChecksum,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    if checksum.is_present() && !checksum.matches(&body) {
-        return Ok(format_s3_error(
-            StatusCode::BAD_REQUEST,
-            "BadDigest",
-            "the integrity checksum you specified did not match what we received",
-        ));
-    }
     let requested = std::str::from_utf8(&body).ok().and_then(parse_versioning);
     let versioning = match requested {
         Some(Requested::Set(versioning)) => Some(versioning),

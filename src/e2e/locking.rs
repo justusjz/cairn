@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::{BUCKET, delete, get, node_with, put, query_i64};
 use crate::{
     App, AttachTarget, UploadResult,
-    auth::ContentSha256,
+    payload::Payload,
     gc,
     packer::{self, Stage},
     s3::{
@@ -294,7 +294,7 @@ async fn upload_part(app: &Arc<App>, upload_id: Uuid, number: i32, data: &[u8]) 
         part_number: number,
     };
     let body = http_body_util::Full::new(hyper::body::Bytes::from(data.to_vec()));
-    crate::upload_part(app, body, &attach, false, ContentSha256::Unsigned, None)
+    crate::upload_part(app, body, &attach, Payload::unchecked())
         .await
         .unwrap()
 }
@@ -454,7 +454,7 @@ async fn a_put_into_a_missing_bucket_writes_nothing() {
         conditions: crate::s3::conditional::Preconditions::default(),
     };
     let body = http_body_util::Full::new(hyper::body::Bytes::from_static(b"data"));
-    let result = crate::upload_part(&app, body, &attach, false, ContentSha256::Unsigned, None)
+    let result = crate::upload_part(&app, body, &attach, Payload::unchecked())
         .await
         .unwrap();
     assert!(matches!(result, UploadResult::NoSuchBucket));

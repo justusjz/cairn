@@ -11,7 +11,7 @@ use super::{BUCKET, get, node_with, put, query_i64};
 use uuid::Uuid;
 
 use crate::{
-    App, AttachTarget, UploadResult, auth::ContentSha256, packer,
+    App, AttachTarget, UploadResult, payload::Payload, packer,
     s3::conditional::Preconditions,
 };
 
@@ -24,7 +24,7 @@ async fn try_put(app: &Arc<App>, key: &str, data: Vec<u8>) -> anyhow::Result<()>
         conditions: Preconditions::default(),
     };
     let body = Full::new(Bytes::from(data));
-    let result = crate::upload_part(app, body, &attach, false, ContentSha256::Unsigned, None).await?;
+    let result = crate::upload_part(app, body, &attach, Payload::unchecked()).await?;
     assert!(matches!(result, UploadResult::Committed { .. }));
     Ok(())
 }

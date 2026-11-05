@@ -10,10 +10,10 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App, AttachTarget, Contended, UploadResult,
-    auth::ContentSha256,
     blobs::{reap_blobs, reap_columns},
     body::channel_body,
     db,
+    payload::Payload,
     s3::{
         conditional::{Precondition, Preconditions},
         objects::get::{
@@ -462,17 +462,15 @@ async fn stream_part_copy(
         upload_id,
         part_number,
     };
-    // The source stream is trusted internal data, so it carries no
-    // content-sha256 claim and no aws-chunked framing: only Committed is
-    // reachable.
-    match crate::upload_part(app, source_body, &attach, false, ContentSha256::Unsigned, None).await? {
+    // The source stream is data from within Cairn (verified against its block
+    // checksums as it's read), so there's nothing to check it against.
+    match crate::upload_part(app, source_body, &attach, Payload::unchecked()).await? {
         UploadResult::Committed { etag, .. } => Ok(Some(etag)),
         UploadResult::NoSuchUpload => Ok(None),
-        UploadResult::ContentSha256Mismatch
-        | UploadResult::ChunkSignatureMismatch
-        | UploadResult::PreconditionFailed
-        | UploadResult::NoSuchBucket => {
-            anyhow::bail!("the copy of a source range failed an integrity check")
+        // Nothing is checked, there are no conditions, and a part has no bucket
+        // to check.
+        UploadResult::Rejected(_) | UploadResult::PreconditionFailed | UploadResult::NoSuchBucket => {
+            unreachable!("an unchecked part upload only commits, or finds its upload gone")
         }
     }
 }

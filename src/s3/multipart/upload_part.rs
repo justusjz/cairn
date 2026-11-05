@@ -7,8 +7,8 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App, AttachTarget, UploadResult,
-    auth::{ContentSha256, StreamingChunkVerifier},
-    s3::util::format_s3_error,
+    payload::Payload,
+    s3::util::{format_s3_error, rejection_response},
 };
 
 /// UploadPart: `PUT /{bucket}/{key}?partNumber=N&uploadId=U`. Streams the part
@@ -21,9 +21,7 @@ pub async fn put_part(
     upload_id: &str,
     part_number: &str,
     body: Incoming,
-    aws_chunked: bool,
-    content_sha256: ContentSha256,
-    chunk_verifier: Option<StreamingChunkVerifier>,
+    payload: Payload,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -74,9 +72,7 @@ pub async fn put_part(
             upload_id,
             part_number,
         },
-        aws_chunked,
-        content_sha256,
-        chunk_verifier,
+        payload,
     )
     .await?
     {
@@ -85,16 +81,7 @@ pub async fn put_part(
             .header(header::ETAG, format!("\"{etag}\""))
             .body(Full::new(Bytes::new()))
             .unwrap()),
-        UploadResult::ContentSha256Mismatch => Ok(format_s3_error(
-            StatusCode::BAD_REQUEST,
-            "XAmzContentSHA256Mismatch",
-            "the provided x-amz-content-sha256 does not match the calculated hash",
-        )),
-        UploadResult::ChunkSignatureMismatch => Ok(format_s3_error(
-            StatusCode::FORBIDDEN,
-            "SignatureDoesNotMatch",
-            "the request signature we calculated does not match the signature you provided",
-        )),
+        UploadResult::Rejected(rejection) => Ok(rejection_response(&rejection)),
         // The upload was completed or aborted while the body streamed.
         UploadResult::NoSuchUpload => Ok(format_s3_error(
             StatusCode::NOT_FOUND,

@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::{BUCKET, assert_files, node_replicating, node_with, put, query_i64};
 use crate::{
     App, AttachTarget, UploadResult,
-    auth::ContentSha256,
+    payload::Payload,
     body::channel_body,
     packer,
     s3::conditional::Preconditions,
@@ -32,15 +32,15 @@ fn object(key: &str, conditions: Preconditions) -> AttachTarget {
     }
 }
 
-/// Uploads `data` to `attach`, claiming `content_sha256`.
+/// Uploads `data` to `attach`, checked as `payload` says.
 async fn upload(
     app: &Arc<App>,
     attach: &AttachTarget,
     data: &'static [u8],
-    content_sha256: ContentSha256,
+    payload: Payload,
 ) -> anyhow::Result<UploadResult> {
     let body = Full::new(Bytes::from_static(data));
-    crate::upload_part(app, body, attach, false, content_sha256, None).await
+    crate::upload_part(app, body, attach, payload).await
 }
 
 /// Checks that exactly `blobs` blobs are left, in the catalog and on disk
@@ -55,9 +55,14 @@ async fn assert_left(app: &App, blobs: i64) {
 #[tokio::test]
 async fn a_body_that_fails_its_checksum_leaves_nothing() {
     let Some(app) = node().await else { return };
-    let wrong = ContentSha256::Single("0".repeat(64));
+    let mut headers = HeaderMap::new();
+    headers.insert("x-amz-content-sha256", "0".repeat(64).parse().unwrap());
+    let wrong = Payload::new(&headers, "", true).unwrap();
     let result = upload(&app, &object("k", Preconditions::default()), b"data", wrong).await;
-    assert!(matches!(result.unwrap(), UploadResult::ContentSha256Mismatch));
+    assert!(matches!(
+        result.unwrap(),
+        UploadResult::Rejected(rejection) if rejection.code == "XAmzContentSHA256Mismatch"
+    ));
     assert_left(&app, 0).await;
 }
 
@@ -69,7 +74,7 @@ async fn a_failed_precondition_leaves_nothing() {
     let mut headers = HeaderMap::new();
     headers.insert("if-none-match", "*".parse().unwrap());
     let create_only = object("k", Preconditions::from_headers(&headers));
-    let result = upload(&app, &create_only, b"second", ContentSha256::Unsigned).await;
+    let result = upload(&app, &create_only, b"second", Payload::unchecked()).await;
     assert!(matches!(result.unwrap(), UploadResult::PreconditionFailed));
     // Only the first object's blob.
     assert_left(&app, 1).await;
@@ -84,7 +89,7 @@ async fn a_part_of_a_vanished_upload_leaves_nothing() {
         upload_id: Uuid::now_v7(),
         part_number: 1,
     };
-    let result = upload(&app, &attach, b"data", ContentSha256::Unsigned).await;
+    let result = upload(&app, &attach, b"data", Payload::unchecked()).await;
     assert!(matches!(result.unwrap(), UploadResult::NoSuchUpload));
     assert_left(&app, 0).await;
 }
@@ -100,7 +105,7 @@ async fn a_body_that_breaks_off_leaves_nothing() {
         tx.send(Err(std::io::Error::other("the client went away"))).await.unwrap();
     });
     let attach = object("k", Preconditions::default());
-    let result = crate::upload_part(&app, body, &attach, false, ContentSha256::Unsigned, None).await;
+    let result = crate::upload_part(&app, body, &attach, Payload::unchecked()).await;
     assert!(result.is_err());
     assert_left(&app, 0).await;
 }
@@ -125,7 +130,7 @@ async fn unreachable_node(app: &App) {
 async fn a_failed_replica_leaves_nothing() {
     let Some(app) = node_replicating(packer::Config::default(), None, 2).await else { return };
     unreachable_node(&app).await;
-    let result = upload(&app, &object("k", Preconditions::default()), b"data", ContentSha256::Unsigned).await;
+    let result = upload(&app, &object("k", Preconditions::default()), b"data", Payload::unchecked()).await;
     assert!(result.is_err());
     assert_left(&app, 0).await;
 }
@@ -134,7 +139,7 @@ async fn a_failed_replica_leaves_nothing() {
 #[tokio::test]
 async fn too_few_nodes_leave_nothing() {
     let Some(app) = node_replicating(packer::Config::default(), None, 2).await else { return };
-    let result = upload(&app, &object("k", Preconditions::default()), b"data", ContentSha256::Unsigned).await;
+    let result = upload(&app, &object("k", Preconditions::default()), b"data", Payload::unchecked()).await;
     assert!(result.is_err());
     assert_left(&app, 0).await;
 }

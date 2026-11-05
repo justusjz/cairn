@@ -6,9 +6,9 @@ use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
 use crate::db::Cached;
 use crate::{
     App, AttachTarget, UploadResult,
-    auth::{ContentSha256, StreamingChunkVerifier},
+    payload::Payload,
     s3::conditional::Preconditions,
-    s3::util::{format_s3_error, with_version_id},
+    s3::util::{format_s3_error, rejection_response, with_version_id},
     s3::versions::current_etag,
 };
 
@@ -18,9 +18,7 @@ pub async fn put_object(
     key: &str,
     content_type: &str,
     body: Incoming,
-    aws_chunked: bool,
-    content_sha256: ContentSha256,
-    chunk_verifier: Option<StreamingChunkVerifier>,
+    payload: Payload,
     conditions: &Preconditions,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     // Fast-fail a conditional write (If-Match / If-None-Match) before streaming the
@@ -52,8 +50,7 @@ pub async fn put_object(
         content_type: content_type.to_owned(),
         conditions: conditions.clone(),
     };
-    match crate::upload_part(app, body, &attach, aws_chunked, content_sha256, chunk_verifier).await?
-    {
+    match crate::upload_part(app, body, &attach, payload).await? {
         UploadResult::Committed { etag, version_id } => Ok(with_version_id(
             Response::builder()
                 .status(StatusCode::OK)
@@ -62,16 +59,7 @@ pub async fn put_object(
                 .unwrap(),
             version_id.as_deref(),
         )),
-        UploadResult::ContentSha256Mismatch => Ok(format_s3_error(
-            StatusCode::BAD_REQUEST,
-            "XAmzContentSHA256Mismatch",
-            "the provided x-amz-content-sha256 does not match the calculated hash",
-        )),
-        UploadResult::ChunkSignatureMismatch => Ok(format_s3_error(
-            StatusCode::FORBIDDEN,
-            "SignatureDoesNotMatch",
-            "the request signature we calculated does not match the signature you provided",
-        )),
+        UploadResult::Rejected(rejection) => Ok(rejection_response(&rejection)),
         // A concurrent writer won the race between the fast-fail check and commit.
         UploadResult::PreconditionFailed => Ok(precondition_failed()),
         // There's no such bucket, or it was deleted while the body streamed.

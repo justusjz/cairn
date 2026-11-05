@@ -12,7 +12,7 @@ use tokio::task::JoinSet;
 use super::{BUCKET, node_with, put, query_i64};
 use crate::{
     App, AttachTarget, UploadResult,
-    auth::ContentSha256,
+    payload::Payload,
     db, gc, packer,
     s3::{
         conditional::Preconditions,
@@ -58,7 +58,7 @@ async fn upload_part(app: &Arc<App>, upload_id: &str, number: i32, data: Vec<u8>
         part_number: number,
     };
     let body = Full::new(Bytes::from(data));
-    match crate::upload_part(app, body, &attach, false, ContentSha256::Unsigned, None).await? {
+    match crate::upload_part(app, body, &attach, Payload::unchecked()).await? {
         UploadResult::Committed { etag, .. } => Ok(etag),
         _ => anyhow::bail!("the part wasn't committed"),
     }

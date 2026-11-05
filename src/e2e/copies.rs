@@ -10,7 +10,7 @@ use uuid::Uuid;
 use super::{BUCKET, assert_files, delete, get, node_with, put};
 use crate::{
     App, AttachTarget, UploadResult,
-    auth::ContentSha256,
+    payload::Payload,
     packer,
     s3::{
         conditional::Preconditions,
@@ -78,7 +78,7 @@ async fn put_part(app: &Arc<App>, upload_id: Uuid, part_number: i32, data: Vec<u
         part_number,
     };
     let body = Full::new(Bytes::from(data));
-    match crate::upload_part(app, body, &attach, false, ContentSha256::Unsigned, None)
+    match crate::upload_part(app, body, &attach, Payload::unchecked())
         .await
         .unwrap()
     {

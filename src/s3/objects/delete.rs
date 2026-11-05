@@ -7,7 +7,6 @@ use hyper::{Response, StatusCode, body::Bytes};
 use crate::db::Cached;
 use crate::{
     App,
-    auth::BodyChecksum,
     blobs::{ReapTarget, reap_blobs, reap_columns},
     db,
     s3::util::{
@@ -165,37 +164,29 @@ fn parse_delete_request(body: &str) -> Option<(Vec<Target>, bool)> {
 }
 
 /// DeleteObjects (batch): `POST /{bucket}?delete` with a `<Delete>` body listing
-/// keys, each optionally with a version ID. `checksum` is the request's
-/// body-integrity headers. Authorization is per entry, as in S3: an entry naming
+/// keys, each optionally with a version ID. The body has been checked against
+/// its integrity headers (see `Payload`), of which S3 requires one here
+/// ([`missing_checksum`]). Authorization is per entry, as in S3: an entry naming
 /// a version needs `may_delete_versions`, any other needs `may_write`; a denied
 /// entry is reported as an AccessDenied `<Error>` and the rest still proceed.
+/// The error for a DeleteObjects without an integrity header. The body *is*
+/// the list of things to destroy, so S3 requires one: Content-MD5 (minio-go)
+/// or an x-amz-checksum-* (aws-cli).
+pub fn missing_checksum() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::BAD_REQUEST,
+        "InvalidRequest",
+        "missing required integrity header: Content-MD5 or x-amz-checksum-*",
+    )
+}
+
 pub async fn delete_objects(
     app: &Arc<App>,
     bucket: &str,
     body: Bytes,
-    checksum: BodyChecksum,
     may_write: bool,
     may_delete_versions: bool,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    // Integrity first: this operation is destructive and the body *is* the list of
-    // things to destroy, so a corrupted body must never delete the wrong objects.
-    // S3 requires an integrity header here — Content-MD5 (minio-go) or an
-    // x-amz-checksum-* (aws-cli). Require at least one and verify it.
-    if !checksum.is_present() {
-        return Ok(format_s3_error(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "missing required integrity header: Content-MD5 or x-amz-checksum-*",
-        ));
-    }
-    if !checksum.matches(&body) {
-        return Ok(format_s3_error(
-            StatusCode::BAD_REQUEST,
-            "BadDigest",
-            "the integrity checksum you specified did not match what we received",
-        ));
-    }
-
     let Ok(body_str) = std::str::from_utf8(&body) else {
         return Ok(format_s3_error(
             StatusCode::BAD_REQUEST,

@@ -5,7 +5,9 @@ use hyper::{Method, Request, Response, StatusCode};
 
 use crate::{
     App,
+    auth::Rejection,
     body::{ResBody, box_response},
+    payload::{self, Payload},
     roles::{Permission, Principal},
     s3::{
         buckets::{
@@ -22,7 +24,7 @@ use crate::{
         },
         objects::{
             copy::{copy_object, copy_part, parse_copy_source},
-            delete::{delete_object, delete_objects},
+            delete::{delete_object, delete_objects, missing_checksum},
             get::{get_object, head_object},
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
             list_versions::list_object_versions,
@@ -177,20 +179,26 @@ pub async fn handle(
             // PutBucketVersioning: PUT /{bucket}?versioning with a
             // <VersioningConfiguration> body.
             hyper::Method::PUT if query_param(&query, "versioning").is_some() => {
-                let checksum = crate::auth::BodyChecksum::from_headers(req.headers());
-                let body = req.into_body().collect().await?.to_bytes();
-                put_bucket_versioning(&app, &bucket, body, checksum).await?
+                match read_body(req, &principal.secret, true).await? {
+                    Ok(body) => put_bucket_versioning(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
             }
             hyper::Method::PUT => create_bucket(&app, &bucket).await?,
-            // DeleteObjects (batch): POST /{bucket}?delete with a <Delete> body.
-            // Read the integrity headers before consuming the body to verify it.
+            // DeleteObjects (batch): POST /{bucket}?delete with a <Delete> body,
+            // which must declare a checksum.
             hyper::Method::POST if query_param(&query, "delete").is_some() => {
-                let checksum = crate::auth::BodyChecksum::from_headers(req.headers());
-                let body = req.into_body().collect().await?.to_bytes();
-                let may_write = principal.can(Permission::Write, &bucket);
-                let may_delete_versions = principal.can(Permission::DeleteVersion, &bucket);
-                delete_objects(&app, &bucket, body, checksum, may_write, may_delete_versions)
-                    .await?
+                if !payload::has_body_checksum(req.headers()) {
+                    return Ok(box_response(missing_checksum()));
+                }
+                match read_body(req, &principal.secret, true).await? {
+                    Ok(body) => {
+                        let may_write = principal.can(Permission::Write, &bucket);
+                        let may_delete_versions = principal.can(Permission::DeleteVersion, &bucket);
+                        delete_objects(&app, &bucket, body, may_write, may_delete_versions).await?
+                    }
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
             }
             hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
@@ -256,20 +264,8 @@ pub async fn handle(
         .map(str::to_owned);
     // The copy endpoints gate on the *source* via x-amz-copy-source-if-* headers.
     let copy_source_preconditions = Preconditions::from_copy_source_headers(req.headers());
-    // Streaming-signature uploads (e.g. Mimir) frame the body as `aws-chunked`;
-    // the upload path must decode it rather than store the framing verbatim.
-    let aws_chunked = crate::aws_chunked::is_aws_chunked(req.headers());
-    // The body-integrity claim the client makes (verified as the body streams).
-    let content_sha256 = crate::auth::ContentSha256::from_headers(req.headers());
-    // For a signed streaming body (mode 4), build the chunk-signature verifier
-    // from the request's SigV4 auth + the role's secret. Absent for unsigned
-    // requests (no Authorization), which then stream without chunk verification.
-    let chunk_verifier = match &content_sha256 {
-        crate::auth::ContentSha256::Streaming => {
-            crate::auth::StreamingChunkVerifier::from_headers(req.headers(), &principal.secret)
-        }
-        _ => None,
-    };
+    // What the request claims about an uploaded body, checked as it streams.
+    let payload = Payload::new(req.headers(), &principal.secret, true);
     let resp = match req.method().clone() {
         hyper::Method::HEAD => {
             head_object(
@@ -295,10 +291,16 @@ pub async fn handle(
             create_multipart_upload(&app, &bucket, &key, &content_type).await?
         }
         // CompleteMultipartUpload
+        // Its x-amz-checksum-* header is the object's, not the body's.
         hyper::Method::POST if query_param(&query, "uploadId").is_some() => {
-            let body = req.into_body().collect().await?.to_bytes();
-            let upload_id = query_param(&query, "uploadId").unwrap_or_default();
-            complete_multipart_upload(&app, &bucket, &key, &upload_id, body, &preconditions).await?
+            match read_body(req, &principal.secret, false).await? {
+                Ok(body) => {
+                    let upload_id = query_param(&query, "uploadId").unwrap_or_default();
+                    complete_multipart_upload(&app, &bucket, &key, &upload_id, body, &preconditions)
+                        .await?
+                }
+                Err(rejection) => util::rejection_response(&rejection),
+            }
         }
         // UploadPartCopy: an UploadPart whose bytes come from another object
         // (x-amz-copy-source) instead of the request body. Must precede UploadPart.
@@ -323,18 +325,13 @@ pub async fn handle(
         hyper::Method::PUT if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
             let part_number = query_param(&query, "partNumber").unwrap_or_default();
-            put_part(
-                &app,
-                &bucket,
-                &key,
-                &upload_id,
-                &part_number,
-                req.into_body(),
-                aws_chunked,
-                content_sha256,
-                chunk_verifier,
-            )
-            .await?
+            match payload {
+                Ok(payload) => {
+                    put_part(&app, &bucket, &key, &upload_id, &part_number, req.into_body(), payload)
+                        .await?
+                }
+                Err(rejection) => util::rejection_response(&rejection),
+            }
         }
         // CopyObject: a PUT with x-amz-copy-source and no uploadId (the uploadId
         // variant, UploadPartCopy, is handled above). The source is read
@@ -351,23 +348,41 @@ pub async fn handle(
             )
             .await?
         }
-        hyper::Method::PUT => {
-            put_object(
-                &app,
-                &bucket,
-                &key,
-                &content_type,
-                req.into_body(),
-                aws_chunked,
-                content_sha256,
-                chunk_verifier,
-                &preconditions,
-            )
-            .await?
-        }
+        hyper::Method::PUT => match payload {
+            Ok(payload) => {
+                put_object(&app, &bucket, &key, &content_type, req.into_body(), payload, &preconditions)
+                    .await?
+            }
+            Err(rejection) => util::rejection_response(&rejection),
+        },
         _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
     };
     Ok(box_response(resp))
+}
+
+/// Reads a request body that's handled whole (an XML document), checked
+/// against what the request claims about it, as an upload's is (see
+/// `Payload`). `checksum_headers` says whether its `x-amz-checksum-*` header
+/// is one of the body. `Err` holds why it was refused.
+async fn read_body(
+    req: Request<hyper::body::Incoming>,
+    secret: &str,
+    checksum_headers: bool,
+) -> anyhow::Result<Result<hyper::body::Bytes, Rejection>> {
+    let mut payload = match Payload::new(req.headers(), secret, checksum_headers) {
+        Ok(payload) => payload,
+        Err(rejection) => return Ok(Err(rejection)),
+    };
+    let mut body = req.into_body();
+    let mut data = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let Ok(chunk) = frame?.into_data() else { continue };
+        match payload.decode(chunk) {
+            Ok(pieces) => pieces.iter().for_each(|piece| data.extend_from_slice(piece)),
+            Err(rejection) => return Ok(Err(rejection)),
+        }
+    }
+    Ok(payload.finish().map(|()| data.into()))
 }
 
 /// The S3 error for a request whose handler failed: 503 if storage nodes are

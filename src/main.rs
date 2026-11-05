@@ -11,16 +11,15 @@ use hyper_util::{
     client::legacy::Client, rt::TokioExecutor, rt::TokioIo, server::graceful::GracefulShutdown,
 };
 use md5::{Digest, Md5};
-use sha2::Sha256;
 use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use uuid::Uuid;
 
 use crate::db::Cached;
-use crate::auth::{ContentSha256, StreamingChunkVerifier, TrailerChecksum};
-use crate::aws_chunked::AwsChunkedDecoder;
+use crate::auth::Rejection;
 use crate::blobs::{Location, ReapTarget, reap_blobs};
 use crate::body::{FrameSender, channel_body};
 use crate::checksum::BlobSummer;
+use crate::payload::Payload;
 use crate::s3::conditional::Preconditions;
 use crate::store::Store;
 use crate::writing::WritingSet;
@@ -40,6 +39,7 @@ mod e2e;
 mod gc;
 mod metrics;
 mod packer;
+mod payload;
 mod roles;
 mod s3;
 mod store;
@@ -689,8 +689,8 @@ enum AttachTarget {
     MultipartPart { upload_id: Uuid, part_number: i32 },
 }
 
-/// The outcome of an upload: the committed part's ETag, or a rejection because
-/// the streamed body didn't match the client's `x-amz-content-sha256`.
+/// The outcome of an upload: the committed part's ETag, or why it wasn't
+/// committed.
 enum UploadResult {
     /// Committed, with the new part's ETag and, for an object write, the
     /// `x-amz-version-id` to report for the version it created.
@@ -698,9 +698,8 @@ enum UploadResult {
         etag: String,
         version_id: Option<String>,
     },
-    ContentSha256Mismatch,
-    /// A mode-4 chunk signature didn't verify against the secret.
-    ChunkSignatureMismatch,
+    /// The body wasn't what the request claimed it to be (see `Payload`).
+    Rejected(Rejection),
     /// A conditional-write guard (If-Match / If-None-Match) didn't hold against
     /// the object currently at the target key.
     PreconditionFailed,
@@ -711,13 +710,14 @@ enum UploadResult {
     NoSuchUpload,
 }
 
+/// Uploads `body`, checked against what its request claims about it
+/// (`payload`), as a new blob, and attaches it to `attach`. Nothing is
+/// committed unless the body is everything it claimed to be.
 async fn upload_part<B>(
     app: &Arc<App>,
     mut body: B,
     attach: &AttachTarget,
-    aws_chunked: bool,
-    content_sha256: ContentSha256,
-    chunk_verifier: Option<StreamingChunkVerifier>,
+    mut payload: Payload,
 ) -> anyhow::Result<UploadResult>
 where
     B: Body<Data = Bytes> + Unpin + Send,
@@ -733,117 +733,47 @@ where
         AttachTarget::MultipartPart { .. } => BlobWriter::begin(app).await?,
     };
     let blob_id = writer.blob_id;
-    // 3. tee: read the client body once, hashing it and fanning each chunk out
-    // to every replica.
+    // 3. tee: read the client body once, decoding it (an `aws-chunked` body's
+    // framing isn't the object) and checking it as it goes, hashing the data
+    // for the ETag, and fanning each chunk out to every replica.
     let mut hasher = Md5::new();
-    let mut read_err: Option<anyhow::Error> = None;
-    // A streaming-signature upload arrives `aws-chunked` framed; decode it back to
-    // the raw object bytes before hashing/sizing/teeing, so the ETag and size
-    // describe the object — not the framing. A verifier (mode 4) checks each
-    // chunk's signature as it's decoded; a bad chunk faults the stream.
-    let verifying = chunk_verifier.is_some();
-    let mut chunk_failed = false;
-    let mut decoder = aws_chunked.then(move || AwsChunkedDecoder::new(chunk_verifier));
-    // Verify body integrity for a whole-body hash claim. The chunked modes carry
-    // their integrity differently (trailer checksum or per-chunk signatures), so
-    // they're handled elsewhere — only a non-chunked Single() hash is checked here.
-    // `Md5` and `Sha256` share one `Digest` trait (same `digest` version), so both
-    // hashers coexist here without trait ambiguity.
-    let mut content_hasher: Option<Sha256> =
-        matches!((&content_sha256, aws_chunked), (ContentSha256::Single(_), false))
-            .then(Sha256::new);
-    // For an `aws-chunked` trailer body, compute the declared checksum over the
-    // decoded payload; it's compared to the body's trailer value at the end. An
-    // algorithm we don't support is skipped (logged) rather than rejected.
-    let mut trailer_checksum = match (&content_sha256, aws_chunked) {
-        (ContentSha256::StreamingTrailer { trailer }, true) => {
-            let checksum = TrailerChecksum::for_trailer(trailer);
-            if checksum.is_none() && !trailer.is_empty() {
-                eprintln!("unsupported aws-chunked trailer '{trailer}', skipping integrity check");
-            }
-            checksum
-        }
-        _ => None,
-    };
-    loop {
+    let failure = loop {
         match body.frame().await {
             Some(Ok(frame)) => {
                 let Ok(chunk) = frame.into_data() else { continue };
-                let segments = match &mut decoder {
-                    Some(dec) => match dec.decode(chunk) {
-                        Ok(segments) => segments,
-                        Err(e) => {
-                            // A decode error while verifying is a bad chunk
-                            // signature (or malformed signed framing) — a client
-                            // error, surfaced as 403 rather than a 500.
-                            chunk_failed = verifying;
-                            read_err = Some(e.into());
-                            break;
+                match payload.decode(chunk) {
+                    Ok(data) => {
+                        for piece in data {
+                            hasher.update(&piece);
+                            writer.write(piece).await;
                         }
-                    },
-                    None => vec![chunk],
-                };
-                for chunk in segments {
-                    hasher.update(&chunk);
-                    if let Some(h) = &mut content_hasher {
-                        h.update(&chunk);
                     }
-                    if let Some(c) = &mut trailer_checksum {
-                        c.update(&chunk);
-                    }
-                    writer.write(chunk).await;
+                    Err(rejection) => break Some(Ok(rejection)),
                 }
             }
-            Some(Err(e)) => {
-                read_err = Some(e.into());
-                break;
-            }
-            None => {
-                // A chunked body must end with its terminating zero-size chunk;
-                // stopping short means truncation, so fault the sinks rather than
-                // durably store a short object.
-                if let Some(dec) = &decoder
-                    && !dec.is_complete()
-                {
-                    read_err = Some(std::io::Error::other("aws-chunked: truncated body").into());
-                }
-                break;
-            }
+            Some(Err(e)) => break Some(Err(anyhow::Error::from(e))),
+            None => break payload.finish().err().map(Ok),
         }
-    }
-    // 4. wait for every replica to finish. On a client read error, fault the
-    // sinks instead, so they don't durably store a truncated part.
-    if let Some(e) = read_err {
-        writer.abort(&e.to_string()).await;
-        // A bad chunk signature (mode 4) is a client error, not a server fault.
-        if chunk_failed {
-            return Ok(UploadResult::ChunkSignatureMismatch);
+    };
+    // 4. wait for every replica to finish. If the body failed to read, or
+    // wasn't what it claimed to be, fault the sinks instead, so they don't
+    // durably store it.
+    match failure {
+        None => {}
+        Some(Ok(rejection)) => {
+            writer.abort(rejection.code).await;
+            return Ok(UploadResult::Rejected(rejection));
         }
-        return Err(e);
+        Some(Err(e)) => {
+            writer.abort(&e.to_string()).await;
+            return Err(e);
+        }
     }
     // On failure, `finish` deletes what the replicas stored itself.
     let written = writer.finish().await?;
     // Whatever keeps the upload from committing from here on, the blob is
     // deleted with its files right away; only a crash leaves it to the GC.
     let result = async {
-        // The body is fully read and replicated (but not yet committed). If the client
-        // claimed a whole-body hash, check it now and refuse to commit on a mismatch.
-        if let (Some(h), ContentSha256::Single(expected)) = (content_hasher, &content_sha256) {
-            let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-            if actual != *expected {
-                return Ok(UploadResult::ContentSha256Mismatch);
-            }
-        }
-        // For a trailer body, compare our checksum to the value the body carried in
-        // its trailer (captured by the decoder). A missing/garbled trailer fails too.
-        if let (Some(c), ContentSha256::StreamingTrailer { trailer }) =
-            (trailer_checksum, &content_sha256)
-        {
-            let claimed = decoder.as_ref().and_then(|d| d.trailer(trailer));
-            if claimed.as_deref() != Some(c.finish_base64().as_str()) {
-                return Ok(UploadResult::ContentSha256Mismatch);
-            }
-        }
         let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
         // 5. commit + attach with the now-known size and ETag, in one transaction;
         // retry on a conflict.

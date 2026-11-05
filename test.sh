@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=79
+TOTAL=82
 STEP=0
 PASS=0
 FAIL=0
@@ -557,6 +557,41 @@ content_sha256_ok() {
     awss3 s3api delete-object --bucket "$BUCKET" --key cs-good.txt >/dev/null 2>&1
 }
 
+# A body must match the SHA-256 its request signs, whatever else is claimed. A
+# signed PUT replayed with someone else's aws-chunked body (and Content-Encoding,
+# which isn't signed) is refused, and so is a DeleteObjects whose key list was
+# swapped for another with its own Content-MD5: the object it names survives.
+replayed_body_rejected() {
+    local sha body="$WORK_DIR/swap.body" list="$WORK_DIR/swap.xml" md5
+    sha=$(openssl dgst -sha256 "$NESTED" | awk '{print $NF}')
+    printf '4\r\nevil\r\n0\r\n\r\n' >"$body"
+    [ "$(SCURL_UNSIGNED="Content-Encoding: aws-chunked" \
+        scurl PUT "/${BUCKET}/swap.txt" "$sha" "$body")" = 400 ] || return 1
+    s3 put "$SMALL" "s3://${BUCKET}/swap-keep.txt" >/dev/null 2>&1 || return 1
+    printf '<Delete><Object><Key>swap-keep.txt</Key></Object></Delete>' >"$list"
+    md5=$(openssl dgst -md5 -binary "$list" | base64)
+    [ "$(scurl POST "/${BUCKET}?delete" "$sha" "$list" "Content-MD5: ${md5}")" = 400 ] || return 1
+    check_roundtrip "$SMALL" "s3://${BUCKET}/swap-keep.txt" || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key swap-keep.txt >/dev/null 2>&1
+}
+
+# Content-MD5 and x-amz-checksum-* headers are checked against an upload's
+# data: a right one is accepted, a wrong one refused (400 BadDigest). aws-cli
+# computes a SHA-1 checksum itself.
+upload_checksums_ok() {
+    local md5 key="sums.txt"
+    md5=$(openssl dgst -md5 -binary "$NESTED" | base64)
+    [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$NESTED" "Content-MD5: ${md5}")" = 200 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$NESTED" \
+        "Content-MD5: 1B2M2Y8AsgTpgAmY7PhCfg==")" = 400 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$NESTED" \
+        "x-amz-checksum-crc32: AAAAAA==")" = 400 ] || return 1
+    awss3 s3api put-object --bucket "$BUCKET" --key "$key" --body "$BIG" \
+        --checksum-algorithm SHA1 >/dev/null 2>&1 || return 1
+    check_roundtrip "$BIG" "s3://${BUCKET}/${key}" || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key "$key" >/dev/null 2>&1
+}
+
 # Mode 3: STREAMING-UNSIGNED-PAYLOAD-TRAILER with a CRC32 trailer. Correct CRC
 # accepted + round-trips; wrong CRC → 400. No real client emits mode 3, so the
 # body is crafted and signed with scurl.
@@ -586,6 +621,20 @@ mc_streaming_ok() {
     check_roundtrip "$NESTED" "s3://${BUCKET}/mc-good.txt" || return 1
     ! mcli --config-dir "$MCFG" alias set bad "$host" "$ACCESS_KEY" wrongsecret123 >/dev/null 2>&1 || return 1
     mcli --config-dir "$MCFG" rm "good/${BUCKET}/mc-good.txt" >/dev/null 2>&1
+}
+
+# Signed streaming with a trailing checksum, whose signature covers it
+# (STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER), via mcli, in each of S3's
+# checksum algorithms.
+mc_trailer_ok() {
+    local host="http://${SERVER_HOST}:${SERVER_PORT}" algorithm
+    mcli --config-dir "$MCFG" alias set good "$host" "$ACCESS_KEY" cairnsecret >/dev/null 2>&1 || return 1
+    for algorithm in CRC32 CRC32C CRC64NVME SHA1 SHA256; do
+        mcli --config-dir "$MCFG" cp --checksum "$algorithm" "$BIG" "good/${BUCKET}/mc-trailer.bin" \
+            >/dev/null 2>&1 || return 1
+        check_roundtrip "$BIG" "s3://${BUCKET}/mc-trailer.bin" || return 1
+    done
+    mcli --config-dir "$MCFG" rm "good/${BUCKET}/mc-trailer.bin" >/dev/null 2>&1
 }
 
 # ─── Pagination: signed GETs (scurl) so we control max-keys/tokens precisely ──
@@ -1367,6 +1416,9 @@ run_test    "Conditional CompleteMultipartUpload"     conditional_complete_ok
 run_test    "Body SHA-256 verified (good/bad)"      content_sha256_ok
 run_test    "aws-chunked trailer checksum (CRC32)"  streaming_trailer_ok
 run_test    "Signed streaming upload via mcli (mode 4)" mc_streaming_ok
+run_test    "Signed trailer checksums via mcli"     mc_trailer_ok
+run_test    "Replayed request with another body refused" replayed_body_rejected
+run_test    "Upload Content-MD5/checksum headers checked" upload_checksums_ok
 run_test    "Set up pagination fixtures"            setup_pagination
 run_test    "ListObjectsV2 paginates leaves"        v2_leaves_ok
 run_test    "ListObjects (v1) paginates leaves"     v1_leaves_ok

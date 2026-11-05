@@ -1,15 +1,11 @@
-//! Request body integrity and SigV4 streaming-signature verification.
-//!
-//! A client declares its body's hash in `x-amz-content-sha256`. We verify the
-//! body matches that claim — by hashing (modes 2/3) or, for a signed streaming
-//! body (mode 4), by verifying the per-chunk HMAC signature chain.
+//! SigV4: verifying a request's signature, and the signatures of the chunks of
+//! a signed streaming body. What a body claims about itself otherwise is
+//! checked in `payload`.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
 use hyper::{HeaderMap, StatusCode};
-use md5::Md5;
 use sha2::{Digest, Sha256};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -42,121 +38,6 @@ impl Rejection {
     }
 }
 
-/// What a client's `x-amz-content-sha256` header claims about the body.
-#[derive(Debug)]
-pub enum ContentSha256 {
-    /// `UNSIGNED-PAYLOAD`: the client makes no claim, so there's nothing to
-    /// verify. (`verify_sigv4` refuses a request without the header.)
-    Unsigned,
-    /// Hex SHA-256 of the entire body; checked once the body has been read.
-    Single(String),
-    /// `aws-chunked` body whose integrity rides on per-chunk HMAC signatures —
-    /// verifiable only with the signing key (the auth layer), not by hashing here.
-    Streaming,
-    /// `aws-chunked` body with a trailing checksum (verifiable without a key).
-    /// `trailer` is the declared trailer header name, e.g. `x-amz-checksum-crc32`.
-    StreamingTrailer { trailer: String },
-}
-
-impl ContentSha256 {
-    pub fn from_headers(headers: &HeaderMap) -> Self {
-        let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
-        match header("x-amz-content-sha256") {
-            None | Some("UNSIGNED-PAYLOAD") => ContentSha256::Unsigned,
-            Some("STREAMING-UNSIGNED-PAYLOAD-TRAILER") => ContentSha256::StreamingTrailer {
-                trailer: header("x-amz-trailer").unwrap_or("").to_ascii_lowercase(),
-            },
-            // Other STREAMING-* variants are HMAC-signed; verifying their chunks
-            // needs the signing key, so they're the auth layer's job.
-            Some(v) if v.starts_with("STREAMING-") => ContentSha256::Streaming,
-            Some(hex) => ContentSha256::Single(hex.to_ascii_lowercase()),
-        }
-    }
-}
-
-/// A streaming checksum over the decoded body, used to verify an `aws-chunked`
-/// trailer.
-pub enum TrailerChecksum {
-    Crc32(crc32fast::Hasher),
-    Sha256(Sha256),
-}
-
-impl TrailerChecksum {
-    /// Builds the checksum matching a trailer name (`x-amz-checksum-crc32` /
-    /// `…-sha256`); `None` for an algorithm we don't compute, so the caller can
-    /// skip verification rather than reject a body it can't check.
-    pub fn for_trailer(name: &str) -> Option<Self> {
-        match name {
-            "x-amz-checksum-crc32" => Some(Self::Crc32(crc32fast::Hasher::new())),
-            "x-amz-checksum-sha256" => Some(Self::Sha256(Sha256::new())),
-            _ => None,
-        }
-    }
-
-    pub fn update(&mut self, data: &[u8]) {
-        match self {
-            Self::Crc32(h) => h.update(data),
-            Self::Sha256(h) => h.update(data),
-        }
-    }
-
-    /// The base64 checksum, in the same form S3 puts in the trailer value.
-    pub fn finish_base64(self) -> String {
-        match self {
-            Self::Crc32(h) => STANDARD.encode(h.finalize().to_be_bytes()),
-            Self::Sha256(h) => STANDARD.encode(h.finalize()),
-        }
-    }
-}
-
-/// The body-integrity headers a client may attach to a DeleteObjects request:
-/// `Content-MD5` (minio-go) or an `x-amz-checksum-{crc32,sha256}` (aws-cli). At
-/// least one must be present and correct — that's the destructive op's guard.
-pub struct BodyChecksum {
-    content_md5: Option<String>,
-    crc32: Option<String>,
-    sha256: Option<String>,
-}
-
-impl BodyChecksum {
-    pub fn from_headers(headers: &HeaderMap) -> Self {
-        let h = |name: &str| headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_owned);
-        Self {
-            content_md5: h("content-md5"),
-            crc32: h("x-amz-checksum-crc32"),
-            sha256: h("x-amz-checksum-sha256"),
-        }
-    }
-
-    /// Whether the client supplied any supported integrity header.
-    pub fn is_present(&self) -> bool {
-        self.content_md5.is_some() || self.crc32.is_some() || self.sha256.is_some()
-    }
-
-    /// Checks every supplied checksum against `body` (base64-encoded, as on the
-    /// wire); `false` if any present one mismatches.
-    pub fn matches(&self, body: &[u8]) -> bool {
-        if let Some(md5) = &self.content_md5
-            && STANDARD.encode(Md5::digest(body)) != md5.trim()
-        {
-            return false;
-        }
-        if let Some(crc) = &self.crc32 {
-            let mut hasher = crc32fast::Hasher::new();
-            hasher.update(body);
-            if STANDARD.encode(hasher.finalize().to_be_bytes()) != crc.trim() {
-                return false;
-            }
-        }
-        if let Some(sha) = &self.sha256
-            && STANDARD.encode(Sha256::digest(body)) != sha.trim()
-        {
-            return false;
-        }
-        true
-    }
-}
-
 fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
@@ -181,11 +62,12 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 /// Verifies the per-chunk signature chain of a `STREAMING-AWS4-HMAC-SHA256-PAYLOAD`
-/// body. Built from the request's `Authorization`/`x-amz-date` plus the server
-/// secret, then fed each chunk's data hash and claimed signature in order. This
-/// proves both body integrity and that the client holds the secret; it does *not*
-/// verify the seed against the canonical request (the metadata-binding step is a
-/// later slice), so the seed is taken as the chain's anchor.
+/// body (and its trailer's signature, with `…-PAYLOAD-TRAILER`). Built from the
+/// request's `Authorization`/`x-amz-date` plus the server secret, then fed each
+/// chunk's data hash and claimed signature in order. The chain starts at the
+/// seed signature, the request's own, which `verify_sigv4` has checked against
+/// the request's headers. So each chunk is bound to the request, and to the
+/// chunks before it.
 pub struct StreamingChunkVerifier {
     signing_key: [u8; 32],
     datetime: String, // x-amz-date, the full timestamp
@@ -210,10 +92,7 @@ impl StreamingChunkVerifier {
     /// Verifies one chunk given its data's hex SHA-256 and the claimed signature
     /// (hex), advancing the chain on success. Constant-time via `verify_slice`.
     pub fn verify_chunk(&mut self, data_hash: &str, chunk_signature: &str) -> bool {
-        let string_to_sign = format!(
-            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{}",
-            self.datetime, self.scope, self.prev_signature, data_hash,
-        );
+        let string_to_sign = self.chunk_string_to_sign(data_hash);
         let Some(sig) = hex_decode(chunk_signature) else {
             return false;
         };
@@ -226,6 +105,56 @@ impl StreamingChunkVerifier {
             false
         }
     }
+
+    /// Verifies the trailer's signature, given the hex SHA-256 of its
+    /// canonical headers, chained from the terminating chunk's signature.
+    pub fn verify_trailer(&self, trailer_hash: &str, signature: &str) -> bool {
+        let Some(sig) = hex_decode(signature) else {
+            return false;
+        };
+        let mut mac = HmacSha256::new_from_slice(&self.signing_key).expect("any key length");
+        mac.update(self.trailer_string_to_sign(trailer_hash).as_bytes());
+        mac.verify_slice(&sig).is_ok()
+    }
+
+    fn chunk_string_to_sign(&self, data_hash: &str) -> String {
+        format!(
+            "AWS4-HMAC-SHA256-PAYLOAD\n{}\n{}\n{}\n{EMPTY_SHA256}\n{}",
+            self.datetime, self.scope, self.prev_signature, data_hash,
+        )
+    }
+
+    fn trailer_string_to_sign(&self, trailer_hash: &str) -> String {
+        format!(
+            "AWS4-HMAC-SHA256-TRAILER\n{}\n{}\n{}\n{}",
+            self.datetime, self.scope, self.prev_signature, trailer_hash,
+        )
+    }
+
+    /// The signature the next chunk needs, for tests that build a signed body.
+    #[cfg(test)]
+    pub fn sign_chunk(&mut self, data: &[u8]) -> String {
+        let signature = hex(&hmac_sha256(
+            &self.signing_key,
+            self.chunk_string_to_sign(&sha256_hex(data)).as_bytes(),
+        ));
+        self.prev_signature = signature.clone();
+        signature
+    }
+
+    /// The signature a trailer with `canonical` headers needs, for tests.
+    #[cfg(test)]
+    pub fn sign_trailer(&self, canonical: &str) -> String {
+        hex(&hmac_sha256(
+            &self.signing_key,
+            self.trailer_string_to_sign(&sha256_hex(canonical.as_bytes())).as_bytes(),
+        ))
+    }
+}
+
+#[cfg(test)]
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The SigV4 `Authorization` header fields, parsed once and shared by request
