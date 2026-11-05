@@ -3,6 +3,8 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes, header::HeaderValue};
 use percent_encoding::percent_decode_str;
 
+use crate::auth::Rejection;
+
 /// A time, as S3 writes it in XML and as seconds since the Unix epoch.
 pub struct Timestamp {
     pub iso: String,
@@ -126,12 +128,31 @@ pub fn with_delete_marker<B>(mut resp: Response<B>) -> Response<B> {
 }
 
 pub fn format_s3_error(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>> {
-    let body = format!(
+    error_document(status, code, message, &[])
+}
+
+/// The S3 error for a request refused for what it claims about itself.
+pub fn rejection_response(rejection: &Rejection) -> Response<Full<Bytes>> {
+    error_document(rejection.status, rejection.code, &rejection.message, &rejection.details)
+}
+
+/// An S3 error document: its code and message, and any further elements.
+fn error_document(
+    status: StatusCode,
+    code: &str,
+    message: &str,
+    details: &[(&str, String)],
+) -> Response<Full<Bytes>> {
+    let mut body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-             <Error><Code>{}</Code><Message>{}</Message></Error>",
+             <Error><Code>{}</Code><Message>{}</Message>",
         xml_escape(code),
         xml_escape(message)
     );
+    for (name, value) in details {
+        body.push_str(&format!("<{name}>{}</{name}>", xml_escape(value)));
+    }
+    body.push_str("</Error>");
     Response::builder()
         .status(status)
         .header("content-type", "application/xml")

@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=78
+TOTAL=79
 STEP=0
 PASS=0
 FAIL=0
@@ -286,12 +286,18 @@ for e in extra:
 PYEOF
 
 # scurl <method> <pathquery> <payload-hash> <bodyfile|-> [extra "Header: val"...]
-# Signs the request and runs curl, printing the HTTP status code.
+# Signs the request and runs curl, printing the HTTP status code. With
+# SCURL_UNSIGNED="Header: val", that header is added after signing, so the
+# signature doesn't cover it. With SCURL_DROP=<header name>, that signed header
+# isn't sent.
 scurl() {
     local method="$1" pathquery="$2" phash="$3" body="$4"; shift 4
     local url="http://${SERVER_HOST}:${SERVER_PORT}${pathquery}" args=() line
-    while IFS= read -r line; do args+=(-H "$line"); done \
-        < <(python3 "$SIGNER" "$method" "$url" "$phash" "$@")
+    while IFS= read -r line; do
+        [ -n "${SCURL_DROP:-}" ] && [ "${line%%:*}" = "$SCURL_DROP" ] && continue
+        args+=(-H "$line")
+    done < <(python3 "$SIGNER" "$method" "$url" "$phash" "$@")
+    [ -n "${SCURL_UNSIGNED:-}" ] && args+=(-H "$SCURL_UNSIGNED")
     if [ "$body" = "-" ]; then
         curl -s -o /dev/null -w '%{http_code}' -X "$method" "${args[@]}" "$url"
     else
@@ -338,6 +344,16 @@ list_contains() {    # list_contains <s3 ls target> <needle>
 unsigned_rejected() {  # an unsigned request must be refused
     [ "$(curl -s -o /dev/null -w '%{http_code}' \
         "http://${SERVER_HOST}:${SERVER_PORT}/${BUCKET}/small.txt")" = 403 ]
+}
+
+# As in S3, the signature must cover every x-amz-* header: one added after
+# signing is refused (403), and so is a request without x-amz-content-sha256
+# (400), which declares what the signature covers the body with.
+unsigned_headers_rejected() {
+    local path="/${BUCKET}/small.txt"
+    [ "$(SCURL_UNSIGNED="x-amz-meta-added: 1" scurl GET "$path" "$EMPTY_SHA256" -)" = 403 ] || return 1
+    [ "$(SCURL_DROP=x-amz-content-sha256 scurl GET "$path" "$EMPTY_SHA256" -)" = 400 ] || return 1
+    [ "$(scurl GET "$path" "$EMPTY_SHA256" -)" = 200 ]
 }
 
 # A correctly signed request whose x-amz-date is outside the 15-minute skew
@@ -1323,6 +1339,7 @@ run_test    "Unsigned request is rejected (403)"    unsigned_rejected
 expect_fail "Unknown access key is rejected"        as_role nosuchrole nosuchsecret s3api list-buckets
 run_test    "Upload small text object"              s3 put "$SMALL" "s3://${BUCKET}/small.txt"
 run_test    "Stale/future-dated request rejected"   stale_request_rejected
+run_test    "Headers outside the signature rejected" unsigned_headers_rejected
 run_test    "Object appears in bucket listing"      list_contains "s3://${BUCKET}" "small.txt"
 run_test    "Download matches upload (small)"       check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
 run_test    "Upload 4 MiB binary object"            s3 put "$BIG" "s3://${BUCKET}/big.bin"

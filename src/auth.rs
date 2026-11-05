@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, KeyInit, Mac};
-use hyper::HeaderMap;
+use hyper::{HeaderMap, StatusCode};
 use md5::Md5;
 use sha2::{Digest, Sha256};
 
@@ -19,11 +19,34 @@ type HmacSha256 = Hmac<Sha256>;
 pub const EMPTY_SHA256: &str =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 
+/// A request refused for what it claims about itself (its signature, or its
+/// body's integrity): the S3 error to answer it with.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Rejection {
+    pub status: StatusCode,
+    pub code: &'static str,
+    pub message: String,
+    /// Further elements of the error document, as S3 adds them (such as
+    /// `HeadersNotSigned`).
+    pub details: Vec<(&'static str, String)>,
+}
+
+impl Rejection {
+    pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
+        Rejection {
+            status,
+            code,
+            message: message.into(),
+            details: Vec::new(),
+        }
+    }
+}
+
 /// What a client's `x-amz-content-sha256` header claims about the body.
 #[derive(Debug)]
 pub enum ContentSha256 {
-    /// `UNSIGNED-PAYLOAD`, or no header: the client makes no claim, so there's
-    /// nothing to verify.
+    /// `UNSIGNED-PAYLOAD`: the client makes no claim, so there's nothing to
+    /// verify. (`verify_sigv4` refuses a request without the header.)
     Unsigned,
     /// Hex SHA-256 of the entire body; checked once the body has been read.
     Single(String),
@@ -292,6 +315,7 @@ fn canonical_request(
     query: &str,
     headers: &HeaderMap,
     auth: &Authorization,
+    payload_hash: &str,
 ) -> String {
     let uri = if path.is_empty() { "/" } else { path };
     let mut canonical_headers = String::new();
@@ -305,10 +329,6 @@ fn canonical_request(
         canonical_headers.push('\n');
     }
     let signed_headers = auth.signed_headers.join(";");
-    let payload_hash = headers
-        .get("x-amz-content-sha256")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("UNSIGNED-PAYLOAD");
     format!(
         "{method}\n{uri}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
         canonical_query(query),
@@ -364,37 +384,132 @@ fn check_request_time(datetime: &str, scope_date: &str, now: i64) -> Result<(), 
     Ok(())
 }
 
-/// Verifies a request's SigV4 header signature against `secret`. `Ok(())` on a
-/// match; `Err(code)` with the S3 error code otherwise — missing `Authorization`
-/// / `x-amz-date` → `AccessDenied`, a timestamp too far from the server clock →
-/// `RequestTimeTooSkewed`, wrong signature → `SignatureDoesNotMatch`.
+/// The values `x-amz-content-sha256` may take besides a hex SHA-256, as S3
+/// accepts them.
+const PAYLOAD_HASH_KEYWORDS: [&str; 4] = [
+    "UNSIGNED-PAYLOAD",
+    "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
+    "STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER",
+];
+
+/// Whether `value` is something S3 accepts as `x-amz-content-sha256`.
+fn valid_payload_hash(value: &str) -> bool {
+    PAYLOAD_HASH_KEYWORDS.contains(&value)
+        || (value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The headers that the request's signature has to cover, but doesn't:
+/// `host`, and every `x-amz-*` header. S3 refuses a request with any of them
+/// unsigned, since whoever relays it could otherwise add or change them.
+fn unsigned_headers(headers: &HeaderMap, auth: &Authorization) -> Vec<String> {
+    let signed = |name: &str| auth.signed_headers.iter().any(|s| s == name);
+    let mut names: Vec<String> = headers
+        .keys()
+        .map(|name| name.as_str())
+        .filter(|name| name.starts_with("x-amz-") && !signed(name))
+        .map(str::to_owned)
+        .collect();
+    if !signed("host") {
+        names.push("host".to_owned());
+    }
+    names.sort();
+    names
+}
+
+/// Verifies a request's SigV4 header signature against `secret`, as S3 does:
+///
+/// - a missing or malformed `Authorization` or `x-amz-date`: 403 AccessDenied;
+/// - no `x-amz-content-sha256` (400 InvalidRequest), or one that's neither a
+///   SHA-256 nor one of S3's keywords (400 InvalidArgument). Its value is what
+///   the signature covers the body with, so it can't be left out;
+/// - `host` or an `x-amz-*` header that the signature doesn't cover: 403
+///   AccessDenied, naming them in `HeadersNotSigned`;
+/// - a timestamp too far from the server clock: 403 RequestTimeTooSkewed;
+/// - a wrong signature: 403 SignatureDoesNotMatch.
 pub fn verify_sigv4(
     method: &str,
     path: &str,
     query: &str,
     headers: &HeaderMap,
     secret: &str,
-) -> Result<(), &'static str> {
-    let auth = Authorization::from_headers(headers).ok_or("AccessDenied")?;
-    let datetime = headers
-        .get("x-amz-date")
-        .and_then(|v| v.to_str().ok())
-        .ok_or("AccessDenied")?;
+) -> Result<(), Rejection> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")
         .as_secs() as i64;
-    check_request_time(datetime, &auth.date, now)?;
+    verify_sigv4_at(method, path, query, headers, secret, now)
+}
+
+/// `verify_sigv4`, with the server clock at `now` (Unix seconds).
+fn verify_sigv4_at(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    secret: &str,
+    now: i64,
+) -> Result<(), Rejection> {
+    let access_denied = |message: &str| Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", message);
+    let auth = Authorization::from_headers(headers)
+        .ok_or_else(|| access_denied("the Authorization header is malformed"))?;
+    let datetime = headers
+        .get("x-amz-date")
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| access_denied("the request has no valid x-amz-date header"))?;
+    let payload_hash = match headers.get("x-amz-content-sha256").map(|v| v.to_str()) {
+        None => {
+            return Err(Rejection::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "Missing required header for this request: x-amz-content-sha256",
+            ));
+        }
+        Some(Ok(value)) if valid_payload_hash(value) => value,
+        Some(_) => {
+            return Err(Rejection::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "x-amz-content-sha256 must be UNSIGNED-PAYLOAD, \
+                 STREAMING-UNSIGNED-PAYLOAD-TRAILER, STREAMING-AWS4-HMAC-SHA256-PAYLOAD, \
+                 STREAMING-AWS4-HMAC-SHA256-PAYLOAD-TRAILER or a valid SHA-256 value",
+            ));
+        }
+    };
+    let unsigned = unsigned_headers(headers, &auth);
+    if !unsigned.is_empty() {
+        let mut rejection =
+            access_denied("There were headers present in the request which were not signed");
+        rejection.details.push(("HeadersNotSigned", unsigned.join(", ")));
+        return Err(rejection);
+    }
+    check_request_time(datetime, &auth.date, now).map_err(|code| {
+        let message = match code {
+            "RequestTimeTooSkewed" => {
+                "The difference between the request time and the server's time is too large."
+            }
+            _ => "the request's x-amz-date is malformed or doesn't match its credential scope",
+        };
+        Rejection::new(StatusCode::FORBIDDEN, code, message)
+    })?;
+    let canonical = canonical_request(method, path, query, headers, &auth, payload_hash);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{datetime}\n{}\n{}",
         auth.scope,
-        sha256_hex(canonical_request(method, path, query, headers, &auth).as_bytes()),
+        sha256_hex(canonical.as_bytes()),
     );
     let key = derive_signing_key(secret, &auth.date, &auth.region, &auth.service);
-    let sig = hex_decode(&auth.signature).ok_or("SignatureDoesNotMatch")?;
+    let mismatch = || {
+        Rejection::new(
+            StatusCode::FORBIDDEN,
+            "SignatureDoesNotMatch",
+            "The request signature we calculated does not match the signature you provided.",
+        )
+    };
+    let sig = hex_decode(&auth.signature).ok_or_else(mismatch)?;
     let mut mac = HmacSha256::new_from_slice(&key).expect("any key length");
     mac.update(string_to_sign.as_bytes());
-    mac.verify_slice(&sig).map_err(|_| "SignatureDoesNotMatch")
+    mac.verify_slice(&sig).map_err(|_| mismatch())
 }
 
 #[cfg(test)]
@@ -413,6 +528,103 @@ mod tests {
                 .unwrap(),
         );
         StreamingChunkVerifier::from_headers(&h, "cairnsecret").unwrap()
+    }
+
+    const DATE: &str = "20260613T120000Z";
+    const SECRET: &str = "cairnsecret";
+
+    /// The headers of a PUT of `/b/k`, signed at `DATE` with `SECRET`, which
+    /// covers `headers` (lowercase names), but not `unsigned`, which are added
+    /// afterwards.
+    fn signed(headers: &[(&str, &str)], unsigned: &[(&'static str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (name, value) in headers {
+            h.insert(hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
+        }
+        let mut names: Vec<&str> = headers.iter().map(|(name, _)| *name).collect();
+        names.sort();
+        let scope = format!("{}/us-east-1/s3/aws4_request", &DATE[..8]);
+        let auth = Authorization {
+            access_key: "akid".into(),
+            date: DATE[..8].into(),
+            region: "us-east-1".into(),
+            service: "s3".into(),
+            scope: scope.clone(),
+            signed_headers: names.iter().map(|n| n.to_string()).collect(),
+            signature: String::new(),
+        };
+        let payload_hash = h
+            .get("x-amz-content-sha256")
+            .map_or("UNSIGNED-PAYLOAD", |v| v.to_str().unwrap())
+            .to_owned();
+        let canonical = canonical_request("PUT", "/b/k", "", &h, &auth, &payload_hash);
+        let sts = format!("AWS4-HMAC-SHA256\n{DATE}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
+        let key = derive_signing_key(SECRET, &auth.date, &auth.region, &auth.service);
+        let signature: String =
+            hmac_sha256(&key, sts.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=akid/{scope}, SignedHeaders={}, Signature={signature}",
+            names.join(";")
+        );
+        h.insert("authorization", authorization.parse().unwrap());
+        for (name, value) in unsigned {
+            h.insert(*name, value.parse().unwrap());
+        }
+        h
+    }
+
+    fn verify(headers: &HeaderMap) -> Result<(), Rejection> {
+        verify_sigv4_at("PUT", "/b/k", "", headers, SECRET, parse_amz_date(DATE).unwrap())
+    }
+
+    const BASE: [(&str, &str); 3] = [
+        ("host", "localhost:8333"),
+        ("x-amz-content-sha256", EMPTY_SHA256),
+        ("x-amz-date", DATE),
+    ];
+
+    #[test]
+    fn accepts_a_signed_request() {
+        assert_eq!(verify(&signed(&BASE, &[])), Ok(()));
+        // Headers other than the host and x-amz-* may go unsigned, as in S3.
+        let h = signed(&BASE, &[("content-type", "text/plain"), ("content-encoding", "gzip")]);
+        assert_eq!(verify(&h), Ok(()));
+        for keyword in PAYLOAD_HASH_KEYWORDS {
+            let h = signed(&[BASE[0], ("x-amz-content-sha256", keyword), BASE[2]], &[]);
+            assert_eq!(verify(&h), Ok(()), "{keyword}");
+        }
+    }
+
+    #[test]
+    fn rejects_unsigned_amz_headers() {
+        let h = signed(&BASE, &[("x-amz-copy-source", "/other/key"), ("x-amz-meta-a", "1")]);
+        let rejection = verify(&h).unwrap_err();
+        assert_eq!((rejection.status, rejection.code), (StatusCode::FORBIDDEN, "AccessDenied"));
+        let unsigned = "x-amz-copy-source, x-amz-meta-a".to_owned();
+        assert_eq!(rejection.details, [("HeadersNotSigned", unsigned)]);
+        // The host must be signed too.
+        let h = signed(&BASE[1..], &[("host", "localhost:8333")]);
+        assert_eq!(verify(&h).unwrap_err().details, [("HeadersNotSigned", "host".to_owned())]);
+    }
+
+    #[test]
+    fn requires_a_valid_payload_hash() {
+        let rejection = verify(&signed(&[BASE[0], BASE[2]], &[])).unwrap_err();
+        assert_eq!((rejection.status, rejection.code), (StatusCode::BAD_REQUEST, "InvalidRequest"));
+        let not_hex = "g".repeat(64);
+        for bad in ["STREAMING-AWS4-ECDSA-P256-SHA256-PAYLOAD", "abc", &not_hex] {
+            let h = signed(&[BASE[0], ("x-amz-content-sha256", bad), BASE[2]], &[]);
+            let rejection = verify(&h).unwrap_err();
+            let expected = (StatusCode::BAD_REQUEST, "InvalidArgument");
+            assert_eq!((rejection.status, rejection.code), expected, "{bad}");
+        }
+    }
+
+    #[test]
+    fn rejects_a_changed_payload_hash() {
+        let mut h = signed(&BASE, &[]);
+        h.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        assert_eq!(verify(&h).unwrap_err().code, "SignatureDoesNotMatch");
     }
 
     #[test]

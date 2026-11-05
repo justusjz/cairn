@@ -60,14 +60,14 @@ pub async fn handle(
             "the access key ID does not exist",
         ));
     };
-    if let Err(code) = crate::auth::verify_sigv4(
+    if let Err(rejection) = crate::auth::verify_sigv4(
         req.method().as_str(),
         req.uri().path(),
         req.uri().query().unwrap_or(""),
         req.headers(),
         &principal.secret,
     ) {
-        return Ok(forbidden(code, "request authentication failed"));
+        return Ok(box_response(util::rejection_response(&rejection)));
     }
     let path = req.uri().path().trim_start_matches('/');
     if path.is_empty() {
