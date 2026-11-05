@@ -21,7 +21,7 @@ use crate::{
             resolve_object_parts, select_parts_in_range, spawn_range_stream,
         },
         util::{decode_path_param, format_s3_error, query_param, with_version_id, xml_ok},
-        versions::new_version_id,
+        versions::{invalid_version_id, is_version_id, new_version_id},
     },
 };
 
@@ -84,6 +84,9 @@ pub async fn copy_object(
             ));
         }
     };
+    if let Some(v) = src_version.as_deref().filter(|v| !is_version_id(v)) {
+        return Ok(invalid_version_id("versionId", v));
+    }
 
     // COPY (the default) keeps the source metadata; only REPLACE substitutes new.
     let replace = metadata_directive
@@ -281,6 +284,9 @@ pub async fn copy_part(
             ));
         }
     };
+    if let Some(v) = src_version.as_deref().filter(|v| !is_version_id(v)) {
+        return Ok(invalid_version_id("versionId", v));
+    }
 
     // Reject up front if the upload is gone, and require it to belong to the
     // request's bucket/key — as put_part does.
@@ -627,11 +633,8 @@ fn with_copy_source_version_id(
     mut resp: Response<Full<Bytes>>,
     version_id: Option<&str>,
 ) -> Response<Full<Bytes>> {
-    if let Some(v) = version_id {
-        resp.headers_mut().insert(
-            "x-amz-copy-source-version-id",
-            HeaderValue::from_str(v).unwrap(),
-        );
+    if let Some(v) = version_id.and_then(|v| HeaderValue::from_str(v).ok()) {
+        resp.headers_mut().insert("x-amz-copy-source-version-id", v);
     }
     resp
 }

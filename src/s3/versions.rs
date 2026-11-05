@@ -19,7 +19,11 @@
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use deadpool_postgres::GenericClient;
+use http_body_util::Full;
+use hyper::{Response, StatusCode, body::Bytes};
+
 use crate::db::Cached;
+use crate::{auth::Rejection, s3::util::rejection_response};
 
 /// A bucket's versioning state. A bucket starts out unversioned; once enabled,
 /// it only moves between enabled and suspended. Serialized as it's stored.
@@ -78,6 +82,25 @@ pub(crate) fn new_version_id() -> String {
     URL_SAFE_NO_PAD.encode(bytes).replace('-', ".")
 }
 
+/// Whether `id` can be a version ID: `null`, or one `new_version_id` makes, 32
+/// characters of URL-safe base64 (with `.` for `-`, which IDs from before that
+/// swap still have). Anything else names no version, and is refused before it
+/// gets anywhere, as S3 refuses a malformed one.
+pub(crate) fn is_version_id(id: &str) -> bool {
+    id == "null"
+        || (id.len() == 32
+            && id.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')))
+}
+
+/// S3's 400 for a version ID that can't be one, given as `argument`.
+pub(crate) fn invalid_version_id(argument: &str, id: &str) -> Response<Full<Bytes>> {
+    let mut rejection =
+        Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", "Invalid version id specified");
+    rejection.details.push(("ArgumentName", argument.to_owned()));
+    rejection.details.push(("ArgumentValue", id.to_owned()));
+    rejection_response(&rejection)
+}
+
 /// The ETag of the object a plain GET of the key would return: the current
 /// version, unless that's a delete marker (then the key reads as absent). This is
 /// what conditional writes (If-Match / If-None-Match) are evaluated against.
@@ -116,6 +139,25 @@ mod tests {
                 id.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_'),
                 "{id}"
             );
+            assert!(is_version_id(&id), "{id}");
+        }
+    }
+
+    #[test]
+    fn only_version_ids_are_version_ids() {
+        assert!(is_version_id("null"));
+        // From before `-` was swapped for `.`.
+        assert!(is_version_id("Ab-_0123456789abcdefghijklmnopqr"));
+        let long = "a".repeat(33);
+        for bad in [
+            "",
+            "NULL",
+            "abc",
+            "Ab-_0123456789abcdefghijklmnopq\n",
+            "Ab-_0123456789abcdefghijklmnop/r",
+            &long,
+        ] {
+            assert!(!is_version_id(bad), "{bad:?}");
         }
     }
 }

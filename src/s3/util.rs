@@ -112,10 +112,11 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
 }
 
 /// Sets `x-amz-version-id` on a response, if there's a version ID to report.
+/// Version IDs are checked as they come in (`is_version_id`), so every one
+/// makes a valid header; one that wouldn't is left out rather than panicking.
 pub fn with_version_id<B>(mut resp: Response<B>, version_id: Option<&str>) -> Response<B> {
-    if let Some(v) = version_id {
-        resp.headers_mut()
-            .insert("x-amz-version-id", HeaderValue::from_str(v).unwrap());
+    if let Some(v) = version_id.and_then(|v| HeaderValue::from_str(v).ok()) {
+        resp.headers_mut().insert("x-amz-version-id", v);
     }
     resp
 }

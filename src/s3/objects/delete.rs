@@ -12,7 +12,7 @@ use crate::{
     s3::util::{
         format_s3_error, slow_down, with_delete_marker, with_version_id, xml_escape, xml_ok,
     },
-    s3::versions::{Deleted, new_version_id},
+    s3::versions::{Deleted, is_version_id, new_version_id},
 };
 
 /// What a delete addresses: a key, and optionally one specific version of it.
@@ -214,7 +214,11 @@ pub async fn delete_objects(
 
     // One transaction deletes every permitted target. Absent keys and
     // versions are no-ops, so — like the single-key delete — every permitted
-    // target is reported deleted (delete is idempotent).
+    // target is reported deleted (delete is idempotent). A version ID that
+    // can't be one names no version, which S3 reports as such.
+    let (malformed, targets): (Vec<Target>, Vec<Target>) = targets
+        .into_iter()
+        .partition(|t| t.version_id.as_deref().is_some_and(|v| !is_version_id(v)));
     let (permitted, denied): (Vec<Target>, Vec<Target>) =
         targets.into_iter().partition(|t| match t.version_id {
             Some(_) => may_delete_versions,
@@ -259,13 +263,17 @@ pub async fn delete_objects(
         }
     }
     // Errors are reported even in quiet mode.
-    for t in &denied {
+    let errors = denied
+        .iter()
+        .map(|t| (t, "AccessDenied", "Access Denied"))
+        .chain(malformed.iter().map(|t| (t, "NoSuchVersion", "The specified version does not exist.")));
+    for (t, code, message) in errors {
         out.push_str("<Error>");
         out.push_str(&format!("<Key>{}</Key>", xml_escape(&t.key)));
         if let Some(v) = &t.version_id {
             out.push_str(&format!("<VersionId>{}</VersionId>", xml_escape(v)));
         }
-        out.push_str("<Code>AccessDenied</Code><Message>Access Denied</Message></Error>");
+        out.push_str(&format!("<Code>{code}</Code><Message>{message}</Message></Error>"));
     }
     out.push_str("</DeleteResult>");
     Ok(xml_ok(out))

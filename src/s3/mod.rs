@@ -34,6 +34,7 @@ use crate::{
             bucket_subresource_stub, decode_continuation_token, decode_path_param, format_s3_error,
             query_param, stub_acl,
         },
+        versions::{invalid_version_id, is_version_id},
     },
 };
 
@@ -118,13 +119,17 @@ pub async fn handle(
             // ListObjectVersions: GET /{bucket}?versions, paginated by key-marker
             // and version-id-marker.
             hyper::Method::GET if query_param(&query, "versions").is_some() => {
+                let marker = query_param(&query, "version-id-marker");
+                if let Some(v) = marker.as_deref().filter(|v| !is_version_id(v)) {
+                    return Ok(box_response(invalid_version_id("version-id-marker", v)));
+                }
                 list_object_versions(
                     &app,
                     &bucket,
                     &query_param(&query, "prefix").unwrap_or_default(),
                     query_param(&query, "delimiter").as_deref(),
                     &query_param(&query, "key-marker").unwrap_or_default(),
-                    query_param(&query, "version-id-marker").as_deref(),
+                    marker.as_deref(),
                     max_keys,
                 )
                 .await?
@@ -220,6 +225,10 @@ pub async fn handle(
     let preconditions = Preconditions::from_headers(req.headers());
     // GET, HEAD and DELETE may address one specific version of the object.
     let version_id = query_param(&query, "versionId");
+    let addresses_version = matches!(*req.method(), Method::GET | Method::HEAD | Method::DELETE);
+    if let Some(v) = version_id.as_deref().filter(|v| addresses_version && !is_version_id(v)) {
+        return Ok(box_response(invalid_version_id("versionId", v)));
+    }
     if *req.method() == hyper::Method::GET {
         // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
         // break XML-parsing clients like `s3cmd info`.

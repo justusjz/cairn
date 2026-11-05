@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=83
+TOTAL=84
 STEP=0
 PASS=0
 FAIL=0
@@ -575,6 +575,20 @@ replayed_body_rejected() {
     awss3 s3api delete-object --bucket "$BUCKET" --key swap-keep.txt >/dev/null 2>&1
 }
 
+# A version ID that can't be one is refused (400 InvalidArgument) wherever it's
+# given, as S3 does; one with a newline used to crash the request. In the
+# versioned bucket, where testkey may delete versions.
+malformed_version_id_rejected() {
+    local path="/${VBUCKET}/cs"
+    [ "$(scurl DELETE "${path}?versionId=%0A" "$EMPTY_SHA256" -)" = 400 ] || return 1
+    [ "$(scurl GET "${path}?versionId=nope" "$EMPTY_SHA256" -)" = 400 ] || return 1
+    [ "$(scurl GET "/${VBUCKET}?versions&version-id-marker=nope" "$EMPTY_SHA256" -)" = 400 ] || return 1
+    [ "$(scurl PUT "/${VBUCKET}/copied.txt" "$EMPTY_SHA256" - \
+        "x-amz-copy-source: ${path}?versionId=nope")" = 400 ] || return 1
+    # A well-formed one that names no version is a 404, as before.
+    [ "$(scurl GET "${path}?versionId=$(printf 'x%.0s' {1..32})" "$EMPTY_SHA256" -)" = 404 ]
+}
+
 # A body that's read whole (here PutBucketVersioning's) is refused once it's
 # larger than 8 MiB (400), rather than kept in memory, whether it declares its
 # length or arrives in HTTP chunks. The document is valid, and names no bucket,
@@ -1047,8 +1061,12 @@ copy_source_version_ok() {
         --copy-source "${VBUCKET}/cs?versionId=${marker}" 2>&1 | grep -q InvalidRequest || return 1
     awss3 s3api copy-object --bucket "$VBUCKET" --key cs2 \
         --copy-source "${VBUCKET}/cs" 2>&1 | grep -q NoSuchKey || return 1
+    # A version ID that can't be one is malformed; a well-formed one names no
+    # version.
     awss3 s3api copy-object --bucket "$VBUCKET" --key cs2 \
-        --copy-source "${VBUCKET}/cs?versionId=nosuchversion" 2>&1 | grep -q NoSuchVersion
+        --copy-source "${VBUCKET}/cs?versionId=nosuchversion" 2>&1 | grep -q InvalidArgument || return 1
+    awss3 s3api copy-object --bucket "$VBUCKET" --key cs2 \
+        --copy-source "${VBUCKET}/cs?versionId=$(printf 'x%.0s' {1..32})" 2>&1 | grep -q NoSuchVersion
 }
 
 # An unversioned bucket lists its objects as `null` versions, all current.
@@ -1454,6 +1472,7 @@ run_test    "Unversioned bucket reports no versions" unversioned_no_version_id_o
 run_test    "ListObjectVersions lists versions"      list_versions_ok
 run_test    "ListObjectVersions paginates"           list_versions_paginates_ok
 run_test    "Copy from a named source version"       copy_source_version_ok
+run_test    "Malformed version IDs refused"          malformed_version_id_rejected
 run_test    "Unversioned bucket lists null versions" list_versions_unversioned_ok
 run_test    "Listing versions needs read"            list_versions_needs_read_ok
 run_test    "Delete markers keep a bucket non-empty" versioned_bucket_not_empty_ok
