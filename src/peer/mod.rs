@@ -1,7 +1,7 @@
 //! The peer endpoint: blob traffic between nodes, each node's metrics, and
 //! the dashboard. Unauthenticated, for the private network only.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
@@ -11,12 +11,20 @@ use axum::{
     response::{IntoResponse, Redirect, Response},
     routing::{any, get},
 };
-use hyper::body::{Bytes, Frame};
+use http_body_util::{BodyExt, Empty};
+use hyper::{
+    Request,
+    body::{Bytes, Frame},
+};
+use hyper_util::{
+    client::legacy::{Client, ResponseFuture, connect::HttpConnector},
+    rt::{TokioExecutor, TokioTimer},
+};
 use uuid::Uuid;
 
 use crate::{
     App, blob_file,
-    body::{channel_body, send_file},
+    body::{ResBody, channel_body, send_file},
     checksum::BlockLayout,
     gc, packer,
 };
@@ -24,6 +32,45 @@ use crate::{
 /// Response header of a blob PUT: the hex CRC64/NVME of the file the replica
 /// stored (the data plus its checksum table and blob ID).
 pub const CRC64_HEADER: &str = "x-cairn-crc64nvme";
+
+/// How long a connection to a peer may sit idle in the pool before it's
+/// closed. A peer's server never closes one itself (`axum::serve` sets no
+/// timer, so hyper's header read timeout doesn't apply), so this is what keeps
+/// connections to nodes that are rarely talked to from staying open for good.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// The HTTP client that every request to another node goes through: one per
+/// process, so that connections to a peer are kept open and reused, rather
+/// than opened anew for every blob that's read, written or reaped. Cheap to
+/// clone; the clones share the pool. HTTP/1.1, so that every transfer has a
+/// connection (and TCP flow) of its own.
+#[derive(Clone)]
+pub struct PeerClient(Client<HttpConnector, ResBody>);
+
+impl PeerClient {
+    pub fn new() -> PeerClient {
+        // Without TCP_NODELAY, a request's small writes on a reused connection
+        // wait for the ACK of the response before (Nagle's algorithm), which
+        // the peer delays: tens of milliseconds per request.
+        let mut connector = HttpConnector::new();
+        connector.set_nodelay(true);
+        PeerClient(
+            Client::builder(TokioExecutor::new())
+                .pool_idle_timeout(IDLE_TIMEOUT)
+                .pool_timer(TokioTimer::new())
+                .build(connector),
+        )
+    }
+
+    pub fn request(&self, req: Request<ResBody>) -> ResponseFuture {
+        self.0.request(req)
+    }
+
+    /// The body of a request that has none.
+    pub fn empty() -> ResBody {
+        Empty::new().map_err(|never| match never {}).boxed_unsync()
+    }
+}
 
 /// A failed peer request: a bare 500, since peers only check the status. The
 /// error itself is logged.

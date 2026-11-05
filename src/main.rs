@@ -7,9 +7,7 @@ use hyper::{
     Method, Request, StatusCode, body::Body, body::Bytes, body::Frame,
     server::conn::http1, service::service_fn,
 };
-use hyper_util::{
-    client::legacy::Client, rt::TokioExecutor, rt::TokioIo, server::graceful::GracefulShutdown,
-};
+use hyper_util::{rt::TokioIo, server::graceful::GracefulShutdown};
 use md5::{Digest, Md5};
 use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use uuid::Uuid;
@@ -55,6 +53,8 @@ pub struct App {
     pack: packer::Config,
     metrics: Arc<metrics::Metrics>,
     dashboard: dashboard::Dashboard,
+    /// Every request to another node goes through this.
+    peers: peer::PeerClient,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -138,6 +138,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         pack: packer::Config::default(),
         metrics: Arc::default(),
         dashboard: dashboard::Dashboard::new(&peer_url),
+        peers: peer::PeerClient::new(),
         #[cfg(test)]
         pack_hook: None,
     });
@@ -372,22 +373,20 @@ async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<Lo
         .collect())
 }
 
-/// Streams a blob body to a single replica's peer endpoint, returning the
-/// CRC64/NVME the replica reports for the file it stored. Generic over the body so the
-/// caller can hand us any stream (e.g. one side of a fan-out tee), not just the
-/// original client `Incoming`.
-async fn upload_to_replica<B>(peer_url: &str, blob_id: Uuid, body: B) -> anyhow::Result<u64>
-where
-    B: Body + Send + Unpin + 'static,
-    B::Data: Send,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    let client = Client::builder(TokioExecutor::new()).build_http();
+/// Streams a blob body (one side of the writer's fan-out) to a single
+/// replica's peer endpoint, returning the CRC64/NVME the replica reports for
+/// the file it stored.
+async fn upload_to_replica(
+    peers: &peer::PeerClient,
+    peer_url: &str,
+    blob_id: Uuid,
+    body: body::ResBody,
+) -> anyhow::Result<u64> {
     let req = Request::builder()
         .method(Method::PUT)
         .uri(format!("{peer_url}/blobs/{blob_id}"))
         .body(body)?;
-    let res = client.request(req).await?;
+    let res = peers.request(req).await?;
     if res.status() != StatusCode::OK {
         anyhow::bail!("replica {peer_url} returned status {}", res.status());
     }
@@ -565,8 +564,9 @@ impl BlobWriter {
                 let app = app.clone();
                 sinks.spawn(async move { write_blob_streaming(&app, blob_id, body).await });
             } else {
+                let peers = app.peers.clone();
                 sinks.spawn(async move {
-                    upload_to_replica(&peer_url, blob_id, body)
+                    upload_to_replica(&peers, &peer_url, blob_id, body)
                         .await
                         .map_err(|e| Unavailable(format!("replica {peer_url}: {e:#}")).into())
                 });

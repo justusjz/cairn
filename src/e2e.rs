@@ -79,6 +79,7 @@ pub async fn node_replicating(
         pack,
         metrics: Arc::default(),
         dashboard: crate::dashboard::Dashboard::new(peer_url),
+        peers: crate::peer::PeerClient::new(),
         pack_hook: hook,
     }))
 }

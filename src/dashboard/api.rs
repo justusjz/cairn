@@ -19,8 +19,7 @@ use axum::{
     http::{HeaderValue, StatusCode, header},
     response::Response,
 };
-use http_body_util::{BodyExt, Empty, Limited};
-use hyper_util::{client::legacy::Client, rt::TokioExecutor};
+use http_body_util::{BodyExt, Limited};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
@@ -31,6 +30,7 @@ use super::{ApiError, ErrorBody, NodeStats, node_stats};
 use crate::db::Cached;
 use crate::{
     App,
+    peer::PeerClient,
     roles::{self, Permission},
     s3::{
         buckets::{create, list as bucket_list},
@@ -149,8 +149,8 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
         if node.id == app.node {
             node.stats = Some(node_stats(app));
         } else if node.live {
-            let peer_url = node.peer_url.clone();
-            fetches.spawn(async move { (index, fetch_stats(&peer_url).await) });
+            let (peers, peer_url) = (app.peers.clone(), node.peer_url.clone());
+            fetches.spawn(async move { (index, fetch_stats(&peers, &peer_url).await) });
         }
     }
     while let Some(result) = fetches.join_next().await {
@@ -168,10 +168,10 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
 }
 
 /// Asks another node for its metrics, through its peer endpoint.
-async fn fetch_stats(peer_url: &str) -> anyhow::Result<NodeStats> {
-    let client = Client::builder(TokioExecutor::new()).build_http::<Empty<hyper::body::Bytes>>();
+async fn fetch_stats(peers: &PeerClient, peer_url: &str) -> anyhow::Result<NodeStats> {
     let fetch = async {
-        let res = client.get(format!("{peer_url}/stats").parse()?).await?;
+        let req = hyper::Request::get(format!("{peer_url}/stats")).body(PeerClient::empty())?;
+        let res = peers.request(req).await?;
         if res.status() != StatusCode::OK {
             anyhow::bail!("{peer_url} answered with status {}", res.status());
         }

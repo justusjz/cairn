@@ -6,14 +6,10 @@
 use std::io::{self, SeekFrom};
 use std::sync::Arc;
 
-use http_body_util::{BodyExt, Empty};
+use http_body_util::BodyExt;
 use hyper::{
     Method, Request, StatusCode,
     body::{Bytes, Frame, Incoming},
-};
-use hyper_util::{
-    client::legacy::{Client, connect::HttpConnector},
-    rt::TokioExecutor,
 };
 use tokio::{
     fs::File,
@@ -26,6 +22,7 @@ use crate::{
     App, blob_file,
     body::FrameSender,
     checksum::{BlockLayout, BlockSums},
+    peer::PeerClient,
 };
 
 /// A replica holding a blob: the node's number (`nodes.id`) and peer URL.
@@ -106,7 +103,7 @@ pub(crate) fn reap_blobs(app: &Arc<App>, targets: Vec<ReapTarget>) {
             let result = if node == app.node {
                 app.store.remove_blob(blob_id).await
             } else {
-                delete_from_replica(&peer_url, blob_id).await
+                delete_from_replica(&app.peers, &peer_url, blob_id).await
             };
             if let Err(e) = result {
                 eprintln!("best-effort reap of blob {blob_id} on {peer_url} failed: {e}");
@@ -115,13 +112,16 @@ pub(crate) fn reap_blobs(app: &Arc<App>, targets: Vec<ReapTarget>) {
     });
 }
 
-async fn delete_from_replica(peer_url: &str, blob_id: Uuid) -> anyhow::Result<()> {
-    let client = Client::builder(TokioExecutor::new()).build_http();
+async fn delete_from_replica(
+    peers: &PeerClient,
+    peer_url: &str,
+    blob_id: Uuid,
+) -> anyhow::Result<()> {
     let req = Request::builder()
         .method(Method::DELETE)
         .uri(format!("{peer_url}/blobs/{blob_id}"))
-        .body(Empty::<Bytes>::new())?;
-    let res = client.request(req).await?;
+        .body(PeerClient::empty())?;
+    let res = peers.request(req).await?;
     if res.status() != StatusCode::OK {
         anyhow::bail!("replica {peer_url} returned status {}", res.status());
     }
@@ -181,7 +181,8 @@ pub(crate) async fn stream_blob_range(
             let source = if *node == app.node {
                 Source::local(app, blob_id, slice.layout, start, stop - start).await?
             } else {
-                Source::remote(peer_url, blob_id, slice.layout, start, stop - start).await?
+                Source::remote(&app.peers, peer_url, blob_id, slice.layout, start, stop - start)
+                    .await?
             };
             let Some((mut source, crcs)) = source else {
                 return Err(io::Error::new(io::ErrorKind::NotFound, "replica doesn't have it"));
@@ -295,8 +296,6 @@ enum Source {
         body: Incoming,
         /// Data that arrived in the same frame as the end of the checksums.
         leftover: Option<Bytes>,
-        // Kept alive while the body streams.
-        _client: Client<HttpConnector, Empty<Bytes>>,
     },
 }
 
@@ -336,13 +335,13 @@ impl Source {
     /// ahead of the data. It checks its file against the layout we send, which
     /// comes from the catalog.
     async fn remote(
+        peers: &PeerClient,
         peer_url: &str,
         blob_id: Uuid,
         layout: Option<BlockLayout>,
         offset: u64,
         length: u64,
     ) -> io::Result<Opened> {
-        let client = Client::builder(TokioExecutor::new()).build_http();
         let checksums = match layout {
             Some(l) => format!("&blob_size={}&block_size={}", l.blob_size, l.block_size),
             None => String::new(),
@@ -352,9 +351,9 @@ impl Source {
             .uri(format!(
                 "{peer_url}/blobs/{blob_id}?offset={offset}&length={length}{checksums}"
             ))
-            .body(Empty::<Bytes>::new())
+            .body(PeerClient::empty())
             .map_err(io::Error::other)?;
-        let res = client.request(req).await.map_err(io::Error::other)?;
+        let res = peers.request(req).await.map_err(io::Error::other)?;
         match res.status() {
             StatusCode::OK => {}
             StatusCode::NOT_FOUND => return Ok(None),
@@ -363,7 +362,6 @@ impl Source {
         let mut source = Source::Remote {
             body: res.into_body(),
             leftover: None,
-            _client: client,
         };
         let crc_len = layout.map_or(0, |l| l.crc_bytes(offset, offset + length));
         let mut crcs = Vec::with_capacity(crc_len);
