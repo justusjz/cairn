@@ -280,8 +280,8 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
         // PutBucketVersioning, PutBucketAcl (`acl`).
         (true, &Method::PUT) => &["versioning", "acl"],
         (true, &Method::POST) => &["delete"],
-        // GetObjectAcl (stubbed).
-        (false, &Method::GET) => &["acl"],
+        // GetObjectAcl (stubbed), ListParts.
+        (false, &Method::GET) => &["acl", "uploadId"],
         // UploadPart / UploadPartCopy, PutObjectAcl (`acl`).
         (false, &Method::PUT) => &["uploadId", "partNumber", "acl"],
         // CreateMultipartUpload / CompleteMultipartUpload.
@@ -377,6 +377,7 @@ mod tests {
             (Method::PUT, false, "acl"),
             (Method::PUT, true, "acl"),
             (Method::GET, true, "ownershipControls"),
+            (Method::GET, false, "uploadId=u&max-parts=2"),
             (Method::DELETE, false, "versionId=null"),
             (Method::DELETE, false, "uploadId=u"),
         ] {
@@ -390,7 +391,6 @@ mod tests {
             (Method::DELETE, false, "tagging"),
             (Method::GET, false, "attributes"),
             (Method::GET, false, "partNumber=1"),
-            (Method::GET, false, "uploadId=u"),
             (Method::HEAD, false, "partNumber=1"),
             (Method::POST, false, "restore"),
             (Method::PUT, true, "policy"),

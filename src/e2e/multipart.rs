@@ -259,3 +259,77 @@ async fn parts_but_the_last_must_be_5_mib() {
     assert_eq!(complete(&app, "k", &upload_id, &[(1, &tiny)]).await.0, StatusCode::OK);
     assert_eq!(super::get(&app, "k").await, Some(b"tiny".to_vec()));
 }
+
+/// One page of ListParts: its parts (number, ETag, size), and the next marker
+/// if it's truncated.
+async fn parts_page(
+    app: &Arc<App>,
+    key: &str,
+    upload_id: &str,
+    marker: i32,
+    max_parts: i64,
+) -> (StatusCode, Vec<(i32, String, u64)>, Option<i32>) {
+    let response = crate::s3::multipart::list_parts::list_parts(app, BUCKET, key, upload_id, marker, max_parts)
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap().to_owned();
+    let field = |s: &str, name: &str| {
+        let open = format!("<{name}>");
+        let start = s.find(&open)? + open.len();
+        Some(s[start..start + s[start..].find(&format!("</{name}>"))?].to_owned())
+    };
+    let parts = body
+        .split("<Part>")
+        .skip(1)
+        .map(|p| {
+            (
+                field(p, "PartNumber").unwrap().parse().unwrap(),
+                field(p, "ETag").unwrap().trim_matches('"').to_owned(),
+                field(p, "Size").unwrap().parse().unwrap(),
+            )
+        })
+        .collect();
+    let next = (field(&body, "IsTruncated").as_deref() == Some("true"))
+        .then(|| field(&body, "NextPartNumberMarker").unwrap().parse().unwrap());
+    (status, parts, next)
+}
+
+/// ListParts pages through an upload's parts by number, each with the ETag
+/// it was last uploaded with and the size of its data; only for the upload's
+/// own bucket and key.
+#[tokio::test]
+async fn lists_an_uploads_parts() {
+    let Some(app) = node().await else { return };
+    let customer = super::customer_key(&[7; 32]);
+    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", Some(&customer)).await.unwrap();
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap();
+    let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
+    let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
+    // Parts 3, 1 and 2, and 2 again: the second upload of it counts.
+    let mut etags = std::collections::BTreeMap::new();
+    for (number, len) in [(3, 30), (1, 10), (2, 20), (2, 25)] {
+        let attach = AttachTarget::MultipartPart {
+            upload_id: upload_id.parse().unwrap(),
+            part_number: number,
+            key: Some(zeroize::Zeroizing::new(*customer.key())),
+        };
+        let body = Full::new(Bytes::from(vec![number as u8; len]));
+        let UploadResult::Committed { etag, .. } =
+            crate::upload_part(&app, body, &attach, Payload::unchecked()).await.unwrap()
+        else {
+            panic!("part {number} wasn't committed");
+        };
+        etags.insert(number, (etag, len as u64));
+    }
+    let all: Vec<(i32, String, u64)> = etags.iter().map(|(n, (e, len))| (*n, e.clone(), *len)).collect();
+    // Sizes are the data's, not the ciphertext's.
+    assert_eq!(parts_page(&app, "k", &upload_id, 0, 1000).await, (StatusCode::OK, all.clone(), None));
+    assert_eq!(parts_page(&app, "k", &upload_id, 0, 2).await, (StatusCode::OK, all[..2].to_vec(), Some(2)));
+    assert_eq!(parts_page(&app, "k", &upload_id, 2, 2).await, (StatusCode::OK, all[2..].to_vec(), None));
+    // Another key's upload, or none, is no such upload.
+    assert_eq!(parts_page(&app, "other", &upload_id, 0, 1000).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(parts_page(&app, "k", "not-an-upload", 0, 1000).await.0, StatusCode::NOT_FOUND);
+}

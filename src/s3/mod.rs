@@ -21,7 +21,10 @@ use crate::{
         conditional::Preconditions,
         multipart::{
             abort::abort_multipart_upload, complete::complete_multipart_upload,
-            create::create_multipart_upload, list::list_multipart_uploads, upload_part::put_part,
+            create::create_multipart_upload,
+            list::list_multipart_uploads,
+            list_parts::{MAX_PARTS, list_parts},
+            upload_part::put_part,
         },
         objects::{
             copy::{CopyKeys, copy_object, copy_part, parse_copy_source, replaces_metadata},
@@ -332,6 +335,19 @@ pub async fn handle(
         if query_param(&query, "acl").is_some() {
             return Ok(box_response(stub_acl()));
         }
+        // ListParts: GET /{bucket}/{key}?uploadId=U, paginated by
+        // part-number-marker.
+        if let Some(upload_id) = query_param(&query, "uploadId") {
+            let max_parts = query_param(&query, "max-parts")
+                .and_then(|v| v.parse::<i64>().ok())
+                .unwrap_or(MAX_PARTS)
+                .clamp(0, MAX_PARTS);
+            let marker = query_param(&query, "part-number-marker")
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or(0);
+            let resp = list_parts(&app, &bucket, &key, &upload_id, marker, max_parts).await?;
+            return Ok(box_response(resp));
+        }
         return get_object(
             &app,
             &bucket,
@@ -590,8 +606,9 @@ const BUCKET_CONFIGURATION: &[&str] = &[
 /// configuring versioning — is admin-only, while a bucket HEAD or reading its
 /// configuration (`BUCKET_CONFIGURATION`) just needs the bucket to be visible
 /// to the role. Everything
-/// else needs a grant on the bucket: `read` for GET/HEAD, `delete-version` to
-/// delete a specific version, `write` for the rest. A copy also needs `read` on
+/// else needs a grant on the bucket: `read` for GET/HEAD (or `write`, to list
+/// uploads and their parts), `delete-version` to delete a specific version,
+/// `write` for the rest. A copy also needs `read` on
 /// its source bucket. DeleteObjects only needs one of `write` / `delete-version`
 /// here; it checks each entry against them itself.
 fn authorize(
@@ -611,6 +628,11 @@ fn authorize(
             Method::GET if BUCKET_CONFIGURATION.iter().any(|c| query_param(query, c).is_some()) => {
                 principal.can_see(bucket)
             }
+            // ListMultipartUploads: what's being written, which a writer
+            // needs to find, to resume or abort an upload of its own.
+            Method::GET if query_param(query, "uploads").is_some() => {
+                principal.can(Permission::Read, bucket) || principal.can(Permission::Write, bucket)
+            }
             Method::GET => principal.can(Permission::Read, bucket),
             Method::POST if query_param(query, "delete").is_some() => {
                 principal.can(Permission::Write, bucket)
@@ -620,6 +642,10 @@ fn authorize(
         };
     }
     match *method {
+        // ListParts: likewise.
+        Method::GET if query_param(query, "uploadId").is_some() => {
+            principal.can(Permission::Read, bucket) || principal.can(Permission::Write, bucket)
+        }
         Method::GET | Method::HEAD => principal.can(Permission::Read, bucket),
         Method::PUT => {
             // A malformed copy source is left for the handler to reject with 400.

@@ -54,7 +54,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=93
+TOTAL=94
 STEP=0
 PASS=0
 FAIL=0
@@ -1561,6 +1561,27 @@ setup_role_buckets() {
     cairn_role grant reader "$BUCKET" read
 }
 
+# Resuming an upload with write alone: the role finds its upload
+# (ListMultipartUploads), the parts uploaded so far and their ETags
+# (ListParts), and completes it with them.
+resume_upload_ok() {
+    local w=(as_role writer writersecret) key="resume.bin" uid listed
+    cairn_role revoke writer "$OBUCKET" read >/dev/null 2>&1 || return 1
+    uid=$("${w[@]}" s3api create-multipart-upload --bucket "$OBUCKET" --key "$key" \
+        --query UploadId --output text 2>/dev/null) || return 1
+    "${w[@]}" s3api upload-part --bucket "$OBUCKET" --key "$key" --upload-id "$uid" \
+        --part-number 1 --body "$SMALL" >/dev/null 2>&1 || return 1
+    [ "$("${w[@]}" s3api list-multipart-uploads --bucket "$OBUCKET" --query 'Uploads[0].UploadId' \
+        --output text 2>/dev/null)" = "$uid" ] || return 1
+    listed=$("${w[@]}" s3api list-parts --bucket "$OBUCKET" --key "$key" --upload-id "$uid" \
+        --query '{Parts: Parts[].{PartNumber: PartNumber, ETag: ETag}}' --output json 2>/dev/null) || return 1
+    "${w[@]}" s3api complete-multipart-upload --bucket "$OBUCKET" --key "$key" --upload-id "$uid" \
+        --multipart-upload "$listed" >/dev/null 2>&1 || return 1
+    cairn_role grant writer "$OBUCKET" read >/dev/null 2>&1 || return 1
+    check_roundtrip "$SMALL" "s3://${OBUCKET}/$key" || return 1
+    "${w[@]}" s3api delete-object --bucket "$OBUCKET" --key "$key" >/dev/null 2>&1
+}
+
 # Grants follow the bucket's lifecycle: granting on a missing bucket fails, and
 # deleting a bucket drops its grants, so re-creating it doesn't revive them.
 grants_follow_bucket_ok() {
@@ -1678,6 +1699,7 @@ run_test    "Read-only role can read, not write"    reader_permissions_ok
 run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
 run_test    "Admin manages buckets, not objects"    admin_scope_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
+run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok
 run_test    "Missing bucket 404, no grant 403"      missing_bucket_404_ok
 run_test    "Revoked grant takes effect"            revoke_takes_effect_ok

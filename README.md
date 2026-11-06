@@ -163,8 +163,9 @@ What a role may do:
   see every bucket in ListBuckets. Admin does **not** grant access to objects.
 - **`read`** on a bucket: GetObject, HeadObject, ListObjects, and being the
   source of a CopyObject / UploadPartCopy.
-- **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads, and
-  being the destination of a copy. In a versioned bucket, a delete only adds a
+- **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads
+  (listing them and their parts too, to resume one), and being the destination
+  of a copy. In a versioned bucket, a delete only adds a
   delete marker.
 - **`delete-version`** on a bucket: DeleteObject(s) naming a version ID, which
   removes that version for good.
