@@ -1,6 +1,6 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes, header::HeaderValue};
+use hyper::{Method, Response, StatusCode, body::Bytes, header::HeaderValue};
 use percent_encoding::percent_decode_str;
 
 use crate::auth::Rejection;
@@ -200,6 +200,101 @@ pub fn unsupported_characters() -> Response<Full<Bytes>> {
     )
 }
 
+/// S3's subresources: query parameters that pick the operation, rather than
+/// parameterize it. `PUT /bucket/key?tagging` is PutObjectTagging, not a
+/// PutObject, so one Cairn doesn't handle must be refused, never served as the
+/// plain operation: that would overwrite the object with the request's XML, or
+/// delete it, or a bucket. Other parameters are ignored, as S3 ignores them
+/// (SDKs add some, like `x-id`).
+const SUBRESOURCES: &[&str] = &[
+    "accelerate",
+    "acl",
+    "analytics",
+    "attributes",
+    "cors",
+    "delete",
+    "encryption",
+    "intelligent-tiering",
+    "inventory",
+    "legal-hold",
+    "lifecycle",
+    "location",
+    "logging",
+    "metadataConfiguration",
+    "metadataTable",
+    "metrics",
+    "notification",
+    "object-lock",
+    "ownershipControls",
+    "partNumber",
+    "policy",
+    "policyStatus",
+    "publicAccessBlock",
+    "renameObject",
+    "replication",
+    "requestPayment",
+    "restore",
+    "retention",
+    "select",
+    "session",
+    "tagging",
+    "torrent",
+    "uploadId",
+    "uploads",
+    "versioning",
+    "versions",
+    "website",
+];
+
+/// The subresources Cairn handles, by method, for a bucket-level request or an
+/// object-level one. Must match the routing in `s3::handle`.
+fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'static str] {
+    match (bucket_level, method) {
+        // ListObjectVersions, versioning, and the stubs (`bucket_subresource_stub`).
+        (true, &Method::GET) => &[
+            "versioning",
+            "versions",
+            "acl",
+            "location",
+            "object-lock",
+            "policy",
+            "cors",
+            "tagging",
+            "lifecycle",
+        ],
+        (true, &Method::PUT) => &["versioning"],
+        (true, &Method::POST) => &["delete"],
+        // GetObjectAcl (stubbed).
+        (false, &Method::GET) => &["acl"],
+        // UploadPart / UploadPartCopy.
+        (false, &Method::PUT) => &["uploadId", "partNumber"],
+        // CreateMultipartUpload / CompleteMultipartUpload.
+        (false, &Method::POST) => &["uploads", "uploadId"],
+        // AbortMultipartUpload.
+        (false, &Method::DELETE) => &["uploadId"],
+        _ => &[],
+    }
+}
+
+/// A 501 for a request naming a subresource Cairn doesn't handle for its method
+/// (see [`SUBRESOURCES`]), or `None` if it names none.
+pub fn unsupported_subresource(
+    method: &Method,
+    bucket_level: bool,
+    query: &str,
+) -> Option<Response<Full<Bytes>>> {
+    let handled = handled_subresources(method, bucket_level);
+    let name = query
+        .split('&')
+        .map(|pair| decode_path_param(pair.split_once('=').map_or(pair, |(k, _)| k)))
+        .find(|name| SUBRESOURCES.contains(&name.as_str()) && !handled.contains(&name.as_str()))?;
+    Some(format_s3_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        &format!("the {name} subresource is not implemented for {method} requests"),
+    ))
+}
+
 /// Mints a ListObjectsV2 `continuation-token` carrying `marker` (the key to
 /// resume after). URL-safe base64 has no `+`/`/`/`=`, so the token survives
 /// `query_param` untouched on the way back. Inverse of
@@ -236,6 +331,62 @@ mod tests {
         }
         for bad in ["%FF", "caf%C3", "a%00b", "%C0%80"] {
             assert!(!is_well_formed(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_unhandled_subresources_are_refused() {
+        let refused = |method, bucket_level, query| {
+            unsupported_subresource(&method, bucket_level, query).map(|resp| resp.status())
+        };
+        // What Cairn routes, and parameters that aren't subresources at all.
+        for (method, bucket_level, query) in [
+            (Method::GET, true, ""),
+            (Method::GET, true, "list-type=2&prefix=a&x-id=ListObjectsV2"),
+            (Method::GET, true, "versions&key-marker=a"),
+            (Method::GET, true, "policy"),
+            (Method::PUT, true, "versioning"),
+            (Method::PUT, true, ""),
+            (Method::POST, true, "delete"),
+            (Method::DELETE, true, ""),
+            (Method::GET, false, "versionId=null"),
+            (Method::GET, false, "acl"),
+            (Method::GET, false, "response-content-type=a%2Fb"),
+            (Method::HEAD, false, "versionId=null"),
+            (Method::PUT, false, "x-id=PutObject"),
+            (Method::PUT, false, "partNumber=1&uploadId=u"),
+            (Method::POST, false, "uploads"),
+            (Method::POST, false, "uploadId=u"),
+            (Method::DELETE, false, "versionId=null"),
+            (Method::DELETE, false, "uploadId=u"),
+        ] {
+            assert_eq!(refused(method.clone(), bucket_level, query), None, "{method} {query}");
+        }
+        // Each of these used to run as the plain operation: overwriting the
+        // object, deleting it or the bucket, or serving the wrong bytes.
+        for (method, bucket_level, query) in [
+            (Method::PUT, false, "tagging"),
+            (Method::PUT, false, "acl"),
+            (Method::PUT, false, "retention&versionId=null"),
+            (Method::DELETE, false, "tagging"),
+            (Method::GET, false, "attributes"),
+            (Method::GET, false, "partNumber=1"),
+            (Method::GET, false, "uploadId=u"),
+            (Method::HEAD, false, "partNumber=1"),
+            (Method::POST, false, "restore"),
+            (Method::PUT, true, "policy"),
+            (Method::PUT, true, "acl"),
+            (Method::DELETE, true, "policy"),
+            (Method::DELETE, true, "cors"),
+            (Method::GET, true, "uploads"),
+            (Method::GET, true, "website"),
+            (Method::GET, true, "prefix=a&%77ebsite"),
+        ] {
+            assert_eq!(
+                refused(method.clone(), bucket_level, query),
+                Some(StatusCode::NOT_IMPLEMENTED),
+                "{method} {query}"
+            );
         }
     }
 }

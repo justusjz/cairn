@@ -103,6 +103,11 @@ pub async fn handle(
             "Your key is too long",
         )));
     }
+    // Before anything routes on the method alone: an operation Cairn doesn't
+    // implement would otherwise run as the plain PUT, DELETE or GET.
+    if let Some(resp) = util::unsupported_subresource(req.method(), key.is_empty(), query) {
+        return Ok(box_response(resp));
+    }
     if !authorize(&principal, req.method(), &bucket, &key, query, copy_source_header) {
         return Ok(forbidden("AccessDenied", "Access Denied"));
     }

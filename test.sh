@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=86
+TOTAL=87
 STEP=0
 PASS=0
 FAIL=0
@@ -778,6 +778,20 @@ subresource_stubs_ok() {
     ! awss3 s3api get-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+}
+
+# Operations Cairn doesn't implement are refused (501), not run as the plain
+# PUT/DELETE/GET they'd otherwise route to: the object and the bucket survive.
+unsupported_subresources_refused() {
+    local path="/${BUCKET}/small.txt" xml="$WORK_DIR/tagging.xml"
+    printf '<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>' >"$xml"
+    local hash; hash=$(sha256sum "$xml" | cut -d' ' -f1)
+    [ "$(scurl PUT "$path?tagging" "$hash" "$xml")" = 501 ] || return 1
+    [ "$(scurl PUT "$path?acl" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl DELETE "$path?tagging" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl GET "$path?partNumber=1" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl DELETE "/${BUCKET}?policy" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
 }
 
 # DeleteObjects via aws-cli — which sends an x-amz-checksum-crc32 (not Content-MD5).
@@ -1514,6 +1528,7 @@ run_test    "Packer leaves too little alone"         pack_below_thresholds_ok
 run_test    "Packer compacts mostly-dead blobs"      pack_compacts_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
+run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
 run_test    "Create second bucket, grant roles"     setup_role_buckets
 run_test    "Read-only role can read, not write"    reader_permissions_ok
 run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
