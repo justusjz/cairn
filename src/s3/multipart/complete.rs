@@ -58,7 +58,9 @@ fn parse_complete_request(body: &str) -> Option<Vec<(i32, String)>> {
 }
 
 /// CompleteMultipartUpload: `POST /{bucket}/{key}?uploadId=U` with a part-list
-/// body. Assembles the listed parts into the object atomically.
+/// body. Assembles the listed parts into the object atomically. A retry of a
+/// completion that went through (its response lost, say) is answered as it
+/// was, as long as the version it made is still there.
 pub async fn complete_multipart_upload(
     app: &Arc<App>,
     bucket: &str,

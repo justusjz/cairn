@@ -27,6 +27,7 @@ mod copies;
 mod deadlocks;
 mod listing;
 mod locking;
+mod multipart;
 
 /// The bucket every test node has.
 pub const BUCKET: &str = "bucket";

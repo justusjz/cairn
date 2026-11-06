@@ -868,6 +868,12 @@ $$;
 -- ('precondition_failed'). Then publishes the listed parts as the key's new
 -- version, deletes the staged parts left out, and the upload ('done', with
 -- the object's ETag).
+--
+-- A retry, whose upload this already completed, finds the version it made,
+-- if that's still there and has the ETag the listed parts give, and reports
+-- it as 'done' again (S3 answers a retried completion as it did the first).
+-- That's a read, after the upload's lock was waited for: a completion that
+-- held it has committed by then (F1).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_complete_upload(
     p_upload uuid, p_bucket text, p_key text, p_part_numbers int[], p_etags text[],
     p_if_match text[], p_if_none_match text[], p_new_version_id text,
@@ -897,8 +903,31 @@ BEGIN
     SELECT content_type INTO v_content_type FROM multipart_uploads
     WHERE upload_id = p_upload AND bucket = p_bucket AND key = p_key
     FOR UPDATE;
-    IF v_versioning IS NULL OR NOT FOUND THEN
+    IF v_versioning IS NULL THEN
         status := 'no_such_upload';
+        RETURN;
+    END IF;
+    IF NOT FOUND THEN
+        -- Only part ETags (MD5s in hex) can make the version's; anything else
+        -- can't be decoded, and names no part.
+        IF EXISTS (SELECT 1 FROM unnest(p_etags) AS e WHERE e !~ '^[0-9a-f]{32}$') THEN
+            status := 'no_such_upload';
+            RETURN;
+        END IF;
+        v_combined := (SELECT md5(string_agg(decode(e, 'hex'), ''::bytea ORDER BY n))
+                       FROM unnest(p_etags) WITH ORDINALITY AS r(e, n))
+                      || '-' || cardinality(p_etags);
+        SELECT o.etag, o.version_id INTO etag, version_id FROM objects o
+        WHERE o.bucket = p_bucket AND o.key = p_key AND o.upload_id = p_upload
+          AND o.etag = v_combined;
+        IF NOT FOUND THEN
+            status := 'no_such_upload';
+            RETURN;
+        END IF;
+        IF v_versioning = 'unversioned' THEN
+            version_id := NULL;
+        END IF;
+        status := 'done';
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
@@ -931,6 +960,7 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, v_total, etag, v_content_type, p_new_version_id);
     version_id := v.version_id;
+    UPDATE objects SET upload_id = p_upload WHERE id = v.id;
     UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);
     DELETE FROM parts WHERE id = ANY(v_unused);
     SELECT * INTO reap_blob, reap_node, reap_peer

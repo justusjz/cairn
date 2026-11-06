@@ -180,6 +180,7 @@ const MIGRATIONS: &[&str] = &[
     BYTEWISE_KEYS,
     COMPACTABLE,
     UPLOADS_BY_KEY,
+    COMPLETED_FROM,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -658,6 +659,13 @@ DROP INDEX blobs_sparse;
 /// were created), and DeleteBucket finds them by.
 const UPLOADS_BY_KEY: &str = r#"
 CREATE INDEX multipart_uploads_by_key ON multipart_uploads (bucket, key, upload_id);
+"#;
+
+/// Migration 12: the upload a version was completed from, so that a retried
+/// CompleteMultipartUpload, whose upload is gone, can tell that it succeeded.
+/// Nullable without a default, so the table isn't rewritten.
+const COMPLETED_FROM: &str = r#"
+ALTER TABLE objects ADD COLUMN upload_id uuid;
 "#;
 
 #[cfg(test)]
