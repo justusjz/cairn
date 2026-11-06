@@ -132,7 +132,7 @@ async fn a_put_after_delete_bucket_finds_no_bucket() {
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
     let deleted: String = tx
-        .query_one("SELECT pg_temp.cairn_delete_bucket($1)", &[&BUCKET])
+        .query_one("SELECT status FROM pg_temp.cairn_delete_bucket($1)", &[&BUCKET])
         .await
         .unwrap()
         .get(0);

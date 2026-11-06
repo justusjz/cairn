@@ -362,7 +362,7 @@ every node:
 
 - Data whose upload has been unfinished for a day is deleted: its upload (or
   packing job) has died. Multipart uploads that were never completed are kept
-  until they're aborted.
+  until they're aborted, or their bucket is deleted.
 - Each node checks its data directory for files the database doesn't know,
   and deletes them. It checks a slice at a time, getting through all of it in
   a day.

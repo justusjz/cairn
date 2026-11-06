@@ -95,7 +95,8 @@
 --     bucket's versioning state. Guard: B(b): writers read the state with it
 --     shared, PutBucketVersioning holds it exclusively.
 -- I3. A bucket is only deleted when it has no objects and no uploads, since
---     its cascades must never delete data. Guard: B(b): DeleteBucket holds it
+--     its cascades must never delete data. (DeleteBucket aborts the uploads
+--     itself first.) Guard: B(b): DeleteBucket holds it
 --     exclusively and checks afterwards; every inserter of objects holds it
 --     shared (and CreateMultipartUpload's insert, through its FK check). An
 --     inserter that finds the row gone reports NoSuchBucket
@@ -1023,25 +1024,55 @@ BEGIN
 END
 $$;
 
--- T9: DeleteBucket. Takes B(b) exclusive, then G on the bucket's grants. Only
--- an empty bucket (no objects, no uploads) is deleted: the cascades from it
--- must never delete data. Returns 'deleted', 'no_such_bucket' or 'not_empty'.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_bucket(p_bucket text)
-RETURNS text LANGUAGE plpgsql AS $$
+-- T9: DeleteBucket. Takes B(b) exclusive, then U(u) exclusive on each of the
+-- bucket's uploads (in order of their ids), G on its grants, and X on the
+-- uploads' staged parts' blobs. Only a bucket without objects is deleted, as
+-- S3 deletes one; its incomplete uploads are aborted with it, as S3 aborts
+-- them, and their parts and blobs deleted here, not by the cascades, which
+-- must never delete data (I3). Returns 'deleted', 'no_such_bucket' or
+-- 'not_empty'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_bucket(
+    p_bucket text,
+    OUT status text,
+    OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_uploads uuid[];
+    v_staged bigint[];
+    f record;
+    v_locked uuid[];
 BEGIN
+    reap_blob := '{}';
+    reap_node := '{}';
+    reap_peer := '{}';
     PERFORM 1 FROM buckets WHERE name = p_bucket FOR UPDATE;
     IF NOT FOUND THEN
-        RETURN 'no_such_bucket';
+        status := 'no_such_bucket';
+        RETURN;
     END IF;
-    IF EXISTS (SELECT 1 FROM objects WHERE bucket = p_bucket)
-       OR EXISTS (SELECT 1 FROM multipart_uploads WHERE bucket = p_bucket) THEN
-        RETURN 'not_empty';
+    IF EXISTS (SELECT 1 FROM objects WHERE bucket = p_bucket) THEN
+        status := 'not_empty';
+        RETURN;
     END IF;
+    -- No upload can be created in the bucket now (its insert's FK check
+    -- conflicts with B), and none attaches a part once its U is held.
+    v_uploads := ARRAY(SELECT s.upload_id FROM (
+        SELECT upload_id FROM multipart_uploads WHERE bucket = p_bucket
+        ORDER BY upload_id FOR UPDATE
+    ) AS s);
     -- The grants go with the bucket (a cascade); locked first, in order.
     PERFORM 1 FROM role_grants WHERE bucket = p_bucket
     ORDER BY role, bucket, permission FOR UPDATE;
+    v_staged := ARRAY(SELECT id FROM parts WHERE upload_id = ANY(v_uploads));
+    SELECT * INTO f FROM pg_temp.cairn_freeable(v_staged);
+    v_locked := pg_temp.cairn_lock_blobs(f.blobs, f.exclusive);
+    PERFORM pg_temp.cairn_check_on(v_staged, v_locked);
+    DELETE FROM parts WHERE id = ANY(v_staged);
+    DELETE FROM multipart_uploads WHERE upload_id = ANY(v_uploads);
     DELETE FROM buckets WHERE name = p_bucket;
-    RETURN 'deleted';
+    SELECT * INTO reap_blob, reap_node, reap_peer
+    FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
+    status := 'deleted';
 END
 $$;
 

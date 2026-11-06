@@ -3,11 +3,12 @@
 
 use std::sync::Arc;
 
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::{
-    HeaderMap,
+    HeaderMap, StatusCode,
     body::{Bytes, Frame},
 };
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use super::{BUCKET, assert_files, node_replicating, node_with, put, query_i64};
@@ -16,7 +17,10 @@ use crate::{
     payload::Payload,
     body::channel_body,
     packer,
-    s3::conditional::Preconditions,
+    s3::{
+        buckets::delete::delete_bucket, conditional::Preconditions,
+        multipart::create::create_multipart_upload,
+    },
 };
 
 async fn node() -> Option<Arc<App>> {
@@ -240,4 +244,55 @@ async fn an_upload_dropped_while_committing_leaves_nothing_unreferenced() {
     let committed = query_i64(&app, "SELECT count(*) FROM blobs WHERE state = 'committed'").await;
     assert_eq!(committed, objects, "a committed object has its blob, and only then");
     assert_left(&app, objects).await;
+}
+
+/// DeleteBucket aborts the bucket's incomplete uploads, as S3 does, and frees
+/// their parts' blobs right away, including those of parts that commit while
+/// it runs. A part that comes after finds its upload gone, and leaves nothing
+/// either. Objects still keep a bucket from being deleted.
+#[tokio::test]
+async fn delete_bucket_aborts_its_uploads() {
+    let Some(app) = node().await else { return };
+    let create = |key: &'static str| {
+        let app = app.clone();
+        async move {
+            let response = create_multipart_upload(&app, BUCKET, key, "x").await.unwrap();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = String::from_utf8(body.to_vec()).unwrap();
+            let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
+            body[start..body.find("</UploadId>").unwrap()].parse::<Uuid>().unwrap()
+        }
+    };
+    let uploads = [create("a").await, create("b").await];
+    for (i, upload_id) in uploads.iter().enumerate() {
+        let attach = AttachTarget::MultipartPart { upload_id: *upload_id, part_number: i as i32 + 1 };
+        let result = upload(&app, &attach, b"staged", Payload::unchecked()).await.unwrap();
+        assert!(matches!(result, UploadResult::Committed { .. }));
+    }
+    put(&app, "k", b"object".to_vec()).await;
+    assert_eq!(delete_bucket(&app, BUCKET).await.unwrap().status(), StatusCode::CONFLICT);
+    super::delete(&app, "k").await;
+    assert_left(&app, 2).await;
+
+    // Parts of both uploads race the delete.
+    let mut parts = JoinSet::new();
+    for n in 0..16 {
+        let (app, upload_id) = (app.clone(), uploads[n % 2]);
+        parts.spawn(async move {
+            let attach = AttachTarget::MultipartPart { upload_id, part_number: 10 + n as i32 };
+            upload(&app, &attach, b"racing", Payload::unchecked()).await.unwrap()
+        });
+    }
+    assert_eq!(delete_bucket(&app, BUCKET).await.unwrap().status(), StatusCode::NO_CONTENT);
+    while let Some(result) = parts.join_next().await {
+        let result = result.unwrap();
+        assert!(
+            matches!(result, UploadResult::Committed { .. } | UploadResult::NoSuchUpload),
+            "a part either made it in before the delete, or found its upload gone"
+        );
+    }
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM buckets").await, 0);
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM multipart_uploads").await, 0);
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM parts").await, 0);
+    assert_left(&app, 0).await;
 }
