@@ -3,10 +3,17 @@
 
 use std::sync::Arc;
 
-use super::{BUCKET, node_with, put};
+use http_body_util::BodyExt;
+use hyper::StatusCode;
+
+use super::{BUCKET, delete, node_with, put};
 use crate::{
     App, packer,
-    s3::objects::list::{ListEntry, ListQuery, list},
+    s3::objects::{
+        delete::delete_object,
+        list::{ListEntry, ListQuery, list},
+        list_versions::list_object_versions,
+    },
 };
 
 async fn node() -> Option<Arc<App>> {
@@ -192,4 +199,96 @@ async fn walks_versions_and_common_prefixes() {
         assert_eq!(all_versions(&app, "", "/", limit).await, rolled_up, "limit {limit}");
     }
     assert_eq!(all_versions(&app, "d/", "/", 1).await, ["d/x/", "d/y"]);
+}
+
+/// One page of ListObjectVersions, as the handler answers it: its versions'
+/// keys and IDs.
+async fn versions_page(
+    app: &App,
+    key_marker: &str,
+    version_id_marker: &str,
+    max_keys: i64,
+) -> Vec<(String, String)> {
+    let response =
+        list_object_versions(app, BUCKET, "", None, key_marker, Some(version_id_marker), max_keys)
+            .await
+            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap();
+    let between = |s: &str, open: &str, close: &str| {
+        let start = s.find(open).unwrap() + open.len();
+        s[start..start + s[start..].find(close).unwrap()].to_owned()
+    };
+    body.split("<Version>")
+        .skip(1)
+        .map(|v| (between(v, "<Key>", "</Key>"), between(v, "<VersionId>", "</VersionId>")))
+        .collect()
+}
+
+async fn version_ids(app: &App, key: &str) -> Vec<String> {
+    let client = app.pool.get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT version_id FROM objects WHERE bucket = $1 AND key = $2 ORDER BY id DESC",
+            &[&BUCKET, &key],
+        )
+        .await
+        .unwrap();
+    rows.iter().map(|row| row.get(0)).collect()
+}
+
+/// A page can follow one whose last version was deleted since, as a client
+/// emptying a bucket page by page deletes it: it starts at that key's newest
+/// version that's left, so nothing is skipped.
+#[tokio::test]
+async fn a_version_marker_may_be_gone() {
+    let Some(app) = node().await else { return };
+    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+    // Unversioned: the key's only version was the marker, so the next key follows.
+    for key in ["a", "b"] {
+        put(&app, key, b"x".to_vec()).await;
+    }
+    delete(&app, "a").await;
+    assert_eq!(versions_page(&app, "a", "null", 1000).await, [pair("b", "null")]);
+    delete(&app, "b").await;
+
+    // Versioned: k has versions v3, v2, v1 (newest first), then comes l.
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT pg_temp.cairn_set_versioning($1, 'enabled')", &[&BUCKET])
+        .await
+        .unwrap();
+    for (key, data) in [("k", "1"), ("k", "2"), ("k", "3"), ("l", "1")] {
+        put(&app, key, data.as_bytes().to_vec()).await;
+    }
+    let k = version_ids(&app, "k").await;
+    let l = version_ids(&app, "l").await;
+    // A page ended at v2, which is still there: the rest of k follows it.
+    assert_eq!(
+        versions_page(&app, "k", &k[1], 1000).await,
+        [pair("k", &k[2]), pair("l", &l[0])]
+    );
+    // v2 is deleted, as a page's versions are when emptying the bucket.
+    let delete_version = |v: String| {
+        let app = app.clone();
+        async move {
+            let response = delete_object(&app, BUCKET, "k", Some(&v)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+    };
+    delete_version(k[1].clone()).await;
+    // v3 is still there, so it's listed again, then v1 and l: nothing is skipped.
+    assert_eq!(
+        versions_page(&app, "k", &k[1], 1000).await,
+        [pair("k", &k[0]), pair("k", &k[2]), pair("l", &l[0])]
+    );
+    // With v3 deleted too, as it is in that case, the page is exactly the rest.
+    delete_version(k[0].clone()).await;
+    assert_eq!(
+        versions_page(&app, "k", &k[1], 1000).await,
+        [pair("k", &k[2]), pair("l", &l[0])]
+    );
 }

@@ -36,6 +36,11 @@ pub async fn list_object_versions(
     }
     // A version-id-marker only means something within a key-marker; resolve it
     // to the version's row id, which orders a key's versions (higher is newer).
+    // If that version is gone (deleted since the last page, as a client emptying
+    // the bucket page by page deletes it), where it was is gone with it: version
+    // IDs are random. Then the page starts at the key's newest version that's
+    // left, which skips nothing; it can only repeat versions newer than the
+    // marker that someone left in place while deleting it.
     let marker_id: Option<i64> = match version_id_marker {
         None => None,
         Some(_) if key_marker.is_empty() => {
@@ -51,7 +56,7 @@ pub async fn list_object_versions(
             .await?
         {
             Some(row) => Some(row.get(0)),
-            None => return Ok(invalid_argument("invalid version id specified")),
+            None => Some(i64::MAX),
         },
     };
 
