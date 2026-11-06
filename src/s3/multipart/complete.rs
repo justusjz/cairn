@@ -11,6 +11,7 @@ use crate::{
     blobs::{ReapTarget, reap_blobs, reap_columns},
     db,
     s3::conditional::Preconditions,
+    s3::sse_c::{self, CustomerKey},
     s3::util::{format_s3_error, slow_down, with_version_id, xml_escape, xml_ok},
     s3::versions::new_version_id,
 };
@@ -68,6 +69,7 @@ pub async fn complete_multipart_upload(
     upload_id: &str,
     body: Bytes,
     preconditions: &Preconditions,
+    customer_key: Option<&CustomerKey>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -106,6 +108,22 @@ pub async fn complete_multipart_upload(
     }
 
     let mut client = app.pool.get().await?;
+    // The object gets its upload's key check; a key isn't needed. One given
+    // must be the upload's (a retry, whose upload is gone, isn't checked).
+    if let Some(customer) = customer_key {
+        let upload = client
+            .query_opt_cached(
+                "SELECT sse_c_key FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
+                &[&upload_id, &bucket, &key],
+            )
+            .await?;
+        if let Some(upload) = upload {
+            let check: Option<Vec<u8>> = upload.get(0);
+            if let Err(refused) = sse_c::check_read(check.as_deref(), Some(customer)) {
+                return Ok(refused);
+            }
+        }
+    }
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         match try_complete(&mut client, bucket, key, &upload_id, &requested, preconditions).await {
@@ -126,7 +144,11 @@ pub async fn complete_multipart_upload(
                     xml_escape(&key),
                     xml_escape(&etag),
                 );
-                return Ok(with_version_id(xml_ok(body), version_id.as_deref()));
+                let response = with_version_id(xml_ok(body), version_id.as_deref());
+                return Ok(match customer_key {
+                    Some(customer) => customer.echo_onto(response),
+                    None => response,
+                });
             }
             Ok(CompleteOutcome::NoSuchUpload) => {
                 return Ok(format_s3_error(

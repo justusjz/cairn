@@ -479,6 +479,15 @@ sse_c_ok() {
         --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k1" 2>/dev/null)" = "$(stat -c %s "$BIG")" ] || return 1
     ! awss3 s3api put-object --bucket "$BUCKET" --key sse/s3.txt --body "$SMALL" \
         --server-side-encryption AES256 >/dev/null 2>&1 || return 1
+    # Multipart (16 MiB in 8 MiB parts), and downloaded in parallel ranges.
+    awss3 s3 cp "$MULTIPART" "s3://${BUCKET}/sse/multi.bin" --sse-c AES256 --sse-c-key "fileb://$k1" \
+        >/dev/null 2>&1 || return 1
+    awss3 s3 cp "s3://${BUCKET}/sse/multi.bin" "$out" --sse-c AES256 --sse-c-key "fileb://$k1" \
+        >/dev/null 2>&1 || return 1
+    cmp -s "$MULTIPART" "$out" || return 1
+    ! awss3 s3 cp "s3://${BUCKET}/sse/multi.bin" "$out" --sse-c AES256 --sse-c-key "fileb://$k2" \
+        >/dev/null 2>&1 || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key sse/multi.bin >/dev/null 2>&1 || return 1
     for key in small.txt big.bin; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "sse/$key" >/dev/null 2>&1 || return 1
     done
@@ -1555,7 +1564,7 @@ run_test    "CopyObject shares the source's data"   copy_shares_data_ok
 run_test    "CopyObject of multipart src is normal" copy_multipart_source_normal_ok
 run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok
 run_test    "Metadata stored, copied, replaced"     metadata_ok
-run_test    "SSE-C put/get/range, wrong key refused" sse_c_ok
+run_test    "SSE-C put/multipart/get/range, wrong key" sse_c_ok
 expect_fail "Self-copy without REPLACE rejected"    awss3 s3api copy-object --bucket "$BUCKET" --key big.bin --copy-source "${BUCKET}/big.bin"
 expect_fail "Copy from missing source fails"        awss3 s3api copy-object --bucket "$BUCKET" --key copy/none.txt --copy-source "${BUCKET}/does-not-exist.txt"
 run_test    "UploadPartCopy (whole object)"         upload_part_copy_whole_ok

@@ -93,6 +93,14 @@ impl CustomerKey {
             .header(HEADERS.algorithm, ALGORITHM)
             .header(HEADERS.md5, self.md5.as_str())
     }
+
+    /// Adds them to a response that's already built.
+    pub fn echo_onto<B>(&self, mut response: Response<B>) -> Response<B> {
+        let headers = response.headers_mut();
+        headers.insert(HEADERS.algorithm, ALGORITHM.parse().unwrap());
+        headers.insert(HEADERS.md5, self.md5.parse().expect("it came in a header"));
+        response
+    }
 }
 
 fn invalid(code: &str, message: &str) -> Response<Full<Bytes>> {

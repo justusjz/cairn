@@ -749,8 +749,13 @@ enum AttachTarget {
         /// If it's SSE-C: what to encrypt it with.
         sealing: Option<Sealing>,
     },
-    /// A part staged under an in-progress multipart upload.
-    MultipartPart { upload_id: Uuid, part_number: i32 },
+    /// A part staged under an in-progress multipart upload, encrypted with
+    /// `key` if the upload is SSE-C.
+    MultipartPart {
+        upload_id: Uuid,
+        part_number: i32,
+        key: Option<zeroize::Zeroizing<encryption::Key>>,
+    },
 }
 
 /// What an SSE-C object is encrypted with: the client's key, and the check of
@@ -808,6 +813,9 @@ where
     let mut sealer = match attach {
         AttachTarget::Object { sealing: Some(sealing), .. } => {
             Some(encryption::Sealer::new(&sealing.key, encryption::new_salt()))
+        }
+        AttachTarget::MultipartPart { key: Some(key), .. } => {
+            Some(encryption::Sealer::new(key, encryption::new_salt()))
         }
         _ => None,
     };
@@ -1001,6 +1009,7 @@ async fn try_commit_part(
         AttachTarget::MultipartPart {
             upload_id,
             part_number,
+            ..
         } => {
             let row = client
                 .query_one_cached(

@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App,
+    s3::sse_c::CustomerKey,
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
 
@@ -17,6 +18,7 @@ pub async fn create_multipart_upload(
     key: &str,
     content_type: &str,
     metadata: &str,
+    customer_key: Option<&CustomerKey>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     if client
@@ -31,14 +33,16 @@ pub async fn create_multipart_upload(
         ));
     }
     // The content type and metadata are captured now and applied to the object
-    // at completion.
+    // at completion; so is the check of an SSE-C upload's key, which its parts
+    // need.
     let upload_id = Uuid::now_v7();
+    let check = customer_key.map(|key| key.new_check());
     client
         .execute_cached(
             "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, metadata,
-                                            initiated_at)
-             VALUES ($1, $2, $3, $4, $5, NOW())",
-            &[&upload_id, &bucket, &key, &content_type, &metadata],
+                                            sse_c_key, initiated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, NOW())",
+            &[&upload_id, &bucket, &key, &content_type, &metadata, &check],
         )
         .await?;
     let body = format!(
@@ -50,5 +54,8 @@ pub async fn create_multipart_upload(
         xml_escape(key),
         upload_id
     );
-    Ok(xml_ok(body))
+    Ok(match customer_key {
+        Some(key) => key.echo_onto(xml_ok(body)),
+        None => xml_ok(body),
+    })
 }

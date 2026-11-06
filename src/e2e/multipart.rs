@@ -28,7 +28,7 @@ async fn staged(app: &Arc<App>, key: &str) -> (String, [String; 2]) {
 
 /// Like `staged`, the upload to give its object the stored `metadata`.
 async fn staged_with(app: &Arc<App>, key: &str, metadata: &str) -> (String, [String; 2]) {
-    let response = create_multipart_upload(app, BUCKET, key, "x", metadata).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", metadata, None).await.unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -38,6 +38,7 @@ async fn staged_with(app: &Arc<App>, key: &str, metadata: &str) -> (String, [Str
         let attach = AttachTarget::MultipartPart {
             upload_id: upload_id.parse::<Uuid>().unwrap(),
             part_number: i as i32 + 1,
+            key: None,
         };
         let body = Full::new(Bytes::from(vec![i as u8; 100]));
         let UploadResult::Committed { etag: e, .. } =
@@ -64,7 +65,7 @@ async fn complete(
         .collect();
     let body = Bytes::from(format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>"));
     let response =
-        complete_multipart_upload(app, BUCKET, key, upload_id, body, &Preconditions::default())
+        complete_multipart_upload(app, BUCKET, key, upload_id, body, &Preconditions::default(), None)
             .await
             .unwrap();
     let status = response.status();
@@ -155,4 +156,61 @@ async fn a_completed_upload_has_its_metadata() {
     let headers = super::metadata::read_headers(&app, "k").await;
     assert_eq!(headers["x-amz-meta-from"], "upload");
     assert_eq!(headers["content-language"], "de");
+}
+
+/// An SSE-C upload: its parts are encrypted with its key, its object has its
+/// key check, and reads back with the key, also in ranges across segments and
+/// parts. A completion needs no key, but one it's given must be the upload's.
+#[tokio::test]
+async fn an_sse_c_upload_makes_an_sse_c_object() {
+    let Some(app) = node().await else { return };
+    let customer = super::customer_key(&[3; 32]);
+    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", Some(&customer)).await.unwrap();
+    assert_eq!(response.headers()["x-amz-server-side-encryption-customer-algorithm"], "AES256");
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap();
+    let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
+    let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
+    let lens = [70_000usize, 5, 65_536];
+    let data: Vec<Vec<u8>> = lens.iter().enumerate().map(|(i, len)| vec![i as u8 + 1; *len]).collect();
+    let mut etags = Vec::new();
+    for (i, part) in data.iter().enumerate() {
+        let attach = AttachTarget::MultipartPart {
+            upload_id: upload_id.parse().unwrap(),
+            part_number: i as i32 + 1,
+            key: Some(zeroize::Zeroizing::new(*customer.key())),
+        };
+        let body = Full::new(Bytes::from(part.clone()));
+        let UploadResult::Committed { etag, .. } =
+            crate::upload_part(&app, body, &attach, Payload::unchecked()).await.unwrap()
+        else {
+            panic!("part {i} wasn't committed");
+        };
+        etags.push(etag);
+    }
+    let parts: Vec<(i32, &str)> = etags.iter().enumerate().map(|(i, e)| (i as i32 + 1, e.as_str())).collect();
+    // Another key is refused; none will do.
+    let listed: String = parts
+        .iter()
+        .map(|(n, etag)| format!("<Part><PartNumber>{n}</PartNumber><ETag>\"{etag}\"</ETag></Part>"))
+        .collect();
+    let request = Bytes::from(format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>"));
+    let other = super::customer_key(&[4; 32]);
+    let response = complete_multipart_upload(&app, BUCKET, "k", &upload_id, request, &Preconditions::default(), Some(&other))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let (status, etag, _) = complete(&app, "k", &upload_id, &parts).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(etag.unwrap().ends_with("-3\""));
+
+    let whole: Vec<u8> = data.concat();
+    assert_eq!(super::get_sealed(&app, "k", None, Some(&customer)).await, (StatusCode::OK, whole.clone()));
+    for (start, end) in [(65_530, 70_003), (69_999, 70_006), (70_004, 135_541), (0, 135_541)] {
+        let range = format!("bytes={start}-{}", end - 1);
+        let (status, body) = super::get_sealed(&app, "k", Some(&range), Some(&customer)).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(body, &whole[start..end], "{range}");
+    }
+    assert_eq!(super::get_sealed(&app, "k", None, None).await.0, StatusCode::BAD_REQUEST);
 }

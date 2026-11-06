@@ -94,6 +94,7 @@ async fn a_part_of_a_vanished_upload_leaves_nothing() {
     let attach = AttachTarget::MultipartPart {
         upload_id: Uuid::now_v7(),
         part_number: 1,
+        key: None,
     };
     let result = upload(&app, &attach, b"data", Payload::unchecked()).await;
     assert!(matches!(result.unwrap(), UploadResult::NoSuchUpload));
@@ -258,7 +259,7 @@ async fn delete_bucket_aborts_its_uploads() {
     let create = |key: &'static str| {
         let app = app.clone();
         async move {
-            let response = create_multipart_upload(&app, BUCKET, key, "x", "").await.unwrap();
+            let response = create_multipart_upload(&app, BUCKET, key, "x", "", None).await.unwrap();
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let body = String::from_utf8(body.to_vec()).unwrap();
             let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -267,7 +268,7 @@ async fn delete_bucket_aborts_its_uploads() {
     };
     let uploads = [create("a").await, create("b").await];
     for (i, upload_id) in uploads.iter().enumerate() {
-        let attach = AttachTarget::MultipartPart { upload_id: *upload_id, part_number: i as i32 + 1 };
+        let attach = AttachTarget::MultipartPart { upload_id: *upload_id, part_number: i as i32 + 1, key: None };
         let result = upload(&app, &attach, b"staged", Payload::unchecked()).await.unwrap();
         assert!(matches!(result, UploadResult::Committed { .. }));
     }
@@ -281,7 +282,7 @@ async fn delete_bucket_aborts_its_uploads() {
     for n in 0..16 {
         let (app, upload_id) = (app.clone(), uploads[n % 2]);
         parts.spawn(async move {
-            let attach = AttachTarget::MultipartPart { upload_id, part_number: 10 + n as i32 };
+            let attach = AttachTarget::MultipartPart { upload_id, part_number: 10 + n as i32, key: None };
             upload(&app, &attach, b"racing", Payload::unchecked()).await.unwrap()
         });
     }

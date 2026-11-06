@@ -279,7 +279,7 @@ async fn a_copy_after_a_delete_finds_the_source_changed() {
 
 /// Creates an upload for `key`, returning its ID.
 async fn create_upload(app: &App, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "").await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", None).await.unwrap();
     let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -292,6 +292,7 @@ async fn upload_part(app: &Arc<App>, upload_id: Uuid, number: i32, data: &[u8]) 
     let attach = AttachTarget::MultipartPart {
         upload_id,
         part_number: number,
+        key: None,
     };
     let body = http_body_util::Full::new(hyper::body::Bytes::from(data.to_vec()));
     crate::upload_part(app, body, &attach, Payload::unchecked())

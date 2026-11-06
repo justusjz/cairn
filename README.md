@@ -332,8 +332,9 @@ Without the key, the data can't be read, by anyone.
   request must come through a proxy that sets `X-Forwarded-Proto: https` (or
   `Forwarded: proto=https`). Behind an encrypted network instead, allow it with
   `--allow-sse-c-over-http`. Lose the key and the object is lost.
-- Not yet: SSE-C for multipart uploads, and copies of SSE-C objects (both
-  answer `501 NotImplemented`).
+- Multipart uploads: send the key with CreateMultipartUpload and every
+  UploadPart (CompleteMultipartUpload doesn't need it).
+- Not yet: copies of SSE-C objects, or into them (`501 NotImplemented`).
 
 Encryption with keys of Cairn's own (**SSE-S3**, **SSE-KMS**) isn't
 implemented: a request asking for it is refused with `501 NotImplemented`,

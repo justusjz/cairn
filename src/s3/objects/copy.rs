@@ -501,6 +501,7 @@ async fn stream_part_copy(
     let attach = AttachTarget::MultipartPart {
         upload_id,
         part_number,
+        key: None,
     };
     // The source stream is data from within Cairn (verified against its block
     // checksums as it's read), so there's nothing to check it against.

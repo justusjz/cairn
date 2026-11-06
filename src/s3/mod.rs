@@ -280,18 +280,17 @@ pub async fn handle(
         if let Some(refused) = sse_c::refuse_server_keys(req.headers()) {
             return Ok(box_response(refused));
         }
-        // SSE-C, for now, only for single PUTs.
+        // SSE-C, for now, not for copies.
         let copies = req.headers().contains_key("x-amz-copy-source");
         let names_source_key = req
             .headers()
             .keys()
             .any(|name| name.as_str().starts_with("x-amz-copy-source-server-side-encryption"));
-        let multipart = *req.method() == Method::POST || query_param(&query, "uploadId").is_some();
-        if names_source_key || (customer_key.is_some() && (copies || multipart)) {
+        if names_source_key || (customer_key.is_some() && copies) {
             return Ok(box_response(format_s3_error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                "SSE-C is not implemented for multipart uploads and copies yet",
+                "SSE-C is not implemented for copies yet",
             )));
         }
     }
@@ -370,7 +369,8 @@ pub async fn handle(
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {
             match metadata {
                 Ok(metadata) => {
-                    create_multipart_upload(&app, &bucket, &key, &content_type, &metadata).await?
+                    create_multipart_upload(&app, &bucket, &key, &content_type, &metadata, customer_key.as_ref())
+                        .await?
                 }
                 Err(refused) => refused,
             }
@@ -381,7 +381,8 @@ pub async fn handle(
             match read_body(req, &principal.secret, false).await? {
                 Ok(body) => {
                     let upload_id = query_param(&query, "uploadId").unwrap_or_default();
-                    complete_multipart_upload(&app, &bucket, &key, &upload_id, body, &preconditions)
+                    let customer_key = customer_key.as_ref();
+                    complete_multipart_upload(&app, &bucket, &key, &upload_id, body, &preconditions, customer_key)
                         .await?
                 }
                 Err(rejection) => util::rejection_response(&rejection),
@@ -412,7 +413,8 @@ pub async fn handle(
             let part_number = query_param(&query, "partNumber").unwrap_or_default();
             match payload {
                 Ok(payload) => {
-                    put_part(&app, &bucket, &key, &upload_id, &part_number, req.into_body(), payload)
+                    let customer_key = customer_key.as_ref();
+                    put_part(&app, &bucket, &key, &upload_id, &part_number, req.into_body(), payload, customer_key)
                         .await?
                 }
                 Err(rejection) => util::rejection_response(&rejection),
