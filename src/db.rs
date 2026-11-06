@@ -181,6 +181,7 @@ const MIGRATIONS: &[&str] = &[
     COMPACTABLE,
     UPLOADS_BY_KEY,
     COMPLETED_FROM,
+    METADATA,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -666,6 +667,14 @@ CREATE INDEX multipart_uploads_by_key ON multipart_uploads (bucket, key, upload_
 /// Nullable without a default, so the table isn't rewritten.
 const COMPLETED_FROM: &str = r#"
 ALTER TABLE objects ADD COLUMN upload_id uuid;
+"#;
+
+/// Migration 13: the headers S3 stores with an object besides its Content-Type
+/// (see `s3::metadata`), and those an upload is to give its object. A
+/// constant default, so neither table is rewritten.
+const METADATA: &str = r#"
+ALTER TABLE objects ADD COLUMN metadata text NOT NULL DEFAULT '';
+ALTER TABLE multipart_uploads ADD COLUMN metadata text NOT NULL DEFAULT '';
 "#;
 
 #[cfg(test)]

@@ -23,7 +23,12 @@ async fn node() -> Option<Arc<App>> {
 
 /// A new upload of `key`, with parts 1 and 2 staged; its ID and the parts' ETags.
 async fn staged(app: &Arc<App>, key: &str) -> (String, [String; 2]) {
-    let response = create_multipart_upload(app, BUCKET, key, "x").await.unwrap();
+    staged_with(app, key, "").await
+}
+
+/// Like `staged`, the upload to give its object the stored `metadata`.
+async fn staged_with(app: &Arc<App>, key: &str, metadata: &str) -> (String, [String; 2]) {
+    let response = create_multipart_upload(app, BUCKET, key, "x", metadata).await.unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -138,4 +143,16 @@ async fn racing_completions_both_succeed() {
         assert_eq!(a, b, "round {round}");
     }
     assert_eq!(query_i64(&app, "SELECT count(*) FROM objects").await, 10);
+}
+
+/// The metadata an upload was created with is its object's.
+#[tokio::test]
+async fn a_completed_upload_has_its_metadata() {
+    let Some(app) = node().await else { return };
+    let metadata = super::metadata::stored(&[("x-amz-meta-from", "upload"), ("content-language", "de")]);
+    let (upload_id, [e1, e2]) = staged_with(&app, "k", &metadata).await;
+    assert_eq!(complete(&app, "k", &upload_id, &[(1, &e1), (2, &e2)]).await.0, StatusCode::OK);
+    let headers = super::metadata::read_headers(&app, "k").await;
+    assert_eq!(headers["x-amz-meta-from"], "upload");
+    assert_eq!(headers["content-language"], "de");
 }

@@ -47,7 +47,7 @@ fn xml_field(xml: &str, tag: &str) -> String {
 async fn copy(app: &Arc<App>, source: &str, key: &str, replace: bool) -> String {
     let directive = replace.then_some("REPLACE");
     let source = format!("{BUCKET}/{source}");
-    let response = copy_object(app, BUCKET, key, &source, directive, "text/plain", &Preconditions::default())
+    let response = copy_object(app, BUCKET, key, &source, directive, "text/plain", "", &Preconditions::default())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -66,7 +66,7 @@ async fn put_multipart(app: &Arc<App>, key: &str, parts: &[Vec<u8>]) {
 }
 
 async fn create_upload(app: &Arc<App>, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream")
+    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "")
         .await
         .unwrap();
     Uuid::parse_str(&xml_field(&body_text(response).await, "UploadId")).unwrap()
@@ -252,7 +252,7 @@ async fn copies_racing_deletes_of_their_source_stay_whole() {
         put(&app, "source", data.clone()).await;
         let (source, conditions) = (format!("{BUCKET}/source"), Preconditions::default());
         let (copied, ()) = tokio::join!(
-            copy_object(&app, BUCKET, "copy", &source, None, "", &conditions),
+            copy_object(&app, BUCKET, "copy", &source, None, "", "", &conditions),
             delete(&app, "source"),
         );
         match copied.unwrap().status() {
@@ -274,7 +274,7 @@ async fn a_copy_reports_its_last_modified_time() {
     let Some(app) = node().await else { return };
     put(&app, "src", b"data".to_vec()).await;
     let source = format!("{BUCKET}/src");
-    let response = copy_object(&app, BUCKET, "dst", &source, None, "text/plain", &Preconditions::default())
+    let response = copy_object(&app, BUCKET, "dst", &source, None, "text/plain", "", &Preconditions::default())
         .await
         .unwrap();
     let reported = xml_field(&body_text(response).await, "LastModified");

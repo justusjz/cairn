@@ -523,14 +523,15 @@ END
 $$;
 
 -- Writes a new object version as the key's current version, the way S3 lands
--- a write in a bucket with the given versioning state. `p_new_version_id` is
+-- a write in a bucket with the given versioning state, with its content type
+-- and metadata (see `s3::metadata`). `p_new_version_id` is
 -- the fresh version ID to use if the bucket is versioned. Returns the new
 -- row's id, and the version ID to report (NULL in an unversioned bucket). The
 -- caller holds B(b) shared (which gave it the versioning state), K(b,k), and
 -- X(x) on the blobs of the parts `cairn_freed_by_put` names.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
-    p_content_type text, p_new_version_id text,
+    p_content_type text, p_metadata text, p_new_version_id text,
     OUT id bigint, OUT version_id text
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -545,8 +546,9 @@ BEGIN
     END IF;
     PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
     INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
-                         size, etag, content_type, last_modified)
-    VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type, NOW())
+                         size, etag, content_type, metadata, last_modified)
+    VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type,
+            p_metadata, NOW())
     RETURNING objects.id INTO id;
     version_id := CASE WHEN p_versioning = 'unversioned' THEN NULL ELSE v_version_id END;
 END
@@ -609,7 +611,7 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_blob uuid, p_nodes int[], p_size bigint, p_file_crc bigint, p_block_size int,
     p_data_crc bigint, p_etag text,
-    p_bucket text, p_key text, p_content_type text,
+    p_bucket text, p_key text, p_content_type text, p_metadata text,
     p_if_match text[], p_if_none_match text[], p_new_version_id text,
     OUT status text, OUT present bigint, OUT version_id text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
@@ -647,7 +649,8 @@ BEGIN
     END IF;
     PERFORM pg_temp.cairn_mark_committed(p_blob, p_size, p_file_crc, p_block_size);
     SELECT * INTO v FROM pg_temp.cairn_put_version(
-        p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_new_version_id);
+        p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_metadata,
+        p_new_version_id);
     version_id := v.version_id;
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
                        part_number, created_at)
@@ -757,7 +760,7 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_source bigint, p_part_ids bigint[], p_part_sizes bigint[],
     p_bucket text, p_key text, p_size bigint, p_etag text, p_content_type text,
-    p_new_version_id text,
+    p_metadata text, p_new_version_id text,
     OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -793,7 +796,8 @@ BEGIN
         RETURN;
     END IF;
     SELECT * INTO v FROM pg_temp.cairn_put_version(
-        p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_new_version_id);
+        p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_metadata,
+        p_new_version_id);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -883,6 +887,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_complete_upload(
 DECLARE
     v_versioning text;
     v_content_type text;
+    v_metadata text;
     v_listed bigint[];
     v_listed_blobs uuid[];
     v_total bigint;
@@ -898,9 +903,10 @@ BEGIN
     reap_peer := '{}';
     -- An upload's bucket exists as long as the upload does.
     v_versioning := pg_temp.cairn_lock_bucket(p_bucket);
-    -- The upload defines the object's content type. It must belong to the
-    -- request's bucket and key: authorization only checked the bucket.
-    SELECT content_type INTO v_content_type FROM multipart_uploads
+    -- The upload defines the object's content type and metadata. It must
+    -- belong to the request's bucket and key: authorization only checked the
+    -- bucket.
+    SELECT content_type, metadata INTO v_content_type, v_metadata FROM multipart_uploads
     WHERE upload_id = p_upload AND bucket = p_bucket AND key = p_key
     FOR UPDATE;
     IF v_versioning IS NULL THEN
@@ -958,7 +964,8 @@ BEGIN
     PERFORM pg_temp.cairn_check_on(v_listed || v_unused || v_freed, v_locked);
     etag := v_combined || '-' || cardinality(p_part_numbers);
     SELECT * INTO v FROM pg_temp.cairn_put_version(
-        p_bucket, p_key, v_versioning, v_total, etag, v_content_type, p_new_version_id);
+        p_bucket, p_key, v_versioning, v_total, etag, v_content_type, v_metadata,
+        p_new_version_id);
     version_id := v.version_id;
     UPDATE objects SET upload_id = p_upload WHERE id = v.id;
     UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);

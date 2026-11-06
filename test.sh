@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=88
+TOTAL=89
 STEP=0
 PASS=0
 FAIL=0
@@ -421,6 +421,35 @@ copy_replace_content_type_ok() {
     awss3 s3api head-object --bucket "$BUCKET" --key copy/typed.txt \
         --query ContentType --output text 2>/dev/null | grep -qx text/x-cairn || return 1
     awss3 s3api delete-object --bucket "$BUCKET" --key copy/typed.txt >/dev/null 2>&1
+}
+
+# Metadata: aws-cli's user metadata and stored headers come back on HEAD; a
+# COPY copy keeps them, a REPLACE copy takes its own; more than 2 KB of user
+# metadata is refused.
+metadata_ok() {
+    local key="meta/m.txt" got big
+    awss3 s3api put-object --bucket "$BUCKET" --key "$key" --body "$SMALL" \
+        --metadata color=blue,shape=round --cache-control max-age=60 \
+        --content-disposition attachment >/dev/null 2>&1 || return 1
+    got=$(awss3 s3api head-object --bucket "$BUCKET" --key "$key" \
+        --query '[Metadata.color, Metadata.shape, CacheControl, ContentDisposition]' --output text 2>/dev/null)
+    [ "$got" = "$(printf 'blue\tround\tmax-age=60\tattachment')" ] || return 1
+    awss3 s3api copy-object --bucket "$BUCKET" --key meta/kept.txt \
+        --copy-source "${BUCKET}/$key" >/dev/null 2>&1 || return 1
+    got=$(awss3 s3api head-object --bucket "$BUCKET" --key meta/kept.txt \
+        --query '[Metadata.color, CacheControl]' --output text 2>/dev/null)
+    [ "$got" = "$(printf 'blue\tmax-age=60')" ] || return 1
+    awss3 s3api copy-object --bucket "$BUCKET" --key meta/replaced.txt \
+        --copy-source "${BUCKET}/$key" --metadata-directive REPLACE --metadata size=big >/dev/null 2>&1 || return 1
+    got=$(awss3 s3api head-object --bucket "$BUCKET" --key meta/replaced.txt \
+        --query 'Metadata' --output json 2>/dev/null | tr -d ' \n')
+    [ "$got" = '{"size":"big"}' ] || return 1
+    big=$(head -c 2100 /dev/zero | tr '\0' x)
+    ! awss3 s3api put-object --bucket "$BUCKET" --key meta/big.txt --body "$SMALL" \
+        --metadata "big=$big" >/dev/null 2>&1 || return 1
+    for key in "$key" meta/kept.txt meta/replaced.txt; do
+        awss3 s3api delete-object --bucket "$BUCKET" --key "$key" >/dev/null 2>&1 || return 1
+    done
 }
 
 # UploadPartCopy: assemble a destination by copying the whole source as a single
@@ -1493,6 +1522,7 @@ run_test    "CopyObject (small object)"             copy_small_ok
 run_test    "CopyObject shares the source's data"   copy_shares_data_ok
 run_test    "CopyObject of multipart src is normal" copy_multipart_source_normal_ok
 run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok
+run_test    "Metadata stored, copied, replaced"     metadata_ok
 expect_fail "Self-copy without REPLACE rejected"    awss3 s3api copy-object --bucket "$BUCKET" --key big.bin --copy-source "${BUCKET}/big.bin"
 expect_fail "Copy from missing source fails"        awss3 s3api copy-object --bucket "$BUCKET" --key copy/none.txt --copy-source "${BUCKET}/does-not-exist.txt"
 run_test    "UploadPartCopy (whole object)"         upload_part_copy_whole_ok

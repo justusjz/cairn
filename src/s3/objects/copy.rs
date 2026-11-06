@@ -66,8 +66,10 @@ struct Source {
 /// data is read once to work it out (but not written).
 ///
 /// `metadata_directive` is `x-amz-metadata-directive` (COPY, the default, or
-/// REPLACE). Under COPY the destination inherits the source's content-type; under
-/// REPLACE it takes `request_content_type` (the request's own Content-Type).
+/// REPLACE). Under COPY the destination inherits the source's content-type and
+/// metadata; under REPLACE it takes `request_content_type` and
+/// `request_metadata` (the request's own Content-Type and metadata).
+#[allow(clippy::too_many_arguments)]
 pub async fn copy_object(
     app: &Arc<App>,
     dest_bucket: &str,
@@ -75,6 +77,7 @@ pub async fn copy_object(
     copy_source: &str,
     metadata_directive: Option<&str>,
     request_content_type: &str,
+    request_metadata: &str,
     preconditions: &Preconditions,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let (src_bucket, src_key, src_version) = match parse_copy_source(copy_source) {
@@ -91,10 +94,7 @@ pub async fn copy_object(
         return Ok(invalid_version_id("versionId", v));
     }
 
-    // COPY (the default) keeps the source metadata; only REPLACE substitutes new.
-    let replace = metadata_directive
-        .map(|d| d.eq_ignore_ascii_case("REPLACE"))
-        .unwrap_or(false);
+    let replace = replaces_metadata(metadata_directive);
     // S3 rejects a copy of an object onto itself that changes nothing, guarding
     // against a client accidentally issuing a destructive no-op. Copying a named
     // version onto its own key is allowed: that's how an old version is restored.
@@ -139,17 +139,17 @@ pub async fn copy_object(
                 }
             }
         };
-        let content_type = if replace {
-            request_content_type
+        let (content_type, metadata) = if replace {
+            (request_content_type, request_metadata)
         } else {
-            &version.content_type
+            (version.content_type.as_str(), version.metadata.as_str())
         };
         // CopyObject reports the new version's last-modified time in the body
         // (not just the ETag header). It comes from the commit itself: read
         // afterwards, a concurrent write to the key could have replaced the
         // version already.
         let (version_id, last_modified) =
-            match commit_object_copy(app, &source, dest_bucket, dest_key, &etag, content_type)
+            match commit_object_copy(app, &source, dest_bucket, dest_key, &etag, content_type, metadata)
                 .await?
             {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
@@ -169,6 +169,12 @@ pub async fn copy_object(
         return Ok(with_copy_source_version_id(resp, source.version.version_id.as_deref()));
     }
     Err(Contended("the copy source kept changing".to_owned()).into())
+}
+
+/// Whether a copy's `x-amz-metadata-directive` has it take the request's
+/// metadata (REPLACE), rather than keep the source's (COPY, the default).
+pub fn replaces_metadata(metadata_directive: Option<&str>) -> bool {
+    metadata_directive.is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
 }
 
 enum ObjectCopy {
@@ -193,6 +199,7 @@ async fn commit_object_copy(
     key: &str,
     etag: &str,
     content_type: &str,
+    metadata: &str,
 ) -> anyhow::Result<ObjectCopy> {
     let (part_ids, part_sizes) = source.part_keys();
     let client = app.pool.get().await?;
@@ -202,7 +209,7 @@ async fn commit_object_copy(
             let row = client
                 .query_one_cached(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
-                     FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                     FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -212,6 +219,7 @@ async fn commit_object_copy(
                         &source.version.size,
                         &etag,
                         &content_type,
+                        &metadata,
                         &new_version_id(),
                     ],
                 )

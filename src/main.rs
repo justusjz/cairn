@@ -734,6 +734,8 @@ enum AttachTarget {
         bucket: String,
         key: String,
         content_type: String,
+        /// What `s3::metadata` stores with it.
+        metadata: String,
         conditions: Preconditions,
     },
     /// A part staged under an in-progress multipart upload.
@@ -905,6 +907,7 @@ async fn try_commit_part(
             bucket,
             key,
             content_type,
+            metadata,
             conditions,
         } => {
             let (if_match, if_none_match) = conditions.write_conditions();
@@ -912,7 +915,7 @@ async fn try_commit_part(
                 .query_one_cached(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                                                      $11, $12, $13)",
+                                                      $11, $12, $13, $14)",
                     &[
                         &written.blob_id,
                         &written.nodes,
@@ -924,6 +927,7 @@ async fn try_commit_part(
                         bucket,
                         key,
                         content_type,
+                        metadata,
                         &if_match,
                         &if_none_match,
                         &s3::versions::new_version_id(),

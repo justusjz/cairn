@@ -74,7 +74,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
         // Crossing copies, and copies of an object onto itself.
         4..=8 => {
             let directive = (a == b).then_some("REPLACE");
-            let response = match copy_object(app, BUCKET, &b, &format!("{BUCKET}/{a}"), directive, "x", &Preconditions::default()).await {
+            let response = match copy_object(app, BUCKET, &b, &format!("{BUCKET}/{a}"), directive, "x", "", &Preconditions::default()).await {
                 Ok(response) => response,
                 // With this much churn on so few keys, a copy's source can keep
                 // changing under it, and the copy gives up (with SlowDown).
@@ -115,7 +115,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
         }
         // Part re-uploads racing each other, then a complete or an abort.
         12..=16 => {
-            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x").await?).await;
+            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "").await?).await;
             let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
             let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
             let mut parts = JoinSet::new();

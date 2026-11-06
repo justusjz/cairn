@@ -12,11 +12,13 @@ use crate::{
     s3::versions::current_etag,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub async fn put_object(
     app: &Arc<App>,
     bucket: &str,
     key: &str,
     content_type: &str,
+    metadata: &str,
     body: Incoming,
     payload: Payload,
     conditions: &Preconditions,
@@ -48,6 +50,7 @@ pub async fn put_object(
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         content_type: content_type.to_owned(),
+        metadata: metadata.to_owned(),
         conditions: conditions.clone(),
     };
     match crate::upload_part(app, body, &attach, payload).await? {

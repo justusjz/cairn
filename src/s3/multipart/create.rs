@@ -16,6 +16,7 @@ pub async fn create_multipart_upload(
     bucket: &str,
     key: &str,
     content_type: &str,
+    metadata: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     if client
@@ -29,13 +30,15 @@ pub async fn create_multipart_upload(
             "the specified bucket does not exist",
         ));
     }
-    // The content type is captured now and applied to the object at completion.
+    // The content type and metadata are captured now and applied to the object
+    // at completion.
     let upload_id = Uuid::now_v7();
     client
         .execute_cached(
-            "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, initiated_at)
-             VALUES ($1, $2, $3, $4, NOW())",
-            &[&upload_id, &bucket, &key, &content_type],
+            "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, metadata,
+                                            initiated_at)
+             VALUES ($1, $2, $3, $4, $5, NOW())",
+            &[&upload_id, &bucket, &key, &content_type, &metadata],
         )
         .await?;
     let body = format!(

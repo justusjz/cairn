@@ -60,7 +60,7 @@ async fn commit_object(tx: &Transaction<'_>, app: &App, blob: Uuid, key: &str) -
     tx.query_one(
         "SELECT status FROM pg_temp.cairn_commit_object(
              $1, ARRAY[$2::int], 0, 0, 65536, 0, 'd41d8cd98f00b204e9800998ecf8427e',
-             $3, $4, 'application/octet-stream', NULL, NULL, $5)",
+             $3, $4, 'application/octet-stream', '', NULL, NULL, $5)",
         &[&blob, &app.node, &BUCKET, &key, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -100,7 +100,7 @@ async fn copy_object(
 ) -> String {
     let size: i64 = source.2.iter().sum();
     tx.query_one(
-        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', $7)",
+        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', $7)",
         &[&source.0, &source.1, &source.2, &BUCKET, &key, &size, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -279,7 +279,7 @@ async fn a_copy_after_a_delete_finds_the_source_changed() {
 
 /// Creates an upload for `key`, returning its ID.
 async fn create_upload(app: &App, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "text/plain").await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "").await.unwrap();
     let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -451,6 +451,7 @@ async fn a_put_into_a_missing_bucket_writes_nothing() {
         bucket: "missing".to_owned(),
         key: "k".to_owned(),
         content_type: "text/plain".to_owned(),
+        metadata: String::new(),
         conditions: crate::s3::conditional::Preconditions::default(),
     };
     let body = http_body_util::Full::new(hyper::body::Bytes::from_static(b"data"));

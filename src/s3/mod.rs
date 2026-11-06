@@ -23,7 +23,7 @@ use crate::{
             create::create_multipart_upload, list::list_multipart_uploads, upload_part::put_part,
         },
         objects::{
-            copy::{copy_object, copy_part, parse_copy_source},
+            copy::{copy_object, copy_part, parse_copy_source, replaces_metadata},
             delete::{delete_object, delete_objects, missing_checksum},
             get::{get_object, head_object},
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
@@ -40,6 +40,7 @@ use crate::{
 
 pub(crate) mod buckets;
 pub(crate) mod conditional;
+pub(crate) mod metadata;
 pub(crate) mod multipart;
 pub(crate) mod objects;
 pub(crate) mod util;
@@ -312,6 +313,9 @@ pub async fn handle(
     let copy_source_preconditions = Preconditions::from_copy_source_headers(req.headers());
     // What the request claims about an uploaded body, checked as it streams.
     let payload = Payload::new(req.headers(), &principal.secret, true);
+    // The metadata a write stores with its object, or why it's refused. Only
+    // the writes that take the request's metadata look at it.
+    let metadata = metadata::from_request(req.headers());
     let resp = match req.method().clone() {
         hyper::Method::HEAD => {
             head_object(
@@ -334,7 +338,12 @@ pub async fn handle(
         }
         // CreateMultipartUpload
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {
-            create_multipart_upload(&app, &bucket, &key, &content_type).await?
+            match metadata {
+                Ok(metadata) => {
+                    create_multipart_upload(&app, &bucket, &key, &content_type, &metadata).await?
+                }
+                Err(refused) => refused,
+            }
         }
         // CompleteMultipartUpload
         // Its x-amz-checksum-* header is the object's, not the body's.
@@ -383,6 +392,13 @@ pub async fn handle(
         // variant, UploadPartCopy, is handled above). The source is read
         // server-side, so the request body is ignored.
         hyper::Method::PUT if copy_source.is_some() => {
+            // The request's metadata only matters if it replaces the source's.
+            let metadata = match metadata {
+                Err(refused) if replaces_metadata(metadata_directive.as_deref()) => {
+                    return Ok(box_response(refused));
+                }
+                metadata => metadata.unwrap_or_default(),
+            };
             copy_object(
                 &app,
                 &bucket,
@@ -390,16 +406,19 @@ pub async fn handle(
                 &copy_source.unwrap(),
                 metadata_directive.as_deref(),
                 &content_type,
+                &metadata,
                 &copy_source_preconditions,
             )
             .await?
         }
-        hyper::Method::PUT => match payload {
-            Ok(payload) => {
-                put_object(&app, &bucket, &key, &content_type, req.into_body(), payload, &preconditions)
+        hyper::Method::PUT => match (payload, metadata) {
+            (Ok(payload), Ok(metadata)) => {
+                let body = req.into_body();
+                put_object(&app, &bucket, &key, &content_type, &metadata, body, payload, &preconditions)
                     .await?
             }
-            Err(rejection) => util::rejection_response(&rejection),
+            (Err(rejection), _) => util::rejection_response(&rejection),
+            (_, Err(refused)) => refused,
         },
         _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
     };

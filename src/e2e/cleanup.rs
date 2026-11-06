@@ -32,6 +32,7 @@ fn object(key: &str, conditions: Preconditions) -> AttachTarget {
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "text/plain".to_owned(),
+        metadata: String::new(),
         conditions,
     }
 }
@@ -256,7 +257,7 @@ async fn delete_bucket_aborts_its_uploads() {
     let create = |key: &'static str| {
         let app = app.clone();
         async move {
-            let response = create_multipart_upload(&app, BUCKET, key, "x").await.unwrap();
+            let response = create_multipart_upload(&app, BUCKET, key, "x", "").await.unwrap();
             let body = response.into_body().collect().await.unwrap().to_bytes();
             let body = String::from_utf8(body.to_vec()).unwrap();
             let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();

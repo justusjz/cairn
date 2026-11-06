@@ -12,6 +12,7 @@ use crate::{
     checksum::BlockLayout,
     body::{FrameSender, ResBody, box_response, channel_body},
     s3::conditional::{Precondition, Preconditions, not_modified},
+    s3::metadata,
     s3::util::{format_s3_error, with_delete_marker, with_version_id},
     s3::versions::Versioning,
 };
@@ -22,6 +23,8 @@ pub(crate) struct ObjectVersion {
     pub id: i64,
     pub etag: String,
     pub content_type: String,
+    /// The headers stored with it (see `s3::metadata`).
+    pub metadata: String,
     pub size: i64,
     /// Last-Modified as an HTTP date (for headers) and in ISO 8601 (for XML
     /// bodies), and as a Unix timestamp for conditionals.
@@ -97,7 +100,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
                     floor(extract(epoch FROM o.last_modified))::bigint,
-                    o.version_id, o.is_delete_marker, b.versioning
+                    o.version_id, o.is_delete_marker, b.versioning, o.metadata
              FROM objects o JOIN buckets b ON b.name = o.bucket
              WHERE o.bucket = $1 AND o.key = $2
                AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",
@@ -123,6 +126,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
         id: row.get(0),
         etag: row.get(1),
         content_type: row.get(2),
+        metadata: row.get(10),
         size: row.get(3),
         last_modified: row.get(4),
         last_modified_iso: row.get(5),
@@ -173,6 +177,7 @@ pub async fn get_object(
         id: object_id,
         etag,
         content_type,
+        metadata,
         size,
         last_modified,
         lm_epoch,
@@ -226,6 +231,7 @@ pub async fn get_object(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, range_end - range_start)
         .header(header::LAST_MODIFIED, last_modified);
+    let builder = metadata::apply(builder, &metadata);
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,
@@ -472,6 +478,7 @@ pub async fn head_object(
     let ObjectVersion {
         etag,
         content_type,
+        metadata,
         size,
         last_modified,
         lm_epoch,
@@ -513,6 +520,7 @@ pub async fn head_object(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, range_end - range_start)
         .header(header::LAST_MODIFIED, last_modified);
+    let builder = metadata::apply(builder, &metadata);
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,
