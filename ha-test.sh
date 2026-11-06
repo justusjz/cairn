@@ -14,6 +14,10 @@
 #      (replication factor 2 cannot be satisfied with one node)
 #   6. Phase D: restarts a killed instance, verifies uploads work again
 #
+# SSE-C objects (aws-cli) are written and read through different nodes, and
+# read with replicas damaged in different places, which makes a read switch
+# replicas in the middle of an encrypted segment.
+#
 # Usage:  ./ha-test.sh
 # Exit code is 0 only if every test passes.
 #
@@ -40,7 +44,9 @@ USE_SIGV2=false
 # replication test, so set this if your storage path is cwd-relative!
 DATA_DIR_FLAG="--data-dir"
 
-EXTRA_SERVER_ARGS=()             # appended to every instance's command line
+# Appended to every instance's command line. No TLS proxy here, so SSE-C keys
+# come over plain HTTP.
+EXTRA_SERVER_ARGS=(--allow-sse-c-over-http)
 STARTUP_TIMEOUT=60               # seconds to wait for postgres / each server
 FAILURE_DETECT_WAIT=11           # seconds for a dead node to stop counting as live (10 s after its last heartbeat)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -61,7 +67,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=19
+TOTAL=24
 STEP=0
 PASS=0
 FAIL=0
@@ -145,7 +151,7 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # ─── Preflight ───────────────────────────────────────────────────────────────
-for tool in podman cargo s3cmd; do
+for tool in podman cargo s3cmd aws; do
     command -v "$tool" >/dev/null 2>&1 || fatal "'$tool' not found in PATH"
 done
 
@@ -282,6 +288,58 @@ list_contains_via() {  # list_contains_via <instance> <s3 ls target> <needle>
 }
 
 sql() { podman exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc "$1"; }
+
+# aws-cli (for SSE-C, which s3cmd doesn't do) against instance <n>, path-style.
+AWSCFG="$WORK_DIR/awscfg"
+printf '[default]\nregion = us-east-1\ns3 =\n    addressing_style = path\n' >"$AWSCFG"
+awsi() {  # awsi <instance> <aws args...>
+    local n="$1"; shift
+    AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" AWS_DEFAULT_REGION=us-east-1 \
+    AWS_EC2_METADATA_DISABLED=true AWS_CONFIG_FILE="$AWSCFG" \
+    aws --endpoint-url "http://${SERVER_HOST}:$(client_port "$n")" "$@"
+}
+SSE_KEY="$WORK_DIR/sse-key"; head -c 32 /dev/urandom >"$SSE_KEY"
+SSE=(--sse-customer-algorithm AES256 --sse-customer-key "fileb://$SSE_KEY")
+
+sse_put_via() {  # sse_put_via <instance> <key> — FILE_B, encrypted with SSE_KEY
+    awsi "$1" s3api put-object --bucket "$BUCKET" --key "$2" --body "$FILE_B" "${SSE[@]}" >/dev/null 2>&1
+}
+
+sse_roundtrip_via() {  # sse_roundtrip_via <instance> <key> — reads back as FILE_B with the key
+    local dst="$WORK_DIR/dl.$RANDOM"
+    awsi "$1" s3api get-object --bucket "$BUCKET" --key "$2" "$dst" "${SSE[@]}" >/dev/null 2>&1 || return 1
+    cmp -s "$FILE_B" "$dst"
+}
+
+sse_needs_key_via() {  # sse_needs_key_via <instance> <key> — unreadable without the key
+    ! awsi "$1" s3api get-object --bucket "$BUCKET" --key "$2" "$WORK_DIR/dl.$RANDOM" >/dev/null 2>&1
+}
+
+flip_byte() {  # flip_byte <file> <offset> — inverts one bit of a byte, in place
+    local byte
+    byte=$(dd if="$1" bs=1 skip="$2" count=1 status=none | od -An -tu1 | tr -d ' ')
+    printf "\\$(printf '%03o' $((byte ^ 1)))" | dd of="$1" bs=1 seek="$2" conv=notrunc status=none
+}
+
+# sse_failover_via <instance> — an SSE-C object whose two replicas are each
+# damaged in a different place (their block checksums no longer match) reads
+# back intact: whichever it starts on, the read meets damage, and switches to
+# the other replica there, in the middle of an encrypted segment.
+sse_failover_via() {
+    local blob files
+    sse_put_via 1 sse-damaged.bin || return 1
+    blob=$(sql "SELECT p.blob_id FROM parts p JOIN objects o ON o.id = p.object_id
+                WHERE o.bucket = '$BUCKET' AND o.key = 'sse-damaged.bin'")
+    mapfile -t files < <(find "$WORK_DIR"/data* -type f -name "$blob")
+    [ "${#files[@]}" = "$REPLICATION_FACTOR" ] || return 1
+    flip_byte "${files[0]}" 1000000
+    flip_byte "${files[1]}" 3000000
+    sse_roundtrip_via "$1" sse-damaged.bin || return 1
+    # It met the damage (on one replica at least: starting on the one damaged
+    # further in, it switches once, past the other's), and switched.
+    [ "$(cat "$WORK_DIR"/server*.log | grep -c "CORRUPTION: blob $blob")" -ge 1 ] || return 1
+    awsi 1 s3api delete-object --bucket "$BUCKET" --key sse-damaged.bin >/dev/null 2>&1
+}
 SMALL_BLOBS="FROM blobs WHERE state = 'committed' AND size <= 67108864"
 
 # upload_to_pack_via <instance> — uploads the small objects, then objects of
@@ -332,6 +390,10 @@ run_test "Download B via node 1 matches"            roundtrip_via 1 "$FILE_B" "s
 run_test "Upload objects to pack via node 1"        upload_to_pack_via 1
 run_test "They're packed (passes on node 3)"        packed_via 3
 run_test "Packed objects read back via node 2"      packed_roundtrip_via 2
+run_test "SSE-C upload via node 1"                  sse_put_via 1 sse.bin
+run_test "SSE-C download via node 2 matches"        sse_roundtrip_via 2 sse.bin
+run_test "SSE-C object unreadable without its key"  sse_needs_key_via 3 sse.bin
+run_test "SSE-C read switches replicas mid-segment" sse_failover_via 2
 
 # ─── 6. Phase B: one node down (within tolerance) ────────────────────────────
 phase "Phase B: node 3 crashed — cluster must keep working"
@@ -339,6 +401,7 @@ kill_instance 3
 run_test "Download A via node 1 still matches"      roundtrip_via 1 "$FILE_A" "s3://${BUCKET}/a.txt"
 run_test "Download B via node 2 still matches"      roundtrip_via 2 "$FILE_B" "s3://${BUCKET}/b.bin"
 run_test "Packed objects still read back via node 1" packed_roundtrip_via 1
+run_test "SSE-C download via node 1 still matches"  sse_roundtrip_via 1 sse.bin
 run_test "Upload C via node 2 still works"          s3i 2 put "$FILE_C" "s3://${BUCKET}/c.txt"
 run_test "Download C via node 1 matches"            roundtrip_via 1 "$FILE_C" "s3://${BUCKET}/c.txt"
 

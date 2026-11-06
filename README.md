@@ -335,6 +335,9 @@ Without the key, the data can't be read, by anyone.
 - The algorithm is XChaCha20-Poly1305 (S3's API calls every SSE-C key
   `AES256`, and Cairn answers the same way), in 64 KiB segments, so a range
   reads only the segments it covers, and altered data is detected.
+- Only the content is encrypted. Its key (name), size, times, Content-Type
+  and metadata (`x-amz-meta-*` and the like) are stored as they are, as in S3:
+  don't put anything secret there.
 - An SSE-C object's ETag is random, not the MD5 of its content, as in S3:
   an MD5 would give away whether the content is a guessed one.
 - The key travels in a request header, so it's only accepted over HTTPS: a
