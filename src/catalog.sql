@@ -1599,3 +1599,77 @@ BEGIN
     END LOOP;
 END
 $$;
+
+-- ListMultipartUploads: the walk of `cairn_list_versions`, over the bucket's
+-- incomplete uploads, ordered by key and then by upload ID (UUIDv7s, so each
+-- key's in the order they were created). With an upload marker, the marker
+-- key's uploads after it come first, if that key is listed as a key; the
+-- marker needn't exist, the IDs order themselves. At most `p_limit` entries.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_list_uploads(
+    p_bucket text, p_prefix text, p_delimiter text, p_key_marker text, p_upload_marker uuid,
+    p_limit int,
+    OUT name text, OUT is_prefix boolean, OUT upload_id uuid, OUT initiated_at timestamptz
+) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_pfx text COLLATE "C" := p_prefix;
+    v_marker text COLLATE "C" := p_key_marker;
+    v_delim text COLLATE "C" := p_delimiter;
+    v_from text COLLATE "C" := pg_temp.cairn_walk_start(p_prefix, p_key_marker);
+    v_end text COLLATE "C" := pg_temp.cairn_prefix_end(p_prefix);
+    v_count int := 0;
+    v_cp text COLLATE "C";
+    c refcursor;
+    r record;
+BEGIN
+    IF p_upload_marker IS NOT NULL AND starts_with(v_marker, v_pfx)
+       AND pg_temp.cairn_common_prefix(v_marker, v_pfx, v_delim) IS NULL THEN
+        RETURN QUERY
+            SELECT u.key::text, false, u.upload_id, u.initiated_at
+            FROM multipart_uploads u
+            WHERE u.bucket = p_bucket COLLATE "default" AND u.key = v_marker
+              AND u.upload_id > p_upload_marker
+            ORDER BY u.upload_id LIMIT p_limit;
+        GET DIAGNOSTICS v_count = ROW_COUNT;
+    END IF;
+    WHILE v_count < p_limit LOOP
+        IF v_end IS NULL THEN
+            OPEN c FOR
+                SELECT u.key, u.upload_id, u.initiated_at
+                FROM multipart_uploads u
+                WHERE u.bucket = p_bucket COLLATE "default" AND u.key >= v_from
+                ORDER BY u.key, u.upload_id LIMIT p_limit - v_count;
+        ELSE
+            OPEN c FOR
+                SELECT u.key, u.upload_id, u.initiated_at
+                FROM multipart_uploads u
+                WHERE u.bucket = p_bucket COLLATE "default" AND u.key >= v_from AND u.key < v_end
+                ORDER BY u.key, u.upload_id LIMIT p_limit - v_count;
+        END IF;
+        v_cp := NULL;
+        LOOP
+            FETCH c INTO r;
+            EXIT WHEN NOT FOUND;
+            v_cp := pg_temp.cairn_common_prefix(r.key, v_pfx, v_delim);
+            EXIT WHEN v_cp IS NOT NULL;
+            name := r.key;
+            is_prefix := false;
+            upload_id := r.upload_id;
+            initiated_at := r.initiated_at;
+            RETURN NEXT;
+            v_count := v_count + 1;
+        END LOOP;
+        CLOSE c;
+        EXIT WHEN v_cp IS NULL;
+        IF v_cp > v_marker THEN
+            name := v_cp;
+            is_prefix := true;
+            upload_id := NULL;
+            initiated_at := NULL;
+            RETURN NEXT;
+            v_count := v_count + 1;
+        END IF;
+        v_from := pg_temp.cairn_prefix_end(v_cp);
+        EXIT WHEN v_from IS NULL;
+    END LOOP;
+END
+$$;

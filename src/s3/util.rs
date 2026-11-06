@@ -250,10 +250,12 @@ const SUBRESOURCES: &[&str] = &[
 /// object-level one. Must match the routing in `s3::handle`.
 fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'static str] {
     match (bucket_level, method) {
-        // ListObjectVersions, versioning, and the stubs (`bucket_subresource_stub`).
+        // ListObjectVersions, ListMultipartUploads, versioning, and the stubs
+        // (`bucket_subresource_stub`).
         (true, &Method::GET) => &[
             "versioning",
             "versions",
+            "uploads",
             "acl",
             "location",
             "object-lock",
@@ -344,6 +346,7 @@ mod tests {
             (Method::GET, true, ""),
             (Method::GET, true, "list-type=2&prefix=a&x-id=ListObjectsV2"),
             (Method::GET, true, "versions&key-marker=a"),
+            (Method::GET, true, "uploads&prefix=a"),
             (Method::GET, true, "policy"),
             (Method::PUT, true, "versioning"),
             (Method::PUT, true, ""),
@@ -378,7 +381,6 @@ mod tests {
             (Method::PUT, true, "acl"),
             (Method::DELETE, true, "policy"),
             (Method::DELETE, true, "cors"),
-            (Method::GET, true, "uploads"),
             (Method::GET, true, "website"),
             (Method::GET, true, "prefix=a&%77ebsite"),
         ] {

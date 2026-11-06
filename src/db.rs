@@ -179,6 +179,7 @@ const MIGRATIONS: &[&str] = &[
     PROTOCOL_GATE,
     BYTEWISE_KEYS,
     COMPACTABLE,
+    UPLOADS_BY_KEY,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -650,6 +651,13 @@ pub(crate) const COMPACTABLE: &str = r#"
 CREATE INDEX blobs_compactable ON blobs ((size - dead_size))
     WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * 0.25;
 DROP INDEX blobs_sparse;
+"#;
+
+/// Migration 11: the uploads of a bucket in the order ListMultipartUploads
+/// walks them, by key, and each key's by ID (UUIDv7s, so in the order they
+/// were created), and DeleteBucket finds them by.
+const UPLOADS_BY_KEY: &str = r#"
+CREATE INDEX multipart_uploads_by_key ON multipart_uploads (bucket, key, upload_id);
 "#;
 
 #[cfg(test)]

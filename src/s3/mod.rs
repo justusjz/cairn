@@ -20,7 +20,7 @@ use crate::{
         conditional::Preconditions,
         multipart::{
             abort::abort_multipart_upload, complete::complete_multipart_upload,
-            create::create_multipart_upload, upload_part::put_part,
+            create::create_multipart_upload, list::list_multipart_uploads, upload_part::put_part,
         },
         objects::{
             copy::{copy_object, copy_part, parse_copy_source},
@@ -150,6 +150,24 @@ pub async fn handle(
                     &query_param(&query, "key-marker").unwrap_or_default(),
                     marker.as_deref(),
                     max_keys,
+                )
+                .await?
+            }
+            // ListMultipartUploads: GET /{bucket}?uploads, paginated by
+            // key-marker and upload-id-marker.
+            hyper::Method::GET if query_param(&query, "uploads").is_some() => {
+                let max_uploads = query_param(&query, "max-uploads")
+                    .and_then(|v| v.parse::<i64>().ok())
+                    .unwrap_or(MAX_KEYS_LIMIT)
+                    .clamp(0, MAX_KEYS_LIMIT);
+                list_multipart_uploads(
+                    &app,
+                    &bucket,
+                    &query_param(&query, "prefix").unwrap_or_default(),
+                    query_param(&query, "delimiter").as_deref(),
+                    &query_param(&query, "key-marker").unwrap_or_default(),
+                    query_param(&query, "upload-id-marker").as_deref(),
+                    max_uploads,
                 )
                 .await?
             }

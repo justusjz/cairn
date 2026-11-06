@@ -9,10 +9,16 @@ use hyper::StatusCode;
 use super::{BUCKET, delete, node_with, put};
 use crate::{
     App, packer,
-    s3::objects::{
-        delete::delete_object,
-        list::{ListEntry, ListQuery, list},
-        list_versions::list_object_versions,
+    s3::{
+        multipart::{
+            abort::abort_multipart_upload, create::create_multipart_upload,
+            list::list_multipart_uploads,
+        },
+        objects::{
+            delete::delete_object,
+            list::{ListEntry, ListQuery, list},
+            list_versions::list_object_versions,
+        },
     },
 };
 
@@ -291,4 +297,87 @@ async fn a_version_marker_may_be_gone() {
         versions_page(&app, "k", &k[1], 1000).await,
         [pair("k", &k[2]), pair("l", &l[0])]
     );
+}
+
+/// One page of ListMultipartUploads: its entries, an upload as `key@id` and a
+/// common prefix as itself, in key order (the response lists uploads before
+/// common prefixes), and its next markers, if it's truncated.
+async fn uploads_page(
+    app: &App,
+    delimiter: &str,
+    key_marker: &str,
+    upload_id_marker: Option<&str>,
+    max_uploads: i64,
+) -> (Vec<String>, Option<(String, Option<String>)>) {
+    let delimiter = (!delimiter.is_empty()).then_some(delimiter);
+    let response =
+        list_multipart_uploads(app, BUCKET, "", delimiter, key_marker, upload_id_marker, max_uploads)
+            .await
+            .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap().to_owned();
+    let between = |s: &str, open: &str, close: &str| {
+        let start = s.find(open)? + open.len();
+        Some(s[start..start + s[start..].find(close)?].to_owned())
+    };
+    let mut entries: Vec<String> = body
+        .split("<Upload>")
+        .skip(1)
+        .map(|u| format!("{}@{}", between(u, "<Key>", "</Key>").unwrap(), between(u, "<UploadId>", "</UploadId>").unwrap()))
+        .collect();
+    entries.extend(
+        body.split("<CommonPrefixes>").skip(1).map(|p| between(p, "<Prefix>", "</Prefix>").unwrap()),
+    );
+    // Stable, so each key's uploads keep their order.
+    entries.sort_by(|a, b| a.split('@').next().cmp(&b.split('@').next()));
+    let next = between(&body, "<NextKeyMarker>", "</NextKeyMarker>")
+        .map(|key| (key, between(&body, "<NextUploadIdMarker>", "</NextUploadIdMarker>")));
+    (entries, next)
+}
+
+/// Every entry, page by page, `max_uploads` at a time.
+async fn all_uploads(app: &App, delimiter: &str, max_uploads: i64) -> Vec<String> {
+    let (mut names, mut key_marker, mut upload_marker) = (Vec::new(), String::new(), None::<String>);
+    loop {
+        let (mut got, next) =
+            uploads_page(app, delimiter, &key_marker, upload_marker.as_deref(), max_uploads).await;
+        assert!(got.len() as i64 <= max_uploads);
+        names.append(&mut got);
+        let Some((key, upload)) = next else { return names };
+        (key_marker, upload_marker) = (key, upload);
+    }
+}
+
+#[tokio::test]
+async fn walks_uploads_and_common_prefixes() {
+    let Some(app) = node().await else { return };
+    let mut ids = std::collections::HashMap::<&str, Vec<String>>::new();
+    // Created out of key order: each key's uploads list in the order they
+    // were created, after the keys before it.
+    for key in ["c", "b/2", "a", "b/1", "a"] {
+        let response = create_multipart_upload(&app, BUCKET, key, "x").await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body = std::str::from_utf8(&body).unwrap();
+        let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
+        ids.entry(key).or_default().push(body[start..body.find("</UploadId>").unwrap()].to_owned());
+    }
+    let upload = |key: &str, i: usize| format!("{key}@{}", ids[key][i]);
+    let all = [upload("a", 0), upload("a", 1), upload("b/1", 0), upload("b/2", 0), upload("c", 0)];
+    let rolled_up = [upload("a", 0), upload("a", 1), "b/".to_owned(), upload("c", 0)];
+    for max_uploads in [1, 2, 1000] {
+        assert_eq!(all_uploads(&app, "", max_uploads).await, all, "max-uploads {max_uploads}");
+        assert_eq!(all_uploads(&app, "/", max_uploads).await, rolled_up, "max-uploads {max_uploads}");
+    }
+    // A key marker alone resumes after all of its key's uploads, and an upload
+    // marker without a key marker is ignored.
+    assert_eq!(uploads_page(&app, "", "a", None, 1000).await.0, all[2..]);
+    assert_eq!(uploads_page(&app, "", "", Some(&ids["a"][0]), 1000).await.0, all);
+    // An upload marker resumes after that upload, even once it's aborted.
+    let response = abort_multipart_upload(&app, BUCKET, "a", &ids["a"][0]).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(uploads_page(&app, "", "a", Some(&ids["a"][0]), 1000).await.0, all[1..]);
+    // An upload marker that can't be an upload ID is refused.
+    let response = list_multipart_uploads(&app, BUCKET, "", None, "a", Some("nope"), 1000).await.unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }

@@ -52,7 +52,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=87
+TOTAL=88
 STEP=0
 PASS=0
 FAIL=0
@@ -778,6 +778,21 @@ subresource_stubs_ok() {
     ! awss3 s3api get-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+}
+
+# ListMultipartUploads: aws-cli lists an incomplete upload under its prefix,
+# and no longer once it's aborted.
+list_uploads_ok() {
+    local key="lmu/pending.bin" uid listed
+    uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key "$key" \
+        --query UploadId --output text 2>/dev/null) || return 1
+    listed=$(awss3 s3api list-multipart-uploads --bucket "$BUCKET" --prefix lmu/ \
+        --query 'Uploads[].[Key,UploadId]' --output text 2>/dev/null)
+    awss3 s3api abort-multipart-upload --bucket "$BUCKET" --key "$key" --upload-id "$uid" >/dev/null 2>&1 || return 1
+    [ "$listed" = "$(printf '%s\t%s' "$key" "$uid")" ] || return 1
+    listed=$(awss3 s3api list-multipart-uploads --bucket "$BUCKET" --prefix lmu/ \
+        --query 'length(Uploads || `[]`)' --output text 2>/dev/null)
+    [ "$listed" = 0 ]
 }
 
 # Operations Cairn doesn't implement are refused (501), not run as the plain
@@ -1529,6 +1544,7 @@ run_test    "Packer compacts mostly-dead blobs"      pack_compacts_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
+run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets
 run_test    "Read-only role can read, not write"    reader_permissions_ok
 run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
