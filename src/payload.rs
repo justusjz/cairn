@@ -268,6 +268,11 @@ impl Payload {
         Ok(payload)
     }
 
+    /// The MD5 `Content-MD5` declares. Once `finish` succeeds, it's the data's.
+    pub fn claimed_md5(&self) -> Option<[u8; 16]> {
+        self.md5.as_ref().and_then(|(_, claimed)| claimed.as_slice().try_into().ok())
+    }
+
     /// A body that claims nothing, and isn't framed: data from within Cairn.
     pub fn unchecked() -> Payload {
         Payload {

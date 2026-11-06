@@ -458,9 +458,11 @@ async fn read_slice(app: &App, mut slice: BlobSlice, tx: &FrameSender) -> io::Re
 /// read as any other, and decrypted after: its bytes come verified and in
 /// order, whichever replica or blob they're read from (`read_slice` resumes
 /// where a failed read stopped, maybe mid-segment), so the decryption only
-/// ever sees one stream.
+/// ever sees one stream. The reading runs as a task of its own, so that it
+/// and the decryption proceed side by side; a bounded channel between them
+/// keeps what's in flight small.
 async fn read_decrypted(
-    app: &App,
+    app: &Arc<App>,
     slice: BlobSlice,
     decrypt: Decrypt,
     tx: &FrameSender,
@@ -469,32 +471,38 @@ async fn read_decrypted(
         return Err(io::Error::other("an encrypted part, and no key to read it with"));
     };
     let (stored_tx, mut stored) = tokio::sync::mpsc::channel(4);
-    let read = async move { read_slice(app, slice, &stored_tx).await };
+    let reading = {
+        let app = app.clone();
+        tokio::spawn(async move { read_slice(&app, slice, &stored_tx).await })
+    };
     let open = async {
         let mut opener = Opener::new(key, decrypt.salt, decrypt.plain, decrypt.first);
         let (mut skip, mut left) = (decrypt.skip as usize, decrypt.len as usize);
         while let Some(frame) = stored.recv().await {
             let Ok(data) = frame?.into_data() else { continue };
             let opened = opener.update(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let Some(mut plain) = opened else { continue };
-            let skipped = skip.min(plain.len());
-            plain = plain.slice(skipped..);
-            skip -= skipped;
-            let take = left.min(plain.len());
-            if take > 0 {
-                left -= take;
-                tx.send(Ok(Frame::data(plain.slice(..take))))
-                    .await
-                    .map_err(|_| io::Error::other("the reader went away"))?;
+            for mut plain in opened {
+                let skipped = skip.min(plain.len());
+                plain = plain.slice(skipped..);
+                skip -= skipped;
+                let take = left.min(plain.len());
+                if take > 0 {
+                    left -= take;
+                    tx.send(Ok(Frame::data(plain.slice(..take))))
+                        .await
+                        .map_err(|_| io::Error::other("the reader went away"))?;
+                }
             }
         }
         opener.finish().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok::<_, io::Error>(left)
     };
-    let (read, open) = tokio::join!(read, open);
+    let opened = open.await;
+    // Stops the reading, if the decryption gave up first (its sends fail).
+    drop(stored);
+    let read = reading.await.map_err(io::Error::other)?;
     read?;
-    let left = open?;
-    if left > 0 {
+    if opened? > 0 {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "an encrypted part ended early"));
     }
     Ok(())

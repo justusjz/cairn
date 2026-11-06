@@ -821,11 +821,29 @@ where
         }
         _ => None,
     };
+    // A plain part's ETag is its MD5. If the client declared it (Content-MD5),
+    // the body is checked against it as it's read, so it's that one. Otherwise
+    // a task of its own works it out beside the writing (MD5 is slow, and
+    // can't be split up), from the same chunks, through a short queue.
+    let claimed_md5 = payload.claimed_md5();
+    let (md5_tx, md5_task) = match (&sealer, claimed_md5) {
+        (None, None) => {
+            let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
+            let task = tokio::spawn(async move {
+                let mut hasher = Md5::new();
+                while let Some(piece) = rx.recv().await {
+                    hasher.update(&piece);
+                }
+                hasher.finalize()
+            });
+            (Some(tx), Some(task))
+        }
+        _ => (None, None),
+    };
     // 3. tee: read the client body once, decoding it (an `aws-chunked` body's
     // framing isn't the object) and checking it as it goes, hashing the data
     // for the ETag (or encrypting it), and fanning each chunk out to every
     // replica.
-    let mut hasher = Md5::new();
     let failure = loop {
         match body.frame().await {
             Some(Ok(frame)) => {
@@ -835,12 +853,15 @@ where
                         for piece in data {
                             match &mut sealer {
                                 Some(sealer) => {
-                                    if let Some(sealed) = sealer.update(&piece) {
+                                    for sealed in sealer.update(&piece) {
                                         writer.write(sealed).await;
                                     }
                                 }
                                 None => {
-                                    hasher.update(&piece);
+                                    if let Some(md5_tx) = &md5_tx {
+                                        // Only fails if the task panicked; awaited below.
+                                        let _ = md5_tx.send(piece.clone()).await;
+                                    }
                                     writer.write(piece).await;
                                 }
                             }
@@ -853,6 +874,8 @@ where
             None => break payload.finish().err().map(Ok),
         }
     };
+    // The MD5 task has all there is.
+    drop(md5_tx);
     // The last segment, once the whole body is in and what it claimed to be.
     let encrypted = match sealer {
         Some(sealer) if failure.is_none() => {
@@ -877,6 +900,19 @@ where
             return Err(e);
         }
     }
+    let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let etag = match (&encrypted, claimed_md5, md5_task) {
+        (Some(encrypted), _, _) => hex(&encrypted.salt),
+        (None, Some(claimed), _) => hex(&claimed),
+        (None, None, Some(task)) => match task.await {
+            Ok(md5) => hex(&md5),
+            Err(e) => {
+                writer.abort("the MD5 task failed").await;
+                return Err(e.into());
+            }
+        },
+        (None, None, None) => unreachable!("a plain part has its MD5 claimed or worked out"),
+    };
     // On failure, `finish` deletes what the replicas stored itself.
     let written = writer.finish().await?;
     // If this future is dropped before the blob is committed or discarded, the
@@ -885,10 +921,6 @@ where
     // Whatever keeps the upload from committing from here on, the blob is
     // deleted with its files right away; only a crash leaves it to the GC.
     let result = async {
-        let etag: String = match &encrypted {
-            Some(encrypted) => encrypted.salt.iter().map(|b| format!("{b:02x}")).collect(),
-            None => hasher.finalize().iter().map(|b| format!("{b:02x}")).collect(),
-        };
         // 5. commit + attach with the now-known size and ETag, in one transaction;
         // retry on a conflict.
         let mut client = app.pool.get().await?;

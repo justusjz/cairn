@@ -128,19 +128,19 @@ impl Sealer {
     }
 
     /// Takes more plaintext, and returns the stored bytes of the segments it
-    /// completed (if any).
-    pub fn update(&mut self, mut data: &[u8]) -> Option<Bytes> {
-        let mut out = BytesMut::new();
+    /// completed, each as it was sealed (in place: no copy).
+    pub fn update(&mut self, mut data: &[u8]) -> Vec<Bytes> {
+        let mut out = Vec::new();
         self.plain += data.len() as u64;
         while !data.is_empty() {
             if self.pending.len() as u64 == SEGMENT {
-                out.extend_from_slice(&self.seal(false));
+                out.push(self.seal(false));
             }
             let take = (SEGMENT as usize - self.pending.len()).min(data.len());
             self.pending.extend_from_slice(&data[..take]);
             data = &data[take..];
         }
-        (!out.is_empty()).then(|| out.freeze())
+        out
     }
 
     /// Seals the last segment, and returns its stored bytes, with the
@@ -212,9 +212,9 @@ impl Opener {
     }
 
     /// Takes more stored bytes, and returns the plaintext of the segments
-    /// they completed (if any).
-    pub fn update(&mut self, mut data: &[u8]) -> Result<Option<Bytes>, Unauthentic> {
-        let mut out = BytesMut::new();
+    /// they completed, each as it was opened (in place: no copy).
+    pub fn update(&mut self, mut data: &[u8]) -> Result<Vec<Bytes>, Unauthentic> {
+        let mut out = Vec::new();
         while !data.is_empty() {
             // No bytes belong past the last segment.
             if self.index > self.last {
@@ -226,10 +226,10 @@ impl Opener {
             self.pending.extend_from_slice(&data[..take]);
             data = &data[take..];
             if self.pending.len() == self.segment_stored() {
-                out.extend_from_slice(&self.open()?);
+                out.push(self.open()?);
             }
         }
-        Ok((!out.is_empty()).then(|| out.freeze()))
+        Ok(out)
     }
 
     /// Checks that the bytes ended at a segment boundary.
@@ -282,7 +282,7 @@ mod tests {
         let mut sealer = Sealer::new(&KEY, SALT);
         let mut stored = Vec::new();
         for piece in data.chunks(chunk.max(1)) {
-            if let Some(out) = sealer.update(piece) {
+            for out in sealer.update(piece) {
                 stored.extend_from_slice(&out);
             }
         }
@@ -303,7 +303,7 @@ mod tests {
         let mut opener = Opener::new(key, SALT, plain, first);
         let mut out = Vec::new();
         for piece in stored.chunks(chunk.max(1)) {
-            if let Some(got) = opener.update(piece)? {
+            for got in opener.update(piece)? {
                 out.extend_from_slice(&got);
             }
         }
@@ -450,7 +450,7 @@ mod tests {
     fn another_salt_is_another_part() {
         let data = plaintext(100);
         let mut sealer = Sealer::new(&KEY, [1; SALT_LEN]);
-        assert!(sealer.update(&data).is_none());
+        assert!(sealer.update(&data).is_empty());
         let (stored, _) = sealer.finish();
         assert!(open(&KEY, &stored, 100, 0, 100).is_err());
         assert_ne!(stored.to_vec(), seal(&data, 100));

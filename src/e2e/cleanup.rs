@@ -299,3 +299,35 @@ async fn delete_bucket_aborts_its_uploads() {
     assert_eq!(query_i64(&app, "SELECT count(*) FROM parts").await, 0);
     assert_left(&app, 0).await;
 }
+
+/// A plain object's ETag is its MD5: the one its Content-MD5 declares, once
+/// the body is checked against it, or else the one worked out beside the
+/// writing. A body that doesn't match its Content-MD5 leaves nothing.
+#[tokio::test]
+async fn an_etag_is_the_md5_declared_or_worked_out() {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use md5::Digest;
+    let Some(app) = node().await else { return };
+    let data: &'static [u8] = b"some data for its MD5";
+    let md5 = md5::Md5::digest(data);
+    let hex: String = md5.iter().map(|b| format!("{b:02x}")).collect();
+    let payload = |content_md5: Option<String>| {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD".parse().unwrap());
+        if let Some(content_md5) = content_md5 {
+            headers.insert("content-md5", content_md5.parse().unwrap());
+        }
+        Payload::new(&headers, "", true).unwrap()
+    };
+    for (key, declared) in [("declared", Some(STANDARD.encode(md5))), ("worked-out", None)] {
+        let result = upload(&app, &object(key, Preconditions::default()), data, payload(declared)).await;
+        let UploadResult::Committed { etag, .. } = result.unwrap() else {
+            panic!("{key} wasn't committed");
+        };
+        assert_eq!(etag, hex, "{key}");
+    }
+    let wrong = STANDARD.encode(md5::Md5::digest(b"other data"));
+    let result = upload(&app, &object("wrong", Preconditions::default()), data, payload(Some(wrong))).await;
+    assert!(matches!(result.unwrap(), UploadResult::Rejected(rejection) if rejection.code == "BadDigest"));
+    assert_left(&app, 2).await;
+}
