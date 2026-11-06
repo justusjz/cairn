@@ -207,6 +207,17 @@ A signed request is only accepted within **15 minutes** of its timestamp
 clocks of nodes and clients in sync (e.g. NTP); otherwise requests fail with
 `RequestTimeTooSkewed`.
 
+**Presigned URLs** (SigV4 in the query string) work as in S3: a URL signed
+with a role's credentials makes exactly that request, as that role, for as
+long as it says (`X-Amz-Expires`, at most 7 days), with nothing but an HTTP
+client, a browser say. Its body is unsigned. GetObject and HeadObject take
+S3's `response-*` parameters (`response-content-disposition`,
+`response-content-type`, …), which set those headers of the response, so that
+a link can download an object under a name of its own. Only SigV4 is
+supported: `aws s3 presign` makes SigV2 URLs unless its config has
+`signature_version = s3v4` under `s3`. For an SSE-C object, the URL has to be
+signed with the key's headers, and the client has to send them.
+
 > [!NOTE]
 > Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,

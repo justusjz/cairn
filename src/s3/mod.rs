@@ -60,7 +60,7 @@ pub async fn handle(
     // credential names and verify the header signature with its secret. Needs
     // only the method/URI/query/headers, so it runs before any body is read. The
     // peer endpoint is a separate service and stays open for internal traffic.
-    let Some(access_key) = crate::auth::access_key(req.headers()) else {
+    let Some(access_key) = crate::auth::access_key(req.headers(), req.uri().query().unwrap_or("")) else {
         return Ok(forbidden("AccessDenied", "request is not signed"));
     };
     let principal = Principal::load(&app.pool.get().await?, &access_key).await?;
@@ -329,6 +329,14 @@ pub async fn handle(
     if writes_object && let Err(refused) = acl::check_write(req.headers(), acl::On::Object) {
         return Ok(box_response(refused));
     }
+    // The headers a read's `response-*` parameters replace (GET and HEAD).
+    let overrides = match *req.method() {
+        Method::GET | Method::HEAD => match metadata::Overrides::from_query(&query) {
+            Ok(overrides) => overrides,
+            Err(refused) => return Ok(box_response(refused)),
+        },
+        _ => metadata::Overrides::default(),
+    };
     if *req.method() == hyper::Method::GET {
         // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
         // break XML-parsing clients like `s3cmd info`.
@@ -357,7 +365,8 @@ pub async fn handle(
             &preconditions,
             customer_key.as_ref(),
         )
-        .await;
+        .await
+        .map(|response| overrides.apply(response));
     }
     let content_type = req
         .headers()
@@ -393,7 +402,7 @@ pub async fn handle(
     // the writes that take the request's metadata look at it.
     let metadata = metadata::from_request(req.headers());
     let resp = match req.method().clone() {
-        hyper::Method::HEAD => {
+        hyper::Method::HEAD => overrides.apply(
             head_object(
                 &app,
                 &bucket,
@@ -403,8 +412,8 @@ pub async fn handle(
                 &preconditions,
                 customer_key.as_ref(),
             )
-            .await?
-        }
+            .await?,
+        ),
         // AbortMultipartUpload
         hyper::Method::DELETE if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();

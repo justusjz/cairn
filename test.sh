@@ -54,7 +54,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=94
+TOTAL=95
 STEP=0
 PASS=0
 FAIL=0
@@ -223,6 +223,7 @@ cat >"$AWSCFG" <<EOF
 region = us-east-1
 s3 =
     addressing_style = path
+    signature_version = s3v4
 EOF
 # as_role <access-key> <secret> <aws args...> — aws-cli under a given role.
 as_role() {
@@ -285,6 +286,40 @@ print(f"x-amz-content-sha256: {payload_hash}")
 print(f"Authorization: AWS4-HMAC-SHA256 Credential={akid}/{scope}, SignedHeaders={signed_headers}, Signature={sig}")
 for e in extra:
     print(e)
+PYEOF
+
+# A presigner (SigV4 in the query string), from the standard library only:
+# presign.py <method> <url> <expires> [extra query params, already encoded]
+PRESIGNER="$WORK_DIR/presign.py"
+cat >"$PRESIGNER" <<'PYEOF'
+import sys, hashlib, hmac
+from datetime import datetime, timezone
+from urllib.parse import urlsplit, quote
+
+method, url, expires = sys.argv[1], sys.argv[2], sys.argv[3]
+extra = sys.argv[4] if len(sys.argv) > 4 else ""
+secret, region, akid = "cairnsecret", "us-east-1", "testkey"
+u = urlsplit(url)
+now = datetime.now(timezone.utc)
+amzdate, datestamp = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+scope = f"{datestamp}/{region}/s3/aws4_request"
+params = {
+    "X-Amz-Algorithm": "AWS4-HMAC-SHA256",
+    "X-Amz-Credential": quote(f"{akid}/{scope}", safe=""),
+    "X-Amz-Date": amzdate,
+    "X-Amz-Expires": expires,
+    "X-Amz-SignedHeaders": "host",
+}
+for p in extra.split("&") if extra else []:
+    k, _, v = p.partition("=")
+    params[k] = v
+query = "&".join(f"{k}={params[k]}" for k in sorted(params))
+canonical = f"{method}\n{u.path}\n{query}\nhost:{u.netloc}\n\nhost\nUNSIGNED-PAYLOAD"
+def mac(k, m): return hmac.new(k, m.encode(), hashlib.sha256).digest()
+k = mac(("AWS4" + secret).encode(), datestamp)
+k = mac(mac(mac(k, region), "s3"), "aws4_request")
+sts = f"AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
+print(f"{u.scheme}://{u.netloc}{u.path}?{query}&X-Amz-Signature={hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()}")
 PYEOF
 
 # scurl <method> <pathquery> <payload-hash> <bodyfile|-> [extra "Header: val"...]
@@ -905,6 +940,27 @@ acls_disabled_ok() {
         --query 'OwnershipControls.Rules[0].ObjectOwnership' --output text 2>/dev/null)" = BucketOwnerEnforced ] || return 1
     awss3 s3api delete-bucket --bucket "$nb" >/dev/null 2>&1 || return 1
     awss3 s3api delete-object --bucket "$BUCKET" --key acl/x.txt >/dev/null 2>&1
+}
+
+# Presigned URLs: a GET (aws-cli's) and a PUT (ours) work with nothing but
+# curl, and a GET can set the response's Content-Disposition; changing the URL
+# or letting it expire breaks it.
+presigned_ok() {
+    local base="http://${SERVER_HOST}:${SERVER_PORT}/${BUCKET}" url code
+    url=$(awss3 s3 presign "s3://${BUCKET}/small.txt" --expires-in 60 2>/dev/null) || return 1
+    curl -sf "$url" -o "$WORK_DIR/pre.get" && cmp -s "$SMALL" "$WORK_DIR/pre.get" || return 1
+    url=$(python3 "$PRESIGNER" PUT "$base/pre/up.txt" 60) || return 1
+    curl -sf -T "$SMALL" "$url" -o /dev/null || return 1
+    check_roundtrip "$SMALL" "s3://${BUCKET}/pre/up.txt" || return 1
+    url=$(python3 "$PRESIGNER" GET "$base/pre/up.txt" 60 \
+        "response-content-disposition=attachment%3B%20filename%3D%22saved.txt%22") || return 1
+    curl -sf -D - -o /dev/null "$url" | grep -qi '^content-disposition: attachment; filename="saved.txt"' || return 1
+    code=$(curl -s -o /dev/null -w '%{http_code}' "${url/pre\/up.txt/small.txt}")
+    [ "$code" = 403 ] || return 1
+    url=$(python3 "$PRESIGNER" GET "$base/pre/up.txt" 1) || return 1
+    sleep 2
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$url")" = 403 ] || return 1
+    s3 del "s3://${BUCKET}/pre/up.txt" >/dev/null 2>&1
 }
 
 # Operations Cairn doesn't implement are refused (501), not run as the plain
@@ -1692,6 +1748,7 @@ run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
 run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
+run_test    "Presigned GET/PUT, response headers"   presigned_ok
 run_test    "A PUT over 5 GiB is refused"           too_large_refused
 run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets

@@ -193,7 +193,9 @@ impl Payload {
         let mut payload = Payload::unchecked();
         payload.content_length = header("content-length").and_then(|v| v.trim().parse().ok());
         // `verify_sigv4` has checked that it's there, and valid.
-        let (streaming, trailer) = match header("x-amz-content-sha256").unwrap_or("") {
+        // Only a presigned URL comes without one (`verify_sigv4` checked a
+        // signed header's): its body is unsigned.
+        let (streaming, trailer) = match header("x-amz-content-sha256").unwrap_or("UNSIGNED-PAYLOAD") {
             "UNSIGNED-PAYLOAD" => (false, false),
             "STREAMING-UNSIGNED-PAYLOAD-TRAILER" => (true, true),
             "STREAMING-AWS4-HMAC-SHA256-PAYLOAD" => {

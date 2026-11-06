@@ -158,7 +158,8 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// The SigV4 `Authorization` header fields, parsed once and shared by request
-/// verification and the streaming chunk verifier.
+/// verification and the streaming chunk verifier. Or the same, from a
+/// presigned URL's query (`from_query`).
 ///
 /// `AWS4-HMAC-SHA256 Credential=<akid>/<date>/<region>/<service>/aws4_request,
 ///  SignedHeaders=h1;h2;…, Signature=<hex>`
@@ -203,13 +204,63 @@ impl Authorization {
             signature: signature?.to_owned(),
         })
     }
+
+    /// The same fields from a presigned URL's query (`X-Amz-Credential`,
+    /// `X-Amz-SignedHeaders`, `X-Amz-Signature`), or `None` if it isn't one.
+    fn from_query(query: &str) -> Option<Self> {
+        let get = |name| query_value(query, name);
+        if get("X-Amz-Algorithm")? != "AWS4-HMAC-SHA256" {
+            return None;
+        }
+        let credential = get("X-Amz-Credential")?;
+        let mut cred = credential.split('/');
+        let (access_key, date, region, service) = (
+            cred.next()?.to_owned(),
+            cred.next()?.to_owned(),
+            cred.next()?.to_owned(),
+            cred.next()?.to_owned(),
+        );
+        let terminator = cred.next()?;
+        Some(Authorization {
+            access_key,
+            scope: format!("{date}/{region}/{service}/{terminator}"),
+            date,
+            region,
+            service,
+            signed_headers: get("X-Amz-SignedHeaders")?
+                .split(';')
+                .map(str::to_owned)
+                .collect(),
+            signature: get("X-Amz-Signature")?,
+        })
+    }
+}
+
+/// A query parameter's value, percent-decoded; `None` if it's absent.
+fn query_value(query: &str, name: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        (k == name).then(|| {
+            percent_encoding::percent_decode_str(v)
+                .decode_utf8_lossy()
+                .into_owned()
+        })
+    })
+}
+
+/// Whether the request is signed in its query: a presigned URL.
+fn presigned(query: &str) -> bool {
+    query_value(query, "X-Amz-Algorithm").is_some()
 }
 
 /// The access key ID a SigV4-signed request claims (from its `Authorization`
-/// credential), used to look up the secret to verify it with. `None` for an
-/// unsigned or malformed request.
-pub fn access_key(headers: &HeaderMap) -> Option<String> {
-    Authorization::from_headers(headers).map(|a| a.access_key)
+/// credential, or a presigned URL's), used to look up the secret to verify it
+/// with. `None` for an unsigned or malformed request.
+pub fn access_key(headers: &HeaderMap, query: &str) -> Option<String> {
+    match headers.contains_key("authorization") {
+        true => Authorization::from_headers(headers).map(|a| a.access_key),
+        false => Authorization::from_query(query).map(|a| a.access_key),
+    }
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -223,9 +274,11 @@ fn canonical_query(query: &str) -> String {
     if query.is_empty() {
         return String::new();
     }
+    // A presigned URL's signature isn't part of what it signs.
     let mut pairs: Vec<(&str, &str)> = query
         .split('&')
         .map(|p| p.split_once('=').unwrap_or((p, "")))
+        .filter(|(k, _)| *k != "X-Amz-Signature")
         .collect();
     pairs.sort_unstable();
     pairs
@@ -370,6 +423,9 @@ pub fn verify_sigv4(
     verify_sigv4_at(method, path, query, headers, secret, now)
 }
 
+/// The longest a presigned URL may be valid: a week, as in S3.
+pub const MAX_PRESIGNED_SECS: i64 = 7 * 24 * 60 * 60;
+
 /// `verify_sigv4`, with the server clock at `now` (Unix seconds).
 fn verify_sigv4_at(
     method: &str,
@@ -379,6 +435,17 @@ fn verify_sigv4_at(
     secret: &str,
     now: i64,
 ) -> Result<(), Rejection> {
+    if !headers.contains_key("authorization") {
+        return verify_presigned_at(method, path, query, headers, secret, now);
+    }
+    if presigned(query) {
+        return Err(Rejection::new(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "Only one auth mechanism allowed; only the X-Amz-Algorithm query parameter or the \
+             Authorization header should be specified",
+        ));
+    }
     let access_denied = |message: &str| Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", message);
     let auth = Authorization::from_headers(headers)
         .ok_or_else(|| access_denied("the Authorization header is malformed"))?;
@@ -421,7 +488,117 @@ fn verify_sigv4_at(
         };
         Rejection::new(StatusCode::FORBIDDEN, code, message)
     })?;
-    let canonical = canonical_request(method, path, query, headers, &auth, payload_hash);
+    check_signature(
+        method,
+        path,
+        query,
+        headers,
+        &auth,
+        payload_hash,
+        datetime,
+        secret,
+    )
+}
+
+/// Verifies a presigned URL: a SigV4 signature in the query (`X-Amz-*`), as S3
+/// does. It's valid from its `X-Amz-Date` (give or take the clock skew S3
+/// allows) for `X-Amz-Expires` seconds, at most a week. Its body is unsigned,
+/// unless it comes with a (signed) `x-amz-content-sha256`; `host` and every
+/// `x-amz-*` header must be signed, as with a signed header.
+fn verify_presigned_at(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    secret: &str,
+    now: i64,
+) -> Result<(), Rejection> {
+    let parameters_error = |message: &str| {
+        Rejection::new(
+            StatusCode::BAD_REQUEST,
+            "AuthorizationQueryParametersError",
+            message,
+        )
+    };
+    let access_denied =
+        |message: &str| Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", message);
+    let auth = Authorization::from_query(query).ok_or_else(|| {
+        parameters_error(
+            "Query-string authentication version 4 requires the X-Amz-Algorithm, \
+             X-Amz-Credential, X-Amz-Signature, X-Amz-Date, X-Amz-SignedHeaders, and \
+             X-Amz-Expires parameters.",
+        )
+    })?;
+    let datetime = query_value(query, "X-Amz-Date")
+        .ok_or_else(|| parameters_error("X-Amz-Date is missing"))?;
+    let expires: i64 = query_value(query, "X-Amz-Expires")
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| parameters_error("X-Amz-Expires should be a number"))?;
+    if expires <= 0 {
+        return Err(parameters_error("X-Amz-Expires must be non-negative"));
+    }
+    if expires > MAX_PRESIGNED_SECS {
+        return Err(parameters_error(
+            "X-Amz-Expires must be less than a week (in seconds) that is 604800",
+        ));
+    }
+    let signed_at = parse_amz_date(&datetime)
+        .filter(|_| datetime[..8] == *auth.date)
+        .ok_or_else(|| {
+            access_denied(
+                "the presigned URL's X-Amz-Date is malformed or doesn't match its credential scope",
+            )
+        })?;
+    if now < signed_at - MAX_CLOCK_SKEW_SECS {
+        return Err(access_denied("Request is not valid yet"));
+    }
+    if now > signed_at + expires {
+        return Err(access_denied("Request has expired"));
+    }
+    let payload_hash = match headers.get("x-amz-content-sha256").map(|v| v.to_str()) {
+        None => "UNSIGNED-PAYLOAD",
+        Some(Ok(value)) if valid_payload_hash(value) => value,
+        Some(_) => {
+            return Err(Rejection::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "x-amz-content-sha256 must be UNSIGNED-PAYLOAD or a valid SHA-256 value",
+            ));
+        }
+    };
+    let unsigned = unsigned_headers(headers, &auth);
+    if !unsigned.is_empty() {
+        let mut rejection =
+            access_denied("There were headers present in the request which were not signed");
+        rejection.details.push(("HeadersNotSigned", unsigned.join(", ")));
+        return Err(rejection);
+    }
+    check_signature(
+        method,
+        path,
+        query,
+        headers,
+        &auth,
+        payload_hash,
+        &datetime,
+        secret,
+    )
+}
+
+/// Checks the signature of the canonical request the parts make, under the
+/// key `secret` derives for the credential's scope.
+#[allow(clippy::too_many_arguments)]
+fn check_signature(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    auth: &Authorization,
+    payload_hash: &str,
+    datetime: &str,
+    secret: &str,
+) -> Result<(), Rejection> {
+    let canonical = canonical_request(method, path, query, headers, auth, payload_hash);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{datetime}\n{}\n{}",
         auth.scope,
@@ -547,6 +724,103 @@ mod tests {
             let expected = (StatusCode::BAD_REQUEST, "InvalidArgument");
             assert_eq!((rejection.status, rejection.code), expected, "{bad}");
         }
+    }
+
+    /// AWS's example of a presigned URL (a GET of examplebucket's test.txt,
+    /// signed on 24 May 2013 for a day), from its SigV4 documentation.
+    const AWS_PRESIGNED: &str = "X-Amz-Algorithm=AWS4-HMAC-SHA256\
+        &X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request\
+        &X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host\
+        &X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404";
+    const AWS_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+
+    fn verify_aws_presigned(query: &str, headers: &HeaderMap, now: i64) -> Result<(), Rejection> {
+        verify_sigv4_at("GET", "/test.txt", query, headers, AWS_SECRET, now)
+    }
+
+    fn aws_host() -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("host", "examplebucket.s3.amazonaws.com".parse().unwrap());
+        h
+    }
+
+    #[test]
+    fn verifies_a_presigned_url() {
+        let signed_at = parse_amz_date("20130524T000000Z").unwrap();
+        assert_eq!(
+            access_key(&aws_host(), AWS_PRESIGNED).as_deref(),
+            Some("AKIAIOSFODNN7EXAMPLE")
+        );
+        // Valid for its day, and from a little before it, as the clock may be off.
+        for now in [signed_at - 60, signed_at, signed_at + 86_400] {
+            assert_eq!(
+                verify_aws_presigned(AWS_PRESIGNED, &aws_host(), now),
+                Ok(()),
+                "{now}"
+            );
+        }
+        let code = |query: &str, headers: &HeaderMap, now: i64| {
+            verify_aws_presigned(query, headers, now).unwrap_err()
+        };
+        assert_eq!(
+            code(AWS_PRESIGNED, &aws_host(), signed_at + 86_401).message,
+            "Request has expired"
+        );
+        assert_eq!(
+            code(AWS_PRESIGNED, &aws_host(), signed_at - 3600).message,
+            "Request is not valid yet"
+        );
+        // Anything it covers changed: the expiry, the host, the path.
+        let longer = AWS_PRESIGNED.replace("X-Amz-Expires=86400", "X-Amz-Expires=86500");
+        assert_eq!(
+            code(&longer, &aws_host(), signed_at).code,
+            "SignatureDoesNotMatch"
+        );
+        let mut other_host = HeaderMap::new();
+        other_host.insert("host", "otherbucket.s3.amazonaws.com".parse().unwrap());
+        assert_eq!(
+            code(AWS_PRESIGNED, &other_host, signed_at).code,
+            "SignatureDoesNotMatch"
+        );
+        let other_path = verify_sigv4_at(
+            "GET",
+            "/other.txt",
+            AWS_PRESIGNED,
+            &aws_host(),
+            AWS_SECRET,
+            signed_at,
+        );
+        assert_eq!(other_path.unwrap_err().code, "SignatureDoesNotMatch");
+        // An x-amz-* header it doesn't cover.
+        let mut extra = aws_host();
+        extra.insert("x-amz-meta-a", "1".parse().unwrap());
+        assert_eq!(code(AWS_PRESIGNED, &extra, signed_at).code, "AccessDenied");
+        // At most a week, and positive.
+        for expires in ["604801", "0", "-5", "soon"] {
+            let query =
+                AWS_PRESIGNED.replace("X-Amz-Expires=86400", &format!("X-Amz-Expires={expires}"));
+            let rejection = code(&query, &aws_host(), signed_at);
+            assert_eq!(
+                (rejection.status, rejection.code),
+                (StatusCode::BAD_REQUEST, "AuthorizationQueryParametersError"),
+                "{expires}"
+            );
+        }
+        // Not both kinds of signature at once.
+        let both = signed(&BASE, &[]);
+        let rejection = verify_sigv4_at(
+            "PUT",
+            "/b/k",
+            AWS_PRESIGNED,
+            &both,
+            SECRET,
+            parse_amz_date(DATE).unwrap(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            (rejection.status, rejection.code),
+            (StatusCode::BAD_REQUEST, "InvalidArgument")
+        );
     }
 
     #[test]

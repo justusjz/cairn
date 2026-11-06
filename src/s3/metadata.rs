@@ -78,6 +78,53 @@ pub fn from_request(headers: &HeaderMap) -> Result<String, Response<Full<Bytes>>
     Ok(stored.iter().map(|(name, value)| format!("{name}: {value}\n")).collect())
 }
 
+/// GetObject's and HeadObject's `response-*` query parameters, and the
+/// headers whose values they replace in that response (only), as in S3: so a
+/// presigned URL can have a browser save the object under a name of its own.
+const OVERRIDES: [(&str, &str); 6] = [
+    ("response-content-type", "content-type"),
+    ("response-content-language", "content-language"),
+    ("response-expires", "expires"),
+    ("response-cache-control", "cache-control"),
+    ("response-content-disposition", "content-disposition"),
+    ("response-content-encoding", "content-encoding"),
+];
+
+/// The headers a read's `response-*` parameters replace.
+#[derive(Default)]
+pub struct Overrides(Vec<(&'static str, hyper::header::HeaderValue)>);
+
+impl Overrides {
+    /// The overrides `query` asks for, or the error to refuse it with.
+    pub fn from_query(query: &str) -> Result<Overrides, Response<Full<Bytes>>> {
+        let mut overrides = Vec::new();
+        for (parameter, header) in OVERRIDES {
+            let Some(value) = crate::s3::util::query_param(query, parameter) else {
+                continue;
+            };
+            let Ok(value) = value.parse() else {
+                return Err(format_s3_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    &format!("{parameter} isn't a valid header value"),
+                ));
+            };
+            overrides.push((header, value));
+        }
+        Ok(Overrides(overrides))
+    }
+
+    /// Replaces the headers of a successful read's `response`.
+    pub fn apply<B>(&self, mut response: Response<B>) -> Response<B> {
+        if response.status().is_success() {
+            for (header, value) in &self.0 {
+                response.headers_mut().insert(*header, value.clone());
+            }
+        }
+        response
+    }
+}
+
 /// Adds the stored `metadata`'s headers to a response.
 pub fn apply(mut builder: Builder, metadata: &str) -> Builder {
     for line in metadata.lines() {
@@ -131,6 +178,35 @@ mod tests {
         let response = apply(Response::builder(), &stored).body(()).unwrap();
         assert_eq!(response.headers()["x-amz-meta-k"], "v: w");
         assert_eq!(response.headers()["x-amz-meta-e"], "");
+    }
+
+    #[test]
+    fn response_parameters_replace_a_reads_headers() {
+        let query = "response-content-type=text%2Fcsv&response-content-disposition=attachment%3B%20filename%3D%22r.csv%22&x-id=GetObject";
+        let overrides = Overrides::from_query(query).unwrap();
+        let read = Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/octet-stream");
+        let response = overrides.apply(read.body(()).unwrap());
+        assert_eq!(response.headers()["content-type"], "text/csv");
+        assert_eq!(
+            response.headers()["content-disposition"],
+            "attachment; filename=\"r.csv\""
+        );
+        assert_eq!(response.headers().get_all("content-type").iter().count(), 1);
+        // Not an error's.
+        let missing = Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(())
+            .unwrap();
+        assert!(
+            !overrides
+                .apply(missing)
+                .headers()
+                .contains_key("content-disposition")
+        );
+        // A value that can't be a header's is refused.
+        assert!(Overrides::from_query("response-content-type=a%0Ab").is_err());
     }
 
     #[test]
