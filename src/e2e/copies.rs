@@ -47,7 +47,7 @@ fn xml_field(xml: &str, tag: &str) -> String {
 async fn copy(app: &Arc<App>, source: &str, key: &str, replace: bool) -> String {
     let directive = replace.then_some("REPLACE");
     let source = format!("{BUCKET}/{source}");
-    let response = copy_object(app, BUCKET, key, &source, directive, "text/plain", "", &Preconditions::default())
+    let response = copy_object(app, BUCKET, key, &source, directive, "text/plain", "", &Preconditions::default(), Default::default())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -187,6 +187,7 @@ async fn a_part_copy_within_one_part_shares_its_bytes() {
         &format!("{BUCKET}/source"),
         Some("bytes=100-299"),
         &Preconditions::default(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -229,6 +230,7 @@ async fn a_part_copy_across_parts_copies_data() {
         &format!("{BUCKET}/source"),
         Some("bytes=900-1099"),
         &Preconditions::default(),
+        Default::default(),
     )
     .await
     .unwrap();
@@ -254,7 +256,7 @@ async fn copies_racing_deletes_of_their_source_stay_whole() {
         put(&app, "source", data.clone()).await;
         let (source, conditions) = (format!("{BUCKET}/source"), Preconditions::default());
         let (copied, ()) = tokio::join!(
-            copy_object(&app, BUCKET, "copy", &source, None, "", "", &conditions),
+            copy_object(&app, BUCKET, "copy", &source, None, "", "", &conditions, Default::default()),
             delete(&app, "source"),
         );
         match copied.unwrap().status() {
@@ -276,7 +278,7 @@ async fn a_copy_reports_its_last_modified_time() {
     let Some(app) = node().await else { return };
     put(&app, "src", b"data".to_vec()).await;
     let source = format!("{BUCKET}/src");
-    let response = copy_object(&app, BUCKET, "dst", &source, None, "text/plain", "", &Preconditions::default())
+    let response = copy_object(&app, BUCKET, "dst", &source, None, "text/plain", "", &Preconditions::default(), Default::default())
         .await
         .unwrap();
     let reported = xml_field(&body_text(response).await, "LastModified");

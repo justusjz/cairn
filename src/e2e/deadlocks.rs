@@ -75,7 +75,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
         // Crossing copies, and copies of an object onto itself.
         4..=8 => {
             let directive = (a == b).then_some("REPLACE");
-            let response = match copy_object(app, BUCKET, &b, &format!("{BUCKET}/{a}"), directive, "x", "", &Preconditions::default()).await {
+            let response = match copy_object(app, BUCKET, &b, &format!("{BUCKET}/{a}"), directive, "x", "", &Preconditions::default(), Default::default()).await {
                 Ok(response) => response,
                 // With this much churn on so few keys, a copy's source can keep
                 // changing under it, and the copy gives up (with SlowDown).

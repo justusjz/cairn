@@ -23,7 +23,7 @@ use crate::{
             create::create_multipart_upload, list::list_multipart_uploads, upload_part::put_part,
         },
         objects::{
-            copy::{copy_object, copy_part, parse_copy_source, replaces_metadata},
+            copy::{CopyKeys, copy_object, copy_part, parse_copy_source, replaces_metadata},
             delete::{delete_object, delete_objects, missing_checksum},
             get::{get_object, head_object},
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
@@ -275,23 +275,15 @@ pub async fn handle(
         Ok(key) => key,
         Err(refused) => return Ok(box_response(refused)),
     };
+    // A copy's source's, which has headers of its own.
+    let source_key = match sse_c::requested(req.headers(), &sse_c::COPY_SOURCE_HEADERS, secure) {
+        Ok(key) => key,
+        Err(refused) => return Ok(box_response(refused)),
+    };
     if matches!(*req.method(), Method::PUT | Method::POST) {
         // SSE-S3 and SSE-KMS: Cairn has no keys of its own to encrypt with.
         if let Some(refused) = sse_c::refuse_server_keys(req.headers()) {
             return Ok(box_response(refused));
-        }
-        // SSE-C, for now, not for copies.
-        let copies = req.headers().contains_key("x-amz-copy-source");
-        let names_source_key = req
-            .headers()
-            .keys()
-            .any(|name| name.as_str().starts_with("x-amz-copy-source-server-side-encryption"));
-        if names_source_key || (customer_key.is_some() && copies) {
-            return Ok(box_response(format_s3_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "NotImplemented",
-                "SSE-C is not implemented for copies yet",
-            )));
         }
     }
     if *req.method() == hyper::Method::GET {
@@ -404,6 +396,7 @@ pub async fn handle(
                 &copy_source.unwrap(),
                 copy_source_range.as_deref(),
                 &copy_source_preconditions,
+                CopyKeys { source: source_key.as_ref(), dest: customer_key.as_ref() },
             )
             .await?
         }
@@ -440,6 +433,7 @@ pub async fn handle(
                 &content_type,
                 &metadata,
                 &copy_source_preconditions,
+                CopyKeys { source: source_key.as_ref(), dest: customer_key.as_ref() },
             )
             .await?
         }

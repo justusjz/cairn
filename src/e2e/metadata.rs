@@ -99,7 +99,7 @@ async fn a_copy_keeps_or_replaces_metadata() {
     let replacement = stored(&[("x-amz-meta-b", "2")]);
 
     // COPY (the default): the source's, whatever the request says.
-    let response = copy_object(&app, BUCKET, "kept", &source, None, "a/b", &replacement, &none)
+    let response = copy_object(&app, BUCKET, "kept", &source, None, "a/b", &replacement, &none, Default::default())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -112,7 +112,7 @@ async fn a_copy_keeps_or_replaces_metadata() {
     // REPLACE: the request's, all of it; a copy onto the source itself too.
     for dest in ["replaced", "src"] {
         let response =
-            copy_object(&app, BUCKET, dest, &source, Some("REPLACE"), "a/b", &replacement, &none)
+            copy_object(&app, BUCKET, dest, &source, Some("REPLACE"), "a/b", &replacement, &none, Default::default())
                 .await
                 .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{dest}");

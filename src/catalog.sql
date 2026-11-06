@@ -608,7 +608,9 @@ $$;
 -- the version it replaces. Checks that the bucket exists ('no_such_bucket'),
 -- the conditional-write guard ('precondition_failed') and that every replica
 -- recorded its location ('missing_locations', with how many did), then
--- commits the blob, writes the version and attaches the part ('committed').
+-- commits the blob, writes the version and attaches the part ('committed',
+-- with the version's last-modified time in ISO 8601, as CopyObject reports
+-- it).
 -- `p_size` is the blob's (and the part's); an encrypted part also has its
 -- plaintext's size and its salt (NULL for a plain one), and an SSE-C object
 -- its key check.
@@ -617,7 +619,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
     p_bucket text, p_key text, p_content_type text, p_metadata text, p_sse_c_key bytea,
     p_if_match text[], p_if_none_match text[], p_new_version_id text,
-    OUT status text, OUT present bigint, OUT version_id text,
+    OUT status text, OUT present bigint, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -656,6 +658,8 @@ BEGIN
         p_bucket, p_key, v_versioning, coalesce(p_plain_size, p_size), p_etag, p_content_type,
         p_metadata, p_sse_c_key, p_new_version_id);
     version_id := v.version_id;
+    SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
+    INTO last_modified FROM objects o WHERE o.id = v.id;
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
                        part_number, plain_size, enc_salt, created_at)
     VALUES (p_blob, 0, p_size, p_etag, p_data_crc, v.id, NULL, 1, p_plain_size, p_enc_salt,

@@ -33,12 +33,18 @@ use crate::{encryption::Key, s3::util::format_s3_error};
 /// The algorithm a request must name: S3's only one.
 pub const ALGORITHM: &str = "AES256";
 
-/// The headers naming the key of the object a request is about. (A copy's
-/// source has its own, `x-amz-copy-source-server-side-encryption-customer-*`.)
+/// The headers naming the key of the object a request is about.
 pub const HEADERS: Names = Names {
     algorithm: "x-amz-server-side-encryption-customer-algorithm",
     key: "x-amz-server-side-encryption-customer-key",
     md5: "x-amz-server-side-encryption-customer-key-md5",
+};
+
+/// The headers naming the key of a copy's source.
+pub const COPY_SOURCE_HEADERS: Names = Names {
+    algorithm: "x-amz-copy-source-server-side-encryption-customer-algorithm",
+    key: "x-amz-copy-source-server-side-encryption-customer-key",
+    md5: "x-amz-copy-source-server-side-encryption-customer-key-md5",
 };
 
 pub struct Names {

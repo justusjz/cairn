@@ -9,13 +9,14 @@ use uuid::Uuid;
 
 use crate::db::Cached;
 use crate::{
-    App, AttachTarget, Contended, UploadResult,
+    App, AttachTarget, Contended, Sealing, UploadResult,
     blobs::{reap_blobs, reap_columns},
     body::channel_body,
     db,
     payload::Payload,
     s3::{
         conditional::{Precondition, Preconditions},
+        sse_c::{self, CustomerKey},
         objects::get::{
             Missing, ObjectVersion, PartLocation, lookup_version, no_such_version, parse_range,
             resolve_object_parts, select_parts_in_range, spawn_range_stream,
@@ -56,20 +57,26 @@ struct Source {
     locations: Vec<PartLocation>,
 }
 
-impl Source {
-    /// Whether it's encrypted (SSE-C), which copies don't handle yet.
-    fn encrypted(&self) -> bool {
-        self.version.sse_c_key.is_some() || self.locations.iter().any(|part| part.salt.is_some())
-    }
+/// The SSE-C keys of a copy: its source's (from the
+/// `x-amz-copy-source-server-side-encryption-customer-*` headers) and its
+/// destination's, either `None` for a plain object.
+#[derive(Clone, Copy, Default)]
+pub struct CopyKeys<'a> {
+    pub source: Option<&'a CustomerKey>,
+    pub dest: Option<&'a CustomerKey>,
 }
 
-/// The 501 for a copy of an encrypted source: not implemented yet.
-fn encrypted_source() -> Response<Full<Bytes>> {
-    format_s3_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "NotImplemented",
-        "copying an object encrypted with SSE-C is not implemented yet",
-    )
+impl CopyKeys<'_> {
+    /// Whether the destination can share the source's bytes: both are plain,
+    /// or encrypted with the same key. Otherwise the data is decrypted and
+    /// encrypted again.
+    fn same(&self) -> bool {
+        match (self.source, self.dest) {
+            (None, None) => true,
+            (Some(source), Some(dest)) => source.key() == dest.key(),
+            _ => false,
+        }
+    }
 }
 
 /// CopyObject: `PUT /{dest_bucket}/{dest_key}` with an `x-amz-copy-source`
@@ -80,6 +87,12 @@ fn encrypted_source() -> Response<Full<Bytes>> {
 /// The copy's ETag is the MD5 of its data, as S3's is. For a source of one
 /// part, that's the part's ETag. A multipart source has no such ETag, so its
 /// data is read once to work it out (but not written).
+///
+/// An SSE-C source needs its key (`keys.source`). The copy shares its bytes
+/// if it's encrypted with the same key, or both are plain; then an encrypted
+/// copy's ETag is the source's (an MD5 of the data would give it away).
+/// Otherwise the data is read, decrypted, and written again, encrypted with
+/// `keys.dest` if there is one.
 ///
 /// `metadata_directive` is `x-amz-metadata-directive` (COPY, the default, or
 /// REPLACE). Under COPY the destination inherits the source's content-type and
@@ -95,6 +108,7 @@ pub async fn copy_object(
     request_content_type: &str,
     request_metadata: &str,
     preconditions: &Preconditions,
+    keys: CopyKeys<'_>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let (src_bucket, src_key, src_version) = match parse_copy_source(copy_source) {
         Some(source) => source,
@@ -114,7 +128,9 @@ pub async fn copy_object(
     // S3 rejects a copy of an object onto itself that changes nothing, guarding
     // against a client accidentally issuing a destructive no-op. Copying a named
     // version onto its own key is allowed: that's how an old version is restored.
-    if src_bucket == dest_bucket && src_key == dest_key && !replace && src_version.is_none() {
+    // So is changing its encryption (another key, or none).
+    let same_object = src_bucket == dest_bucket && src_key == dest_key && src_version.is_none();
+    if same_object && !replace && keys.same() {
         return Ok(format_s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidRequest",
@@ -137,8 +153,10 @@ pub async fn copy_object(
             Ok(source) => source,
             Err(missing) => return Ok(missing),
         };
-        if source.encrypted() {
-            return Ok(encrypted_source());
+        // An SSE-C source only with its key; before the conditions, which would
+        // tell about it otherwise.
+        if let Err(refused) = sse_c::check_read(source.version.sse_c_key.as_deref(), keys.source) {
+            return Ok(refused);
         }
         // Honour x-amz-copy-source-if-* conditions on the source; any failure (a
         // 304 for a read maps to 412 here) aborts the copy.
@@ -146,7 +164,42 @@ pub async fn copy_object(
         if preconditions.evaluate(&version.etag, version.lm_epoch, true) != Precondition::Proceed {
             return Ok(copy_precondition_failed());
         }
+        let (content_type, metadata) = if replace {
+            (request_content_type, request_metadata)
+        } else {
+            (version.content_type.as_str(), version.metadata.as_str())
+        };
+        let respond = |etag: &str, version_id: Option<&str>, last_modified: &str| {
+            let resp = with_version_id(
+                xml_ok(format!(
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                     <CopyObjectResult>\
+                     <LastModified>{last_modified}</LastModified>\
+                     <ETag>\"{etag}\"</ETag>\
+                     </CopyObjectResult>"
+                )),
+                version_id,
+            );
+            let resp = with_copy_source_version_id(resp, source.version.version_id.as_deref());
+            match keys.dest {
+                Some(dest) => dest.echo_onto(resp),
+                None => resp,
+            }
+        };
+        if !keys.same() {
+            let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata };
+            match stream_object_copy(app, &source, &dest, keys).await {
+                Ok(Some((etag, version_id, last_modified))) => {
+                    return Ok(respond(&etag, version_id.as_deref(), &last_modified));
+                }
+                Ok(None) => return Ok(no_such_bucket()),
+                // Its data went with it: copy what it is now.
+                Err(_) if source.changed(app).await? => continue,
+                Err(e) => return Err(e),
+            }
+        }
         let etag = match source.parts.as_slice() {
+            _ if keys.dest.is_some() => version.etag.clone(),
             [part] => part.etag.clone(),
             _ => {
                 let size = version.size as u64;
@@ -158,34 +211,19 @@ pub async fn copy_object(
                 }
             }
         };
-        let (content_type, metadata) = if replace {
-            (request_content_type, request_metadata)
-        } else {
-            (version.content_type.as_str(), version.metadata.as_str())
-        };
+        let check = keys.dest.map(|dest| dest.new_check());
         // CopyObject reports the new version's last-modified time in the body
         // (not just the ETag header). It comes from the commit itself: read
         // afterwards, a concurrent write to the key could have replaced the
         // version already.
+        let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata };
         let (version_id, last_modified) =
-            match commit_object_copy(app, &source, dest_bucket, dest_key, &etag, content_type, metadata)
-                .await?
-            {
+            match commit_object_copy(app, &source, &dest, &etag, check.as_deref()).await? {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
                 ObjectCopy::SourceChanged => continue, // copy what it is now
                 ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
             };
-        let resp = with_version_id(
-            xml_ok(format!(
-                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                 <CopyObjectResult>\
-                 <LastModified>{last_modified}</LastModified>\
-                 <ETag>\"{etag}\"</ETag>\
-                 </CopyObjectResult>"
-            )),
-            version_id.as_deref(),
-        );
-        return Ok(with_copy_source_version_id(resp, source.version.version_id.as_deref()));
+        return Ok(respond(&etag, version_id.as_deref(), &last_modified));
     }
     Err(Contended("the copy source kept changing".to_owned()).into())
 }
@@ -194,6 +232,56 @@ pub async fn copy_object(
 /// metadata (REPLACE), rather than keep the source's (COPY, the default).
 pub fn replaces_metadata(metadata_directive: Option<&str>) -> bool {
     metadata_directive.is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
+}
+
+/// Where a CopyObject writes, and what its new version is to have.
+struct Dest<'a> {
+    bucket: &'a str,
+    key: &'a str,
+    content_type: &'a str,
+    metadata: &'a str,
+}
+
+/// Copies `source` to `dest` as data, through the normal upload path: read
+/// (and decrypted with `keys.source`) like a GET, and written (encrypted with
+/// `keys.dest`) like a PUT, which works out the ETag as it streams. For a copy
+/// that can't share the source's bytes. The new version's ETag, version ID to
+/// report and last-modified time, or `None` if the bucket is gone.
+async fn stream_object_copy(
+    app: &Arc<App>,
+    source: &Source,
+    dest: &Dest<'_>,
+    keys: CopyKeys<'_>,
+) -> anyhow::Result<Option<(String, Option<String>, String)>> {
+    let (sender, body) = channel_body();
+    let size = source.version.size as u64;
+    let slices = select_parts_in_range(source.locations.clone(), 0, size, keys.source.map(|k| k.key()));
+    spawn_range_stream(app.clone(), slices, sender);
+    let attach = AttachTarget::Object {
+        bucket: dest.bucket.to_owned(),
+        key: dest.key.to_owned(),
+        content_type: dest.content_type.to_owned(),
+        metadata: dest.metadata.to_owned(),
+        conditions: Preconditions::default(),
+        sealing: keys.dest.map(|key| Sealing {
+            key: zeroize::Zeroizing::new(*key.key()),
+            check: key.new_check(),
+        }),
+    };
+    // The source stream is data from within Cairn (verified as it's read), so
+    // there's nothing to check it against.
+    match crate::upload_part(app, body, &attach, Payload::unchecked()).await? {
+        UploadResult::Committed { etag, version_id, last_modified } => Ok(Some((
+            etag,
+            version_id,
+            last_modified.expect("an object write reports its last-modified time"),
+        ))),
+        UploadResult::NoSuchBucket => Ok(None),
+        // Nothing is checked, there are no conditions, and an object has no upload.
+        UploadResult::Rejected(_) | UploadResult::PreconditionFailed | UploadResult::NoSuchUpload => {
+            unreachable!("an unchecked, unconditional object write only commits, or finds no bucket")
+        }
+    }
 }
 
 enum ObjectCopy {
@@ -214,11 +302,9 @@ enum ObjectCopy {
 async fn commit_object_copy(
     app: &Arc<App>,
     source: &Source,
-    bucket: &str,
-    key: &str,
+    dest: &Dest<'_>,
     etag: &str,
-    content_type: &str,
-    metadata: &str,
+    sse_c_key: Option<&[u8]>,
 ) -> anyhow::Result<ObjectCopy> {
     let (part_ids, part_sizes) = source.part_keys();
     let client = app.pool.get().await?;
@@ -233,13 +319,13 @@ async fn commit_object_copy(
                         &source.version.id,
                         &part_ids,
                         &part_sizes,
-                        &bucket,
-                        &key,
+                        &dest.bucket,
+                        &dest.key,
                         &source.version.size,
                         &etag,
-                        &content_type,
-                        &metadata,
-                        &None::<Vec<u8>>,
+                        &dest.content_type,
+                        &dest.metadata,
+                        &sse_c_key,
                         &new_version_id(),
                     ],
                 )
@@ -281,6 +367,11 @@ async fn commit_object_copy(
 /// on the source's bytes. Its ETag is their MD5, which, unless the range is a
 /// whole part, takes reading them (but not writing them). A part can't span
 /// blobs, so a range over several parts of the source is copied as data.
+///
+/// So is any range of an SSE-C source (which needs its key, `keys.source`), or
+/// into an SSE-C upload (which needs the upload's key, `keys.dest`, as an
+/// UploadPart does): a range of ciphertext isn't a part of its own.
+#[allow(clippy::too_many_arguments)]
 pub async fn copy_part(
     app: &Arc<App>,
     bucket: &str,
@@ -290,6 +381,7 @@ pub async fn copy_part(
     copy_source: &str,
     copy_source_range: Option<&str>,
     preconditions: &Preconditions,
+    keys: CopyKeys<'_>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -320,27 +412,30 @@ pub async fn copy_part(
     }
 
     // Reject up front if the upload is gone, and require it to belong to the
-    // request's bucket/key — as put_part does.
+    // request's bucket/key, and its key if it's SSE-C — as put_part does.
     let client = app.pool.get().await?;
-    if client
+    let Some(upload) = client
         .query_opt_cached(
-            "SELECT 1 FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
+            "SELECT sse_c_key FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
             &[&upload_id, &bucket, &key],
         )
         .await?
-        .is_none()
-    {
+    else {
         return Ok(no_such_upload());
-    }
+    };
     drop(client);
+    let check: Option<Vec<u8>> = upload.get(0);
+    if let Err(refused) = sse_c::check_read(check.as_deref(), keys.dest) {
+        return Ok(refused);
+    }
 
     for _ in 0..MAX_SOURCE_ATTEMPTS {
         let source = match read_source(app, &src_bucket, &src_key, src_version.as_deref()).await? {
             Ok(source) => source,
             Err(missing) => return Ok(missing),
         };
-        if source.encrypted() {
-            return Ok(encrypted_source());
+        if let Err(refused) = sse_c::check_read(source.version.sse_c_key.as_deref(), keys.source) {
+            return Ok(refused);
         }
         let version = &source.version;
         // Honour x-amz-copy-source-if-* conditions on the source before copying.
@@ -370,13 +465,22 @@ pub async fn copy_part(
                  </CopyPartResult>",
                 version.last_modified_iso
             ));
-            with_copy_source_version_id(resp, version.version_id.as_deref())
+            let resp = with_copy_source_version_id(resp, version.version_id.as_deref());
+            match keys.dest {
+                Some(dest) => dest.echo_onto(resp),
+                None => resp,
+            }
         };
-        let Some((index, within)) = part_holding(&source.parts, start, end) else {
+        let encrypted = keys.source.is_some() || keys.dest.is_some();
+        let holding = part_holding(&source.parts, start, end).filter(|_| !encrypted);
+        let Some((index, within)) = holding else {
             return Ok(
-                match stream_part_copy(app, &source, start, end, upload_id, part_number).await? {
-                    Some(etag) => respond(&etag),
-                    None => no_such_upload(),
+                match stream_part_copy(app, &source, start, end, upload_id, part_number, keys).await {
+                    Ok(Some(etag)) => respond(&etag),
+                    Ok(None) => no_such_upload(),
+                    // Its data went with it: copy what it is now.
+                    Err(_) if source.changed(app).await? => continue,
+                    Err(e) => return Err(e),
                 },
             );
         };
@@ -485,8 +589,10 @@ async fn commit_part_copy(
 
 /// Copies bytes [start, end) of `source` as data into a new part staged
 /// under the upload, through the normal upload path (which works out the
-/// part's ETag as it streams). For a range over several parts of the source.
-/// `None` if the upload was completed or aborted meanwhile.
+/// part's ETag as it streams): decrypted with `keys.source` and encrypted with
+/// `keys.dest`, if they're SSE-C. For a range over several parts of the
+/// source, or of or into an SSE-C one. `None` if the upload was completed or
+/// aborted meanwhile.
 async fn stream_part_copy(
     app: &Arc<App>,
     source: &Source,
@@ -494,14 +600,15 @@ async fn stream_part_copy(
     end: u64,
     upload_id: Uuid,
     part_number: i32,
+    keys: CopyKeys<'_>,
 ) -> anyhow::Result<Option<String>> {
     let (sender, source_body) = channel_body();
-    let slices = select_parts_in_range(source.locations.clone(), start, end, None);
+    let slices = select_parts_in_range(source.locations.clone(), start, end, keys.source.map(|k| k.key()));
     spawn_range_stream(app.clone(), slices, sender);
     let attach = AttachTarget::MultipartPart {
         upload_id,
         part_number,
-        key: None,
+        key: keys.dest.map(|key| zeroize::Zeroizing::new(*key.key())),
     };
     // The source stream is data from within Cairn (verified against its block
     // checksums as it's read), so there's nothing to check it against.

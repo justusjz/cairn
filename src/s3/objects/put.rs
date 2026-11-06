@@ -62,7 +62,7 @@ pub async fn put_object(
         }),
     };
     match crate::upload_part(app, body, &attach, payload).await? {
-        UploadResult::Committed { etag, version_id } => {
+        UploadResult::Committed { etag, version_id, .. } => {
             let mut builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, format!("\"{etag}\""));

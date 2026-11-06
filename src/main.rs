@@ -769,10 +769,12 @@ pub(crate) struct Sealing {
 /// committed.
 enum UploadResult {
     /// Committed, with the new part's ETag and, for an object write, the
-    /// `x-amz-version-id` to report for the version it created.
+    /// `x-amz-version-id` to report for the version it created, and its
+    /// last-modified time (ISO 8601).
     Committed {
         etag: String,
         version_id: Option<String>,
+        last_modified: Option<String>,
     },
     /// The body wasn't what the request claimed it to be (see `Payload`).
     Rejected(Rejection),
@@ -893,10 +895,10 @@ where
         for attempt in 0..db::MAX_TX_ATTEMPTS {
             db::backoff(attempt).await;
             match try_commit_part(&mut client, &written, attach, &etag, encrypted.as_ref()).await {
-                Ok(CommitResult::Committed { reap, version_id }) => {
+                Ok(CommitResult::Committed { reap, version_id, last_modified }) => {
                     // Reap the blobs this overwrite displaced; their rows are gone.
                     reap_blobs(app, reap);
-                    return Ok(UploadResult::Committed { etag, version_id });
+                    return Ok(UploadResult::Committed { etag, version_id, last_modified });
                 }
                 Ok(CommitResult::PreconditionFailed) => return Ok(UploadResult::PreconditionFailed),
                 Ok(CommitResult::NoSuchBucket) => return Ok(UploadResult::NoSuchBucket),
@@ -930,6 +932,7 @@ enum CommitResult {
     Committed {
         reap: Vec<ReapTarget>,
         version_id: Option<String>,
+        last_modified: Option<String>,
     },
     MissingLocations { present: i64, required: usize },
     /// A conditional-write guard didn't hold; nothing was written.
@@ -967,7 +970,7 @@ async fn try_commit_part(
     let data_crc = written.data_crc as i64;
     let plain_size = encrypted.map(|e| e.plain_size as i64);
     let enc_salt = encrypted.map(|e| e.salt.to_vec());
-    let (row, version_column, reap_column) = match attach {
+    let (row, version_column, reap_column, last_modified_column) = match attach {
         AttachTarget::Object {
             bucket,
             key,
@@ -980,7 +983,7 @@ async fn try_commit_part(
             let sse_c_key = sealing.as_ref().map(|sealing| &sealing.check);
             let row = client
                 .query_one_cached(
-                    "SELECT status, present, version_id, reap_blob, reap_node, reap_peer
+                    "SELECT status, present, version_id, reap_blob, reap_node, reap_peer, last_modified
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                                                       $11, $12, $13, $14, $15, $16, $17)",
                     &[
@@ -1004,7 +1007,7 @@ async fn try_commit_part(
                     ],
                 )
                 .await?;
-            (row, Some(2), 3)
+            (row, Some(2), 3, Some(6))
         }
         AttachTarget::MultipartPart {
             upload_id,
@@ -1031,7 +1034,7 @@ async fn try_commit_part(
                     ],
                 )
                 .await?;
-            (row, None, 2)
+            (row, None, 2, None)
         }
     };
     // On anything but a commit, the function changed nothing.
@@ -1049,6 +1052,7 @@ async fn try_commit_part(
         status => unreachable!("cairn_commit_*: unknown status {status}"),
     }
     let version_id = version_column.and_then(|c| row.get(c));
+    let last_modified = last_modified_column.map(|c| row.get(c));
     let reap = blobs::reap_columns(&row, reap_column);
-    Ok(CommitResult::Committed { reap, version_id })
+    Ok(CommitResult::Committed { reap, version_id, last_modified })
 }

@@ -334,7 +334,10 @@ Without the key, the data can't be read, by anyone.
   `--allow-sse-c-over-http`. Lose the key and the object is lost.
 - Multipart uploads: send the key with CreateMultipartUpload and every
   UploadPart (CompleteMultipartUpload doesn't need it).
-- Not yet: copies of SSE-C objects, or into them (`501 NotImplemented`).
+- Copies: send the source's key in the `x-amz-copy-source-server-side-encryption-customer-*`
+  headers, and the copy's (if any) in the usual ones. A copy with the same key
+  shares the source's data; one with another key, or none, is written anew.
+  Copying an object onto itself with another key changes its key.
 
 Encryption with keys of Cairn's own (**SSE-S3**, **SSE-KMS**) isn't
 implemented: a request asking for it is refused with `501 NotImplemented`,
