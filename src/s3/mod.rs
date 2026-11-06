@@ -3,6 +3,7 @@ use std::sync::Arc;
 use http_body_util::BodyExt;
 use hyper::{Method, Request, Response, StatusCode};
 
+use crate::db::Cached;
 use crate::{
     App,
     auth::Rejection,
@@ -111,6 +112,24 @@ pub async fn handle(
         return Ok(box_response(resp));
     }
     if !authorize(&principal, req.method(), &bucket, &key, query, copy_source_header) {
+        // As in S3, a bucket that doesn't exist is a 404 to anyone: bucket
+        // names aren't secret, only what's in them is. Except to CreateBucket,
+        // which is about a bucket that isn't there yet.
+        let creates_bucket = key.is_empty() && *req.method() == Method::PUT && query.is_empty();
+        let exists = app
+            .pool
+            .get()
+            .await?
+            .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+            .await?
+            .is_some();
+        if !exists && !creates_bucket {
+            return Ok(box_response(format_s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "the specified bucket does not exist",
+            )));
+        }
         return Ok(forbidden("AccessDenied", "Access Denied"));
     }
     if key.is_empty() {

@@ -54,7 +54,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=91
+TOTAL=92
 STEP=0
 PASS=0
 FAIL=0
@@ -930,8 +930,7 @@ delete_nonempty_bucket_rejected() {
 
 # DeleteObjects integrity/existence guards (crafted, signed with scurl): no
 # integrity header → 400, a wrong CRC32 → 400, a valid Content-MD5 (minio-go's
-# path) → 200, and a well-formed request against a missing bucket → 403: no role
-# can hold a grant on a missing bucket, so it can't tell whether it exists.
+# path) → 200, and a well-formed request against a missing bucket → 404, as in S3.
 batch_delete_guards_ok() {
     local body="$WORK_DIR/del.xml" md5
     printf '<Delete><Object><Key>whatever.txt</Key></Object></Delete>' >"$body"
@@ -939,7 +938,7 @@ batch_delete_guards_ok() {
     [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body")" = 400 ] || return 1
     [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "x-amz-checksum-crc32: AAAAAA==")" = 400 ] || return 1
     [ "$(scurl POST "/${BUCKET}?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 200 ] || return 1
-    [ "$(scurl POST "/no-such-bucket-xyz?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 403 ] || return 1
+    [ "$(scurl POST "/no-such-bucket-xyz?delete" UNSIGNED-PAYLOAD "$body" "Content-MD5: ${md5}")" = 404 ] || return 1
 }
 
 # Immediate part reaping: after deleting objects, their on-disk part files should
@@ -1552,6 +1551,17 @@ grants_follow_bucket_ok() {
     "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
+# As in S3, a missing bucket is a 404 to any role, and one without a grant on
+# an existing bucket gets a 403; CreateBucket without admin is a 403 too.
+missing_bucket_404_ok() {
+    local r=(as_role reader readersecret)
+    "${r[@]}" s3api list-objects-v2 --bucket "$OBUCKET" 2>&1 | grep -q AccessDenied || return 1
+    "${r[@]}" s3api list-objects-v2 --bucket "no-such-bucket-$(date +%s)" 2>&1 | grep -q NoSuchBucket || return 1
+    "${r[@]}" s3api get-object --bucket "no-such-bucket-$(date +%s)" --key k "$WORK_DIR/x404" 2>&1 \
+        | grep -q NoSuchBucket || return 1
+    "${r[@]}" s3api create-bucket --bucket "no-such-bucket-$(date +%s)" 2>&1 | grep -q AccessDenied
+}
+
 # A revoked grant takes effect on the very next request (no caching).
 revoke_takes_effect_ok() {
     cairn_role revoke reader "$BUCKET" >/dev/null 2>&1 || return 1
@@ -1644,6 +1654,7 @@ run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
 run_test    "Admin manages buckets, not objects"    admin_scope_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok
+run_test    "Missing bucket 404, no grant 403"      missing_bucket_404_ok
 run_test    "Revoked grant takes effect"            revoke_takes_effect_ok
 run_test    "Overwrite object, new content wins"    bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
