@@ -34,6 +34,9 @@ mod dashboard;
 mod db;
 #[cfg(test)]
 mod e2e;
+// The format of encrypted parts; SSE-C uses it from the next phase on.
+#[allow(dead_code)]
+mod encryption;
 mod gc;
 mod metrics;
 mod packer;

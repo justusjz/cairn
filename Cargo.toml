@@ -33,6 +33,8 @@ serde = { version = "1", features = ["derive"] }
 utoipa = "6"
 utoipa-axum = "0.3"
 sha1 = "0.11"
+chacha20poly1305 = { version = "0.11.0", features = ["zeroize"] }
+bytes = "1.11"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
