@@ -56,6 +56,22 @@ struct Source {
     locations: Vec<PartLocation>,
 }
 
+impl Source {
+    /// Whether it's encrypted (SSE-C), which copies don't handle yet.
+    fn encrypted(&self) -> bool {
+        self.version.sse_c_key.is_some() || self.locations.iter().any(|part| part.salt.is_some())
+    }
+}
+
+/// The 501 for a copy of an encrypted source: not implemented yet.
+fn encrypted_source() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        "copying an object encrypted with SSE-C is not implemented yet",
+    )
+}
+
 /// CopyObject: `PUT /{dest_bucket}/{dest_key}` with an `x-amz-copy-source`
 /// header. Copies only metadata: the new version gets parts of its own on the
 /// source's bytes, which the two then share. Deleting either leaves the other
@@ -121,6 +137,9 @@ pub async fn copy_object(
             Ok(source) => source,
             Err(missing) => return Ok(missing),
         };
+        if source.encrypted() {
+            return Ok(encrypted_source());
+        }
         // Honour x-amz-copy-source-if-* conditions on the source; any failure (a
         // 304 for a read maps to 412 here) aborts the copy.
         let version = &source.version;
@@ -320,6 +339,9 @@ pub async fn copy_part(
             Ok(source) => source,
             Err(missing) => return Ok(missing),
         };
+        if source.encrypted() {
+            return Ok(encrypted_source());
+        }
         let version = &source.version;
         // Honour x-amz-copy-source-if-* conditions on the source before copying.
         if preconditions.evaluate(&version.etag, version.lm_epoch, true) != Precondition::Proceed {
@@ -474,7 +496,7 @@ async fn stream_part_copy(
     part_number: i32,
 ) -> anyhow::Result<Option<String>> {
     let (sender, source_body) = channel_body();
-    let slices = select_parts_in_range(source.locations.clone(), start, end);
+    let slices = select_parts_in_range(source.locations.clone(), start, end, None);
     spawn_range_stream(app.clone(), slices, sender);
     let attach = AttachTarget::MultipartPart {
         upload_id,
@@ -588,7 +610,7 @@ async fn hash_range(
     end: u64,
 ) -> anyhow::Result<(String, u64)> {
     let (sender, mut body) = channel_body();
-    spawn_range_stream(app.clone(), select_parts_in_range(parts, start, end), sender);
+    spawn_range_stream(app.clone(), select_parts_in_range(parts, start, end, None), sender);
     let mut md5 = Md5::new();
     let mut crc = crc64fast_nvme::Digest::new();
     let mut read = 0;

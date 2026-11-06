@@ -453,6 +453,7 @@ async fn a_put_into_a_missing_bucket_writes_nothing() {
         content_type: "text/plain".to_owned(),
         metadata: String::new(),
         conditions: crate::s3::conditional::Preconditions::default(),
+        sealing: None,
     };
     let body = http_body_util::Full::new(hyper::body::Bytes::from_static(b"data"));
     let result = crate::upload_part(&app, body, &attach, Payload::unchecked())

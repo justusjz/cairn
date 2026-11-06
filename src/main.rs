@@ -34,8 +34,6 @@ mod dashboard;
 mod db;
 #[cfg(test)]
 mod e2e;
-// The format of encrypted parts; SSE-C uses it from the next phase on.
-#[allow(dead_code)]
 mod encryption;
 mod gc;
 mod metrics;
@@ -58,6 +56,8 @@ pub struct App {
     dashboard: dashboard::Dashboard,
     /// Every request to another node goes through this.
     peers: peer::PeerClient,
+    /// Whether SSE-C keys are accepted over plain HTTP (see `s3::sse_c`).
+    allow_sse_c_over_http: bool,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -105,6 +105,11 @@ struct ServeArgs {
     /// Local directory for blobs.
     #[arg(long, env = "CAIRN_DATA_DIR")]
     data_dir: String,
+    /// Accept SSE-C keys in requests that didn't come over HTTPS (that no
+    /// proxy marked `X-Forwarded-Proto: https`). Only for a network that's
+    /// encrypted itself: the key travels in a header.
+    #[arg(long, env = "CAIRN_ALLOW_SSE_C_OVER_HTTP")]
+    allow_sse_c_over_http: bool,
 }
 
 /// How often a node refreshes its `nodes` row (last_seen / free_space).
@@ -142,6 +147,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         metrics: Arc::default(),
         dashboard: dashboard::Dashboard::new(&peer_url),
         peers: peer::PeerClient::new(),
+        allow_sse_c_over_http: args.allow_sse_c_over_http,
         #[cfg(test)]
         pack_hook: None,
     });
@@ -740,9 +746,18 @@ enum AttachTarget {
         /// What `s3::metadata` stores with it.
         metadata: String,
         conditions: Preconditions,
+        /// If it's SSE-C: what to encrypt it with.
+        sealing: Option<Sealing>,
     },
     /// A part staged under an in-progress multipart upload.
     MultipartPart { upload_id: Uuid, part_number: i32 },
+}
+
+/// What an SSE-C object is encrypted with: the client's key, and the check of
+/// it to store with the object (see `s3::sse_c`).
+pub(crate) struct Sealing {
+    pub key: zeroize::Zeroizing<encryption::Key>,
+    pub check: Vec<u8>,
 }
 
 /// The outcome of an upload: the committed part's ETag, or why it wasn't
@@ -789,9 +804,17 @@ where
         AttachTarget::MultipartPart { .. } => BlobWriter::begin(app).await?,
     };
     let blob_id = writer.blob_id;
+    // An encrypted part is stored as its ciphertext; its ETag is its salt.
+    let mut sealer = match attach {
+        AttachTarget::Object { sealing: Some(sealing), .. } => {
+            Some(encryption::Sealer::new(&sealing.key, encryption::new_salt()))
+        }
+        _ => None,
+    };
     // 3. tee: read the client body once, decoding it (an `aws-chunked` body's
     // framing isn't the object) and checking it as it goes, hashing the data
-    // for the ETag, and fanning each chunk out to every replica.
+    // for the ETag (or encrypting it), and fanning each chunk out to every
+    // replica.
     let mut hasher = Md5::new();
     let failure = loop {
         match body.frame().await {
@@ -800,8 +823,17 @@ where
                 match payload.decode(chunk) {
                     Ok(data) => {
                         for piece in data {
-                            hasher.update(&piece);
-                            writer.write(piece).await;
+                            match &mut sealer {
+                                Some(sealer) => {
+                                    if let Some(sealed) = sealer.update(&piece) {
+                                        writer.write(sealed).await;
+                                    }
+                                }
+                                None => {
+                                    hasher.update(&piece);
+                                    writer.write(piece).await;
+                                }
+                            }
                         }
                     }
                     Err(rejection) => break Some(Ok(rejection)),
@@ -810,6 +842,16 @@ where
             Some(Err(e)) => break Some(Err(anyhow::Error::from(e))),
             None => break payload.finish().err().map(Ok),
         }
+    };
+    // The last segment, once the whole body is in and what it claimed to be.
+    let encrypted = match sealer {
+        Some(sealer) if failure.is_none() => {
+            let salt = sealer.salt();
+            let (sealed, plain) = sealer.finish();
+            writer.write(sealed).await;
+            Some(Encrypted { plain_size: plain, salt })
+        }
+        _ => None,
     };
     // 4. wait for every replica to finish. If the body failed to read, or
     // wasn't what it claimed to be, fault the sinks instead, so they don't
@@ -833,13 +875,16 @@ where
     // Whatever keeps the upload from committing from here on, the blob is
     // deleted with its files right away; only a crash leaves it to the GC.
     let result = async {
-        let etag: String = hasher.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        let etag: String = match &encrypted {
+            Some(encrypted) => encrypted.salt.iter().map(|b| format!("{b:02x}")).collect(),
+            None => hasher.finalize().iter().map(|b| format!("{b:02x}")).collect(),
+        };
         // 5. commit + attach with the now-known size and ETag, in one transaction;
         // retry on a conflict.
         let mut client = app.pool.get().await?;
         for attempt in 0..db::MAX_TX_ATTEMPTS {
             db::backoff(attempt).await;
-            match try_commit_part(&mut client, &written, attach, &etag).await {
+            match try_commit_part(&mut client, &written, attach, &etag, encrypted.as_ref()).await {
                 Ok(CommitResult::Committed { reap, version_id }) => {
                     // Reap the blobs this overwrite displaced; their rows are gone.
                     reap_blobs(app, reap);
@@ -892,11 +937,18 @@ enum CommitResult {
 /// `attach` (with the CRC64/NVME of its data), all in one statement, and so
 /// one transaction. The raw postgres error is returned unwrapped so the caller can distinguish a
 /// conflict (retry) from a real error (give up).
+/// An encrypted part's plaintext size and salt.
+struct Encrypted {
+    plain_size: u64,
+    salt: encryption::Salt,
+}
+
 async fn try_commit_part(
     client: &mut Object,
     written: &Written,
     attach: &AttachTarget,
     etag: &str,
+    encrypted: Option<&Encrypted>,
 ) -> Result<CommitResult, tokio_postgres::Error> {
     // CRCs are stored as their 64 bits, read as a signed BIGINT. The part's
     // covers just its data, and stays valid wherever it's moved later; the
@@ -905,8 +957,8 @@ async fn try_commit_part(
     let file_crc = written.file_crc as i64;
     let block_size = checksum::BLOCK_SIZE as i32;
     let data_crc = written.data_crc as i64;
-    // Not encrypted (yet): no plaintext size or salt apart from the stored ones.
-    let (plain_size, enc_salt, sse_c_key) = (None::<i64>, None::<Vec<u8>>, None::<Vec<u8>>);
+    let plain_size = encrypted.map(|e| e.plain_size as i64);
+    let enc_salt = encrypted.map(|e| e.salt.to_vec());
     let (row, version_column, reap_column) = match attach {
         AttachTarget::Object {
             bucket,
@@ -914,8 +966,10 @@ async fn try_commit_part(
             content_type,
             metadata,
             conditions,
+            sealing,
         } => {
             let (if_match, if_none_match) = conditions.write_conditions();
+            let sse_c_key = sealing.as_ref().map(|sealing| &sealing.check);
             let row = client
                 .query_one_cached(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer

@@ -4,10 +4,16 @@
 
 use std::sync::Arc;
 
+use hyper::StatusCode;
 use uuid::Uuid;
 
-use super::{BUCKET, locking::pending_blob, node_with};
-use crate::{App, packer};
+use super::{BUCKET, customer_key, get_sealed, locking::pending_blob, node_with, put, put_sealed};
+use crate::{
+    App,
+    encryption::stored_len,
+    packer,
+    s3::{conditional::Preconditions, objects::get::head_object},
+};
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
@@ -237,4 +243,197 @@ async fn sizes_salts_and_key_checks_carry_through() {
             .await;
         assert!(refused.is_err(), "{plain:?} {salt:?}");
     }
+}
+
+fn data(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i * 7 % 253) as u8).collect()
+}
+
+/// An SSE-C object reads back whole, and in any range, with its key; it's
+/// stored as ciphertext, and its ETag isn't its MD5.
+#[tokio::test]
+async fn an_sse_c_object_reads_back_with_its_key() {
+    let Some(app) = node().await else { return };
+    let key = customer_key(&[5; 32]);
+    for len in [0, 1, 65535, 65536, 65537, 200_000] {
+        let name = format!("o{len}");
+        let plain = data(len);
+        let etag = put_sealed(&app, &name, plain.clone(), &key).await;
+        assert_eq!(etag.len(), 32);
+        let md5: String = {
+            use md5::Digest;
+            md5::Md5::digest(&plain)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        };
+        assert_ne!(etag, md5, "the ETag of {name} gives its content away");
+        assert_eq!(
+            get_sealed(&app, &name, None, Some(&key)).await,
+            (StatusCode::OK, plain.clone()),
+            "{name}"
+        );
+
+        // What's stored: the ciphertext, which doesn't hold the plaintext.
+        let client = app.pool.get().await.unwrap();
+        let row = client
+            .query_one(
+                "SELECT p.size, p.blob_id FROM parts p JOIN objects o ON o.id = p.object_id
+                 WHERE o.key = $1",
+                &[&name],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            row.get::<_, i64>(0) as u64,
+            stored_len(len as u64),
+            "{name}"
+        );
+        let file = std::fs::read(app.store.blob_path(row.get(1))).unwrap();
+        if len >= 64 {
+            assert!(
+                !file.windows(64).any(|w| w == &plain[..64]),
+                "{name} is stored in the clear"
+            );
+        }
+
+        // HEAD: the plaintext's size.
+        let head = head_object(
+            &app,
+            BUCKET,
+            &name,
+            None,
+            None,
+            &Preconditions::default(),
+            Some(&key),
+        )
+        .await
+        .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        assert_eq!(head.headers()["content-length"], len.to_string().as_str());
+        assert_eq!(
+            head.headers()["x-amz-server-side-encryption-customer-algorithm"],
+            "AES256"
+        );
+    }
+    // Ranges: within a segment, across segments, the last bytes, open-ended.
+    let plain = data(200_000);
+    for (range, start, end) in [
+        ("bytes=0-0", 0, 1),
+        ("bytes=10-99", 10, 100),
+        ("bytes=65530-65545", 65530, 65546),
+        ("bytes=65536-131071", 65536, 131072),
+        ("bytes=1000-199999", 1000, 200_000),
+        ("bytes=-5", 199_995, 200_000),
+        ("bytes=131072-", 131072, 200_000),
+    ] {
+        let (status, body) = get_sealed(&app, "o200000", Some(range), Some(&key)).await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{range}");
+        assert_eq!(body, &plain[start..end], "{range}");
+    }
+}
+
+/// Without its key, or with another, an SSE-C object isn't read, and a key
+/// for a plain object is refused too. Conditions tell nothing without the key.
+#[tokio::test]
+async fn an_sse_c_object_needs_its_key() {
+    let Some(app) = node().await else { return };
+    let key = customer_key(&[5; 32]);
+    let other = customer_key(&[6; 32]);
+    let etag = put_sealed(&app, "sealed", data(100), &key).await;
+    put(&app, "plain", data(100)).await;
+    assert_eq!(
+        get_sealed(&app, "sealed", None, None).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        get_sealed(&app, "sealed", None, Some(&other)).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        get_sealed(&app, "plain", None, Some(&key)).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    for customer in [None, Some(&other)] {
+        let head = head_object(
+            &app,
+            BUCKET,
+            "sealed",
+            None,
+            None,
+            &Preconditions::default(),
+            customer,
+        )
+        .await
+        .unwrap();
+        assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+    }
+    // If-None-Match with the right ETag: without the key, still a 400, not a 304.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("if-none-match", format!("\"{etag}\"").parse().unwrap());
+    let conditions = Preconditions::from_headers(&headers);
+    let head = head_object(&app, BUCKET, "sealed", None, None, &conditions, None)
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+    let head = head_object(&app, BUCKET, "sealed", None, None, &conditions, Some(&key))
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::NOT_MODIFIED);
+}
+
+/// Ciphertext altered past the block CRCs (rewritten to match, as only someone
+/// tampering would) is caught by the segment's tag: the read fails instead of
+/// serving what it decrypts to.
+#[tokio::test]
+async fn tampering_past_the_crcs_is_caught() {
+    let Some(app) = node().await else { return };
+    let key = customer_key(&[5; 32]);
+    put_sealed(&app, "k", data(200_000), &key).await;
+    let client = app.pool.get().await.unwrap();
+    let row = client
+        .query_one("SELECT b.blob_id, b.size, b.block_size FROM blobs b JOIN parts p ON p.blob_id = b.blob_id", &[])
+        .await
+        .unwrap();
+    let (blob_id, size, block_size): (Uuid, i64, i32) = (row.get(0), row.get(1), row.get(2));
+    let path = app.store.blob_path(blob_id);
+    let mut file = std::fs::read(&path).unwrap();
+    // A byte in the second segment, and its block's checksum to match.
+    let at = 70_000;
+    file[at] ^= 1;
+    let block = at / block_size as usize;
+    let start = block * block_size as usize;
+    let end = (start + block_size as usize).min(size as usize);
+    let crc = crc32c::crc32c(&file[start..end]).to_be_bytes();
+    let entry = size as usize + 4 * block;
+    file[entry..entry + 4].copy_from_slice(&crc);
+    std::fs::write(&path, &file).unwrap();
+
+    let response = crate::s3::objects::get::get_object(
+        &app,
+        BUCKET,
+        "k",
+        None,
+        None,
+        &Preconditions::default(),
+        Some(&key),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the headers go out before the damage is reached"
+    );
+    use http_body_util::BodyExt;
+    assert!(
+        response.into_body().collect().await.is_err(),
+        "a tampered segment must fail the read"
+    );
+    // The first segment is still intact.
+    let (status, body) = get_sealed(&app, "k", Some("bytes=0-65535"), Some(&key)).await;
+    assert_eq!(
+        (status, body),
+        (StatusCode::PARTIAL_CONTENT, data(200_000)[..65536].to_vec())
+    );
 }

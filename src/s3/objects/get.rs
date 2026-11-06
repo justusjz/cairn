@@ -1,7 +1,11 @@
-use std::sync::Arc;
+use std::{io, sync::Arc};
 
 use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes, header};
+use hyper::{
+    Response, StatusCode,
+    body::{Bytes, Frame},
+    header,
+};
 use deadpool_postgres::GenericClient;
 use uuid::Uuid;
 
@@ -11,8 +15,10 @@ use crate::{
     blobs::{BlobSlice, Location, stream_blob_range},
     checksum::BlockLayout,
     body::{FrameSender, ResBody, box_response, channel_body},
+    encryption::{Key, Opener, Salt, segment_range},
     s3::conditional::{Precondition, Preconditions, not_modified},
     s3::metadata,
+    s3::sse_c::{self, CustomerKey},
     s3::util::{format_s3_error, with_delete_marker, with_version_id},
     s3::versions::Versioning,
 };
@@ -25,6 +31,8 @@ pub(crate) struct ObjectVersion {
     pub content_type: String,
     /// The headers stored with it (see `s3::metadata`).
     pub metadata: String,
+    /// If it's SSE-C, the check of its key (see `s3::sse_c`).
+    pub sse_c_key: Option<Vec<u8>>,
     pub size: i64,
     /// Last-Modified as an HTTP date (for headers) and in ISO 8601 (for XML
     /// bodies), and as a Unix timestamp for conditionals.
@@ -100,7 +108,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
                     floor(extract(epoch FROM o.last_modified))::bigint,
-                    o.version_id, o.is_delete_marker, b.versioning, o.metadata
+                    o.version_id, o.is_delete_marker, b.versioning, o.metadata, o.sse_c_key
              FROM objects o JOIN buckets b ON b.name = o.bucket
              WHERE o.bucket = $1 AND o.key = $2
                AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",
@@ -127,6 +135,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
         etag: row.get(1),
         content_type: row.get(2),
         metadata: row.get(10),
+        sse_c_key: row.get(11),
         size: row.get(3),
         last_modified: row.get(4),
         last_modified_iso: row.get(5),
@@ -160,6 +169,7 @@ pub async fn get_object(
     version_id: Option<&str>,
     range_header: Option<&str>,
     preconditions: &Preconditions,
+    customer_key: Option<&CustomerKey>,
 ) -> anyhow::Result<Response<ResBody>> {
     let mut client = app.pool.get().await?;
     // Read the metadata, the ordered parts, and each part's locations in one
@@ -178,12 +188,18 @@ pub async fn get_object(
         etag,
         content_type,
         metadata,
+        sse_c_key,
         size,
         last_modified,
         lm_epoch,
         version_id,
         ..
     } = version;
+    // An SSE-C object only with its key; before the conditions, which would
+    // tell about it otherwise.
+    if let Err(refused) = sse_c::check_read(sse_c_key.as_deref(), customer_key) {
+        return Ok(box_response(refused));
+    }
     // Honour conditional-request headers before doing any streaming work.
     match preconditions.evaluate(&etag, lm_epoch, true) {
         Precondition::Proceed => {}
@@ -221,7 +237,7 @@ pub async fn get_object(
     // pulls each from a replica (locally if that's us), verifies it, and forwards
     // it. We set Content-Length, so a truncated stream (a part we can't serve) is
     // detected by the client rather than read as a short-but-complete object.
-    let slices = select_parts_in_range(parts, range_start, range_end);
+    let slices = select_parts_in_range(parts, range_start, range_end, customer_key.map(|k| k.key()));
     let (sender, body) = channel_body();
     spawn_range_stream(app.clone(), slices, sender);
 
@@ -231,7 +247,10 @@ pub async fn get_object(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, range_end - range_start)
         .header(header::LAST_MODIFIED, last_modified);
-    let builder = metadata::apply(builder, &metadata);
+    let mut builder = metadata::apply(builder, &metadata);
+    if let Some(key) = customer_key {
+        builder = key.echo(builder);
+    }
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,
@@ -252,8 +271,19 @@ pub(crate) struct PartLocation {
     pub blob_id: Uuid,
     pub layout: Option<BlockLayout>,
     pub blob_offset: u64,
+    /// What it takes in its blob.
     pub size: u64,
+    /// If it's encrypted: its plaintext's size, and its salt.
+    pub plain_size: Option<u64>,
+    pub salt: Option<Salt>,
     pub locations: Vec<Location>,
+}
+
+impl PartLocation {
+    /// What it contributes to its object.
+    pub fn object_size(&self) -> u64 {
+        self.plain_size.unwrap_or(self.size)
+    }
 }
 
 /// Resolves an object version's parts in order, each with its blob and the
@@ -268,7 +298,7 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
     let rows = client
         .query_cached(
             "SELECT p.part_number, p.blob_id, p.blob_offset, p.size, b.size, b.block_size,
-                    bl.node, n.peer_url, p.id
+                    bl.node, n.peer_url, p.id, p.plain_size, p.enc_salt
              FROM parts p
              JOIN blobs b ON b.blob_id = p.blob_id
              JOIN blob_locations bl ON bl.blob_id = p.blob_id
@@ -296,6 +326,10 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
                 layout,
                 blob_offset: row.get::<_, i64>(2) as u64,
                 size: row.get::<_, i64>(3) as u64,
+                plain_size: row.get::<_, Option<i64>>(9).map(|size| size as u64),
+                salt: row
+                    .get::<_, Option<Vec<u8>>>(10)
+                    .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)")),
                 locations: Vec::new(),
             });
             current = Some(part_number);
@@ -305,35 +339,74 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
     Ok(parts)
 }
 
+/// A slice of a blob to read for an object's range, and, if its part is
+/// encrypted, how to decrypt it.
+pub(crate) struct ReadSlice {
+    pub blob: BlobSlice,
+    pub decrypt: Option<Decrypt>,
+}
+
+/// How to decrypt a slice of an encrypted part: whole segments of it, from
+/// `first` on, of which the range is `len` bytes from `skip` on.
+pub(crate) struct Decrypt {
+    /// `None` if the read has no key; then it fails.
+    key: Option<zeroize::Zeroizing<Key>>,
+    salt: Salt,
+    plain: u64,
+    first: u64,
+    skip: u64,
+    len: u64,
+}
+
 /// Selects the parts overlapping the half-open byte range [range_start, range_end)
 /// of the assembled object, each as the slice of its blob to read. Parts entirely
-/// outside the range are dropped; `parts` must be in object order. Shared by
-/// GetObject (ranged reads) and the copy paths.
+/// outside the range are dropped; `parts` must be in object order. An encrypted
+/// part's slice is its whole segments that the range overlaps, decrypted with
+/// `key`. Shared by GetObject (ranged reads) and the copy paths.
 pub(crate) fn select_parts_in_range(
     parts: Vec<PartLocation>,
     range_start: u64,
     range_end: u64,
-) -> Vec<BlobSlice> {
+    key: Option<&Key>,
+) -> Vec<ReadSlice> {
     // Track the object offset where each part begins, and intersect its span with
     // the requested range.
-    let mut slices: Vec<BlobSlice> = Vec::new();
+    let mut slices = Vec::new();
     let mut cursor: u64 = 0;
     for part in parts {
         let part_start = cursor;
-        let part_end = cursor + part.size;
+        let part_end = cursor + part.object_size();
         cursor = part_end;
         let overlap_start = range_start.max(part_start);
         let overlap_end = range_end.min(part_end);
         if overlap_start >= overlap_end {
             continue; // part lies entirely outside the requested range
         }
-        slices.push(BlobSlice {
-            blob_id: part.blob_id,
-            layout: part.layout,
-            locations: part.locations,
-            offset: part.blob_offset + (overlap_start - part_start),
-            length: overlap_end - overlap_start,
-            part: Some((part.id, part.blob_offset)),
+        let (within, length, decrypt) = match (part.salt, part.plain_size) {
+            (Some(salt), Some(plain)) => {
+                let range = segment_range(plain, overlap_start - part_start, overlap_end - part_start);
+                let decrypt = Decrypt {
+                    key: key.map(|key| zeroize::Zeroizing::new(*key)),
+                    salt,
+                    plain,
+                    first: range.first,
+                    skip: range.skip,
+                    len: range.len,
+                };
+                (range.stored_start, range.stored_end - range.stored_start, Some(decrypt))
+            }
+            _ => (overlap_start - part_start, overlap_end - overlap_start, None),
+        };
+        slices.push(ReadSlice {
+            blob: BlobSlice {
+                blob_id: part.blob_id,
+                layout: part.layout,
+                locations: part.locations,
+                offset: part.blob_offset + within,
+                length,
+                part: Some((part.id, part.blob_offset)),
+            },
+            decrypt,
         });
     }
     slices
@@ -347,29 +420,84 @@ pub(crate) fn select_parts_in_range(
 /// The packer may move a part to another blob after it was resolved, and reap
 /// the old one mid-read. So when a slice can't be served, its part is looked up
 /// again, and the rest is read from wherever it lives now.
-pub(crate) fn spawn_range_stream(app: Arc<App>, slices: Vec<BlobSlice>, sender: FrameSender) {
+pub(crate) fn spawn_range_stream(app: Arc<App>, slices: Vec<ReadSlice>, sender: FrameSender) {
     tokio::spawn(async move {
-        for mut slice in slices {
-            let mut moves = 0;
-            while let Err(e) = stream_blob_range(&app, &mut slice, &sender).await {
-                match relocate(&app, &slice).await {
-                    Ok(Some(moved)) if moves < MAX_RELOCATIONS => {
-                        slice = moved;
-                        moves += 1;
-                    }
-                    Ok(_) => {
-                        let _ = sender.send(Err(e)).await;
-                        return;
-                    }
-                    Err(lookup) => {
-                        eprintln!("looking up part of blob {} failed: {lookup:#}", slice.blob_id);
-                        let _ = sender.send(Err(e)).await;
-                        return;
-                    }
-                }
+        for slice in slices {
+            let read = match slice.decrypt {
+                None => read_slice(&app, slice.blob, &sender).await,
+                Some(decrypt) => read_decrypted(&app, slice.blob, decrypt, &sender).await,
+            };
+            if let Err(e) = read {
+                let _ = sender.send(Err(e)).await;
+                return;
             }
         }
     });
+}
+
+/// Streams `slice` to `tx`, following its part if the packer moves it.
+async fn read_slice(app: &App, mut slice: BlobSlice, tx: &FrameSender) -> io::Result<()> {
+    let mut moves = 0;
+    while let Err(e) = stream_blob_range(app, &mut slice, tx).await {
+        match relocate(app, &slice).await {
+            Ok(Some(moved)) if moves < MAX_RELOCATIONS => {
+                slice = moved;
+                moves += 1;
+            }
+            Ok(_) => return Err(e),
+            Err(lookup) => {
+                eprintln!("looking up part of blob {} failed: {lookup:#}", slice.blob_id);
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Streams the plaintext of an encrypted part's `slice` to `tx`. The slice is
+/// read as any other, and decrypted after: its bytes come verified and in
+/// order, whichever replica or blob they're read from (`read_slice` resumes
+/// where a failed read stopped, maybe mid-segment), so the decryption only
+/// ever sees one stream.
+async fn read_decrypted(
+    app: &App,
+    slice: BlobSlice,
+    decrypt: Decrypt,
+    tx: &FrameSender,
+) -> io::Result<()> {
+    let Some(key) = &decrypt.key else {
+        return Err(io::Error::other("an encrypted part, and no key to read it with"));
+    };
+    let (stored_tx, mut stored) = tokio::sync::mpsc::channel(4);
+    let read = async move { read_slice(app, slice, &stored_tx).await };
+    let open = async {
+        let mut opener = Opener::new(key, decrypt.salt, decrypt.plain, decrypt.first);
+        let (mut skip, mut left) = (decrypt.skip as usize, decrypt.len as usize);
+        while let Some(frame) = stored.recv().await {
+            let Ok(data) = frame?.into_data() else { continue };
+            let opened = opener.update(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let Some(mut plain) = opened else { continue };
+            let skipped = skip.min(plain.len());
+            plain = plain.slice(skipped..);
+            skip -= skipped;
+            let take = left.min(plain.len());
+            if take > 0 {
+                left -= take;
+                tx.send(Ok(Frame::data(plain.slice(..take))))
+                    .await
+                    .map_err(|_| io::Error::other("the reader went away"))?;
+            }
+        }
+        opener.finish().map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok::<_, io::Error>(left)
+    };
+    let (read, open) = tokio::join!(read, open);
+    read?;
+    let left = open?;
+    if left > 0 {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "an encrypted part ended early"));
+    }
+    Ok(())
 }
 
 /// How often a single read follows its part to a new blob before giving up.
@@ -473,12 +601,14 @@ pub async fn head_object(
     version_id: Option<&str>,
     range_header: Option<&str>,
     preconditions: &Preconditions,
+    customer_key: Option<&CustomerKey>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     let ObjectVersion {
         etag,
         content_type,
         metadata,
+        sse_c_key,
         size,
         last_modified,
         lm_epoch,
@@ -488,6 +618,9 @@ pub async fn head_object(
         Ok(version) => version,
         Err(missing) => return Ok(missing.read_response()),
     };
+    if let Err(refused) = sse_c::check_read(sse_c_key.as_deref(), customer_key) {
+        return Ok(refused);
+    }
     // Honour conditional-request headers, exactly as GET does.
     match preconditions.evaluate(&etag, lm_epoch, true) {
         Precondition::Proceed => {}
@@ -520,7 +653,10 @@ pub async fn head_object(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, range_end - range_start)
         .header(header::LAST_MODIFIED, last_modified);
-    let builder = metadata::apply(builder, &metadata);
+    let mut builder = metadata::apply(builder, &metadata);
+    if let Some(key) = customer_key {
+        builder = key.echo(builder);
+    }
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,

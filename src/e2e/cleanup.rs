@@ -34,6 +34,7 @@ fn object(key: &str, conditions: Preconditions) -> AttachTarget {
         content_type: "text/plain".to_owned(),
         metadata: String::new(),
         conditions,
+        sealing: None,
     }
 }
 

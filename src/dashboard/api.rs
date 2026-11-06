@@ -786,6 +786,7 @@ async fn download(
         params.version.as_deref(),
         None,
         &Preconditions::default(),
+        None,
     )
     .await?;
     if resp.status() != StatusCode::OK {

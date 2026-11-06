@@ -23,6 +23,7 @@ async fn try_put(app: &Arc<App>, key: &str, data: Vec<u8>) -> anyhow::Result<()>
         content_type: "application/octet-stream".to_owned(),
         metadata: String::new(),
         conditions: Preconditions::default(),
+        sealing: None,
     };
     let body = Full::new(Bytes::from(data));
     let result = crate::upload_part(app, body, &attach, Payload::unchecked()).await?;

@@ -19,7 +19,10 @@ use super::{Config, Hook, Kind, Stage, pass};
 use crate::{
     App,
     body::channel_body,
-    e2e::{BUCKET, assert_files, assert_reaped, delete, get, node_with, put, query_i64},
+    e2e::{
+        BUCKET, assert_files, assert_reaped, customer_key, delete, get, get_sealed, node_with, put,
+        put_sealed, query_i64,
+    },
     gc,
     s3::objects,
 };
@@ -510,9 +513,46 @@ async fn read_follows_moved_part() {
 
     // A range from the middle of the part, as a ranged GET would read it.
     let len = data(9).len() as u64;
-    let slices = objects::get::select_parts_in_range(parts, 10, len - 10);
+    let slices = objects::get::select_parts_in_range(parts, 10, len - 10, None);
     let (sender, body) = channel_body();
     objects::get::spawn_range_stream(app.clone(), slices, sender);
     let read = body.collect().await.unwrap().to_bytes();
     assert_eq!(read.as_ref(), &data(9)[10..len as usize - 10]);
+}
+
+/// Encrypted parts are just bytes to the packer: it moves them, verified by
+/// their CRCs (which cover their ciphertext), and they read back after; also
+/// by a read that resolved them before the move, from the middle of one
+/// segment to the middle of another.
+#[tokio::test]
+async fn moves_encrypted_parts() {
+    let config = Config { target_size: 250_000, small_size: 250_000, ..Config::default() };
+    let Some(app) = node_with(config, None).await else { return };
+    let customer = customer_key(&[9; 32]);
+    let sizes = [1000, 65536, 150_000, 200_000, 5];
+    for (i, len) in sizes.iter().enumerate() {
+        put_sealed(&app, &key(i), content(i, *len), &customer).await;
+    }
+    let mut client = app.pool.get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    let Ok(version) = objects::get::lookup_version(&tx, BUCKET, &key(3), None).await.unwrap() else {
+        panic!("object 3 exists");
+    };
+    let parts = objects::get::resolve_object_parts(&tx, version.id).await.unwrap();
+    tx.commit().await.unwrap();
+    drop(client);
+    let old = parts[0].blob_id;
+
+    assert!(!pass(&app).await.unwrap().is_empty());
+    assert_reaped(&app, old).await;
+
+    let slices = objects::get::select_parts_in_range(parts, 70_000, 190_000, Some(customer.key()));
+    let (sender, body) = channel_body();
+    objects::get::spawn_range_stream(app.clone(), slices, sender);
+    let read = body.collect().await.unwrap().to_bytes();
+    assert_eq!(read.as_ref(), &content(3, 200_000)[70_000..190_000]);
+    for (i, len) in sizes.iter().enumerate() {
+        let (status, body) = get_sealed(&app, &key(i), None, Some(&customer)).await;
+        assert_eq!((status, body), (hyper::StatusCode::OK, content(i, *len)), "object {i}");
+    }
 }

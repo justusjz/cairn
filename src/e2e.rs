@@ -83,6 +83,7 @@ pub async fn node_replicating(
         metrics: Arc::default(),
         dashboard: crate::dashboard::Dashboard::new(peer_url),
         peers: crate::peer::PeerClient::new(),
+        allow_sse_c_over_http: false,
         pack_hook: hook,
     }))
 }
@@ -94,6 +95,7 @@ pub async fn put(app: &Arc<App>, key: &str, data: Vec<u8>) {
         content_type: "application/octet-stream".to_owned(),
         metadata: String::new(),
         conditions: Preconditions::default(),
+        sealing: None,
     };
     let body = Full::new(Bytes::from(data));
     let result = crate::upload_part(app, body, &attach, Payload::unchecked())
@@ -104,7 +106,7 @@ pub async fn put(app: &Arc<App>, key: &str, data: Vec<u8>) {
 
 /// Reads an object through GetObject; `None` if it doesn't exist.
 pub async fn get(app: &Arc<App>, key: &str) -> Option<Vec<u8>> {
-    let response = objects::get::get_object(app, BUCKET, key, None, None, &Preconditions::default())
+    let response = objects::get::get_object(app, BUCKET, key, None, None, &Preconditions::default(), None)
         .await
         .unwrap();
     if response.status() == StatusCode::NOT_FOUND {
@@ -112,6 +114,56 @@ pub async fn get(app: &Arc<App>, key: &str) -> Option<Vec<u8>> {
     }
     assert_eq!(response.status(), StatusCode::OK);
     Some(response.into_body().collect().await.unwrap().to_bytes().to_vec())
+}
+
+/// A client's SSE-C key, as a request over HTTPS supplies it.
+pub fn customer_key(key: &crate::encryption::Key) -> crate::s3::sse_c::CustomerKey {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use md5::Digest;
+    use crate::s3::sse_c::HEADERS;
+    let mut headers = hyper::HeaderMap::new();
+    for (name, value) in [
+        ("x-amz-server-side-encryption-customer-algorithm", "AES256".to_owned()),
+        ("x-amz-server-side-encryption-customer-key", STANDARD.encode(key)),
+        ("x-amz-server-side-encryption-customer-key-md5", STANDARD.encode(md5::Md5::digest(key))),
+    ] {
+        headers.insert(name, value.parse().unwrap());
+    }
+    crate::s3::sse_c::requested(&headers, &HEADERS, true).ok().flatten().unwrap()
+}
+
+/// Writes `data` as `key`, encrypted with the SSE-C `customer` key. Its ETag.
+pub async fn put_sealed(app: &Arc<App>, key: &str, data: Vec<u8>, customer: &crate::s3::sse_c::CustomerKey) -> String {
+    let attach = AttachTarget::Object {
+        bucket: BUCKET.to_owned(),
+        key: key.to_owned(),
+        content_type: "application/octet-stream".to_owned(),
+        metadata: String::new(),
+        conditions: Preconditions::default(),
+        sealing: Some(crate::Sealing {
+            key: zeroize::Zeroizing::new(*customer.key()),
+            check: customer.new_check(),
+        }),
+    };
+    let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
+        .await
+        .unwrap();
+    let UploadResult::Committed { etag, .. } = result else { panic!("not committed") };
+    etag
+}
+
+/// Reads (the `range` of) an SSE-C object through GetObject: its status and body.
+pub async fn get_sealed(
+    app: &Arc<App>,
+    key: &str,
+    range: Option<&str>,
+    customer: Option<&crate::s3::sse_c::CustomerKey>,
+) -> (StatusCode, Vec<u8>) {
+    let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), customer)
+        .await
+        .unwrap();
+    let status = response.status();
+    (status, response.into_body().collect().await.unwrap().to_bytes().to_vec())
 }
 
 pub async fn delete(app: &Arc<App>, key: &str) {

@@ -41,6 +41,7 @@ use crate::{
 pub(crate) mod buckets;
 pub(crate) mod conditional;
 pub(crate) mod metadata;
+pub(crate) mod sse_c;
 pub(crate) mod multipart;
 pub(crate) mod objects;
 pub(crate) mod util;
@@ -267,6 +268,33 @@ pub async fn handle(
     if let Some(v) = version_id.as_deref().filter(|v| addresses_version && !is_version_id(v)) {
         return Ok(box_response(invalid_version_id("versionId", v)));
     }
+    // SSE-C: the key the request names for its object, if any. Refused if it's
+    // malformed, or didn't come over HTTPS.
+    let secure = sse_c::secure(req.headers(), app.allow_sse_c_over_http);
+    let customer_key = match sse_c::requested(req.headers(), &sse_c::HEADERS, secure) {
+        Ok(key) => key,
+        Err(refused) => return Ok(box_response(refused)),
+    };
+    if matches!(*req.method(), Method::PUT | Method::POST) {
+        // SSE-S3 and SSE-KMS: Cairn has no keys of its own to encrypt with.
+        if let Some(refused) = sse_c::refuse_server_keys(req.headers()) {
+            return Ok(box_response(refused));
+        }
+        // SSE-C, for now, only for single PUTs.
+        let copies = req.headers().contains_key("x-amz-copy-source");
+        let names_source_key = req
+            .headers()
+            .keys()
+            .any(|name| name.as_str().starts_with("x-amz-copy-source-server-side-encryption"));
+        let multipart = *req.method() == Method::POST || query_param(&query, "uploadId").is_some();
+        if names_source_key || (customer_key.is_some() && (copies || multipart)) {
+            return Ok(box_response(format_s3_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                "SSE-C is not implemented for multipart uploads and copies yet",
+            )));
+        }
+    }
     if *req.method() == hyper::Method::GET {
         // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
         // break XML-parsing clients like `s3cmd info`.
@@ -280,6 +308,7 @@ pub async fn handle(
             version_id.as_deref(),
             range.as_deref(),
             &preconditions,
+            customer_key.as_ref(),
         )
         .await;
     }
@@ -325,6 +354,7 @@ pub async fn handle(
                 version_id.as_deref(),
                 range.as_deref(),
                 &preconditions,
+                customer_key.as_ref(),
             )
             .await?
         }
@@ -414,7 +444,8 @@ pub async fn handle(
         hyper::Method::PUT => match (payload, metadata) {
             (Ok(payload), Ok(metadata)) => {
                 let body = req.into_body();
-                put_object(&app, &bucket, &key, &content_type, &metadata, body, payload, &preconditions)
+                let customer_key = customer_key.as_ref();
+                put_object(&app, &bucket, &key, &content_type, &metadata, body, payload, &preconditions, customer_key)
                     .await?
             }
             (Err(rejection), _) => util::rejection_response(&rejection),

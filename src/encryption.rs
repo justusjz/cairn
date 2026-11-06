@@ -122,6 +122,11 @@ impl Sealer {
         }
     }
 
+    /// The part's salt.
+    pub fn salt(&self) -> Salt {
+        self.salt
+    }
+
     /// Takes more plaintext, and returns the stored bytes of the segments it
     /// completed (if any).
     pub fn update(&mut self, mut data: &[u8]) -> Option<Bytes> {

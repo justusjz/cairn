@@ -37,6 +37,8 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK_DIR="$(mktemp -d /tmp/s3-smoke.XXXXXX)"
 CARGO_ARGS+=(--data-dir "$WORK_DIR/data")   # required; per-run blob dir
+# No TLS proxy here, so SSE-C keys come over plain HTTP.
+CARGO_ARGS+=(--allow-sse-c-over-http)
 SERVER_LOG="$WORK_DIR/server.log"
 SERVER_PID=""
 BUCKET="smoke-$(date +%s)"
@@ -52,7 +54,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=89
+TOTAL=90
 STEP=0
 PASS=0
 FAIL=0
@@ -449,6 +451,36 @@ metadata_ok() {
         --metadata "big=$big" >/dev/null 2>&1 || return 1
     for key in "$key" meta/kept.txt meta/replaced.txt; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "$key" >/dev/null 2>&1 || return 1
+    done
+}
+
+# SSE-C: objects written with a client's key read back with it (whole and in a
+# range), and not without it or with another; SSE-S3 is refused, since Cairn has
+# no keys of its own.
+sse_c_ok() {
+    local k1="$WORK_DIR/sse-key1" k2="$WORK_DIR/sse-key2" out="$WORK_DIR/sse-out" key
+    head -c 32 /dev/urandom >"$k1"
+    head -c 32 /dev/urandom >"$k2"
+    for key in small.txt big.bin; do
+        local src="$SMALL"; [ "$key" = big.bin ] && src="$BIG"
+        awss3 s3api put-object --bucket "$BUCKET" --key "sse/$key" --body "$src" \
+            --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k1" >/dev/null 2>&1 || return 1
+        awss3 s3api get-object --bucket "$BUCKET" --key "sse/$key" "$out" \
+            --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k1" >/dev/null 2>&1 || return 1
+        cmp -s "$src" "$out" || return 1
+        ! awss3 s3api get-object --bucket "$BUCKET" --key "sse/$key" "$out" >/dev/null 2>&1 || return 1
+        ! awss3 s3api get-object --bucket "$BUCKET" --key "sse/$key" "$out" \
+            --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k2" >/dev/null 2>&1 || return 1
+    done
+    awss3 s3api get-object --bucket "$BUCKET" --key sse/big.bin --range bytes=100000-299999 "$out" \
+        --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k1" >/dev/null 2>&1 || return 1
+    cmp -s <(tail -c +100001 "$BIG" | head -c 200000) "$out" || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key sse/big.bin --query ContentLength --output text \
+        --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k1" 2>/dev/null)" = "$(stat -c %s "$BIG")" ] || return 1
+    ! awss3 s3api put-object --bucket "$BUCKET" --key sse/s3.txt --body "$SMALL" \
+        --server-side-encryption AES256 >/dev/null 2>&1 || return 1
+    for key in small.txt big.bin; do
+        awss3 s3api delete-object --bucket "$BUCKET" --key "sse/$key" >/dev/null 2>&1 || return 1
     done
 }
 
@@ -1523,6 +1555,7 @@ run_test    "CopyObject shares the source's data"   copy_shares_data_ok
 run_test    "CopyObject of multipart src is normal" copy_multipart_source_normal_ok
 run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok
 run_test    "Metadata stored, copied, replaced"     metadata_ok
+run_test    "SSE-C put/get/range, wrong key refused" sse_c_ok
 expect_fail "Self-copy without REPLACE rejected"    awss3 s3api copy-object --bucket "$BUCKET" --key big.bin --copy-source "${BUCKET}/big.bin"
 expect_fail "Copy from missing source fails"        awss3 s3api copy-object --bucket "$BUCKET" --key copy/none.txt --copy-source "${BUCKET}/does-not-exist.txt"
 run_test    "UploadPartCopy (whole object)"         upload_part_copy_whole_ok

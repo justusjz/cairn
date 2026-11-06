@@ -100,6 +100,7 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--peer-url <URL>` | `CAIRN_PEER_URL` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
 | `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on. |
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
+| `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#encryption) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 
 On SIGTERM or Ctrl-C, a node stops accepting connections and finishes the
 requests in flight before it exits; a second signal exits right away. Anything
@@ -311,6 +312,32 @@ aws s3api copy-object --bucket my-bucket --key some/key \
 
 Old versions take up space until they're deleted. There are no lifecycle rules
 yet to expire them automatically.
+
+## Encryption
+
+Objects can be encrypted with a key their client supplies (**SSE-C**): send the
+`x-amz-server-side-encryption-customer-*` headers with the PUT, as with S3
+(`aws s3api put-object --sse-customer-algorithm AES256 --sse-customer-key
+fileb://key`), and the same key with every GET and HEAD of the object. Cairn
+encrypts the data before it's stored, so no disk ever holds it in the clear,
+and never stores the key: only a salted HMAC of it, to refuse a wrong one.
+Without the key, the data can't be read, by anyone.
+
+- The algorithm is XChaCha20-Poly1305 (S3's API calls every SSE-C key
+  `AES256`, and Cairn answers the same way), in 64 KiB segments, so a range
+  reads only the segments it covers, and altered data is detected.
+- An SSE-C object's ETag is random, not the MD5 of its content, as in S3:
+  an MD5 would give away whether the content is a guessed one.
+- The key travels in a request header, so it's only accepted over HTTPS: a
+  request must come through a proxy that sets `X-Forwarded-Proto: https` (or
+  `Forwarded: proto=https`). Behind an encrypted network instead, allow it with
+  `--allow-sse-c-over-http`. Lose the key and the object is lost.
+- Not yet: SSE-C for multipart uploads, and copies of SSE-C objects (both
+  answer `501 NotImplemented`).
+
+Encryption with keys of Cairn's own (**SSE-S3**, **SSE-KMS**) isn't
+implemented: a request asking for it is refused with `501 NotImplemented`,
+rather than stored unencrypted.
 
 ## Data integrity
 
