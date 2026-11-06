@@ -397,14 +397,21 @@ async fn the_packer_keeps_a_blob_that_a_copy_references() {
             }
             let Some((locked, release)) = state.lock().unwrap().take() else { return };
             let src = source(&app, "o0").await;
+            let (held_tx, held) = oneshot::channel::<()>();
             tokio::spawn(async move {
                 let mut client = connection(&app).await;
                 let tx = client.transaction().await.unwrap();
                 assert_eq!(copy_object(&tx, &src, "copy").await, "committed");
+                held_tx.send(()).unwrap();
                 locked.send(()).unwrap();
                 release.await.unwrap();
                 tx.commit().await.unwrap();
             });
+            // The job goes on only once the copy holds the source's blob. (The
+            // job takes its locks when it commits, so the copy doesn't wait for
+            // it.) Else, under load, the job could commit first, and the copy
+            // after it, and nothing would wait.
+            held.await.unwrap();
         })
     });
     let Some(app) = node_with(pack, Some(hook)).await else { return };
