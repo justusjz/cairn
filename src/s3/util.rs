@@ -205,6 +205,10 @@ pub fn unsupported_characters() -> Response<Full<Bytes>> {
 /// are multipart uploads, and are copied part by part.
 pub const MAX_UPLOAD: u64 = 5 << 30;
 
+/// The smallest part S3 takes in a multipart upload, but for the last (5 MiB).
+/// Mirrored in `cairn_complete_upload`.
+pub const MIN_PART: u64 = 5 << 20;
+
 /// The largest object S3 stores (5 TiB). Mirrored in `cairn_complete_upload`.
 pub const MAX_OBJECT: u64 = 5 << 40;
 

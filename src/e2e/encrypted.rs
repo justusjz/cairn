@@ -167,8 +167,16 @@ async fn sizes_salts_and_key_checks_carry_through() {
         )
         .await
         .unwrap();
+    let min = crate::s3::util::MIN_PART;
     assert_eq!(
-        commit(&app, Err((upload, 1)), 65552, 65536, &[2; 16]).await,
+        commit(
+            &app,
+            Err((upload, 1)),
+            stored_len(min) as i64,
+            min as i64,
+            &[2; 16]
+        )
+        .await,
         "committed"
     );
     assert_eq!(
@@ -198,7 +206,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
             "m"
         )
         .await,
-        65541
+        min as i64 + 5
     );
     let key_check: Vec<u8> = client
         .query_one("SELECT sse_c_key FROM objects WHERE key = 'm'", &[])
@@ -206,6 +214,51 @@ async fn sizes_salts_and_key_checks_carry_through() {
         .unwrap()
         .get(0);
     assert_eq!(key_check, KEY_CHECK.to_vec());
+
+    // A part's plaintext is what must be 5 MiB: one whose ciphertext is, but
+    // not its plaintext, is too small.
+    let upload = Uuid::now_v7();
+    client
+        .execute(
+            "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, initiated_at)
+             VALUES ($1, $2, 's', 'x', NOW())",
+            &[&upload, &BUCKET],
+        )
+        .await
+        .unwrap();
+    let short = min - 10;
+    assert!(stored_len(short) >= min);
+    assert_eq!(
+        commit(
+            &app,
+            Err((upload, 1)),
+            stored_len(short) as i64,
+            short as i64,
+            &[5; 16]
+        )
+        .await,
+        "committed"
+    );
+    assert_eq!(
+        commit(&app, Err((upload, 2)), 21, 5, &[6; 16]).await,
+        "committed"
+    );
+    let etags = ["05".repeat(16), "06".repeat(16)];
+    let status: String = client
+        .query_one(
+            "SELECT status FROM pg_temp.cairn_complete_upload(
+                 $1, $2, 's', ARRAY[1, 2], $3, NULL, NULL, $4)",
+            &[
+                &upload,
+                &BUCKET,
+                &etags.to_vec(),
+                &crate::s3::versions::new_version_id(),
+            ],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(status, "too_small");
 
     // A range of an encrypted part can't be staged in place.
     let upload = Uuid::now_v7();

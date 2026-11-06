@@ -146,7 +146,9 @@ async fn a_copy_shares_its_source_bytes() {
 #[tokio::test]
 async fn a_copy_of_a_multipart_object_shares_every_part() {
     let Some(app) = node().await else { return };
-    let parts = [content(3000, 1), content(2000, 2), content(1000, 3)];
+    // Every part but the last at least the 5 MiB S3 requires.
+    let min = crate::s3::util::MIN_PART as usize;
+    let parts = [content(min + 3000, 1), content(min + 2000, 2), content(1000, 3)];
     put_multipart(&app, "source", &parts).await;
     let etag = copy(&app, "source", "copy", false).await;
     let whole = parts.concat();
@@ -218,9 +220,11 @@ async fn a_part_copy_within_one_part_shares_its_bytes() {
 #[tokio::test]
 async fn a_part_copy_across_parts_copies_data() {
     let Some(app) = node().await else { return };
-    let parts = [content(1000, 1), content(1000, 2)];
+    let min = crate::s3::util::MIN_PART as usize;
+    let parts = [content(min, 1), content(1000, 2)];
     put_multipart(&app, "source", &parts).await;
     let upload_id = create_upload(&app, "assembled").await;
+    let range = format!("bytes={}-{}", min - 100, min + 99);
     let response = copy_part(
         &app,
         BUCKET,
@@ -228,7 +232,7 @@ async fn a_part_copy_across_parts_copies_data() {
         &upload_id.to_string(),
         "1",
         &format!("{BUCKET}/source"),
-        Some("bytes=900-1099"),
+        Some(&range),
         &Preconditions::default(),
         Default::default(),
     )
@@ -237,13 +241,13 @@ async fn a_part_copy_across_parts_copies_data() {
     assert_eq!(response.status(), StatusCode::OK);
     let etag = xml_field(&body_text(response).await, "ETag");
     let whole = parts.concat();
-    assert_eq!(etag, md5_hex(&whole[900..1100]));
+    assert_eq!(etag, md5_hex(&whole[min - 100..min + 100]));
     complete(&app, "assembled", upload_id, &format!(
         "<Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>"
     ))
     .await;
     assert_files(&app, 3).await;
-    assert_eq!(get(&app, "assembled").await, Some(whole[900..1100].to_vec()));
+    assert_eq!(get(&app, "assembled").await, Some(whole[min - 100..min + 100].to_vec()));
 }
 
 /// Copies racing deletes of their source either copy it or find it gone, but

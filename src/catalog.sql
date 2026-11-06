@@ -889,8 +889,9 @@ $$;
 -- then X: the blobs of the listed parts (shared), the left-out staged parts
 -- and the replaced version's parts. Checks that the upload exists and belongs
 -- to (bucket, key) ('no_such_upload'), that every listed part is staged with
--- the listed ETag ('invalid_part'), that they make an object S3 would store
--- ('too_large'), and the conditional-write guard ('precondition_failed'). Then publishes the listed parts as the key's new
+-- the listed ETag ('invalid_part'), that every one but the last is large
+-- enough ('too_small') and they make an object S3 would store ('too_large'),
+-- and the conditional-write guard ('precondition_failed'). Then publishes the listed parts as the key's new
 -- version, deletes the staged parts left out, and the upload ('done', with
 -- the object's ETag).
 --
@@ -971,6 +972,14 @@ BEGIN
                 AND p.etag = r.etag;
     IF cardinality(v_listed) <> cardinality(p_part_numbers) THEN
         status := 'invalid_part';
+        RETURN;
+    END IF;
+    -- S3's smallest part, 5 MiB, but for the last (`s3::util::MIN_PART`).
+    IF EXISTS (SELECT 1 FROM unnest(p_part_numbers) WITH ORDINALITY AS r(part_number, n)
+               JOIN parts p ON p.upload_id = p_upload AND p.part_number = r.part_number
+               WHERE r.n < cardinality(p_part_numbers)
+                 AND coalesce(p.plain_size, p.size) < 5242880) THEN
+        status := 'too_small';
         RETURN;
     END IF;
     -- S3's largest object, 5 TiB (`s3::util::MAX_OBJECT`).

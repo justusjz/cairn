@@ -122,7 +122,9 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
             let mut parts = JoinSet::new();
             for n in [1, 1, 2] {
                 let (app, upload_id) = (app.clone(), upload_id.clone());
-                parts.spawn(async move { (n, upload_part(&app, &upload_id, n, vec![n as u8; 700]).await) });
+                // Part 1 as small as a part that isn't the last may be.
+                let len = if n == 1 { crate::s3::util::MIN_PART as usize } else { 700 };
+                parts.spawn(async move { (n, upload_part(&app, &upload_id, n, vec![n as u8; len]).await) });
             }
             let mut etags = std::collections::BTreeMap::new();
             while let Some(result) = parts.join_next().await {

@@ -31,6 +31,8 @@ enum CompleteOutcome {
     InvalidPart,
     /// Its parts make an object larger than S3 stores.
     TooLarge,
+    /// A part, not the last, is smaller than S3 takes.
+    TooSmall,
     /// A conditional-completion guard (If-Match / If-None-Match) didn't hold.
     PreconditionFailed,
 }
@@ -176,6 +178,17 @@ pub async fn complete_multipart_upload(
                     ),
                 ));
             }
+            Ok(CompleteOutcome::TooSmall) => {
+                return Ok(format_s3_error(
+                    StatusCode::BAD_REQUEST,
+                    "EntityTooSmall",
+                    &format!(
+                        "Your proposed upload is smaller than the minimum allowed size: every part \
+                         but the last must be at least {} bytes.",
+                        crate::s3::util::MIN_PART
+                    ),
+                ));
+            }
             Ok(CompleteOutcome::PreconditionFailed) => {
                 return Ok(format_s3_error(
                     StatusCode::PRECONDITION_FAILED,
@@ -226,6 +239,7 @@ async fn try_complete(
         "no_such_upload" => return Ok(CompleteOutcome::NoSuchUpload),
         "invalid_part" => return Ok(CompleteOutcome::InvalidPart),
         "too_large" => return Ok(CompleteOutcome::TooLarge),
+        "too_small" => return Ok(CompleteOutcome::TooSmall),
         "precondition_failed" => return Ok(CompleteOutcome::PreconditionFailed),
         status => unreachable!("cairn_complete_upload: unknown status {status}"),
     }

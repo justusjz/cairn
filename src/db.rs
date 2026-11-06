@@ -730,9 +730,11 @@ mod tests {
     }
 
     #[test]
-    fn the_largest_object_matches_the_catalog() {
+    fn the_size_limits_match_the_catalog() {
         let limit = crate::s3::util::MAX_OBJECT.to_string();
         assert!(super::CATALOG_FUNCTIONS.contains(&format!("v_total > {limit}")));
+        let limit = crate::s3::util::MIN_PART.to_string();
+        assert!(super::CATALOG_FUNCTIONS.contains(&format!("p.size) < {limit}")));
     }
 
     #[test]

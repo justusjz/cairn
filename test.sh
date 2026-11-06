@@ -1345,7 +1345,9 @@ pack_consolidates_ok() {
     local dir="$PACK_DIR" i v1 v2 uid e1 e2 fills=0
     mkdir -p "$dir/up"
     for i in $(seq 1 120); do head -c $((i * 1024)) /dev/urandom >"$dir/up/o$i"; done
-    for i in v1 v2 p1 p2; do head -c 3000 /dev/urandom >"$dir/$i"; done
+    for i in v1 v2 p2; do head -c 3000 /dev/urandom >"$dir/$i"; done
+    # A part that isn't the last is at least 5 MiB.
+    head -c $((5 * 1024 * 1024)) /dev/urandom >"$dir/p1"
     awss3 s3 cp --recursive "$dir/up" "s3://${BUCKET}/pack/" >/dev/null 2>&1 || return 1
     mb_granted "$PACK_VBUCKET" >/dev/null 2>&1 || return 1
     cairn_role grant "$ACCESS_KEY" "$PACK_VBUCKET" delete-version >/dev/null 2>&1 || return 1

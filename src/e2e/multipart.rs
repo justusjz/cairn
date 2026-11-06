@@ -21,7 +21,8 @@ async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
 }
 
-/// A new upload of `key`, with parts 1 and 2 staged; its ID and the parts' ETags.
+/// A new upload of `key`, with parts 1 (5 MiB, as small as a part that isn't
+/// the last may be) and 2 staged; its ID and the parts' ETags.
 async fn staged(app: &Arc<App>, key: &str) -> (String, [String; 2]) {
     staged_with(app, key, "").await
 }
@@ -40,7 +41,8 @@ async fn staged_with(app: &Arc<App>, key: &str, metadata: &str) -> (String, [Str
             part_number: i as i32 + 1,
             key: None,
         };
-        let body = Full::new(Bytes::from(vec![i as u8; 100]));
+        let len = if i == 0 { crate::s3::util::MIN_PART as usize } else { 100 };
+        let body = Full::new(Bytes::from(vec![i as u8; len]));
         let UploadResult::Committed { etag: e, .. } =
             crate::upload_part(app, body, &attach, Payload::unchecked()).await.unwrap()
         else {
@@ -171,7 +173,10 @@ async fn an_sse_c_upload_makes_an_sse_c_object() {
     let body = std::str::from_utf8(&body).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
     let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
-    let lens = [70_000usize, 5, 65_536];
+    // Every part but the last at least 5 MiB; the first ends 3 bytes into a
+    // segment, so the parts' boundaries and the segments' don't line up.
+    let min = crate::s3::util::MIN_PART as usize;
+    let lens = [min + 3, min, 1000];
     let data: Vec<Vec<u8>> = lens.iter().enumerate().map(|(i, len)| vec![i as u8 + 1; *len]).collect();
     let mut etags = Vec::new();
     for (i, part) in data.iter().enumerate() {
@@ -206,11 +211,51 @@ async fn an_sse_c_upload_makes_an_sse_c_object() {
 
     let whole: Vec<u8> = data.concat();
     assert_eq!(super::get_sealed(&app, "k", None, Some(&customer)).await, (StatusCode::OK, whole.clone()));
-    for (start, end) in [(65_530, 70_003), (69_999, 70_006), (70_004, 135_541), (0, 135_541)] {
+    let total = whole.len();
+    for (start, end) in [
+        (65_530, 65_545),
+        (min - 2, min + 5),
+        (2 * min, 2 * min + 10),
+        (2 * min + 1, total),
+        (0, total),
+    ] {
         let range = format!("bytes={start}-{}", end - 1);
         let (status, body) = super::get_sealed(&app, "k", Some(&range), Some(&customer)).await;
         assert_eq!(status, StatusCode::PARTIAL_CONTENT, "{range}");
         assert_eq!(body, &whole[start..end], "{range}");
     }
     assert_eq!(super::get_sealed(&app, "k", None, None).await.0, StatusCode::BAD_REQUEST);
+}
+
+/// Every part but the last must be at least 5 MiB, as in S3; the upload stays,
+/// for the client to complete with other parts. The last may be any size.
+#[tokio::test]
+async fn parts_but_the_last_must_be_5_mib() {
+    let Some(app) = node().await else { return };
+    let (upload_id, [_, e2]) = staged(&app, "k").await;
+    // Part 1 again, now 4 bytes.
+    let attach = AttachTarget::MultipartPart {
+        upload_id: upload_id.parse().unwrap(),
+        part_number: 1,
+        key: None,
+    };
+    let body = Full::new(Bytes::from_static(b"tiny"));
+    let UploadResult::Committed { etag: tiny, .. } =
+        crate::upload_part(&app, body, &attach, Payload::unchecked()).await.unwrap()
+    else {
+        panic!("the part wasn't committed");
+    };
+    let listed = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{tiny}\"</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>\"{e2}\"</ETag></Part></CompleteMultipartUpload>"
+    );
+    let response = complete_multipart_upload(&app, BUCKET, "k", &upload_id, Bytes::from(listed), &Preconditions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(std::str::from_utf8(&body).unwrap().contains("<Code>EntityTooSmall</Code>"));
+    // The upload is still there, and part 1 on its own (the last) completes it.
+    assert_eq!(complete(&app, "k", &upload_id, &[(1, &tiny)]).await.0, StatusCode::OK);
+    assert_eq!(super::get(&app, "k").await, Some(b"tiny".to_vec()));
 }
