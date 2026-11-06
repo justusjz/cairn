@@ -159,8 +159,8 @@ very next request; there is nothing to restart or sync.
 What a role may do:
 
 - **admin** (`--admin`): create and delete buckets, configure their
-  [versioning](#versioning), HEAD any bucket, and see every bucket in
-  ListBuckets. Admin does **not** grant access to objects.
+  [versioning](#versioning), HEAD any bucket and read its configuration, and
+  see every bucket in ListBuckets. Admin does **not** grant access to objects.
 - **`read`** on a bucket: GetObject, HeadObject, ListObjects, and being the
   source of a CopyObject / UploadPartCopy.
 - **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads, and
@@ -175,6 +175,13 @@ exist before you can grant access to it, so the setup order is: an admin creates
 the bucket (with any S3 client), then you grant roles access. Deleting a bucket
 removes its grants, so a bucket re-created under the same name starts with no
 access for anyone.
+
+There are no ACLs: as with S3's default for new buckets ("bucket owner
+enforced"), access is a matter of grants alone. A request that asks for an ACL
+other than the owner's (`bucket-owner-full-control` for an object, `private`
+for a bucket) is refused with `AccessControlListNotSupported`, as S3 refuses
+it; one asking for the owner's is fine, and reading an ACL shows the owner with
+full control.
 
 Bucket names follow S3's rules: 3 to 63 lowercase letters, digits, dots and
 hyphens, starting and ending with a letter or digit.

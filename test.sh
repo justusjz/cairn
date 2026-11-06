@@ -54,7 +54,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=92
+TOTAL=93
 STEP=0
 PASS=0
 FAIL=0
@@ -883,6 +883,30 @@ too_large_refused() {
     [ "$(scurl PUT "/${BUCKET}/too-large" UNSIGNED-PAYLOAD "$SMALL" "Content-Length: 5368709121")" = 400 ]
 }
 
+# ACLs, as with S3's default "bucket owner enforced": a write may ask for the
+# owner's ACL only (or none), setting it is a no-op, anything else is refused;
+# reading ACLs and ownership controls shows the owner in control.
+acls_disabled_ok() {
+    local nb="acl-$(date +%s)"
+    ! awss3 s3api put-object --bucket "$BUCKET" --key acl/x.txt --body "$SMALL" --acl public-read \
+        >/dev/null 2>&1 || return 1
+    awss3 s3api put-object --bucket "$BUCKET" --key acl/x.txt --body "$SMALL" \
+        --acl bucket-owner-full-control >/dev/null 2>&1 || return 1
+    awss3 s3api put-object-acl --bucket "$BUCKET" --key acl/x.txt --acl bucket-owner-full-control \
+        >/dev/null 2>&1 || return 1
+    awss3 s3api put-object-acl --bucket "$BUCKET" --key acl/x.txt --acl public-read 2>&1 \
+        | grep -q AccessControlListNotSupported || return 1
+    awss3 s3api put-object-acl --bucket "$BUCKET" --key acl/missing --acl bucket-owner-full-control 2>&1 \
+        | grep -q NoSuchKey || return 1
+    awss3 s3api create-bucket --bucket "$nb" --acl public-read 2>&1 \
+        | grep -q InvalidBucketAclWithObjectOwnership || return 1
+    awss3 s3api create-bucket --bucket "$nb" --acl private >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-ownership-controls --bucket "$nb" \
+        --query 'OwnershipControls.Rules[0].ObjectOwnership' --output text 2>/dev/null)" = BucketOwnerEnforced ] || return 1
+    awss3 s3api delete-bucket --bucket "$nb" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key acl/x.txt >/dev/null 2>&1
+}
+
 # Operations Cairn doesn't implement are refused (501), not run as the plain
 # PUT/DELETE/GET they'd otherwise route to: the object and the bucket survive.
 unsupported_subresources_refused() {
@@ -890,7 +914,7 @@ unsupported_subresources_refused() {
     printf '<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>' >"$xml"
     local hash; hash=$(sha256sum "$xml" | cut -d' ' -f1)
     [ "$(scurl PUT "$path?tagging" "$hash" "$xml")" = 501 ] || return 1
-    [ "$(scurl PUT "$path?acl" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl PUT "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "$path?tagging" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl GET "$path?partNumber=1" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "/${BUCKET}?policy" "$EMPTY_SHA256" -)" = 501 ] || return 1
@@ -1646,6 +1670,7 @@ run_test    "Packer compacts mostly-dead blobs"      pack_compacts_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
+run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
 run_test    "A PUT over 5 GiB is refused"           too_large_refused
 run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets

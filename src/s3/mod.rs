@@ -40,6 +40,7 @@ use crate::{
 };
 
 pub(crate) mod buckets;
+pub(crate) mod acl;
 pub(crate) mod conditional;
 pub(crate) mod metadata;
 pub(crate) mod sse_c;
@@ -145,6 +146,9 @@ pub async fn handle(
             if query_param(&query, "versioning").is_some() {
                 return Ok(box_response(get_bucket_versioning(&app, &bucket).await?));
             }
+            if query_param(&query, "ownershipControls").is_some() {
+                return Ok(box_response(acl::ownership_controls()));
+            }
             if let Some(resp) = bucket_subresource_stub(&query) {
                 return Ok(box_response(resp));
             }
@@ -247,7 +251,14 @@ pub async fn handle(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
-            hyper::Method::PUT => create_bucket(&app, &bucket).await?,
+            // PutBucketAcl: there are no ACLs (`acl`).
+            hyper::Method::PUT if query_param(&query, "acl").is_some() => {
+                acl::put_bucket_acl(&app, &bucket, req.headers()).await?
+            }
+            hyper::Method::PUT => match acl::check_write(req.headers(), acl::On::Bucket) {
+                Ok(()) => create_bucket(&app, &bucket).await?,
+                Err(refused) => refused,
+            },
             // DeleteObjects (batch): POST /{bucket}?delete with a <Delete> body,
             // which must declare a checksum.
             hyper::Method::POST if query_param(&query, "delete").is_some() => {
@@ -304,6 +315,16 @@ pub async fn handle(
         if let Some(refused) = sse_c::refuse_server_keys(req.headers()) {
             return Ok(box_response(refused));
         }
+    }
+    // An object write may only ask for the ACL there is (see `acl`):
+    // PutObject, CopyObject, CreateMultipartUpload.
+    let writes_object = match *req.method() {
+        Method::PUT => query_param(&query, "uploadId").is_none() && query_param(&query, "acl").is_none(),
+        Method::POST => query_param(&query, "uploads").is_some(),
+        _ => false,
+    };
+    if writes_object && let Err(refused) = acl::check_write(req.headers(), acl::On::Object) {
+        return Ok(box_response(refused));
     }
     if *req.method() == hyper::Method::GET {
         // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
@@ -398,6 +419,10 @@ pub async fn handle(
                 }
                 Err(rejection) => util::rejection_response(&rejection),
             }
+        }
+        // PutObjectAcl: there are no ACLs (`acl`).
+        hyper::Method::PUT if query_param(&query, "acl").is_some() => {
+            acl::put_object_acl(&app, &bucket, &key, version_id.as_deref(), req.headers()).await?
         }
         // UploadPartCopy: an UploadPart whose bytes come from another object
         // (x-amz-copy-source) instead of the request body. Must precede UploadPart.
@@ -546,10 +571,25 @@ fn forbidden(code: &str, message: &str) -> Response<ResBody> {
     box_response(format_s3_error(StatusCode::FORBIDDEN, code, message))
 }
 
+/// The subresources a bucket's configuration is read from, which a role that
+/// may see the bucket may read.
+const BUCKET_CONFIGURATION: &[&str] = &[
+    "versioning",
+    "ownershipControls",
+    "acl",
+    "location",
+    "object-lock",
+    "policy",
+    "cors",
+    "tagging",
+    "lifecycle",
+];
+
 /// Whether `principal` may make this request against `bucket` (`key` empty for a
 /// bucket-level request). Bucket management — creating, deleting, and
 /// configuring versioning — is admin-only, while a bucket HEAD or reading its
-/// versioning state just needs the bucket to be visible to the role. Everything
+/// configuration (`BUCKET_CONFIGURATION`) just needs the bucket to be visible
+/// to the role. Everything
 /// else needs a grant on the bucket: `read` for GET/HEAD, `delete-version` to
 /// delete a specific version, `write` for the rest. A copy also needs `read` on
 /// its source bucket. DeleteObjects only needs one of `write` / `delete-version`
@@ -566,7 +606,11 @@ fn authorize(
         return match *method {
             Method::PUT | Method::DELETE => principal.admin,
             Method::HEAD => principal.can_see(bucket),
-            Method::GET if query_param(query, "versioning").is_some() => principal.can_see(bucket),
+            // The bucket's configuration, like its versioning state, rather
+            // than anything in it.
+            Method::GET if BUCKET_CONFIGURATION.iter().any(|c| query_param(query, c).is_some()) => {
+                principal.can_see(bucket)
+            }
             Method::GET => principal.can(Permission::Read, bucket),
             Method::POST if query_param(query, "delete").is_some() => {
                 principal.can(Permission::Write, bucket)

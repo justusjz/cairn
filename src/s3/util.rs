@@ -262,12 +262,13 @@ const SUBRESOURCES: &[&str] = &[
 /// object-level one. Must match the routing in `s3::handle`.
 fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'static str] {
     match (bucket_level, method) {
-        // ListObjectVersions, ListMultipartUploads, versioning, and the stubs
-        // (`bucket_subresource_stub`).
+        // ListObjectVersions, ListMultipartUploads, versioning, ownership
+        // controls (`acl`), and the stubs (`bucket_subresource_stub`).
         (true, &Method::GET) => &[
             "versioning",
             "versions",
             "uploads",
+            "ownershipControls",
             "acl",
             "location",
             "object-lock",
@@ -276,12 +277,13 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "tagging",
             "lifecycle",
         ],
-        (true, &Method::PUT) => &["versioning"],
+        // PutBucketVersioning, PutBucketAcl (`acl`).
+        (true, &Method::PUT) => &["versioning", "acl"],
         (true, &Method::POST) => &["delete"],
         // GetObjectAcl (stubbed).
         (false, &Method::GET) => &["acl"],
-        // UploadPart / UploadPartCopy.
-        (false, &Method::PUT) => &["uploadId", "partNumber"],
+        // UploadPart / UploadPartCopy, PutObjectAcl (`acl`).
+        (false, &Method::PUT) => &["uploadId", "partNumber", "acl"],
         // CreateMultipartUpload / CompleteMultipartUpload.
         (false, &Method::POST) => &["uploads", "uploadId"],
         // AbortMultipartUpload.
@@ -372,6 +374,9 @@ mod tests {
             (Method::PUT, false, "partNumber=1&uploadId=u"),
             (Method::POST, false, "uploads"),
             (Method::POST, false, "uploadId=u"),
+            (Method::PUT, false, "acl"),
+            (Method::PUT, true, "acl"),
+            (Method::GET, true, "ownershipControls"),
             (Method::DELETE, false, "versionId=null"),
             (Method::DELETE, false, "uploadId=u"),
         ] {
@@ -381,7 +386,6 @@ mod tests {
         // object, deleting it or the bucket, or serving the wrong bytes.
         for (method, bucket_level, query) in [
             (Method::PUT, false, "tagging"),
-            (Method::PUT, false, "acl"),
             (Method::PUT, false, "retention&versionId=null"),
             (Method::DELETE, false, "tagging"),
             (Method::GET, false, "attributes"),
@@ -390,7 +394,6 @@ mod tests {
             (Method::HEAD, false, "partNumber=1"),
             (Method::POST, false, "restore"),
             (Method::PUT, true, "policy"),
-            (Method::PUT, true, "acl"),
             (Method::DELETE, true, "policy"),
             (Method::DELETE, true, "cors"),
             (Method::GET, true, "website"),
