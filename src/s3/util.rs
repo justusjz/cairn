@@ -200,6 +200,14 @@ pub fn unsupported_characters() -> Response<Full<Bytes>> {
     )
 }
 
+/// The most data S3 takes in one request: a PutObject's, an UploadPart's, an
+/// UploadPartCopy's range, and a CopyObject's source (5 GiB). Larger objects
+/// are multipart uploads, and are copied part by part.
+pub const MAX_UPLOAD: u64 = 5 << 30;
+
+/// The largest object S3 stores (5 TiB). Mirrored in `cairn_complete_upload`.
+pub const MAX_OBJECT: u64 = 5 << 40;
+
 /// S3's subresources: query parameters that pick the operation, rather than
 /// parameterize it. `PUT /bucket/key?tagging` is PutObjectTagging, not a
 /// PutObject, so one Cairn doesn't handle must be refused, never served as the

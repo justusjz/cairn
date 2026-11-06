@@ -139,6 +139,10 @@ pub struct Payload {
     signed: bool,
     /// `x-amz-decoded-content-length`, for a streaming body.
     decoded_length: Option<u64>,
+    /// `Content-Length`, which, unless the body is streaming, is the data's.
+    content_length: Option<u64>,
+    /// The most data the body may hold (see `at_most`).
+    max: Option<u64>,
     /// How many bytes of data have been decoded.
     decoded: u64,
     /// The SHA-256 of the body as sent, and the hex one it claims.
@@ -162,6 +166,11 @@ fn bad_request(code: &'static str, message: impl Into<String>) -> Rejection {
     Rejection::new(StatusCode::BAD_REQUEST, code, message)
 }
 
+/// S3's 400 for an upload over its size limit.
+pub fn too_large() -> Rejection {
+    bad_request("EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
+}
+
 fn bad_digest(algorithm: Algorithm) -> Rejection {
     bad_request(
         "BadDigest",
@@ -182,6 +191,7 @@ impl Payload {
     ) -> Result<Payload, Rejection> {
         let header = |name: &str| headers.get(name).and_then(|v| v.to_str().ok());
         let mut payload = Payload::unchecked();
+        payload.content_length = header("content-length").and_then(|v| v.trim().parse().ok());
         // `verify_sigv4` has checked that it's there, and valid.
         let (streaming, trailer) = match header("x-amz-content-sha256").unwrap_or("") {
             "UNSIGNED-PAYLOAD" => (false, false),
@@ -264,12 +274,29 @@ impl Payload {
             decoder: None,
             signed: false,
             decoded_length: None,
+            content_length: None,
+            max: None,
             decoded: 0,
             sha256: None,
             md5: None,
             checksum: None,
             trailer: None,
         }
+    }
+
+    /// Limits the body's data to `max` bytes, as S3 limits an upload's: refused
+    /// now if it declares more (in `Content-Length`, or, streaming, in
+    /// `x-amz-decoded-content-length`), else as soon as more of it arrives.
+    pub fn at_most(mut self, max: u64) -> Result<Payload, Rejection> {
+        let declared = match self.decoder {
+            Some(_) => self.decoded_length,
+            None => self.content_length,
+        };
+        if declared.is_some_and(|length| length > max) {
+            return Err(too_large());
+        }
+        self.max = Some(max);
+        Ok(self)
     }
 
     /// Takes the next `chunk` of the body as sent, and returns the data in it.
@@ -283,6 +310,9 @@ impl Payload {
         };
         for piece in &data {
             self.decoded += piece.len() as u64;
+            if self.max.is_some_and(|max| self.decoded > max) {
+                return Err(too_large());
+            }
             if let Some((hasher, _)) = &mut self.md5 {
                 hasher.update(piece);
             }
@@ -419,6 +449,43 @@ mod tests {
         assert_eq!(code(read(&pairs, framed)), "XAmzContentSHA256Mismatch");
         let pairs = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("content-encoding", "aws-chunked")];
         assert_eq!(read(&pairs, framed).unwrap(), framed);
+    }
+
+    /// Feeds `body`, limited to `max` bytes, a byte at a time.
+    fn read_at_most(pairs: &[(&'static str, &str)], body: &[u8], max: u64) -> Result<Vec<u8>, Rejection> {
+        let mut payload = Payload::new(&headers(pairs), "secret", true)?.at_most(max)?;
+        let mut data = Vec::new();
+        for byte in body {
+            for piece in payload.decode(Bytes::copy_from_slice(&[*byte]))? {
+                data.extend_from_slice(&piece);
+            }
+        }
+        payload.finish()?;
+        Ok(data)
+    }
+
+    #[test]
+    fn limits_the_data() {
+        let unsigned = ("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        assert_eq!(read_at_most(&[unsigned, ("content-length", "4")], b"data", 4).unwrap(), b"data");
+        // Declared too large: refused before any of it is read.
+        let refused = Payload::new(&headers(&[unsigned, ("content-length", "5")]), "secret", true)
+            .unwrap()
+            .at_most(4);
+        assert_eq!(refused.err().unwrap().code, "EntityTooLarge");
+        // Not declared (chunked transfer encoding): refused once there's more.
+        assert_eq!(code(read_at_most(&[unsigned], b"datas", 4)), "EntityTooLarge");
+        // Streaming: by its declared data length, not its framed one.
+        let pairs = [
+            ("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER"),
+            ("x-amz-trailer", "x-amz-checksum-crc32c"),
+            ("x-amz-decoded-content-length", "9"),
+            ("content-length", "1000"),
+        ];
+        let crc = checksum(Algorithm::Crc32c, b"some data");
+        let body = unsigned_body(b"some data", 4, &format!("x-amz-checksum-crc32c:{crc}\r\n"));
+        assert_eq!(read_at_most(&pairs, &body, 9).unwrap(), b"some data");
+        assert_eq!(code(read_at_most(&pairs, &body, 8)), "EntityTooLarge");
     }
 
     #[test]

@@ -730,6 +730,12 @@ mod tests {
     }
 
     #[test]
+    fn the_largest_object_matches_the_catalog() {
+        let limit = crate::s3::util::MAX_OBJECT.to_string();
+        assert!(super::CATALOG_FUNCTIONS.contains(&format!("v_total > {limit}")));
+    }
+
+    #[test]
     fn the_fold_lock_matches_the_catalog() {
         let call = format!("pg_try_advisory_xact_lock({})", super::FOLD_LOCK);
         assert!(super::CATALOG_FUNCTIONS.contains(&call));

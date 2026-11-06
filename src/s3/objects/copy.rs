@@ -22,8 +22,8 @@ use crate::{
             resolve_object_parts, select_parts_in_range, spawn_range_stream,
         },
         util::{
-            decode_path_param, format_s3_error, is_well_formed, query_param, with_version_id,
-            xml_ok,
+            MAX_UPLOAD, decode_path_param, format_s3_error, is_well_formed, query_param,
+            with_version_id, xml_ok,
         },
         versions::{invalid_version_id, is_version_id, new_version_id},
     },
@@ -163,6 +163,17 @@ pub async fn copy_object(
         let version = &source.version;
         if preconditions.evaluate(&version.etag, version.lm_epoch, true) != Precondition::Proceed {
             return Ok(copy_precondition_failed());
+        }
+        // As in S3: a larger object is copied part by part (UploadPartCopy).
+        if version.size as u64 > MAX_UPLOAD {
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                &format!(
+                    "The specified copy source is larger than the maximum allowable size for a \
+                     copy source: {MAX_UPLOAD}"
+                ),
+            ));
         }
         let (content_type, metadata) = if replace {
             (request_content_type, request_metadata)
@@ -456,6 +467,13 @@ pub async fn copy_part(
                 ));
             }
         };
+        if end - start > MAX_UPLOAD {
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                &format!("The specified copy range is larger than the maximum part size: {MAX_UPLOAD}"),
+            ));
+        }
         let respond = |etag: &str| {
             let resp = xml_ok(format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\

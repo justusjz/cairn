@@ -313,6 +313,14 @@ aws s3api copy-object --bucket my-bucket --key some/key \
 Old versions take up space until they're deleted. There are no lifecycle rules
 yet to expire them automatically.
 
+## Limits
+
+As in S3: a PutObject, an UploadPart, an UploadPartCopy's range and a
+CopyObject's source may hold up to **5 GiB**, and an object up to **5 TiB**
+(10,000 parts). Larger objects are uploaded in parts, and copied part by part,
+which S3 clients do by themselves. A request declaring more is refused before
+its body is read.
+
 ## Encryption
 
 Objects can be encrypted with a key their client supplies (**SSE-C**): send the

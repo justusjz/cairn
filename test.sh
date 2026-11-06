@@ -54,7 +54,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=90
+TOTAL=91
 STEP=0
 PASS=0
 FAIL=0
@@ -877,6 +877,12 @@ list_uploads_ok() {
     [ "$listed" = 0 ]
 }
 
+# A PUT declaring more than 5 GiB is refused (400 EntityTooLarge) before its
+# body is read: here, it never comes.
+too_large_refused() {
+    [ "$(scurl PUT "/${BUCKET}/too-large" UNSIGNED-PAYLOAD "$SMALL" "Content-Length: 5368709121")" = 400 ]
+}
+
 # Operations Cairn doesn't implement are refused (501), not run as the plain
 # PUT/DELETE/GET they'd otherwise route to: the object and the bucket survive.
 unsupported_subresources_refused() {
@@ -1628,6 +1634,7 @@ run_test    "Packer compacts mostly-dead blobs"      pack_compacts_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
+run_test    "A PUT over 5 GiB is refused"           too_large_refused
 run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets
 run_test    "Read-only role can read, not write"    reader_permissions_ok

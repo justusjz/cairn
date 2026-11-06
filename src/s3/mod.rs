@@ -404,7 +404,7 @@ pub async fn handle(
         hyper::Method::PUT if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
             let part_number = query_param(&query, "partNumber").unwrap_or_default();
-            match payload {
+            match payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)) {
                 Ok(payload) => {
                     let customer_key = customer_key.as_ref();
                     put_part(&app, &bucket, &key, &upload_id, &part_number, req.into_body(), payload, customer_key)
@@ -437,7 +437,7 @@ pub async fn handle(
             )
             .await?
         }
-        hyper::Method::PUT => match (payload, metadata) {
+        hyper::Method::PUT => match (payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)), metadata) {
             (Ok(payload), Ok(metadata)) => {
                 let body = req.into_body();
                 let customer_key = customer_key.as_ref();

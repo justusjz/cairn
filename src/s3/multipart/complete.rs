@@ -29,6 +29,8 @@ enum CompleteOutcome {
     },
     NoSuchUpload,
     InvalidPart,
+    /// Its parts make an object larger than S3 stores.
+    TooLarge,
     /// A conditional-completion guard (If-Match / If-None-Match) didn't hold.
     PreconditionFailed,
 }
@@ -164,6 +166,16 @@ pub async fn complete_multipart_upload(
                     "one or more listed parts could not be found or its ETag did not match",
                 ));
             }
+            Ok(CompleteOutcome::TooLarge) => {
+                return Ok(format_s3_error(
+                    StatusCode::BAD_REQUEST,
+                    "EntityTooLarge",
+                    &format!(
+                        "Your proposed upload exceeds the maximum allowed object size ({} bytes).",
+                        crate::s3::util::MAX_OBJECT
+                    ),
+                ));
+            }
             Ok(CompleteOutcome::PreconditionFailed) => {
                 return Ok(format_s3_error(
                     StatusCode::PRECONDITION_FAILED,
@@ -213,6 +225,7 @@ async fn try_complete(
         "done" => {}
         "no_such_upload" => return Ok(CompleteOutcome::NoSuchUpload),
         "invalid_part" => return Ok(CompleteOutcome::InvalidPart),
+        "too_large" => return Ok(CompleteOutcome::TooLarge),
         "precondition_failed" => return Ok(CompleteOutcome::PreconditionFailed),
         status => unreachable!("cairn_complete_upload: unknown status {status}"),
     }

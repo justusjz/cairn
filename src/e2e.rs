@@ -26,6 +26,7 @@ mod cleanup;
 mod copies;
 mod deadlocks;
 mod encrypted;
+mod limits;
 mod listing;
 mod locking;
 mod metadata;

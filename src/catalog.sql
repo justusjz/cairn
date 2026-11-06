@@ -889,8 +889,8 @@ $$;
 -- then X: the blobs of the listed parts (shared), the left-out staged parts
 -- and the replaced version's parts. Checks that the upload exists and belongs
 -- to (bucket, key) ('no_such_upload'), that every listed part is staged with
--- the listed ETag ('invalid_part'), and the conditional-write guard
--- ('precondition_failed'). Then publishes the listed parts as the key's new
+-- the listed ETag ('invalid_part'), that they make an object S3 would store
+-- ('too_large'), and the conditional-write guard ('precondition_failed'). Then publishes the listed parts as the key's new
 -- version, deletes the staged parts left out, and the upload ('done', with
 -- the object's ETag).
 --
@@ -971,6 +971,11 @@ BEGIN
                 AND p.etag = r.etag;
     IF cardinality(v_listed) <> cardinality(p_part_numbers) THEN
         status := 'invalid_part';
+        RETURN;
+    END IF;
+    -- S3's largest object, 5 TiB (`s3::util::MAX_OBJECT`).
+    IF v_total > 5497558138880 THEN
+        status := 'too_large';
         RETURN;
     END IF;
     IF (p_if_match IS NOT NULL OR p_if_none_match IS NOT NULL)
