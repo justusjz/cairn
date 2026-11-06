@@ -215,10 +215,18 @@ async fn versions_page(
     version_id_marker: &str,
     max_keys: i64,
 ) -> Vec<(String, String)> {
-    let response =
-        list_object_versions(app, BUCKET, "", None, key_marker, Some(version_id_marker), max_keys)
-            .await
-            .unwrap();
+    let response = list_object_versions(
+        app,
+        BUCKET,
+        "",
+        None,
+        key_marker,
+        Some(version_id_marker),
+        max_keys,
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
@@ -310,10 +318,18 @@ async fn uploads_page(
     max_uploads: i64,
 ) -> (Vec<String>, Option<(String, Option<String>)>) {
     let delimiter = (!delimiter.is_empty()).then_some(delimiter);
-    let response =
-        list_multipart_uploads(app, BUCKET, "", delimiter, key_marker, upload_id_marker, max_uploads)
-            .await
-            .unwrap();
+    let response = list_multipart_uploads(
+        app,
+        BUCKET,
+        "",
+        delimiter,
+        key_marker,
+        upload_id_marker,
+        max_uploads,
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap().to_owned();
@@ -378,6 +394,108 @@ async fn walks_uploads_and_common_prefixes() {
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(uploads_page(&app, "", "a", Some(&ids["a"][0]), 1000).await.0, all[1..]);
     // An upload marker that can't be an upload ID is refused.
-    let response = list_multipart_uploads(&app, BUCKET, "", None, "a", Some("nope"), 1000).await.unwrap();
+    let response = list_multipart_uploads(
+        &app,
+        BUCKET,
+        "",
+        None,
+        "a",
+        Some("nope"),
+        1000,
+        Default::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// ListObjects as S3 writes it: `encoding-type=url` percent-encodes keys and
+/// common prefixes (but `/`), v1 lists each key's owner and v2 only with
+/// `fetch-owner`, and a page of none isn't truncated.
+#[tokio::test]
+async fn lists_as_s3_writes_listings() {
+    use crate::s3::{
+        objects::list::{ListVersion, list_objects},
+        util::Encoding,
+    };
+    let Some(app) = node().await else { return };
+    for key in ["foo+1/bar", "foo/bar/xyzzy", "quux ab/thud", "asdf+b"] {
+        put(&app, key, b"x".to_vec()).await;
+    }
+    let body = |response: hyper::Response<http_body_util::Full<hyper::body::Bytes>>| async move {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    };
+    let v2 = |fetch_owner| ListVersion::V2 {
+        continuation_token: None,
+        start_after: None,
+        fetch_owner,
+    };
+    let listed = body(
+        list_objects(
+            &app,
+            BUCKET,
+            "",
+            Some("/"),
+            "",
+            1000,
+            ListVersion::V1,
+            Encoding::Url,
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        listed.contains("<EncodingType>url</EncodingType>"),
+        "{listed}"
+    );
+    assert!(listed.contains("<Key>asdf%2Bb</Key>"), "{listed}");
+    for prefix in ["foo%2B1/", "foo/", "quux%20ab/"] {
+        assert!(
+            listed.contains(&format!("<Prefix>{prefix}</Prefix>")),
+            "{prefix}: {listed}"
+        );
+    }
+    assert!(
+        listed.contains("<Owner><ID>cairn</ID>"),
+        "v1 lists owners: {listed}"
+    );
+    let listed = body(
+        list_objects(&app, BUCKET, "", None, "", 1000, v2(false), Encoding::Plain)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(
+        listed.contains("<Key>quux ab/thud</Key>") && !listed.contains("<Owner>"),
+        "{listed}"
+    );
+    assert!(!listed.contains("<EncodingType>"), "{listed}");
+    let listed = body(
+        list_objects(&app, BUCKET, "", None, "", 1000, v2(true), Encoding::Plain)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(listed.contains("<Owner><ID>cairn</ID>"), "{listed}");
+    let listed = body(
+        list_objects(
+            &app,
+            BUCKET,
+            "",
+            None,
+            "",
+            0,
+            ListVersion::V1,
+            Encoding::Plain,
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert!(
+        listed.contains("<IsTruncated>false</IsTruncated>") && !listed.contains("<Contents>"),
+        "{listed}"
+    );
 }

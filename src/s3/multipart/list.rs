@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App,
-    s3::util::{format_s3_error, xml_escape, xml_ok},
+    s3::util::{Encoding, format_s3_error, xml_escape, xml_ok},
     s3::versions::bucket_versioning,
 };
 
@@ -19,6 +19,7 @@ use crate::{
 /// later uploads come first). Without a key marker, the upload marker is
 /// ignored, as S3 ignores it. Uploads and common prefixes each count toward
 /// `max_uploads`.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_multipart_uploads(
     app: &App,
     bucket: &str,
@@ -27,6 +28,7 @@ pub async fn list_multipart_uploads(
     key_marker: &str,
     upload_id_marker: Option<&str>,
     max_uploads: i64,
+    encoding: Encoding,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id_marker = upload_id_marker.filter(|_| !key_marker.is_empty());
     // Upload IDs are UUIDv7s, which order an upload among its key's whether or
@@ -66,7 +68,8 @@ pub async fn list_multipart_uploads(
     tx.commit().await?;
     drop(client);
 
-    let truncated = rows.len() as i64 > max_uploads;
+    // A page of none tells nothing about what's left (as in S3).
+    let truncated = rows.len() as i64 > max_uploads && max_uploads > 0;
     let kept = &rows[..(max_uploads as usize).min(rows.len())];
 
     let mut uploads = String::new();
@@ -75,7 +78,7 @@ pub async fn list_multipart_uploads(
         if row.get::<_, bool>("is_prefix") {
             prefixes.push_str(&format!(
                 "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
-                xml_escape(row.get("key"))
+                encoding.xml(row.get("key"))
             ));
             continue;
         }
@@ -84,7 +87,7 @@ pub async fn list_multipart_uploads(
         uploads.push_str(&format!(
             "<Upload><Key>{}</Key><UploadId>{upload_id}</UploadId>{INITIATOR}{OWNER}\
              <StorageClass>STANDARD</StorageClass><Initiated>{initiated}</Initiated></Upload>",
-            xml_escape(row.get("key")),
+            encoding.xml(row.get("key")),
         ));
     }
 
@@ -93,16 +96,20 @@ pub async fn list_multipart_uploads(
          <ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
     body.push_str(&format!("<Bucket>{}</Bucket>", xml_escape(bucket)));
-    body.push_str(&format!("<KeyMarker>{}</KeyMarker>", xml_escape(key_marker)));
+    body.push_str(&format!(
+        "<KeyMarker>{}</KeyMarker>",
+        encoding.xml(key_marker)
+    ));
     body.push_str(&format!(
         "<UploadIdMarker>{}</UploadIdMarker>",
         xml_escape(upload_id_marker.unwrap_or(""))
     ));
-    body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
+    body.push_str(&format!("<Prefix>{}</Prefix>", encoding.xml(prefix)));
     if let Some(d) = delimiter {
-        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", encoding.xml(d)));
     }
     body.push_str(&format!("<MaxUploads>{max_uploads}</MaxUploads>"));
+    body.push_str(encoding.element());
     body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
     // The next page resumes after the last entry kept: after that upload of its
     // key, or past a whole common prefix, which is then the key marker. An empty
@@ -117,7 +124,10 @@ pub async fn list_multipart_uploads(
             ),
             None => (key_marker.to_owned(), upload_id_marker.map(str::to_owned)),
         };
-        body.push_str(&format!("<NextKeyMarker>{}</NextKeyMarker>", xml_escape(&next_key)));
+        body.push_str(&format!(
+            "<NextKeyMarker>{}</NextKeyMarker>",
+            encoding.xml(&next_key)
+        ));
         if let Some(u) = next_upload {
             body.push_str(&format!("<NextUploadIdMarker>{}</NextUploadIdMarker>", xml_escape(&u)));
         }

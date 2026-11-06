@@ -4,7 +4,7 @@ use hyper::{Response, StatusCode, body::Bytes};
 use crate::db::Cached;
 use crate::{
     App,
-    s3::util::{format_s3_error, xml_escape, xml_ok},
+    s3::util::{Encoding, format_s3_error, xml_escape, xml_ok},
     s3::versions::bucket_versioning,
 };
 
@@ -16,6 +16,7 @@ use crate::{
 /// `version_id_marker` too, after that version of `key_marker` (so the rest of
 /// that key's older versions come first). Versions, delete markers and common
 /// prefixes each count toward `max_keys`.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_object_versions(
     app: &App,
     bucket: &str,
@@ -24,6 +25,7 @@ pub async fn list_object_versions(
     key_marker: &str,
     version_id_marker: Option<&str>,
     max_keys: i64,
+    encoding: Encoding,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let mut client = app.pool.get().await?;
     let tx = client.transaction().await?;
@@ -80,7 +82,8 @@ pub async fn list_object_versions(
     drop(client);
 
     // The extra row (if present) means there's more; keep only max_keys of them.
-    let truncated = rows.len() as i64 > max_keys;
+    // A page of none tells nothing about what's left (as in S3).
+    let truncated = rows.len() as i64 > max_keys && max_keys > 0;
     let kept = &rows[..(max_keys as usize).min(rows.len())];
 
     let mut entries = String::new();
@@ -89,7 +92,7 @@ pub async fn list_object_versions(
         if row.get::<_, bool>("is_prefix") {
             prefixes.push_str(&format!(
                 "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
-                xml_escape(row.get("key"))
+                encoding.xml(row.get("key"))
             ));
             continue;
         }
@@ -100,7 +103,7 @@ pub async fn list_object_versions(
         let common = format!(
             "<Key>{}</Key><VersionId>{}</VersionId><IsLatest>{is_latest}</IsLatest>\
              <LastModified>{last_modified}</LastModified>",
-            xml_escape(key),
+            encoding.xml(key),
             xml_escape(version_id),
         );
         if row.get::<_, bool>("is_delete_marker") {
@@ -121,16 +124,20 @@ pub async fn list_object_versions(
          <ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
     body.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
-    body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
-    body.push_str(&format!("<KeyMarker>{}</KeyMarker>", xml_escape(key_marker)));
+    body.push_str(&format!("<Prefix>{}</Prefix>", encoding.xml(prefix)));
+    body.push_str(&format!(
+        "<KeyMarker>{}</KeyMarker>",
+        encoding.xml(key_marker)
+    ));
     body.push_str(&format!(
         "<VersionIdMarker>{}</VersionIdMarker>",
         xml_escape(version_id_marker.unwrap_or(""))
     ));
     if let Some(d) = delimiter {
-        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", encoding.xml(d)));
     }
     body.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    body.push_str(encoding.element());
     body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
     // The next page resumes after the last entry kept: after that version of its
     // key, or past a whole common prefix, which is then the key marker. An empty
@@ -144,7 +151,7 @@ pub async fn list_object_versions(
         };
         body.push_str(&format!(
             "<NextKeyMarker>{}</NextKeyMarker>",
-            xml_escape(next_key)
+            encoding.xml(next_key)
         ));
         if let Some(v) = next_version {
             body.push_str(&format!(

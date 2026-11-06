@@ -1,7 +1,7 @@
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use http_body_util::Full;
 use hyper::{Method, Response, StatusCode, body::Bytes, header::HeaderValue};
-use percent_encoding::percent_decode_str;
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 
 use crate::auth::Rejection;
 
@@ -327,6 +327,83 @@ pub fn decode_continuation_token(token: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// How a listing writes keys, prefixes, delimiters and markers: as they are,
+/// or, asked for with `encoding-type=url`, percent-encoded (so that keys XML
+/// can't hold, control characters say, come through).
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub enum Encoding {
+    #[default]
+    Plain,
+    Url,
+}
+
+/// What `encoding-type=url` leaves as it is, as S3 does: unreserved characters
+/// and `/`.
+const URL_KEEPS: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
+
+impl Encoding {
+    /// `encoding-type`, or the error to refuse a listing with.
+    pub fn from_query(query: &str) -> Result<Encoding, Response<Full<Bytes>>> {
+        match query_param(query, "encoding-type").as_deref() {
+            None => Ok(Encoding::Plain),
+            Some(e) if e.eq_ignore_ascii_case("url") => Ok(Encoding::Url),
+            Some(_) => Err(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "Invalid Encoding Method specified in Request",
+            )),
+        }
+    }
+
+    /// `s`, encoded, escaped for XML.
+    pub fn xml(self, s: &str) -> String {
+        match self {
+            Encoding::Plain => xml_escape(s),
+            Encoding::Url => utf8_percent_encode(s, URL_KEEPS).to_string(),
+        }
+    }
+
+    /// The `<EncodingType>` a listing reports, if it was asked for one.
+    pub fn element(self) -> &'static str {
+        match self {
+            Encoding::Plain => "",
+            Encoding::Url => "<EncodingType>url</EncodingType>",
+        }
+    }
+}
+
+/// A listing's page size (`max-keys`, `max-uploads`, `max-parts`,
+/// `max-buckets`): `default` if absent, at most `max`, or the error for one
+/// that isn't a whole number, not negative, as S3 refuses it.
+pub fn page_size(
+    query: &str,
+    name: &str,
+    default: i64,
+    max: i64,
+) -> Result<i64, Response<Full<Bytes>>> {
+    match query_param(query, name) {
+        None => Ok(default),
+        Some(v) => match v.trim().parse::<i64>() {
+            Ok(n) if n >= 0 => Ok(n.min(max)),
+            _ => Err(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                &format!("Provided {name} not an integer or within integer range"),
+            )),
+        },
+    }
+}
+
+/// A listing's delimiter: none if absent or empty, as S3 takes an empty one.
+pub fn delimiter(query: &str) -> Option<String> {
+    query_param(query, "delimiter").filter(|d| !d.is_empty())
+}
+
 /// Extracts and percent-decodes a single parameter from a raw query string
 /// (e.g. "prefix=dir%2F&delimiter=%2F").
 pub fn query_param(query: &str, name: &str) -> Option<String> {
@@ -348,6 +425,31 @@ mod tests {
         for bad in ["%FF", "caf%C3", "a%00b", "%C0%80"] {
             assert!(!is_well_formed(bad), "{bad}");
         }
+    }
+
+    #[test]
+    fn listings_encode_and_page_as_s3_does() {
+        assert_eq!(
+            Encoding::Url.xml("foo+1/quux ab/a&b~-_."),
+            "foo%2B1/quux%20ab/a%26b~-_."
+        );
+        assert_eq!(Encoding::Plain.xml("a&b"), "a&amp;b");
+        assert_eq!(
+            Encoding::from_query("encoding-type=url").unwrap(),
+            Encoding::Url
+        );
+        assert!(Encoding::from_query("encoding-type=base64").is_err());
+        assert_eq!(page_size("", "max-keys", 1000, 1000).unwrap(), 1000);
+        assert_eq!(page_size("max-keys=0", "max-keys", 1000, 1000).unwrap(), 0);
+        assert_eq!(
+            page_size("max-keys=5000", "max-keys", 1000, 1000).unwrap(),
+            1000
+        );
+        for bad in ["max-keys=blah", "max-keys=-1", "max-keys="] {
+            assert!(page_size(bad, "max-keys", 1000, 1000).is_err(), "{bad}");
+        }
+        assert_eq!(delimiter("delimiter="), None);
+        assert_eq!(delimiter("delimiter=%2F").as_deref(), Some("/"));
     }
 
     #[test]

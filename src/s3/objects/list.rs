@@ -4,7 +4,9 @@ use hyper::{Response, StatusCode, body::Bytes};
 use crate::db::Cached;
 use crate::{
     App,
-    s3::util::{Timestamp, encode_continuation_token, format_s3_error, xml_escape, xml_ok},
+    s3::util::{
+        Encoding, Timestamp, encode_continuation_token, format_s3_error, xml_escape, xml_ok,
+    },
 };
 
 /// S3's cap on keys returned per listing, and the default when `max-keys` is
@@ -21,6 +23,8 @@ pub enum ListVersion {
     V2 {
         continuation_token: Option<String>,
         start_after: Option<String>,
+        /// Whether each key's owner is listed (`fetch-owner`), as v1 always does.
+        fetch_owner: bool,
     },
 }
 
@@ -154,7 +158,9 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
     }))
 }
 
-/// ListObjects and ListObjectsV2: a page of `list`, as S3's XML.
+/// ListObjects and ListObjectsV2: a page of `list`, as S3's XML, with keys and
+/// the like written as `encoding` says.
+#[allow(clippy::too_many_arguments)]
 pub async fn list_objects(
     app: &App,
     bucket: &str,
@@ -163,6 +169,7 @@ pub async fn list_objects(
     marker: &str,
     max_keys: i64,
     version: ListVersion,
+    encoding: Encoding,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let query = ListQuery {
         prefix,
@@ -176,8 +183,17 @@ pub async fn list_objects(
         return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", ""));
     };
     let key_count = listing.entries.len();
-    let next_marker = listing.next_marker;
-    let truncated = listing.truncated;
+    // A page of none tells nothing about what's left, so S3 says there's
+    // nothing (`max-keys=0`).
+    let truncated = listing.truncated && max_keys > 0;
+    let next_marker = listing.next_marker.filter(|_| truncated);
+    let owner = match &version {
+        ListVersion::V1
+        | ListVersion::V2 {
+            fetch_owner: true, ..
+        } => "<Owner><ID>cairn</ID><DisplayName>cairn</DisplayName></Owner>",
+        ListVersion::V2 { .. } => "",
+    };
 
     // Split the sorted stream into the two output lists (each stays sorted).
     let mut contents = String::new();
@@ -186,7 +202,7 @@ pub async fn list_objects(
         match entry {
             ListEntry::Prefix { prefix, .. } => prefixes.push_str(&format!(
                 "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
-                xml_escape(prefix)
+                encoding.xml(prefix)
             )),
             ListEntry::Object {
                 key,
@@ -196,8 +212,8 @@ pub async fn list_objects(
                 ..
             } => contents.push_str(&format!(
                 "<Contents><Key>{}</Key><LastModified>{}</LastModified>\
-                 <ETag>\"{}\"</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
-                xml_escape(key),
+                 <ETag>\"{}\"</ETag><Size>{}</Size>{owner}<StorageClass>STANDARD</StorageClass></Contents>",
+                encoding.xml(key),
                 last_modified.iso,
                 xml_escape(etag.as_deref().unwrap_or("")),
                 size,
@@ -210,23 +226,25 @@ pub async fn list_objects(
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
     body.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
-    body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
+    body.push_str(&format!("<Prefix>{}</Prefix>", encoding.xml(prefix)));
     if let Some(d) = delimiter {
-        body.push_str(&format!("<Delimiter>{}</Delimiter>", xml_escape(d)));
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", encoding.xml(d)));
     }
     body.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    body.push_str(encoding.element());
     // Version-specific cursor elements. v1 speaks markers; v2 speaks opaque
     // continuation tokens and reports KeyCount.
     match &version {
         ListVersion::V1 => {
-            body.push_str(&format!("<Marker>{}</Marker>", xml_escape(marker)));
+            body.push_str(&format!("<Marker>{}</Marker>", encoding.xml(marker)));
             if let Some(nm) = &next_marker {
-                body.push_str(&format!("<NextMarker>{}</NextMarker>", xml_escape(nm)));
+                body.push_str(&format!("<NextMarker>{}</NextMarker>", encoding.xml(nm)));
             }
         }
         ListVersion::V2 {
             continuation_token,
             start_after,
+            ..
         } => {
             body.push_str(&format!("<KeyCount>{key_count}</KeyCount>"));
             if let Some(token) = continuation_token {
@@ -236,7 +254,7 @@ pub async fn list_objects(
                 ));
             }
             if let Some(sa) = start_after {
-                body.push_str(&format!("<StartAfter>{}</StartAfter>", xml_escape(sa)));
+                body.push_str(&format!("<StartAfter>{}</StartAfter>", encoding.xml(sa)));
             }
             if let Some(nm) = &next_marker {
                 body.push_str(&format!(

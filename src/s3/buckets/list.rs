@@ -1,11 +1,14 @@
 use http_body_util::Full;
-use hyper::{Response, body::Bytes};
+use hyper::{Response, StatusCode, body::Bytes};
 
 use crate::db::Cached;
 use crate::{
     App,
     roles::Principal,
-    s3::util::{Timestamp, timestamp_sql, xml_escape, xml_ok},
+    s3::util::{
+        Timestamp, decode_continuation_token, encode_continuation_token, format_s3_error,
+        page_size, query_param, timestamp_sql, xml_escape, xml_ok,
+    },
     s3::versions::Versioning,
 };
 
@@ -40,27 +43,65 @@ pub async fn buckets(app: &App) -> anyhow::Result<Vec<BucketInfo>> {
         .collect())
 }
 
+/// The most buckets a page of ListBuckets lists, as in S3.
+const MAX_BUCKETS: i64 = 10_000;
+
 /// ListBuckets: `GET /`. Lists the buckets the role can see: every bucket for an
-/// admin, otherwise only those it holds a grant on.
+/// admin, otherwise only those it holds a grant on. As in S3, by name, those
+/// starting with `prefix`, paginated by `max-buckets` and an opaque
+/// `continuation-token` (all of them, without `max-buckets`).
 pub async fn list_buckets(
     app: &App,
     principal: &Principal,
+    query: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
+    let invalid =
+        |message: &str| format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message);
+    let max = match page_size(query, "max-buckets", MAX_BUCKETS, MAX_BUCKETS) {
+        Ok(0) => return Ok(invalid("max-buckets must be between 1 and 10000")),
+        Ok(n) => n as usize,
+        Err(refused) => return Ok(refused),
+    };
+    let after = match query_param(query, "continuation-token") {
+        None => None,
+        Some(token) => match decode_continuation_token(&token) {
+            Some(name) => Some(name),
+            None => return Ok(invalid("the continuation token is not valid")),
+        },
+    };
+    let prefix = query_param(query, "prefix").unwrap_or_default();
+    let mut listed: Vec<BucketInfo> = buckets(app)
+        .await?
+        .into_iter()
+        .filter(|b| principal.can_see(&b.name) && b.name.starts_with(&prefix))
+        .filter(|b| after.as_ref().is_none_or(|after| b.name > *after))
+        .take(max + 1)
+        .collect();
+    let more = listed.len() > max;
+    listed.truncate(max);
+
     let mut body = String::from(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
              <ListAllMyBucketsResult><Owner><ID>cairn</ID>\
              <DisplayName>cairn</DisplayName></Owner><Buckets>",
     );
-    for bucket in buckets(app).await? {
-        if !principal.can_see(&bucket.name) {
-            continue;
-        }
+    for bucket in &listed {
         body.push_str(&format!(
             "<Bucket><Name>{}</Name><CreationDate>{}</CreationDate></Bucket>",
             xml_escape(&bucket.name),
             bucket.created_at.iso
         ));
     }
-    body.push_str("</Buckets></ListAllMyBucketsResult>");
+    body.push_str("</Buckets>");
+    if let Some(last) = listed.last().filter(|_| more) {
+        body.push_str(&format!(
+            "<ContinuationToken>{}</ContinuationToken>",
+            encode_continuation_token(&last.name)
+        ));
+    }
+    if !prefix.is_empty() {
+        body.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(&prefix)));
+    }
+    body.push_str("</ListAllMyBucketsResult>");
     Ok(xml_ok(body))
 }

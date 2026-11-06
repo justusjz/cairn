@@ -54,7 +54,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=95
+TOTAL=96
 STEP=0
 PASS=0
 FAIL=0
@@ -942,6 +942,24 @@ acls_disabled_ok() {
     awss3 s3api delete-object --bucket "$BUCKET" --key acl/x.txt >/dev/null 2>&1
 }
 
+# Listing parameters as S3 takes them: url-encoded keys, an empty delimiter
+# that isn't one, a page size that's no number refused; and ListBuckets in
+# pages.
+listing_parameters_ok() {
+    local listed tok
+    s3 put "$SMALL" "s3://${BUCKET}/enc/a+b c" >/dev/null 2>&1 || return 1
+    listed=$(scurl_get "/${BUCKET}?list-type=2&prefix=enc%2F&encoding-type=url&delimiter=") || return 1
+    echo "$listed" | grep -q '<Key>enc/a%2Bb%20c</Key>' || return 1
+    echo "$listed" | grep -q '<EncodingType>url</EncodingType>' || return 1
+    ! echo "$listed" | grep -q '<Delimiter>' || return 1
+    [ "$(scurl GET "/${BUCKET}?max-keys=blah" "$EMPTY_SHA256" -)" = 400 ] || return 1
+    tok=$(awss3 s3api list-buckets --max-buckets 1 --query ContinuationToken --output text 2>/dev/null) || return 1
+    [ -n "$tok" ] && [ "$tok" != None ] || return 1
+    [ "$(awss3 s3api list-buckets --max-buckets 1 --continuation-token "$tok" \
+        --query 'length(Buckets)' --output text 2>/dev/null)" = 1 ] || return 1
+    s3 del "s3://${BUCKET}/enc/a+b c" >/dev/null 2>&1
+}
+
 # Presigned URLs: a GET (aws-cli's) and a PUT (ours) work with nothing but
 # curl, and a GET can set the response's Content-Disposition; changing the URL
 # or letting it expire breaks it.
@@ -1749,6 +1767,7 @@ run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
 run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
 run_test    "Presigned GET/PUT, response headers"   presigned_ok
+run_test    "Listing parameters as in S3"           listing_parameters_ok
 run_test    "A PUT over 5 GiB is refused"           too_large_refused
 run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets

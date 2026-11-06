@@ -89,7 +89,9 @@ pub async fn handle(
     let path = req.uri().path().trim_start_matches('/');
     if path.is_empty() {
         let resp = match req.method() {
-            &hyper::Method::GET => list_buckets(&app, &principal).await?,
+            &hyper::Method::GET => {
+                list_buckets(&app, &principal, req.uri().query().unwrap_or("")).await?
+            }
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
         };
         return Ok(box_response(resp));
@@ -156,12 +158,27 @@ pub async fn handle(
                 return Ok(box_response(resp));
             }
         }
-        // Clamp max-keys to [0, 1000]; absent or unparseable falls back to the 1000
-        // default (lenient — we don't 400 on a garbage value).
-        let max_keys = query_param(&query, "max-keys")
-            .and_then(|v| v.parse::<i64>().ok())
-            .unwrap_or(MAX_KEYS_LIMIT)
-            .clamp(0, MAX_KEYS_LIMIT);
+        // A listing's page size (max-keys, or max-uploads), and how it writes
+        // keys (encoding-type), checked before anything's listed, as in S3. An
+        // empty delimiter is none.
+        let (max_keys, encoding) = match *req.method() {
+            Method::GET => {
+                let name = match query_param(&query, "uploads") {
+                    Some(_) => "max-uploads",
+                    None => "max-keys",
+                };
+                let max_keys = match util::page_size(&query, name, MAX_KEYS_LIMIT, MAX_KEYS_LIMIT) {
+                    Ok(n) => n,
+                    Err(refused) => return Ok(box_response(refused)),
+                };
+                match util::Encoding::from_query(&query) {
+                    Ok(encoding) => (max_keys, encoding),
+                    Err(refused) => return Ok(box_response(refused)),
+                }
+            }
+            _ => (MAX_KEYS_LIMIT, util::Encoding::Plain),
+        };
+        let delimiter = util::delimiter(&query);
         let resp = match req.method().clone() {
             // ListObjectVersions: GET /{bucket}?versions, paginated by key-marker
             // and version-id-marker.
@@ -174,34 +191,31 @@ pub async fn handle(
                     &app,
                     &bucket,
                     &query_param(&query, "prefix").unwrap_or_default(),
-                    query_param(&query, "delimiter").as_deref(),
+                    delimiter.as_deref(),
                     &query_param(&query, "key-marker").unwrap_or_default(),
                     marker.as_deref(),
                     max_keys,
+                    encoding,
                 )
                 .await?
             }
             // ListMultipartUploads: GET /{bucket}?uploads, paginated by
             // key-marker and upload-id-marker.
             hyper::Method::GET if query_param(&query, "uploads").is_some() => {
-                let max_uploads = query_param(&query, "max-uploads")
-                    .and_then(|v| v.parse::<i64>().ok())
-                    .unwrap_or(MAX_KEYS_LIMIT)
-                    .clamp(0, MAX_KEYS_LIMIT);
                 list_multipart_uploads(
                     &app,
                     &bucket,
                     &query_param(&query, "prefix").unwrap_or_default(),
-                    query_param(&query, "delimiter").as_deref(),
+                    delimiter.as_deref(),
                     &query_param(&query, "key-marker").unwrap_or_default(),
                     query_param(&query, "upload-id-marker").as_deref(),
-                    max_uploads,
+                    max_keys,
+                    encoding,
                 )
                 .await?
             }
             hyper::Method::GET => {
                 let prefix = query_param(&query, "prefix").unwrap_or_default();
-                let delimiter = query_param(&query, "delimiter");
                 let is_v2 = query_param(&query, "list-type").as_deref() == Some("2");
                 // Resolve the pagination cursor to a single "resume after this
                 // key" marker. ListObjectsV2 carries it in an opaque
@@ -230,6 +244,7 @@ pub async fn handle(
                     ListVersion::V2 {
                         continuation_token: query_param(&query, "continuation-token"),
                         start_after: query_param(&query, "start-after"),
+                        fetch_owner: query_param(&query, "fetch-owner").as_deref() == Some("true"),
                     }
                 } else {
                     ListVersion::V1
@@ -242,6 +257,7 @@ pub async fn handle(
                     &marker,
                     max_keys,
                     version,
+                    encoding,
                 )
                 .await?
             }
@@ -346,10 +362,10 @@ pub async fn handle(
         // ListParts: GET /{bucket}/{key}?uploadId=U, paginated by
         // part-number-marker.
         if let Some(upload_id) = query_param(&query, "uploadId") {
-            let max_parts = query_param(&query, "max-parts")
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(MAX_PARTS)
-                .clamp(0, MAX_PARTS);
+            let max_parts = match util::page_size(&query, "max-parts", MAX_PARTS, MAX_PARTS) {
+                Ok(n) => n,
+                Err(refused) => return Ok(box_response(refused)),
+            };
             let marker = query_param(&query, "part-number-marker")
                 .and_then(|v| v.parse::<i32>().ok())
                 .unwrap_or(0);
