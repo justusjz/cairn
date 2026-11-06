@@ -182,6 +182,7 @@ const MIGRATIONS: &[&str] = &[
     UPLOADS_BY_KEY,
     COMPLETED_FROM,
     METADATA,
+    ENCRYPTED_PARTS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -675,6 +676,30 @@ ALTER TABLE objects ADD COLUMN upload_id uuid;
 const METADATA: &str = r#"
 ALTER TABLE objects ADD COLUMN metadata text NOT NULL DEFAULT '';
 ALTER TABLE multipart_uploads ADD COLUMN metadata text NOT NULL DEFAULT '';
+"#;
+
+/// Migration 14: encrypted parts (see `encryption`). An encrypted part's
+/// `size` stays what it takes in its blob, which everything below the S3 layer
+/// works with; `plain_size` is its plaintext's, which objects are made of, and
+/// `enc_salt` its salt. A plain part has neither. An SSE-C object, and an
+/// upload that's to make one, keep a check of the client's key: a random salt
+/// and the HMAC-SHA256 of the key under it, never the key.
+///
+/// The checks are NOT VALID, so adding them doesn't scan the tables: they hold
+/// for every row written from now on, and every row before has NULLs.
+const ENCRYPTED_PARTS: &str = r#"
+ALTER TABLE parts ADD COLUMN plain_size bigint;
+ALTER TABLE parts ADD COLUMN enc_salt bytea;
+ALTER TABLE parts ADD CONSTRAINT parts_encrypted CHECK (
+    (plain_size IS NULL) = (enc_salt IS NULL)
+    AND (enc_salt IS NULL OR (octet_length(enc_salt) = 16 AND plain_size >= 0))
+) NOT VALID;
+ALTER TABLE objects ADD COLUMN sse_c_key bytea;
+ALTER TABLE objects ADD CONSTRAINT objects_sse_c_key
+    CHECK (octet_length(sse_c_key) = 48) NOT VALID;
+ALTER TABLE multipart_uploads ADD COLUMN sse_c_key bytea;
+ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_sse_c_key
+    CHECK (octet_length(sse_c_key) = 48) NOT VALID;
 "#;
 
 #[cfg(test)]

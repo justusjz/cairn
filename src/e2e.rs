@@ -25,6 +25,7 @@ mod concurrency;
 mod cleanup;
 mod copies;
 mod deadlocks;
+mod encrypted;
 mod listing;
 mod locking;
 mod metadata;

@@ -523,15 +523,16 @@ END
 $$;
 
 -- Writes a new object version as the key's current version, the way S3 lands
--- a write in a bucket with the given versioning state, with its content type
--- and metadata (see `s3::metadata`). `p_new_version_id` is
+-- a write in a bucket with the given versioning state, with its content type,
+-- metadata (see `s3::metadata`) and SSE-C key check (NULL if it isn't SSE-C).
+-- `p_size` is its plaintext's. `p_new_version_id` is
 -- the fresh version ID to use if the bucket is versioned. Returns the new
 -- row's id, and the version ID to report (NULL in an unversioned bucket). The
 -- caller holds B(b) shared (which gave it the versioning state), K(b,k), and
 -- X(x) on the blobs of the parts `cairn_freed_by_put` names.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
-    p_content_type text, p_metadata text, p_new_version_id text,
+    p_content_type text, p_metadata text, p_sse_c_key bytea, p_new_version_id text,
     OUT id bigint, OUT version_id text
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -546,9 +547,9 @@ BEGIN
     END IF;
     PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
     INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
-                         size, etag, content_type, metadata, last_modified)
+                         size, etag, content_type, metadata, sse_c_key, last_modified)
     VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type,
-            p_metadata, NOW())
+            p_metadata, p_sse_c_key, NOW())
     RETURNING objects.id INTO id;
     version_id := CASE WHEN p_versioning = 'unversioned' THEN NULL ELSE v_version_id END;
 END
@@ -608,10 +609,13 @@ $$;
 -- the conditional-write guard ('precondition_failed') and that every replica
 -- recorded its location ('missing_locations', with how many did), then
 -- commits the blob, writes the version and attaches the part ('committed').
+-- `p_size` is the blob's (and the part's); an encrypted part also has its
+-- plaintext's size and its salt (NULL for a plain one), and an SSE-C object
+-- its key check.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_blob uuid, p_nodes int[], p_size bigint, p_file_crc bigint, p_block_size int,
-    p_data_crc bigint, p_etag text,
-    p_bucket text, p_key text, p_content_type text, p_metadata text,
+    p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
+    p_bucket text, p_key text, p_content_type text, p_metadata text, p_sse_c_key bytea,
     p_if_match text[], p_if_none_match text[], p_new_version_id text,
     OUT status text, OUT present bigint, OUT version_id text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
@@ -649,12 +653,13 @@ BEGIN
     END IF;
     PERFORM pg_temp.cairn_mark_committed(p_blob, p_size, p_file_crc, p_block_size);
     SELECT * INTO v FROM pg_temp.cairn_put_version(
-        p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_metadata,
-        p_new_version_id);
+        p_bucket, p_key, v_versioning, coalesce(p_plain_size, p_size), p_etag, p_content_type,
+        p_metadata, p_sse_c_key, p_new_version_id);
     version_id := v.version_id;
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
-                       part_number, created_at)
-    VALUES (p_blob, 0, p_size, p_etag, p_data_crc, v.id, NULL, 1, NOW());
+                       part_number, plain_size, enc_salt, created_at)
+    VALUES (p_blob, 0, p_size, p_etag, p_data_crc, v.id, NULL, 1, p_plain_size, p_enc_salt,
+            NOW());
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'committed';
@@ -664,10 +669,11 @@ $$;
 -- T2: commits an uploaded blob as part `p_part_number` of a multipart upload,
 -- displacing any part uploaded at that number before. Takes U(u) shared,
 -- P(u,n), then X: the blob exclusively, and the displaced part's blob. Or
--- 'no_such_upload', or 'missing_locations'.
+-- 'no_such_upload', or 'missing_locations'. Sizes and salt as for
+-- `cairn_commit_object`.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_upload_part(
     p_blob uuid, p_nodes int[], p_size bigint, p_file_crc bigint, p_block_size int,
-    p_data_crc bigint, p_etag text,
+    p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
     p_upload uuid, p_part_number int,
     OUT status text, OUT present bigint,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
@@ -698,8 +704,9 @@ BEGIN
     PERFORM pg_temp.cairn_mark_committed(p_blob, p_size, p_file_crc, p_block_size);
     DELETE FROM parts WHERE id = ANY(v_displaced);
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
-                       part_number, created_at)
-    VALUES (p_blob, 0, p_size, p_etag, p_data_crc, NULL, p_upload, p_part_number, NOW());
+                       part_number, plain_size, enc_salt, created_at)
+    VALUES (p_blob, 0, p_size, p_etag, p_data_crc, NULL, p_upload, p_part_number,
+            p_plain_size, p_enc_salt, NOW());
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'committed';
@@ -726,7 +733,7 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_source_parts(
     p_object bigint, p_part_ids bigint[], p_part_sizes bigint[], p_locked uuid[],
     OUT blob_ids uuid[], OUT offsets bigint[], OUT sizes bigint[],
-    OUT etags text[], OUT crcs bigint[]
+    OUT etags text[], OUT crcs bigint[], OUT plain_sizes bigint[], OUT salts bytea[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_ids bigint[];
@@ -736,8 +743,10 @@ BEGIN
            coalesce(array_agg(p.blob_offset ORDER BY p.part_number), '{}'),
            coalesce(array_agg(p.size ORDER BY p.part_number), '{}'),
            coalesce(array_agg(p.etag ORDER BY p.part_number), '{}'),
-           coalesce(array_agg(p.crc64nvme ORDER BY p.part_number), '{}')
-    INTO v_ids, blob_ids, offsets, sizes, etags, crcs
+           coalesce(array_agg(p.crc64nvme ORDER BY p.part_number), '{}'),
+           coalesce(array_agg(p.plain_size ORDER BY p.part_number), '{}'),
+           coalesce(array_agg(p.enc_salt ORDER BY p.part_number), '{}')
+    INTO v_ids, blob_ids, offsets, sizes, etags, crcs, plain_sizes, salts
     FROM parts p WHERE p.object_id = p_object;
     IF v_ids <> p_part_ids OR sizes <> p_part_sizes THEN
         blob_ids := NULL;
@@ -745,6 +754,8 @@ BEGIN
         sizes := NULL;
         etags := NULL;
         crcs := NULL;
+        plain_sizes := NULL;
+        salts := NULL;
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_check_on(v_ids, p_locked);
@@ -760,7 +771,7 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_source bigint, p_part_ids bigint[], p_part_sizes bigint[],
     p_bucket text, p_key text, p_size bigint, p_etag text, p_content_type text,
-    p_metadata text, p_new_version_id text,
+    p_metadata text, p_sse_c_key bytea, p_new_version_id text,
     OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -797,15 +808,16 @@ BEGIN
     END IF;
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_metadata,
-        p_new_version_id);
+        p_sse_c_key, p_new_version_id);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
-                       part_number, created_at)
-    SELECT t.blob_id, t.blob_offset, t.size, t.etag, t.crc, v.id, NULL, t.n, NOW()
-    FROM unnest(s.blob_ids, s.offsets, s.sizes, s.etags, s.crcs)
-        WITH ORDINALITY AS t(blob_id, blob_offset, size, etag, crc, n);
+                       part_number, plain_size, enc_salt, created_at)
+    SELECT t.blob_id, t.blob_offset, t.size, t.etag, t.crc, v.id, NULL, t.n, t.plain_size,
+           t.salt, NOW()
+    FROM unnest(s.blob_ids, s.offsets, s.sizes, s.etags, s.crcs, s.plain_sizes, s.salts)
+        WITH ORDINALITY AS t(blob_id, blob_offset, size, etag, crc, plain_size, salt, n);
     -- After inserting the new parts, so that a self-copy keeps its bytes.
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
@@ -853,6 +865,11 @@ BEGIN
         status := 'source_changed';
         RETURN;
     END IF;
+    -- A range of an encrypted part isn't a part (its bytes are ciphertext);
+    -- such a copy streams instead.
+    IF s.salts[p_index] IS NOT NULL THEN
+        RAISE EXCEPTION 'cairn: a range of an encrypted part can''t be staged in place';
+    END IF;
     DELETE FROM parts WHERE id = ANY(v_displaced);
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
                        part_number, created_at)
@@ -888,6 +905,7 @@ DECLARE
     v_versioning text;
     v_content_type text;
     v_metadata text;
+    v_sse_c_key bytea;
     v_listed bigint[];
     v_listed_blobs uuid[];
     v_total bigint;
@@ -906,7 +924,8 @@ BEGIN
     -- The upload defines the object's content type and metadata. It must
     -- belong to the request's bucket and key: authorization only checked the
     -- bucket.
-    SELECT content_type, metadata INTO v_content_type, v_metadata FROM multipart_uploads
+    SELECT content_type, metadata, sse_c_key INTO v_content_type, v_metadata, v_sse_c_key
+    FROM multipart_uploads
     WHERE upload_id = p_upload AND bucket = p_bucket AND key = p_key
     FOR UPDATE;
     IF v_versioning IS NULL THEN
@@ -939,7 +958,8 @@ BEGIN
     PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
     -- The object's ETag is the MD5 of the listed parts' binary MD5s, then the
     -- part count. The part numbers are distinct (the caller checked their order).
-    SELECT coalesce(array_agg(p.id), '{}'), coalesce(array_agg(p.blob_id), '{}'), sum(p.size),
+    SELECT coalesce(array_agg(p.id), '{}'), coalesce(array_agg(p.blob_id), '{}'),
+           sum(coalesce(p.plain_size, p.size)),
            md5(string_agg(decode(p.etag, 'hex'), ''::bytea ORDER BY r.n))
     INTO v_listed, v_listed_blobs, v_total, v_combined
     FROM unnest(p_part_numbers, p_etags) WITH ORDINALITY AS r(part_number, etag, n)
@@ -965,7 +985,7 @@ BEGIN
     etag := v_combined || '-' || cardinality(p_part_numbers);
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, v_total, etag, v_content_type, v_metadata,
-        p_new_version_id);
+        v_sse_c_key, p_new_version_id);
     version_id := v.version_id;
     UPDATE objects SET upload_id = p_upload WHERE id = v.id;
     UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);

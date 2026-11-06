@@ -209,7 +209,7 @@ async fn commit_object_copy(
             let row = client
                 .query_one_cached(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
-                     FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                     FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -220,6 +220,7 @@ async fn commit_object_copy(
                         &etag,
                         &content_type,
                         &metadata,
+                        &None::<Vec<u8>>,
                         &new_version_id(),
                     ],
                 )

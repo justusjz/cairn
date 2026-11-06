@@ -905,6 +905,8 @@ async fn try_commit_part(
     let file_crc = written.file_crc as i64;
     let block_size = checksum::BLOCK_SIZE as i32;
     let data_crc = written.data_crc as i64;
+    // Not encrypted (yet): no plaintext size or salt apart from the stored ones.
+    let (plain_size, enc_salt, sse_c_key) = (None::<i64>, None::<Vec<u8>>, None::<Vec<u8>>);
     let (row, version_column, reap_column) = match attach {
         AttachTarget::Object {
             bucket,
@@ -918,7 +920,7 @@ async fn try_commit_part(
                 .query_one_cached(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                                                      $11, $12, $13, $14)",
+                                                      $11, $12, $13, $14, $15, $16, $17)",
                     &[
                         &written.blob_id,
                         &written.nodes,
@@ -927,10 +929,13 @@ async fn try_commit_part(
                         &block_size,
                         &data_crc,
                         &etag,
+                        &plain_size,
+                        &enc_salt,
                         bucket,
                         key,
                         content_type,
                         metadata,
+                        &sse_c_key,
                         &if_match,
                         &if_none_match,
                         &s3::versions::new_version_id(),
@@ -946,7 +951,8 @@ async fn try_commit_part(
             let row = client
                 .query_one_cached(
                     "SELECT status, present, reap_blob, reap_node, reap_peer
-                     FROM pg_temp.cairn_commit_upload_part($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+                     FROM pg_temp.cairn_commit_upload_part($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                                                           $10, $11)",
                     &[
                         &written.blob_id,
                         &written.nodes,
@@ -955,6 +961,8 @@ async fn try_commit_part(
                         &block_size,
                         &data_crc,
                         &etag,
+                        &plain_size,
+                        &enc_salt,
                         upload_id,
                         part_number,
                     ],
