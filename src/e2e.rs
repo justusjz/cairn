@@ -92,43 +92,20 @@ pub async fn node_replicating(
 }
 
 /// A node with a KMS: the OpenBao that `CAIRN_TEST_OPENBAO` points at (see
-/// `db-test.sh`), logged in to with the AppRole `CAIRN_TEST_OPENBAO_ROLE_ID`
-/// and `_SECRET_ID`, with `cairn-test` its default key. `None` if there's no
-/// database or OpenBao to test against.
+/// `db-test.sh`), whose JWT auth mount `cairn` trusts the key in
+/// `CAIRN_TEST_OPENBAO_JWT_KEY`, with `transit/cairn-test` its default key.
+/// `None` if there's no database or OpenBao to test against.
 pub async fn kms_node() -> Option<Arc<App>> {
-    let secret_id = std::env::var("CAIRN_TEST_OPENBAO_SECRET_ID").ok()?;
-    kms_node_with(KmsAuth::AppRole(secret_id)).await
-}
-
-/// How `kms_node_with`'s node logs in to the KMS.
-pub enum KmsAuth {
-    /// With the test role and this secret ID.
-    AppRole(String),
-    /// With the token in this file.
-    TokenFile(std::path::PathBuf),
-}
-
-/// `kms_node`, logging in as `auth` says.
-pub async fn kms_node_with(auth: KmsAuth) -> Option<Arc<App>> {
     let address = std::env::var("CAIRN_TEST_OPENBAO").ok()?;
     let app = node_with(Config::default(), None).await?;
     let mut app = Arc::into_inner(app).expect("a new node isn't shared");
-    let (token_file, role_id, secret_id_file) = match auth {
-        KmsAuth::AppRole(secret_id) => {
-            let file = std::env::temp_dir().join(format!("cairn-e2e-secret-id-{}", Uuid::new_v4()));
-            std::fs::write(&file, secret_id).unwrap();
-            (None, Some(std::env::var("CAIRN_TEST_OPENBAO_ROLE_ID").unwrap()), Some(file))
-        }
-        KmsAuth::TokenFile(file) => (Some(file), None, None),
-    };
     app.kms = crate::kms::Kms::new(&crate::kms::KmsArgs {
         kms_address: Some(address),
-        kms_mount: "transit".to_owned(),
         kms_default_key: Some("cairn-test".to_owned()),
+        kms_jwt_key: Some(std::env::var("CAIRN_TEST_OPENBAO_JWT_KEY").unwrap().into()),
+        kms_auth_mount: "cairn".to_owned(),
+        kms_auth_role: "s3".to_owned(),
         kms_ca_cert: None,
-        kms_token_file: token_file,
-        kms_approle_role_id: role_id,
-        kms_approle_secret_id_file: secret_id_file,
     })
     .unwrap();
     Some(Arc::new(app))
@@ -152,7 +129,7 @@ pub async fn put(app: &Arc<App>, key: &str, data: Vec<u8>) {
 
 /// Reads an object through GetObject; `None` if it doesn't exist.
 pub async fn get(app: &Arc<App>, key: &str) -> Option<Vec<u8>> {
-    let response = objects::get::get_object(app, BUCKET, key, None, None, &Preconditions::default(), None)
+    let response = objects::get::get_object(app, BUCKET, key, None, None, &Preconditions::default(), None, None)
         .await
         .unwrap();
     if response.status() == StatusCode::NOT_FOUND {
@@ -205,7 +182,7 @@ pub async fn get_sealed(
     range: Option<&str>,
     customer: Option<&crate::s3::sse_c::CustomerKey>,
 ) -> (StatusCode, Vec<u8>) {
-    let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), customer)
+    let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), customer, None)
         .await
         .unwrap();
     let status = response.status();

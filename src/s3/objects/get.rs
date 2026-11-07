@@ -172,6 +172,7 @@ pub async fn get_object(
     range_header: Option<&str>,
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
+    role: Option<uuid::Uuid>,
 ) -> anyhow::Result<Response<ResBody>> {
     let mut client = app.pool.get().await?;
     // Read the metadata, the ordered parts, and each part's locations in one
@@ -235,7 +236,7 @@ pub async fn get_object(
     tx.commit().await?;
     // The key it's encrypted with, from the KMS for an SSE-KMS object: only
     // once it's certain to be read.
-    let object_key = match sse::open(app, &encryption, customer_key, bucket, key).await? {
+    let object_key = match sse::open(app, &encryption, customer_key, role, bucket, key).await? {
         Ok(object_key) => object_key,
         Err(refused) => return Ok(box_response(refused)),
     };

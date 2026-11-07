@@ -280,7 +280,7 @@ async fn a_copy_after_a_delete_finds_the_source_changed() {
 
 /// Creates an upload for `key`, returning its ID.
 async fn create_upload(app: &App, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", Wanted::Plain).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", Wanted::Plain, None).await.unwrap();
     let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();

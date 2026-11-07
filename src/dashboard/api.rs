@@ -830,6 +830,8 @@ async fn download(
         None,
         &Preconditions::default(),
         None,
+        // No role: the dashboard can't open SSE-KMS objects (see `s3::sse`).
+        None,
     )
     .await?;
     if resp.status() != StatusCode::OK {
@@ -868,6 +870,12 @@ async fn download(
 #[derive(Serialize, ToSchema)]
 pub(super) struct RoleSummary {
     name: String,
+    /// Its ID, which never changes or comes back: its name (alias) in the
+    /// KMS's auth mount for Cairn.
+    id: String,
+    /// Its identity (entity) in the KMS, which key owners grant keys to;
+    /// none until Cairn has logged in as it, or without a KMS.
+    kms_entity_id: Option<String>,
     admin: bool,
     created_at: f64,
     grants: Vec<Grant>,
@@ -889,6 +897,8 @@ async fn list_roles(State(app): AppState) -> Result<Json<Vec<RoleSummary>>> {
         .into_iter()
         .map(|r| RoleSummary {
             name: r.name,
+            id: r.id.to_string(),
+            kms_entity_id: r.kms_entity_id,
             admin: r.admin,
             created_at: r.created_at,
             grants: r
@@ -929,6 +939,11 @@ async fn create_role(
     let client = app.pool.get().await?;
     let secret = body.secret.filter(|s| !s.is_empty());
     let secret = roles::create(&client, &body.name, secret, body.admin).await?;
+    // Its identity in the KMS, so that key owners can grant it keys now; if
+    // the KMS can't be reached, the next maintenance pass makes it.
+    if let Err(e) = roles::identify(&app).await {
+        eprintln!("kms: identifying roles: {e:#}");
+    }
     Ok((
         StatusCode::CREATED,
         Json(Secret {

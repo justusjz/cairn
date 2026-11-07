@@ -30,7 +30,7 @@ async fn staged(app: &Arc<App>, key: &str) -> (String, [String; 2]) {
 
 /// Like `staged`, the upload to give its object the stored `metadata`.
 async fn staged_with(app: &Arc<App>, key: &str, metadata: &str) -> (String, [String; 2]) {
-    let response = create_multipart_upload(app, BUCKET, key, "x", metadata, Wanted::Plain).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", metadata, Wanted::Plain, None).await.unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -168,7 +168,7 @@ async fn a_completed_upload_has_its_metadata() {
 async fn an_sse_c_upload_makes_an_sse_c_object() {
     let Some(app) = node().await else { return };
     let customer = super::customer_key(&[3; 32]);
-    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", Wanted::Customer(&customer)).await.unwrap();
+    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", Wanted::Customer(&customer), None).await.unwrap();
     assert_eq!(response.headers()["x-amz-server-side-encryption-customer-algorithm"], "AES256");
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
@@ -304,7 +304,7 @@ async fn parts_page(
 async fn lists_an_uploads_parts() {
     let Some(app) = node().await else { return };
     let customer = super::customer_key(&[7; 32]);
-    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", Wanted::Customer(&customer)).await.unwrap();
+    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", Wanted::Customer(&customer), None).await.unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();

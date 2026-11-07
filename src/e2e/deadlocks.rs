@@ -117,7 +117,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
         }
         // Part re-uploads racing each other, then a complete or an abort.
         12..=16 => {
-            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "", Wanted::Plain).await?).await;
+            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "", Wanted::Plain, None).await?).await;
             let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
             let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
             let mut parts = JoinSet::new();

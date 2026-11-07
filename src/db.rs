@@ -184,6 +184,7 @@ const MIGRATIONS: &[&str] = &[
     METADATA,
     ENCRYPTED_PARTS,
     SSE_KMS,
+    ROLE_IDS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -748,6 +749,20 @@ BEGIN
     RETURN NULL;
 END
 $$;
+"#;
+
+/// Migration 16: every role gets an ID that's never reused, which the KMS
+/// knows it by (see `kms`): a role deleted and made again under its name
+/// mustn't inherit what the KMS allowed the old one. And the ID of its
+/// identity (entity) in the KMS, once Cairn has logged in as it.
+///
+/// The IDs are random, so the table (small) is rewritten. No new lock
+/// protocol: the one before (3) was never released, and nothing here changes
+/// what a write must do.
+const ROLE_IDS: &str = r#"
+ALTER TABLE roles ADD COLUMN id uuid NOT NULL DEFAULT gen_random_uuid();
+ALTER TABLE roles ADD CONSTRAINT roles_id UNIQUE (id);
+ALTER TABLE roles ADD COLUMN kms_entity_id text;
 "#;
 
 #[cfg(test)]

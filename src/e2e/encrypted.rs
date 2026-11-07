@@ -480,6 +480,7 @@ async fn tampering_past_the_crcs_is_caught() {
         None,
         &Preconditions::default(),
         Some(&key),
+        None,
     )
     .await
     .unwrap();
@@ -554,7 +555,7 @@ async fn copies_keep_or_change_encryption() {
     // The same key: shared bytes, and the source's ETag.
     let same = CopyKeys {
         source: Some(&k1),
-        dest: Wanted::Customer(&k1),
+        dest: Wanted::Customer(&k1), role: None,
     };
     assert_eq!(
         copy(&app, "src", "same", same).await,
@@ -580,7 +581,7 @@ async fn copies_keep_or_change_encryption() {
             "src",
             CopyKeys {
                 source: Some(&k1),
-                dest: Wanted::Customer(&k2),
+                dest: Wanted::Customer(&k2), role: None,
             },
             Some(&k2),
         ),
@@ -589,7 +590,7 @@ async fn copies_keep_or_change_encryption() {
             "src",
             CopyKeys {
                 source: Some(&k1),
-                dest: Wanted::Plain,
+                dest: Wanted::Plain, role: None,
             },
             None,
         ),
@@ -598,7 +599,7 @@ async fn copies_keep_or_change_encryption() {
             "plain",
             CopyKeys {
                 source: None,
-                dest: Wanted::Customer(&k2),
+                dest: Wanted::Customer(&k2), role: None,
             },
             Some(&k2),
         ),
@@ -640,7 +641,7 @@ async fn copies_keep_or_change_encryption() {
     for source in [None, Some(&k2)] {
         let keys = CopyKeys {
             source,
-            dest: Wanted::Customer(&k1),
+            dest: Wanted::Customer(&k1), role: None,
         };
         assert_eq!(
             copy(&app, "src", "nope", keys).await.0,
@@ -654,7 +655,7 @@ async fn copies_keep_or_change_encryption() {
     );
     let rotate = CopyKeys {
         source: Some(&k1),
-        dest: Wanted::Customer(&k2),
+        dest: Wanted::Customer(&k2), role: None,
     };
     assert_eq!(copy(&app, "src", "src", rotate).await.0, StatusCode::OK);
     assert_eq!(
@@ -680,7 +681,7 @@ async fn part_copies_of_and_into_sse_c() {
         let app = app.clone();
         let customer = customer.map(|c| customer_key(c.key()));
         async move {
-            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", Wanted::new(customer.as_ref(), None))
+            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", Wanted::new(customer.as_ref(), None), None)
                 .await
                 .unwrap();
             use http_body_util::BodyExt;
@@ -709,6 +710,7 @@ async fn part_copies_of_and_into_sse_c() {
                     &Preconditions::default(),
                     source.as_ref(),
                     dest.as_ref(),
+                    None,
                 )
                 .await
                 .unwrap();
@@ -754,7 +756,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=60000-70000",
             CopyKeys {
                 source: None,
-                dest: Wanted::Plain
+                dest: Wanted::Plain, role: None,
             }
         )
         .await,
@@ -767,7 +769,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=60000-70000",
             CopyKeys {
                 source: Some(&k1),
-                dest: Wanted::Plain
+                dest: Wanted::Plain, role: None,
             }
         )
         .await,
@@ -788,7 +790,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=10-99999",
             CopyKeys {
                 source: None,
-                dest: Wanted::Plain
+                dest: Wanted::Plain, role: None,
             }
         )
         .await,
@@ -801,7 +803,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=10-99999",
             CopyKeys {
                 source: None,
-                dest: Wanted::Customer(&k1)
+                dest: Wanted::Customer(&k1), role: None,
             }
         )
         .await,
@@ -814,7 +816,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=10-99999",
             CopyKeys {
                 source: None,
-                dest: Wanted::Customer(&k2)
+                dest: Wanted::Customer(&k2), role: None,
             }
         )
         .await,

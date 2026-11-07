@@ -197,6 +197,7 @@ dependencies = [
  "libc",
  "md-5",
  "percent-encoding",
+ "ring",
  "roxmltree",
  "rustls",
  "serde",

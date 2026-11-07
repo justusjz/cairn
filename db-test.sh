@@ -49,8 +49,9 @@ until podman exec "$PG_CONTAINER" psql -h 127.0.0.1 -U "$PG_USER" -d postgres -c
     fi
 done
 
-# OpenBao: Transit with two keys Cairn may use, and one it may not, and an
-# AppRole whose policy allows only what Cairn needs (see `kms`).
+# OpenBao: keys in two Transit mounts, and the JWT auth mount Cairn logs in
+# to as its roles (see `kms`), trusting a throwaway key. The tests grant
+# their roles keys themselves, as root.
 bao() { podman exec -e BAO_ADDR=http://127.0.0.1:8200 -e BAO_TOKEN=root "$BAO_CONTAINER" bao "$@"; }
 elapsed=0
 until bao status >/dev/null 2>&1; do
@@ -61,25 +62,25 @@ until bao status >/dev/null 2>&1; do
         exit 1
     fi
 done
+KEY_DIR="$(mktemp -d /tmp/cairn-db-test-kms.XXXXXX)"
+trap 'cleanup; rm -rf "$KEY_DIR"' EXIT
 {
+    openssl genpkey -algorithm ed25519 -out "$KEY_DIR/jwt.pem" &&
+    openssl pkey -in "$KEY_DIR/jwt.pem" -pubout -out "$KEY_DIR/jwt.pub" &&
+    podman cp "$KEY_DIR/jwt.pub" "$BAO_CONTAINER:/tmp/cairn-jwt.pub" &&
     bao secrets enable transit &&
     bao write -f transit/keys/cairn-test &&
     bao write -f transit/keys/cairn-other &&
-    bao write -f transit/keys/forbidden &&
-    podman exec -i -e BAO_ADDR=http://127.0.0.1:8200 -e BAO_TOKEN=root "$BAO_CONTAINER" \
-        bao policy write cairn - <<'POLICY' &&
-path "transit/datakey/plaintext/cairn-*" { capabilities = ["update"] }
-path "transit/decrypt/cairn-*" { capabilities = ["update"] }
-POLICY
-    bao auth enable approle &&
-    bao write auth/approle/role/cairn token_policies=cairn token_ttl=1h
-} >/dev/null || { echo "could not set up OpenBao" >&2; exit 1; }
-ROLE_ID=$(bao read -field=role_id auth/approle/role/cairn/role-id)
-SECRET_ID=$(bao write -f -field=secret_id auth/approle/role/cairn/secret-id)
+    bao secrets enable -path=team-transit transit &&
+    bao write -f team-transit/keys/invoices &&
+    bao auth enable -path=cairn jwt &&
+    bao write auth/cairn/config jwt_validation_pubkeys=@/tmp/cairn-jwt.pub &&
+    bao write auth/cairn/role/s3 role_type=jwt user_claim=sub bound_audiences=cairn \
+        token_type=batch token_ttl=5m
+} >/dev/null 2>&1 || { echo "could not set up OpenBao" >&2; exit 1; }
 
 cd "$SCRIPT_DIR" &&
     CAIRN_TEST_DATABASE="postgres://$PG_USER:$PG_PASS@127.0.0.1:${PG_PORT}/postgres" \
     CAIRN_TEST_OPENBAO="http://127.0.0.1:${BAO_PORT}" \
-    CAIRN_TEST_OPENBAO_ROLE_ID="$ROLE_ID" \
-    CAIRN_TEST_OPENBAO_SECRET_ID="$SECRET_ID" \
+    CAIRN_TEST_OPENBAO_JWT_KEY="$KEY_DIR/jwt.pem" \
     cargo test "$@"

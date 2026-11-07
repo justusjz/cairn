@@ -67,7 +67,7 @@ async fn put_multipart(app: &Arc<App>, key: &str, parts: &[Vec<u8>]) {
 }
 
 async fn create_upload(app: &Arc<App>, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "", Wanted::Plain)
+    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "", Wanted::Plain, None)
         .await
         .unwrap();
     Uuid::parse_str(&xml_field(&body_text(response).await, "UploadId")).unwrap()
@@ -192,6 +192,7 @@ async fn a_part_copy_within_one_part_shares_its_bytes() {
         &Preconditions::default(),
         None,
         None,
+        None,
     )
     .await
     .unwrap();
@@ -236,6 +237,7 @@ async fn a_part_copy_across_parts_copies_data() {
         &format!("{BUCKET}/source"),
         Some(&range),
         &Preconditions::default(),
+        None,
         None,
         None,
     )

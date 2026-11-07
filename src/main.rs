@@ -168,6 +168,13 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     });
     tokio::spawn(heartbeat(app.clone(), peer_url));
     tokio::spawn(maintain(app.clone()));
+    // The roles' identities in the KMS, now rather than in a minute.
+    let identifying = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = roles::identify(&identifying).await {
+            eprintln!("kms: identifying roles: {e:#}");
+        }
+    });
 
     let listen_client_addr = SocketAddr::from_str(&args.listen_client).unwrap();
     let listen_peer_addr = SocketAddr::from_str(&args.listen_peer).unwrap();
@@ -224,6 +231,9 @@ async fn maintain(app: Arc<App>) {
         // than ending maintenance on this node.
         let pass = tokio::spawn(async move {
             let app = task_app;
+            if let Err(e) = roles::identify(&app).await {
+                eprintln!("kms: identifying roles: {e:#}");
+            }
             let report = gc::pass(&app, scope).await;
             if !report.is_empty() {
                 eprintln!("gc: {report}");

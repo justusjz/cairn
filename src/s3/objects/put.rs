@@ -24,6 +24,7 @@ pub async fn put_object(
     payload: Payload,
     conditions: &Preconditions,
     wanted: Wanted<'_>,
+    role: Option<uuid::Uuid>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     // Fast-fail a conditional write (If-Match / If-None-Match) before streaming the
     // body, so a client "create if absent" against an existing key doesn't upload
@@ -52,7 +53,7 @@ pub async fn put_object(
 
     // Encrypted, with the client's key (SSE-C), or one of its own that's
     // sealed under a data key from the KMS (SSE-KMS); see `sse`.
-    let sealing = match sse::seal(app, wanted, bucket, key).await? {
+    let sealing = match sse::seal(app, wanted, role, bucket, key).await? {
         Ok(sealing) => sealing,
         Err(refused) => return Ok(refused),
     };

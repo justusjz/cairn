@@ -394,6 +394,8 @@ async fn handle_request(
     };
     // How an object write asks for its object to be encrypted.
     let wanted = sse::Wanted::new(customer_key.as_ref(), kms_request.as_ref());
+    // Who the KMS is asked as, for SSE-KMS (see `kms`).
+    let role = Some(principal.id);
     // An object write may only ask for the ACL there is (see `acl`).
     if writes_object && let Err(refused) = acl::check_write(req.headers(), acl::On::Object) {
         return Ok(box_response(refused));
@@ -433,6 +435,7 @@ async fn handle_request(
             range.as_deref(),
             &preconditions,
             customer_key.as_ref(),
+            role,
         )
         .await
         .map(|response| overrides.apply(response));
@@ -495,7 +498,7 @@ async fn handle_request(
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {
             match metadata {
                 Ok(metadata) => {
-                    create_multipart_upload(&app, &bucket, &key, &content_type, &metadata, wanted).await?
+                    create_multipart_upload(&app, &bucket, &key, &content_type, &metadata, wanted, role).await?
                 }
                 Err(refused) => refused,
             }
@@ -535,6 +538,7 @@ async fn handle_request(
                 &copy_source_preconditions,
                 source_key.as_ref(),
                 customer_key.as_ref(),
+                role,
             )
             .await?
         }
@@ -545,7 +549,7 @@ async fn handle_request(
             match payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)) {
                 Ok(payload) => {
                     let customer_key = customer_key.as_ref();
-                    put_part(&app, &bucket, &key, &upload_id, &part_number, req.into_body(), payload, customer_key)
+                    put_part(&app, &bucket, &key, &upload_id, &part_number, req.into_body(), payload, customer_key, role)
                         .await?
                 }
                 Err(rejection) => util::rejection_response(&rejection),
@@ -571,14 +575,14 @@ async fn handle_request(
                 &content_type,
                 &metadata,
                 &copy_source_preconditions,
-                CopyKeys { source: source_key.as_ref(), dest: wanted },
+                CopyKeys { source: source_key.as_ref(), dest: wanted, role },
             )
             .await?
         }
         hyper::Method::PUT => match (payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)), metadata) {
             (Ok(payload), Ok(metadata)) => {
                 let body = req.into_body();
-                put_object(&app, &bucket, &key, &content_type, &metadata, body, payload, &preconditions, wanted)
+                put_object(&app, &bucket, &key, &content_type, &metadata, body, payload, &preconditions, wanted, role)
                     .await?
             }
             (Err(rejection), _) => util::rejection_response(&rejection),

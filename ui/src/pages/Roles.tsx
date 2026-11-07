@@ -114,7 +114,19 @@ function RoleRow(props: {
 
   return (
     <tr>
-      <td class="mono">{r().name}</td>
+      <td class="mono">
+        {r().name}
+        <div class="subtle small" title="The role's name (alias) in the KMS's auth mount for Cairn">
+          id {r().id}
+        </div>
+        <Show when={r().kms_entity_id}>
+          {(entity) => (
+            <div class="subtle small" title="The role's identity in the KMS, which key owners grant keys to">
+              KMS entity {entity()}
+            </div>
+          )}
+        </Show>
+      </td>
       <td>
         <Show when={r().admin} fallback={<span class="subtle">–</span>}>
           <Badge tone="accent">admin</Badge>

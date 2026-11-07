@@ -48,7 +48,7 @@ async fn error_code(
 }
 
 async fn new_upload(app: &Arc<App>, key: &str) -> String {
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", Wanted::Plain)
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", Wanted::Plain, None)
         .await
         .unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -99,6 +99,7 @@ async fn copies_are_limited_to_5_gib() {
         &source,
         Some(&too_long),
         &none,
+        None,
         None,
         None,
     )

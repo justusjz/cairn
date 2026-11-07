@@ -19,6 +19,7 @@ pub async fn create_multipart_upload(
     content_type: &str,
     metadata: &str,
     wanted: Wanted<'_>,
+    role: Option<Uuid>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     if client
@@ -37,7 +38,7 @@ pub async fn create_multipart_upload(
     // at completion; so is its encryption, which its parts need: the check of
     // an SSE-C upload's key, or the sealed key of an SSE-KMS one (see `sse`).
     let upload_id = Uuid::now_v7();
-    let stored = match sse::seal(app, wanted, bucket, key).await? {
+    let stored = match sse::seal(app, wanted, role, bucket, key).await? {
         Ok(sealing) => sealing.map_or(sse::Stored::Plain, |sealing| sealing.stored),
         Err(refused) => return Ok(refused),
     };

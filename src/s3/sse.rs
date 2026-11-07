@@ -10,7 +10,10 @@
 //!   with the same associated data: the encryption context the client gave
 //!   (if any), with `"aws:s3:arn": "arn:aws:s3:::<bucket>/<key>"` added
 //!   (unless the client gave that entry itself), as canonical JSON. So a
-//!   data key only opens for an object of the name it was made for.
+//!   data key only opens for an object of the name it was made for. The KMS
+//!   is asked as the role that made the request, so it decides which roles
+//!   may use which keys (see `kms`); a request of no role (the dashboard's)
+//!   may use none.
 //!
 //! The two levels are MinIO's, and let a copy share its source's parts under
 //! another KMS key, or context: it takes a data key of its own, and seals the
@@ -21,17 +24,19 @@
 
 use std::collections::BTreeMap;
 
+use anyhow::Context as _;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chacha20poly1305::{AeadInOut, KeyInit, XChaCha20Poly1305, XNonce, aead::Tag};
 use http_body_util::Full;
 use hyper::{HeaderMap, Response, StatusCode, body::Bytes, http::response::Builder};
 use tokio_postgres::Row;
+use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::{
     App,
     encryption::Key,
-    kms::{KmsError, valid_key_name},
+    kms::{KeyId, KmsError},
     s3::sse_c::CustomerKey,
     s3::util::format_s3_error,
 };
@@ -66,7 +71,8 @@ pub enum Stored {
 /// An SSE-KMS object's key, as it's stored.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Envelope {
-    /// The KMS key.
+    /// The KMS key (as `KeyId::as_string` has it; a bare name, from before
+    /// key IDs named their mount, is in the mount `transit`).
     pub key_id: String,
     /// The data key, as the KMS's ciphertext.
     pub data_key: String,
@@ -141,7 +147,7 @@ pub(crate) struct Sealing {
 #[derive(Clone, Debug, PartialEq)]
 pub struct KmsRequest {
     /// The KMS key it names, if it names one (else the default key).
-    pub key_id: Option<String>,
+    pub key_id: Option<KeyId>,
     /// Its encryption context, if it gave one.
     pub context: Option<BTreeMap<String, String>>,
 }
@@ -230,13 +236,13 @@ pub fn requested_kms(
         None => None,
         Some(id) => {
             let id = id.strip_prefix(ARN_PREFIX).unwrap_or(id);
-            if !valid_key_name(id) {
+            let Some(id) = KeyId::parse(id) else {
                 return Err(bad_request(
                     "InvalidRequest",
                     "The specified KMS KeyID contains unsupported characters",
                 ));
-            }
-            Some(id.to_owned())
+            };
+            Some(id)
         }
     };
     let context = match get(KMS_CONTEXT) {
@@ -305,11 +311,13 @@ pub fn check(stored: &Stored, given: Option<&CustomerKey>) -> Result<(), Respons
 }
 
 /// The key a stored object at `bucket`/`key` (`check`ed already) is encrypted
-/// with, if it is, or why it can't be had. Asks the KMS for an SSE-KMS one.
+/// with, if it is, or why it can't be had. Asks the KMS for an SSE-KMS one,
+/// as the role `role` (see `kms`).
 pub async fn open(
     app: &App,
     stored: &Stored,
     given: Option<&CustomerKey>,
+    role: Option<Uuid>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Option<Zeroizing<Key>>, Response<Full<Bytes>>>> {
@@ -319,7 +327,7 @@ pub async fn open(
             let given = given.expect("an SSE-C object is read with its key (`check`)");
             Ok(Ok(Some(Zeroizing::new(*given.key()))))
         }
-        Stored::Kms(envelope) => Ok(open_envelope(app, envelope, bucket, key).await?.map(Some)),
+        Stored::Kms(envelope) => Ok(open_envelope(app, envelope, role, bucket, key).await?.map(Some)),
     }
 }
 
@@ -327,6 +335,7 @@ pub async fn open(
 async fn open_envelope(
     app: &App,
     envelope: &Envelope,
+    role: Option<Uuid>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Zeroizing<Key>, Response<Full<Bytes>>>> {
@@ -337,10 +346,14 @@ async fn open_envelope(
             "the object is encrypted with a key from a KMS, but no KMS is configured",
         )));
     };
+    let Some(role) = role else {
+        return Ok(Err(no_role()));
+    };
+    let key_id = envelope.key_id()?;
     let ad = associated_data(envelope.context.as_deref(), bucket, key);
-    let data_key = match kms.decrypt(&envelope.key_id, &envelope.data_key, &ad).await {
+    let data_key = match kms.decrypt(role, &key_id, &envelope.data_key, &ad).await {
         Ok(data_key) => data_key,
-        Err(e) => return kms_refusal(e, &envelope.key_id).map(Err),
+        Err(e) => return kms_refusal(e, &key_id, role).map(Err),
     };
     match unseal_object_key(&data_key, &envelope.sealed) {
         Some(object_key) => Ok(Ok(object_key)),
@@ -354,6 +367,7 @@ async fn open_envelope(
 pub async fn seal(
     app: &App,
     wanted: Wanted<'_>,
+    role: Option<Uuid>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Option<Sealing>, Response<Full<Bytes>>>> {
@@ -366,7 +380,7 @@ pub async fn seal(
         Wanted::Kms(request) => {
             let mut object_key = Zeroizing::new([0; 32]);
             getrandom::fill(object_key.as_mut_slice()).expect("the OS random number generator failed");
-            Ok(reseal(app, &object_key, request, bucket, key)
+            Ok(reseal(app, &object_key, request, role, bucket, key)
                 .await?
                 .map(|envelope| Some(Sealing { key: object_key, stored: Stored::Kms(envelope) })))
         }
@@ -375,42 +389,63 @@ pub async fn seal(
 
 /// Seals `object_key` under a new data key, as `request` asks, for the object
 /// at `bucket`/`key`: for a new SSE-KMS object, or a copy that shares another
-/// one's parts.
+/// one's parts. Asks the KMS as the role `role` (see `kms`).
 pub async fn reseal(
     app: &App,
     object_key: &Key,
     request: &KmsRequest,
+    role: Option<Uuid>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<Envelope, Response<Full<Bytes>>>> {
     let kms = app.kms.as_ref().expect("an SSE-KMS request is refused without a KMS (`requested_kms`)");
-    let key_id = request.key_id.as_deref().unwrap_or(kms.default_key());
+    let Some(role) = role else {
+        return Ok(Err(no_role()));
+    };
+    let key_id = request.key_id.as_ref().unwrap_or(kms.default_key());
     let context = request.context.as_ref().map(|c| serde_json::to_string(c).unwrap());
     let ad = associated_data(context.as_deref(), bucket, key);
-    let data_key = match kms.generate(key_id, &ad).await {
+    let data_key = match kms.generate(role, key_id, &ad).await {
         Ok(data_key) => data_key,
-        Err(e) => return kms_refusal(e, key_id).map(Err),
+        Err(e) => return kms_refusal(e, key_id, role).map(Err),
     };
     Ok(Ok(Envelope {
-        key_id: key_id.to_owned(),
+        key_id: key_id.as_string(),
         data_key: data_key.ciphertext,
         sealed: seal_object_key(&data_key.plaintext, object_key),
         context,
     }))
 }
 
-/// The response to a request the KMS refused, or the error, which is a 500.
-fn kms_refusal(e: KmsError, key_id: &str) -> anyhow::Result<Response<Full<Bytes>>> {
+impl Envelope {
+    /// Its KMS key.
+    fn key_id(&self) -> anyhow::Result<KeyId> {
+        KeyId::parse(&self.key_id).with_context(|| format!("the stored KMS key ID {:?} isn't one", self.key_id))
+    }
+}
+
+/// The 403 for a request that would need a KMS key without a role to ask
+/// the KMS for it as: the dashboard's. The KMS decides which roles may use
+/// a key, so a request of none may use none.
+fn no_role() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::FORBIDDEN,
+        "AccessDenied",
+        "Only an S3 role may use a KMS key, as the KMS allows it.",
+    )
+}
+
+/// The response to a request the KMS refused the role `role`, or the error,
+/// which is a 500.
+fn kms_refusal(e: KmsError, key_id: &KeyId, role: Uuid) -> anyhow::Result<Response<Full<Bytes>>> {
+    let key_id = key_id.as_string();
     match e {
         KmsError::NoSuchKey => Ok(bad_request("KMS.NotFoundException", "Invalid keyId")),
-        KmsError::Denied => {
-            eprintln!("the KMS refused Cairn the key {key_id:?}");
-            Ok(format_s3_error(
-                StatusCode::FORBIDDEN,
-                "AccessDenied",
-                "The KMS refused the use of the key.",
-            ))
-        }
+        KmsError::Denied => Ok(format_s3_error(
+            StatusCode::FORBIDDEN,
+            "AccessDenied",
+            "The KMS doesn't allow this role the use of the key.",
+        )),
         KmsError::Unavailable(e) => {
             eprintln!("the KMS is unavailable: {e:#}");
             Ok(format_s3_error(
@@ -419,7 +454,9 @@ fn kms_refusal(e: KmsError, key_id: &str) -> anyhow::Result<Response<Full<Bytes>
                 "the KMS is unavailable; please try again later",
             ))
         }
-        e @ KmsError::Failed(_) => Err(anyhow::Error::new(e).context(format!("KMS key {key_id:?}"))),
+        e @ KmsError::Failed(_) => {
+            Err(anyhow::Error::new(e).context(format!("KMS key {key_id:?}, as role {role}")))
+        }
     }
 }
 
@@ -476,7 +513,7 @@ pub fn echo(builder: Builder, stored: &Stored, given: Option<&CustomerKey>) -> B
         Stored::Kms(envelope) => {
             let builder = builder
                 .header(ENCRYPTION, AWS_KMS)
-                .header(KMS_KEY_ID, format!("{ARN_PREFIX}{}", envelope.key_id));
+                .header(KMS_KEY_ID, format!("{ARN_PREFIX}{}", envelope.key_id().map_or(envelope.key_id.clone(), |id| id.as_string())));
             match &envelope.context {
                 Some(context) => builder.header(KMS_CONTEXT, STANDARD.encode(context)),
                 None => builder,
@@ -532,7 +569,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(request.key_id.as_deref(), Some("my-key"));
+        assert_eq!(request.key_id.unwrap().as_string(), "transit/my-key");
         let context = request.context.unwrap();
         assert_eq!(serde_json::to_string(&context).unwrap(), r#"{"a":"1","b":"2"}"#);
     }
@@ -549,7 +586,7 @@ mod tests {
         // A key ID without asking for SSE-KMS.
         assert_eq!(status(requested_kms(&headers(&[(KMS_KEY_ID, "k")]), false, true)), 400);
         assert_eq!(status(requested_kms(&headers(&[(ENCRYPTION, "aws:kms:dsse")]), false, true)), 400);
-        for id in [" k", "k ", "../k", "a/b", ""] {
+        for id in [" k", "k ", "../k", "a//b", "a/../b", ""] {
             assert_eq!(status(requested_kms(&kms(&[(KMS_KEY_ID, id)]), false, true)), 400, "{id:?}");
         }
         for context in ["not base64!", &STANDARD.encode("[1]"), &STANDARD.encode(r#"{"a":1}"#)] {

@@ -42,9 +42,10 @@ WORK_DIR="$(mktemp -d /tmp/s3-smoke.XXXXXX)"
 CARGO_ARGS+=(--data-dir "$WORK_DIR/data")   # required; per-run blob dir
 # No TLS proxy here, so SSE-C keys come over plain HTTP.
 CARGO_ARGS+=(--allow-sse-c-over-http)
-# SSE-KMS, with keys in OpenBao's Transit engine (its dev server's root token).
+# SSE-KMS, with keys in OpenBao's Transit engine, used as each role (see
+# `kms`), logged in to with a throwaway key.
 CARGO_ARGS+=(--kms-address "http://127.0.0.1:${BAO_PORT}" --kms-default-key cairn-test
-             --kms-token-file "$WORK_DIR/bao-token")
+             --kms-jwt-key "$WORK_DIR/kms-jwt.pem")
 SERVER_LOG="$WORK_DIR/server.log"
 SERVER_PID=""
 BUCKET="smoke-$(date +%s)"
@@ -186,12 +187,25 @@ until bao status >/dev/null 2>&1; do
     elapsed=$((elapsed + 1))
     [ "$elapsed" -ge "$STARTUP_TIMEOUT" ] && fatal "OpenBao did not become ready in ${STARTUP_TIMEOUT}s"
 done
+# Two keys, and the JWT auth mount Cairn logs in to as its roles, trusting
+# its key; testkey may use both keys (see 2a), the other roles neither.
 {
+    openssl genpkey -algorithm ed25519 -out "$WORK_DIR/kms-jwt.pem" &&
+    openssl pkey -in "$WORK_DIR/kms-jwt.pem" -pubout -out "$WORK_DIR/kms-jwt.pub" &&
+    podman cp "$WORK_DIR/kms-jwt.pub" "$BAO_CONTAINER:/tmp/cairn-jwt.pub" &&
     bao secrets enable transit &&
     bao write -f transit/keys/cairn-test &&
-    bao write -f transit/keys/cairn-other
-} >/dev/null || fatal "could not set up OpenBao"
-printf 'root' >"$WORK_DIR/bao-token"
+    bao write -f transit/keys/cairn-other &&
+    bao auth enable -path=cairn jwt &&
+    bao write auth/cairn/config jwt_validation_pubkeys=@/tmp/cairn-jwt.pub &&
+    bao write auth/cairn/role/s3 role_type=jwt user_claim=sub bound_audiences=cairn \
+        token_type=batch token_ttl=5m &&
+    podman exec -i -e BAO_ADDR=http://127.0.0.1:8200 -e BAO_TOKEN=root "$BAO_CONTAINER" \
+        bao policy write cairn-test-keys - <<'POLICY'
+path "transit/datakey/plaintext/cairn-*" { capabilities = ["update"] }
+path "transit/decrypt/cairn-*" { capabilities = ["update"] }
+POLICY
+} >/dev/null 2>&1 || fatal "could not set up OpenBao"
 info "OpenBao is ready."
 
 # ─── 2. Roles ────────────────────────────────────────────────────────────────
@@ -209,6 +223,18 @@ info "Creating roles..."
     cairn_role create writer --secret writersecret &&
     cairn_role create bucketadmin --admin --secret adminsecret
 } >"$WORK_DIR/roles.log" 2>&1 || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create roles"; }
+
+# ─── 2a. testkey's identity in OpenBao ───────────────────────────────────────
+# Made beforehand, as an OpenBao admin can, so that it may use the keys from
+# its first request: an entity, and its alias on Cairn's mount, the role's ID.
+# (Cairn would make it when it starts; the other roles get theirs that way.)
+{
+    role_id=$(podman exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc \
+        "SELECT id FROM roles WHERE name = '$ACCESS_KEY'") &&
+    accessor=$(bao read -field=accessor sys/auth/cairn) &&
+    entity=$(bao write -field=id identity/entity name=cairn-testkey policies=cairn-test-keys) &&
+    bao write identity/entity-alias name="$role_id" canonical_id="$entity" mount_accessor="$accessor"
+} >"$WORK_DIR/kms-identity.log" 2>&1 || { cat "$WORK_DIR/kms-identity.log" >&2; fatal "could not set up testkey in OpenBao"; }
 
 # ─── 2b. Run the server ───────────────────────────────────────────────────────
 info "Starting server (cargo run) on ${SERVER_HOST}:${SERVER_PORT}..."
@@ -569,8 +595,9 @@ sse_c_ok() {
 
 # SSE-KMS: objects written under a KMS key (the default one, or another, with a
 # context) read back without any key, whole, in ranges and multipart, and tell
-# their key; copies change it, or decrypt. A key the KMS doesn't have is
-# refused, and so are SSE-KMS headers on a read.
+# their key; copies change it, or decrypt. A key the role may not use is
+# refused, as is a read by a role that may read the bucket but not use the
+# key, and SSE-KMS headers on a read.
 sse_kms_ok() {
     local out="$WORK_DIR/kms-out" context
     context=$(printf '{"team":"storage"}' | base64)
@@ -585,9 +612,9 @@ sse_kms_ok() {
     done
     [ "$(awss3 s3api head-object --bucket "$BUCKET" --key kms/default.bin \
         --query '[ServerSideEncryption,SSEKMSKeyId]' --output text 2>/dev/null)" \
-        = "$(printf 'aws:kms\tarn:aws:kms:cairn-test')" ] || return 1
+        = "$(printf 'aws:kms\tarn:aws:kms:transit/cairn-test')" ] || return 1
     [ "$(awss3 s3api get-object --bucket "$BUCKET" --key kms/other.bin "$out" \
-        --query SSEKMSKeyId --output text 2>/dev/null)" = "arn:aws:kms:cairn-other" ] || return 1
+        --query SSEKMSKeyId --output text 2>/dev/null)" = "arn:aws:kms:transit/cairn-other" ] || return 1
     awss3 s3api get-object --bucket "$BUCKET" --key kms/other.bin --range bytes=100000-299999 "$out" \
         >/dev/null 2>&1 || return 1
     cmp -s <(tail -c +100001 "$BIG" | head -c 200000) "$out" || return 1
@@ -600,7 +627,7 @@ sse_kms_ok() {
     awss3 s3api copy-object --bucket "$BUCKET" --key kms/copy.bin --copy-source "${BUCKET}/kms/other.bin" \
         --server-side-encryption aws:kms --ssekms-key-id cairn-test >/dev/null 2>&1 || return 1
     [ "$(awss3 s3api get-object --bucket "$BUCKET" --key kms/copy.bin "$out" \
-        --query SSEKMSKeyId --output text 2>/dev/null)" = "arn:aws:kms:cairn-test" ] || return 1
+        --query SSEKMSKeyId --output text 2>/dev/null)" = "arn:aws:kms:transit/cairn-test" ] || return 1
     cmp -s "$BIG" "$out" || return 1
     awss3 s3api copy-object --bucket "$BUCKET" --key kms/clear.bin --copy-source "${BUCKET}/kms/copy.bin" \
         >/dev/null 2>&1 || return 1
@@ -611,6 +638,14 @@ sse_kms_ok() {
         --server-side-encryption aws:kms --ssekms-key-id no-such-key >/dev/null 2>&1 || return 1
     [ "$(scurl GET "/${BUCKET}/kms/copy.bin" "$EMPTY_SHA256" - "x-amz-server-side-encryption: aws:kms")" = 400 ] \
         || return 1
+    # A role that may read the bucket, but not use the key, can't read it
+    # (but a plain object).
+    cairn_role grant reader "$BUCKET" read >/dev/null 2>&1 || return 1
+    ! as_role reader readersecret s3api get-object --bucket "$BUCKET" --key kms/copy.bin "$out" \
+        >/dev/null 2>&1 || return 1
+    as_role reader readersecret s3api get-object --bucket "$BUCKET" --key kms/clear.bin "$out" \
+        >/dev/null 2>&1 || return 1
+    cairn_role revoke reader "$BUCKET" read >/dev/null 2>&1 || return 1
     for key in default other multi copy clear; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "kms/$key.bin" >/dev/null 2>&1 || return 1
     done

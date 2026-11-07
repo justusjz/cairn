@@ -28,6 +28,7 @@ pub async fn put_part(
     body: Incoming,
     payload: Payload,
     customer_key: Option<&CustomerKey>,
+    role: Option<Uuid>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -63,7 +64,7 @@ pub async fn put_part(
     if let Err(refused) = sse::check(&encryption, customer_key) {
         return Ok(refused);
     }
-    let upload_key = match sse::open(app, &encryption, customer_key, bucket, key).await? {
+    let upload_key = match sse::open(app, &encryption, customer_key, role, bucket, key).await? {
         Ok(upload_key) => upload_key,
         Err(refused) => return Ok(refused),
     };

@@ -612,6 +612,16 @@ export interface components {
             /** Format: double */
             created_at: number;
             grants: components["schemas"]["Grant"][];
+            /**
+             * @description Its ID, which never changes or comes back: its name (alias) in the
+             *     KMS's auth mount for Cairn.
+             */
+            id: string;
+            /**
+             * @description Its identity (entity) in the KMS, which key owners grant keys to;
+             *     none until Cairn has logged in as it, or without a KMS.
+             */
+            kms_entity_id?: string | null;
             name: string;
         };
         /** @description A role's secret, which is shown only this once. */

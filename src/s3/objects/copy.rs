@@ -68,6 +68,8 @@ struct Source {
 pub struct CopyKeys<'a> {
     pub source: Option<&'a CustomerKey>,
     pub dest: Wanted<'a>,
+    /// Who the KMS is asked as, for SSE-KMS (see `kms`).
+    pub role: Option<Uuid>,
 }
 
 impl CopyKeys<'_> {
@@ -217,13 +219,13 @@ pub async fn copy_object(
             sse::echo_onto(resp, stored, keys.dest.customer())
         };
         // The key the source is encrypted with, if it is.
-        let source_key = match sse::open(app, encryption, keys.source, &src_bucket, &src_key).await? {
+        let source_key = match sse::open(app, encryption, keys.source, keys.role, &src_bucket, &src_key).await? {
             Ok(key) => key,
             Err(refused) => return Ok(refused),
         };
         if !keys.shares(encryption) {
             let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata };
-            let sealing = match sse::seal(app, keys.dest, dest_bucket, dest_key).await? {
+            let sealing = match sse::seal(app, keys.dest, keys.role, dest_bucket, dest_key).await? {
                 Ok(sealing) => sealing,
                 Err(refused) => return Ok(refused),
             };
@@ -257,7 +259,7 @@ pub async fn copy_object(
             (Wanted::Plain, _) => Stored::Plain,
             (Wanted::Customer(dest), _) => Stored::Customer { check: dest.new_check() },
             (Wanted::Kms(request), Some(object_key)) => {
-                match sse::reseal(app, object_key, request, dest_bucket, dest_key).await? {
+                match sse::reseal(app, object_key, request, keys.role, dest_bucket, dest_key).await? {
                     Ok(envelope) => Stored::Kms(envelope),
                     Err(refused) => return Ok(refused),
                 }
@@ -445,6 +447,7 @@ pub async fn copy_part(
     preconditions: &Preconditions,
     source_key: Option<&CustomerKey>,
     dest_key: Option<&CustomerKey>,
+    role: Option<Uuid>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -526,7 +529,7 @@ pub async fn copy_part(
         let encrypted = !version.encryption.is_plain() || !upload_encryption.is_plain();
         let holding = part_holding(&source.parts, start, end).filter(|_| !encrypted);
         let Some((index, within)) = holding else {
-            let keys = match stream_keys(app, &source, source_key, &src_bucket, &src_key, &upload_encryption, dest_key, bucket, key).await? {
+            let keys = match stream_keys(app, &source, source_key, &src_bucket, &src_key, &upload_encryption, dest_key, role, bucket, key).await? {
                 Ok(keys) => keys,
                 Err(refused) => return Ok(refused),
             };
@@ -735,14 +738,15 @@ async fn stream_keys(
     src_key: &str,
     upload: &Stored,
     dest_key: Option<&CustomerKey>,
+    role: Option<Uuid>,
     bucket: &str,
     key: &str,
 ) -> anyhow::Result<Result<StreamKeys, Response<Full<Bytes>>>> {
-    let source = match sse::open(app, &source.version.encryption, source_key, src_bucket, src_key).await? {
+    let source = match sse::open(app, &source.version.encryption, source_key, role, src_bucket, src_key).await? {
         Ok(key) => key,
         Err(refused) => return Ok(Err(refused)),
     };
-    let dest = match sse::open(app, upload, dest_key, bucket, key).await? {
+    let dest = match sse::open(app, upload, dest_key, role, bucket, key).await? {
         Ok(key) => key,
         Err(refused) => return Ok(Err(refused)),
     };

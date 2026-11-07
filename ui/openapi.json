@@ -1712,6 +1712,7 @@
         "description": "A role, never with its secret.",
         "required": [
           "name",
+          "id",
           "admin",
           "created_at",
           "grants"
@@ -1729,6 +1730,17 @@
             "items": {
               "$ref": "#/components/schemas/Grant"
             }
+          },
+          "id": {
+            "type": "string",
+            "description": "Its ID, which never changes or comes back: its name (alias) in the\nKMS's auth mount for Cairn."
+          },
+          "kms_entity_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its identity (entity) in the KMS, which key owners grant keys to;\nnone until Cairn has logged in as it, or without a KMS."
           },
           "name": {
             "type": "string"

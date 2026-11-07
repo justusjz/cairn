@@ -53,6 +53,8 @@ impl Permission {
 
 /// An authenticated role's secret and permissions, loaded once per request.
 pub struct Principal {
+    /// The role's ID, which the KMS knows it by (see `kms`).
+    pub id: uuid::Uuid,
     pub secret: String,
     pub admin: bool,
     read: HashSet<String>,
@@ -65,7 +67,7 @@ impl Principal {
     pub async fn load(client: &Object, access_key: &str) -> anyhow::Result<Option<Self>> {
         let row = client
             .query_opt_cached(
-                "SELECT r.secret, r.admin,
+                "SELECT r.secret, r.admin, r.id,
                         ARRAY(SELECT bucket FROM role_grants
                               WHERE role = r.name AND permission = 'read'),
                         ARRAY(SELECT bucket FROM role_grants
@@ -79,9 +81,10 @@ impl Principal {
         Ok(row.map(|r| Principal {
             secret: r.get(0),
             admin: r.get(1),
-            read: r.get::<_, Vec<String>>(2).into_iter().collect(),
-            write: r.get::<_, Vec<String>>(3).into_iter().collect(),
-            delete_version: r.get::<_, Vec<String>>(4).into_iter().collect(),
+            id: r.get(2),
+            read: r.get::<_, Vec<String>>(3).into_iter().collect(),
+            write: r.get::<_, Vec<String>>(4).into_iter().collect(),
+            delete_version: r.get::<_, Vec<String>>(5).into_iter().collect(),
         }))
     }
 
@@ -198,6 +201,10 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
             for role in list(&client).await? {
                 let admin = if role.admin { " (admin)" } else { "" };
                 println!("{}{admin}", role.name);
+                println!("  id {}", role.id);
+                if let Some(entity) = role.kms_entity_id {
+                    println!("  KMS entity {entity}");
+                }
                 for (bucket, permission) in role.grants {
                     println!("  {bucket}:{}", permission.as_str());
                 }
@@ -336,12 +343,43 @@ pub async fn delete(client: &Object, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Logs in to the KMS once as each role that has no identity (entity) there
+/// yet, so that OpenBao makes it, and keeps its ID (see `kms`): then key
+/// owners can grant the role keys before it uses any. A role the KMS can't
+/// be asked about now is tried again in the next maintenance pass.
+pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
+    let Some(kms) = &app.kms else { return Ok(()) };
+    let client = app.pool.get().await?;
+    let roles: Vec<uuid::Uuid> = client
+        .query_cached("SELECT id FROM roles WHERE kms_entity_id IS NULL ORDER BY created_at", &[])
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    drop(client);
+    for role in roles {
+        let entity = kms.identify(role).await.map_err(|e| anyhow::anyhow!("role {role}: {e}"))?;
+        // A plain write of one row's own column: no invariant of the lock
+        // protocol (see `catalog.sql`) involves it.
+        app.pool
+            .get()
+            .await?
+            .execute_cached("UPDATE roles SET kms_entity_id = $2 WHERE id = $1", &[&role, &entity])
+            .await?;
+    }
+    Ok(())
+}
+
 /// A role as listed: never with its secret.
 pub struct RoleInfo {
     pub name: String,
     pub admin: bool,
     /// When it was created, in seconds since the Unix epoch.
     pub created_at: f64,
+    /// Its ID, which the KMS knows it by (see `kms`).
+    pub id: uuid::Uuid,
+    /// Its identity (entity) in the KMS, once Cairn has logged in as it.
+    pub kms_entity_id: Option<String>,
     /// (bucket, permission), sorted.
     pub grants: Vec<(String, Permission)>,
 }
@@ -354,7 +392,8 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                     ARRAY(SELECT g.bucket FROM role_grants g
                           WHERE g.role = r.name ORDER BY g.bucket, g.permission),
                     ARRAY(SELECT g.permission FROM role_grants g
-                          WHERE g.role = r.name ORDER BY g.bucket, g.permission)
+                          WHERE g.role = r.name ORDER BY g.bucket, g.permission),
+                    r.id, r.kms_entity_id
              FROM roles r ORDER BY r.name",
             &[],
         )
@@ -367,6 +406,8 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                 name: r.get(0),
                 admin: r.get(1),
                 created_at: r.get(2),
+                id: r.get(5),
+                kms_entity_id: r.get(6),
                 grants: buckets
                     .into_iter()
                     .zip(permissions.iter())

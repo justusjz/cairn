@@ -51,7 +51,7 @@ async fn put_with(app: &Arc<App>, key: &str, metadata: String) {
 /// The headers of a GET and a HEAD of `key`, which must be the same.
 pub(super) async fn read_headers(app: &Arc<App>, key: &str) -> HeaderMap {
     let none = Preconditions::default();
-    let got = get_object(app, BUCKET, key, None, None, &none, None).await.unwrap();
+    let got = get_object(app, BUCKET, key, None, None, &none, None, None).await.unwrap();
     let head = head_object(app, BUCKET, key, None, None, &none, None).await.unwrap();
     assert_eq!(got.status(), StatusCode::OK);
     assert_eq!(got.headers(), head.headers(), "a HEAD answers as a GET does");

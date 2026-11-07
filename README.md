@@ -102,12 +102,11 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
-| `--kms-mount <PATH>` | `CAIRN_KMS_MOUNT` | `transit` | Where its Transit engine is mounted. |
-| `--kms-default-key <NAME>` | `CAIRN_KMS_DEFAULT_KEY` | *required with a KMS* | The Transit key for SSE-KMS requests that name none. |
+| `--kms-default-key <ID>` | `CAIRN_KMS_DEFAULT_KEY` | *required with a KMS* | The key for SSE-KMS requests that name none: `<mount>/<key>`, or a key in the mount `transit`. |
+| `--kms-jwt-key <PATH>` | `CAIRN_KMS_JWT_KEY` | *required with a KMS* | PEM file of the Ed25519 private key Cairn signs its roles' logins to the KMS with. The same on every node. |
+| `--kms-auth-mount <PATH>` | `CAIRN_KMS_AUTH_MOUNT` | `cairn` | Where the KMS's JWT auth method for Cairn is mounted. |
+| `--kms-auth-role <NAME>` | `CAIRN_KMS_AUTH_ROLE` | `s3` | The role of that auth method Cairn's logins use. |
 | `--kms-ca-cert <PATH>` | `CAIRN_KMS_CA_CERT` | public roots | PEM file of the CA certificates to trust for the KMS's TLS. |
-| `--kms-token-file <PATH>` | `CAIRN_KMS_TOKEN_FILE` | none | File holding a token for the KMS; read again whenever the KMS refuses the one Cairn has. |
-| `--kms-approle-role-id <ID>` | `CAIRN_KMS_APPROLE_ROLE_ID` | none | AppRole role ID to log in with, instead of a token file. |
-| `--kms-approle-secret-id-file <PATH>` | `CAIRN_KMS_APPROLE_SECRET_ID_FILE` | none | File holding the AppRole secret ID. |
 
 On SIGTERM or Ctrl-C, a node stops accepting connections and finishes the
 requests in flight before it exits; a second signal exits right away. Anything
@@ -248,10 +247,12 @@ cluster:
   doing on each node, what they still have to do, and what they did recently.
 - **Buckets:** browse buckets by prefix, see every version of a key with how
   it's encrypted, the blobs its parts are stored in and the nodes holding
-  them, and download any version (but an SSE-C one, whose key Cairn doesn't
-  have). Buckets can be created and (when empty) deleted.
+  them, and download any version (but an encrypted one: Cairn doesn't have
+  an SSE-C object's key, and the KMS opens an SSE-KMS one only for a role).
+  Buckets can be created and (when empty) deleted.
 - **Roles:** everything `cairn role` does: create and delete roles, grant and
-  revoke permissions, rotate secrets, and toggle admin.
+  revoke permissions, rotate secrets, and toggle admin. Each role's ID and
+  its identity in the KMS are shown, for granting it [KMS keys](#sse-kms).
 
 To keep other websites from reaching it through DNS rebinding, the dashboard
 only answers when it's opened by IP address, as `localhost`, or by the host of
@@ -265,9 +266,9 @@ spec at `/_dashboard/api/openapi.json` (also committed as `ui/openapi.json`).
 
 > [!WARNING]
 > Like the rest of the peer endpoint, the dashboard has no authentication:
-> anyone who can reach it can read every object (SSE-KMS ones decrypted, as
-> for any role) and manage every role. Keep the peer endpoint on a trusted
-> network.
+> anyone who can reach it can read every unencrypted object and manage every
+> role, and so act as any role, with the KMS keys it may use. Keep the peer
+> endpoint on a trusted network.
 
 ### Building the dashboard
 
@@ -399,54 +400,96 @@ Without the key, the data can't be read, by anyone.
 
 With a KMS configured (`--kms-*` flags), a write may ask for SSE-KMS, as with
 S3: `aws s3api put-object --server-side-encryption aws:kms`, optionally with
-`--ssekms-key-id <name>` (else the default key) and
-`--ssekms-encryption-context <base64 JSON>`. Reads need nothing: Cairn asks the
-KMS. The KMS is the Transit engine of [OpenBao](https://openbao.org) (or
-Vault), whose keys never leave it.
+`--ssekms-key-id <key ID>` (else the default key) and
+`--ssekms-encryption-context <base64 JSON>`. Reads need nothing more. The KMS
+is [OpenBao](https://openbao.org) (or Vault): its Transit engines hold the
+keys, which never leave it.
 
+The keys are their owners'. Whoever manages a key in OpenBao decides there
+which of Cairn's roles may use it, as with AWS's customer managed keys: Cairn
+asks OpenBao as the role that made the request, so a role may read an
+SSE-KMS object only if it may read the bucket (Cairn's grants) *and* use the
+key (OpenBao's). Key owners rotate, revoke and delete their keys themselves;
+deleting a key makes its objects unreadable for good (crypto-shredding).
+
+- **Key IDs** are `<mount>/<key>`: the path of a Transit engine (which may
+  start with OpenBao namespaces, e.g. `finance/transit`) and a key's name in
+  it. A bare name is in the mount `transit`. Responses tell the key as
+  `arn:aws:kms:<mount>/<key>`, and a request may name it so too.
+- **Roles in OpenBao.** Every Cairn role is an identity (an *entity*) in
+  OpenBao, which Cairn logs in as through a JWT auth mount of its own,
+  naming the role by its ID, which is never reused. Cairn logs in once for
+  each new role (when the dashboard creates it, or within a minute), so that
+  OpenBao makes its entity right away. `cairn role list` and the dashboard
+  show each role's ID and entity. A deleted role's entity stays in OpenBao,
+  harmlessly (no role will have its ID again), until its key owners remove
+  it.
+- **Trust.** OpenBao trusts Cairn to say which role asks, as AWS KMS trusts
+  S3. So a Cairn admin can use every key any role may use. But Cairn can't
+  use anything OpenBao doesn't grant one of its roles, and nothing granted to
+  anyone else.
 - Every object gets a random key of its own, which Cairn keeps sealed under a
   data key from the KMS, and keeps that data key only as the KMS encrypted it.
   The KMS binds it to the object's name (`bucket/key`) and encryption context:
   it opens for that object only, and only with that context.
-- Responses tell the key as `arn:aws:kms:<name>`, and a request may name it
-  so too. `x-amz-server-side-encryption-bucket-key-enabled` is accepted and
-  ignored, as in MinIO: every object has keys of its own anyway.
-- Multipart uploads: ask for SSE-KMS with CreateMultipartUpload. Its parts and
-  its completion need nothing more.
+- `x-amz-server-side-encryption-bucket-key-enabled` is accepted and ignored,
+  as in MinIO: every object has keys of its own anyway.
+- Multipart uploads: ask for SSE-KMS with CreateMultipartUpload. Its parts
+  need the role's use of the key, but no headers.
 - Copies to another SSE-KMS key or context share the source's data, as copies
   under the same SSE-C key do: the copy seals the same object key under a data
   key of its own. That changes who may open it, but not the key the data is
   encrypted with: anyone who could open the source's can read the copy's
   data. To change that (if a key may have leaked, say), copy to a plain or
   SSE-C object and back, which writes the data anew.
-- The keys are the operator's, not the clients': clients name a key, but
-  can't create or manage keys, and OpenBao sees only Cairn, not which role
-  asked. So Cairn's S3 permissions alone decide who may read and write an
-  object: any role that may read it can, and any role that may write may use
-  any key Cairn's policy allows. Restrict the keys there.
-- Revoking Cairn's access to a key, or deleting it, makes the objects under it
-  unreadable for good. If the KMS can't be reached, reads and writes of
-  SSE-KMS objects fail with `503`, and nothing else is affected (HEAD needs no
-  KMS).
+- If the KMS can't be reached, reads and writes of SSE-KMS objects fail with
+  `503`, and nothing else is affected (HEAD needs no KMS).
 
-Setting up OpenBao for it (Vault's commands are the same, with `vault` for
-`bao`):
+Setting up OpenBao for Cairn, once (Vault's commands are the same, with `vault`
+for `bao`). Cairn's key pair:
 
 ```bash
-bao secrets enable transit
-bao write -f transit/keys/cairn-default
-# Cairn needs only these two calls, for the keys it may use.
-bao policy write cairn - <<'POLICY'
-path "transit/datakey/plaintext/cairn-*" { capabilities = ["update"] }
-path "transit/decrypt/cairn-*" { capabilities = ["update"] }
-POLICY
-bao auth enable approle
-bao write auth/approle/role/cairn token_policies=cairn token_ttl=1h
-bao read -field=role_id auth/approle/role/cairn/role-id          # --kms-approle-role-id
-bao write -f -field=secret_id auth/approle/role/cairn/secret-id  # into --kms-approle-secret-id-file
+openssl genpkey -algorithm ed25519 -out cairn-kms.pem   # --kms-jwt-key, on every node
+openssl pkey -in cairn-kms.pem -pubout -out cairn-kms.pub
 ```
 
-Don't grant Cairn `transit/encrypt`: OpenBao creates a missing key on an
+The JWT auth mount Cairn logs in through, trusting only that key:
+
+```bash
+bao auth enable -path=cairn jwt
+bao write auth/cairn/config jwt_validation_pubkeys=@cairn-kms.pub
+bao write auth/cairn/role/s3 role_type=jwt user_claim=sub bound_audiences=cairn \
+    token_type=batch token_ttl=5m
+bao read -field=accessor sys/auth/cairn    # the mount's accessor, to find roles' entities by
+```
+
+Keep it as it is: then Cairn can use exactly what key owners grant its roles.
+That mount must be Cairn's alone, and must not map JWT claims to groups or
+metadata (`groups_claim`, `claim_mappings`), nor give tokens policies of its
+own (`token_policies`): Cairn would choose them. And never attach an alias of
+Cairn's mount to an entity of anyone else: Cairn could then act as them.
+
+Then a key owner makes a key, and lets roles use it, by their entities (as
+shown by Cairn) or through a group:
+
+```bash
+bao secrets enable -path=finance-transit transit
+bao write -f finance-transit/keys/invoices
+bao policy write finance-invoices - <<'POLICY'
+path "finance-transit/datakey/plaintext/invoices" { capabilities = ["update"] }
+path "finance-transit/decrypt/invoices" { capabilities = ["update"] }
+POLICY
+bao write identity/group name=finance-invoices policies=finance-invoices \
+    member_entity_ids=<the entity of Cairn's role "billing">
+```
+
+A role then writes with `--ssekms-key-id finance-transit/invoices`. Grants and
+revocations take effect at once. The group (or policy on an entity) must be
+in the namespace of Cairn's mount: a key in a child namespace is granted by
+its path there (`finance/transit/...`), since OpenBao's groups can't hold
+another namespace's entities.
+
+Don't grant `encrypt` on the keys: OpenBao creates a missing key on an
 encrypt, so a mistyped key name would make a new key. Cairn never calls it.
 
 ## Data integrity
