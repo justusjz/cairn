@@ -311,6 +311,24 @@ export function ObjectPage() {
                           <dd class="mono">{v.etag}</dd>
                           <dt>Content type</dt>
                           <dd>{v.content_type}</dd>
+                          <dt>Encryption</dt>
+                          <dd>
+                            <Show when={v.encryption} fallback="none">
+                              {(e) => (
+                                <Show when={e().kind === "SSE-KMS"} fallback="SSE-C (with its client's key)">
+                                  SSE-KMS with key <span class="mono">{e().kms_key_id}</span>
+                                  {e().kms_key_version != null ? `, version ${e().kms_key_version}` : ""}
+                                  <Show when={e().kms_context}>
+                                    {(c) => (
+                                      <div class="subtle">
+                                        context <span class="mono">{c()}</span>
+                                      </div>
+                                    )}
+                                  </Show>
+                                </Show>
+                              )}
+                            </Show>
+                          </dd>
                         </dl>
                         <div class="parts">
                           <Table

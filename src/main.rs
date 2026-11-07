@@ -131,6 +131,14 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
+    // A node holds keys in memory: its clients' (SSE-C), and data keys from
+    // the KMS (SSE-KMS). No core dump of it may hold them, nor may another
+    // process of the same user read its memory (ptrace, /proc/<pid>/mem).
+    // Swap is the operator's to rule out (see README.md).
+    // SAFETY: prctl with PR_SET_DUMPABLE takes no pointers.
+    if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
+        anyhow::bail!("couldn't make the process non-dumpable: {}", std::io::Error::last_os_error());
+    }
     let kms = kms::Kms::new(&args.kms)?;
     let pool = db::connect(&args.database).await?;
     let store = Store::new(args.data_dir)?;

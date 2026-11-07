@@ -246,9 +246,10 @@ cluster:
   than the replication factor, and what each node holds.
 - **Jobs:** how the background passes (garbage collection and packing) are
   doing on each node, what they still have to do, and what they did recently.
-- **Buckets:** browse buckets by prefix, see every version of a key with the
-  blobs its parts are stored in and the nodes holding them, and download any
-  version. Buckets can be created and (when empty) deleted.
+- **Buckets:** browse buckets by prefix, see every version of a key with how
+  it's encrypted, the blobs its parts are stored in and the nodes holding
+  them, and download any version (but an SSE-C one, whose key Cairn doesn't
+  have). Buckets can be created and (when empty) deleted.
 - **Roles:** everything `cairn role` does: create and delete roles, grant and
   revoke permissions, rotate secrets, and toggle admin.
 
@@ -264,8 +265,9 @@ spec at `/_dashboard/api/openapi.json` (also committed as `ui/openapi.json`).
 
 > [!WARNING]
 > Like the rest of the peer endpoint, the dashboard has no authentication:
-> anyone who can reach it can read every object and manage every role. Keep
-> the peer endpoint on a trusted network.
+> anyone who can reach it can read every object (SSE-KMS ones decrypted, as
+> for any role) and manage every role. Keep the peer endpoint on a trusted
+> network.
 
 ### Building the dashboard
 
@@ -364,6 +366,10 @@ stored, so no disk ever holds it in the clear.
   don't put anything secret there.
 - An encrypted object's ETag is random, not the MD5 of its content, as in S3:
   an MD5 would give away whether the content is a guessed one.
+- Keys are only ever in a node's memory, and wiped once they're no longer
+  needed. A node can't be core-dumped or debugged by another process of its
+  user. But its memory can be swapped out: run nodes without swap, or with
+  encrypted swap (and without hibernation), as you would OpenBao.
 
 Encryption with keys of Cairn's own (**SSE-S3**) isn't implemented: a request
 asking for it is refused with `501 NotImplemented`, rather than stored
@@ -413,9 +419,11 @@ Vault), whose keys never leave it.
   encrypted with: anyone who could open the source's can read the copy's
   data. To change that (if a key may have leaked, say), copy to a plain or
   SSE-C object and back, which writes the data anew.
-- Cairn's S3 permissions decide who may read and write an object; the KMS
-  doesn't see who asked. Any role that may write may use any key Cairn's
-  policy allows, so restrict the keys there.
+- The keys are the operator's, not the clients': clients name a key, but
+  can't create or manage keys, and OpenBao sees only Cairn, not which role
+  asked. So Cairn's S3 permissions alone decide who may read and write an
+  object: any role that may read it can, and any role that may write may use
+  any key Cairn's policy allows. Restrict the keys there.
 - Revoking Cairn's access to a key, or deleting it, makes the objects under it
   unreadable for good. If the KMS can't be reached, reads and writes of
   SSE-KMS objects fail with `503`, and nothing else is affected (HEAD needs no

@@ -664,7 +664,48 @@ struct VersionInfo {
     etag: Option<String>,
     content_type: Option<String>,
     last_modified: f64,
+    /// How it's encrypted; none if it isn't.
+    encryption: Option<EncryptionInfo>,
     parts: Vec<PartInfo>,
+}
+
+/// How an object version is encrypted (see `s3::sse`).
+#[derive(Serialize, ToSchema)]
+struct EncryptionInfo {
+    /// `SSE-C` (with its client's key, which Cairn doesn't have) or `SSE-KMS`.
+    kind: String,
+    /// SSE-KMS: the name of the KMS key.
+    kms_key_id: Option<String>,
+    /// SSE-KMS: the version of the KMS key its data key is from.
+    kms_key_version: Option<i64>,
+    /// SSE-KMS: the encryption context its client gave, as JSON.
+    kms_context: Option<String>,
+}
+
+impl EncryptionInfo {
+    fn of(stored: crate::s3::sse::Stored) -> Option<EncryptionInfo> {
+        use crate::s3::sse::Stored;
+        match stored {
+            Stored::Plain => None,
+            Stored::Customer { .. } => Some(EncryptionInfo {
+                kind: "SSE-C".to_owned(),
+                kms_key_id: None,
+                kms_key_version: None,
+                kms_context: None,
+            }),
+            Stored::Kms(envelope) => Some(EncryptionInfo {
+                kind: "SSE-KMS".to_owned(),
+                // Transit's ciphertexts start `vault:v<version>:`.
+                kms_key_version: envelope
+                    .data_key
+                    .strip_prefix("vault:v")
+                    .and_then(|rest| rest.split(':').next())
+                    .and_then(|version| version.parse().ok()),
+                kms_key_id: Some(envelope.key_id),
+                kms_context: envelope.context,
+            }),
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -702,7 +743,8 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
     let versions = client
         .query_cached(
             "SELECT id, version_id, is_latest, is_delete_marker, size, etag, content_type,
-                    extract(epoch FROM last_modified)::float8
+                    extract(epoch FROM last_modified)::float8, sse_c_key, sse_kms_key_id,
+                    sse_kms_data_key, sse_kms_sealed, sse_kms_context
              FROM objects WHERE bucket = $1 AND key = $2
              ORDER BY id DESC LIMIT $3",
             &[&bucket, &key, &MAX_VERSIONS],
@@ -748,6 +790,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
             etag: v.get(5),
             content_type: v.get(6),
             last_modified: v.get(7),
+            encryption: EncryptionInfo::of(crate::s3::sse::Stored::from_row(v, 8)),
             parts: parts.remove(&v.get::<_, i64>(0)).unwrap_or_default(),
         })
         .collect();
@@ -1090,10 +1133,30 @@ mod e2e {
         assert_eq!(o["versions"].as_array().unwrap().len(), 1);
         assert_eq!(o["versions"][0]["parts"][0]["size"], 20);
         assert_eq!(o["versions"][0]["parts"][0]["nodes"], json!([app.node]));
+        assert!(o["versions"][0]["encryption"].is_null());
 
         let c = serde_json::to_value(cluster(&app).await.unwrap()).unwrap();
         assert_eq!(c["nodes"][0]["stats"]["node"], app.node);
         assert!(c["nodes"][0]["stats"]["requests"]["ops"].is_array());
+    }
+
+    #[test]
+    fn tells_how_a_version_is_encrypted() {
+        use crate::s3::sse::{Envelope, Stored};
+        assert!(EncryptionInfo::of(Stored::Plain).is_none());
+        let sse_c = EncryptionInfo::of(Stored::Customer { check: vec![0; 48] }).unwrap();
+        assert_eq!((sse_c.kind.as_str(), sse_c.kms_key_id), ("SSE-C", None));
+        let kms = EncryptionInfo::of(Stored::Kms(Envelope {
+            key_id: "cairn-a".to_owned(),
+            data_key: "vault:v12:AAAA".to_owned(),
+            sealed: vec![0; 72],
+            context: Some(r#"{"a":"b"}"#.to_owned()),
+        }))
+        .unwrap();
+        assert_eq!(kms.kind, "SSE-KMS");
+        assert_eq!(kms.kms_key_id.as_deref(), Some("cairn-a"));
+        assert_eq!(kms.kms_key_version, Some(12));
+        assert_eq!(kms.kms_context.as_deref(), Some(r#"{"a":"b"}"#));
     }
 
     /// Sends a request through the whole peer endpoint.

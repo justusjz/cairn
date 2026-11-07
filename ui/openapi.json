@@ -976,6 +976,41 @@
           }
         }
       },
+      "EncryptionInfo": {
+        "type": "object",
+        "description": "How an object version is encrypted (see `s3::sse`).",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`SSE-C` (with its client's key, which Cairn doesn't have) or `SSE-KMS`."
+          },
+          "kms_context": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SSE-KMS: the encryption context its client gave, as JSON."
+          },
+          "kms_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SSE-KMS: the name of the KMS key."
+          },
+          "kms_key_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "SSE-KMS: the version of the KMS key its data key is from."
+          }
+        }
+      },
       "Entry": {
         "oneOf": [
           {
@@ -1799,6 +1834,17 @@
           },
           "delete_marker": {
             "type": "boolean"
+          },
+          "encryption": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EncryptionInfo",
+                "description": "How it's encrypted; none if it isn't."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "etag": {
             "type": [

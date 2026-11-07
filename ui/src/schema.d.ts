@@ -354,6 +354,20 @@ export interface components {
              */
             total: number;
         };
+        /** @description How an object version is encrypted (see `s3::sse`). */
+        EncryptionInfo: {
+            /** @description `SSE-C` (with its client's key, which Cairn doesn't have) or `SSE-KMS`. */
+            kind: string;
+            /** @description SSE-KMS: the encryption context its client gave, as JSON. */
+            kms_context?: string | null;
+            /** @description SSE-KMS: the name of the KMS key. */
+            kms_key_id?: string | null;
+            /**
+             * Format: int64
+             * @description SSE-KMS: the version of the KMS key its data key is from.
+             */
+            kms_key_version?: number | null;
+        };
         Entry: {
             /** Format: int64 */
             bytes: number;
@@ -628,6 +642,7 @@ export interface components {
         VersionInfo: {
             content_type?: string | null;
             delete_marker: boolean;
+            encryption?: components["schemas"]["EncryptionInfo"] | null;
             etag?: string | null;
             /** Format: double */
             last_modified: number;
