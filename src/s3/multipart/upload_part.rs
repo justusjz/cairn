@@ -4,18 +4,20 @@ use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
 use uuid::Uuid;
 
-use crate::db::Cached;
 use crate::{
     App, AttachTarget, UploadResult,
     payload::Payload,
-    s3::sse_c::{self, CustomerKey},
+    s3::multipart::upload_encryption,
+    s3::sse,
+    s3::sse_c::CustomerKey,
     s3::util::{format_s3_error, rejection_response},
 };
 
 /// UploadPart: `PUT /{bucket}/{key}?partNumber=N&uploadId=U`. Streams the part
 /// and stages it under the upload (the live object is untouched); returns its
 /// ETag. The part of an SSE-C upload needs the upload's key, and is encrypted
-/// with it.
+/// with it; that of an SSE-KMS upload is encrypted with the upload's key,
+/// which the KMS opens.
 #[allow(clippy::too_many_arguments)]
 pub async fn put_part(
     app: &Arc<App>,
@@ -50,26 +52,21 @@ pub async fn put_part(
     // Reject up front if the upload is gone, so we don't replicate a part we'd
     // only fail to stage at commit (the FK would reject it anyway). It must also
     // belong to the request's bucket/key: authorization only checked that bucket.
-    // Its key check, if it's SSE-C, never changes, so it's checked here, once.
-    let client = app.pool.get().await?;
-    let Some(upload) = client
-        .query_opt_cached(
-            "SELECT sse_c_key FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
-            &[&upload_id, &bucket, &key],
-        )
-        .await?
-    else {
+    // Its encryption never changes, so it's checked here, once.
+    let Some(encryption) = upload_encryption(app, &upload_id, bucket, key).await? else {
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchUpload",
             "the specified multipart upload does not exist",
         ));
     };
-    drop(client);
-    let check: Option<Vec<u8>> = upload.get(0);
-    if let Err(refused) = sse_c::check_read(check.as_deref(), customer_key) {
+    if let Err(refused) = sse::check(&encryption, customer_key) {
         return Ok(refused);
     }
+    let upload_key = match sse::open(app, &encryption, customer_key, bucket, key).await? {
+        Ok(upload_key) => upload_key,
+        Err(refused) => return Ok(refused),
+    };
 
     // `upload_part` streams the body, computing the part's ETag (hex MD5, or,
     // encrypted, its salt) as it goes.
@@ -79,19 +76,17 @@ pub async fn put_part(
         &AttachTarget::MultipartPart {
             upload_id,
             part_number,
-            key: customer_key.map(|key| zeroize::Zeroizing::new(*key.key())),
+            key: upload_key,
         },
         payload,
     )
     .await?
     {
         UploadResult::Committed { etag, .. } => {
-            let mut builder = Response::builder()
+            let builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, format!("\"{etag}\""));
-            if let Some(key) = customer_key {
-                builder = key.echo(builder);
-            }
+            let builder = sse::echo(builder, &encryption, customer_key);
             Ok(builder.body(Full::new(Bytes::new())).unwrap())
         }
         UploadResult::Rejected(rejection) => Ok(rejection_response(&rejection)),

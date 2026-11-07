@@ -46,6 +46,7 @@ pub(crate) mod buckets;
 pub(crate) mod acl;
 pub(crate) mod conditional;
 pub(crate) mod metadata;
+pub(crate) mod sse;
 pub(crate) mod sse_c;
 pub(crate) mod multipart;
 pub(crate) mod objects;
@@ -366,19 +367,34 @@ async fn handle_request(
         Ok(key) => key,
         Err(refused) => return Ok(box_response(refused)),
     };
-    if matches!(*req.method(), Method::PUT | Method::POST) {
-        // SSE-S3 and SSE-KMS: Cairn has no keys of its own to encrypt with.
-        if let Some(refused) = sse_c::refuse_server_keys(req.headers()) {
-            return Ok(box_response(refused));
-        }
-    }
-    // An object write may only ask for the ACL there is (see `acl`):
-    // PutObject, CopyObject, CreateMultipartUpload.
+    // The writes that make an object (or an upload): PutObject, CopyObject,
+    // CreateMultipartUpload.
     let writes_object = match *req.method() {
         Method::PUT => query_param(&query, "uploadId").is_none() && query_param(&query, "acl").is_none(),
         Method::POST => query_param(&query, "uploads").is_some(),
         _ => false,
     };
+    // SSE-KMS: what such a write asks for. Its headers are refused elsewhere.
+    let kms_request = match *req.method() {
+        _ if writes_object => {
+            match sse::requested_kms(req.headers(), customer_key.is_some(), app.kms.is_some()) {
+                Ok(request) => request,
+                Err(refused) => return Ok(box_response(refused)),
+            }
+        }
+        Method::GET | Method::HEAD => match sse::refuse_on_read(req.headers()) {
+            Some(refused) => return Ok(box_response(refused)),
+            None => None,
+        },
+        Method::PUT | Method::POST => match sse::refuse_on_other_writes(req.headers()) {
+            Some(refused) => return Ok(box_response(refused)),
+            None => None,
+        },
+        _ => None,
+    };
+    // How an object write asks for its object to be encrypted.
+    let wanted = sse::Wanted::new(customer_key.as_ref(), kms_request.as_ref());
+    // An object write may only ask for the ACL there is (see `acl`).
     if writes_object && let Err(refused) = acl::check_write(req.headers(), acl::On::Object) {
         return Ok(box_response(refused));
     }
@@ -479,8 +495,7 @@ async fn handle_request(
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {
             match metadata {
                 Ok(metadata) => {
-                    create_multipart_upload(&app, &bucket, &key, &content_type, &metadata, customer_key.as_ref())
-                        .await?
+                    create_multipart_upload(&app, &bucket, &key, &content_type, &metadata, wanted).await?
                 }
                 Err(refused) => refused,
             }
@@ -518,7 +533,8 @@ async fn handle_request(
                 &copy_source.unwrap(),
                 copy_source_range.as_deref(),
                 &copy_source_preconditions,
-                CopyKeys { source: source_key.as_ref(), dest: customer_key.as_ref() },
+                source_key.as_ref(),
+                customer_key.as_ref(),
             )
             .await?
         }
@@ -555,15 +571,14 @@ async fn handle_request(
                 &content_type,
                 &metadata,
                 &copy_source_preconditions,
-                CopyKeys { source: source_key.as_ref(), dest: customer_key.as_ref() },
+                CopyKeys { source: source_key.as_ref(), dest: wanted },
             )
             .await?
         }
         hyper::Method::PUT => match (payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)), metadata) {
             (Ok(payload), Ok(metadata)) => {
                 let body = req.into_body();
-                let customer_key = customer_key.as_ref();
-                put_object(&app, &bucket, &key, &content_type, &metadata, body, payload, &preconditions, customer_key)
+                put_object(&app, &bucket, &key, &content_type, &metadata, body, payload, &preconditions, wanted)
                     .await?
             }
             (Err(rejection), _) => util::rejection_response(&rejection),

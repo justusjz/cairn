@@ -18,7 +18,8 @@ use crate::{
     encryption::{Key, Opener, Salt, segment_range},
     s3::conditional::{Precondition, Preconditions, not_modified},
     s3::metadata,
-    s3::sse_c::{self, CustomerKey},
+    s3::sse::{self, Stored},
+    s3::sse_c::CustomerKey,
     s3::util::{format_s3_error, with_delete_marker, with_version_id},
     s3::versions::Versioning,
 };
@@ -31,8 +32,8 @@ pub(crate) struct ObjectVersion {
     pub content_type: String,
     /// The headers stored with it (see `s3::metadata`).
     pub metadata: String,
-    /// If it's SSE-C, the check of its key (see `s3::sse_c`).
-    pub sse_c_key: Option<Vec<u8>>,
+    /// How it's encrypted (see `s3::sse`).
+    pub encryption: Stored,
     pub size: i64,
     /// Last-Modified as an HTTP date (for headers) and in ISO 8601 (for XML
     /// bodies), and as a Unix timestamp for conditionals.
@@ -108,7 +109,8 @@ pub(crate) async fn lookup_version<C: GenericClient>(
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
                     floor(extract(epoch FROM o.last_modified))::bigint,
-                    o.version_id, o.is_delete_marker, b.versioning, o.metadata, o.sse_c_key
+                    o.version_id, o.is_delete_marker, b.versioning, o.metadata, o.sse_c_key,
+                    o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed, o.sse_kms_context
              FROM objects o JOIN buckets b ON b.name = o.bucket
              WHERE o.bucket = $1 AND o.key = $2
                AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",
@@ -135,7 +137,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
         etag: row.get(1),
         content_type: row.get(2),
         metadata: row.get(10),
-        sse_c_key: row.get(11),
+        encryption: Stored::from_row(&row, 11),
         size: row.get(3),
         last_modified: row.get(4),
         last_modified_iso: row.get(5),
@@ -188,7 +190,7 @@ pub async fn get_object(
         etag,
         content_type,
         metadata,
-        sse_c_key,
+        encryption,
         size,
         last_modified,
         lm_epoch,
@@ -197,7 +199,7 @@ pub async fn get_object(
     } = version;
     // An SSE-C object only with its key; before the conditions, which would
     // tell about it otherwise.
-    if let Err(refused) = sse_c::check_read(sse_c_key.as_deref(), customer_key) {
+    if let Err(refused) = sse::check(&encryption, customer_key) {
         return Ok(box_response(refused));
     }
     // Honour conditional-request headers before doing any streaming work.
@@ -231,13 +233,19 @@ pub async fn get_object(
     // first) from this same snapshot.
     let parts = resolve_object_parts(&tx, object_id).await?;
     tx.commit().await?;
+    // The key it's encrypted with, from the KMS for an SSE-KMS object: only
+    // once it's certain to be read.
+    let object_key = match sse::open(app, &encryption, customer_key, bucket, key).await? {
+        Ok(object_key) => object_key,
+        Err(refused) => return Ok(box_response(refused)),
+    };
 
     // Select the parts overlapping the requested range and stream them (each over
     // its computed sub-range) through a channel-backed body: a background task
     // pulls each from a replica (locally if that's us), verifies it, and forwards
     // it. We set Content-Length, so a truncated stream (a part we can't serve) is
     // detected by the client rather than read as a short-but-complete object.
-    let slices = select_parts_in_range(parts, range_start, range_end, customer_key.map(|k| k.key()));
+    let slices = select_parts_in_range(parts, range_start, range_end, object_key.as_deref());
     let (sender, body) = channel_body();
     spawn_range_stream(app.clone(), slices, sender);
 
@@ -247,10 +255,8 @@ pub async fn get_object(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, range_end - range_start)
         .header(header::LAST_MODIFIED, last_modified);
-    let mut builder = metadata::apply(builder, &metadata);
-    if let Some(key) = customer_key {
-        builder = key.echo(builder);
-    }
+    let builder = metadata::apply(builder, &metadata);
+    let builder = sse::echo(builder, &encryption, customer_key);
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,
@@ -616,7 +622,7 @@ pub async fn head_object(
         etag,
         content_type,
         metadata,
-        sse_c_key,
+        encryption,
         size,
         last_modified,
         lm_epoch,
@@ -626,7 +632,8 @@ pub async fn head_object(
         Ok(version) => version,
         Err(missing) => return Ok(missing.read_response()),
     };
-    if let Err(refused) = sse_c::check_read(sse_c_key.as_deref(), customer_key) {
+    // Like GET's, but an SSE-KMS object's key isn't needed.
+    if let Err(refused) = sse::check(&encryption, customer_key) {
         return Ok(refused);
     }
     // Honour conditional-request headers, exactly as GET does.
@@ -661,10 +668,8 @@ pub async fn head_object(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, range_end - range_start)
         .header(header::LAST_MODIFIED, last_modified);
-    let mut builder = metadata::apply(builder, &metadata);
-    if let Some(key) = customer_key {
-        builder = key.echo(builder);
-    }
+    let builder = metadata::apply(builder, &metadata);
+    let builder = sse::echo(builder, &encryption, customer_key);
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,

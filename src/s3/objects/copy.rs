@@ -6,6 +6,7 @@ use hyper::{Response, StatusCode, body::Bytes, header::HeaderValue};
 use md5::{Digest, Md5};
 use tokio_postgres::IsolationLevel;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use crate::db::Cached;
 use crate::{
@@ -13,10 +14,13 @@ use crate::{
     blobs::{reap_blobs, reap_columns},
     body::channel_body,
     db,
+    encryption::Key,
     payload::Payload,
     s3::{
         conditional::{Precondition, Preconditions},
-        sse_c::{self, CustomerKey},
+        multipart::upload_encryption,
+        sse::{self, Stored, Wanted},
+        sse_c::CustomerKey,
         objects::get::{
             Missing, ObjectVersion, PartLocation, lookup_version, no_such_version,
             resolve_object_parts, select_parts_in_range, spawn_range_stream,
@@ -57,23 +61,38 @@ struct Source {
     locations: Vec<PartLocation>,
 }
 
-/// The SSE-C keys of a copy: its source's (from the
-/// `x-amz-copy-source-server-side-encryption-customer-*` headers) and its
-/// destination's, either `None` for a plain object.
+/// The keys of a CopyObject: its source's SSE-C key (from the
+/// `x-amz-copy-source-server-side-encryption-customer-*` headers), if it's
+/// SSE-C, and how its destination is to be encrypted.
 #[derive(Clone, Copy, Default)]
 pub struct CopyKeys<'a> {
     pub source: Option<&'a CustomerKey>,
-    pub dest: Option<&'a CustomerKey>,
+    pub dest: Wanted<'a>,
 }
 
 impl CopyKeys<'_> {
-    /// Whether the destination can share the source's bytes: both are plain,
-    /// or encrypted with the same key. Otherwise the data is decrypted and
-    /// encrypted again.
-    fn same(&self) -> bool {
-        match (self.source, self.dest) {
-            (None, None) => true,
-            (Some(source), Some(dest)) => source.key() == dest.key(),
+    /// Whether the destination can share the bytes of a source encrypted as
+    /// `source` is: both are plain, or SSE-C with the same key, or SSE-KMS
+    /// (under any KMS key: the copy seals the same object key under a data
+    /// key of its own). Otherwise the data is decrypted and encrypted again.
+    fn shares(&self, source: &Stored) -> bool {
+        match (source, self.dest) {
+            (Stored::Plain, Wanted::Plain) | (Stored::Kms(_), Wanted::Kms(_)) => true,
+            (Stored::Customer { .. }, Wanted::Customer(dest)) => {
+                self.source.is_some_and(|source| source.key() == dest.key())
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a copy of a source encrypted as `source` onto itself leaves its
+    /// encryption as it is: plain, or SSE-C with the same key. An SSE-KMS
+    /// destination never does: it's a new object with keys of its own, as in
+    /// MinIO.
+    fn keeps(&self, source: &Stored) -> bool {
+        match (source, self.dest) {
+            (Stored::Plain, Wanted::Plain) => true,
+            (Stored::Customer { .. }, Wanted::Customer(_)) => self.shares(source),
             _ => false,
         }
     }
@@ -89,10 +108,10 @@ impl CopyKeys<'_> {
 /// data is read once to work it out (but not written).
 ///
 /// An SSE-C source needs its key (`keys.source`). The copy shares its bytes
-/// if it's encrypted with the same key, or both are plain; then an encrypted
-/// copy's ETag is the source's (an MD5 of the data would give it away).
-/// Otherwise the data is read, decrypted, and written again, encrypted with
-/// `keys.dest` if there is one.
+/// if it's encrypted with the same key, or both are plain, or both SSE-KMS
+/// (see `CopyKeys::shares`); then an encrypted copy's ETag is the source's (an
+/// MD5 of the data would give it away). Otherwise the data is read, decrypted,
+/// and written again, encrypted as `keys.dest` asks.
 ///
 /// `metadata_directive` is `x-amz-metadata-directive` (COPY, the default, or
 /// REPLACE). Under COPY the destination inherits the source's content-type and
@@ -128,16 +147,10 @@ pub async fn copy_object(
     // S3 rejects a copy of an object onto itself that changes nothing, guarding
     // against a client accidentally issuing a destructive no-op. Copying a named
     // version onto its own key is allowed: that's how an old version is restored.
-    // So is changing its encryption (another key, or none).
+    // So is changing its encryption (another key, or none), which is only
+    // known once the source is read: a request without encryption headers
+    // decrypts an SSE-KMS source.
     let same_object = src_bucket == dest_bucket && src_key == dest_key && src_version.is_none();
-    if same_object && !replace && keys.same() {
-        return Ok(format_s3_error(
-            StatusCode::BAD_REQUEST,
-            "InvalidRequest",
-            "this copy request is illegal because it is trying to copy an object to \
-             itself without changing the object's metadata",
-        ));
-    }
     let client = app.pool.get().await?;
     if client
         .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&dest_bucket])
@@ -155,8 +168,17 @@ pub async fn copy_object(
         };
         // An SSE-C source only with its key; before the conditions, which would
         // tell about it otherwise.
-        if let Err(refused) = sse_c::check_read(source.version.sse_c_key.as_deref(), keys.source) {
+        let encryption = &source.version.encryption;
+        if let Err(refused) = sse::check(encryption, keys.source) {
             return Ok(refused);
+        }
+        if same_object && !replace && keys.keeps(encryption) {
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "this copy request is illegal because it is trying to copy an object to \
+                 itself without changing the object's metadata",
+            ));
         }
         // Honour x-amz-copy-source-if-* conditions on the source; any failure (a
         // 304 for a read maps to 412 here) aborts the copy.
@@ -180,7 +202,7 @@ pub async fn copy_object(
         } else {
             (version.content_type.as_str(), version.metadata.as_str())
         };
-        let respond = |etag: &str, version_id: Option<&str>, last_modified: &str| {
+        let respond = |etag: &str, version_id: Option<&str>, last_modified: &str, stored: &Stored| {
             let resp = with_version_id(
                 xml_ok(format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -192,16 +214,23 @@ pub async fn copy_object(
                 version_id,
             );
             let resp = with_copy_source_version_id(resp, source.version.version_id.as_deref());
-            match keys.dest {
-                Some(dest) => dest.echo_onto(resp),
-                None => resp,
-            }
+            sse::echo_onto(resp, stored, keys.dest.customer())
         };
-        if !keys.same() {
+        // The key the source is encrypted with, if it is.
+        let source_key = match sse::open(app, encryption, keys.source, &src_bucket, &src_key).await? {
+            Ok(key) => key,
+            Err(refused) => return Ok(refused),
+        };
+        if !keys.shares(encryption) {
             let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata };
-            match stream_object_copy(app, &source, &dest, keys).await {
+            let sealing = match sse::seal(app, keys.dest, dest_bucket, dest_key).await? {
+                Ok(sealing) => sealing,
+                Err(refused) => return Ok(refused),
+            };
+            let stored = sealing.as_ref().map_or(Stored::Plain, |sealing| sealing.stored.clone());
+            match stream_object_copy(app, &source, &dest, source_key, sealing).await {
                 Ok(Some((etag, version_id, last_modified))) => {
-                    return Ok(respond(&etag, version_id.as_deref(), &last_modified));
+                    return Ok(respond(&etag, version_id.as_deref(), &last_modified, &stored));
                 }
                 Ok(None) => return Ok(no_such_bucket()),
                 // Its data went with it: copy what it is now.
@@ -210,7 +239,7 @@ pub async fn copy_object(
             }
         }
         let etag = match source.parts.as_slice() {
-            _ if keys.dest.is_some() => version.etag.clone(),
+            _ if !encryption.is_plain() => version.etag.clone(),
             [part] => part.etag.clone(),
             _ => {
                 let size = version.size as u64;
@@ -222,19 +251,31 @@ pub async fn copy_object(
                 }
             }
         };
-        let check = keys.dest.map(|dest| dest.new_check());
+        // The copy's own record of the same key: a check of the client's, or
+        // the object key sealed under a data key for the copy.
+        let stored = match (keys.dest, &source_key) {
+            (Wanted::Plain, _) => Stored::Plain,
+            (Wanted::Customer(dest), _) => Stored::Customer { check: dest.new_check() },
+            (Wanted::Kms(request), Some(object_key)) => {
+                match sse::reseal(app, object_key, request, dest_bucket, dest_key).await? {
+                    Ok(envelope) => Stored::Kms(envelope),
+                    Err(refused) => return Ok(refused),
+                }
+            }
+            (Wanted::Kms(_), None) => unreachable!("an SSE-KMS copy shares only an SSE-KMS source's parts"),
+        };
         // CopyObject reports the new version's last-modified time in the body
         // (not just the ETag header). It comes from the commit itself: read
         // afterwards, a concurrent write to the key could have replaced the
         // version already.
         let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata };
         let (version_id, last_modified) =
-            match commit_object_copy(app, &source, &dest, &etag, check.as_deref()).await? {
+            match commit_object_copy(app, &source, &dest, &etag, &stored).await? {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
                 ObjectCopy::SourceChanged => continue, // copy what it is now
                 ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
             };
-        return Ok(respond(&etag, version_id.as_deref(), &last_modified));
+        return Ok(respond(&etag, version_id.as_deref(), &last_modified, &stored));
     }
     Err(Contended("the copy source kept changing".to_owned()).into())
 }
@@ -254,19 +295,20 @@ struct Dest<'a> {
 }
 
 /// Copies `source` to `dest` as data, through the normal upload path: read
-/// (and decrypted with `keys.source`) like a GET, and written (encrypted with
-/// `keys.dest`) like a PUT, which works out the ETag as it streams. For a copy
-/// that can't share the source's bytes. The new version's ETag, version ID to
-/// report and last-modified time, or `None` if the bucket is gone.
+/// (and decrypted with `source_key`) like a GET, and written (encrypted as
+/// `sealing` says) like a PUT, which works out the ETag as it streams. For a
+/// copy that can't share the source's bytes. The new version's ETag, version
+/// ID to report and last-modified time, or `None` if the bucket is gone.
 async fn stream_object_copy(
     app: &Arc<App>,
     source: &Source,
     dest: &Dest<'_>,
-    keys: CopyKeys<'_>,
+    source_key: Option<Zeroizing<Key>>,
+    sealing: Option<Sealing>,
 ) -> anyhow::Result<Option<(String, Option<String>, String)>> {
     let (sender, body) = channel_body();
     let size = source.version.size as u64;
-    let slices = select_parts_in_range(source.locations.clone(), 0, size, keys.source.map(|k| k.key()));
+    let slices = select_parts_in_range(source.locations.clone(), 0, size, source_key.as_deref());
     spawn_range_stream(app.clone(), slices, sender);
     let attach = AttachTarget::Object {
         bucket: dest.bucket.to_owned(),
@@ -274,10 +316,7 @@ async fn stream_object_copy(
         content_type: dest.content_type.to_owned(),
         metadata: dest.metadata.to_owned(),
         conditions: Preconditions::default(),
-        sealing: keys.dest.map(|key| Sealing {
-            key: zeroize::Zeroizing::new(*key.key()),
-            check: key.new_check(),
-        }),
+        sealing,
     };
     // The source stream is data from within Cairn (verified as it's read), so
     // there's nothing to check it against.
@@ -320,9 +359,10 @@ async fn commit_object_copy(
     source: &Source,
     dest: &Dest<'_>,
     etag: &str,
-    sse_c_key: Option<&[u8]>,
+    stored: &Stored,
 ) -> anyhow::Result<ObjectCopy> {
     let (part_ids, part_sizes) = source.part_keys();
+    let sse = stored.columns();
     let client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
@@ -330,7 +370,8 @@ async fn commit_object_copy(
             let row = client
                 .query_one_cached(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
-                     FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                     FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
+                                                    $12, $13, $14, $15)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -341,7 +382,11 @@ async fn commit_object_copy(
                         &etag,
                         &dest.content_type,
                         &dest.metadata,
-                        &sse_c_key,
+                        &sse.sse_c_key,
+                        &sse.kms_key_id,
+                        &sse.kms_data_key,
+                        &sse.kms_sealed,
+                        &sse.kms_context,
                         &new_version_id(),
                     ],
                 )
@@ -384,9 +429,10 @@ async fn commit_object_copy(
 /// whole part, takes reading them (but not writing them). A part can't span
 /// blobs, so a range over several parts of the source is copied as data.
 ///
-/// So is any range of an SSE-C source (which needs its key, `keys.source`), or
-/// into an SSE-C upload (which needs the upload's key, `keys.dest`, as an
-/// UploadPart does): a range of ciphertext isn't a part of its own.
+/// So is any range of an encrypted source (an SSE-C one needs its key,
+/// `source_key`), or into an encrypted upload (an SSE-C one needs its key,
+/// `dest_key`, as an UploadPart does): a range of ciphertext isn't a part of
+/// its own.
 #[allow(clippy::too_many_arguments)]
 pub async fn copy_part(
     app: &Arc<App>,
@@ -397,7 +443,8 @@ pub async fn copy_part(
     copy_source: &str,
     copy_source_range: Option<&str>,
     preconditions: &Preconditions,
-    keys: CopyKeys<'_>,
+    source_key: Option<&CustomerKey>,
+    dest_key: Option<&CustomerKey>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -429,19 +476,10 @@ pub async fn copy_part(
 
     // Reject up front if the upload is gone, and require it to belong to the
     // request's bucket/key, and its key if it's SSE-C — as put_part does.
-    let client = app.pool.get().await?;
-    let Some(upload) = client
-        .query_opt_cached(
-            "SELECT sse_c_key FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
-            &[&upload_id, &bucket, &key],
-        )
-        .await?
-    else {
+    let Some(upload_encryption) = upload_encryption(app, &upload_id, bucket, key).await? else {
         return Ok(no_such_upload());
     };
-    drop(client);
-    let check: Option<Vec<u8>> = upload.get(0);
-    if let Err(refused) = sse_c::check_read(check.as_deref(), keys.dest) {
+    if let Err(refused) = sse::check(&upload_encryption, dest_key) {
         return Ok(refused);
     }
 
@@ -450,7 +488,7 @@ pub async fn copy_part(
             Ok(source) => source,
             Err(missing) => return Ok(missing),
         };
-        if let Err(refused) = sse_c::check_read(source.version.sse_c_key.as_deref(), keys.source) {
+        if let Err(refused) = sse::check(&source.version.encryption, source_key) {
             return Ok(refused);
         }
         let version = &source.version;
@@ -483,14 +521,15 @@ pub async fn copy_part(
                 version.last_modified_iso
             ));
             let resp = with_copy_source_version_id(resp, version.version_id.as_deref());
-            match keys.dest {
-                Some(dest) => dest.echo_onto(resp),
-                None => resp,
-            }
+            sse::echo_onto(resp, &upload_encryption, dest_key)
         };
-        let encrypted = keys.source.is_some() || keys.dest.is_some();
+        let encrypted = !version.encryption.is_plain() || !upload_encryption.is_plain();
         let holding = part_holding(&source.parts, start, end).filter(|_| !encrypted);
         let Some((index, within)) = holding else {
+            let keys = match stream_keys(app, &source, source_key, &src_bucket, &src_key, &upload_encryption, dest_key, bucket, key).await? {
+                Ok(keys) => keys,
+                Err(refused) => return Ok(refused),
+            };
             return Ok(
                 match stream_part_copy(app, &source, start, end, upload_id, part_number, keys).await {
                     Ok(Some(etag)) => respond(&etag),
@@ -641,10 +680,10 @@ async fn commit_part_copy(
 
 /// Copies bytes [start, end) of `source` as data into a new part staged
 /// under the upload, through the normal upload path (which works out the
-/// part's ETag as it streams): decrypted with `keys.source` and encrypted with
-/// `keys.dest`, if they're SSE-C. For a range over several parts of the
-/// source, or of or into an SSE-C one. `None` if the upload was completed or
-/// aborted meanwhile.
+/// part's ETag as it streams): decrypted with the source's key and encrypted
+/// with the upload's (`keys`), if they're encrypted. For a range over several
+/// parts of the source, or of or into an encrypted one. `None` if the upload
+/// was completed or aborted meanwhile.
 async fn stream_part_copy(
     app: &Arc<App>,
     source: &Source,
@@ -652,15 +691,15 @@ async fn stream_part_copy(
     end: u64,
     upload_id: Uuid,
     part_number: i32,
-    keys: CopyKeys<'_>,
+    keys: StreamKeys,
 ) -> anyhow::Result<Option<String>> {
     let (sender, source_body) = channel_body();
-    let slices = select_parts_in_range(source.locations.clone(), start, end, keys.source.map(|k| k.key()));
+    let slices = select_parts_in_range(source.locations.clone(), start, end, keys.source.as_deref());
     spawn_range_stream(app.clone(), slices, sender);
     let attach = AttachTarget::MultipartPart {
         upload_id,
         part_number,
-        key: keys.dest.map(|key| zeroize::Zeroizing::new(*key.key())),
+        key: keys.dest,
     };
     // The source stream is data from within Cairn (verified against its block
     // checksums as it's read), so there's nothing to check it against.
@@ -676,6 +715,38 @@ async fn stream_part_copy(
             unreachable!("an unchecked part upload only commits, or finds its upload gone")
         }
     }
+}
+
+/// The keys an UploadPartCopy streams with: its source's, and its upload's.
+struct StreamKeys {
+    source: Option<Zeroizing<Key>>,
+    dest: Option<Zeroizing<Key>>,
+}
+
+/// The keys of an UploadPartCopy's source (`source_key` being the SSE-C key
+/// the request gave for it) and of its upload (`dest_key` likewise), both
+/// `check`ed already. Asks the KMS for SSE-KMS ones.
+#[allow(clippy::too_many_arguments)]
+async fn stream_keys(
+    app: &App,
+    source: &Source,
+    source_key: Option<&CustomerKey>,
+    src_bucket: &str,
+    src_key: &str,
+    upload: &Stored,
+    dest_key: Option<&CustomerKey>,
+    bucket: &str,
+    key: &str,
+) -> anyhow::Result<Result<StreamKeys, Response<Full<Bytes>>>> {
+    let source = match sse::open(app, &source.version.encryption, source_key, src_bucket, src_key).await? {
+        Ok(key) => key,
+        Err(refused) => return Ok(Err(refused)),
+    };
+    let dest = match sse::open(app, upload, dest_key, bucket, key).await? {
+        Ok(key) => key,
+        Err(refused) => return Ok(Err(refused)),
+    };
+    Ok(Ok(StreamKeys { source, dest }))
 }
 
 /// Reads the version a copy addresses (the one named, else the key's current

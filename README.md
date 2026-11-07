@@ -100,7 +100,14 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--peer-url <URL>` | `CAIRN_PEER_URL` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
 | `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on. |
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
-| `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#encryption) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
+| `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
+| `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
+| `--kms-mount <PATH>` | `CAIRN_KMS_MOUNT` | `transit` | Where its Transit engine is mounted. |
+| `--kms-default-key <NAME>` | `CAIRN_KMS_DEFAULT_KEY` | *required with a KMS* | The Transit key for SSE-KMS requests that name none. |
+| `--kms-ca-cert <PATH>` | `CAIRN_KMS_CA_CERT` | public roots | PEM file of the CA certificates to trust for the KMS's TLS. |
+| `--kms-token-file <PATH>` | `CAIRN_KMS_TOKEN_FILE` | none | File holding a token for the KMS; read again whenever the KMS refuses the one Cairn has. |
+| `--kms-approle-role-id <ID>` | `CAIRN_KMS_APPROLE_ROLE_ID` | none | AppRole role ID to log in with, instead of a token file. |
+| `--kms-approle-secret-id-file <PATH>` | `CAIRN_KMS_APPROLE_SECRET_ID_FILE` | none | File holding the AppRole secret ID. |
 
 On SIGTERM or Ctrl-C, a node stops accepting connections and finishes the
 requests in flight before it exits; a second signal exits right away. Anything
@@ -345,13 +352,9 @@ its body is read.
 
 ## Encryption
 
-Objects can be encrypted with a key their client supplies (**SSE-C**): send the
-`x-amz-server-side-encryption-customer-*` headers with the PUT, as with S3
-(`aws s3api put-object --sse-customer-algorithm AES256 --sse-customer-key
-fileb://key`), and the same key with every GET and HEAD of the object. Cairn
-encrypts the data before it's stored, so no disk ever holds it in the clear,
-and never stores the key: only a salted HMAC of it, to refuse a wrong one.
-Without the key, the data can't be read, by anyone.
+Objects can be encrypted with a key their client supplies (**SSE-C**), or with
+keys from a KMS (**SSE-KMS**). Either way, Cairn encrypts the data before it's
+stored, so no disk ever holds it in the clear.
 
 - The algorithm is XChaCha20-Poly1305 (S3's API calls every SSE-C key
   `AES256`, and Cairn answers the same way), in 64 KiB segments, so a range
@@ -359,8 +362,22 @@ Without the key, the data can't be read, by anyone.
 - Only the content is encrypted. Its key (name), size, times, Content-Type
   and metadata (`x-amz-meta-*` and the like) are stored as they are, as in S3:
   don't put anything secret there.
-- An SSE-C object's ETag is random, not the MD5 of its content, as in S3:
+- An encrypted object's ETag is random, not the MD5 of its content, as in S3:
   an MD5 would give away whether the content is a guessed one.
+
+Encryption with keys of Cairn's own (**SSE-S3**) isn't implemented: a request
+asking for it is refused with `501 NotImplemented`, rather than stored
+unencrypted. Nor is a bucket's default encryption: each write asks for its own.
+
+### SSE-C
+
+Send the
+`x-amz-server-side-encryption-customer-*` headers with the PUT, as with S3
+(`aws s3api put-object --sse-customer-algorithm AES256 --sse-customer-key
+fileb://key`), and the same key with every GET and HEAD of the object. Cairn
+never stores the key: only a salted HMAC of it, to refuse a wrong one.
+Without the key, the data can't be read, by anyone.
+
 - The key travels in a request header, so it's only accepted over HTTPS: a
   request must come through a proxy that sets `X-Forwarded-Proto: https` (or
   `Forwarded: proto=https`). Behind an encrypted network instead, allow it with
@@ -372,9 +389,57 @@ Without the key, the data can't be read, by anyone.
   shares the source's data; one with another key, or none, is written anew.
   Copying an object onto itself with another key changes its key.
 
-Encryption with keys of Cairn's own (**SSE-S3**, **SSE-KMS**) isn't
-implemented: a request asking for it is refused with `501 NotImplemented`,
-rather than stored unencrypted.
+### SSE-KMS
+
+With a KMS configured (`--kms-*` flags), a write may ask for SSE-KMS, as with
+S3: `aws s3api put-object --server-side-encryption aws:kms`, optionally with
+`--ssekms-key-id <name>` (else the default key) and
+`--ssekms-encryption-context <base64 JSON>`. Reads need nothing: Cairn asks the
+KMS. The KMS is the Transit engine of [OpenBao](https://openbao.org) (or
+Vault), whose keys never leave it.
+
+- Every object gets a random key of its own, which Cairn keeps sealed under a
+  data key from the KMS, and keeps that data key only as the KMS encrypted it.
+  The KMS binds it to the object's name (`bucket/key`) and encryption context:
+  it opens for that object only, and only with that context.
+- Responses tell the key as `arn:aws:kms:<name>`, and a request may name it
+  so too. `x-amz-server-side-encryption-bucket-key-enabled` is accepted and
+  ignored, as in MinIO: every object has keys of its own anyway.
+- Multipart uploads: ask for SSE-KMS with CreateMultipartUpload. Its parts and
+  its completion need nothing more.
+- Copies to another SSE-KMS key or context share the source's data, as copies
+  under the same SSE-C key do: the copy seals the same object key under a data
+  key of its own. That changes who may open it, but not the key the data is
+  encrypted with: anyone who could open the source's can read the copy's
+  data. To change that (if a key may have leaked, say), copy to a plain or
+  SSE-C object and back, which writes the data anew.
+- Cairn's S3 permissions decide who may read and write an object; the KMS
+  doesn't see who asked. Any role that may write may use any key Cairn's
+  policy allows, so restrict the keys there.
+- Revoking Cairn's access to a key, or deleting it, makes the objects under it
+  unreadable for good. If the KMS can't be reached, reads and writes of
+  SSE-KMS objects fail with `503`, and nothing else is affected (HEAD needs no
+  KMS).
+
+Setting up OpenBao for it (Vault's commands are the same, with `vault` for
+`bao`):
+
+```bash
+bao secrets enable transit
+bao write -f transit/keys/cairn-default
+# Cairn needs only these two calls, for the keys it may use.
+bao policy write cairn - <<'POLICY'
+path "transit/datakey/plaintext/cairn-*" { capabilities = ["update"] }
+path "transit/decrypt/cairn-*" { capabilities = ["update"] }
+POLICY
+bao auth enable approle
+bao write auth/approle/role/cairn token_policies=cairn token_ttl=1h
+bao read -field=role_id auth/approle/role/cairn/role-id          # --kms-approle-role-id
+bao write -f -field=secret_id auth/approle/role/cairn/secret-id  # into --kms-approle-secret-id-file
+```
+
+Don't grant Cairn `transit/encrypt`: OpenBao creates a missing key on an
+encrypt, so a mistyped key name would make a new key. Cairn never calls it.
 
 ## Data integrity
 

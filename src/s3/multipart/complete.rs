@@ -11,7 +11,9 @@ use crate::{
     blobs::{ReapTarget, reap_blobs, reap_columns},
     db,
     s3::conditional::Preconditions,
-    s3::sse_c::{self, CustomerKey},
+    s3::multipart::upload_encryption,
+    s3::sse::{self, Stored},
+    s3::sse_c::CustomerKey,
     s3::util::{format_s3_error, slow_down, with_version_id, xml_escape, xml_ok},
     s3::versions::new_version_id,
 };
@@ -113,23 +115,15 @@ pub async fn complete_multipart_upload(
         ));
     }
 
-    let mut client = app.pool.get().await?;
-    // The object gets its upload's key check; a key isn't needed. One given
-    // must be the upload's (a retry, whose upload is gone, isn't checked).
-    if let Some(customer) = customer_key {
-        let upload = client
-            .query_opt_cached(
-                "SELECT sse_c_key FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
-                &[&upload_id, &bucket, &key],
-            )
-            .await?;
-        if let Some(upload) = upload {
-            let check: Option<Vec<u8>> = upload.get(0);
-            if let Err(refused) = sse_c::check_read(check.as_deref(), Some(customer)) {
-                return Ok(refused);
-            }
-        }
+    // The object gets its upload's encryption; an SSE-C key isn't needed. One
+    // given must be the upload's (a retry, whose upload is gone, isn't checked).
+    let encryption = upload_encryption(app, &upload_id, bucket, key).await?;
+    if let (Some(encryption), Some(_)) = (&encryption, customer_key)
+        && let Err(refused) = sse::check(encryption, customer_key)
+    {
+        return Ok(refused);
     }
+    let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         match try_complete(&mut client, bucket, key, &upload_id, &requested, preconditions).await {
@@ -151,10 +145,12 @@ pub async fn complete_multipart_upload(
                     xml_escape(&etag),
                 );
                 let response = with_version_id(xml_ok(body), version_id.as_deref());
-                return Ok(match customer_key {
-                    Some(customer) => customer.echo_onto(response),
-                    None => response,
-                });
+                // A retry's upload is gone, but its version tells.
+                let encryption = match &encryption {
+                    Some(encryption) => encryption.clone(),
+                    None => completed_encryption(&client, &bucket, &key, &upload_id).await?,
+                };
+                return Ok(sse::echo_onto(response, &encryption, customer_key));
             }
             Ok(CompleteOutcome::NoSuchUpload) => {
                 return Ok(format_s3_error(
@@ -210,6 +206,24 @@ pub async fn complete_multipart_upload(
         }
     }
     Ok(slow_down())
+}
+
+/// How the version that completed `upload_id` is encrypted (plain if it's
+/// gone).
+async fn completed_encryption(
+    client: &Object,
+    bucket: &str,
+    key: &str,
+    upload_id: &Uuid,
+) -> Result<Stored, tokio_postgres::Error> {
+    let row = client
+        .query_opt_cached(
+            "SELECT sse_c_key, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, sse_kms_context
+             FROM objects WHERE bucket = $1 AND key = $2 AND upload_id = $3",
+            &[&bucket, &key, upload_id],
+        )
+        .await?;
+    Ok(row.map_or(Stored::Plain, |row| Stored::from_row(&row, 0)))
 }
 
 /// One attempt at the completion transaction (`cairn_complete_upload`). The

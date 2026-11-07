@@ -99,14 +99,6 @@ impl CustomerKey {
             .header(HEADERS.algorithm, ALGORITHM)
             .header(HEADERS.md5, self.md5.as_str())
     }
-
-    /// Adds them to a response that's already built.
-    pub fn echo_onto<B>(&self, mut response: Response<B>) -> Response<B> {
-        let headers = response.headers_mut();
-        headers.insert(HEADERS.algorithm, ALGORITHM.parse().unwrap());
-        headers.insert(HEADERS.md5, self.md5.parse().expect("it came in a header"));
-        response
-    }
 }
 
 fn invalid(code: &str, message: &str) -> Response<Full<Bytes>> {
@@ -226,21 +218,6 @@ pub fn check_read(
     }
 }
 
-/// A 501 for a write asking for SSE-S3 or SSE-KMS (`x-amz-server-side-encryption`
-/// and its kin): Cairn encrypts only with its clients' keys, and must not
-/// answer as if it had done what it was asked.
-pub fn refuse_server_keys(headers: &HeaderMap) -> Option<Response<Full<Bytes>>> {
-    let name = headers.keys().map(|n| n.as_str()).find(|name| {
-        name.starts_with("x-amz-server-side-encryption")
-            && !name.starts_with("x-amz-server-side-encryption-customer-")
-    })?;
-    Some(format_s3_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "NotImplemented",
-        &format!("{name}: Cairn encrypts only with keys its clients supply (SSE-C)"),
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,21 +323,5 @@ mod tests {
             &headers(&[("forwarded", "proto=http, proto=https")]),
             false
         ));
-    }
-
-    #[test]
-    fn refuses_server_side_keys() {
-        assert!(
-            refuse_server_keys(&headers(&[("x-amz-server-side-encryption", "AES256")])).is_some()
-        );
-        assert!(
-            refuse_server_keys(&headers(&[(
-                "x-amz-server-side-encryption-aws-kms-key-id",
-                "k"
-            )]))
-            .is_some()
-        );
-        assert!(refuse_server_keys(&full("AES256", KEY_B64, MD5_B64)).is_none());
-        assert!(refuse_server_keys(&HeaderMap::new()).is_none());
     }
 }

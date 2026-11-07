@@ -21,6 +21,7 @@ use crate::{
         objects::delete::delete_object,
     },
 };
+use crate::s3::sse::Wanted;
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
@@ -60,7 +61,7 @@ async fn commit_object(tx: &Transaction<'_>, app: &App, blob: Uuid, key: &str) -
     tx.query_one(
         "SELECT status FROM pg_temp.cairn_commit_object(
              $1, ARRAY[$2::int], 0, 0, 65536, 0, 'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
-             $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, $5)",
+             $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, NULL, NULL, $5)",
         &[&blob, &app.node, &BUCKET, &key, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -100,7 +101,7 @@ async fn copy_object(
 ) -> String {
     let size: i64 = source.2.iter().sum();
     tx.query_one(
-        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, $7)",
+        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, NULL, NULL, NULL, NULL, $7)",
         &[&source.0, &source.1, &source.2, &BUCKET, &key, &size, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -279,7 +280,7 @@ async fn a_copy_after_a_delete_finds_the_source_changed() {
 
 /// Creates an upload for `key`, returning its ID.
 async fn create_upload(app: &App, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", None).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", Wanted::Plain).await.unwrap();
     let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -564,16 +565,23 @@ async fn an_old_session_cant_write() {
 
     let objects: i64 = old.query_one("SELECT count(*) FROM objects", &[]).await.unwrap().get(0);
     assert_eq!(objects, 1);
-    for write in [
-        "UPDATE buckets SET versioning = 'enabled'",
-        "DELETE FROM objects",
-        "INSERT INTO blobs (blob_id, size, state, created_at) VALUES (gen_random_uuid(), 0, 'pending', NOW())",
-        "UPDATE nodes SET last_seen = NOW()",
-        // Even a statement that changes no rows.
-        "DELETE FROM parts WHERE false",
-    ] {
-        let e = old.batch_execute(write).await.unwrap_err();
-        assert!(format!("{e:?}").contains("too old"), "{write}: {e:?}");
+    // Without a protocol (before 0.4.1), and with protocol 2 (from before
+    // encryption, which doesn't know an object's keys; see migration 15).
+    for protocol in [None, Some("2")] {
+        if let Some(protocol) = protocol {
+            old.batch_execute(&format!("SET cairn.protocol = '{protocol}'")).await.unwrap();
+        }
+        for write in [
+            "UPDATE buckets SET versioning = 'enabled'",
+            "DELETE FROM objects",
+            "INSERT INTO blobs (blob_id, size, state, created_at) VALUES (gen_random_uuid(), 0, 'pending', NOW())",
+            "UPDATE nodes SET last_seen = NOW()",
+            // Even a statement that changes no rows.
+            "DELETE FROM parts WHERE false",
+        ] {
+            let e = old.batch_execute(write).await.unwrap_err();
+            assert!(format!("{e:?}").contains("too old"), "{protocol:?}: {write}: {e:?}");
+        }
     }
     assert_eq!(get(&app, "k").await, Some(b"data".to_vec()));
 }

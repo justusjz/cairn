@@ -36,6 +36,7 @@ mod db;
 mod e2e;
 mod encryption;
 mod gc;
+mod kms;
 mod metrics;
 mod packer;
 mod payload;
@@ -58,6 +59,8 @@ pub struct App {
     peers: peer::PeerClient,
     /// Whether SSE-C keys are accepted over plain HTTP (see `s3::sse_c`).
     allow_sse_c_over_http: bool,
+    /// The KMS SSE-KMS keeps its keys in, if there's one (see `s3::sse`).
+    kms: Option<Arc<kms::Kms>>,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -110,6 +113,8 @@ struct ServeArgs {
     /// encrypted itself: the key travels in a header.
     #[arg(long, env = "CAIRN_ALLOW_SSE_C_OVER_HTTP")]
     allow_sse_c_over_http: bool,
+    #[command(flatten)]
+    kms: kms::KmsArgs,
 }
 
 /// How often a node refreshes its `nodes` row (last_seen / free_space).
@@ -126,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
+    let kms = kms::Kms::new(&args.kms)?;
     let pool = db::connect(&args.database).await?;
     let store = Store::new(args.data_dir)?;
     // The URL peers use to reach us: explicit if given, otherwise derived from
@@ -148,6 +154,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         dashboard: dashboard::Dashboard::new(&peer_url),
         peers: peer::PeerClient::new(),
         allow_sse_c_over_http: args.allow_sse_c_over_http,
+        kms,
         #[cfg(test)]
         pack_hook: None,
     });
@@ -744,11 +751,11 @@ enum AttachTarget {
         /// What `s3::metadata` stores with it.
         metadata: String,
         conditions: Preconditions,
-        /// If it's SSE-C: what to encrypt it with.
+        /// If it's encrypted: what with, and how that's stored.
         sealing: Option<Sealing>,
     },
     /// A part staged under an in-progress multipart upload, encrypted with
-    /// `key` if the upload is SSE-C.
+    /// `key` if the upload is encrypted (SSE-C or SSE-KMS).
     MultipartPart {
         upload_id: Uuid,
         part_number: i32,
@@ -756,12 +763,7 @@ enum AttachTarget {
     },
 }
 
-/// What an SSE-C object is encrypted with: the client's key, and the check of
-/// it to store with the object (see `s3::sse_c`).
-pub(crate) struct Sealing {
-    pub key: zeroize::Zeroizing<encryption::Key>,
-    pub check: Vec<u8>,
-}
+pub(crate) use s3::sse::Sealing;
 
 /// The outcome of an upload: the committed part's ETag, or why it wasn't
 /// committed.
@@ -1015,12 +1017,14 @@ async fn try_commit_part(
             sealing,
         } => {
             let (if_match, if_none_match) = conditions.write_conditions();
-            let sse_c_key = sealing.as_ref().map(|sealing| &sealing.check);
+            let plain = s3::sse::Stored::Plain;
+            let sse = sealing.as_ref().map_or(&plain, |sealing| &sealing.stored).columns();
             let row = client
                 .query_one_cached(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer, last_modified
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                                                      $11, $12, $13, $14, $15, $16, $17)",
+                                                      $11, $12, $13, $14, $15, $16, $17, $18,
+                                                      $19, $20, $21)",
                     &[
                         &written.blob_id,
                         &written.nodes,
@@ -1035,7 +1039,11 @@ async fn try_commit_part(
                         key,
                         content_type,
                         metadata,
-                        &sse_c_key,
+                        &sse.sse_c_key,
+                        &sse.kms_key_id,
+                        &sse.kms_data_key,
+                        &sse.kms_sealed,
+                        &sse.kms_context,
                         &if_match,
                         &if_none_match,
                         &s3::versions::new_version_id(),

@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App,
-    s3::sse_c::CustomerKey,
+    s3::sse::{self, Wanted},
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
 
@@ -18,7 +18,7 @@ pub async fn create_multipart_upload(
     key: &str,
     content_type: &str,
     metadata: &str,
-    customer_key: Option<&CustomerKey>,
+    wanted: Wanted<'_>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     if client
@@ -32,17 +32,36 @@ pub async fn create_multipart_upload(
             "the specified bucket does not exist",
         ));
     }
+    drop(client);
     // The content type and metadata are captured now and applied to the object
-    // at completion; so is the check of an SSE-C upload's key, which its parts
-    // need.
+    // at completion; so is its encryption, which its parts need: the check of
+    // an SSE-C upload's key, or the sealed key of an SSE-KMS one (see `sse`).
     let upload_id = Uuid::now_v7();
-    let check = customer_key.map(|key| key.new_check());
-    client
+    let stored = match sse::seal(app, wanted, bucket, key).await? {
+        Ok(sealing) => sealing.map_or(sse::Stored::Plain, |sealing| sealing.stored),
+        Err(refused) => return Ok(refused),
+    };
+    let sse = stored.columns();
+    app.pool
+        .get()
+        .await?
         .execute_cached(
             "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, metadata,
-                                            sse_c_key, initiated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, NOW())",
-            &[&upload_id, &bucket, &key, &content_type, &metadata, &check],
+                                            sse_c_key, sse_kms_key_id, sse_kms_data_key,
+                                            sse_kms_sealed, sse_kms_context, initiated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())",
+            &[
+                &upload_id,
+                &bucket,
+                &key,
+                &content_type,
+                &metadata,
+                &sse.sse_c_key,
+                &sse.kms_key_id,
+                &sse.kms_data_key,
+                &sse.kms_sealed,
+                &sse.kms_context,
+            ],
         )
         .await?;
     let body = format!(
@@ -54,8 +73,6 @@ pub async fn create_multipart_upload(
         xml_escape(key),
         upload_id
     );
-    Ok(match customer_key {
-        Some(key) => key.echo_onto(xml_ok(body)),
-        None => xml_ok(body),
-    })
+    let customer_key = wanted.customer();
+    Ok(sse::echo_onto(xml_ok(body), &stored, customer_key))
 }

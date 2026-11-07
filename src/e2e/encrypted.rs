@@ -21,6 +21,7 @@ use crate::{
         },
     },
 };
+use crate::s3::sse::Wanted;
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
@@ -46,7 +47,8 @@ async fn commit(
                 .query_one(
                     "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], $3, 0, 65536, 0, $4, $5, $6,
-                     $7, $8, 'application/octet-stream', '', $9, NULL, NULL, $10)",
+                     $7, $8, 'application/octet-stream', '', $9, NULL, NULL, NULL, NULL,
+                     NULL, NULL, $10)",
                     &[
                         &blob,
                         &app.node,
@@ -130,7 +132,8 @@ async fn sizes_salts_and_key_checks_carry_through() {
     let status: String = client
         .query_one(
             "SELECT status FROM pg_temp.cairn_copy_object(
-                 $1, ARRAY[$2::bigint], ARRAY[1016::bigint], $3, 'c', 1000, 'etag', 'x', '', $4, $5)",
+                 $1, ARRAY[$2::bigint], ARRAY[1016::bigint], $3, 'c', 1000, 'etag', 'x', '', $4,
+                 NULL, NULL, NULL, NULL, $5)",
             &[&object_id, &part_id, &BUCKET, &&KEY_CHECK[..], &crate::s3::versions::new_version_id()],
         )
         .await
@@ -290,7 +293,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
             .query_one(
                 "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], 1016, 0, 65536, 0, 'etag', $3, $4,
-                     $5, 'bad', 'x', '', NULL, NULL, NULL, $6)",
+                     $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, NULL, NULL, $6)",
                 &[
                     &blob,
                     &app.node,
@@ -551,7 +554,7 @@ async fn copies_keep_or_change_encryption() {
     // The same key: shared bytes, and the source's ETag.
     let same = CopyKeys {
         source: Some(&k1),
-        dest: Some(&k1),
+        dest: Wanted::Customer(&k1),
     };
     assert_eq!(
         copy(&app, "src", "same", same).await,
@@ -577,7 +580,7 @@ async fn copies_keep_or_change_encryption() {
             "src",
             CopyKeys {
                 source: Some(&k1),
-                dest: Some(&k2),
+                dest: Wanted::Customer(&k2),
             },
             Some(&k2),
         ),
@@ -586,7 +589,7 @@ async fn copies_keep_or_change_encryption() {
             "src",
             CopyKeys {
                 source: Some(&k1),
-                dest: None,
+                dest: Wanted::Plain,
             },
             None,
         ),
@@ -595,7 +598,7 @@ async fn copies_keep_or_change_encryption() {
             "plain",
             CopyKeys {
                 source: None,
-                dest: Some(&k2),
+                dest: Wanted::Customer(&k2),
             },
             Some(&k2),
         ),
@@ -637,7 +640,7 @@ async fn copies_keep_or_change_encryption() {
     for source in [None, Some(&k2)] {
         let keys = CopyKeys {
             source,
-            dest: Some(&k1),
+            dest: Wanted::Customer(&k1),
         };
         assert_eq!(
             copy(&app, "src", "nope", keys).await.0,
@@ -651,7 +654,7 @@ async fn copies_keep_or_change_encryption() {
     );
     let rotate = CopyKeys {
         source: Some(&k1),
-        dest: Some(&k2),
+        dest: Wanted::Customer(&k2),
     };
     assert_eq!(copy(&app, "src", "src", rotate).await.0, StatusCode::OK);
     assert_eq!(
@@ -677,7 +680,7 @@ async fn part_copies_of_and_into_sse_c() {
         let app = app.clone();
         let customer = customer.map(|c| customer_key(c.key()));
         async move {
-            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", customer.as_ref())
+            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", Wanted::new(customer.as_ref(), None))
                 .await
                 .unwrap();
             use http_body_util::BodyExt;
@@ -692,13 +695,9 @@ async fn part_copies_of_and_into_sse_c() {
             let app = app.clone();
             let (source, dest) = (
                 keys.source.map(|k| customer_key(k.key())),
-                keys.dest.map(|k| customer_key(k.key())),
+                keys.dest.customer().map(|k| customer_key(k.key())),
             );
             async move {
-                let keys = CopyKeys {
-                    source: source.as_ref(),
-                    dest: dest.as_ref(),
-                };
                 let response = copy_part(
                     &app,
                     BUCKET,
@@ -708,7 +707,8 @@ async fn part_copies_of_and_into_sse_c() {
                     &format!("{BUCKET}/{src}"),
                     Some(range),
                     &Preconditions::default(),
-                    keys,
+                    source.as_ref(),
+                    dest.as_ref(),
                 )
                 .await
                 .unwrap();
@@ -754,7 +754,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=60000-70000",
             CopyKeys {
                 source: None,
-                dest: None
+                dest: Wanted::Plain
             }
         )
         .await,
@@ -767,7 +767,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=60000-70000",
             CopyKeys {
                 source: Some(&k1),
-                dest: None
+                dest: Wanted::Plain
             }
         )
         .await,
@@ -788,7 +788,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=10-99999",
             CopyKeys {
                 source: None,
-                dest: None
+                dest: Wanted::Plain
             }
         )
         .await,
@@ -801,7 +801,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=10-99999",
             CopyKeys {
                 source: None,
-                dest: Some(&k1)
+                dest: Wanted::Customer(&k1)
             }
         )
         .await,
@@ -814,7 +814,7 @@ async fn part_copies_of_and_into_sse_c() {
             "bytes=10-99999",
             CopyKeys {
                 source: None,
-                dest: Some(&k2)
+                dest: Wanted::Customer(&k2)
             }
         )
         .await,

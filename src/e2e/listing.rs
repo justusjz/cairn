@@ -21,6 +21,7 @@ use crate::{
         },
     },
 };
+use crate::s3::sse::Wanted;
 
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
@@ -372,7 +373,7 @@ async fn walks_uploads_and_common_prefixes() {
     // Created out of key order: each key's uploads list in the order they
     // were created, after the keys before it.
     for key in ["c", "b/2", "a", "b/1", "a"] {
-        let response = create_multipart_upload(&app, BUCKET, key, "x", "", None).await.unwrap();
+        let response = create_multipart_upload(&app, BUCKET, key, "x", "", Wanted::Plain).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&body).unwrap();
         let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();

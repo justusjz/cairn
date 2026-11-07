@@ -46,7 +46,7 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-const PROTOCOL: &str = "2";
+const PROTOCOL: &str = "3";
 
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
@@ -183,6 +183,7 @@ const MIGRATIONS: &[&str] = &[
     COMPLETED_FROM,
     METADATA,
     ENCRYPTED_PARTS,
+    SSE_KMS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -702,12 +703,65 @@ ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_sse_c_key
     CHECK (octet_length(sse_c_key) = 48) NOT VALID;
 "#;
 
+/// Migration 15: SSE-KMS (see `s3::sse`). An SSE-KMS object, and an upload
+/// that's to make one, keep the name of their KMS key, the data key the KMS
+/// gave for them (as its ciphertext, which only the KMS can open), the
+/// object's own key sealed under that data key (nonce, ciphertext and tag),
+/// and the encryption context their client gave, if any (as canonical JSON).
+/// The checks are NOT VALID, as migration 14's: every row before has NULLs.
+///
+/// It also moves the catalog to lock protocol 3. The locks are the same, but
+/// a Cairn from before encryption doesn't know an object's key records: a
+/// copy it made of an encrypted object would share the object's encrypted
+/// parts, but not what opens them, and be unreadable. So such a Cairn may no
+/// longer write (see migration 8). Its reads keep working; it can't decrypt
+/// an encrypted object, and serves its ciphertext.
+const SSE_KMS: &str = r#"
+ALTER TABLE objects ADD COLUMN sse_kms_key_id text;
+ALTER TABLE objects ADD COLUMN sse_kms_data_key text;
+ALTER TABLE objects ADD COLUMN sse_kms_sealed bytea;
+ALTER TABLE objects ADD COLUMN sse_kms_context text;
+ALTER TABLE objects ADD CONSTRAINT objects_sse_kms CHECK (
+    (sse_kms_key_id IS NULL) = (sse_kms_data_key IS NULL)
+    AND (sse_kms_key_id IS NULL) = (sse_kms_sealed IS NULL)
+    AND (sse_kms_context IS NULL OR sse_kms_key_id IS NOT NULL)
+    AND (sse_kms_sealed IS NULL OR octet_length(sse_kms_sealed) = 72)
+    AND (sse_kms_key_id IS NULL OR sse_c_key IS NULL)
+) NOT VALID;
+ALTER TABLE multipart_uploads ADD COLUMN sse_kms_key_id text;
+ALTER TABLE multipart_uploads ADD COLUMN sse_kms_data_key text;
+ALTER TABLE multipart_uploads ADD COLUMN sse_kms_sealed bytea;
+ALTER TABLE multipart_uploads ADD COLUMN sse_kms_context text;
+ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_sse_kms CHECK (
+    (sse_kms_key_id IS NULL) = (sse_kms_data_key IS NULL)
+    AND (sse_kms_key_id IS NULL) = (sse_kms_sealed IS NULL)
+    AND (sse_kms_context IS NULL OR sse_kms_key_id IS NOT NULL)
+    AND (sse_kms_sealed IS NULL OR octet_length(sse_kms_sealed) = 72)
+    AND (sse_kms_key_id IS NULL OR sse_c_key IS NULL)
+) NOT VALID;
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '3' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
     fn the_gate_requires_this_protocol() {
+        // The last migration to define the gate's function sets the protocol.
+        let gate = super::MIGRATIONS
+            .iter()
+            .rev()
+            .find(|sql| sql.contains("FUNCTION cairn_require_protocol()"))
+            .unwrap();
         let check = format!("IS DISTINCT FROM '{}'", super::PROTOCOL);
-        assert!(super::PROTOCOL_GATE.contains(&check));
+        assert!(gate.contains(&check));
     }
 
     /// Every table in the schema is gated, or listed here as not needing it.

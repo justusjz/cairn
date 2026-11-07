@@ -5,10 +5,10 @@ use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
 
 use crate::db::Cached;
 use crate::{
-    App, AttachTarget, Sealing, UploadResult,
+    App, AttachTarget, UploadResult,
     payload::Payload,
     s3::conditional::Preconditions,
-    s3::sse_c::CustomerKey,
+    s3::sse::{self, Wanted},
     s3::util::{format_s3_error, rejection_response, with_version_id},
     s3::versions::current_etag,
 };
@@ -23,7 +23,7 @@ pub async fn put_object(
     body: Incoming,
     payload: Payload,
     conditions: &Preconditions,
-    customer_key: Option<&CustomerKey>,
+    wanted: Wanted<'_>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     // Fast-fail a conditional write (If-Match / If-None-Match) before streaming the
     // body, so a client "create if absent" against an existing key doesn't upload
@@ -50,6 +50,15 @@ pub async fn put_object(
         }
     }
 
+    // Encrypted, with the client's key (SSE-C), or one of its own that's
+    // sealed under a data key from the KMS (SSE-KMS); see `sse`.
+    let sealing = match sse::seal(app, wanted, bucket, key).await? {
+        Ok(sealing) => sealing,
+        Err(refused) => return Ok(refused),
+    };
+    // What the response tells about it.
+    let stored = sealing.as_ref().map_or(sse::Stored::Plain, |sealing| sealing.stored.clone());
+    let customer_key = wanted.customer();
     // Stream the body into one replicated, committed part and atomically point
     // (bucket, key) at it. `upload_part` computes the ETag (hex MD5) as it streams.
     let attach = AttachTarget::Object {
@@ -58,21 +67,14 @@ pub async fn put_object(
         content_type: content_type.to_owned(),
         metadata: metadata.to_owned(),
         conditions: conditions.clone(),
-        // SSE-C: encrypted with the client's key, which the object keeps a
-        // check of.
-        sealing: customer_key.map(|key| Sealing {
-            key: zeroize::Zeroizing::new(*key.key()),
-            check: key.new_check(),
-        }),
+        sealing,
     };
     match crate::upload_part(app, body, &attach, payload).await? {
         UploadResult::Committed { etag, version_id, .. } => {
-            let mut builder = Response::builder()
+            let builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, format!("\"{etag}\""));
-            if let Some(key) = customer_key {
-                builder = key.echo(builder);
-            }
+            let builder = sse::echo(builder, &stored, customer_key);
             Ok(with_version_id(builder.body(Full::new(Bytes::new())).unwrap(), version_id.as_deref()))
         }
         UploadResult::Rejected(rejection) => Ok(rejection_response(&rejection)),

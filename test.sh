@@ -14,6 +14,9 @@
 # Exit code is 0 only if every test passes.
 #
 # ─── Configuration — adjust these to match your server ──────────────────────
+BAO_IMAGE="quay.io/openbao/openbao:2.7.2"   # the KMS for SSE-KMS
+BAO_CONTAINER="s3test-bao"
+BAO_PORT=18202
 PG_IMAGE="docker.io/library/postgres:18"
 PG_CONTAINER="s3test-pg"
 PG_PORT=15432                    # host port, picked to avoid a local postgres
@@ -39,6 +42,9 @@ WORK_DIR="$(mktemp -d /tmp/s3-smoke.XXXXXX)"
 CARGO_ARGS+=(--data-dir "$WORK_DIR/data")   # required; per-run blob dir
 # No TLS proxy here, so SSE-C keys come over plain HTTP.
 CARGO_ARGS+=(--allow-sse-c-over-http)
+# SSE-KMS, with keys in OpenBao's Transit engine (its dev server's root token).
+CARGO_ARGS+=(--kms-address "http://127.0.0.1:${BAO_PORT}" --kms-default-key cairn-test
+             --kms-token-file "$WORK_DIR/bao-token")
 SERVER_LOG="$WORK_DIR/server.log"
 SERVER_PID=""
 BUCKET="smoke-$(date +%s)"
@@ -54,7 +60,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=98
+TOTAL=99
 STEP=0
 PASS=0
 FAIL=0
@@ -134,7 +140,7 @@ cleanup() {
         kill "$SERVER_PID" 2>/dev/null
         wait "$SERVER_PID" 2>/dev/null
     fi
-    podman rm -f "$PG_CONTAINER" >/dev/null 2>&1
+    podman rm -f "$PG_CONTAINER" "$BAO_CONTAINER" >/dev/null 2>&1
     rm -rf "$WORK_DIR"
 }
 # On Ctrl+C / SIGTERM, exit (running cleanup via the EXIT trap) rather than
@@ -166,6 +172,27 @@ until podman exec "$PG_CONTAINER" pg_isready -U "$PG_USER" -d "$PG_DB" >/dev/nul
     [ "$elapsed" -ge "$STARTUP_TIMEOUT" ] && fatal "Postgres did not become ready in ${STARTUP_TIMEOUT}s"
 done
 info "Postgres is ready."
+
+# ─── 1b. OpenBao ─────────────────────────────────────────────────────────────
+info "Starting OpenBao ($BAO_IMAGE) on port $BAO_PORT..."
+podman rm -f "$BAO_CONTAINER" >/dev/null 2>&1
+podman run -d --rm --name "$BAO_CONTAINER" -e BAO_DEV_ROOT_TOKEN_ID=root \
+    -p "127.0.0.1:${BAO_PORT}:8200" "$BAO_IMAGE" server -dev -dev-listen-address=0.0.0.0:8200 \
+    >/dev/null || fatal "could not start OpenBao container"
+bao() { podman exec -e BAO_ADDR=http://127.0.0.1:8200 -e BAO_TOKEN=root "$BAO_CONTAINER" bao "$@"; }
+elapsed=0
+until bao status >/dev/null 2>&1; do
+    sleep 1
+    elapsed=$((elapsed + 1))
+    [ "$elapsed" -ge "$STARTUP_TIMEOUT" ] && fatal "OpenBao did not become ready in ${STARTUP_TIMEOUT}s"
+done
+{
+    bao secrets enable transit &&
+    bao write -f transit/keys/cairn-test &&
+    bao write -f transit/keys/cairn-other
+} >/dev/null || fatal "could not set up OpenBao"
+printf 'root' >"$WORK_DIR/bao-token"
+info "OpenBao is ready."
 
 # ─── 2. Roles ────────────────────────────────────────────────────────────────
 # Roles live in Postgres and are managed with `cairn role`, so set them up before
@@ -490,8 +517,8 @@ metadata_ok() {
 }
 
 # SSE-C: objects written with a client's key read back with it (whole and in a
-# range), and not without it or with another; SSE-S3 is refused, since Cairn has
-# no keys of its own.
+# range), and not without it or with another; SSE-S3 is refused (Cairn has
+# SSE-KMS, not SSE-S3).
 sse_c_ok() {
     local k1="$WORK_DIR/sse-key1" k2="$WORK_DIR/sse-key2" out="$WORK_DIR/sse-out" key
     head -c 32 /dev/urandom >"$k1"
@@ -537,6 +564,55 @@ sse_c_ok() {
     cmp -s "$BIG" "$out" || return 1
     for key in small.txt big.bin clear.bin; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "sse/$key" >/dev/null 2>&1 || return 1
+    done
+}
+
+# SSE-KMS: objects written under a KMS key (the default one, or another, with a
+# context) read back without any key, whole, in ranges and multipart, and tell
+# their key; copies change it, or decrypt. A key the KMS doesn't have is
+# refused, and so are SSE-KMS headers on a read.
+sse_kms_ok() {
+    local out="$WORK_DIR/kms-out" context
+    context=$(printf '{"team":"storage"}' | base64)
+    awss3 s3api put-object --bucket "$BUCKET" --key kms/default.bin --body "$BIG" \
+        --server-side-encryption aws:kms >/dev/null 2>&1 || return 1
+    awss3 s3api put-object --bucket "$BUCKET" --key kms/other.bin --body "$BIG" \
+        --server-side-encryption aws:kms --ssekms-key-id cairn-other \
+        --ssekms-encryption-context "$context" >/dev/null 2>&1 || return 1
+    for key in default other; do
+        awss3 s3api get-object --bucket "$BUCKET" --key "kms/$key.bin" "$out" >/dev/null 2>&1 || return 1
+        cmp -s "$BIG" "$out" || return 1
+    done
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key kms/default.bin \
+        --query '[ServerSideEncryption,SSEKMSKeyId]' --output text 2>/dev/null)" \
+        = "$(printf 'aws:kms\tarn:aws:kms:cairn-test')" ] || return 1
+    [ "$(awss3 s3api get-object --bucket "$BUCKET" --key kms/other.bin "$out" \
+        --query SSEKMSKeyId --output text 2>/dev/null)" = "arn:aws:kms:cairn-other" ] || return 1
+    awss3 s3api get-object --bucket "$BUCKET" --key kms/other.bin --range bytes=100000-299999 "$out" \
+        >/dev/null 2>&1 || return 1
+    cmp -s <(tail -c +100001 "$BIG" | head -c 200000) "$out" || return 1
+    # Multipart (16 MiB in 8 MiB parts), and downloaded in parallel ranges.
+    awss3 s3 cp "$MULTIPART" "s3://${BUCKET}/kms/multi.bin" --sse aws:kms --sse-kms-key-id cairn-other \
+        >/dev/null 2>&1 || return 1
+    awss3 s3 cp "s3://${BUCKET}/kms/multi.bin" "$out" >/dev/null 2>&1 || return 1
+    cmp -s "$MULTIPART" "$out" || return 1
+    # Copies: to another KMS key (sharing the data), and decrypted.
+    awss3 s3api copy-object --bucket "$BUCKET" --key kms/copy.bin --copy-source "${BUCKET}/kms/other.bin" \
+        --server-side-encryption aws:kms --ssekms-key-id cairn-test >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-object --bucket "$BUCKET" --key kms/copy.bin "$out" \
+        --query SSEKMSKeyId --output text 2>/dev/null)" = "arn:aws:kms:cairn-test" ] || return 1
+    cmp -s "$BIG" "$out" || return 1
+    awss3 s3api copy-object --bucket "$BUCKET" --key kms/clear.bin --copy-source "${BUCKET}/kms/copy.bin" \
+        >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-object --bucket "$BUCKET" --key kms/clear.bin "$out" \
+        --query ServerSideEncryption --output text 2>/dev/null)" = None ] || return 1
+    cmp -s "$BIG" "$out" || return 1
+    ! awss3 s3api put-object --bucket "$BUCKET" --key kms/x.bin --body "$SMALL" \
+        --server-side-encryption aws:kms --ssekms-key-id no-such-key >/dev/null 2>&1 || return 1
+    [ "$(scurl GET "/${BUCKET}/kms/copy.bin" "$EMPTY_SHA256" - "x-amz-server-side-encryption: aws:kms")" = 400 ] \
+        || return 1
+    for key in default other multi copy clear; do
+        awss3 s3api delete-object --bucket "$BUCKET" --key "kms/$key.bin" >/dev/null 2>&1 || return 1
     done
 }
 
@@ -1753,6 +1829,7 @@ run_test    "CopyObject of multipart src is normal" copy_multipart_source_normal
 run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok
 run_test    "Metadata stored, copied, replaced"     metadata_ok
 run_test    "SSE-C put/multipart/copy/get, wrong key" sse_c_ok
+run_test    "SSE-KMS put/multipart/copy/get, keys"   sse_kms_ok
 expect_fail "Self-copy without REPLACE rejected"    awss3 s3api copy-object --bucket "$BUCKET" --key big.bin --copy-source "${BUCKET}/big.bin"
 expect_fail "Copy from missing source fails"        awss3 s3api copy-object --bucket "$BUCKET" --key copy/none.txt --copy-source "${BUCKET}/does-not-exist.txt"
 run_test    "UploadPartCopy (whole object)"         upload_part_copy_whole_ok
