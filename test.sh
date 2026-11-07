@@ -54,7 +54,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=96
+TOTAL=97
 STEP=0
 PASS=0
 FAIL=0
@@ -960,6 +960,21 @@ listing_parameters_ok() {
     s3 del "s3://${BUCKET}/enc/a+b c" >/dev/null 2>&1
 }
 
+# Every response has an x-amz-request-id, and an error document names it too.
+request_id_ok() {
+    local url="http://${SERVER_HOST}:${SERVER_PORT}/${BUCKET}" args=() line out id
+    while IFS= read -r line; do args+=(-H "$line"); done \
+        < <(python3 "$SIGNER" GET "$url/no-such-key" "$EMPTY_SHA256")
+    out=$(curl -s -D - "${args[@]}" "$url/no-such-key")
+    id=$(echo "$out" | tr -d '\r' | sed -n 's/^x-amz-request-id: //Ip')
+    [ "${#id}" = 16 ] || return 1
+    echo "$out" | grep -q "<RequestId>$id</RequestId>" || return 1
+    args=()
+    while IFS= read -r line; do args+=(-H "$line"); done \
+        < <(python3 "$SIGNER" GET "$url/small.txt" "$EMPTY_SHA256")
+    curl -s -D - -o /dev/null "${args[@]}" "$url/small.txt" | grep -qi '^x-amz-request-id: '
+}
+
 # Presigned URLs: a GET (aws-cli's) and a PUT (ours) work with nothing but
 # curl, and a GET can set the response's Content-Disposition; changing the URL
 # or letting it expire breaks it.
@@ -1768,6 +1783,7 @@ run_test    "Unimplemented operations refused (501)" unsupported_subresources_re
 run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
 run_test    "Presigned GET/PUT, response headers"   presigned_ok
 run_test    "Listing parameters as in S3"           listing_parameters_ok
+run_test    "Request IDs in headers and errors"     request_id_ok
 run_test    "A PUT over 5 GiB is refused"           too_large_refused
 run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets

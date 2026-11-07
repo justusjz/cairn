@@ -153,6 +153,10 @@ fn error_document(
     for (name, value) in details {
         body.push_str(&format!("<{name}>{}</{name}>", xml_escape(value)));
     }
+    // The request's ID, as its x-amz-request-id header has it too.
+    if let Some(id) = crate::s3::request_id() {
+        body.push_str(&format!("<RequestId>{id}</RequestId>"));
+    }
     body.push_str("</Error>");
     Response::builder()
         .status(status)
@@ -425,6 +429,36 @@ mod tests {
         for bad in ["%FF", "caf%C3", "a%00b", "%C0%80"] {
             assert!(!is_well_formed(bad), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn an_error_names_its_request() {
+        use http_body_util::BodyExt;
+        let body = |response: Response<Full<Bytes>>| async move {
+            String::from_utf8(
+                response
+                    .into_body()
+                    .collect()
+                    .await
+                    .unwrap()
+                    .to_bytes()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+        let named = crate::s3::REQUEST_ID
+            .scope("0123456789ABCDEF".to_owned(), async {
+                format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "no")
+            })
+            .await;
+        assert!(
+            body(named)
+                .await
+                .ends_with("<RequestId>0123456789ABCDEF</RequestId></Error>")
+        );
+        // Outside of a request (the dashboard's, say), none.
+        let unnamed = format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "no");
+        assert!(!body(unnamed).await.contains("RequestId"));
     }
 
     #[test]

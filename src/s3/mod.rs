@@ -52,7 +52,44 @@ pub(crate) mod objects;
 pub(crate) mod util;
 pub(crate) mod versions;
 
+tokio::task_local! {
+    /// The ID of the request being handled, which its error document names.
+    static REQUEST_ID: String;
+}
+
+/// The ID of the request the current task handles, if it handles one.
+pub fn request_id() -> Option<String> {
+    REQUEST_ID.try_with(|id| id.clone()).ok()
+}
+
+/// Handles an S3 request, as S3 answers: every response has an ID of its own
+/// (`x-amz-request-id`), which an error document names too, so a client can
+/// tell which request it got. A handler that fails answers with a 500 (or a
+/// 503), logged with `what` the request was.
 pub async fn handle(
+    req: Request<hyper::body::Incoming>,
+    app: Arc<App>,
+    what: &str,
+) -> Response<ResBody> {
+    let mut id = [0u8; 8];
+    getrandom::fill(&mut id).expect("the OS random number generator failed");
+    let id: String = id.iter().map(|b| format!("{b:02X}")).collect();
+    let mut response = REQUEST_ID
+        .scope(id.clone(), async {
+            handle_request(req, app).await.unwrap_or_else(|e| {
+                eprintln!("{what} failed (request {id}): {e:#}");
+                error_response(&e)
+            })
+        })
+        .await;
+    response.headers_mut().insert(
+        "x-amz-request-id",
+        id.parse().expect("hex is a header value"),
+    );
+    response
+}
+
+async fn handle_request(
     req: Request<hyper::body::Incoming>,
     app: Arc<App>,
 ) -> anyhow::Result<Response<ResBody>> {

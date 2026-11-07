@@ -325,13 +325,11 @@ async fn serve_client(
                         req.headers(),
                     );
                     let bytes_in = metrics::bytes_in(req.headers());
-                    // A handler error must still produce a response: returning
-                    // it to hyper would drop the connection without one, which
-                    // clients take as a network fault and retry with backoff.
-                    let res = s3::handle(req, app.clone()).await.unwrap_or_else(|e| {
-                        eprintln!("{what} failed: {e:#}");
-                        s3::error_response(&e)
-                    });
+                    // A handler error must still produce a response (`handle`
+                    // makes one): returning it to hyper would drop the
+                    // connection without one, which clients take as a network
+                    // fault and retry with backoff.
+                    let res = s3::handle(req, app.clone(), &what).await;
                     let (parts, body) = res.into_parts();
                     let body =
                         app.metrics
