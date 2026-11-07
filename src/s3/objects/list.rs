@@ -226,7 +226,13 @@ pub async fn list_objects(
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
     body.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
-    body.push_str(&format!("<Prefix>{}</Prefix>", encoding.xml(prefix)));
+    // ListObjects (v1) doesn't encode the prefix it echoes, as S3 doesn't (nor
+    // do SDKs decode it); v2 does.
+    let echoed_prefix = match &version {
+        ListVersion::V1 => xml_escape(prefix),
+        ListVersion::V2 { .. } => encoding.xml(prefix),
+    };
+    body.push_str(&format!("<Prefix>{echoed_prefix}</Prefix>"));
     if let Some(d) = delimiter {
         body.push_str(&format!("<Delimiter>{}</Delimiter>", encoding.xml(d)));
     }

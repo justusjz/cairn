@@ -293,21 +293,14 @@ impl Payload {
 
     /// Limits an upload's data to `max` bytes, as S3 does: refused now if it
     /// declares more (in `Content-Length`, or, streaming, in
-    /// `x-amz-decoded-content-length`), and as soon as more of it arrives. As
-    /// in S3, an upload must declare its length (411 MissingContentLength).
+    /// `x-amz-decoded-content-length`), and as soon as more of it arrives (a
+    /// body in chunked transfer encoding, which S3 takes too, declares none).
     pub fn at_most(mut self, max: u64) -> Result<Payload, Rejection> {
         let declared = match self.decoder {
             Some(_) => self.decoded_length,
             None => self.content_length,
         };
-        let Some(declared) = declared else {
-            return Err(Rejection::new(
-                StatusCode::LENGTH_REQUIRED,
-                "MissingContentLength",
-                "You must provide the Content-Length HTTP header.",
-            ));
-        };
-        if declared > max {
+        if declared.is_some_and(|length| length > max) {
             return Err(too_large());
         }
         self.max = Some(max);
@@ -488,18 +481,11 @@ mod tests {
             .unwrap()
             .at_most(4);
         assert_eq!(refused.err().unwrap().code, "EntityTooLarge");
-        // Not declared (chunked transfer encoding): refused, as S3 does.
+        // Not declared (chunked transfer encoding, which S3 takes too): taken,
+        // and refused once there's more.
+        assert_eq!(read_at_most(&[unsigned], b"data", 4).unwrap(), b"data");
         assert_eq!(
-            code(read_at_most(&[unsigned], b"data", 4)),
-            "MissingContentLength"
-        );
-        // More than declared is refused as it arrives (and less, at the end).
-        assert_eq!(
-            code(read_at_most(
-                &[unsigned, ("content-length", "4")],
-                b"datas",
-                4
-            )),
+            code(read_at_most(&[unsigned], b"datas", 4)),
             "EntityTooLarge"
         );
         // Streaming: by its declared data length, not its framed one.

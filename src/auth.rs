@@ -534,11 +534,12 @@ fn verify_presigned_at(
     let expires: i64 = query_value(query, "X-Amz-Expires")
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| parameters_error("X-Amz-Expires should be a number"))?;
+    // Out of range is a 403, as S3 answers it; not a number, a 400.
     if expires <= 0 {
-        return Err(parameters_error("X-Amz-Expires must be non-negative"));
+        return Err(access_denied("X-Amz-Expires must be non-negative"));
     }
     if expires > MAX_PRESIGNED_SECS {
-        return Err(parameters_error(
+        return Err(access_denied(
             "X-Amz-Expires must be less than a week (in seconds) that is 604800",
         ));
     }
@@ -795,16 +796,20 @@ mod tests {
         let mut extra = aws_host();
         extra.insert("x-amz-meta-a", "1".parse().unwrap());
         assert_eq!(code(AWS_PRESIGNED, &extra, signed_at).code, "AccessDenied");
-        // At most a week, and positive.
-        for expires in ["604801", "0", "-5", "soon"] {
+        // At most a week, and positive (403, as S3 answers); a number (400).
+        for (expires, expected) in [
+            ("604801", (StatusCode::FORBIDDEN, "AccessDenied")),
+            ("0", (StatusCode::FORBIDDEN, "AccessDenied")),
+            ("-5", (StatusCode::FORBIDDEN, "AccessDenied")),
+            (
+                "soon",
+                (StatusCode::BAD_REQUEST, "AuthorizationQueryParametersError"),
+            ),
+        ] {
             let query =
                 AWS_PRESIGNED.replace("X-Amz-Expires=86400", &format!("X-Amz-Expires={expires}"));
             let rejection = code(&query, &aws_host(), signed_at);
-            assert_eq!(
-                (rejection.status, rejection.code),
-                (StatusCode::BAD_REQUEST, "AuthorizationQueryParametersError"),
-                "{expires}"
-            );
+            assert_eq!((rejection.status, rejection.code), expected, "{expires}");
         }
         // Not both kinds of signature at once.
         let both = signed(&BASE, &[]);

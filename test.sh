@@ -961,13 +961,15 @@ listing_parameters_ok() {
 }
 
 # Smaller things S3 does: If-Match on a key without an object is a 404, an
-# upload without a declared length a 411, a copy range out of the source a
-# 416 (and a malformed one a 400), and a bucket name like an IP address a 400.
+# upload in chunked transfer encoding is fine, a copy range out of the source
+# a 416 (and a malformed one a 400), and a bucket name like an IP address a 400.
 s3_details_ok() {
     local hash uid code
     hash=$(sha256sum "$SMALL" | cut -d' ' -f1)
     [ "$(scurl PUT "/${BUCKET}/no-such-key" "$hash" "$SMALL" "If-Match: *")" = 404 ] || return 1
-    [ "$(scurl PUT "/${BUCKET}/chunked" UNSIGNED-PAYLOAD "$SMALL" "Transfer-Encoding: chunked")" = 411 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/chunked" UNSIGNED-PAYLOAD "$SMALL" "Transfer-Encoding: chunked")" = 200 ] || return 1
+    check_roundtrip "$SMALL" "s3://${BUCKET}/chunked" || return 1
+    s3 del "s3://${BUCKET}/chunked" >/dev/null 2>&1
     uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key range-copy \
         --query UploadId --output text 2>/dev/null) || return 1
     code=$(scurl PUT "/${BUCKET}/range-copy?partNumber=1&uploadId=${uid}" "$EMPTY_SHA256" - \
@@ -1806,7 +1808,7 @@ run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
 run_test    "Presigned GET/PUT, response headers"   presigned_ok
 run_test    "Listing parameters as in S3"           listing_parameters_ok
 run_test    "Request IDs in headers and errors"     request_id_ok
-run_test    "If-Match 404, 411, copy ranges, names" s3_details_ok
+run_test    "If-Match 404, chunked, ranges, names"  s3_details_ok
 run_test    "A PUT over 5 GiB is refused"           too_large_refused
 run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets
