@@ -333,3 +333,25 @@ async fn lists_an_uploads_parts() {
     assert_eq!(parts_page(&app, "other", &upload_id, 0, 1000).await.0, StatusCode::NOT_FOUND);
     assert_eq!(parts_page(&app, "k", "not-an-upload", 0, 1000).await.0, StatusCode::NOT_FOUND);
 }
+
+/// A completion with If-Match, where the key has no object, is S3's 404
+/// NoSuchKey; the upload stays.
+#[tokio::test]
+async fn if_match_without_an_object_is_no_such_key() {
+    let Some(app) = node().await else { return };
+    let (upload_id, [e1, e2]) = staged(&app, "k").await;
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("if-match", "*".parse().unwrap());
+    let listed = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{e1}\"</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>\"{e2}\"</ETag></Part></CompleteMultipartUpload>"
+    );
+    let conditions = Preconditions::from_headers(&headers);
+    let response = complete_multipart_upload(&app, BUCKET, "k", &upload_id, Bytes::from(listed), &conditions, None)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(std::str::from_utf8(&body).unwrap().contains("<Code>NoSuchKey</Code>"));
+    assert_eq!(complete(&app, "k", &upload_id, &[(1, &e1), (2, &e2)]).await.0, StatusCode::OK);
+}

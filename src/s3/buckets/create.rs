@@ -12,11 +12,20 @@ pub enum Creation {
     InvalidName,
 }
 
+/// Prefixes and suffixes S3 reserves, which no bucket name may have.
+const RESERVED_PREFIXES: [&str; 3] = ["xn--", "sthree-", "amzn-s3-demo-"];
+const RESERVED_SUFFIXES: [&str; 5] = ["-s3alias", "--ol-s3", ".mrap", "--x-s3", "--table-s3"];
+
 /// Whether `name` is a valid S3 bucket name: 3 to 63 lowercase letters, digits,
-/// dots and hyphens, starting and ending with a letter or digit. No bucket
+/// dots and hyphens, starting and ending with a letter or digit, not formatted
+/// like an IP address, and without a prefix or suffix S3 reserves. No bucket
 /// name has a `_`, so paths starting with one never name a bucket.
 pub fn valid_bucket_name(name: &str) -> bool {
     let edge = |c: Option<char>| c.is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit());
+    let ip_address = name.split('.').count() == 4
+        && name
+            .split('.')
+            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
     (3..=63).contains(&name.len())
         && name
             .chars()
@@ -24,6 +33,9 @@ pub fn valid_bucket_name(name: &str) -> bool {
         && edge(name.chars().next())
         && edge(name.chars().last())
         && !name.contains("..")
+        && !ip_address
+        && !RESERVED_PREFIXES.iter().any(|p| name.starts_with(p))
+        && !RESERVED_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
 /// Creates a bucket. Shared by CreateBucket and the dashboard.
@@ -70,7 +82,15 @@ mod tests {
 
     #[test]
     fn validates_bucket_names() {
-        for name in ["abc", "my-bucket", "my.bucket.2", &"a".repeat(63)] {
+        for name in [
+            "abc",
+            "my-bucket",
+            "my.bucket.2",
+            &"a".repeat(63),
+            "1.2.3",
+            "1.2.3.4.5",
+            "v1.2.3.x",
+        ] {
             assert!(valid_bucket_name(name), "{name}");
         }
         for name in [
@@ -83,6 +103,11 @@ mod tests {
             "a/b",
             "_dashboard",
             &"a".repeat(64),
+            "192.168.5.123",
+            "xn--bucket",
+            "sthree-x",
+            "data-s3alias",
+            "data--x-s3",
         ] {
             assert!(!valid_bucket_name(name), "{name}");
         }

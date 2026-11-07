@@ -779,6 +779,8 @@ enum UploadResult {
     /// A conditional-write guard (If-Match / If-None-Match) didn't hold against
     /// the object currently at the target key.
     PreconditionFailed,
+    /// An If-Match found no object at the target key.
+    NoSuchKey,
     /// The target bucket doesn't exist, or was deleted while the body streamed.
     NoSuchBucket,
     /// The target multipart upload was completed or aborted while the body
@@ -931,6 +933,7 @@ where
                     return Ok(UploadResult::Committed { etag, version_id, last_modified });
                 }
                 Ok(CommitResult::PreconditionFailed) => return Ok(UploadResult::PreconditionFailed),
+                Ok(CommitResult::NoSuchKey) => return Ok(UploadResult::NoSuchKey),
                 Ok(CommitResult::NoSuchBucket) => return Ok(UploadResult::NoSuchBucket),
                 Ok(CommitResult::NoSuchUpload) => return Ok(UploadResult::NoSuchUpload),
                 Ok(CommitResult::MissingLocations { present, required }) => {
@@ -967,6 +970,8 @@ enum CommitResult {
     MissingLocations { present: i64, required: usize },
     /// A conditional-write guard didn't hold; nothing was written.
     PreconditionFailed,
+    /// An If-Match found no object to match.
+    NoSuchKey,
     NoSuchBucket,
     NoSuchUpload,
 }
@@ -1077,6 +1082,7 @@ async fn try_commit_part(
             });
         }
         "precondition_failed" => return Ok(CommitResult::PreconditionFailed),
+        "no_such_key" => return Ok(CommitResult::NoSuchKey),
         "no_such_bucket" => return Ok(CommitResult::NoSuchBucket),
         "no_such_upload" => return Ok(CommitResult::NoSuchUpload),
         status => unreachable!("cairn_commit_*: unknown status {status}"),

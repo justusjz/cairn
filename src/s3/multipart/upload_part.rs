@@ -103,7 +103,7 @@ pub async fn put_part(
         )),
         // UploadPart carries no conditional-write guard, and has no bucket to
         // check (its upload is checked instead), so these can't occur.
-        UploadResult::PreconditionFailed | UploadResult::NoSuchBucket => {
+        UploadResult::PreconditionFailed | UploadResult::NoSuchKey | UploadResult::NoSuchBucket => {
             unreachable!("UploadPart has no conditions, and no bucket check")
         }
     }

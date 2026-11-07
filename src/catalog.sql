@@ -527,8 +527,8 @@ $$;
 -- metadata (see `s3::metadata`) and SSE-C key check (NULL if it isn't SSE-C).
 -- `p_size` is its plaintext's. `p_new_version_id` is
 -- the fresh version ID to use if the bucket is versioned. Returns the new
--- row's id, and the version ID to report (NULL in an unversioned bucket). The
--- caller holds B(b) shared (which gave it the versioning state), K(b,k), and
+-- row's id, and the version ID to report (NULL unless versioning is enabled).
+-- The caller holds B(b) shared (which gave it the versioning state), K(b,k), and
 -- X(x) on the blobs of the parts `cairn_freed_by_put` names.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
@@ -551,7 +551,9 @@ BEGIN
     VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type,
             p_metadata, p_sse_c_key, NOW())
     RETURNING objects.id INTO id;
-    version_id := CASE WHEN p_versioning = 'unversioned' THEN NULL ELSE v_version_id END;
+    -- A write's version ID is reported only where it's a new one: S3 reports
+    -- none for the null version (unversioned or suspended).
+    version_id := CASE WHEN p_versioning = 'enabled' THEN v_version_id END;
 END
 $$;
 
@@ -606,7 +608,8 @@ $$;
 -- T1: commits an uploaded blob as a single-part object at (bucket, key).
 -- Takes B(b) shared, K(b,k), then X: the blob exclusively, and the blobs of
 -- the version it replaces. Checks that the bucket exists ('no_such_bucket'),
--- the conditional-write guard ('precondition_failed') and that every replica
+-- the conditional-write guard ('precondition_failed', or 'no_such_key' for an
+-- If-Match without an object) and that every replica
 -- recorded its location ('missing_locations', with how many did), then
 -- commits the blob, writes the version and attaches the part ('committed',
 -- with the version's last-modified time in ISO 8601, as CopyObject reports
@@ -624,6 +627,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_versioning text;
+    v_current text;
     v_freed bigint[];
     f record;
     v_locked uuid[];
@@ -638,11 +642,17 @@ BEGIN
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
-    IF (p_if_match IS NOT NULL OR p_if_none_match IS NOT NULL)
-       AND NOT pg_temp.cairn_allows_write(p_if_match, p_if_none_match,
-                                          pg_temp.cairn_current_etag(p_bucket, p_key)) THEN
-        status := 'precondition_failed';
-        RETURN;
+    IF p_if_match IS NOT NULL OR p_if_none_match IS NOT NULL THEN
+        v_current := pg_temp.cairn_current_etag(p_bucket, p_key);
+        -- If-Match for a key without an object is S3's 404, not a 412.
+        IF p_if_match IS NOT NULL AND v_current IS NULL THEN
+            status := 'no_such_key';
+            RETURN;
+        END IF;
+        IF NOT pg_temp.cairn_allows_write(p_if_match, p_if_none_match, v_current) THEN
+            status := 'precondition_failed';
+            RETURN;
+        END IF;
     END IF;
     v_freed := pg_temp.cairn_freed_by_put(p_bucket, p_key, v_versioning);
     SELECT * INTO f FROM pg_temp.cairn_freeable(v_freed);
@@ -891,7 +901,8 @@ $$;
 -- to (bucket, key) ('no_such_upload'), that every listed part is staged with
 -- the listed ETag ('invalid_part'), that every one but the last is large
 -- enough ('too_small') and they make an object S3 would store ('too_large'),
--- and the conditional-write guard ('precondition_failed'). Then publishes the listed parts as the key's new
+-- and the conditional-write guard ('precondition_failed', or 'no_such_key').
+-- Then publishes the listed parts as the key's new
 -- version, deletes the staged parts left out, and the upload ('done', with
 -- the object's ETag).
 --
@@ -908,6 +919,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_complete_upload(
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_versioning text;
+    v_current text;
     v_content_type text;
     v_metadata text;
     v_sse_c_key bytea;
@@ -954,7 +966,7 @@ BEGIN
             status := 'no_such_upload';
             RETURN;
         END IF;
-        IF v_versioning = 'unversioned' THEN
+        IF v_versioning <> 'enabled' THEN
             version_id := NULL;
         END IF;
         status := 'done';
@@ -987,11 +999,17 @@ BEGIN
         status := 'too_large';
         RETURN;
     END IF;
-    IF (p_if_match IS NOT NULL OR p_if_none_match IS NOT NULL)
-       AND NOT pg_temp.cairn_allows_write(p_if_match, p_if_none_match,
-                                          pg_temp.cairn_current_etag(p_bucket, p_key)) THEN
-        status := 'precondition_failed';
-        RETURN;
+    IF p_if_match IS NOT NULL OR p_if_none_match IS NOT NULL THEN
+        v_current := pg_temp.cairn_current_etag(p_bucket, p_key);
+        -- If-Match for a key without an object is S3's 404, not a 412.
+        IF p_if_match IS NOT NULL AND v_current IS NULL THEN
+            status := 'no_such_key';
+            RETURN;
+        END IF;
+        IF NOT pg_temp.cairn_allows_write(p_if_match, p_if_none_match, v_current) THEN
+            status := 'precondition_failed';
+            RETURN;
+        END IF;
     END IF;
     v_unused := ARRAY(SELECT id FROM parts WHERE upload_id = p_upload AND NOT id = ANY(v_listed));
     v_freed := pg_temp.cairn_freed_by_put(p_bucket, p_key, v_versioning);

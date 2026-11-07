@@ -35,6 +35,8 @@ enum CompleteOutcome {
     TooSmall,
     /// A conditional-completion guard (If-Match / If-None-Match) didn't hold.
     PreconditionFailed,
+    /// An If-Match found no object to match.
+    NoSuchKey,
 }
 
 /// Parses a CompleteMultipartUpload body into (part_number, unquoted-etag) pairs,
@@ -189,6 +191,13 @@ pub async fn complete_multipart_upload(
                     ),
                 ));
             }
+            Ok(CompleteOutcome::NoSuchKey) => {
+                return Ok(format_s3_error(
+                    StatusCode::NOT_FOUND,
+                    "NoSuchKey",
+                    "the specified key does not exist",
+                ));
+            }
             Ok(CompleteOutcome::PreconditionFailed) => {
                 return Ok(format_s3_error(
                     StatusCode::PRECONDITION_FAILED,
@@ -241,6 +250,7 @@ async fn try_complete(
         "too_large" => return Ok(CompleteOutcome::TooLarge),
         "too_small" => return Ok(CompleteOutcome::TooSmall),
         "precondition_failed" => return Ok(CompleteOutcome::PreconditionFailed),
+        "no_such_key" => return Ok(CompleteOutcome::NoSuchKey),
         status => unreachable!("cairn_complete_upload: unknown status {status}"),
     }
     let outcome = CompleteOutcome::Done {

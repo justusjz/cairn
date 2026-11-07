@@ -54,7 +54,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=97
+TOTAL=98
 STEP=0
 PASS=0
 FAIL=0
@@ -960,6 +960,27 @@ listing_parameters_ok() {
     s3 del "s3://${BUCKET}/enc/a+b c" >/dev/null 2>&1
 }
 
+# Smaller things S3 does: If-Match on a key without an object is a 404, an
+# upload without a declared length a 411, a copy range out of the source a
+# 416 (and a malformed one a 400), and a bucket name like an IP address a 400.
+s3_details_ok() {
+    local hash uid code
+    hash=$(sha256sum "$SMALL" | cut -d' ' -f1)
+    [ "$(scurl PUT "/${BUCKET}/no-such-key" "$hash" "$SMALL" "If-Match: *")" = 404 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/chunked" UNSIGNED-PAYLOAD "$SMALL" "Transfer-Encoding: chunked")" = 411 ] || return 1
+    uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key range-copy \
+        --query UploadId --output text 2>/dev/null) || return 1
+    code=$(scurl PUT "/${BUCKET}/range-copy?partNumber=1&uploadId=${uid}" "$EMPTY_SHA256" - \
+        "x-amz-copy-source: /${BUCKET}/small.txt" "x-amz-copy-source-range: bytes=0-99999")
+    [ "$code" = 416 ] || return 1
+    code=$(scurl PUT "/${BUCKET}/range-copy?partNumber=1&uploadId=${uid}" "$EMPTY_SHA256" - \
+        "x-amz-copy-source: /${BUCKET}/small.txt" "x-amz-copy-source-range: 0-2")
+    [ "$code" = 400 ] || return 1
+    awss3 s3api abort-multipart-upload --bucket "$BUCKET" --key range-copy --upload-id "$uid" \
+        >/dev/null 2>&1 || return 1
+    awss3 s3api create-bucket --bucket 10.0.0.1 2>&1 | grep -q InvalidBucketName
+}
+
 # Every response has an x-amz-request-id, and an error document names it too.
 request_id_ok() {
     local url="http://${SERVER_HOST}:${SERVER_PORT}/${BUCKET}" args=() line out id
@@ -1201,8 +1222,9 @@ versioned_multipart_copy_ok() {
 }
 
 # Suspending keeps existing versions but lands new writes on the single `null`
-# version (an overwrite replaces it), and a DELETE swaps the null version for a
-# null delete marker. Re-enables versioning afterwards.
+# version (an overwrite replaces it; as in S3, a write reports no version ID
+# for it), and a DELETE swaps the null version for a null delete marker.
+# Re-enables versioning afterwards.
 versioning_suspended_ok() {
     local v1 out
     v1=$(vput su "$SMALL") || return 1
@@ -1210,8 +1232,8 @@ versioning_suspended_ok() {
         --versioning-configuration Status=Suspended >/dev/null 2>&1 || return 1
     [ "$(awss3 s3api get-bucket-versioning --bucket "$VBUCKET" \
         --query Status --output text 2>/dev/null)" = "Suspended" ] || return 1
-    [ "$(vput su "$NESTED")" = "null" ] || return 1
-    [ "$(vput su "$BIG")" = "null" ] || return 1
+    [ "$(vput su "$NESTED")" = "None" ] || return 1
+    [ "$(vput su "$BIG")" = "None" ] || return 1
     vget_is su "$BIG" || return 1
     vget_is su "$BIG" null || return 1
     vget_is su "$SMALL" "$v1" || return 1
@@ -1784,6 +1806,7 @@ run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
 run_test    "Presigned GET/PUT, response headers"   presigned_ok
 run_test    "Listing parameters as in S3"           listing_parameters_ok
 run_test    "Request IDs in headers and errors"     request_id_ok
+run_test    "If-Match 404, 411, copy ranges, names" s3_details_ok
 run_test    "A PUT over 5 GiB is refused"           too_large_refused
 run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets

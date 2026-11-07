@@ -185,7 +185,9 @@ it; one asking for the owner's is fine, and reading an ACL shows the owner with
 full control.
 
 Bucket names follow S3's rules: 3 to 63 lowercase letters, digits, dots and
-hyphens, starting and ending with a letter or digit.
+hyphens, starting and ending with a letter or digit, not formatted like an IP
+address, and without the prefixes and suffixes S3 reserves (such as `xn--` or
+`-s3alias`).
 
 Manage roles with `cairn role --database <URL> <command>`:
 
@@ -337,7 +339,8 @@ yet to expire them automatically.
 As in S3: a PutObject, an UploadPart, an UploadPartCopy's range and a
 CopyObject's source may hold up to **5 GiB**, and an object up to **5 TiB**
 (10,000 parts). Every part of a multipart upload but the last must be at least
-**5 MiB**. Larger objects are uploaded in parts, and copied part by part,
+**5 MiB**. An upload must declare its length (`Content-Length`, or, streaming,
+`x-amz-decoded-content-length`). Larger objects are uploaded in parts, and copied part by part,
 which S3 clients do by themselves. A request declaring more is refused before
 its body is read.
 

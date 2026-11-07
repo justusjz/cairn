@@ -18,7 +18,7 @@ use crate::{
         conditional::{Precondition, Preconditions},
         sse_c::{self, CustomerKey},
         objects::get::{
-            Missing, ObjectVersion, PartLocation, lookup_version, no_such_version, parse_range,
+            Missing, ObjectVersion, PartLocation, lookup_version, no_such_version,
             resolve_object_parts, select_parts_in_range, spawn_range_stream,
         },
         util::{
@@ -289,8 +289,13 @@ async fn stream_object_copy(
         ))),
         UploadResult::NoSuchBucket => Ok(None),
         // Nothing is checked, there are no conditions, and an object has no upload.
-        UploadResult::Rejected(_) | UploadResult::PreconditionFailed | UploadResult::NoSuchUpload => {
-            unreachable!("an unchecked, unconditional object write only commits, or finds no bucket")
+        UploadResult::Rejected(_)
+        | UploadResult::PreconditionFailed
+        | UploadResult::NoSuchKey
+        | UploadResult::NoSuchUpload => {
+            unreachable!(
+                "an unchecked, unconditional object write only commits, or finds no bucket"
+            )
         }
     }
 }
@@ -454,18 +459,12 @@ pub async fn copy_part(
             return Ok(copy_precondition_failed());
         }
         // Resolve the copy range against the source size (absent header → whole
-        // object). Reuses GET's range parser; an unsatisfiable range is a 400.
+        // object).
         let size = version.size as u64;
-        let (start, end) = match parse_range(copy_source_range, size) {
-            Ok(Some((start, end))) => (start, end),
-            Ok(None) => (0, size),
-            Err(()) => {
-                return Ok(format_s3_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidArgument",
-                    "the x-amz-copy-source-range is not satisfiable",
-                ));
-            }
+        let (start, end) = match copy_source_range.map(|range| parse_copy_range(range, size)) {
+            None => (0, size),
+            Some(Ok(range)) => range,
+            Some(Err(refused)) => return Ok(refused),
         };
         if end - start > MAX_UPLOAD {
             return Ok(format_s3_error(
@@ -529,6 +528,41 @@ pub async fn copy_part(
         }
     }
     Err(Contended("the copy source kept changing".to_owned()).into())
+}
+
+/// An UploadPartCopy's `x-amz-copy-source-range` of a source of `size` bytes,
+/// as a half-open range. Stricter than a GET's Range, as in S3: exactly
+/// `bytes=first-last` (400 InvalidArgument otherwise), within the source (416
+/// InvalidRange otherwise).
+fn parse_copy_range(range: &str, size: u64) -> Result<(u64, u64), Response<Full<Bytes>>> {
+    let malformed = || {
+        format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The x-amz-copy-source-range value must be of the form bytes=first-last where \
+             first and last are the zero-based offsets of the first and last bytes to copy",
+        )
+    };
+    let number = |s: &str| {
+        (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+            .then(|| s.parse::<u64>().ok())
+            .flatten()
+    };
+    let (first, last) = range
+        .trim()
+        .strip_prefix("bytes=")
+        .and_then(|r| r.split_once('-'))
+        .and_then(|(first, last)| Some((number(first)?, number(last)?)))
+        .filter(|(first, last)| first <= last)
+        .ok_or_else(malformed)?;
+    if last >= size {
+        return Err(format_s3_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "InvalidRange",
+            "The requested range is not satisfiable",
+        ));
+    }
+    Ok((first, last + 1))
 }
 
 /// The part an UploadPartCopy stages: a range of one part of the source.
@@ -635,7 +669,10 @@ async fn stream_part_copy(
         UploadResult::NoSuchUpload => Ok(None),
         // Nothing is checked, there are no conditions, and a part has no bucket
         // to check.
-        UploadResult::Rejected(_) | UploadResult::PreconditionFailed | UploadResult::NoSuchBucket => {
+        UploadResult::Rejected(_)
+        | UploadResult::PreconditionFailed
+        | UploadResult::NoSuchKey
+        | UploadResult::NoSuchBucket => {
             unreachable!("an unchecked part upload only commits, or finds its upload gone")
         }
     }
@@ -818,4 +855,32 @@ pub(crate) fn parse_copy_source(copy_source: &str) -> Option<(String, String, Op
         return None;
     }
     Some((bucket, key, version_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_ranges_are_strict() {
+        assert_eq!(parse_copy_range("bytes=0-4", 5).unwrap(), (0, 5));
+        assert_eq!(parse_copy_range("bytes=2-2", 5).unwrap(), (2, 3));
+        for malformed in [
+            "0-2",
+            "bytes=0",
+            "bytes=hello-world",
+            "bytes=0-bar",
+            "bytes=hello-",
+            "bytes=0-2,3-5",
+            "bytes=3-1",
+            "bytes=-2",
+        ] {
+            let refused = parse_copy_range(malformed, 5).unwrap_err();
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{malformed}");
+        }
+        assert_eq!(
+            parse_copy_range("bytes=0-21", 5).unwrap_err().status(),
+            StatusCode::RANGE_NOT_SATISFIABLE
+        );
+    }
 }

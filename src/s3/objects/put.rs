@@ -41,7 +41,11 @@ pub async fn put_object(
         if exists?.is_none() {
             return Ok(no_such_bucket());
         }
-        if !conditions.allows_write(current?.as_deref()) {
+        let current = current?;
+        if conditions.has_if_match() && current.is_none() {
+            return Ok(no_such_key());
+        }
+        if !conditions.allows_write(current.as_deref()) {
             return Ok(precondition_failed());
         }
     }
@@ -74,10 +78,20 @@ pub async fn put_object(
         UploadResult::Rejected(rejection) => Ok(rejection_response(&rejection)),
         // A concurrent writer won the race between the fast-fail check and commit.
         UploadResult::PreconditionFailed => Ok(precondition_failed()),
+        UploadResult::NoSuchKey => Ok(no_such_key()),
         // There's no such bucket, or it was deleted while the body streamed.
         UploadResult::NoSuchBucket => Ok(no_such_bucket()),
         UploadResult::NoSuchUpload => unreachable!("an object write has no upload"),
     }
+}
+
+/// S3's 404 for an If-Match without an object to match.
+fn no_such_key() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchKey",
+        "the specified key does not exist",
+    )
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {

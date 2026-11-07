@@ -89,6 +89,12 @@ impl Preconditions {
         self.if_match.is_some() || self.if_none_match.is_some()
     }
 
+    /// Whether there's an If-Match, which, without an object to match, is a
+    /// 404 (NoSuchKey) rather than a 412, as in S3.
+    pub fn has_if_match(&self) -> bool {
+        self.if_match.is_some()
+    }
+
     /// Evaluates the write preconditions (If-Match / If-None-Match) against the
     /// object currently at the target key — `current_etag` is `Some` iff it
     /// exists — returning whether the write may proceed. Date conditions are
