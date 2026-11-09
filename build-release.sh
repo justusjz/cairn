@@ -14,7 +14,9 @@
 # Output: dist/cairn-v<version>-<arch>-unknown-linux-musl.tar.gz (+ .sha256)
 #         dist/<amd64|arm64>/cairn
 #
-# Requires the musl target, e.g.:  rustup target add x86_64-unknown-linux-musl
+# Requires the musl target, e.g.:  rustup target add x86_64-unknown-linux-musl,
+# and musl's C compiler wrapper, musl-gcc (Debian/Ubuntu: musl-tools; Arch:
+# musl), since ring compiles C,
 # and Node.js 26 or later (with npm), to build the dashboard's UI.
 
 set -euo pipefail
@@ -38,6 +40,18 @@ BIN="target/${TARGET}/release/cairn"
 # A fresh build, so that the release never ships a stale one.
 echo "Building the dashboard UI..."
 (cd ui && npm ci && npm run build)
+
+# ring's build script compiles C for the target. cc-rs looks for
+# <arch>-linux-musl-gcc, which distributions don't ship, and only falls back to
+# musl-gcc on x86_64; so name musl-gcc for it, unless the caller named another.
+CC_VAR="CC_${TARGET//-/_}"
+if [ -z "${!CC_VAR:-}" ]; then
+    if ! command -v musl-gcc > /dev/null; then
+        echo "ERROR: musl-gcc not found; install musl-tools (or set $CC_VAR)" >&2
+        exit 1
+    fi
+    export "$CC_VAR=musl-gcc"
+fi
 
 echo "Building cairn v${VERSION} for ${TARGET}..."
 cargo build --release --locked --target "$TARGET"

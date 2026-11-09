@@ -48,6 +48,10 @@ jobs:
             exit 1
           fi
 
+      # musl-gcc, for ring's C (see build-release.sh).
+      - name: Install musl-tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - uses: actions/setup-node@v6
         with:
           node-version-file: ui/.node-version
