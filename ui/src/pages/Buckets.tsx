@@ -1,5 +1,5 @@
 import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
-import { For, Show, createEffect, createSignal, on } from "solid-js";
+import { For, Match, Show, Switch, createEffect, createSignal, on } from "solid-js";
 import { type Entry, api, downloadUrl } from "../api";
 import { Badge, LiveDot, Loading, Panel, Table, act, poll } from "../components/ui";
 import { bytes, date, num } from "../format";
@@ -325,17 +325,21 @@ export function ObjectPage() {
                           <dd>
                             <Show when={v.encryption} fallback="none">
                               {(e) => (
-                                <Show when={e().kind === "SSE-KMS"} fallback="SSE-C (with its client's key)">
-                                  SSE-KMS with key <span class="mono">{e().kms_key_id}</span>
-                                  {e().kms_key_version != null ? `, version ${e().kms_key_version}` : ""}
-                                  <Show when={e().kms_context}>
-                                    {(c) => (
-                                      <div class="subtle">
-                                        context <span class="mono">{c()}</span>
-                                      </div>
-                                    )}
-                                  </Show>
-                                </Show>
+                                <Switch fallback={e().kind}>
+                                  <Match when={e().kind === "SSE-C"}>SSE-C (with its client's key)</Match>
+                                  <Match when={e().kind === "SSE-KMS" || e().kind === "SSE-S3"}>
+                                    {e().kind === "SSE-S3" ? "SSE-S3 with Cairn's key " : "SSE-KMS with key "}
+                                    <span class="mono">{e().kms_key_id}</span>
+                                    {e().kms_key_version != null ? `, version ${e().kms_key_version}` : ""}
+                                    <Show when={e().kms_context}>
+                                      {(c) => (
+                                        <div class="subtle">
+                                          context <span class="mono">{c()}</span>
+                                        </div>
+                                      )}
+                                    </Show>
+                                  </Match>
+                                </Switch>
                               )}
                             </Show>
                           </dd>
