@@ -101,22 +101,42 @@ pub(crate) fn invalid_version_id(argument: &str, id: &str) -> Response<Full<Byte
     rejection_response(&rejection)
 }
 
-/// The ETag of the object a plain GET of the key would return: the current
-/// version, unless that's a delete marker (then the key reads as absent). This is
-/// what conditional writes (If-Match / If-None-Match) are evaluated against.
-pub async fn current_etag<C: GenericClient>(
-    client: &C,
+/// The object a plain GET of the key would return, as a conditional write
+/// (If-Match / If-None-Match) is decided against: its row id, and its ETag as
+/// clients see it (decrypted, for SSE-S3).
+pub struct Current {
+    pub id: i64,
+    pub etag: String,
+}
+
+/// The key's current object (see `Current`): its current version, unless
+/// that's a delete marker (then the key reads as absent). `Err` holds why its
+/// ETag can't be had (the KMS can't open an SSE-S3 one, say). The write
+/// lands only if this is still the current one when it does (see
+/// `cairn_current_version`).
+pub async fn current_object(
+    app: &crate::App,
     bucket: &str,
     key: &str,
-) -> Result<Option<String>, tokio_postgres::Error> {
-    Ok(client
+) -> anyhow::Result<Result<Option<Current>, Response<Full<Bytes>>>> {
+    let row = app
+        .pool
+        .get()
+        .await?
         .query_opt_cached(
-            "SELECT etag FROM objects
+            "SELECT id, etag, sse_c_key, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed,
+                    sse_kms_context, sse_s3
+             FROM objects
              WHERE bucket = $1 AND key = $2 AND is_latest AND NOT is_delete_marker",
             &[&bucket, &key],
         )
+        .await?;
+    let Some(row) = row else { return Ok(Ok(None)) };
+    let stored = crate::s3::sse::Stored::from_row(&row, 2);
+    let etag: String = row.get(1);
+    Ok(crate::s3::sse::plain_etag(app, &stored, &etag, bucket, key)
         .await?
-        .map(|row| row.get(0)))
+        .map(|etag| Some(Current { id: row.get(0), etag })))
 }
 
 /// The outcome of a delete: the `x-amz-version-id` to report, and whether the

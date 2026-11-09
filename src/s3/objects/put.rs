@@ -10,7 +10,7 @@ use crate::{
     s3::conditional::Preconditions,
     s3::sse::{self, Wanted},
     s3::util::{format_s3_error, rejection_response, with_version_id},
-    s3::versions::current_etag,
+    s3::versions::current_object,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -34,19 +34,18 @@ pub async fn put_object(
     // checks the bucket as it starts, before it replicates anything.)
     if conditions.has_write_conditions() {
         let client = app.pool.get().await?;
-        // Independent, so they're sent together: one round trip.
-        let (exists, current) = tokio::join!(
-            async { client.query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket]).await },
-            current_etag(&client, bucket, key),
-        );
-        if exists?.is_none() {
+        if client.query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket]).await?.is_none() {
             return Ok(no_such_bucket());
         }
-        let current = current?;
+        drop(client);
+        let current = match current_object(app, bucket, key).await? {
+            Ok(current) => current,
+            Err(refused) => return Ok(refused),
+        };
         if conditions.has_if_match() && current.is_none() {
             return Ok(no_such_key());
         }
-        if !conditions.allows_write(current.as_deref()) {
+        if !conditions.allows_write(current.as_ref().map(|c| c.etag.as_str())) {
             return Ok(precondition_failed());
         }
     }
@@ -85,6 +84,7 @@ pub async fn put_object(
         // There's no such bucket, or it was deleted while the body streamed.
         UploadResult::NoSuchBucket => Ok(no_such_bucket()),
         UploadResult::NoSuchUpload => unreachable!("an object write has no upload"),
+        UploadResult::Refused(refused) => Ok(refused),
     }
 }
 

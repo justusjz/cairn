@@ -119,17 +119,6 @@ impl Preconditions {
         }
         true
     }
-
-    /// The write preconditions (If-Match, If-None-Match) in the form the
-    /// catalog functions take them (see `cairn_allows_write`): `None` for an
-    /// absent header, an empty list for `*`, and else the entity-tags, without
-    /// weak indicators and quotes (our stored ETags are unquoted).
-    pub fn write_conditions(&self) -> (Option<Vec<String>>, Option<Vec<String>>) {
-        (
-            self.if_match.as_deref().map(etag_list),
-            self.if_none_match.as_deref().map(etag_list),
-        )
-    }
 }
 
 fn header(headers: &HeaderMap, name: &str) -> Option<String> {

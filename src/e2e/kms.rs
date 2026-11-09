@@ -229,7 +229,7 @@ async fn put_part(app: &Arc<App>, role: Uuid, upload_id: Uuid, key: &str, part_n
     let encryption = upload_encryption(app, &upload_id, BUCKET, key).await.unwrap().unwrap();
     let upload_key = sse::open(app, &encryption, None, Some(role), BUCKET, key).await.unwrap().ok().unwrap();
     assert!(upload_key.is_some() == !encryption.is_plain());
-    let attach = AttachTarget::MultipartPart { upload_id, part_number, key: upload_key };
+    let attach = AttachTarget::MultipartPart { upload_id, part_number, key: upload_key, sse_s3: matches!(encryption, Stored::S3(_)) };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
         .await
         .unwrap();
@@ -720,13 +720,17 @@ async fn sse_s3_uses_cairns_own_key() {
         .unwrap();
     assert!(get_object(&app, BUCKET, "b", None, None, &Preconditions::default(), None, None).await.is_err());
 
-    // Copies: to SSE-KMS and back share the parts; to plain, they don't.
+    // Copies: to SSE-S3 share the parts; to SSE-KMS and back, or to plain,
+    // they don't (an SSE-S3 object's ETag is its MD5, which takes reading).
+    assert_eq!(copy(&app, bob, "a", "s3", None, Wanted::S3).await, (StatusCode::OK, s3.clone()));
+    assert_eq!(stored(&app, "s3").await.0, blob_a);
+    assert_eq!(etag_of(&app, "s3").await, md5_hex(&data(100_000)));
     let to_kms = kms(None, &[]);
     assert_eq!(copy(&app, alice, "a", "kms", None, Wanted::Kms(&to_kms)).await.0, StatusCode::OK);
-    assert_eq!(stored(&app, "kms").await.0, blob_a);
+    assert!(stored(&app, "kms").await.0 != blob_a);
     assert_eq!(copy(&app, alice, "kms", "back", None, Wanted::S3).await, (StatusCode::OK, s3.clone()));
-    assert_eq!(stored(&app, "back").await.0, blob_a);
     assert!(get(&app, None, "back", None).await.2 == data(100_000));
+    assert_eq!(etag_of(&app, "back").await, md5_hex(&data(100_000)));
     assert_eq!(copy(&app, bob, "a", "plain", None, Wanted::Plain).await.0, StatusCode::OK);
     let (blob, salt, ..) = stored(&app, "plain").await;
     assert!(blob != blob_a && salt.is_none());
@@ -770,4 +774,125 @@ async fn sse_s3_uses_cairns_own_key() {
     let key = KeyId::parse("cairn-sse-s3").unwrap();
     let e = fresh.sse_s3_open(&key, &key_a.unwrap()).await.unwrap_err();
     assert!(matches!(e, crate::kms::KmsError::Denied), "{e}");
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    md5::Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The ETag a GetObject of `key` answers with (unquoted).
+async fn etag_of(app: &Arc<App>, key: &str) -> String {
+    let response = get_object(app, BUCKET, key, None, None, &Preconditions::default(), None, None).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    response.headers()[hyper::header::ETAG].to_str().unwrap().trim_matches('"').to_owned()
+}
+
+/// An SSE-S3 object's ETag is its content's MD5, as in S3, and a multipart
+/// one's S3's combined one: told in GET, HEAD, the listings and by the write,
+/// and stored sealed (never the same twice). Conditional writes and reads go
+/// by it.
+#[tokio::test]
+async fn sse_s3_etags_are_md5s_stored_sealed() {
+    use crate::s3::objects::{list::list_objects, list::ListVersion, list_versions::list_object_versions};
+    let Some(app) = kms_node().await else { return };
+    allow_cairn(&app, &["transit/cairn-sse-s3"]).await;
+    let bob = role(&app, "bob", &[]).await;
+    let plain = data(100_000);
+    put_s3(&app, bob, "k", plain.clone()).await;
+    let md5 = md5_hex(&plain);
+    assert_eq!(etag_of(&app, "k").await, md5);
+    let head = head_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None).await.unwrap();
+    assert_eq!(head.headers()[hyper::header::ETAG].to_str().unwrap(), format!("\"{md5}\""));
+    // Stored sealed: not the MD5, and not the same for the same content.
+    put_s3(&app, bob, "k2", plain.clone()).await;
+    let stored_etag = |key: &'static str| {
+        let app = app.clone();
+        async move {
+            let client = app.pool.get().await.unwrap();
+            client.query_one("SELECT etag FROM objects WHERE key = $1", &[&key]).await.unwrap().get::<_, String>(0)
+        }
+    };
+    let (sealed, sealed2) = (stored_etag("k").await, stored_etag("k2").await);
+    assert!(!sealed.contains(&md5) && sealed != sealed2);
+    for listing in [
+        list_objects(&app, BUCKET, "", None, "", 1000, ListVersion::V2 { continuation_token: None, start_after: None, fetch_owner: false }, Default::default()).await.unwrap(),
+        list_object_versions(&app, BUCKET, "", None, "", None, 1000, Default::default()).await.unwrap(),
+    ] {
+        let body = String::from_utf8(listing.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert_eq!(body.matches(&format!("<ETag>\"{md5}\"</ETag>")).count(), 2, "{body}");
+    }
+
+    // Conditional reads and writes, by the MD5.
+    let conditional = |name: &str, value: &str| {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
+        Preconditions::from_headers(&headers)
+    };
+    let read = get_object(&app, BUCKET, "k", None, None, &conditional("if-none-match", &format!("\"{md5}\"")), None, None)
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::NOT_MODIFIED);
+    let write = |conditions: Preconditions| {
+        let app = app.clone();
+        async move {
+            let sealing = sse::seal(&app, Wanted::S3, Some(bob), BUCKET, "k").await.unwrap().unwrap();
+            let attach = AttachTarget::Object {
+                bucket: BUCKET.to_owned(),
+                key: "k".to_owned(),
+                content_type: "x".to_owned(),
+                metadata: String::new(),
+                conditions,
+                sealing,
+            };
+            crate::upload_part(&app, Full::new(Bytes::from(data(10))), &attach, Payload::unchecked()).await.unwrap()
+        }
+    };
+    assert!(matches!(write(conditional("if-match", "\"0123456789abcdef0123456789abcdef\"")).await, UploadResult::PreconditionFailed));
+    assert!(matches!(write(conditional("if-none-match", "*")).await, UploadResult::PreconditionFailed));
+    assert!(matches!(write(conditional("if-match", &format!("\"{md5}\""))).await, UploadResult::Committed { .. }));
+    assert_eq!(etag_of(&app, "k").await, md5_hex(&data(10)));
+
+    // Multipart: S3's ETag of the parts' MD5s, told back and listed.
+    let (upload_id, _) = create(&app, bob, "multi", Wanted::S3).await;
+    let (first, second) = (data(5 << 20), data(10));
+    let etags = vec![
+        put_part(&app, bob, upload_id, "multi", 1, first.clone()).await,
+        put_part(&app, bob, upload_id, "multi", 2, second.clone()).await,
+    ];
+    assert_eq!(etags, vec![md5_hex(&first), md5_hex(&second)]);
+    let parts = crate::s3::multipart::list_parts::list_parts(&app, BUCKET, "multi", &upload_id.to_string(), 0, 1000).await.unwrap();
+    let body = String::from_utf8(parts.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert!(body.contains(&format!("<ETag>\"{}\"</ETag>", etags[1])), "{body}");
+    // A part listed with a wrong ETag is no part of it.
+    let wrong = vec![etags[0].clone(), md5_hex(b"other")];
+    let response = complete_multipart_upload(&app, BUCKET, "multi", &upload_id.to_string(), complete_body(&wrong), &Preconditions::default(), None)
+        .await
+        .unwrap();
+    assert_eq!(code(response).await, (StatusCode::BAD_REQUEST, "InvalidPart".to_owned()));
+    let combined = {
+        let mut md5 = md5::Md5::new();
+        md5.update(md5::Md5::digest(&first));
+        md5.update(md5::Md5::digest(&second));
+        format!("{}-2", md5.finalize().iter().map(|b| format!("{b:02x}")).collect::<String>())
+    };
+    for _ in 0..2 {
+        // The second time, a retry: its upload is gone, its version tells.
+        let response = complete_multipart_upload(&app, BUCKET, "multi", &upload_id.to_string(), complete_body(&etags), &Preconditions::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(body.contains(&format!("<ETag>\"{combined}\"</ETag>")), "{body}");
+    }
+    assert_eq!(etag_of(&app, "multi").await, combined);
+}
+
+/// A CompleteMultipartUpload body listing `etags` as parts 1, 2, ...
+fn complete_body(etags: &[String]) -> Bytes {
+    let parts: String = etags
+        .iter()
+        .enumerate()
+        .map(|(i, etag)| format!("<Part><PartNumber>{}</PartNumber><ETag>\"{etag}\"</ETag></Part>", i + 1))
+        .collect();
+    Bytes::from(format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>"))
 }

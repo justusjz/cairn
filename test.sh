@@ -678,6 +678,14 @@ sse_s3_ok() {
         cmp -s "$src" "$out" || return 1
     done
     cairn_role revoke reader "$BUCKET" read >/dev/null 2>&1 || return 1
+    # The ETag is the MD5, as in S3, which s3cmd checks after an upload.
+    local log="$WORK_DIR/s3cmd-sse-s3.log"
+    s3 put "$BIG" "s3://${BUCKET}/s3/s3cmd.bin" --server-side-encryption >"$log" 2>&1 || return 1
+    ! grep -q "MD5" "$log" || return 1
+    s3 get --force "s3://${BUCKET}/s3/s3cmd.bin" "$out" >/dev/null 2>&1 || return 1
+    cmp -s "$BIG" "$out" || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key s3/s3cmd.bin --query ETag --output text \
+        2>/dev/null)" = "\"$(md5sum "$BIG" | cut -d' ' -f1)\"" ] || return 1
     awss3 s3api copy-object --bucket "$BUCKET" --key s3/kms.bin --copy-source "${BUCKET}/s3/big.bin" \
         --server-side-encryption aws:kms --ssekms-key-id cairn-test >/dev/null 2>&1 || return 1
     awss3 s3api copy-object --bucket "$BUCKET" --key s3/back.bin --copy-source "${BUCKET}/s3/kms.bin" \
@@ -685,7 +693,7 @@ sse_s3_ok() {
     [ "$(awss3 s3api get-object --bucket "$BUCKET" --key s3/back.bin "$out" --query ServerSideEncryption \
         --output text 2>/dev/null)" = AES256 ] || return 1
     cmp -s "$BIG" "$out" || return 1
-    for key in big multi kms back; do
+    for key in big multi s3cmd kms back; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "s3/$key.bin" >/dev/null 2>&1 || return 1
     done
 }

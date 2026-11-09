@@ -793,20 +793,32 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
             nodes: p.get(10),
         });
     }
-    let versions = versions
-        .iter()
-        .map(|v| VersionInfo {
+    let mut infos = Vec::with_capacity(versions.len());
+    for v in &versions {
+        let stored = crate::s3::sse::Stored::from_row(v, 8);
+        let mut etag: Option<String> = v.get(5);
+        let mut parts = parts.remove(&v.get::<_, i64>(0)).unwrap_or_default();
+        // An SSE-S3 version's ETags (and its parts') are stored sealed; Cairn
+        // can open them, as it can the version itself.
+        if let Some(etag_key) = crate::s3::sse::etag_key(app, &stored, bucket, key).await?.ok().flatten() {
+            etag = etag.map(|e| etag_key.open(&e)).transpose()?;
+            for part in &mut parts {
+                part.etag = etag_key.open(&part.etag)?;
+            }
+        }
+        infos.push(VersionInfo {
             version_id: v.get(1),
             latest: v.get(2),
             delete_marker: v.get(3),
             size: v.get(4),
-            etag: v.get(5),
+            etag,
             content_type: v.get(6),
             last_modified: v.get(7),
-            encryption: EncryptionInfo::of(crate::s3::sse::Stored::from_row(v, 8)),
-            parts: parts.remove(&v.get::<_, i64>(0)).unwrap_or_default(),
-        })
-        .collect();
+            encryption: EncryptionInfo::of(stored),
+            parts,
+        });
+    }
+    let versions = infos;
     Ok(ObjectInfo {
         bucket: bucket.to_owned(),
         key: key.to_owned(),

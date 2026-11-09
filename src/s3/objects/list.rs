@@ -102,7 +102,8 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
         .query_cached(
             "SELECT name, is_prefix, objects, size, etag,
                     to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-                    extract(epoch FROM last_modified)::float8, is_delete_marker
+                    extract(epoch FROM last_modified)::float8, is_delete_marker,
+                    sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed
              FROM pg_temp.cairn_list_current($1, $2, $3, $4, $5, $6, $7)",
             &[&bucket, &q.prefix, &delim, &q.marker, &limit, &q.delete_markers, &q.totals],
         )
@@ -127,9 +128,9 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
             epoch: r.get::<_, Option<f64>>(6)?,
         })
     };
-    let entries = kept
-        .iter()
-        .map(|r| {
+    let mut entries = Vec::with_capacity(kept.len());
+    for r in kept {
+        entries.push(
             if r.get::<_, bool>(1) {
                 let totals = timestamp(r).map(|last_modified| PrefixTotals {
                     objects: r.get(2),
@@ -141,21 +142,51 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
                     totals,
                 }
             } else {
+                let key: String = r.get(0);
                 ListEntry::Object {
-                    key: r.get(0),
+                    etag: listed_etag(app, bucket, &key, r, 4, 8).await?,
+                    key,
                     size: r.get(3),
-                    etag: r.get(4),
                     last_modified: timestamp(r).expect("a key has a last-modified time"),
                     delete_marker: r.get(7),
                 }
-            }
-        })
-        .collect();
+            },
+        );
+    }
     Ok(Some(Listing {
         entries,
         truncated,
         next_marker,
     }))
+}
+
+/// The ETag of a listed object at `bucket`/`key`, as clients know it: the one
+/// in `row`'s column `etag`, decrypted if the row's SSE-S3 columns (`sse_s3,
+/// sse_kms_key_id, sse_kms_data_key, sse_kms_sealed`, from `sse` on) say it's
+/// sealed. A listing fails if the KMS can't open an object's key (which a node
+/// usually has already: see `kms`).
+pub(crate) async fn listed_etag(
+    app: &App,
+    bucket: &str,
+    key: &str,
+    row: &tokio_postgres::Row,
+    etag: usize,
+    sse: usize,
+) -> anyhow::Result<Option<String>> {
+    let stored: Option<String> = row.get(etag);
+    let (Some(stored), Some(true)) = (stored, row.get::<_, Option<bool>>(sse)) else {
+        return Ok(row.get(etag));
+    };
+    let encryption = crate::s3::sse::Stored::S3(crate::s3::sse::Envelope {
+        key_id: row.get(sse + 1),
+        data_key: row.get(sse + 2),
+        sealed: row.get(sse + 3),
+        context: None,
+    });
+    match crate::s3::sse::plain_etag(app, &encryption, &stored, bucket, key).await? {
+        Ok(etag) => Ok(Some(etag)),
+        Err(_) => anyhow::bail!("the KMS couldn't open the key of {bucket}/{key}, to list its ETag"),
+    }
 }
 
 /// ListObjects and ListObjectsV2: a page of `list`, as S3's XML, with keys and

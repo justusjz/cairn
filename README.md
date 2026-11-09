@@ -366,8 +366,10 @@ before it's stored, so no disk ever holds it in the clear.
 - Only the content is encrypted. Its key (name), size, times, Content-Type
   and metadata (`x-amz-meta-*` and the like) are stored as they are, as in S3:
   don't put anything secret there.
-- An encrypted object's ETag is random, not the MD5 of its content, as in S3:
-  an MD5 would give away whether the content is a guessed one.
+- An SSE-C or SSE-KMS object's ETag is random, not the MD5 of its content,
+  as in S3. An SSE-S3 object's is the MD5, as in S3 (clients like s3cmd check
+  it), but it's stored encrypted, with a fresh nonce each time, so that the
+  database doesn't give away whether the content is a guessed one.
 - Keys are only ever in a node's memory, and wiped once they're no longer
   needed. A node can't be core-dumped or debugged by another process of its
   user. But its memory can be swapped out: run nodes without swap, or with

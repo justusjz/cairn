@@ -73,7 +73,8 @@ pub async fn list_object_versions(
         .query_cached(
             "SELECT name AS key, is_prefix, version_id, is_latest, is_delete_marker, size, etag,
                     to_char(last_modified AT TIME ZONE 'UTC',
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_modified
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_modified,
+                    sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed
              FROM pg_temp.cairn_list_versions($1, $2, $3, $4, $5, $6)",
             &[&bucket, &prefix, &delim, &key_marker, &marker_id, &limit],
         )
@@ -109,7 +110,9 @@ pub async fn list_object_versions(
         if row.get::<_, bool>("is_delete_marker") {
             entries.push_str(&format!("<DeleteMarker>{common}{OWNER}</DeleteMarker>"));
         } else {
-            let etag: &str = row.get("etag");
+            // As clients know it (an SSE-S3 one's is stored sealed).
+            let etag = crate::s3::objects::list::listed_etag(app, bucket, key, row, 6, 8).await?;
+            let etag = etag.as_deref().unwrap_or("");
             let size: i64 = row.get("size");
             entries.push_str(&format!(
                 "<Version>{common}<ETag>\"{}\"</ETag><Size>{size}</Size>\

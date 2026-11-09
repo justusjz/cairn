@@ -58,6 +58,7 @@ async fn upload_part(app: &Arc<App>, upload_id: &str, number: i32, data: Vec<u8>
         upload_id: upload_id.parse().unwrap(),
         part_number: number,
         key: None,
+        sse_s3: false,
     };
     let body = Full::new(Bytes::from(data));
     match crate::upload_part(app, body, &attach, Payload::unchecked()).await? {

@@ -35,16 +35,17 @@ pub async fn list_parts(
         .await?;
     // It must belong to the request's bucket and key: authorization only
     // checked the bucket.
-    if tx
+    let Some(encryption) = tx
         .query_opt_cached(
-            "SELECT 1 FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
+            "SELECT sse_c_key, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3
+             FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
             &[&upload, &bucket, &key],
         )
         .await?
-        .is_none()
-    {
+        .map(|row| crate::s3::sse::Stored::from_row(&row, 0))
+    else {
         return Ok(no_such_upload());
-    }
+    };
     // One more than a page, to tell whether there's more.
     let limit = max_parts + 1;
     let rows = tx
@@ -58,6 +59,11 @@ pub async fn list_parts(
         .await?;
     tx.commit().await?;
     drop(client);
+    // An SSE-S3 upload's part ETags are stored sealed, under its key.
+    let etag_key = match crate::s3::sse::etag_key(app, &encryption, bucket, key).await? {
+        Ok(etag_key) => etag_key,
+        Err(refused) => return Ok(refused),
+    };
 
     let truncated = rows.len() as i64 > max_parts;
     let kept = &rows[..(max_parts as usize).min(rows.len())];
@@ -82,10 +88,14 @@ pub async fn list_parts(
     for row in kept {
         let (number, etag, size, modified): (i32, &str, i64, &str) =
             (row.get(0), row.get(1), row.get(2), row.get(3));
+        let etag = match &etag_key {
+            Some(etag_key) => etag_key.open(etag)?,
+            None => etag.to_owned(),
+        };
         body.push_str(&format!(
             "<Part><PartNumber>{number}</PartNumber><LastModified>{modified}</LastModified>\
              <ETag>\"{}\"</ETag><Size>{size}</Size></Part>",
-            xml_escape(etag),
+            xml_escape(&etag),
         ));
     }
     body.push_str("</ListPartsResult>");

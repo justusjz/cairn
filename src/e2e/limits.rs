@@ -122,6 +122,7 @@ async fn objects_are_limited_to_5_tib() {
             upload_id: upload.parse().unwrap(),
             part_number: n,
             key: None,
+            sse_s3: false,
         };
         let body = http_body_util::Full::new(Bytes::from_static(b"part"));
         let crate::UploadResult::Committed { etag, .. } =

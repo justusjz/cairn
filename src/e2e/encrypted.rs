@@ -48,7 +48,7 @@ async fn commit(
                     "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], $3, 0, 65536, 0, $4, $5, $6,
                      $7, $8, 'application/octet-stream', '', $9, NULL, NULL, NULL, NULL, false,
-                     NULL, NULL, $10)",
+                     false, NULL, $10)",
                     &[
                         &blob,
                         &app.node,
@@ -186,17 +186,12 @@ async fn sizes_salts_and_key_checks_carry_through() {
         commit(&app, Err((upload, 2)), 21, 5, &[4; 16]).await,
         "committed"
     );
-    let etags = ["02".repeat(16), "04".repeat(16)];
     let status: String = client
         .query_one(
             "SELECT status FROM pg_temp.cairn_complete_upload(
-                 $1, $2, 'm', ARRAY[1, 2], $3, NULL, NULL, $4)",
-            &[
-                &upload,
-                &BUCKET,
-                &etags.to_vec(),
-                &crate::s3::versions::new_version_id(),
-            ],
+                 $1, $2, 'm', ARRAY(SELECT id FROM parts WHERE upload_id = $1 ORDER BY part_number),
+                 ARRAY[1, 2], 'etag-2', false, NULL, $3)",
+            &[&upload, &BUCKET, &crate::s3::versions::new_version_id()],
         )
         .await
         .unwrap()
@@ -246,17 +241,12 @@ async fn sizes_salts_and_key_checks_carry_through() {
         commit(&app, Err((upload, 2)), 21, 5, &[6; 16]).await,
         "committed"
     );
-    let etags = ["05".repeat(16), "06".repeat(16)];
     let status: String = client
         .query_one(
             "SELECT status FROM pg_temp.cairn_complete_upload(
-                 $1, $2, 's', ARRAY[1, 2], $3, NULL, NULL, $4)",
-            &[
-                &upload,
-                &BUCKET,
-                &etags.to_vec(),
-                &crate::s3::versions::new_version_id(),
-            ],
+                 $1, $2, 's', ARRAY(SELECT id FROM parts WHERE upload_id = $1 ORDER BY part_number),
+                 ARRAY[1, 2], 'etag-2', false, NULL, $3)",
+            &[&upload, &BUCKET, &crate::s3::versions::new_version_id()],
         )
         .await
         .unwrap()
@@ -293,7 +283,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
             .query_one(
                 "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], 1016, 0, 65536, 0, 'etag', $3, $4,
-                     $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, $6)",
+                     $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, false, false, NULL, $6)",
                 &[
                     &blob,
                     &app.node,

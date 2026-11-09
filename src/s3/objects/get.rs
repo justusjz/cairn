@@ -204,6 +204,11 @@ pub async fn get_object(
     if let Err(refused) = sse::check(&encryption, customer_key) {
         return Ok(box_response(refused));
     }
+    // Its ETag, as clients know it (an SSE-S3 one's is stored sealed).
+    let etag = match sse::plain_etag(app, &encryption, &etag, bucket, key).await? {
+        Ok(etag) => etag,
+        Err(refused) => return Ok(box_response(refused)),
+    };
     // Honour conditional-request headers before doing any streaming work.
     match preconditions.evaluate(&etag, lm_epoch, true) {
         Precondition::Proceed => {}
@@ -634,10 +639,15 @@ pub async fn head_object(
         Ok(version) => version,
         Err(missing) => return Ok(missing.read_response()),
     };
-    // Like GET's, but an SSE-KMS object's key isn't needed.
+    // Like GET's, but an SSE-KMS object's key isn't needed (an SSE-S3 one's
+    // is, for its ETag).
     if let Err(refused) = sse::check(&encryption, customer_key) {
         return Ok(refused);
     }
+    let etag = match sse::plain_etag(app, &encryption, &etag, bucket, key).await? {
+        Ok(etag) => etag,
+        Err(refused) => return Ok(refused),
+    };
     // Honour conditional-request headers, exactly as GET does.
     match preconditions.evaluate(&etag, lm_epoch, true) {
         Precondition::Proceed => {}

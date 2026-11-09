@@ -96,6 +96,7 @@ async fn a_part_of_a_vanished_upload_leaves_nothing() {
         upload_id: Uuid::now_v7(),
         part_number: 1,
         key: None,
+        sse_s3: false,
     };
     let result = upload(&app, &attach, b"data", Payload::unchecked()).await;
     assert!(matches!(result.unwrap(), UploadResult::NoSuchUpload));
@@ -269,7 +270,7 @@ async fn delete_bucket_aborts_its_uploads() {
     };
     let uploads = [create("a").await, create("b").await];
     for (i, upload_id) in uploads.iter().enumerate() {
-        let attach = AttachTarget::MultipartPart { upload_id: *upload_id, part_number: i as i32 + 1, key: None };
+        let attach = AttachTarget::MultipartPart { upload_id: *upload_id, part_number: i as i32 + 1, key: None, sse_s3: false };
         let result = upload(&app, &attach, b"staged", Payload::unchecked()).await.unwrap();
         assert!(matches!(result, UploadResult::Committed { .. }));
     }
@@ -283,7 +284,7 @@ async fn delete_bucket_aborts_its_uploads() {
     for n in 0..16 {
         let (app, upload_id) = (app.clone(), uploads[n % 2]);
         parts.spawn(async move {
-            let attach = AttachTarget::MultipartPart { upload_id, part_number: 10 + n as i32, key: None };
+            let attach = AttachTarget::MultipartPart { upload_id, part_number: 10 + n as i32, key: None, sse_s3: false };
             upload(&app, &attach, b"racing", Payload::unchecked()).await.unwrap()
         });
     }

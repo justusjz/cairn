@@ -41,6 +41,7 @@ async fn staged_with(app: &Arc<App>, key: &str, metadata: &str) -> (String, [Str
             upload_id: upload_id.parse::<Uuid>().unwrap(),
             part_number: i as i32 + 1,
             key: None,
+            sse_s3: false,
         };
         let len = if i == 0 { crate::s3::util::MIN_PART as usize } else { 100 };
         let body = Full::new(Bytes::from(vec![i as u8; len]));
@@ -185,6 +186,7 @@ async fn an_sse_c_upload_makes_an_sse_c_object() {
             upload_id: upload_id.parse().unwrap(),
             part_number: i as i32 + 1,
             key: Some(zeroize::Zeroizing::new(*customer.key())),
+            sse_s3: false,
         };
         let body = Full::new(Bytes::from(part.clone()));
         let UploadResult::Committed { etag, .. } =
@@ -239,6 +241,7 @@ async fn parts_but_the_last_must_be_5_mib() {
         upload_id: upload_id.parse().unwrap(),
         part_number: 1,
         key: None,
+        sse_s3: false,
     };
     let body = Full::new(Bytes::from_static(b"tiny"));
     let UploadResult::Committed { etag: tiny, .. } =
@@ -316,6 +319,7 @@ async fn lists_an_uploads_parts() {
             upload_id: upload_id.parse().unwrap(),
             part_number: number,
             key: Some(zeroize::Zeroizing::new(*customer.key())),
+            sse_s3: false,
         };
         let body = Full::new(Bytes::from(vec![number as u8; len]));
         let UploadResult::Committed { etag, .. } =

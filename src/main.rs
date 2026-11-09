@@ -773,11 +773,13 @@ enum AttachTarget {
         sealing: Option<Sealing>,
     },
     /// A part staged under an in-progress multipart upload, encrypted with
-    /// `key` if the upload is encrypted (SSE-C or SSE-KMS).
+    /// `key` if the upload is encrypted (SSE-C, SSE-KMS or SSE-S3), whose
+    /// ETag is then an MD5, sealed, if it's SSE-S3 (see `s3::sse`).
     MultipartPart {
         upload_id: Uuid,
         part_number: i32,
         key: Option<zeroize::Zeroizing<encryption::Key>>,
+        sse_s3: bool,
     },
 }
 
@@ -806,6 +808,9 @@ enum UploadResult {
     /// The target multipart upload was completed or aborted while the body
     /// streamed.
     NoSuchUpload,
+    /// A conditional write couldn't be decided: the current object's ETag
+    /// couldn't be had (its key from the KMS, say). The response.
+    Refused(hyper::Response<http_body_util::Full<Bytes>>),
 }
 
 /// Uploads `body`, checked against what its request claims about it
@@ -841,13 +846,22 @@ where
         }
         _ => None,
     };
-    // A plain part's ETag is its MD5. If the client declared it (Content-MD5),
-    // the body is checked against it as it's read, so it's that one. Otherwise
-    // a task of its own works it out beside the writing (MD5 is slow, and
-    // can't be split up), from the same chunks, through a short queue.
+    // A plain part's ETag is its MD5, and so is an SSE-S3 part's, as in S3
+    // (sealed, to store: see `s3::sse`); other encrypted parts' is their salt.
+    // If the client declared the MD5 (Content-MD5), the body is checked against
+    // it as it's read, so it's that one. Otherwise a task of its own works it
+    // out beside the writing (MD5 is slow, and can't be split up), from the same
+    // plaintext chunks, through a short queue.
+    let sse_s3 = match attach {
+        AttachTarget::Object { sealing, .. } => {
+            sealing.as_ref().is_some_and(|sealing| matches!(sealing.stored, s3::sse::Stored::S3(_)))
+        }
+        AttachTarget::MultipartPart { sse_s3, .. } => *sse_s3,
+    };
+    let md5_etag = sealer.is_none() || sse_s3;
     let claimed_md5 = payload.claimed_md5();
-    let (md5_tx, md5_task) = match (&sealer, claimed_md5) {
-        (None, None) => {
+    let (md5_tx, md5_task) = match (md5_etag, claimed_md5) {
+        (true, None) => {
             let (tx, mut rx) = tokio::sync::mpsc::channel::<Bytes>(4);
             let task = tokio::spawn(async move {
                 let mut hasher = Md5::new();
@@ -871,19 +885,17 @@ where
                 match payload.decode(chunk) {
                     Ok(data) => {
                         for piece in data {
+                            if let Some(md5_tx) = &md5_tx {
+                                // Only fails if the task panicked; awaited below.
+                                let _ = md5_tx.send(piece.clone()).await;
+                            }
                             match &mut sealer {
                                 Some(sealer) => {
                                     for sealed in sealer.update(&piece) {
                                         writer.write(sealed).await;
                                     }
                                 }
-                                None => {
-                                    if let Some(md5_tx) = &md5_tx {
-                                        // Only fails if the task panicked; awaited below.
-                                        let _ = md5_tx.send(piece.clone()).await;
-                                    }
-                                    writer.write(piece).await;
-                                }
+                                None => writer.write(piece).await,
                             }
                         }
                     }
@@ -921,17 +933,28 @@ where
         }
     }
     let hex = |bytes: &[u8]| bytes.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    let etag = match (&encrypted, claimed_md5, md5_task) {
-        (Some(encrypted), _, _) => hex(&encrypted.salt),
-        (None, Some(claimed), _) => hex(&claimed),
-        (None, None, Some(task)) => match task.await {
+    // The ETag clients are told, and the one stored (the same, but SSE-S3's).
+    let etag = match (&encrypted, md5_etag, claimed_md5, md5_task) {
+        (Some(encrypted), false, _, _) => hex(&encrypted.salt),
+        (_, true, Some(claimed), _) => hex(&claimed),
+        (_, true, None, Some(task)) => match task.await {
             Ok(md5) => hex(&md5),
             Err(e) => {
                 writer.abort("the MD5 task failed").await;
                 return Err(e.into());
             }
         },
-        (None, None, None) => unreachable!("a plain part has its MD5 claimed or worked out"),
+        _ => unreachable!("a part's ETag is its salt, or its MD5 claimed or worked out"),
+    };
+    let stored_etag = if sse_s3 {
+        let key = match attach {
+            AttachTarget::Object { sealing: Some(sealing), .. } => &sealing.key,
+            AttachTarget::MultipartPart { key: Some(key), .. } => key,
+            _ => unreachable!("an SSE-S3 part has its key"),
+        };
+        s3::sse::seal_etag(key, &etag)
+    } else {
+        etag.clone()
     };
     // On failure, `finish` deletes what the replicas stored itself.
     let written = writer.finish().await?;
@@ -946,14 +969,34 @@ where
         let mut client = app.pool.get().await?;
         for attempt in 0..db::MAX_TX_ATTEMPTS {
             db::backoff(attempt).await;
-            match try_commit_part(&mut client, &written, attach, &etag, encrypted.as_ref()).await {
+            // A conditional write is decided here, against the current
+            // object, whose ETag only Cairn can read (it may be SSE-S3's);
+            // the commit checks that it's still the current one.
+            let expected = match attach {
+                AttachTarget::Object { bucket, key, conditions, .. } if conditions.has_write_conditions() => {
+                    let current = match s3::versions::current_object(app, bucket, key).await? {
+                        Ok(current) => current,
+                        Err(refused) => return Ok(UploadResult::Refused(refused)),
+                    };
+                    if !conditions.allows_write(current.as_ref().map(|c| c.etag.as_str())) {
+                        // If-Match for a key without an object is S3's 404, not a 412.
+                        if conditions.has_if_match() && current.is_none() {
+                            return Ok(UploadResult::NoSuchKey);
+                        }
+                        return Ok(UploadResult::PreconditionFailed);
+                    }
+                    Some(current.map(|c| c.id))
+                }
+                _ => None,
+            };
+            match try_commit_part(&mut client, &written, attach, &stored_etag, encrypted.as_ref(), expected).await {
                 Ok(CommitResult::Committed { reap, version_id, last_modified }) => {
                     // Reap the blobs this overwrite displaced; their rows are gone.
                     reap_blobs(app, reap);
                     return Ok(UploadResult::Committed { etag, version_id, last_modified });
                 }
-                Ok(CommitResult::PreconditionFailed) => return Ok(UploadResult::PreconditionFailed),
-                Ok(CommitResult::NoSuchKey) => return Ok(UploadResult::NoSuchKey),
+                // Another write landed since it was decided: decide again.
+                Ok(CommitResult::Stale) => continue,
                 Ok(CommitResult::NoSuchBucket) => return Ok(UploadResult::NoSuchBucket),
                 Ok(CommitResult::NoSuchUpload) => return Ok(UploadResult::NoSuchUpload),
                 Ok(CommitResult::MissingLocations { present, required }) => {
@@ -988,10 +1031,9 @@ enum CommitResult {
         last_modified: Option<String>,
     },
     MissingLocations { present: i64, required: usize },
-    /// A conditional-write guard didn't hold; nothing was written.
-    PreconditionFailed,
-    /// An If-Match found no object to match.
-    NoSuchKey,
+    /// The object a conditional write was decided against isn't the current
+    /// one anymore; nothing was written.
+    Stale,
     NoSuchBucket,
     NoSuchUpload,
 }
@@ -1015,6 +1057,7 @@ async fn try_commit_part(
     attach: &AttachTarget,
     etag: &str,
     encrypted: Option<&Encrypted>,
+    expected: Option<Option<i64>>,
 ) -> Result<CommitResult, tokio_postgres::Error> {
     // CRCs are stored as their 64 bits, read as a signed BIGINT. The part's
     // covers just its data, and stays valid wherever it's moved later; the
@@ -1031,10 +1074,9 @@ async fn try_commit_part(
             key,
             content_type,
             metadata,
-            conditions,
             sealing,
+            ..
         } => {
-            let (if_match, if_none_match) = conditions.write_conditions();
             let plain = s3::sse::Stored::Plain;
             let sse = sealing.as_ref().map_or(&plain, |sealing| &sealing.stored).columns();
             let row = client
@@ -1063,8 +1105,8 @@ async fn try_commit_part(
                         &sse.kms_sealed,
                         &sse.kms_context,
                         &sse.sse_s3,
-                        &if_match,
-                        &if_none_match,
+                        &expected.is_some(),
+                        &expected.flatten(),
                         &s3::versions::new_version_id(),
                     ],
                 )
@@ -1108,8 +1150,7 @@ async fn try_commit_part(
                 required: written.nodes.len(),
             });
         }
-        "precondition_failed" => return Ok(CommitResult::PreconditionFailed),
-        "no_such_key" => return Ok(CommitResult::NoSuchKey),
+        "stale" => return Ok(CommitResult::Stale),
         "no_such_bucket" => return Ok(CommitResult::NoSuchBucket),
         "no_such_upload" => return Ok(CommitResult::NoSuchUpload),
         status => unreachable!("cairn_commit_*: unknown status {status}"),

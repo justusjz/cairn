@@ -78,6 +78,7 @@ async fn put_part(app: &Arc<App>, upload_id: Uuid, part_number: i32, data: Vec<u
         upload_id,
         part_number,
         key: None,
+        sse_s3: false,
     };
     let body = Full::new(Bytes::from(data));
     match crate::upload_part(app, body, &attach, Payload::unchecked())

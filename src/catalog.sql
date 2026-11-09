@@ -85,7 +85,8 @@
 --
 -- I1. A key's versions: at most one current version, which is the newest (by
 --     id); at most one null version; a conditional write is evaluated against
---     the current version as of the write. Guard: K(b,k) (or its stripe's
+--     the current version as of the write (Cairn decides it against a version
+--     it read, and the write lands only if that's still the current one). Guard: K(b,k) (or its stripe's
 --     S(b,s) exclusively, see above), taken by every
 --     writer of a key's versions (`cairn_put_version` and `cairn_delete_key`
 --     callers) before reading them. So writes to a key are serialized, and a
@@ -175,34 +176,6 @@
 -- and the packer's claim use SKIP LOCKED, so they never wait at all. What
 -- remains is DDL (migrations), whose table locks a running cluster can
 -- deadlock with; the retry covers that.
-
--- Whether an If-Match / If-None-Match value matches `etag`. A value is NULL
--- when the header is absent, empty for `*`, and else its entity-tags (see
--- `Preconditions::write_conditions`).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_etag_matches(tags text[], etag text)
-RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
-BEGIN
-    RETURN cardinality(tags) = 0 OR etag = ANY(tags);
-END
-$$;
-
--- Whether a conditional write may proceed against the key's current ETag
--- (NULL if there's no current object), as `Preconditions::allows_write`.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_allows_write(
-    if_match text[], if_none_match text[], current_etag text
-) RETURNS boolean LANGUAGE plpgsql IMMUTABLE AS $$
-BEGIN
-    IF if_none_match IS NOT NULL AND current_etag IS NOT NULL
-       AND pg_temp.cairn_etag_matches(if_none_match, current_etag) THEN
-        RETURN false;
-    END IF;
-    IF if_match IS NOT NULL
-       AND (current_etag IS NULL OR NOT pg_temp.cairn_etag_matches(if_match, current_etag)) THEN
-        RETURN false;
-    END IF;
-    RETURN true;
-END
-$$;
 
 -- B(b), shared: returns the bucket's versioning state, or NULL if there's no
 -- such bucket (I2, I3).
@@ -348,13 +321,15 @@ BEGIN
 END
 $$;
 
--- The ETag of the object a plain GET of the key would return. Under K(b,k).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_current_etag(p_bucket text, p_key text)
-RETURNS text LANGUAGE plpgsql AS $$
+-- The row id of the object a plain GET of the key would return (NULL if
+-- there's none), which a conditional write was decided against (by Cairn:
+-- see `s3::versions::current_object`). Under K(b,k).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_current_version(p_bucket text, p_key text)
+RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
-    result text;
+    result bigint;
 BEGIN
-    SELECT etag INTO result FROM objects
+    SELECT id INTO result FROM objects
     WHERE bucket = p_bucket AND key = p_key AND is_latest AND NOT is_delete_marker;
     RETURN result;
 END
@@ -614,8 +589,9 @@ $$;
 -- T1: commits an uploaded blob as a single-part object at (bucket, key).
 -- Takes B(b) shared, K(b,k), then X: the blob exclusively, and the blobs of
 -- the version it replaces. Checks that the bucket exists ('no_such_bucket'),
--- the conditional-write guard ('precondition_failed', or 'no_such_key' for an
--- If-Match without an object) and that every replica
+-- that a conditional write was decided against the version that's current
+-- (`p_expected`, NULL for none; 'stale' otherwise, for the caller to decide
+-- again) and that every replica
 -- recorded its location ('missing_locations', with how many did), then
 -- commits the blob, writes the version and attaches the part ('committed',
 -- with the version's last-modified time in ISO 8601, as CopyObject reports
@@ -628,13 +604,12 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
     p_bucket text, p_key text, p_content_type text, p_metadata text, p_sse_c_key bytea,
     p_kms_key_id text, p_kms_data_key text, p_kms_sealed bytea, p_kms_context text,
-    p_sse_s3 boolean, p_if_match text[], p_if_none_match text[], p_new_version_id text,
+    p_sse_s3 boolean, p_conditional boolean, p_expected bigint, p_new_version_id text,
     OUT status text, OUT present bigint, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_versioning text;
-    v_current text;
     v_freed bigint[];
     f record;
     v_locked uuid[];
@@ -649,17 +624,10 @@ BEGIN
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
-    IF p_if_match IS NOT NULL OR p_if_none_match IS NOT NULL THEN
-        v_current := pg_temp.cairn_current_etag(p_bucket, p_key);
-        -- If-Match for a key without an object is S3's 404, not a 412.
-        IF p_if_match IS NOT NULL AND v_current IS NULL THEN
-            status := 'no_such_key';
-            RETURN;
-        END IF;
-        IF NOT pg_temp.cairn_allows_write(p_if_match, p_if_none_match, v_current) THEN
-            status := 'precondition_failed';
-            RETURN;
-        END IF;
+    IF p_conditional
+       AND pg_temp.cairn_current_version(p_bucket, p_key) IS DISTINCT FROM p_expected THEN
+        status := 'stale';
+        RETURN;
     END IF;
     v_freed := pg_temp.cairn_freed_by_put(p_bucket, p_key, v_versioning);
     SELECT * INTO f FROM pg_temp.cairn_freeable(v_freed);
@@ -907,34 +875,30 @@ $$;
 
 -- T5: CompleteMultipartUpload. Takes B(b) shared, U(u) exclusive, K(b,k),
 -- then X: the blobs of the listed parts (shared), the left-out staged parts
--- and the replaced version's parts. Checks that the upload exists and belongs
--- to (bucket, key) ('no_such_upload'), that every listed part is staged with
--- the listed ETag ('invalid_part'), that every one but the last is large
--- enough ('too_small') and they make an object S3 would store ('too_large'),
--- and the conditional-write guard ('precondition_failed', or 'no_such_key').
--- Then publishes the listed parts as the key's new
--- version, deletes the staged parts left out, and the upload ('done', with
--- the object's ETag).
---
--- A retry, whose upload this already completed, finds the version it made,
--- if that's still there and has the ETag the listed parts give, and reports
--- it as 'done' again (S3 answers a retried completion as it did the first).
--- That's a read, after the upload's lock was waited for: a completion that
--- held it has committed by then (F1).
+-- and the replaced version's parts. Cairn has matched the listed parts
+-- against the upload's (by their ETags, which only it can read: see
+-- `s3::sse`), worked out the object's ETag (`p_etag`, as it's stored), and
+-- decided a conditional completion against the version `p_expected`. This
+-- checks that the upload exists and belongs to (bucket, key)
+-- ('no_such_upload': Cairn tells a retry, whose upload this already
+-- completed, from there), that the listed parts are still those staged at
+-- their numbers, and the conditional's version still the current one
+-- ('stale', for Cairn to decide again), that every part but the last is
+-- large enough ('too_small') and they make an object S3 would store
+-- ('too_large'). Then publishes the listed parts as the key's new version,
+-- deletes the staged parts left out, and the upload ('done').
 CREATE OR REPLACE FUNCTION pg_temp.cairn_complete_upload(
-    p_upload uuid, p_bucket text, p_key text, p_part_numbers int[], p_etags text[],
-    p_if_match text[], p_if_none_match text[], p_new_version_id text,
-    OUT status text, OUT etag text, OUT version_id text,
+    p_upload uuid, p_bucket text, p_key text, p_part_ids bigint[], p_part_numbers int[],
+    p_etag text, p_conditional boolean, p_expected bigint, p_new_version_id text,
+    OUT status text, OUT version_id text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_versioning text;
-    v_current text;
     u record;
     v_listed bigint[];
     v_listed_blobs uuid[];
     v_total bigint;
-    v_combined text;
     v_unused bigint[];
     v_freed bigint[];
     f record;
@@ -953,51 +917,32 @@ BEGIN
     FROM multipart_uploads
     WHERE upload_id = p_upload AND bucket = p_bucket AND key = p_key
     FOR UPDATE;
-    IF v_versioning IS NULL THEN
+    IF v_versioning IS NULL OR NOT FOUND THEN
         status := 'no_such_upload';
         RETURN;
     END IF;
-    IF NOT FOUND THEN
-        -- Only part ETags (MD5s in hex) can make the version's; anything else
-        -- can't be decoded, and names no part.
-        IF EXISTS (SELECT 1 FROM unnest(p_etags) AS e WHERE e !~ '^[0-9a-f]{32}$') THEN
-            status := 'no_such_upload';
-            RETURN;
-        END IF;
-        v_combined := (SELECT md5(string_agg(decode(e, 'hex'), ''::bytea ORDER BY n))
-                       FROM unnest(p_etags) WITH ORDINALITY AS r(e, n))
-                      || '-' || cardinality(p_etags);
-        SELECT o.etag, o.version_id INTO etag, version_id FROM objects o
-        WHERE o.bucket = p_bucket AND o.key = p_key AND o.upload_id = p_upload
-          AND o.etag = v_combined;
-        IF NOT FOUND THEN
-            status := 'no_such_upload';
-            RETURN;
-        END IF;
-        IF v_versioning <> 'enabled' THEN
-            version_id := NULL;
-        END IF;
-        status := 'done';
+    PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
+    -- The listed parts, if they're still staged at their numbers (U(u) holds
+    -- them there from now on).
+    SELECT coalesce(array_agg(p.id ORDER BY r.n), '{}'),
+           coalesce(array_agg(p.blob_id ORDER BY r.n), '{}'),
+           sum(coalesce(p.plain_size, p.size))
+    INTO v_listed, v_listed_blobs, v_total
+    FROM unnest(p_part_ids, p_part_numbers) WITH ORDINALITY AS r(id, part_number, n)
+    JOIN parts p ON p.id = r.id AND p.upload_id = p_upload AND p.part_number = r.part_number;
+    IF cardinality(v_listed) <> cardinality(p_part_ids) THEN
+        status := 'stale';
         RETURN;
     END IF;
-    PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
-    -- The object's ETag is the MD5 of the listed parts' binary MD5s, then the
-    -- part count. The part numbers are distinct (the caller checked their order).
-    SELECT coalesce(array_agg(p.id), '{}'), coalesce(array_agg(p.blob_id), '{}'),
-           sum(coalesce(p.plain_size, p.size)),
-           md5(string_agg(decode(p.etag, 'hex'), ''::bytea ORDER BY r.n))
-    INTO v_listed, v_listed_blobs, v_total, v_combined
-    FROM unnest(p_part_numbers, p_etags) WITH ORDINALITY AS r(part_number, etag, n)
-    JOIN parts p ON p.upload_id = p_upload AND p.part_number = r.part_number
-                AND p.etag = r.etag;
-    IF cardinality(v_listed) <> cardinality(p_part_numbers) THEN
-        status := 'invalid_part';
+    IF p_conditional
+       AND pg_temp.cairn_current_version(p_bucket, p_key) IS DISTINCT FROM p_expected THEN
+        status := 'stale';
         RETURN;
     END IF;
     -- S3's smallest part, 5 MiB, but for the last (`s3::util::MIN_PART`).
-    IF EXISTS (SELECT 1 FROM unnest(p_part_numbers) WITH ORDINALITY AS r(part_number, n)
-               JOIN parts p ON p.upload_id = p_upload AND p.part_number = r.part_number
-               WHERE r.n < cardinality(p_part_numbers)
+    IF EXISTS (SELECT 1 FROM unnest(p_part_ids) WITH ORDINALITY AS r(id, n)
+               JOIN parts p ON p.id = r.id
+               WHERE r.n < cardinality(p_part_ids)
                  AND coalesce(p.plain_size, p.size) < 5242880) THEN
         status := 'too_small';
         RETURN;
@@ -1007,18 +952,6 @@ BEGIN
         status := 'too_large';
         RETURN;
     END IF;
-    IF p_if_match IS NOT NULL OR p_if_none_match IS NOT NULL THEN
-        v_current := pg_temp.cairn_current_etag(p_bucket, p_key);
-        -- If-Match for a key without an object is S3's 404, not a 412.
-        IF p_if_match IS NOT NULL AND v_current IS NULL THEN
-            status := 'no_such_key';
-            RETURN;
-        END IF;
-        IF NOT pg_temp.cairn_allows_write(p_if_match, p_if_none_match, v_current) THEN
-            status := 'precondition_failed';
-            RETURN;
-        END IF;
-    END IF;
     v_unused := ARRAY(SELECT id FROM parts WHERE upload_id = p_upload AND NOT id = ANY(v_listed));
     v_freed := pg_temp.cairn_freed_by_put(p_bucket, p_key, v_versioning);
     SELECT * INTO f FROM pg_temp.cairn_freeable(v_unused || v_freed);
@@ -1026,9 +959,8 @@ BEGIN
         v_listed_blobs || f.blobs,
         array_fill(false, ARRAY[cardinality(v_listed_blobs)]) || f.exclusive);
     PERFORM pg_temp.cairn_check_on(v_listed || v_unused || v_freed, v_locked);
-    etag := v_combined || '-' || cardinality(p_part_numbers);
     SELECT * INTO v FROM pg_temp.cairn_put_version(
-        p_bucket, p_key, v_versioning, v_total, etag, u.content_type, u.metadata,
+        p_bucket, p_key, v_versioning, v_total, p_etag, u.content_type, u.metadata,
         u.sse_c_key, u.sse_kms_key_id, u.sse_kms_data_key, u.sse_kms_sealed, u.sse_kms_context,
         u.sse_s3, p_new_version_id);
     version_id := v.version_id;
@@ -1546,7 +1478,8 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_list_current(
     p_bucket text, p_prefix text, p_delimiter text, p_marker text, p_limit int,
     p_delete_markers boolean, p_totals boolean,
     OUT name text, OUT is_prefix boolean, OUT objects bigint, OUT size bigint, OUT etag text,
-    OUT last_modified timestamptz, OUT is_delete_marker boolean
+    OUT last_modified timestamptz, OUT is_delete_marker boolean,
+    OUT sse_s3 boolean, OUT sse_kms_key_id text, OUT sse_kms_data_key text, OUT sse_kms_sealed bytea
 ) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_pfx text COLLATE "C" := p_prefix;
@@ -1566,13 +1499,15 @@ BEGIN
         -- in [v_from, v_end) starts with the prefix.)
         IF v_end IS NULL THEN
             OPEN c FOR
-                SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker FROM objects o
+                SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker, o.sse_s3,
+                       o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_from
                   AND (p_delete_markers OR NOT o.is_delete_marker)
                 ORDER BY o.key LIMIT p_limit - v_count;
         ELSE
             OPEN c FOR
-                SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker FROM objects o
+                SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker, o.sse_s3,
+                       o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_from
                   AND o.key < v_end AND (p_delete_markers OR NOT o.is_delete_marker)
                 ORDER BY o.key LIMIT p_limit - v_count;
@@ -1590,6 +1525,10 @@ BEGIN
             etag := r.etag;
             last_modified := r.last_modified;
             is_delete_marker := r.is_delete_marker;
+            sse_s3 := r.sse_s3;
+            sse_kms_key_id := r.sse_kms_key_id;
+            sse_kms_data_key := r.sse_kms_data_key;
+            sse_kms_sealed := r.sse_kms_sealed;
             RETURN NEXT;
             v_count := v_count + 1;
         END LOOP;
@@ -1606,6 +1545,10 @@ BEGIN
             etag := NULL;
             last_modified := NULL;
             is_delete_marker := false;
+            sse_s3 := NULL;
+            sse_kms_key_id := NULL;
+            sse_kms_data_key := NULL;
+            sse_kms_sealed := NULL;
             IF p_totals AND v_past IS NULL THEN
                 SELECT count(*), coalesce(sum(o.size), 0), max(o.last_modified)
                 INTO objects, size, last_modified
@@ -1636,7 +1579,8 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_list_versions(
     p_bucket text, p_prefix text, p_delimiter text, p_key_marker text, p_id_marker bigint,
     p_limit int,
     OUT name text, OUT is_prefix boolean, OUT version_id text, OUT is_latest boolean,
-    OUT is_delete_marker boolean, OUT size bigint, OUT etag text, OUT last_modified timestamptz
+    OUT is_delete_marker boolean, OUT size bigint, OUT etag text, OUT last_modified timestamptz,
+    OUT sse_s3 boolean, OUT sse_kms_key_id text, OUT sse_kms_data_key text, OUT sse_kms_sealed bytea
 ) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_pfx text COLLATE "C" := p_prefix;
@@ -1655,7 +1599,8 @@ BEGIN
        AND pg_temp.cairn_common_prefix(v_marker, v_pfx, v_delim) IS NULL THEN
         RETURN QUERY
             SELECT o.key::text, false, o.version_id, o.is_latest, o.is_delete_marker, o.size,
-                   o.etag, o.last_modified
+                   o.etag, o.last_modified, o.sse_s3, o.sse_kms_key_id, o.sse_kms_data_key,
+                   o.sse_kms_sealed
             FROM objects o
             WHERE o.bucket = p_bucket COLLATE "default" AND o.key = v_marker
               AND o.id < p_id_marker
@@ -1668,14 +1613,16 @@ BEGIN
         IF v_end IS NULL THEN
             OPEN c FOR
                 SELECT o.key, o.version_id, o.is_latest, o.is_delete_marker, o.size, o.etag,
-                       o.last_modified
+                       o.last_modified, o.sse_s3, o.sse_kms_key_id, o.sse_kms_data_key,
+                       o.sse_kms_sealed
                 FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from
                 ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
         ELSE
             OPEN c FOR
                 SELECT o.key, o.version_id, o.is_latest, o.is_delete_marker, o.size, o.etag,
-                       o.last_modified
+                       o.last_modified, o.sse_s3, o.sse_kms_key_id, o.sse_kms_data_key,
+                       o.sse_kms_sealed
                 FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from AND o.key < v_end
                 ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
@@ -1694,6 +1641,10 @@ BEGIN
             size := r.size;
             etag := r.etag;
             last_modified := r.last_modified;
+            sse_s3 := r.sse_s3;
+            sse_kms_key_id := r.sse_kms_key_id;
+            sse_kms_data_key := r.sse_kms_data_key;
+            sse_kms_sealed := r.sse_kms_sealed;
             RETURN NEXT;
             v_count := v_count + 1;
         END LOOP;
@@ -1709,6 +1660,10 @@ BEGIN
             size := NULL;
             etag := NULL;
             last_modified := NULL;
+            sse_s3 := NULL;
+            sse_kms_key_id := NULL;
+            sse_kms_data_key := NULL;
+            sse_kms_sealed := NULL;
             RETURN NEXT;
             v_count := v_count + 1;
         END IF;

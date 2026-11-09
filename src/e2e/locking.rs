@@ -4,6 +4,8 @@
 
 use std::{sync::Arc, time::Duration};
 
+use md5::Digest;
+
 use deadpool_postgres::Object;
 use hyper::StatusCode;
 use tokio::{sync::oneshot, task::JoinHandle};
@@ -61,7 +63,7 @@ async fn commit_object(tx: &Transaction<'_>, app: &App, blob: Uuid, key: &str) -
     tx.query_one(
         "SELECT status FROM pg_temp.cairn_commit_object(
              $1, ARRAY[$2::int], 0, 0, 65536, 0, 'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
-             $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, $5)",
+             $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, false, false, NULL, $5)",
         &[&blob, &app.node, &BUCKET, &key, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -209,6 +211,44 @@ async fn default_encryption_waits_only_for_bucket_changes() {
     assert!(!missing);
 }
 
+/// I1: a conditional write is decided (by Cairn) against the current object,
+/// and lands only if that's still the current one when it holds the key: one
+/// that another write replaced meanwhile makes it decide again, against the
+/// new one. So it can't land on an object it wasn't decided against.
+#[tokio::test]
+async fn a_conditional_write_decides_again_if_the_object_changed() {
+    use http_body_util::Full;
+    let Some(app) = node().await else { return };
+    put(&app, "k", b"one".to_vec()).await;
+    let one: String = md5::Md5::digest(b"one").iter().map(|b| format!("{b:02x}")).collect();
+    // A write of an empty "k" holds the key, not yet committed.
+    let mut held = connection(&app).await;
+    let tx = held.transaction().await.unwrap();
+    let blob = pending_blob(&app, 0.0).await;
+    assert_eq!(commit_object(&tx, &app, blob, "k").await, "committed");
+
+    // If-Match the "one" that's current as far as anyone else can see.
+    let app2 = app.clone();
+    let writing = tokio::spawn(async move {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("if-match", format!("\"{one}\"").parse().unwrap());
+        let attach = AttachTarget::Object {
+            bucket: BUCKET.to_owned(),
+            key: "k".to_owned(),
+            content_type: "x".to_owned(),
+            metadata: String::new(),
+            conditions: crate::s3::conditional::Preconditions::from_headers(&headers),
+            sealing: None,
+        };
+        let body = Full::new(hyper::body::Bytes::from_static(b"two"));
+        crate::upload_part(&app2, body, &attach, Payload::unchecked()).await.unwrap()
+    });
+    assert_waits(&writing).await;
+    tx.commit().await.unwrap();
+    assert!(matches!(writing.await.unwrap(), UploadResult::PreconditionFailed));
+    assert_eq!(get(&app, "k").await, Some(Vec::new()));
+}
+
 /// I1: writes to the same key wait for each other; the later one wins.
 #[tokio::test]
 async fn puts_to_one_key_wait_for_each_other() {
@@ -327,6 +367,7 @@ async fn upload_part(app: &Arc<App>, upload_id: Uuid, number: i32, data: &[u8]) 
         upload_id,
         part_number: number,
         key: None,
+        sse_s3: false,
     };
     let body = http_body_util::Full::new(hyper::body::Bytes::from(data.to_vec()));
     crate::upload_part(app, body, &attach, Payload::unchecked())
@@ -347,8 +388,9 @@ async fn a_part_upload_waits_for_complete() {
     let tx = held.transaction().await.unwrap();
     let status: String = tx
         .query_one(
-            "SELECT status FROM pg_temp.cairn_complete_upload($1, $2, 'k', '{1}', $3, NULL, NULL, 'x')",
-            &[&upload_id, &BUCKET, &vec![etag]],
+            "SELECT status FROM pg_temp.cairn_complete_upload(
+                 $1, $2, 'k', ARRAY(SELECT id FROM parts WHERE upload_id = $1), '{1}', $3, false, NULL, 'x')",
+            &[&upload_id, &BUCKET, &format!("{etag}-1")],
         )
         .await
         .unwrap()

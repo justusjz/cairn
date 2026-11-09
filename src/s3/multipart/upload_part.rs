@@ -78,6 +78,7 @@ pub async fn put_part(
             upload_id,
             part_number,
             key: upload_key,
+            sse_s3: matches!(encryption, sse::Stored::S3(_)),
         },
         payload,
     )
@@ -99,7 +100,10 @@ pub async fn put_part(
         )),
         // UploadPart carries no conditional-write guard, and has no bucket to
         // check (its upload is checked instead), so these can't occur.
-        UploadResult::PreconditionFailed | UploadResult::NoSuchKey | UploadResult::NoSuchBucket => {
+        UploadResult::PreconditionFailed
+        | UploadResult::NoSuchKey
+        | UploadResult::NoSuchBucket
+        | UploadResult::Refused(_) => {
             unreachable!("UploadPart has no conditions, and no bucket check")
         }
     }

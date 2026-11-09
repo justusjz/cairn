@@ -74,13 +74,14 @@ pub struct CopyKeys<'a> {
 
 impl CopyKeys<'_> {
     /// Whether the destination can share the bytes of a source encrypted as
-    /// `source` is: both are plain, or SSE-C with the same key, or SSE-KMS or
-    /// SSE-S3 (under any key: the copy seals the same object key under a data
-    /// key of its own). Otherwise the data is decrypted and encrypted again.
+    /// `source` is: both are plain, or SSE-C with the same key, or both SSE-KMS
+    /// (under any key: the copy seals the same object key under a data key of
+    /// its own), or both SSE-S3. Otherwise the data is decrypted and encrypted
+    /// again: so is a copy between SSE-KMS and SSE-S3, whose ETags differ (an
+    /// SSE-S3 object's is its content's MD5, which this works out).
     fn shares(&self, source: &Stored) -> bool {
         match (source, self.dest) {
-            (Stored::Plain, Wanted::Plain) => true,
-            (Stored::Kms(_) | Stored::S3(_), Wanted::Kms(_) | Wanted::S3) => true,
+            (Stored::Plain, Wanted::Plain) | (Stored::Kms(_), Wanted::Kms(_)) | (Stored::S3(_), Wanted::S3) => true,
             (Stored::Customer { .. }, Wanted::Customer(dest)) => {
                 self.source.is_some_and(|source| source.key() == dest.key())
             }
@@ -184,9 +185,14 @@ pub async fn copy_object(
             ));
         }
         // Honour x-amz-copy-source-if-* conditions on the source; any failure (a
-        // 304 for a read maps to 412 here) aborts the copy.
+        // 304 for a read maps to 412 here) aborts the copy. Against its ETag as
+        // clients know it (an SSE-S3 one's is stored sealed).
         let version = &source.version;
-        if preconditions.evaluate(&version.etag, version.lm_epoch, true) != Precondition::Proceed {
+        let source_etag = match sse::plain_etag(app, encryption, &version.etag, &src_bucket, &src_key).await? {
+            Ok(etag) => etag,
+            Err(refused) => return Ok(refused),
+        };
+        if preconditions.evaluate(&source_etag, version.lm_epoch, true) != Precondition::Proceed {
             return Ok(copy_precondition_failed());
         }
         // As in S3: a larger object is copied part by part (UploadPartCopy).
@@ -241,13 +247,15 @@ pub async fn copy_object(
                 Err(e) => return Err(e),
             }
         }
-        let etag = match source.parts.as_slice() {
-            _ if !encryption.is_plain() => version.etag.clone(),
-            [part] => part.etag.clone(),
+        // The copy's ETag, as clients know it, and as it's stored (an SSE-S3
+        // one's sealed, under the object key the copy shares).
+        let (etag, stored_etag) = match source.parts.as_slice() {
+            _ if !encryption.is_plain() => (source_etag.clone(), version.etag.clone()),
+            [part] => (part.etag.clone(), part.etag.clone()),
             _ => {
                 let size = version.size as u64;
                 match hash_range(app, source.locations.clone(), 0, size).await {
-                    Ok((md5, _)) => md5,
+                    Ok((md5, _)) => (md5.clone(), md5),
                     // Its data went with it: copy what it is now.
                     Err(_) if source.changed(app).await? => continue,
                     Err(e) => return Err(e),
@@ -272,7 +280,7 @@ pub async fn copy_object(
                 }
             }
             (Wanted::Kms(_) | Wanted::S3, None) => {
-                unreachable!("an SSE-KMS or SSE-S3 copy shares only such a source's parts")
+                unreachable!("an SSE-KMS or SSE-S3 copy shares only an encrypted source's parts")
             }
         };
         // CopyObject reports the new version's last-modified time in the body
@@ -281,7 +289,7 @@ pub async fn copy_object(
         // version already.
         let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata };
         let (version_id, last_modified) =
-            match commit_object_copy(app, &source, &dest, &etag, &stored).await? {
+            match commit_object_copy(app, &source, &dest, &stored_etag, &stored).await? {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
                 ObjectCopy::SourceChanged => continue, // copy what it is now
                 ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
@@ -340,6 +348,7 @@ async fn stream_object_copy(
         UploadResult::NoSuchBucket => Ok(None),
         // Nothing is checked, there are no conditions, and an object has no upload.
         UploadResult::Rejected(_)
+        | UploadResult::Refused(_)
         | UploadResult::PreconditionFailed
         | UploadResult::NoSuchKey
         | UploadResult::NoSuchUpload => {
@@ -505,8 +514,14 @@ pub async fn copy_part(
             return Ok(refused);
         }
         let version = &source.version;
-        // Honour x-amz-copy-source-if-* conditions on the source before copying.
-        if preconditions.evaluate(&version.etag, version.lm_epoch, true) != Precondition::Proceed {
+        // Honour x-amz-copy-source-if-* conditions on the source before copying,
+        // against its ETag as clients know it.
+        let source_etag =
+            match sse::plain_etag(app, &version.encryption, &version.etag, &src_bucket, &src_key).await? {
+                Ok(etag) => etag,
+                Err(refused) => return Ok(refused),
+            };
+        if preconditions.evaluate(&source_etag, version.lm_epoch, true) != Precondition::Proceed {
             return Ok(copy_precondition_failed());
         }
         // Resolve the copy range against the source size (absent header → whole
@@ -713,6 +728,7 @@ async fn stream_part_copy(
         upload_id,
         part_number,
         key: keys.dest,
+        sse_s3: keys.dest_s3,
     };
     // The source stream is data from within Cairn (verified against its block
     // checksums as it's read), so there's nothing to check it against.
@@ -722,6 +738,7 @@ async fn stream_part_copy(
         // Nothing is checked, there are no conditions, and a part has no bucket
         // to check.
         UploadResult::Rejected(_)
+        | UploadResult::Refused(_)
         | UploadResult::PreconditionFailed
         | UploadResult::NoSuchKey
         | UploadResult::NoSuchBucket => {
@@ -734,6 +751,8 @@ async fn stream_part_copy(
 struct StreamKeys {
     source: Option<Zeroizing<Key>>,
     dest: Option<Zeroizing<Key>>,
+    /// Whether the upload is SSE-S3 (whose parts' ETags are sealed MD5s).
+    dest_s3: bool,
 }
 
 /// The keys of an UploadPartCopy's source (`source_key` being the SSE-C key
@@ -760,7 +779,7 @@ async fn stream_keys(
         Ok(key) => key,
         Err(refused) => return Ok(Err(refused)),
     };
-    Ok(Ok(StreamKeys { source, dest }))
+    Ok(Ok(StreamKeys { source, dest, dest_s3: matches!(upload, Stored::S3(_)) }))
 }
 
 /// Reads the version a copy addresses (the one named, else the key's current
