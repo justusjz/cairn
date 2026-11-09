@@ -60,7 +60,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=99
+TOTAL=100
 STEP=0
 PASS=0
 FAIL=0
@@ -650,6 +650,46 @@ sse_kms_ok() {
     cairn_role revoke reader "$BUCKET" read >/dev/null 2>&1 || return 1
     for key in default other multi copy clear; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "kms/$key.bin" >/dev/null 2>&1 || return 1
+    done
+}
+
+# Default encryption: a bucket's default (SSE-KMS under a key) is set by an
+# admin only, read back, and applied to writes that ask for no encryption of
+# their own; one that asks for SSE-C gets that. SSE-S3 isn't one. Removing it
+# leaves new writes plain.
+bucket_encryption_ok() {
+    local out="$WORK_DIR/enc-out" k1="$WORK_DIR/enc-key"
+    local kms='{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"cairn-test"}}]}'
+    local aes='{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+    head -c 32 /dev/urandom >"$k1"
+    ! awss3 s3api get-bucket-encryption --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api put-bucket-encryption --bucket "$BUCKET" \
+        --server-side-encryption-configuration "$aes" >/dev/null 2>&1 || return 1
+    ! as_role writer writersecret s3api put-bucket-encryption --bucket "$BUCKET" \
+        --server-side-encryption-configuration "$kms" >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-encryption --bucket "$BUCKET" \
+        --server-side-encryption-configuration "$kms" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-encryption --bucket "$BUCKET" --output text \
+        --query 'ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault.KMSMasterKeyID' \
+        2>/dev/null)" = "arn:aws:kms:transit/cairn-test" ] || return 1
+    awss3 s3api put-object --bucket "$BUCKET" --key enc/default.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key enc/default.txt \
+        --query '[ServerSideEncryption,SSEKMSKeyId]' --output text 2>/dev/null)" \
+        = "$(printf 'aws:kms\tarn:aws:kms:transit/cairn-test')" ] || return 1
+    awss3 s3api get-object --bucket "$BUCKET" --key enc/default.txt "$out" >/dev/null 2>&1 || return 1
+    cmp -s "$SMALL" "$out" || return 1
+    awss3 s3api put-object --bucket "$BUCKET" --key enc/sse-c.txt --body "$SMALL" \
+        --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k1" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key enc/sse-c.txt --query SSECustomerAlgorithm \
+        --output text --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k1" 2>/dev/null)" = AES256 ] \
+        || return 1
+    awss3 s3api delete-bucket-encryption --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-encryption --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    awss3 s3api put-object --bucket "$BUCKET" --key enc/plain.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key enc/plain.txt --query ServerSideEncryption \
+        --output text 2>/dev/null)" = None ] || return 1
+    for key in default sse-c plain; do
+        awss3 s3api delete-object --bucket "$BUCKET" --key "enc/$key.txt" >/dev/null 2>&1 || return 1
     done
 }
 
@@ -1867,6 +1907,7 @@ run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok
 run_test    "Metadata stored, copied, replaced"     metadata_ok
 run_test    "SSE-C put/multipart/copy/get, wrong key" sse_c_ok
 run_test    "SSE-KMS put/multipart/copy/get, keys"   sse_kms_ok
+run_test    "Bucket default encryption (SSE-KMS)"    bucket_encryption_ok
 expect_fail "Self-copy without REPLACE rejected"    awss3 s3api copy-object --bucket "$BUCKET" --key big.bin --copy-source "${BUCKET}/big.bin"
 expect_fail "Copy from missing source fails"        awss3 s3api copy-object --bucket "$BUCKET" --key copy/none.txt --copy-source "${BUCKET}/does-not-exist.txt"
 run_test    "UploadPartCopy (whole object)"         upload_part_copy_whole_ok

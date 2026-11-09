@@ -185,6 +185,7 @@ const MIGRATIONS: &[&str] = &[
     ENCRYPTED_PARTS,
     SSE_KMS,
     ROLE_IDS,
+    BUCKET_ENCRYPTION,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -763,6 +764,22 @@ const ROLE_IDS: &str = r#"
 ALTER TABLE roles ADD COLUMN id uuid NOT NULL DEFAULT gen_random_uuid();
 ALTER TABLE roles ADD CONSTRAINT roles_id UNIQUE (id);
 ALTER TABLE roles ADD COLUMN kms_entity_id text;
+"#;
+
+/// Migration 17: a bucket's default encryption (see
+/// `s3::buckets::encryption`), as PutBucketEncryption sets it: SSE-KMS under
+/// a key (its algorithm, the only one, and the key ID), and whether its
+/// configuration asked for a bucket key (told back, but nothing changes). A
+/// constant default, so the table isn't rewritten, and the checks are NOT
+/// VALID, as migration 14's: every row before has NULLs.
+const BUCKET_ENCRYPTION: &str = r#"
+ALTER TABLE buckets ADD COLUMN sse_algorithm text;
+ALTER TABLE buckets ADD COLUMN sse_kms_key_id text;
+ALTER TABLE buckets ADD COLUMN sse_bucket_key boolean NOT NULL DEFAULT false;
+ALTER TABLE buckets ADD CONSTRAINT buckets_sse CHECK (
+    (sse_algorithm IS NULL OR sse_algorithm = 'aws:kms')
+    AND (sse_algorithm IS NULL) = (sse_kms_key_id IS NULL)
+) NOT VALID;
 "#;
 
 #[cfg(test)]

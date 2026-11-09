@@ -53,6 +53,7 @@ export function BucketList() {
               columns={[
                 "Name",
                 "Versioning",
+                "Default encryption",
                 { label: "Objects", num: true },
                 { label: "Size", num: true },
                 { label: "Older versions", num: true },
@@ -76,6 +77,15 @@ export function BucketList() {
                       ) : (
                         <Badge>unversioned</Badge>
                       )}
+                    </td>
+                    <td>
+                      <Show when={b.default_kms_key} fallback={<span class="subtle">none</span>}>
+                        {(key) => (
+                          <span title="Writes that ask for no encryption of their own get SSE-KMS under this key">
+                            SSE-KMS <span class="mono">{key()}</span>
+                          </span>
+                        )}
+                      </Show>
                     </td>
                     <td class="num">{num(b.objects)}</td>
                     <td class="num">{bytes(b.bytes)}</td>

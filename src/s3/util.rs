@@ -266,10 +266,11 @@ const SUBRESOURCES: &[&str] = &[
 /// object-level one. Must match the routing in `s3::handle`.
 fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'static str] {
     match (bucket_level, method) {
-        // ListObjectVersions, ListMultipartUploads, versioning, ownership
-        // controls (`acl`), and the stubs (`bucket_subresource_stub`).
+        // ListObjectVersions, ListMultipartUploads, versioning, encryption,
+        // ownership controls (`acl`), and the stubs (`bucket_subresource_stub`).
         (true, &Method::GET) => &[
             "versioning",
+            "encryption",
             "versions",
             "uploads",
             "ownershipControls",
@@ -281,9 +282,11 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "tagging",
             "lifecycle",
         ],
-        // PutBucketVersioning, PutBucketAcl (`acl`).
-        (true, &Method::PUT) => &["versioning", "acl"],
+        // PutBucketVersioning, PutBucketEncryption, PutBucketAcl (`acl`).
+        (true, &Method::PUT) => &["versioning", "encryption", "acl"],
         (true, &Method::POST) => &["delete"],
+        // DeleteBucketEncryption.
+        (true, &Method::DELETE) => &["encryption"],
         // GetObjectAcl (stubbed), ListParts.
         (false, &Method::GET) => &["acl", "uploadId"],
         // UploadPart / UploadPartCopy, PutObjectAcl (`acl`).

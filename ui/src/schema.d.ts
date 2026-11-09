@@ -288,6 +288,11 @@ export interface components {
             bytes: number;
             /** Format: double */
             created_at: number;
+            /**
+             * @description The KMS key of its default encryption (SSE-KMS), if it has one: what a
+             *     write that asks for no encryption of its own is encrypted with.
+             */
+            default_kms_key?: string | null;
             name: string;
             /**
              * Format: int64

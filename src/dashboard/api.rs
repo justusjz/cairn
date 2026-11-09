@@ -421,6 +421,9 @@ pub(super) struct BucketSummary {
     name: String,
     created_at: f64,
     versioning: Versioning,
+    /// The KMS key of its default encryption (SSE-KMS), if it has one: what a
+    /// write that asks for no encryption of its own is encrypted with.
+    default_kms_key: Option<String>,
     /// Current versions that aren't delete markers.
     objects: i64,
     bytes: i64,
@@ -472,6 +475,12 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         }
     };
     let uploads = counts("SELECT bucket, count(*) FROM multipart_uploads GROUP BY bucket").await?;
+    let mut defaults: HashMap<String, String> = client
+        .query_cached("SELECT name, sse_kms_key_id FROM buckets WHERE sse_kms_key_id IS NOT NULL", &[])
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
     let roles =
         counts("SELECT bucket, count(DISTINCT role) FROM role_grants GROUP BY bucket").await?;
     Ok(buckets
@@ -482,6 +491,7 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
             BucketSummary {
                 uploads: uploads.get(&b.name).copied().unwrap_or(0),
                 roles: roles.get(&b.name).copied().unwrap_or(0),
+                default_kms_key: defaults.remove(&b.name),
                 name: b.name,
                 created_at: b.created_at.epoch,
                 versioning: b.versioning,

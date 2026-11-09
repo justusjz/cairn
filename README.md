@@ -373,7 +373,8 @@ stored, so no disk ever holds it in the clear.
 
 Encryption with keys of Cairn's own (**SSE-S3**) isn't implemented: a request
 asking for it is refused with `501 NotImplemented`, rather than stored
-unencrypted. Nor is a bucket's default encryption: each write asks for its own.
+unencrypted. A bucket's [default encryption](#bucket-default-encryption) can
+be SSE-KMS.
 
 ### SSE-C
 
@@ -398,13 +399,12 @@ Without the key, the data can't be read, by anyone.
 ### SSE-KMS
 
 With a KMS configured (`--kms-*` flags), a write may ask for SSE-KMS, as with
-S3: `aws s3api put-object --server-side-encryption aws:kms`, optionally with
-`--ssekms-key-id <key ID>`, and optionally
-`--ssekms-encryption-context <base64 JSON>`. Reads need nothing more. There's
-no default key: unlike S3's `aws/s3`, it would have to be one every role may
-use. The KMS
-is [OpenBao](https://openbao.org) (or Vault): its Transit engines hold the
-keys, which never leave it.
+S3: `aws s3api put-object --server-side-encryption aws:kms --ssekms-key-id
+<key ID>`, optionally with `--ssekms-encryption-context <base64 JSON>`. Reads
+need nothing more. A request must name its key (or leave it to its bucket's
+default): Cairn has no key every role may use, as S3's `aws/s3` is. The KMS is
+[OpenBao](https://openbao.org) (or Vault): its Transit engines hold the keys,
+which never leave it.
 
 The keys are their owners'. Whoever manages a key in OpenBao decides there
 which of Cairn's roles may use it, as with AWS's customer managed keys: Cairn
@@ -495,6 +495,30 @@ another namespace's entities.
 
 Don't grant `encrypt` on the keys: OpenBao creates a missing key on an
 encrypt, so a mistyped key name would make a new key. Cairn never calls it.
+
+### Bucket default encryption
+
+A bucket can have a default, as in S3: SSE-KMS under a key, set by an admin
+with PutBucketEncryption, read with GetBucketEncryption, removed with
+DeleteBucketEncryption:
+
+```bash
+aws s3api put-bucket-encryption --bucket demo --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"finance/invoices"}}]}'
+```
+
+- A write that asks for no encryption of its own (no SSE-C or SSE-KMS
+  headers: PutObject, CopyObject's destination, CreateMultipartUpload) gets
+  the default. One that asks for SSE-C, or SSE-KMS under a key, gets that.
+- The writing role must be allowed to use the key, as when it names the key
+  itself: a role that may write the bucket but not use its default key can
+  write only by asking for other encryption.
+- The key must exist when it's set: Cairn tries it as the admin setting it
+  (who needn't be allowed to use it). `AES256` (SSE-S3) can't be a default yet.
+  `BucketKeyEnabled` is told back, but changes nothing.
+- Changing or removing the default leaves what's written as it is. A write
+  under way keeps the default it began with.
+- The dashboard's Buckets page shows each bucket's default.
 
 ## Data integrity
 

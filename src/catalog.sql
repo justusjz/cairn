@@ -1192,6 +1192,23 @@ BEGIN
 END
 $$;
 
+-- T16: PutBucketEncryption and DeleteBucketEncryption: sets (or, with NULLs,
+-- removes) the bucket's default encryption. A plain UPDATE of the bucket's
+-- row, which conflicts with B(b) exclusive (waiting for a change of
+-- versioning, or a deletion), but not shared: no invariant involves the
+-- default, which a write reads as it begins, not under B, and keeps for
+-- good. Returns whether the bucket exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_encryption(
+    p_bucket text, p_algorithm text, p_kms_key_id text, p_bucket_key boolean
+) RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE buckets SET sse_algorithm = p_algorithm, sse_kms_key_id = p_kms_key_id,
+                       sse_bucket_key = p_bucket_key
+    WHERE name = p_bucket;
+    RETURN FOUND;
+END
+$$;
+
 -- Deletes a role. Takes G on the role's grants (in order), which go with it
 -- (a cascade), then R (by deleting the row). Returns whether there was one.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_role(p_role text)

@@ -571,3 +571,62 @@ async fn the_kms_tells_how_it_is() {
     .unwrap();
     assert!(!gone.health().await.reachable);
 }
+
+/// A PutBucketEncryption body for SSE-KMS under `key`.
+fn default_config(key: &str) -> Bytes {
+    Bytes::from(format!(
+        "<ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>\
+         <ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>\
+         <KMSMasterKeyID>{key}</KMSMasterKeyID></ApplyServerSideEncryptionByDefault>\
+         </Rule></ServerSideEncryptionConfiguration>"
+    ))
+}
+
+/// A bucket's default encryption: set (with a key the KMS has, which the
+/// admin setting it needn't be allowed to use), read back, applied to writes
+/// that ask for no encryption of their own (as their role, which must be
+/// allowed to use the key), and removed.
+#[tokio::test]
+async fn buckets_have_default_keys() {
+    use crate::s3::buckets::encryption::{
+        default_request, delete_bucket_encryption, get_bucket_encryption, put_bucket_encryption,
+    };
+    let Some(app) = kms_node().await else { return };
+    let admin = role(&app, "admin", &["transit/cairn-missing"]).await;
+    let (alice, bob) = (role(&app, "alice", &["transit/cairn-test"]).await, role(&app, "bob", &[]).await);
+
+    let response = get_bucket_encryption(&app, BUCKET).await.unwrap();
+    assert_eq!(code(response).await, (StatusCode::NOT_FOUND, "ServerSideEncryptionConfigurationNotFoundError".to_owned()));
+    assert_eq!(default_request(&app, BUCKET).await.unwrap().unwrap(), None);
+    // A key the KMS doesn't have.
+    let response = put_bucket_encryption(&app, BUCKET, default_config("cairn-missing"), admin).await.unwrap();
+    assert_eq!(code(response).await, (StatusCode::BAD_REQUEST, "KMS.NotFoundException".to_owned()));
+    // One the admin may not use, but writers may.
+    let response = put_bucket_encryption(&app, BUCKET, default_config("arn:aws:kms:cairn-test"), admin).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let response = get_bucket_encryption(&app, BUCKET).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    assert!(body.contains("<SSEAlgorithm>aws:kms</SSEAlgorithm>"), "{body}");
+    assert!(body.contains("<KMSMasterKeyID>arn:aws:kms:transit/cairn-test</KMSMasterKeyID>"), "{body}");
+    assert!(body.contains("<BucketKeyEnabled>false</BucketKeyEnabled>"), "{body}");
+
+    // A write that asks for nothing gets it, as its own role.
+    let request = default_request(&app, BUCKET).await.unwrap().unwrap().unwrap();
+    assert_eq!(request, kms(None, &[]));
+    put_kms(&app, alice, "k", data(100), &request).await.unwrap();
+    let (status, headers, body) = get(&app, Some(alice), "k", None).await;
+    assert_eq!((status, headers), (StatusCode::OK, Headers::kms("transit/cairn-test", None)));
+    assert!(body == data(100));
+    let refused = put_kms(&app, bob, "k2", data(100), &request).await.unwrap_err();
+    assert_eq!(code(refused).await, (StatusCode::FORBIDDEN, "AccessDenied".to_owned()));
+
+    let response = delete_bucket_encryption(&app, BUCKET).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(default_request(&app, BUCKET).await.unwrap().unwrap(), None);
+    // What was written stays as it was.
+    assert_eq!(get(&app, Some(alice), "k", None).await.1, Headers::kms("transit/cairn-test", None));
+    let response = get_bucket_encryption(&app, "nope").await.unwrap();
+    assert_eq!(code(response).await, (StatusCode::NOT_FOUND, "NoSuchBucket".to_owned()));
+}

@@ -16,6 +16,7 @@ use crate::{
             delete::delete_bucket,
             head::head_bucket,
             list::list_buckets,
+            encryption::{default_request, delete_bucket_encryption, get_bucket_encryption, put_bucket_encryption},
             versioning::{get_bucket_versioning, put_bucket_versioning},
         },
         conditional::Preconditions,
@@ -189,6 +190,9 @@ async fn handle_request(
             if query_param(&query, "versioning").is_some() {
                 return Ok(box_response(get_bucket_versioning(&app, &bucket).await?));
             }
+            if query_param(&query, "encryption").is_some() {
+                return Ok(box_response(get_bucket_encryption(&app, &bucket).await?));
+            }
             if query_param(&query, "ownershipControls").is_some() {
                 return Ok(box_response(acl::ownership_controls()));
             }
@@ -308,6 +312,14 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
+            // PutBucketEncryption: PUT /{bucket}?encryption with a
+            // <ServerSideEncryptionConfiguration> body.
+            hyper::Method::PUT if query_param(&query, "encryption").is_some() => {
+                match read_body(req, &principal.secret, true).await? {
+                    Ok(body) => put_bucket_encryption(&app, &bucket, body, principal.id).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
             // PutBucketAcl: there are no ACLs (`acl`).
             hyper::Method::PUT if query_param(&query, "acl").is_some() => {
                 acl::put_bucket_acl(&app, &bucket, req.headers()).await?
@@ -330,6 +342,9 @@ async fn handle_request(
                     }
                     Err(rejection) => util::rejection_response(&rejection),
                 }
+            }
+            hyper::Method::DELETE if query_param(&query, "encryption").is_some() => {
+                delete_bucket_encryption(&app, &bucket).await?
             }
             hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
@@ -391,6 +406,15 @@ async fn handle_request(
             None => None,
         },
         _ => None,
+    };
+    // A write that asks for no encryption of its own gets its bucket's
+    // default, as in S3 (see `buckets::encryption`).
+    let kms_request = match kms_request {
+        None if writes_object && customer_key.is_none() => match default_request(&app, &bucket).await? {
+            Ok(request) => request,
+            Err(refused) => return Ok(box_response(refused)),
+        },
+        request => request,
     };
     // How an object write asks for its object to be encrypted.
     let wanted = sse::Wanted::new(customer_key.as_ref(), kms_request.as_ref());
@@ -672,6 +696,7 @@ fn forbidden(code: &str, message: &str) -> Response<ResBody> {
 /// may see the bucket may read.
 const BUCKET_CONFIGURATION: &[&str] = &[
     "versioning",
+    "encryption",
     "ownershipControls",
     "acl",
     "location",

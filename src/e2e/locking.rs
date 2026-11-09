@@ -176,6 +176,39 @@ async fn a_put_waits_for_versioning_to_change() {
     assert_eq!(get(&app, "k").await, Some(b"two".to_vec()));
 }
 
+/// T16: setting a bucket's default encryption doesn't wait for writes (B
+/// shared), which read it as they begin, but does wait for a change of the
+/// versioning state (B exclusive); and there's none for a missing bucket.
+#[tokio::test]
+async fn default_encryption_waits_only_for_bucket_changes() {
+    let Some(app) = node().await else { return };
+    let set = "SELECT pg_temp.cairn_set_encryption($1, 'aws:kms', 'transit/k', false)";
+    let mut held = connection(&app).await;
+    let tx = held.transaction().await.unwrap();
+    tx.query_one("SELECT pg_temp.cairn_lock_bucket($1)", &[&BUCKET]).await.unwrap();
+    let setting = connection(&app).await;
+    let done: bool = tokio::time::timeout(Duration::from_secs(5), setting.query_one(set, &[&BUCKET]))
+        .await
+        .expect("it doesn't wait for a write")
+        .unwrap()
+        .get(0);
+    assert!(done);
+    tx.commit().await.unwrap();
+
+    let tx = held.transaction().await.unwrap();
+    tx.query_one("SELECT pg_temp.cairn_set_versioning($1, 'enabled')", &[&BUCKET]).await.unwrap();
+    let app2 = app.clone();
+    let setting = tokio::spawn(async move {
+        let client = connection(&app2).await;
+        client.query_one(set, &[&BUCKET]).await.unwrap().get::<_, bool>(0)
+    });
+    assert_waits(&setting).await;
+    tx.commit().await.unwrap();
+    assert!(setting.await.unwrap());
+    let missing: bool = connection(&app).await.query_one(set, &[&"nope"]).await.unwrap().get(0);
+    assert!(!missing);
+}
+
 /// I1: writes to the same key wait for each other; the later one wins.
 #[tokio::test]
 async fn puts_to_one_key_wait_for_each_other() {

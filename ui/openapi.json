@@ -822,6 +822,13 @@
             "type": "number",
             "format": "double"
           },
+          "default_kms_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KMS key of its default encryption (SSE-KMS), if it has one: what a\nwrite that asks for no encryption of its own is encrypted with."
+          },
           "name": {
             "type": "string"
           },
