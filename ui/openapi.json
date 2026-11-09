@@ -320,6 +320,35 @@
         }
       }
     },
+    "/kms/identify": {
+      "post": {
+        "summary": "Logs in to the KMS as each role without an identity there yet, from this\nnode, now rather than at its next maintenance pass. Fails with what went\nwrong.",
+        "operationId": "identify_roles",
+        "responses": {
+          "204": {
+            "description": "Every role has its identity in the KMS"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/roles": {
       "get": {
         "operationId": "list_roles",
@@ -1172,6 +1201,114 @@
           }
         }
       },
+      "KmsLogin": {
+        "type": "object",
+        "description": "A login to the KMS as a role.",
+        "required": [
+          "at",
+          "role"
+        ],
+        "properties": {
+          "at": {
+            "type": "number",
+            "format": "double",
+            "description": "When, in seconds since the Unix epoch."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it failed, if it did: what's likely wrong with the KMS's setup."
+          },
+          "role": {
+            "type": "string",
+            "description": "The role's ID."
+          }
+        }
+      },
+      "KmsStatus": {
+        "type": "object",
+        "description": "A node's KMS, as it sees it.",
+        "required": [
+          "address",
+          "auth_mount",
+          "auth_role",
+          "public_key",
+          "reachable"
+        ],
+        "properties": {
+          "address": {
+            "type": "string",
+            "description": "The KMS's URL."
+          },
+          "auth_mount": {
+            "type": "string",
+            "description": "Where the KMS's JWT auth method for Cairn is mounted (under `auth/`),\nand the role of it that Cairn's logins use."
+          },
+          "auth_role": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why it couldn't reach it."
+          },
+          "initialized": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "last_login": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KmsLogin",
+                "description": "The node's last login as a role, if it made one since it started."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "last_success": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When its last login that worked was, in seconds since the Unix epoch."
+          },
+          "public_key": {
+            "type": "string",
+            "description": "The public key of the key the node signs its logins with (PEM): what\nthat auth method is to trust (`jwt_validation_pubkeys`). The same on\nevery node."
+          },
+          "reachable": {
+            "type": "boolean",
+            "description": "Whether the node could reach the KMS just now, and how it is."
+          },
+          "sealed": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "standby": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "Listing": {
         "type": "object",
         "description": "A page of a bucket's keys, rolled up at `/` like a directory listing.",
@@ -1407,6 +1544,17 @@
                 "type": [
                   "string",
                   "null"
+                ]
+              },
+              "kms": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/KmsStatus",
+                    "description": "Its KMS, if it has one (see `kms`)."
+                  },
+                  {
+                    "type": "null"
+                  }
                 ]
               },
               "node": {

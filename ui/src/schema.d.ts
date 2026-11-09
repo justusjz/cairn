@@ -106,6 +106,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/kms/identify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logs in to the KMS as each role without an identity there yet, from this
+         *     node, now rather than at its next maintenance pass. Fails with what went
+         *     wrong.
+         */
+        post: operations["identify_roles"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/roles": {
         parameters: {
             query?: never;
@@ -416,6 +437,49 @@ export interface components {
             bucket: string;
             permission: components["schemas"]["Permission"];
         };
+        /** @description A login to the KMS as a role. */
+        KmsLogin: {
+            /**
+             * Format: double
+             * @description When, in seconds since the Unix epoch.
+             */
+            at: number;
+            /** @description Why it failed, if it did: what's likely wrong with the KMS's setup. */
+            error?: string | null;
+            /** @description The role's ID. */
+            role: string;
+        };
+        /** @description A node's KMS, as it sees it. */
+        KmsStatus: {
+            /** @description The KMS's URL. */
+            address: string;
+            /**
+             * @description Where the KMS's JWT auth method for Cairn is mounted (under `auth/`),
+             *     and the role of it that Cairn's logins use.
+             */
+            auth_mount: string;
+            auth_role: string;
+            /** @description Why it couldn't reach it. */
+            error?: string | null;
+            initialized?: boolean | null;
+            last_login?: components["schemas"]["KmsLogin"] | null;
+            /**
+             * Format: double
+             * @description When its last login that worked was, in seconds since the Unix epoch.
+             */
+            last_success?: number | null;
+            /**
+             * @description The public key of the key the node signs its logins with (PEM): what
+             *     that auth method is to trust (`jwt_validation_pubkeys`). The same on
+             *     every node.
+             */
+            public_key: string;
+            /** @description Whether the node could reach the KMS just now, and how it is. */
+            reachable: boolean;
+            sealed?: boolean | null;
+            standby?: boolean | null;
+            version?: string | null;
+        };
         /** @description A page of a bucket's keys, rolled up at `/` like a directory listing. */
         Listing: {
             entries: components["schemas"]["Entry"][];
@@ -496,6 +560,7 @@ export interface components {
         NodeStats: components["schemas"]["MetricsReport"] & {
             disk?: components["schemas"]["Disk"] | null;
             disk_error?: string | null;
+            kms?: components["schemas"]["KmsStatus"] | null;
             /** Format: int32 */
             node: number;
             node_id: string;
@@ -910,6 +975,40 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Cluster"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    identify_roles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every role has its identity in the KMS */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "5XX": {

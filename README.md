@@ -102,7 +102,6 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
-| `--kms-default-key <ID>` | `CAIRN_KMS_DEFAULT_KEY` | *required with a KMS* | The key for SSE-KMS requests that name none: `<mount>/<key>`, or a key in the mount `transit`. |
 | `--kms-jwt-key <PATH>` | `CAIRN_KMS_JWT_KEY` | *required with a KMS* | PEM file of the Ed25519 private key Cairn signs its roles' logins to the KMS with. The same on every node. |
 | `--kms-auth-mount <PATH>` | `CAIRN_KMS_AUTH_MOUNT` | `cairn` | Where the KMS's JWT auth method for Cairn is mounted. |
 | `--kms-auth-role <NAME>` | `CAIRN_KMS_AUTH_ROLE` | `s3` | The role of that auth method Cairn's logins use. |
@@ -400,8 +399,10 @@ Without the key, the data can't be read, by anyone.
 
 With a KMS configured (`--kms-*` flags), a write may ask for SSE-KMS, as with
 S3: `aws s3api put-object --server-side-encryption aws:kms`, optionally with
-`--ssekms-key-id <key ID>` (else the default key) and
-`--ssekms-encryption-context <base64 JSON>`. Reads need nothing more. The KMS
+`--ssekms-key-id <key ID>`, and optionally
+`--ssekms-encryption-context <base64 JSON>`. Reads need nothing more. There's
+no default key: unlike S3's `aws/s3`, it would have to be one every role may
+use. The KMS
 is [OpenBao](https://openbao.org) (or Vault): its Transit engines hold the
 keys, which never leave it.
 
@@ -421,7 +422,10 @@ deleting a key makes its objects unreadable for good (crypto-shredding).
   naming the role by its ID, which is never reused. Cairn logs in once for
   each new role (when the dashboard creates it, or within a minute), so that
   OpenBao makes its entity right away. `cairn role list` and the dashboard
-  show each role's ID and entity. A deleted role's entity stays in OpenBao,
+  show each role's ID and entity; the dashboard's Roles page also shows
+  Cairn's public key, whether each node reaches OpenBao, and how its logins
+  went, with what's wrong in OpenBao's setup if they fail. A deleted role's
+  entity stays in OpenBao,
   harmlessly (no role will have its ID again), until its key owners remove
   it.
 - **Trust.** OpenBao trusts Cairn to say which role asks, as AWS KMS trusts

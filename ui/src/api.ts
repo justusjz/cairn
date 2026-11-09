@@ -77,6 +77,7 @@ export const api = {
     ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
   grant: (role: string, bucket: string, permissions: Permission[]) =>
     ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
+  identifyRoles: () => ok(client.POST("/kms/identify")),
   revoke: (role: string, bucket: string, permission: Permission) =>
     ok(client.DELETE("/roles/{role}/grants", { params: { ...rolePath(role), query: { bucket, permission } } })),
 };

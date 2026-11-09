@@ -75,6 +75,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(delete_role))
         .routes(routes!(rotate_secret))
         .routes(routes!(set_admin))
+        .routes(routes!(identify_roles))
         .routes(routes!(grant, revoke))
 }
 
@@ -147,7 +148,7 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
     let mut fetches = JoinSet::new();
     for (index, node) in nodes.iter_mut().enumerate() {
         if node.id == app.node {
-            node.stats = Some(node_stats(app));
+            node.stats = Some(node_stats(app).await);
         } else if node.live {
             let (peers, peer_url) = (app.peers.clone(), node.peer_url.clone());
             fetches.spawn(async move { (index, fetch_stats(&peers, &peer_url).await) });
@@ -940,10 +941,14 @@ async fn create_role(
     let secret = body.secret.filter(|s| !s.is_empty());
     let secret = roles::create(&client, &body.name, secret, body.admin).await?;
     // Its identity in the KMS, so that key owners can grant it keys now; if
-    // the KMS can't be reached, the next maintenance pass makes it.
-    if let Err(e) = roles::identify(&app).await {
-        eprintln!("kms: identifying roles: {e:#}");
-    }
+    // the KMS can't be reached, the next maintenance pass makes it. In the
+    // background: a slow KMS mustn't hold up the role.
+    let identifying = app.clone();
+    tokio::spawn(async move {
+        if let Err(e) = roles::identify(&identifying).await {
+            eprintln!("kms: identifying roles: {e:#}");
+        }
+    });
     Ok((
         StatusCode::CREATED,
         Json(Secret {
@@ -960,6 +965,22 @@ async fn create_role(
 ))]
 async fn delete_role(State(app): AppState, Path(role): Path<String>) -> Result<StatusCode> {
     roles::delete(&app.pool.get().await?, &role).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Logs in to the KMS as each role without an identity there yet, from this
+/// node, now rather than at its next maintenance pass. Fails with what went
+/// wrong.
+#[utoipa::path(post, path = "/kms/identify", responses(
+    (status = 204, description = "Every role has its identity in the KMS"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn identify_roles(State(app): AppState) -> Result<StatusCode> {
+    if app.kms.is_none() {
+        return Err(ApiError::BadRequest("this node has no KMS".into()));
+    }
+    roles::identify(&app).await.map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

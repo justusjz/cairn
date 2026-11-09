@@ -128,7 +128,7 @@ async fn maintain(State(app): State<Arc<App>>) -> Result<Response, Failed> {
 
 /// This node's own metrics, for the dashboard of whichever node it's open on.
 async fn stats(State(app): State<Arc<App>>) -> axum::Json<crate::dashboard::NodeStats> {
-    axum::Json(crate::dashboard::node_stats(&app))
+    axum::Json(crate::dashboard::node_stats(&app).await)
 }
 
 /// Dumb data plane: streams whatever bytes we hold from disk — the whole blob,

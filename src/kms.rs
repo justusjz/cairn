@@ -74,10 +74,6 @@ pub struct KmsArgs {
     /// for SSE-KMS are refused (501).
     #[arg(long, env = "CAIRN_KMS_ADDRESS")]
     pub kms_address: Option<String>,
-    /// The key for SSE-KMS requests that don't name one: `<mount>/<key>`, or
-    /// a key in the mount `transit`.
-    #[arg(long, env = "CAIRN_KMS_DEFAULT_KEY")]
-    pub kms_default_key: Option<String>,
     /// PEM file of the Ed25519 private key Cairn signs its roles' logins to
     /// the KMS with. The same on every node; the KMS's JWT auth mount for
     /// Cairn trusts its public key.
@@ -149,6 +145,9 @@ pub enum KmsError {
     Denied,
     /// The KMS couldn't be reached, or failed.
     Unavailable(anyhow::Error),
+    /// The KMS refused Cairn's login as a role: its setup for Cairn is
+    /// wrong. What's likely wrong.
+    LoginRefused(String),
     /// The KMS refused the request otherwise: say, a ciphertext that isn't
     /// one, or associated data it wasn't bound to.
     Failed(String),
@@ -160,6 +159,7 @@ impl std::fmt::Display for KmsError {
             KmsError::NoSuchKey => write!(f, "the KMS has no such key"),
             KmsError::Denied => write!(f, "the KMS refused the role the key"),
             KmsError::Unavailable(e) => write!(f, "the KMS is unavailable: {e:#}"),
+            KmsError::LoginRefused(why) => write!(f, "the KMS refused Cairn's login: {why}"),
             KmsError::Failed(message) => write!(f, "the KMS refused the request: {message}"),
         }
     }
@@ -177,13 +177,42 @@ pub struct Kms {
     client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     /// The server's URL, without a trailing slash.
     address: String,
-    default_key: KeyId,
     signer: ring::signature::Ed25519KeyPair,
     auth_mount: String,
     auth_role: String,
     /// Each role's token, by role ID, each behind a lock of its own, so that
     /// one role's login doesn't hold up another's calls.
     tokens: std::sync::Mutex<HashMap<Uuid, Arc<Mutex<Option<Token>>>>>,
+    /// How this node's logins went, for the dashboard.
+    logins: std::sync::Mutex<Logins>,
+}
+
+/// How a node's logins to the KMS went: its last, and its last that worked.
+#[derive(Clone, Default)]
+pub struct Logins {
+    pub last: Option<Login>,
+    /// When the last one that worked was, in seconds since the Unix epoch.
+    pub last_success: Option<f64>,
+}
+
+/// A login to the KMS as a role.
+#[derive(Clone)]
+pub struct Login {
+    /// When, in seconds since the Unix epoch.
+    pub at: f64,
+    pub role: Uuid,
+    /// Why it failed, if it did: what's likely wrong.
+    pub error: Option<String>,
+}
+
+/// How the KMS is, as its health endpoint tells.
+pub struct Health {
+    pub reachable: bool,
+    pub initialized: Option<bool>,
+    pub sealed: Option<bool>,
+    pub standby: Option<bool>,
+    pub version: Option<String>,
+    pub error: Option<String>,
 }
 
 /// What the KMS answers with: `data` on success, `errors` otherwise.
@@ -220,7 +249,7 @@ impl Kms {
     pub fn new(args: &KmsArgs) -> anyhow::Result<Option<Arc<Kms>>> {
         let Some(address) = &args.kms_address else {
             anyhow::ensure!(
-                args.kms_default_key.is_none() && args.kms_jwt_key.is_none() && args.kms_ca_cert.is_none(),
+                args.kms_jwt_key.is_none() && args.kms_ca_cert.is_none(),
                 "the KMS flags need --kms-address"
             );
             return Ok(None);
@@ -230,11 +259,6 @@ impl Kms {
             address.starts_with("https://") || address.starts_with("http://"),
             "--kms-address must be an http(s) URL"
         );
-        let default_key = args
-            .kms_default_key
-            .as_deref()
-            .context("--kms-address needs --kms-default-key, for requests that name no key")?;
-        let default_key = KeyId::parse(default_key).context("--kms-default-key isn't a valid key ID")?;
         let jwt_key = args
             .kms_jwt_key
             .as_ref()
@@ -277,17 +301,74 @@ impl Kms {
         Ok(Some(Arc::new(Kms {
             client: Client::builder(TokioExecutor::new()).build(connector),
             address,
-            default_key,
             signer,
             auth_mount: args.kms_auth_mount.clone(),
             auth_role: args.kms_auth_role.clone(),
             tokens: std::sync::Mutex::default(),
+            logins: std::sync::Mutex::default(),
         })))
     }
 
-    /// The key for requests that name none.
-    pub fn default_key(&self) -> &KeyId {
-        &self.default_key
+    /// The KMS's URL.
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Where Cairn's JWT auth method is mounted, and the role its logins use.
+    pub fn auth(&self) -> (&str, &str) {
+        (&self.auth_mount, &self.auth_role)
+    }
+
+    /// How this node's logins went.
+    pub fn logins(&self) -> Logins {
+        self.logins.lock().unwrap().clone()
+    }
+
+    /// The public key of the key Cairn signs its logins with, as PEM: what
+    /// the KMS's JWT auth mount for Cairn is to trust
+    /// (`jwt_validation_pubkeys`).
+    pub fn public_key_pem(&self) -> String {
+        use ring::signature::KeyPair;
+        // An Ed25519 SubjectPublicKeyInfo: its fixed DER prefix, and the key.
+        const PREFIX: [u8; 12] = [0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00];
+        let der = [&PREFIX[..], self.signer.public_key().as_ref()].concat();
+        format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n", STANDARD.encode(der))
+    }
+
+    /// How the KMS is, from its health endpoint, which needs no token.
+    pub async fn health(&self) -> Health {
+        #[derive(Deserialize)]
+        struct Answer {
+            initialized: Option<bool>,
+            sealed: Option<bool>,
+            standby: Option<bool>,
+            version: Option<String>,
+        }
+        // Each state answers 200, so that only an unreachable KMS fails.
+        let url = format!(
+            "{}/v1/sys/health?standbyok=true&perfstandbyok=true&sealedcode=200&uninitcode=200",
+            self.address
+        );
+        let exchange = async {
+            let request = Request::builder().uri(url).body(Full::new(Bytes::new()))?;
+            let response = self.client.request(request).await?;
+            let status = response.status();
+            let body = response.into_body().collect().await?.to_bytes();
+            anyhow::ensure!(status.is_success(), "its health endpoint answered {status}");
+            Ok(serde_json::from_slice::<Answer>(&body)?)
+        };
+        match tokio::time::timeout(Duration::from_secs(3), exchange).await {
+            Ok(Ok(answer)) => Health {
+                reachable: true,
+                initialized: answer.initialized,
+                sealed: answer.sealed,
+                standby: answer.standby,
+                version: answer.version,
+                error: None,
+            },
+            Ok(Err(e)) => Health::unreachable(format!("{e:#}")),
+            Err(_) => Health::unreachable("it didn't answer in time".to_owned()),
+        }
     }
 
     /// A fresh 256-bit data key from the KMS key `key`, for the role `role`,
@@ -405,6 +486,18 @@ impl Kms {
 
     /// Logs in as the role: a new token, and the role's entity ID.
     async fn log_in(&self, role: Uuid) -> Result<(Token, String), KmsError> {
+        let result = self.try_log_in(role).await;
+        let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
+        let mut logins = self.logins.lock().unwrap();
+        logins.last = Some(Login { at, role, error: result.as_ref().err().map(|e| e.to_string()) });
+        if result.is_ok() {
+            logins.last_success = Some(at);
+        }
+        result
+    }
+
+    async fn try_log_in(&self, role: Uuid) -> Result<(Token, String), KmsError> {
+        // (A missing entity ID is checked by `identify`.)
         let body = json!({ "role": self.auth_role, "jwt": self.jwt(role).as_str() });
         let url = format!("{}/v1/auth/{}/login", self.address, self.auth_mount);
         let (status, answer) = self
@@ -412,15 +505,41 @@ impl Kms {
             .await
             .map_err(KmsError::Unavailable)?;
         let Some(auth) = answer.auth.filter(|_| status == StatusCode::OK) else {
-            return Err(KmsError::Unavailable(anyhow::anyhow!(
-                "logging in as role {role}: {status}: {}",
-                answer.errors.join("; ")
-            )));
+            let why = self.explain_login(status, &answer.errors);
+            return Err(if status.is_server_error() {
+                KmsError::Unavailable(anyhow::anyhow!("logging in: {why}"))
+            } else {
+                KmsError::LoginRefused(why)
+            });
         };
         // Well before the token runs out; one of no TTL doesn't.
         let renew_at = (auth.lease_duration > 0)
             .then(|| Instant::now() + Duration::from_secs(auth.lease_duration) * 2 / 3);
         Ok((Token { token: Zeroizing::new(auth.client_token), renew_at }, auth.entity_id))
+    }
+
+    /// What a failed login's answer says is wrong with the KMS's setup for
+    /// Cairn, as far as it can be told: OpenBao's own error otherwise.
+    fn explain_login(&self, status: StatusCode, errors: &[String]) -> String {
+        let (mount, role) = (&self.auth_mount, &self.auth_role);
+        let said = errors.join("; ");
+        let has = |s: &str| said.contains(s);
+        let why = if status == StatusCode::FORBIDDEN {
+            format!("OpenBao has no JWT auth method at auth/{mount} (or it isn't a JWT one)")
+        } else if has("could not load configuration") {
+            format!("the JWT auth method at auth/{mount} isn't configured: set its jwt_validation_pubkeys to Cairn's public key")
+        } else if has("no known key successfully validated") {
+            format!("the JWT auth method at auth/{mount} doesn't trust Cairn's key: put Cairn's public key in its jwt_validation_pubkeys")
+        } else if has("could not be found") && has("role") {
+            format!("the JWT auth method at auth/{mount} has no role {role:?}")
+        } else if has("audience") {
+            format!("the role {role:?} at auth/{mount} must be bound to the audience {AUDIENCE:?} (bound_audiences)")
+        } else if has("claim") && has("not found") {
+            format!("the role {role:?} at auth/{mount} must take the user from the claim \"sub\" (user_claim)")
+        } else {
+            return format!("{status}: {said}");
+        };
+        format!("{why} (OpenBao said: {said})")
     }
 
     /// A JWT naming the role, to log in as it with: valid for two minutes,
@@ -472,6 +591,12 @@ impl Kms {
             errors: vec![String::from_utf8_lossy(&body).chars().take(200).collect()],
         });
         Ok((status, answer))
+    }
+}
+
+impl Health {
+    fn unreachable(error: String) -> Health {
+        Health { reachable: false, initialized: None, sealed: None, standby: None, version: None, error: Some(error) }
     }
 }
 

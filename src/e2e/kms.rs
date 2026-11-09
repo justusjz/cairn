@@ -32,11 +32,11 @@ fn data(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i * 7 % 251) as u8).collect()
 }
 
-/// An SSE-KMS request for `key_id` (the default key if `None`), with
+/// An SSE-KMS request for `key_id` (`transit/cairn-test` if `None`), with
 /// `context`.
 fn kms(key_id: Option<&str>, context: &[(&str, &str)]) -> KmsRequest {
     KmsRequest {
-        key_id: key_id.map(|id| KeyId::parse(id).unwrap()),
+        key_id: KeyId::parse(key_id.unwrap_or("cairn-test")).unwrap(),
         context: (!context.is_empty())
             .then(|| context.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<BTreeMap<_, _>>()),
     }
@@ -515,4 +515,59 @@ async fn roles_use_the_keys_openbao_lets_them() {
     let request = kms(None, &[]);
     assert_eq!(copy(&app, bob, "k", "k4", None, Wanted::Kms(&request)).await.0, StatusCode::FORBIDDEN);
     assert_eq!(copy(&app, alice, "k", "k4", None, Wanted::Kms(&request)).await.0, StatusCode::OK);
+}
+
+/// What the dashboard tells about the KMS: Cairn's public key, as OpenBao is
+/// to trust it (the one openssl made for `db-test.sh`), OpenBao's health,
+/// and how logins went, with what's wrong if they failed.
+#[tokio::test]
+async fn the_kms_tells_how_it_is() {
+    let Some(app) = kms_node().await else { return };
+    let kms = app.kms.as_ref().unwrap();
+    let key = std::path::PathBuf::from(std::env::var("CAIRN_TEST_OPENBAO_JWT_KEY").unwrap());
+    let public = std::fs::read_to_string(key.with_extension("pub")).unwrap();
+    assert_eq!(kms.public_key_pem(), public);
+
+    let health = kms.health().await;
+    assert!(health.reachable && health.sealed == Some(false), "{:?}", health.error);
+    assert!(health.version.is_some());
+
+    assert!(kms.logins().last.is_none());
+    let r = role(&app, "alice", &[]).await;
+    let logins = kms.logins();
+    let last = logins.last.unwrap();
+    assert_eq!((last.role, last.error.is_none()), (r, true));
+    assert_eq!(logins.last_success, Some(last.at));
+
+    // The wrong mount, the wrong role: refused, saying what's wrong.
+    for (mount, role, why) in [
+        ("nope", "s3", "no JWT auth method at auth/nope"),
+        ("cairn", "nope", "has no role \"nope\""),
+    ] {
+        let misconfigured = crate::kms::Kms::new(&crate::kms::KmsArgs {
+            kms_address: std::env::var("CAIRN_TEST_OPENBAO").ok(),
+            kms_jwt_key: Some(key.clone()),
+            kms_auth_mount: mount.to_owned(),
+            kms_auth_role: role.to_owned(),
+            kms_ca_cert: None,
+        })
+        .unwrap()
+        .unwrap();
+        let e = misconfigured.identify(r).await.unwrap_err();
+        assert!(matches!(e, crate::kms::KmsError::LoginRefused(_)) && e.to_string().contains(why), "{e}");
+        assert!(misconfigured.logins().last.unwrap().error.unwrap().contains(why));
+        assert!(misconfigured.logins().last_success.is_none());
+    }
+
+    // A KMS that isn't there.
+    let gone = crate::kms::Kms::new(&crate::kms::KmsArgs {
+        kms_address: Some("http://127.0.0.1:1".to_owned()),
+        kms_jwt_key: Some(key),
+        kms_auth_mount: "cairn".to_owned(),
+        kms_auth_role: "s3".to_owned(),
+        kms_ca_cert: None,
+    })
+    .unwrap()
+    .unwrap();
+    assert!(!gone.health().await.reachable);
 }

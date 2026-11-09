@@ -146,8 +146,8 @@ pub(crate) struct Sealing {
 /// What an SSE-KMS write asks for.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KmsRequest {
-    /// The KMS key it names, if it names one (else the default key).
-    pub key_id: Option<KeyId>,
+    /// The KMS key it names.
+    pub key_id: KeyId,
     /// Its encryption context, if it gave one.
     pub context: Option<BTreeMap<String, String>>,
 }
@@ -232,18 +232,20 @@ pub fn requested_kms(
             "Server side encryption specified but KMS is not configured",
         ));
     }
-    let key_id = match get(KMS_KEY_ID) {
-        None => None,
-        Some(id) => {
-            let id = id.strip_prefix(ARN_PREFIX).unwrap_or(id);
-            let Some(id) = KeyId::parse(id) else {
-                return Err(bad_request(
-                    "InvalidRequest",
-                    "The specified KMS KeyID contains unsupported characters",
-                ));
-            };
-            Some(id)
-        }
+    // Cairn has no key every role may use: S3's is the account's `aws/s3`.
+    // (A bucket's default key may come.)
+    let Some(key_id) = get(KMS_KEY_ID) else {
+        return Err(bad_request(
+            "InvalidArgument",
+            "Cairn has no default KMS key: name one with x-amz-server-side-encryption-aws-kms-key-id",
+        ));
+    };
+    let key_id = key_id.strip_prefix(ARN_PREFIX).unwrap_or(key_id);
+    let Some(key_id) = KeyId::parse(key_id) else {
+        return Err(bad_request(
+            "InvalidRequest",
+            "The specified KMS KeyID contains unsupported characters",
+        ));
     };
     let context = match get(KMS_CONTEXT) {
         None => None,
@@ -402,7 +404,7 @@ pub async fn reseal(
     let Some(role) = role else {
         return Ok(Err(no_role()));
     };
-    let key_id = request.key_id.as_ref().unwrap_or(kms.default_key());
+    let key_id = &request.key_id;
     let context = request.context.as_ref().map(|c| serde_json::to_string(c).unwrap());
     let ad = associated_data(context.as_deref(), bucket, key);
     let data_key = match kms.generate(role, key_id, &ad).await {
@@ -446,6 +448,14 @@ fn kms_refusal(e: KmsError, key_id: &KeyId, role: Uuid) -> anyhow::Result<Respon
             "AccessDenied",
             "The KMS doesn't allow this role the use of the key.",
         )),
+        KmsError::LoginRefused(why) => {
+            eprintln!("the KMS refused Cairn's login as role {role}: {why}");
+            Ok(format_s3_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ServiceUnavailable",
+                "the KMS is unavailable; please try again later",
+            ))
+        }
         KmsError::Unavailable(e) => {
             eprintln!("the KMS is unavailable: {e:#}");
             Ok(format_s3_error(
@@ -553,8 +563,8 @@ mod tests {
     fn parses_kms_requests() {
         assert_eq!(requested_kms(&HeaderMap::new(), false, true).unwrap(), None);
         assert_eq!(
-            requested_kms(&headers(&[(ENCRYPTION, "aws:kms")]), false, true).unwrap(),
-            Some(KmsRequest { key_id: None, context: None })
+            requested_kms(&headers(&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "k")]), false, true).unwrap(),
+            Some(KmsRequest { key_id: KeyId::parse("transit/k").unwrap(), context: None })
         );
         let context = STANDARD.encode(r#"{"b":"2","a":"1"}"#);
         let request = requested_kms(
@@ -569,14 +579,17 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(request.key_id.unwrap().as_string(), "transit/my-key");
+        assert_eq!(request.key_id.as_string(), "transit/my-key");
         let context = request.context.unwrap();
         assert_eq!(serde_json::to_string(&context).unwrap(), r#"{"a":"1","b":"2"}"#);
     }
 
     #[test]
     fn refuses_bad_kms_requests() {
-        let kms = |pairs: &[(&str, &str)]| headers(&[&[(ENCRYPTION, "aws:kms")], pairs].concat());
+        // A valid request, but for `pairs` (which replace its headers).
+        let kms = |pairs: &[(&str, &str)]| headers(&[&[(ENCRYPTION, "aws:kms"), (KMS_KEY_ID, "k")], pairs].concat());
+        // No key ID: Cairn has no default key.
+        assert_eq!(status(requested_kms(&headers(&[(ENCRYPTION, "aws:kms")]), false, true)), 400);
         // SSE-S3.
         assert_eq!(status(requested_kms(&headers(&[(ENCRYPTION, "AES256")]), false, true)), 501);
         // No KMS.

@@ -44,8 +44,7 @@ CARGO_ARGS+=(--data-dir "$WORK_DIR/data")   # required; per-run blob dir
 CARGO_ARGS+=(--allow-sse-c-over-http)
 # SSE-KMS, with keys in OpenBao's Transit engine, used as each role (see
 # `kms`), logged in to with a throwaway key.
-CARGO_ARGS+=(--kms-address "http://127.0.0.1:${BAO_PORT}" --kms-default-key cairn-test
-             --kms-jwt-key "$WORK_DIR/kms-jwt.pem")
+CARGO_ARGS+=(--kms-address "http://127.0.0.1:${BAO_PORT}" --kms-jwt-key "$WORK_DIR/kms-jwt.pem")
 SERVER_LOG="$WORK_DIR/server.log"
 SERVER_PID=""
 BUCKET="smoke-$(date +%s)"
@@ -602,6 +601,9 @@ sse_kms_ok() {
     local out="$WORK_DIR/kms-out" context
     context=$(printf '{"team":"storage"}' | base64)
     awss3 s3api put-object --bucket "$BUCKET" --key kms/default.bin --body "$BIG" \
+        --server-side-encryption aws:kms --ssekms-key-id cairn-test >/dev/null 2>&1 || return 1
+    # There's no default key.
+    ! awss3 s3api put-object --bucket "$BUCKET" --key kms/x.bin --body "$SMALL" \
         --server-side-encryption aws:kms >/dev/null 2>&1 || return 1
     awss3 s3api put-object --bucket "$BUCKET" --key kms/other.bin --body "$BIG" \
         --server-side-encryption aws:kms --ssekms-key-id cairn-other \
