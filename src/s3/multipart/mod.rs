@@ -22,7 +22,7 @@ pub(crate) async fn upload_encryption(
         .get()
         .await?
         .query_opt_cached(
-            "SELECT sse_c_key, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, sse_kms_context
+            "SELECT sse_c_key, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3
              FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
             &[upload_id, &bucket, &key],
         )

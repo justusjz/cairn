@@ -49,8 +49,8 @@ pub async fn create_multipart_upload(
         .execute_cached(
             "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, metadata,
                                             sse_c_key, sse_kms_key_id, sse_kms_data_key,
-                                            sse_kms_sealed, sse_kms_context, initiated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NOW())",
+                                            sse_kms_sealed, sse_kms_context, sse_s3, initiated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())",
             &[
                 &upload_id,
                 &bucket,
@@ -62,6 +62,7 @@ pub async fn create_multipart_upload(
                 &sse.kms_data_key,
                 &sse.kms_sealed,
                 &sse.kms_context,
+                &sse.sse_s3,
             ],
         )
         .await?;

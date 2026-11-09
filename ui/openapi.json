@@ -1021,7 +1021,7 @@
         "properties": {
           "kind": {
             "type": "string",
-            "description": "`SSE-C` (with its client's key, which Cairn doesn't have) or `SSE-KMS`."
+            "description": "`SSE-C` (with its client's key, which Cairn doesn't have), `SSE-KMS`\nor `SSE-S3` (with Cairn's own key from the KMS)."
           },
           "kms_context": {
             "type": [
@@ -1035,7 +1035,7 @@
               "string",
               "null"
             ],
-            "description": "SSE-KMS: the name of the KMS key."
+            "description": "SSE-KMS and SSE-S3: the name of the KMS key."
           },
           "kms_key_version": {
             "type": [
@@ -1043,7 +1043,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "SSE-KMS: the version of the KMS key its data key is from."
+            "description": "SSE-KMS and SSE-S3: the version of the KMS key its data key is from."
           }
         }
       },
@@ -1230,7 +1230,7 @@
           },
           "role": {
             "type": "string",
-            "description": "The role's ID."
+            "description": "The role's ID, or `cairn` for Cairn itself (for SSE-S3)."
           }
         }
       },
@@ -1255,6 +1255,13 @@
           },
           "auth_role": {
             "type": "string"
+          },
+          "cairn_entity": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Cairn's own identity (entity) in the KMS, which is to be granted that\nkey, once the node has logged in as itself."
           },
           "error": {
             "type": [
@@ -1301,6 +1308,13 @@
               "boolean",
               "null"
             ]
+          },
+          "sse_s3_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SSE-S3's key, if Cairn has one: it uses it as itself."
           },
           "standby": {
             "type": [

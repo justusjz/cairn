@@ -110,7 +110,8 @@ pub(crate) async fn lookup_version<C: GenericClient>(
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
                     floor(extract(epoch FROM o.last_modified))::bigint,
                     o.version_id, o.is_delete_marker, b.versioning, o.metadata, o.sse_c_key,
-                    o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed, o.sse_kms_context
+                    o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed, o.sse_kms_context,
+                    o.sse_s3
              FROM objects o JOIN buckets b ON b.name = o.bucket
              WHERE o.bucket = $1 AND o.key = $2
                AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",

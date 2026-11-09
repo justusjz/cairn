@@ -345,10 +345,16 @@ pub async fn delete(client: &Object, name: &str) -> anyhow::Result<()> {
 
 /// Logs in to the KMS once as each role that has no identity (entity) there
 /// yet, so that OpenBao makes it, and keeps its ID (see `kms`): then key
-/// owners can grant the role keys before it uses any. A role the KMS can't
+/// owners can grant the role keys before it uses any. Likewise as Cairn
+/// itself, for SSE-S3, once on each node. A role the KMS can't
 /// be asked about now is tried again in the next maintenance pass.
 pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
     let Some(kms) = &app.kms else { return Ok(()) };
+    // Cairn's own, for SSE-S3, which the KMS's admin grants its key.
+    if kms.sse_s3_key().is_some() && kms.cairn_entity().is_none() {
+        let entity = kms.identify(crate::kms::Identity::Cairn).await.map_err(|e| anyhow::anyhow!("Cairn itself: {e}"))?;
+        eprintln!("kms: Cairn's own identity (for SSE-S3) is the entity {entity}");
+    }
     let client = app.pool.get().await?;
     let roles: Vec<uuid::Uuid> = client
         .query_cached("SELECT id FROM roles WHERE kms_entity_id IS NULL ORDER BY created_at", &[])
@@ -358,7 +364,7 @@ pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
         .collect();
     drop(client);
     for role in roles {
-        let entity = kms.identify(role).await.map_err(|e| anyhow::anyhow!("role {role}: {e}"))?;
+        let entity = kms.identify(crate::kms::Identity::Role(role)).await.map_err(|e| anyhow::anyhow!("role {role}: {e}"))?;
         // A plain write of one row's own column: no invariant of the lock
         // protocol (see `catalog.sql`) involves it.
         app.pool

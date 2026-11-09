@@ -61,7 +61,7 @@ async fn commit_object(tx: &Transaction<'_>, app: &App, blob: Uuid, key: &str) -
     tx.query_one(
         "SELECT status FROM pg_temp.cairn_commit_object(
              $1, ARRAY[$2::int], 0, 0, 65536, 0, 'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
-             $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, NULL, NULL, $5)",
+             $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, $5)",
         &[&blob, &app.node, &BUCKET, &key, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -101,7 +101,7 @@ async fn copy_object(
 ) -> String {
     let size: i64 = source.2.iter().sum();
     tx.query_one(
-        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, NULL, NULL, NULL, NULL, $7)",
+        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, NULL, NULL, NULL, NULL, false, $7)",
         &[&source.0, &source.1, &source.2, &BUCKET, &key, &size, &crate::s3::versions::new_version_id()],
     )
     .await

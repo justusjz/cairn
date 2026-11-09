@@ -47,7 +47,7 @@ async fn commit(
                 .query_one(
                     "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], $3, 0, 65536, 0, $4, $5, $6,
-                     $7, $8, 'application/octet-stream', '', $9, NULL, NULL, NULL, NULL,
+                     $7, $8, 'application/octet-stream', '', $9, NULL, NULL, NULL, NULL, false,
                      NULL, NULL, $10)",
                     &[
                         &blob,
@@ -133,7 +133,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
         .query_one(
             "SELECT status FROM pg_temp.cairn_copy_object(
                  $1, ARRAY[$2::bigint], ARRAY[1016::bigint], $3, 'c', 1000, 'etag', 'x', '', $4,
-                 NULL, NULL, NULL, NULL, $5)",
+                 NULL, NULL, NULL, NULL, false, $5)",
             &[&object_id, &part_id, &BUCKET, &&KEY_CHECK[..], &crate::s3::versions::new_version_id()],
         )
         .await
@@ -293,7 +293,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
             .query_one(
                 "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], 1016, 0, 65536, 0, 'etag', $3, $4,
-                     $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, NULL, NULL, $6)",
+                     $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, $6)",
                 &[
                     &blob,
                     &app.node,

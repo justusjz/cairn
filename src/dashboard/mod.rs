@@ -305,6 +305,11 @@ pub struct KmsStatus {
     pub last_login: Option<KmsLogin>,
     /// When its last login that worked was, in seconds since the Unix epoch.
     pub last_success: Option<f64>,
+    /// SSE-S3's key, if Cairn has one: it uses it as itself.
+    pub sse_s3_key: Option<String>,
+    /// Cairn's own identity (entity) in the KMS, which is to be granted that
+    /// key, once the node has logged in as itself.
+    pub cairn_entity: Option<String>,
 }
 
 /// A login to the KMS as a role.
@@ -312,7 +317,7 @@ pub struct KmsStatus {
 pub struct KmsLogin {
     /// When, in seconds since the Unix epoch.
     pub at: f64,
-    /// The role's ID.
+    /// The role's ID, or `cairn` for Cairn itself (for SSE-S3).
     pub role: String,
     /// Why it failed, if it did: what's likely wrong with the KMS's setup.
     pub error: Option<String>,
@@ -337,10 +342,12 @@ async fn kms_status(app: &App) -> Option<KmsStatus> {
         error: health.error,
         last_login: logins.last.map(|login| KmsLogin {
             at: login.at,
-            role: login.role.to_string(),
+            role: login.who.subject(),
             error: login.error,
         }),
         last_success: logins.last_success,
+        sse_s3_key: kms.sse_s3_key().map(|key| key.as_string()),
+        cairn_entity: kms.cairn_entity(),
     })
 }
 

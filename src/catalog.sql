@@ -525,8 +525,8 @@ $$;
 -- Writes a new object version as the key's current version, the way S3 lands
 -- a write in a bucket with the given versioning state, with its content type,
 -- metadata (see `s3::metadata`) and encryption (see `s3::sse`): its SSE-C key
--- check, or its SSE-KMS key, data key, sealed object key and context (NULLs
--- for what it isn't).
+-- check, or its SSE-KMS (or SSE-S3, if `p_sse_s3`) key, data key, sealed
+-- object key and context (NULLs for what it isn't).
 -- `p_size` is its plaintext's. `p_new_version_id` is
 -- the fresh version ID to use if the bucket is versioned. Returns the new
 -- row's id, and the version ID to report (NULL unless versioning is enabled).
@@ -535,7 +535,8 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
     p_content_type text, p_metadata text, p_sse_c_key bytea, p_kms_key_id text,
-    p_kms_data_key text, p_kms_sealed bytea, p_kms_context text, p_new_version_id text,
+    p_kms_data_key text, p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean,
+    p_new_version_id text,
     OUT id bigint, OUT version_id text
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -551,10 +552,10 @@ BEGIN
     PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
     INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
                          size, etag, content_type, metadata, sse_c_key, sse_kms_key_id,
-                         sse_kms_data_key, sse_kms_sealed, sse_kms_context, last_modified)
+                         sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3, last_modified)
     VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
-            p_kms_context, NOW())
+            p_kms_context, p_sse_s3, NOW())
     RETURNING objects.id INTO id;
     -- A write's version ID is reported only where it's a new one: S3 reports
     -- none for the null version (unversioned or suspended).
@@ -627,7 +628,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
     p_bucket text, p_key text, p_content_type text, p_metadata text, p_sse_c_key bytea,
     p_kms_key_id text, p_kms_data_key text, p_kms_sealed bytea, p_kms_context text,
-    p_if_match text[], p_if_none_match text[], p_new_version_id text,
+    p_sse_s3 boolean, p_if_match text[], p_if_none_match text[], p_new_version_id text,
     OUT status text, OUT present bigint, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -673,7 +674,7 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, coalesce(p_plain_size, p_size), p_etag, p_content_type,
         p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
-        p_new_version_id);
+        p_sse_s3, p_new_version_id);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -793,7 +794,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_source bigint, p_part_ids bigint[], p_part_sizes bigint[],
     p_bucket text, p_key text, p_size bigint, p_etag text, p_content_type text,
     p_metadata text, p_sse_c_key bytea, p_kms_key_id text, p_kms_data_key text,
-    p_kms_sealed bytea, p_kms_context text, p_new_version_id text,
+    p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean, p_new_version_id text,
     OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -831,7 +832,7 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_metadata,
         p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
-        p_new_version_id);
+        p_sse_s3, p_new_version_id);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -1029,7 +1030,7 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, v_total, etag, u.content_type, u.metadata,
         u.sse_c_key, u.sse_kms_key_id, u.sse_kms_data_key, u.sse_kms_sealed, u.sse_kms_context,
-        p_new_version_id);
+        u.sse_s3, p_new_version_id);
     version_id := v.version_id;
     UPDATE objects SET upload_id = p_upload WHERE id = v.id;
     UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);

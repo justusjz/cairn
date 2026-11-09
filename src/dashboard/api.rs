@@ -683,11 +683,12 @@ struct VersionInfo {
 /// How an object version is encrypted (see `s3::sse`).
 #[derive(Serialize, ToSchema)]
 struct EncryptionInfo {
-    /// `SSE-C` (with its client's key, which Cairn doesn't have) or `SSE-KMS`.
+    /// `SSE-C` (with its client's key, which Cairn doesn't have), `SSE-KMS`
+    /// or `SSE-S3` (with Cairn's own key from the KMS).
     kind: String,
-    /// SSE-KMS: the name of the KMS key.
+    /// SSE-KMS and SSE-S3: the name of the KMS key.
     kms_key_id: Option<String>,
-    /// SSE-KMS: the version of the KMS key its data key is from.
+    /// SSE-KMS and SSE-S3: the version of the KMS key its data key is from.
     kms_key_version: Option<i64>,
     /// SSE-KMS: the encryption context its client gave, as JSON.
     kms_context: Option<String>,
@@ -696,6 +697,7 @@ struct EncryptionInfo {
 impl EncryptionInfo {
     fn of(stored: crate::s3::sse::Stored) -> Option<EncryptionInfo> {
         use crate::s3::sse::Stored;
+        let s3 = matches!(stored, Stored::S3(_));
         match stored {
             Stored::Plain => None,
             Stored::Customer { .. } => Some(EncryptionInfo {
@@ -704,8 +706,8 @@ impl EncryptionInfo {
                 kms_key_version: None,
                 kms_context: None,
             }),
-            Stored::Kms(envelope) => Some(EncryptionInfo {
-                kind: "SSE-KMS".to_owned(),
+            Stored::Kms(envelope) | Stored::S3(envelope) => Some(EncryptionInfo {
+                kind: if s3 { "SSE-S3" } else { "SSE-KMS" }.to_owned(),
                 // Transit's ciphertexts start `vault:v<version>:`.
                 kms_key_version: envelope
                     .data_key
@@ -755,7 +757,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
         .query_cached(
             "SELECT id, version_id, is_latest, is_delete_marker, size, etag, content_type,
                     extract(epoch FROM last_modified)::float8, sse_c_key, sse_kms_key_id,
-                    sse_kms_data_key, sse_kms_sealed, sse_kms_context
+                    sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3
              FROM objects WHERE bucket = $1 AND key = $2
              ORDER BY id DESC LIMIT $3",
             &[&bucket, &key, &MAX_VERSIONS],

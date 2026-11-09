@@ -74,12 +74,13 @@ pub struct CopyKeys<'a> {
 
 impl CopyKeys<'_> {
     /// Whether the destination can share the bytes of a source encrypted as
-    /// `source` is: both are plain, or SSE-C with the same key, or SSE-KMS
-    /// (under any KMS key: the copy seals the same object key under a data
+    /// `source` is: both are plain, or SSE-C with the same key, or SSE-KMS or
+    /// SSE-S3 (under any key: the copy seals the same object key under a data
     /// key of its own). Otherwise the data is decrypted and encrypted again.
     fn shares(&self, source: &Stored) -> bool {
         match (source, self.dest) {
-            (Stored::Plain, Wanted::Plain) | (Stored::Kms(_), Wanted::Kms(_)) => true,
+            (Stored::Plain, Wanted::Plain) => true,
+            (Stored::Kms(_) | Stored::S3(_), Wanted::Kms(_) | Wanted::S3) => true,
             (Stored::Customer { .. }, Wanted::Customer(dest)) => {
                 self.source.is_some_and(|source| source.key() == dest.key())
             }
@@ -264,7 +265,15 @@ pub async fn copy_object(
                     Err(refused) => return Ok(refused),
                 }
             }
-            (Wanted::Kms(_), None) => unreachable!("an SSE-KMS copy shares only an SSE-KMS source's parts"),
+            (Wanted::S3, Some(object_key)) => {
+                match sse::reseal_s3(app, object_key, dest_bucket, dest_key).await? {
+                    Ok(envelope) => Stored::S3(envelope),
+                    Err(refused) => return Ok(refused),
+                }
+            }
+            (Wanted::Kms(_) | Wanted::S3, None) => {
+                unreachable!("an SSE-KMS or SSE-S3 copy shares only such a source's parts")
+            }
         };
         // CopyObject reports the new version's last-modified time in the body
         // (not just the ETag header). It comes from the commit itself: read
@@ -373,7 +382,7 @@ async fn commit_object_copy(
                 .query_one_cached(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                                                    $12, $13, $14, $15)",
+                                                    $12, $13, $14, $15, $16)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -389,6 +398,7 @@ async fn commit_object_copy(
                         &sse.kms_data_key,
                         &sse.kms_sealed,
                         &sse.kms_context,
+                        &sse.sse_s3,
                         &new_version_id(),
                     ],
                 )

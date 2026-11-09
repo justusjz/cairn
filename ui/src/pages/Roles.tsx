@@ -136,6 +136,17 @@ function KmsPanel(props: { cluster: Cluster; pending: number; refresh: () => voi
             <button class="small" onClick={copy}>
               Copy public key
             </button>
+            <Show when={k().sse_s3_key}>
+              {(key) => (
+                <p class="small">
+                  SSE-S3 uses the key <span class="mono">{key()}</span> as Cairn itself, whose identity in OpenBao is{" "}
+                  <Show when={k().cairn_entity} fallback={<Badge tone="warn">pending</Badge>}>
+                    {(entity) => <span class="mono">{entity()}</span>}
+                  </Show>
+                  : grant it <span class="mono">datakey/plaintext</span> and <span class="mono">decrypt</span> on that key.
+                </p>
+              )}
+            </Show>
             <Show when={keys() > 1}>
               <Badge tone="bad">nodes sign with different keys: give every node the same --kms-jwt-key</Badge>
             </Show>

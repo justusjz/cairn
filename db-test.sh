@@ -71,6 +71,7 @@ trap 'cleanup; rm -rf "$KEY_DIR"' EXIT
     bao secrets enable transit &&
     bao write -f transit/keys/cairn-test &&
     bao write -f transit/keys/cairn-other &&
+    bao write -f transit/keys/cairn-sse-s3 &&
     bao secrets enable -path=team-transit transit &&
     bao write -f team-transit/keys/invoices &&
     bao auth enable -path=cairn jwt &&

@@ -105,6 +105,7 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--kms-jwt-key <PATH>` | `CAIRN_KMS_JWT_KEY` | *required with a KMS* | PEM file of the Ed25519 private key Cairn signs its roles' logins to the KMS with. The same on every node. |
 | `--kms-auth-mount <PATH>` | `CAIRN_KMS_AUTH_MOUNT` | `cairn` | Where the KMS's JWT auth method for Cairn is mounted. |
 | `--kms-auth-role <NAME>` | `CAIRN_KMS_AUTH_ROLE` | `s3` | The role of that auth method Cairn's logins use. |
+| `--kms-sse-s3-key <ID>` | `CAIRN_KMS_SSE_S3_KEY` | none | The key for [SSE-S3](#sse-s3) (`<mount>/<key>`), which Cairn uses as itself. Without it, SSE-S3 is refused. |
 | `--kms-ca-cert <PATH>` | `CAIRN_KMS_CA_CERT` | public roots | PEM file of the CA certificates to trust for the KMS's TLS. |
 
 On SIGTERM or Ctrl-C, a node stops accepting connections and finishes the
@@ -354,11 +355,12 @@ its body is read.
 
 ## Encryption
 
-Objects can be encrypted with a key their client supplies (**SSE-C**), or with
-keys from a KMS (**SSE-KMS**). Either way, Cairn encrypts the data before it's
-stored, so no disk ever holds it in the clear.
+Objects can be encrypted with a key their client supplies (**SSE-C**), with
+keys from a KMS that their owners let roles use (**SSE-KMS**), or with a key
+of Cairn's own in that KMS (**SSE-S3**). Either way, Cairn encrypts the data
+before it's stored, so no disk ever holds it in the clear.
 
-- The algorithm is XChaCha20-Poly1305 (S3's API calls every SSE-C key
+- The algorithm is XChaCha20-Poly1305 (S3's API calls SSE-C and SSE-S3
   `AES256`, and Cairn answers the same way), in 64 KiB segments, so a range
   reads only the segments it covers, and altered data is detected.
 - Only the content is encrypted. Its key (name), size, times, Content-Type
@@ -371,10 +373,9 @@ stored, so no disk ever holds it in the clear.
   user. But its memory can be swapped out: run nodes without swap, or with
   encrypted swap (and without hibernation), as you would OpenBao.
 
-Encryption with keys of Cairn's own (**SSE-S3**) isn't implemented: a request
-asking for it is refused with `501 NotImplemented`, rather than stored
-unencrypted. A bucket's [default encryption](#bucket-default-encryption) can
-be SSE-KMS.
+A bucket's [default encryption](#bucket-default-encryption) can be SSE-KMS or
+SSE-S3. A request for encryption Cairn can't give (SSE-KMS or SSE-S3 without a
+KMS) is refused with `501 NotImplemented`, rather than stored unencrypted.
 
 ### SSE-C
 
@@ -432,6 +433,13 @@ deleting a key makes its objects unreadable for good (crypto-shredding).
   S3. So a Cairn admin can use every key any role may use. But Cairn can't
   use anything OpenBao doesn't grant one of its roles, and nothing granted to
   anyone else.
+- **Cairn's private key** (`--kms-jwt-key`) is what lets it log in. Whoever
+  has it, and can reach OpenBao, can do what Cairn can: keep it off the data
+  disks and out of backups (a Kubernetes secret, a tmpfs, a systemd
+  credential), and keep OpenBao on a private network. If it may have leaked,
+  replace it, and the public key in the mount's `jwt_validation_pubkeys`:
+  the old one is worthless then. Without it, Cairn's disks, its database and
+  their backups hold nothing readable.
 - Every object gets a random key of its own, which Cairn keeps sealed under a
   data key from the KMS, and keeps that data key only as the KMS encrypted it.
   The KMS binds it to the object's name (`bucket/key`) and encryption context:
@@ -496,26 +504,61 @@ another namespace's entities.
 Don't grant `encrypt` on the keys: OpenBao creates a missing key on an
 encrypt, so a mistyped key name would make a new key. Cairn never calls it.
 
+### SSE-S3
+
+With an SSE-S3 key configured (`--kms-sse-s3-key`), a write may ask for SSE-S3,
+as with S3: `aws s3api put-object --server-side-encryption AES256`. Reads need
+nothing. Cairn uses that key as itself, not as the role that asks, so any role
+that may read an object reads it, and the dashboard can download it: it
+protects the data at rest (disks, the database, backups), not from Cairn's
+roles.
+
+- Cairn logs in to OpenBao through its JWT mount as itself, with the subject
+  `cairn` (roles' are their IDs), and its entity must be allowed
+  `datakey/plaintext` and `decrypt` on the key. The dashboard's Roles page
+  shows that entity.
+- As S3's bucket keys do, a node uses one data key from OpenBao for an hour of
+  writes, and keeps the data keys it opened for an hour after their last use.
+  So OpenBao sees a few calls an hour, not one a request. Every object still
+  has a key of its own, bound to its name.
+- That also means revoking Cairn's access to the key, or deleting the key (to
+  shred every SSE-S3 object at once), stops nodes reading SSE-S3 objects
+  within an hour, and at once only after they restart.
+- Copies between SSE-S3 and SSE-KMS objects share their data, as copies among
+  SSE-KMS objects do.
+
+Setting it up, after the JWT mount above:
+
+```bash
+bao write -f transit/keys/cairn-sse-s3                     # --kms-sse-s3-key transit/cairn-sse-s3
+bao policy write cairn-sse-s3 - <<'POLICY'
+path "transit/datakey/plaintext/cairn-sse-s3" { capabilities = ["update"] }
+path "transit/decrypt/cairn-sse-s3" { capabilities = ["update"] }
+POLICY
+bao write identity/entity/id/<Cairn's entity> policies=cairn-sse-s3
+```
+
 ### Bucket default encryption
 
-A bucket can have a default, as in S3: SSE-KMS under a key, set by an admin
-with PutBucketEncryption, read with GetBucketEncryption, removed with
-DeleteBucketEncryption:
+A bucket can have a default, as in S3: SSE-KMS under a key, or SSE-S3
+(`AES256`), set by an admin with PutBucketEncryption, read with
+GetBucketEncryption, removed with DeleteBucketEncryption:
 
 ```bash
 aws s3api put-bucket-encryption --bucket demo --server-side-encryption-configuration \
     '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"finance/invoices"}}]}'
 ```
 
-- A write that asks for no encryption of its own (no SSE-C or SSE-KMS
-  headers: PutObject, CopyObject's destination, CreateMultipartUpload) gets
-  the default. One that asks for SSE-C, or SSE-KMS under a key, gets that.
-- The writing role must be allowed to use the key, as when it names the key
-  itself: a role that may write the bucket but not use its default key can
-  write only by asking for other encryption.
-- The key must exist when it's set: Cairn tries it as the admin setting it
-  (who needn't be allowed to use it). `AES256` (SSE-S3) can't be a default yet.
-  `BucketKeyEnabled` is told back, but changes nothing.
+- A write that asks for no encryption of its own (no SSE-C, SSE-KMS or
+  SSE-S3 headers: PutObject, CopyObject's destination, CreateMultipartUpload)
+  gets the default. One that asks for one gets that.
+- With an SSE-KMS default, the writing role must be allowed to use the key,
+  as when it names the key itself: a role that may write the bucket but not
+  use its default key can write only by asking for other encryption.
+- An SSE-KMS default's key must exist when it's set: Cairn tries it as the
+  admin setting it (who needn't be allowed to use it). An SSE-S3 default
+  needs `--kms-sse-s3-key`. `BucketKeyEnabled` is told back, but changes
+  nothing.
 - Changing or removing the default leaves what's written as it is. A write
   under way keeps the default it began with.
 - The dashboard's Buckets page shows each bucket's default.

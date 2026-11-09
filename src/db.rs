@@ -186,6 +186,7 @@ const MIGRATIONS: &[&str] = &[
     SSE_KMS,
     ROLE_IDS,
     BUCKET_ENCRYPTION,
+    SSE_S3,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -779,6 +780,24 @@ ALTER TABLE buckets ADD COLUMN sse_bucket_key boolean NOT NULL DEFAULT false;
 ALTER TABLE buckets ADD CONSTRAINT buckets_sse CHECK (
     (sse_algorithm IS NULL OR sse_algorithm = 'aws:kms')
     AND (sse_algorithm IS NULL) = (sse_kms_key_id IS NULL)
+) NOT VALID;
+"#;
+
+/// Migration 18: SSE-S3 (see `s3::sse`). An SSE-S3 object (or upload) keeps
+/// its keys as an SSE-KMS one does, under Cairn's own key, and is marked so.
+/// And a bucket's default may be SSE-S3 (`AES256`, without a key).
+const SSE_S3: &str = r#"
+ALTER TABLE objects ADD COLUMN sse_s3 boolean NOT NULL DEFAULT false;
+ALTER TABLE objects ADD CONSTRAINT objects_sse_s3
+    CHECK (NOT sse_s3 OR (sse_kms_key_id IS NOT NULL AND sse_kms_context IS NULL)) NOT VALID;
+ALTER TABLE multipart_uploads ADD COLUMN sse_s3 boolean NOT NULL DEFAULT false;
+ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_sse_s3
+    CHECK (NOT sse_s3 OR (sse_kms_key_id IS NOT NULL AND sse_kms_context IS NULL)) NOT VALID;
+ALTER TABLE buckets DROP CONSTRAINT buckets_sse;
+ALTER TABLE buckets ADD CONSTRAINT buckets_sse CHECK (
+    (sse_algorithm IS NULL AND sse_kms_key_id IS NULL)
+    OR (sse_algorithm = 'aws:kms' AND sse_kms_key_id IS NOT NULL)
+    OR (sse_algorithm = 'AES256' AND sse_kms_key_id IS NULL)
 ) NOT VALID;
 "#;
 

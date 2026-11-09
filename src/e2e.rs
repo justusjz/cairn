@@ -93,7 +93,8 @@ pub async fn node_replicating(
 
 /// A node with a KMS: the OpenBao that `CAIRN_TEST_OPENBAO` points at (see
 /// `db-test.sh`), whose JWT auth mount `cairn` trusts the key in
-/// `CAIRN_TEST_OPENBAO_JWT_KEY`. `None` if there's no database or OpenBao to test against.
+/// `CAIRN_TEST_OPENBAO_JWT_KEY`, with `transit/cairn-sse-s3` its SSE-S3 key.
+/// `None` if there's no database or OpenBao to test against.
 pub async fn kms_node() -> Option<Arc<App>> {
     let address = std::env::var("CAIRN_TEST_OPENBAO").ok()?;
     let app = node_with(Config::default(), None).await?;
@@ -103,6 +104,7 @@ pub async fn kms_node() -> Option<Arc<App>> {
         kms_jwt_key: Some(std::env::var("CAIRN_TEST_OPENBAO_JWT_KEY").unwrap().into()),
         kms_auth_mount: "cairn".to_owned(),
         kms_auth_role: "s3".to_owned(),
+        kms_sse_s3_key: Some("cairn-sse-s3".to_owned()),
         kms_ca_cert: None,
     })
     .unwrap();

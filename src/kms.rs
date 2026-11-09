@@ -28,6 +28,15 @@
 //! A role's token is kept until two thirds of its TTL have passed. OpenBao
 //! applies grants and revocations to tokens already issued, so that doesn't
 //! delay them.
+//!
+//! For SSE-S3, Cairn uses one key (`--kms-sse-s3-key`) as itself: its own
+//! identity, with the subject `cairn` (roles' are UUIDs), which the KMS's
+//! admin grants that key. As S3's bucket keys do, a node reuses a data key
+//! from it for an hour of writes, and keeps the data keys it opened for an
+//! hour after their last use: so the KMS sees a few calls an hour, not one a
+//! request. Which also means that revoking Cairn's access to the key, or
+//! deleting it, stops running nodes reading SSE-S3 objects within an hour,
+//! not at once.
 
 use std::{
     collections::HashMap,
@@ -60,6 +69,14 @@ use crate::encryption::Key;
 /// How long a call to the KMS may take, all in all.
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a node seals SSE-S3 object keys under one data key.
+const SSE_S3_WRITE_KEY: Duration = Duration::from_secs(3600);
+/// How long a node keeps an SSE-S3 data key it opened, after its last use.
+const SSE_S3_KEEP: Duration = Duration::from_secs(3600);
+/// The associated data of SSE-S3 data keys at the KMS. They're shared by many
+/// objects, so their names are bound when object keys are sealed instead.
+const SSE_S3_AD: &[u8] = b"cairn sse-s3 data key v1";
+
 /// The audience of Cairn's JWTs, which its JWT role must be bound to.
 pub const AUDIENCE: &str = "cairn";
 
@@ -85,6 +102,10 @@ pub struct KmsArgs {
     /// The role of that auth method that Cairn's logins use.
     #[arg(long, env = "CAIRN_KMS_AUTH_ROLE", default_value = "s3")]
     pub kms_auth_role: String,
+    /// The key for SSE-S3 (`<mount>/<key>`), which Cairn uses as itself (the
+    /// subject `cairn` of that auth method). Without it, SSE-S3 is refused.
+    #[arg(long, env = "CAIRN_KMS_SSE_S3_KEY")]
+    pub kms_sse_s3_key: Option<String>,
     /// PEM file of the CA certificates to trust for the KMS's TLS. Without
     /// it, the public web's (Mozilla's) roots.
     #[arg(long, env = "CAIRN_KMS_CA_CERT")]
@@ -128,6 +149,23 @@ fn valid_segment(segment: &str) -> bool {
         && segment.len() <= 128
         && !segment.starts_with('.')
         && segment.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+
+/// Who Cairn asks the KMS as: a role, or itself (for SSE-S3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Identity {
+    Role(Uuid),
+    Cairn,
+}
+
+impl Identity {
+    /// The subject of its JWTs: the role's ID, or `cairn`.
+    pub fn subject(self) -> String {
+        match self {
+            Identity::Role(role) => role.to_string(),
+            Identity::Cairn => "cairn".to_owned(),
+        }
+    }
 }
 
 /// A token, and when to stop using it (`None`: when it's refused).
@@ -182,9 +220,26 @@ pub struct Kms {
     auth_role: String,
     /// Each role's token, by role ID, each behind a lock of its own, so that
     /// one role's login doesn't hold up another's calls.
-    tokens: std::sync::Mutex<HashMap<Uuid, Arc<Mutex<Option<Token>>>>>,
+    tokens: std::sync::Mutex<HashMap<Identity, Arc<Mutex<Option<Token>>>>>,
     /// How this node's logins went, for the dashboard.
     logins: std::sync::Mutex<Logins>,
+    /// SSE-S3's key, and its data keys, if it's configured.
+    sse_s3: Option<SseS3>,
+    /// Calls of the Transit engine, for tests to count.
+    #[cfg(test)]
+    calls: std::sync::atomic::AtomicU64,
+}
+
+/// SSE-S3's key, which Cairn uses as itself, and the node's data keys from it.
+struct SseS3 {
+    key: KeyId,
+    /// The data key new objects' keys are sealed under, and when it came.
+    current: Mutex<Option<(DataKey, Instant)>>,
+    /// The data keys the node has, by their ciphertext, and when each was last
+    /// used.
+    opened: std::sync::Mutex<HashMap<String, (Zeroizing<Key>, Instant)>>,
+    /// Cairn's own identity (entity) in the KMS, once it logged in as itself.
+    entity: std::sync::Mutex<Option<String>>,
 }
 
 /// How a node's logins to the KMS went: its last, and its last that worked.
@@ -200,7 +255,7 @@ pub struct Logins {
 pub struct Login {
     /// When, in seconds since the Unix epoch.
     pub at: f64,
-    pub role: Uuid,
+    pub who: Identity,
     /// Why it failed, if it did: what's likely wrong.
     pub error: Option<String>,
 }
@@ -273,6 +328,15 @@ impl Kms {
         for (flag, value) in [("--kms-auth-mount", &args.kms_auth_mount), ("--kms-auth-role", &args.kms_auth_role)] {
             anyhow::ensure!(value.split('/').all(valid_segment), "{flag} isn't a valid path");
         }
+        let sse_s3 = match &args.kms_sse_s3_key {
+            None => None,
+            Some(key) => Some(SseS3 {
+                key: KeyId::parse(key).context("--kms-sse-s3-key isn't a valid key ID")?,
+                current: Mutex::new(None),
+                opened: std::sync::Mutex::default(),
+                entity: std::sync::Mutex::default(),
+            }),
+        };
         let roots = match &args.kms_ca_cert {
             Some(path) => {
                 use rustls::pki_types::{CertificateDer, pem::PemObject};
@@ -306,6 +370,9 @@ impl Kms {
             auth_role: args.kms_auth_role.clone(),
             tokens: std::sync::Mutex::default(),
             logins: std::sync::Mutex::default(),
+            sse_s3,
+            #[cfg(test)]
+            calls: std::sync::atomic::AtomicU64::new(0),
         })))
     }
 
@@ -371,11 +438,11 @@ impl Kms {
         }
     }
 
-    /// A fresh 256-bit data key from the KMS key `key`, for the role `role`,
-    /// its ciphertext bound to `associated_data`.
-    pub async fn generate(&self, role: Uuid, key: &KeyId, associated_data: &[u8]) -> Result<DataKey, KmsError> {
+    /// A fresh 256-bit data key from the KMS key `key`, for `who`, its
+    /// ciphertext bound to `associated_data`.
+    pub async fn generate(&self, who: Identity, key: &KeyId, associated_data: &[u8]) -> Result<DataKey, KmsError> {
         let body = json!({ "bits": 256, "associated_data": STANDARD.encode(associated_data) });
-        let data: DataKeyData = self.call(role, &key.path("datakey/plaintext"), body).await?;
+        let data: DataKeyData = self.call(who, &key.path("datakey/plaintext"), body).await?;
         Ok(DataKey {
             plaintext: decode_key(&data.plaintext)?,
             ciphertext: data.ciphertext,
@@ -383,25 +450,25 @@ impl Kms {
     }
 
     /// The data key `ciphertext` (from `generate` with the same key and
-    /// associated data) holds, for the role `role`.
+    /// associated data) holds, for `who`.
     pub async fn decrypt(
         &self,
-        role: Uuid,
+        who: Identity,
         key: &KeyId,
         ciphertext: &str,
         associated_data: &[u8],
     ) -> Result<Zeroizing<Key>, KmsError> {
         let body = json!({ "ciphertext": ciphertext, "associated_data": STANDARD.encode(associated_data) });
-        let data: DecryptData = self.call(role, &key.path("decrypt"), body).await?;
+        let data: DecryptData = self.call(who, &key.path("decrypt"), body).await?;
         decode_key(&data.plaintext)
     }
 
-    /// Logs in as the role `role`, which makes OpenBao create its entity the
-    /// first time, and answers with the entity's ID. Its token is kept.
-    pub async fn identify(&self, role: Uuid) -> Result<String, KmsError> {
-        let slot = self.slot(role);
+    /// Logs in as `who`, which makes OpenBao create its entity the first time,
+    /// and answers with the entity's ID. Its token is kept.
+    pub async fn identify(&self, who: Identity) -> Result<String, KmsError> {
+        let slot = self.slot(who);
         let mut token = slot.lock().await;
-        let (new, entity_id) = self.log_in(role).await?;
+        let (new, entity_id) = self.log_in(who).await?;
         *token = Some(new);
         if entity_id.is_empty() {
             return Err(KmsError::Unavailable(anyhow::anyhow!("the KMS's login answered without an entity")));
@@ -409,19 +476,21 @@ impl Kms {
         Ok(entity_id)
     }
 
-    /// Calls `path` with `body` as the role `role`, with the token Cairn has
-    /// for it, or a new one if the KMS refuses that because it's no longer
-    /// valid (rather than not allowed this call).
+    /// Calls `path` with `body` as `who`, with the token Cairn has for it, or
+    /// a new one if the KMS refuses that because it's no longer valid (rather
+    /// than not allowed this call).
     async fn call<T: serde::de::DeserializeOwned>(
         &self,
-        role: Uuid,
+        who: Identity,
         path: &str,
         body: serde_json::Value,
     ) -> Result<T, KmsError> {
+        #[cfg(test)]
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let url = format!("{}/v1/{path}", self.address);
         let mut fresh = false;
         loop {
-            let token = self.token(role, fresh).await?;
+            let token = self.token(who, fresh).await?;
             let (status, answer) =
                 self.post::<T>(&url, &body, Some(&token)).await.map_err(KmsError::Unavailable)?;
             match (status, answer.data) {
@@ -446,23 +515,80 @@ impl Kms {
         }
     }
 
-    /// The lock around the role's token.
-    fn slot(&self, role: Uuid) -> Arc<Mutex<Option<Token>>> {
-        self.tokens.lock().unwrap().entry(role).or_default().clone()
+    /// The lock around `who`'s token.
+    fn slot(&self, who: Identity) -> Arc<Mutex<Option<Token>>> {
+        self.tokens.lock().unwrap().entry(who).or_default().clone()
     }
 
-    /// A token to call with as the role: the one Cairn has, unless `fresh`
-    /// (the KMS refused it) or it's due for renewal.
-    async fn token(&self, role: Uuid, fresh: bool) -> Result<Zeroizing<String>, KmsError> {
-        let slot = self.slot(role);
+    /// A token to call with as `who`: the one Cairn has, unless `fresh` (the
+    /// KMS refused it) or it's due for renewal.
+    async fn token(&self, who: Identity, fresh: bool) -> Result<Zeroizing<String>, KmsError> {
+        let slot = self.slot(who);
         let mut token = slot.lock().await;
         let usable = token
             .as_ref()
             .is_some_and(|t| !fresh && t.renew_at.is_none_or(|at| Instant::now() < at));
         if !usable {
-            *token = Some(self.log_in(role).await?.0);
+            *token = Some(self.log_in(who).await?.0);
         }
         Ok(token.as_ref().unwrap().token.clone())
+    }
+
+    /// SSE-S3's key, if it's configured.
+    pub fn sse_s3_key(&self) -> Option<&KeyId> {
+        self.sse_s3.as_ref().map(|s| &s.key)
+    }
+
+    /// Cairn's own identity in the KMS, for SSE-S3, once it has logged in as
+    /// itself.
+    pub fn cairn_entity(&self) -> Option<String> {
+        self.sse_s3.as_ref()?.entity.lock().unwrap().clone()
+    }
+
+    /// The data key to seal a new SSE-S3 object's key under, and its
+    /// ciphertext: the node's current one, or a new one once that's an hour
+    /// old. Asks the KMS as Cairn.
+    pub async fn sse_s3_data_key(&self) -> Result<(Zeroizing<Key>, String), KmsError> {
+        let sse_s3 = self.sse_s3.as_ref().expect("SSE-S3 is refused without its key (`requested`)");
+        let mut current = sse_s3.current.lock().await;
+        if let Some((key, since)) = current.as_ref()
+            && since.elapsed() < SSE_S3_WRITE_KEY
+        {
+            return Ok((key.plaintext.clone(), key.ciphertext.clone()));
+        }
+        let key = self.generate(Identity::Cairn, &sse_s3.key, SSE_S3_AD).await?;
+        let answer = (key.plaintext.clone(), key.ciphertext.clone());
+        self.keep(sse_s3, &key.ciphertext, &key.plaintext);
+        *current = Some((key, Instant::now()));
+        Ok(answer)
+    }
+
+    /// The SSE-S3 data key `ciphertext` (from the KMS key `key`) holds: from
+    /// the node's, or else from the KMS, as Cairn.
+    pub async fn sse_s3_open(&self, key: &KeyId, ciphertext: &str) -> Result<Zeroizing<Key>, KmsError> {
+        let Some(sse_s3) = &self.sse_s3 else {
+            return Err(KmsError::Failed("SSE-S3 has no key (--kms-sse-s3-key)".to_owned()));
+        };
+        if let Some((opened, used)) = sse_s3.opened.lock().unwrap().get_mut(ciphertext) {
+            *used = Instant::now();
+            return Ok(opened.clone());
+        }
+        let opened = self.decrypt(Identity::Cairn, key, ciphertext, SSE_S3_AD).await?;
+        self.keep(sse_s3, ciphertext, &opened);
+        Ok(opened)
+    }
+
+    /// Keeps an SSE-S3 data key, and forgets those unused for an hour.
+    fn keep(&self, sse_s3: &SseS3, ciphertext: &str, key: &Key) {
+        let mut opened = sse_s3.opened.lock().unwrap();
+        opened.retain(|_, (_, used)| used.elapsed() < SSE_S3_KEEP);
+        opened.insert(ciphertext.to_owned(), (Zeroizing::new(*key), Instant::now()));
+    }
+
+    /// How many calls of the Transit engine this client made.
+    #[cfg(test)]
+    pub fn transit_calls(&self) -> u64 {
+        self.calls.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Whether the KMS still takes `token` (every token may look itself up).
@@ -484,21 +610,24 @@ impl Kms {
         Ok(status.is_success())
     }
 
-    /// Logs in as the role: a new token, and the role's entity ID.
-    async fn log_in(&self, role: Uuid) -> Result<(Token, String), KmsError> {
-        let result = self.try_log_in(role).await;
+    /// Logs in as `who`: a new token, and its entity's ID.
+    async fn log_in(&self, who: Identity) -> Result<(Token, String), KmsError> {
+        let result = self.try_log_in(who).await;
         let at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64();
         let mut logins = self.logins.lock().unwrap();
-        logins.last = Some(Login { at, role, error: result.as_ref().err().map(|e| e.to_string()) });
-        if result.is_ok() {
+        logins.last = Some(Login { at, who, error: result.as_ref().err().map(|e| e.to_string()) });
+        if let Ok((_, entity)) = &result {
             logins.last_success = Some(at);
+            if who == Identity::Cairn && !entity.is_empty() && let Some(sse_s3) = &self.sse_s3 {
+                *sse_s3.entity.lock().unwrap() = Some(entity.clone());
+            }
         }
         result
     }
 
-    async fn try_log_in(&self, role: Uuid) -> Result<(Token, String), KmsError> {
+    async fn try_log_in(&self, who: Identity) -> Result<(Token, String), KmsError> {
         // (A missing entity ID is checked by `identify`.)
-        let body = json!({ "role": self.auth_role, "jwt": self.jwt(role).as_str() });
+        let body = json!({ "role": self.auth_role, "jwt": self.jwt(who).as_str() });
         let url = format!("{}/v1/auth/{}/login", self.address, self.auth_mount);
         let (status, answer) = self
             .post::<serde_json::Value>(&url, &body, None)
@@ -542,14 +671,14 @@ impl Kms {
         format!("{why} (OpenBao said: {said})")
     }
 
-    /// A JWT naming the role, to log in as it with: valid for two minutes,
-    /// and since 30 seconds ago, for clocks that differ a little.
-    fn jwt(&self, role: Uuid) -> Zeroizing<String> {
+    /// A JWT naming `who`, to log in as it with: valid for two minutes, and
+    /// since 30 seconds ago, for clocks that differ a little.
+    fn jwt(&self, who: Identity) -> Zeroizing<String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
         let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"EdDSA","typ":"JWT"}"#);
         let claims = json!({
             "iss": "cairn",
-            "sub": role.to_string(),
+            "sub": who.subject(),
             "aud": AUDIENCE,
             "iat": now,
             "nbf": now - 30,

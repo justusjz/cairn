@@ -44,7 +44,8 @@ CARGO_ARGS+=(--data-dir "$WORK_DIR/data")   # required; per-run blob dir
 CARGO_ARGS+=(--allow-sse-c-over-http)
 # SSE-KMS, with keys in OpenBao's Transit engine, used as each role (see
 # `kms`), logged in to with a throwaway key.
-CARGO_ARGS+=(--kms-address "http://127.0.0.1:${BAO_PORT}" --kms-jwt-key "$WORK_DIR/kms-jwt.pem")
+CARGO_ARGS+=(--kms-address "http://127.0.0.1:${BAO_PORT}" --kms-jwt-key "$WORK_DIR/kms-jwt.pem"
+             --kms-sse-s3-key sse-s3)
 SERVER_LOG="$WORK_DIR/server.log"
 SERVER_PID=""
 BUCKET="smoke-$(date +%s)"
@@ -60,7 +61,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=100
+TOTAL=101
 STEP=0
 PASS=0
 FAIL=0
@@ -195,6 +196,7 @@ done
     bao secrets enable transit &&
     bao write -f transit/keys/cairn-test &&
     bao write -f transit/keys/cairn-other &&
+    bao write -f transit/keys/sse-s3 &&
     bao auth enable -path=cairn jwt &&
     bao write auth/cairn/config jwt_validation_pubkeys=@/tmp/cairn-jwt.pub &&
     bao write auth/cairn/role/s3 role_type=jwt user_claim=sub bound_audiences=cairn \
@@ -203,6 +205,11 @@ done
         bao policy write cairn-test-keys - <<'POLICY'
 path "transit/datakey/plaintext/cairn-*" { capabilities = ["update"] }
 path "transit/decrypt/cairn-*" { capabilities = ["update"] }
+POLICY
+    podman exec -i -e BAO_ADDR=http://127.0.0.1:8200 -e BAO_TOKEN=root "$BAO_CONTAINER" \
+        bao policy write cairn-sse-s3 - <<'POLICY'
+path "transit/datakey/plaintext/sse-s3" { capabilities = ["update"] }
+path "transit/decrypt/sse-s3" { capabilities = ["update"] }
 POLICY
 } >/dev/null 2>&1 || fatal "could not set up OpenBao"
 info "OpenBao is ready."
@@ -223,16 +230,19 @@ info "Creating roles..."
     cairn_role create bucketadmin --admin --secret adminsecret
 } >"$WORK_DIR/roles.log" 2>&1 || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create roles"; }
 
-# ─── 2a. testkey's identity in OpenBao ───────────────────────────────────────
-# Made beforehand, as an OpenBao admin can, so that it may use the keys from
-# its first request: an entity, and its alias on Cairn's mount, the role's ID.
-# (Cairn would make it when it starts; the other roles get theirs that way.)
+# ─── 2a. testkey's and Cairn's identities in OpenBao ─────────────────────────
+# Made beforehand, as an OpenBao admin can, so that they may use their keys
+# from the first request: entities, and their aliases on Cairn's mount: the
+# role's ID, and `cairn` for Cairn itself (for SSE-S3). (Cairn would make them
+# when it starts; the other roles get theirs that way.)
 {
     role_id=$(podman exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc \
         "SELECT id FROM roles WHERE name = '$ACCESS_KEY'") &&
     accessor=$(bao read -field=accessor sys/auth/cairn) &&
     entity=$(bao write -field=id identity/entity name=cairn-testkey policies=cairn-test-keys) &&
-    bao write identity/entity-alias name="$role_id" canonical_id="$entity" mount_accessor="$accessor"
+    bao write identity/entity-alias name="$role_id" canonical_id="$entity" mount_accessor="$accessor" &&
+    entity=$(bao write -field=id identity/entity name=cairn-itself policies=cairn-sse-s3) &&
+    bao write identity/entity-alias name=cairn canonical_id="$entity" mount_accessor="$accessor"
 } >"$WORK_DIR/kms-identity.log" 2>&1 || { cat "$WORK_DIR/kms-identity.log" >&2; fatal "could not set up testkey in OpenBao"; }
 
 # ─── 2b. Run the server ───────────────────────────────────────────────────────
@@ -542,8 +552,7 @@ metadata_ok() {
 }
 
 # SSE-C: objects written with a client's key read back with it (whole and in a
-# range), and not without it or with another; SSE-S3 is refused (Cairn has
-# SSE-KMS, not SSE-S3).
+# range), and not without it or with another.
 sse_c_ok() {
     local k1="$WORK_DIR/sse-key1" k2="$WORK_DIR/sse-key2" out="$WORK_DIR/sse-out" key
     head -c 32 /dev/urandom >"$k1"
@@ -564,8 +573,6 @@ sse_c_ok() {
     cmp -s <(tail -c +100001 "$BIG" | head -c 200000) "$out" || return 1
     [ "$(awss3 s3api head-object --bucket "$BUCKET" --key sse/big.bin --query ContentLength --output text \
         --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k1" 2>/dev/null)" = "$(stat -c %s "$BIG")" ] || return 1
-    ! awss3 s3api put-object --bucket "$BUCKET" --key sse/s3.txt --body "$SMALL" \
-        --server-side-encryption AES256 >/dev/null 2>&1 || return 1
     # Multipart (16 MiB in 8 MiB parts), and downloaded in parallel ranges.
     awss3 s3 cp "$MULTIPART" "s3://${BUCKET}/sse/multi.bin" --sse-c AES256 --sse-c-key "fileb://$k1" \
         >/dev/null 2>&1 || return 1
@@ -653,18 +660,51 @@ sse_kms_ok() {
     done
 }
 
+# SSE-S3: objects under Cairn's own key read back for any role that may read
+# them (reader has no KMS keys), whole and multipart, and tell that they're
+# AES256; copies to SSE-KMS and back keep the data.
+sse_s3_ok() {
+    local out="$WORK_DIR/s3-out" key
+    awss3 s3api put-object --bucket "$BUCKET" --key s3/big.bin --body "$BIG" \
+        --server-side-encryption AES256 >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key s3/big.bin --query ServerSideEncryption \
+        --output text 2>/dev/null)" = AES256 ] || return 1
+    awss3 s3 cp "$MULTIPART" "s3://${BUCKET}/s3/multi.bin" --sse AES256 >/dev/null 2>&1 || return 1
+    cairn_role grant reader "$BUCKET" read >/dev/null 2>&1 || return 1
+    for key in big multi; do
+        local src="$BIG"; [ "$key" = multi ] && src="$MULTIPART"
+        as_role reader readersecret s3api get-object --bucket "$BUCKET" --key "s3/$key.bin" "$out" \
+            >/dev/null 2>&1 || return 1
+        cmp -s "$src" "$out" || return 1
+    done
+    cairn_role revoke reader "$BUCKET" read >/dev/null 2>&1 || return 1
+    awss3 s3api copy-object --bucket "$BUCKET" --key s3/kms.bin --copy-source "${BUCKET}/s3/big.bin" \
+        --server-side-encryption aws:kms --ssekms-key-id cairn-test >/dev/null 2>&1 || return 1
+    awss3 s3api copy-object --bucket "$BUCKET" --key s3/back.bin --copy-source "${BUCKET}/s3/kms.bin" \
+        --server-side-encryption AES256 >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-object --bucket "$BUCKET" --key s3/back.bin "$out" --query ServerSideEncryption \
+        --output text 2>/dev/null)" = AES256 ] || return 1
+    cmp -s "$BIG" "$out" || return 1
+    for key in big multi kms back; do
+        awss3 s3api delete-object --bucket "$BUCKET" --key "s3/$key.bin" >/dev/null 2>&1 || return 1
+    done
+}
+
 # Default encryption: a bucket's default (SSE-KMS under a key) is set by an
 # admin only, read back, and applied to writes that ask for no encryption of
-# their own; one that asks for SSE-C gets that. SSE-S3 isn't one. Removing it
-# leaves new writes plain.
+# their own; one that asks for SSE-C gets that. SSE-S3 is one too. Removing
+# it leaves new writes plain.
 bucket_encryption_ok() {
     local out="$WORK_DIR/enc-out" k1="$WORK_DIR/enc-key"
     local kms='{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"cairn-test"}}]}'
     local aes='{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
     head -c 32 /dev/urandom >"$k1"
     ! awss3 s3api get-bucket-encryption --bucket "$BUCKET" >/dev/null 2>&1 || return 1
-    ! awss3 s3api put-bucket-encryption --bucket "$BUCKET" \
+    awss3 s3api put-bucket-encryption --bucket "$BUCKET" \
         --server-side-encryption-configuration "$aes" >/dev/null 2>&1 || return 1
+    awss3 s3api put-object --bucket "$BUCKET" --key enc/s3.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key enc/s3.txt --query ServerSideEncryption \
+        --output text 2>/dev/null)" = AES256 ] || return 1
     ! as_role writer writersecret s3api put-bucket-encryption --bucket "$BUCKET" \
         --server-side-encryption-configuration "$kms" >/dev/null 2>&1 || return 1
     awss3 s3api put-bucket-encryption --bucket "$BUCKET" \
@@ -688,7 +728,7 @@ bucket_encryption_ok() {
     awss3 s3api put-object --bucket "$BUCKET" --key enc/plain.txt --body "$SMALL" >/dev/null 2>&1 || return 1
     [ "$(awss3 s3api head-object --bucket "$BUCKET" --key enc/plain.txt --query ServerSideEncryption \
         --output text 2>/dev/null)" = None ] || return 1
-    for key in default sse-c plain; do
+    for key in s3 default sse-c plain; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "enc/$key.txt" >/dev/null 2>&1 || return 1
     done
 }
@@ -1907,7 +1947,8 @@ run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok
 run_test    "Metadata stored, copied, replaced"     metadata_ok
 run_test    "SSE-C put/multipart/copy/get, wrong key" sse_c_ok
 run_test    "SSE-KMS put/multipart/copy/get, keys"   sse_kms_ok
-run_test    "Bucket default encryption (SSE-KMS)"    bucket_encryption_ok
+run_test    "SSE-S3 put/multipart/copy/get"          sse_s3_ok
+run_test    "Bucket default encryption"              bucket_encryption_ok
 expect_fail "Self-copy without REPLACE rejected"    awss3 s3api copy-object --bucket "$BUCKET" --key big.bin --copy-source "${BUCKET}/big.bin"
 expect_fail "Copy from missing source fails"        awss3 s3api copy-object --bucket "$BUCKET" --key copy/none.txt --copy-source "${BUCKET}/does-not-exist.txt"
 run_test    "UploadPartCopy (whole object)"         upload_part_copy_whole_ok

@@ -389,10 +389,12 @@ async fn handle_request(
         Method::POST => query_param(&query, "uploads").is_some(),
         _ => false,
     };
-    // SSE-KMS: what such a write asks for. Its headers are refused elsewhere.
-    let kms_request = match *req.method() {
+    // SSE-KMS or SSE-S3: what such a write asks for. Its headers are refused
+    // elsewhere.
+    let server = match *req.method() {
         _ if writes_object => {
-            match sse::requested_kms(req.headers(), customer_key.is_some(), app.kms.is_some()) {
+            let sse_s3 = app.kms.as_ref().is_some_and(|kms| kms.sse_s3_key().is_some());
+            match sse::requested(req.headers(), customer_key.is_some(), app.kms.is_some(), sse_s3) {
                 Ok(request) => request,
                 Err(refused) => return Ok(box_response(refused)),
             }
@@ -409,7 +411,7 @@ async fn handle_request(
     };
     // A write that asks for no encryption of its own gets its bucket's
     // default, as in S3 (see `buckets::encryption`).
-    let kms_request = match kms_request {
+    let server = match server {
         None if writes_object && customer_key.is_none() => match default_request(&app, &bucket).await? {
             Ok(request) => request,
             Err(refused) => return Ok(box_response(refused)),
@@ -417,7 +419,7 @@ async fn handle_request(
         request => request,
     };
     // How an object write asks for its object to be encrypted.
-    let wanted = sse::Wanted::new(customer_key.as_ref(), kms_request.as_ref());
+    let wanted = sse::Wanted::new(customer_key.as_ref(), server.as_ref());
     // Who the KMS is asked as, for SSE-KMS (see `kms`).
     let role = Some(principal.id);
     // An object write may only ask for the ACL there is (see `acl`).

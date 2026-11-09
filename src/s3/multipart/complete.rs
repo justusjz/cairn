@@ -218,7 +218,7 @@ async fn completed_encryption(
 ) -> Result<Stored, tokio_postgres::Error> {
     let row = client
         .query_opt_cached(
-            "SELECT sse_c_key, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, sse_kms_context
+            "SELECT sse_c_key, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3
              FROM objects WHERE bucket = $1 AND key = $2 AND upload_id = $3",
             &[&bucket, &key, upload_id],
         )

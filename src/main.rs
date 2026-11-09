@@ -1042,7 +1042,7 @@ async fn try_commit_part(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer, last_modified
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                                                       $11, $12, $13, $14, $15, $16, $17, $18,
-                                                      $19, $20, $21)",
+                                                      $19, $20, $21, $22)",
                     &[
                         &written.blob_id,
                         &written.nodes,
@@ -1062,6 +1062,7 @@ async fn try_commit_part(
                         &sse.kms_data_key,
                         &sse.kms_sealed,
                         &sse.kms_context,
+                        &sse.sse_s3,
                         &if_match,
                         &if_none_match,
                         &s3::versions::new_version_id(),

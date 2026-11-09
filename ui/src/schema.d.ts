@@ -382,15 +382,18 @@ export interface components {
         };
         /** @description How an object version is encrypted (see `s3::sse`). */
         EncryptionInfo: {
-            /** @description `SSE-C` (with its client's key, which Cairn doesn't have) or `SSE-KMS`. */
+            /**
+             * @description `SSE-C` (with its client's key, which Cairn doesn't have), `SSE-KMS`
+             *     or `SSE-S3` (with Cairn's own key from the KMS).
+             */
             kind: string;
             /** @description SSE-KMS: the encryption context its client gave, as JSON. */
             kms_context?: string | null;
-            /** @description SSE-KMS: the name of the KMS key. */
+            /** @description SSE-KMS and SSE-S3: the name of the KMS key. */
             kms_key_id?: string | null;
             /**
              * Format: int64
-             * @description SSE-KMS: the version of the KMS key its data key is from.
+             * @description SSE-KMS and SSE-S3: the version of the KMS key its data key is from.
              */
             kms_key_version?: number | null;
         };
@@ -451,7 +454,7 @@ export interface components {
             at: number;
             /** @description Why it failed, if it did: what's likely wrong with the KMS's setup. */
             error?: string | null;
-            /** @description The role's ID. */
+            /** @description The role's ID, or `cairn` for Cairn itself (for SSE-S3). */
             role: string;
         };
         /** @description A node's KMS, as it sees it. */
@@ -464,6 +467,11 @@ export interface components {
              */
             auth_mount: string;
             auth_role: string;
+            /**
+             * @description Cairn's own identity (entity) in the KMS, which is to be granted that
+             *     key, once the node has logged in as itself.
+             */
+            cairn_entity?: string | null;
             /** @description Why it couldn't reach it. */
             error?: string | null;
             initialized?: boolean | null;
@@ -482,6 +490,8 @@ export interface components {
             /** @description Whether the node could reach the KMS just now, and how it is. */
             reachable: boolean;
             sealed?: boolean | null;
+            /** @description SSE-S3's key, if Cairn has one: it uses it as itself. */
+            sse_s3_key?: string | null;
             standby?: boolean | null;
             version?: string | null;
         };
