@@ -45,11 +45,120 @@ async fn enable_versioning(app: &App) {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// Runs the lifecycles due `days` from now; the bucket's report.
-async fn run_in(app: &Arc<App>, days: u32) -> Option<Report> {
-    let results = pass(app, SystemTime::now() + DAY * days).await;
-    assert!(results.len() <= 1, "one bucket ran");
+/// Takes the step due `after` from now, if there's one; its report.
+async fn step_at(app: &Arc<App>, after: Duration) -> Option<Report> {
+    let results = pass(app, SystemTime::now() + after).await;
+    assert!(results.len() <= 1, "one bucket's step");
     results.into_iter().next().map(|result| result.map_err(|(_, e)| e).unwrap())
+}
+
+/// Takes the step due `days` from now, which finishes its sweep (the
+/// buckets here are small); its report.
+async fn run_in(app: &Arc<App>, days: u32) -> Option<Report> {
+    let report = step_at(app, DAY * days).await;
+    if let Some(report) = &report {
+        assert!(report.finished || report.interrupted, "{report:?}");
+    }
+    report
+}
+
+/// The bucket's sweep state: its cursor, versions read, and size.
+async fn sweep_state(app: &App) -> (Option<String>, i64, Option<i64>) {
+    let row = app
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT lifecycle_cursor, lifecycle_seen, lifecycle_size FROM buckets WHERE name = $1",
+            &[&BUCKET],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1), row.get(2))
+}
+
+/// Gives the bucket `n` keys, `k00000` on, each only a delete marker.
+async fn lone_markers(app: &App, n: i32) {
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker, size, etag,
+                                  content_type, last_modified)
+             SELECT $1, 'k' || lpad(n::text, 5, '0'), 'v', true, true, 0, NULL, NULL, now()
+             FROM generate_series(1, $2::int) AS n",
+            &[&BUCKET, &n],
+        )
+        .await
+        .unwrap();
+}
+
+const MARKERS: &str = "<Rule><ID>r</ID><Filter/><Status>Enabled</Status>\
+     <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule>";
+
+#[tokio::test]
+async fn a_sweep_is_spread_over_steps() {
+    let Some(app) = node().await else { return };
+    enable_versioning(&app).await;
+    lone_markers(&app, 2500).await;
+    configure(&app, MARKERS).await;
+    // As if the last sweep had found few versions: a page a step.
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute("UPDATE buckets SET lifecycle_size = 1", &[])
+        .await
+        .unwrap();
+    let minute = Duration::from_secs(60);
+    // A full page leaves its last key for the next, which may have more
+    // versions than fit.
+    let first = step_at(&app, Duration::ZERO).await.unwrap();
+    assert_eq!((first.removed, first.finished), (999, false));
+    assert_eq!(sweep_state(&app).await, (Some("k00999".to_owned()), 999, Some(1)));
+    // Not again until a minute later.
+    assert_eq!(step_at(&app, Duration::ZERO).await, None);
+    let second = step_at(&app, minute * 2).await.unwrap();
+    assert_eq!((second.removed, second.finished), (999, false));
+    // The last page ends the sweep, which recorded its size, and the next
+    // one is due a day after it started.
+    let third = step_at(&app, minute * 4).await.unwrap();
+    assert_eq!((third.removed, third.finished), (502, true));
+    assert_eq!(sweep_state(&app).await, (None, 0, Some(2500)));
+    assert_eq!(step_at(&app, DAY - minute).await, None);
+    assert!(step_at(&app, DAY + minute).await.unwrap().finished);
+}
+
+#[tokio::test]
+async fn a_failed_step_is_taken_up_where_it_got_to() {
+    let Some(app) = node().await else { return };
+    enable_versioning(&app).await;
+    lone_markers(&app, 1500).await;
+    configure(&app, MARKERS).await;
+    // A step that read the first page, and died before the next was due.
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE buckets SET lifecycle_started = now(), lifecycle_cursor = 'k01000',
+                                lifecycle_seen = 1000, lifecycle_due = now() + interval '10 minutes'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(step_at(&app, Duration::from_secs(60)).await, None);
+    let report = step_at(&app, Duration::from_secs(11 * 60)).await.unwrap();
+    // Only what was after where it got to.
+    assert_eq!((report.removed, report.finished), (500, true));
+    assert_eq!(sweep_state(&app).await, (None, 0, Some(1500)));
+    // A new configuration starts a new sweep, from the start, paced by the
+    // last one's size: a page a step.
+    configure(&app, MARKERS).await;
+    let report = step_at(&app, Duration::from_secs(11 * 60)).await.unwrap();
+    assert_eq!((report.removed, report.finished), (999, false));
 }
 
 async fn versions(app: &App, key: &str) -> i64 {
@@ -152,7 +261,7 @@ async fn a_version_written_since_is_not_expired() {
         .get(0);
     let rules = super::Configuration::from_json(&config).unwrap();
     let client = app.pool.get().await.unwrap();
-    let (versions, _) = page(&client, BUCKET, "").await.unwrap().unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "").await.unwrap().unwrap();
     let due: Vec<_> = rules
         .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
         .into_iter()
@@ -172,7 +281,7 @@ async fn a_version_written_since_is_not_expired() {
         "<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>2</Days></Expiration></Rule>",
     )
     .await;
-    let (versions, _) = page(&client, BUCKET, "").await.unwrap().unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "").await.unwrap().unwrap();
     let due: Vec<_> = rules
         .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
         .into_iter()
@@ -238,10 +347,10 @@ async fn a_page_holds_whole_keys() {
         .await
         .unwrap();
     put(&app, "b", vec![1]).await;
-    let (versions, last) = page(&client, BUCKET, "").await.unwrap().unwrap();
-    assert_eq!(last, "a");
+    let (versions, last, last_page) = page(&client, BUCKET, "").await.unwrap().unwrap();
+    assert_eq!((last.as_str(), last_page), ("a", false));
     assert_eq!(versions["a"].len(), super::PAGE as usize + 5);
-    let (versions, last) = page(&client, BUCKET, "a").await.unwrap().unwrap();
-    assert_eq!((versions.len(), last.as_str()), (1, "b"));
+    let (versions, last, last_page) = page(&client, BUCKET, "a").await.unwrap().unwrap();
+    assert_eq!((versions.len(), last.as_str(), last_page), (1, "b", true));
     assert!(page(&client, BUCKET, "b").await.unwrap().is_none());
 }

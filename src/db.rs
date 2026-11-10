@@ -831,11 +831,18 @@ ALTER TABLE parts ADD COLUMN checksum text;
 "#;
 
 /// Migration 20: buckets' lifecycle configurations (see `lifecycle`): the
-/// rules, as JSON, and when the bucket's next lifecycle run is due, which a
-/// node claims it by moving forward. NULL for a bucket without rules.
+/// rules, as JSON (NULL for none), and where the bucket's sweep of them is:
+/// when its next step is due (which a node claims it by moving forward), the
+/// key it has got to, when it started (NULL until it does), how many
+/// versions it has read so far, and how many the last whole sweep read,
+/// which paces the next one.
 const LIFECYCLE: &str = r#"
 ALTER TABLE buckets ADD COLUMN lifecycle text;
 ALTER TABLE buckets ADD COLUMN lifecycle_due timestamptz;
+ALTER TABLE buckets ADD COLUMN lifecycle_cursor text;
+ALTER TABLE buckets ADD COLUMN lifecycle_started timestamptz;
+ALTER TABLE buckets ADD COLUMN lifecycle_seen bigint NOT NULL DEFAULT 0;
+ALTER TABLE buckets ADD COLUMN lifecycle_size bigint;
 CREATE INDEX buckets_lifecycle_due ON buckets (lifecycle_due) WHERE lifecycle IS NOT NULL;
 "#;
 

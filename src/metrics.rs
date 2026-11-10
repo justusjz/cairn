@@ -309,7 +309,7 @@ impl Metrics {
         m.event("packer", true, message);
     }
 
-    /// A bucket's lifecycle run: an event, if it did anything.
+    /// A step of a bucket's lifecycle sweep: an event, if it did anything.
     pub fn lifecycle_done(&self, report: &crate::lifecycle::Report) {
         if !report.is_empty() {
             self.maintenance.lock().unwrap().event("lifecycle", false, report.to_string());

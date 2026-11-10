@@ -1156,9 +1156,9 @@ BEGIN
 END
 $$;
 
--- T17: a lifecycle run's expirations (see `lifecycle`). Takes B(b) shared
+-- T17: a lifecycle sweep's expirations (see `lifecycle`). Takes B(b) shared
 -- and K(b,k) for every key, then X on the blobs of every part they may
--- remove, as DeleteObjects does (T8). Each target is a version the run found
+-- remove, as DeleteObjects does (T8). Each target is a version the sweep found
 -- due, by its row id, with what made it due, which is checked again under the
 -- locks, before anything changes, so that a version written or deleted since
 -- isn't mistaken for it:
@@ -1173,8 +1173,8 @@ $$;
 --                 `p_successors` (which made it noncurrent when it did), and
 --                 at least `p_newer` versions newer than it; removed for good.
 --
--- `p_config` is the configuration the run follows: if the bucket's isn't it
--- anymore (it was changed or deleted since the run began), nothing is done
+-- `p_config` is the configuration the sweep follows: if the bucket's isn't
+-- it anymore (it was changed or deleted since), nothing is done
 -- ('changed'). Returns 'expired', with which targets were, or
 -- 'no_such_bucket'.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_lifecycle_expire(
@@ -1258,15 +1258,17 @@ END
 $$;
 
 -- T18: PutBucketLifecycleConfiguration and DeleteBucketLifecycle: sets (or,
--- with NULL, removes) the bucket's lifecycle configuration, and makes its
--- next run due now. A plain UPDATE of the bucket's row, as T16's: no
--- invariant involves the configuration, which a run checks itself (T17).
--- Returns whether the bucket exists.
+-- with NULL, removes) the bucket's lifecycle configuration, and starts a new
+-- sweep of it now. (The size of the last sweep stays: it's the bucket's.) A
+-- plain UPDATE of the bucket's row, as T16's: no invariant involves the
+-- configuration, which a sweep checks itself (T17). Returns whether the
+-- bucket exists.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_set_lifecycle(p_bucket text, p_config text)
 RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE buckets SET lifecycle = p_config,
-                       lifecycle_due = CASE WHEN p_config IS NULL THEN NULL ELSE now() END
+                       lifecycle_due = CASE WHEN p_config IS NULL THEN NULL ELSE now() END,
+                       lifecycle_cursor = NULL, lifecycle_started = NULL, lifecycle_seen = 0
     WHERE name = p_bucket;
     RETURN FOUND;
 END

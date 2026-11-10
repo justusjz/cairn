@@ -3,17 +3,27 @@
 //! `s3::buckets::lifecycle` for how it's set).
 //!
 //! Like S3, Cairn applies the rules in the background, not as objects are
-//! read: an expired object stays readable until a run gets to it. Every node
-//! looks for due buckets once a minute (`pass`); a bucket's run is due when
-//! its configuration was set, and then at every midnight UTC, when versions
-//! become due (see `rules::Day`). A node claims a bucket's run by moving its
-//! due time an hour ahead (a lease, which it extends as it goes), so that each
-//! run happens on one node, and is picked up again by another if that node
-//! dies. Then it walks the bucket's versions in key order, a page at a time,
-//! and expires the due ones (`cairn_lifecycle_expire`), checking each again
+//! read: an expired object stays readable until a sweep gets to it.
+//!
+//! A bucket with rules is swept continuously, a day at a time: a sweep walks
+//! the bucket's versions in key order and expires the due ones, in small
+//! steps, a minute apart, each a few pages of versions. As many pages as it
+//! takes for the sweep to get through the bucket in `SWEEP_STEPS` minutes
+//! (20 hours), going by how many versions the last sweep found, so that its
+//! load is spread across the day, rather than coming at once. The next sweep
+//! starts a day after the last one did, or right after it ends, if it took
+//! longer. A version is expired when the sweep gets to it, so up to a day
+//! after it became due, as S3 too takes its time.
+//!
+//! Every node looks for due steps once a minute (`pass`), and claims one by
+//! moving its bucket's due time ahead (a lease), so that each step happens
+//! on one node, and is taken up by another if that one dies. Where the sweep
+//! has got to is saved after every page, so it carries on from there, and
+//! never starts over but for a new configuration. Each step expires the due
+//! versions of its pages (`cairn_lifecycle_expire`), checking each again
 //! under the locks a delete takes: a version written meanwhile is never
-//! mistaken for one that was due. A run stops when the bucket's configuration
-//! changes under it, and starts over with the new one.
+//! mistaken for one that was due. A sweep stops when the bucket's
+//! configuration changes under it, and a new one starts with the new one.
 //!
 //! Expirations are deletes, as DeleteObject's: an expired current version in
 //! a versioned bucket gets a delete marker, and stays as a noncurrent version
@@ -36,15 +46,27 @@ pub mod rules;
 
 use rules::{Configuration, Day, Due, Kind, Version};
 
-/// How long a claim on a bucket's run lasts, unless the run extends it.
-const LEASE: Duration = Duration::from_secs(3600);
-/// How many versions a run reads at a time.
+/// How long a claim on a step lasts: how long until another node takes it
+/// up if its node dies. Each page extends it.
+const LEASE: Duration = Duration::from_secs(600);
+/// How long after a step the next one is due.
+const STEP: Duration = crate::MAINTENANCE_INTERVAL;
+/// How long after a sweep started the next one starts (unless it took
+/// longer).
+const SWEEP: Duration = Duration::from_secs(24 * 3600);
+/// How many steps a sweep is spread over: 20 hours' worth, leaving some of
+/// the day for steps that come late.
+const SWEEP_STEPS: i64 = 1200;
+/// How many pages a step of a bucket's first sweep reads, before there's a
+/// last sweep to go by: 10,000 versions a minute, about 14 million a day.
+const FIRST_SWEEP_PAGES: i64 = 10;
+/// How many versions a sweep reads at a time.
 const PAGE: i64 = 1000;
-/// How many versions a run expires in one transaction. More than 8 keys lock
-/// their stripes, as a large DeleteObjects does (see `cairn_lock_keys`).
+/// How many versions a sweep expires in one transaction. More than 8 keys
+/// lock their stripes, as a large DeleteObjects does (see `cairn_lock_keys`).
 const BATCH: usize = 100;
 
-/// What a run did in a bucket.
+/// What a step of a sweep did in a bucket.
 #[derive(Debug, Default, PartialEq)]
 pub struct Report {
     pub bucket: String,
@@ -54,11 +76,15 @@ pub struct Report {
     pub removed: usize,
     /// Uploads aborted.
     pub aborted: usize,
-    /// Whether the configuration changed under the run, which then stopped.
+    /// Whether it ended the sweep.
+    pub finished: bool,
+    /// Whether the configuration changed under it, which ended the sweep
+    /// (and started a new one).
     pub interrupted: bool,
 }
 
 impl Report {
+    /// Whether it changed nothing worth reporting.
     pub fn is_empty(&self) -> bool {
         self.expired + self.removed + self.aborted == 0 && !self.interrupted
     }
@@ -78,42 +104,58 @@ impl std::fmt::Display for Report {
     }
 }
 
-/// Runs every bucket's lifecycle that's due as of `now`, one after the
-/// other, as long as there are any. The result of each run, with the
-/// bucket's name if it failed.
+/// A bucket's sweep, as a step claims it.
+struct Sweep {
+    bucket: String,
+    /// Its configuration, as stored.
+    config: String,
+    /// When it started, and the key it has got to; `None` if it's yet to.
+    started: Option<(SystemTime, String)>,
+    /// How many versions it has read so far.
+    seen: i64,
+    /// How many versions the last whole sweep read.
+    size: Option<i64>,
+}
+
+impl Sweep {
+    /// How many pages a step reads, for the sweep to take `SWEEP_STEPS`.
+    fn pages(&self) -> i64 {
+        match self.size {
+            None => FIRST_SWEEP_PAGES,
+            Some(size) => (size / (PAGE * SWEEP_STEPS) + 1).max(1),
+        }
+    }
+}
+
+/// Takes the steps of buckets' sweeps that are due as of `now` (the
+/// database's clock), one after the other, as long as there are any. What
+/// each did, with the bucket's name if it failed.
 pub async fn pass(app: &Arc<App>, now: SystemTime) -> Vec<Result<Report, (String, anyhow::Error)>> {
     let mut results = Vec::new();
     loop {
-        let claimed = match claim(app, now).await {
-            Ok(Some(claimed)) => claimed,
+        let sweep = match claim(app, now).await {
+            Ok(Some(sweep)) => sweep,
             Ok(None) => return results,
             Err(e) => {
                 results.push(Err((String::new(), e)));
                 return results;
             }
         };
-        let (bucket, config) = claimed;
-        let result = run(app, &bucket, &config, now).await;
-        // A failed run is tried again when its lease runs out; one that
-        // finished, at the next midnight; one interrupted, right away.
-        let next = match &result {
-            Ok(report) if report.interrupted => Some(now),
-            Ok(_) => Some(Day(Day::of(now).0 + 1).midnight()),
-            Err(_) => None,
-        };
-        if let Some(next) = next
-            && let Err(e) = reschedule(app, &bucket, &config, next).await
-        {
-            results.push(Err((bucket.clone(), e)));
-        }
-        results.push(result.map_err(|e| (bucket, e)));
+        // A failed step is taken up again from where it got to, when its
+        // lease runs out.
+        let bucket = sweep.bucket.clone();
+        results.push(step(app, sweep, now).await.map_err(|e| (bucket, e)));
     }
 }
 
-/// Claims the run of a bucket that's due, if there's one, as of `now`: its
-/// name and configuration. Skips the buckets whose rows are locked, so that
-/// it never waits.
-async fn claim(app: &App, now: SystemTime) -> anyhow::Result<Option<(String, String)>> {
+/// The time by the database's clock.
+pub async fn database_time(app: &App) -> anyhow::Result<SystemTime> {
+    Ok(app.pool.get().await?.query_one_cached("SELECT now()", &[]).await?.get(0))
+}
+
+/// Claims a step that's due, if there's one, as of `now`. Skips the buckets
+/// whose rows are locked, so that it never waits.
+async fn claim(app: &App, now: SystemTime) -> anyhow::Result<Option<Sweep>> {
     let lease_end = now + LEASE;
     let row = app
         .pool
@@ -127,70 +169,118 @@ async fn claim(app: &App, now: SystemTime) -> anyhow::Result<Option<(String, Str
                  ORDER BY lifecycle_due LIMIT 1
                  FOR NO KEY UPDATE SKIP LOCKED
              )
-             RETURNING name, lifecycle",
+             RETURNING name, lifecycle, lifecycle_started, lifecycle_cursor, lifecycle_seen, lifecycle_size",
             &[&now, &lease_end],
         )
         .await?;
-    Ok(row.map(|row| (row.get(0), row.get(1))))
+    Ok(row.map(|row| {
+        let started: Option<SystemTime> = row.get(2);
+        let cursor: Option<String> = row.get(3);
+        Sweep {
+            bucket: row.get(0),
+            config: row.get(1),
+            started: started.map(|started| (started, cursor.unwrap_or_default())),
+            seen: row.get(4),
+            size: row.get(5),
+        }
+    }))
 }
 
-/// Makes the bucket's next run due at `next`, unless its configuration
-/// changed (which made a run due now).
-async fn reschedule(app: &App, bucket: &str, config: &str, next: SystemTime) -> anyhow::Result<()> {
-    app.pool
-        .get()
-        .await?
-        .execute_cached(
-            "UPDATE buckets SET lifecycle_due = $3 WHERE name = $1 AND lifecycle = $2",
-            &[&bucket, &config, &next],
-        )
-        .await?;
-    Ok(())
-}
-
-/// Extends the claim on the bucket's run, as long as its configuration is
-/// still `config`. Whether it is.
-async fn extend(client: &Object, bucket: &str, config: &str, now: SystemTime) -> anyhow::Result<bool> {
-    // The lease runs from the real time: a run can take a while.
-    let lease_end = SystemTime::now().max(now) + LEASE;
+/// Saves where the sweep has got to, and when its next step is due (`None`
+/// to extend the lease), as long as the bucket's configuration is still the
+/// one it follows. Whether it is.
+async fn save(
+    client: &Object,
+    sweep: &Sweep,
+    started: SystemTime,
+    cursor: &str,
+    due: Option<SystemTime>,
+    now: SystemTime,
+) -> anyhow::Result<bool> {
+    // A lease runs from the database's clock, as `now` is from, when it's
+    // later: a step may take a while.
+    let lease = LEASE.as_secs_f64();
     let updated = client
         .execute_cached(
-            "UPDATE buckets SET lifecycle_due = $3 WHERE name = $1 AND lifecycle = $2",
-            &[&bucket, &config, &lease_end],
+            "UPDATE buckets SET lifecycle_started = $3, lifecycle_cursor = $4, lifecycle_seen = $5,
+                 lifecycle_due = coalesce($6, greatest(now(), $7) + make_interval(secs => $8))
+             WHERE name = $1 AND lifecycle = $2",
+            &[&sweep.bucket, &sweep.config, &started, &cursor, &sweep.seen, &due, &now, &lease],
         )
         .await?;
     Ok(updated > 0)
 }
 
-/// Runs the bucket's lifecycle `config` (as stored) as of `now`.
-async fn run(app: &Arc<App>, bucket: &str, config: &str, now: SystemTime) -> anyhow::Result<Report> {
-    let rules = Configuration::from_json(config).map_err(|e| {
+/// Ends the sweep, recording its `size` (the versions it read, if it read
+/// them), and makes the next one due a day after it started, or `now` if
+/// that's past, as long as the bucket's configuration is still the one it
+/// followed. Whether it is.
+async fn finish(
+    client: &Object,
+    sweep: &Sweep,
+    started: SystemTime,
+    size: Option<i64>,
+    now: SystemTime,
+) -> anyhow::Result<bool> {
+    let next = (started + SWEEP).max(now);
+    let updated = client
+        .execute_cached(
+            "UPDATE buckets SET lifecycle_started = NULL, lifecycle_cursor = NULL, lifecycle_seen = 0,
+                 lifecycle_size = coalesce($3, lifecycle_size), lifecycle_due = $4
+             WHERE name = $1 AND lifecycle = $2",
+            &[&sweep.bucket, &sweep.config, &size, &next],
+        )
+        .await?;
+    Ok(updated > 0)
+}
+
+/// Takes a step of the bucket's sweep as of `now`.
+async fn step(app: &Arc<App>, mut sweep: Sweep, now: SystemTime) -> anyhow::Result<Report> {
+    let rules = Configuration::from_json(&sweep.config).map_err(|e| {
         anyhow::anyhow!("its lifecycle configuration isn't one this Cairn knows (written by a newer one?): {e}")
     })?;
     let today = Day::of(now);
-    let mut report = Report { bucket: bucket.to_owned(), ..Report::default() };
+    let mut report = Report { bucket: sweep.bucket.clone(), ..Report::default() };
     let client = app.pool.get().await?;
+    let (started, mut after) = sweep.started.clone().unwrap_or((now, String::new()));
+    let interrupted = |mut report: Report| {
+        report.interrupted = true;
+        Ok(report)
+    };
     if rules.expires_objects() {
-        let mut after = String::new();
-        loop {
-            let Some((versions, last)) = page(&client, bucket, &after).await? else { break };
+        let mut end = false;
+        for _ in 0..sweep.pages() {
+            let Some((versions, last, last_page)) = page(&client, &sweep.bucket, &after).await? else {
+                end = true;
+                break;
+            };
             let due: Vec<(String, Due)> = versions
                 .iter()
                 .flat_map(|(key, versions)| rules.due(key, versions, today).into_iter().map(|due| (key.clone(), due)))
                 .collect();
             for batch in due.chunks(BATCH) {
-                if !expire(app, &client, bucket, config, batch, &mut report).await? {
-                    report.interrupted = true;
-                    return Ok(report);
+                if !expire(app, &client, &sweep.bucket, &sweep.config, batch, &mut report).await? {
+                    return interrupted(report);
                 }
             }
-            if !extend(&client, bucket, config, now).await? {
-                report.interrupted = true;
-                return Ok(report);
-            }
+            sweep.seen += versions.values().map(|v| v.len() as i64).sum::<i64>();
             after = last;
+            if !save(&client, &sweep, started, &after, None, now).await? {
+                return interrupted(report);
+            }
+            if last_page {
+                end = true;
+                break;
+            }
+        }
+        if !end {
+            if !save(&client, &sweep, started, &after, Some(now + STEP), now).await? {
+                return interrupted(report);
+            }
+            return Ok(report);
         }
     }
+    // Uploads are few: all of them at the end of the sweep.
     if rules.aborts_uploads() {
         let mut after = (String::new(), Uuid::nil());
         loop {
@@ -199,35 +289,35 @@ async fn run(app: &Arc<App>, bucket: &str, config: &str, now: SystemTime) -> any
                     "SELECT key, upload_id, initiated_at FROM multipart_uploads
                      WHERE bucket = $1 AND (key, upload_id) > ($2, $3)
                      ORDER BY key, upload_id LIMIT $4",
-                    &[&bucket, &after.0, &after.1, &PAGE],
+                    &[&sweep.bucket, &after.0, &after.1, &PAGE],
                 )
                 .await?;
             let Some(last) = rows.last() else { break };
             after = (last.get(0), last.get(1));
             for row in &rows {
                 let (key, upload_id): (String, Uuid) = (row.get(0), row.get(1));
-                if rules.aborts(&key, row.get(2), today) && abort(app, &client, bucket, &key, upload_id).await? {
+                if rules.aborts(&key, row.get(2), today) && abort(app, &client, &sweep.bucket, &key, upload_id).await? {
                     report.aborted += 1;
                 }
             }
-            if !extend(&client, bucket, config, now).await? {
-                report.interrupted = true;
-                return Ok(report);
-            }
         }
     }
+    let size = rules.expires_objects().then_some(sweep.seen);
+    if !finish(&client, &sweep, started, size, now).await? {
+        return interrupted(report);
+    }
+    report.finished = true;
     Ok(report)
 }
 
-/// The next page of the bucket's versions after the key `after`: each key's,
-/// newest first, and the last key in it. `None` past the last key. A page
-/// holds whole keys only, so it ends before a key it can't hold all of, or
-/// holds just that one, whole, if it's the first.
-async fn page(
-    client: &Object,
-    bucket: &str,
-    after: &str,
-) -> anyhow::Result<Option<(BTreeMap<String, Vec<Version>>, String)>> {
+/// The versions in a page: each key's, newest first.
+type Page = BTreeMap<String, Vec<Version>>;
+
+/// The next page of the bucket's versions after the key `after`, the last
+/// key in it, and whether it's the bucket's last page. `None` past the last
+/// key. A page holds whole keys only, so it ends before a key it can't hold
+/// all of, or holds just that one, whole, if it's the first.
+async fn page(client: &Object, bucket: &str, after: &str) -> anyhow::Result<Option<(Page, String, bool)>> {
     const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, last_modified";
     let rows = client
         .query_cached(
@@ -263,7 +353,8 @@ async fn page(
             rows.iter().for_each(|row| add(&mut versions, row));
         }
     }
-    Ok(versions.last_key_value().map(|(last, _)| last.clone()).map(|last| (versions, last)))
+    let last_page = (rows.len() as i64) < PAGE;
+    Ok(versions.last_key_value().map(|(last, _)| last.clone()).map(|last| (versions, last, last_page)))
 }
 
 /// Expires a batch of due versions (`cairn_lifecycle_expire`), counting

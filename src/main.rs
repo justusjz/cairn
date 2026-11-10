@@ -262,17 +262,27 @@ async fn maintain(app: Arc<App>) {
     }
 }
 
-/// Lifecycle rules, on every node: once a minute, the runs of buckets that
-/// are due (see `lifecycle`). Apart from `maintain`, since a run walks a
-/// whole bucket, which can take a while.
+/// Lifecycle rules, on every node: once a minute, the steps of buckets'
+/// sweeps that are due (see `lifecycle`). Apart from `maintain`, so that
+/// neither holds up the other.
 async fn apply_lifecycles(app: Arc<App>) {
     loop {
         tokio::time::sleep(MAINTENANCE_INTERVAL).await;
         let task_app = app.clone();
         // A task of its own, so that a panic (a bug) fails this pass, rather
-        // than ending lifecycle runs on this node.
+        // than ending lifecycle sweeps on this node.
         let pass = tokio::spawn(async move {
-            for result in lifecycle::pass(&task_app, std::time::SystemTime::now()).await {
+            // The database's clock, which every node shares, rather than this
+            // node's, which may be off: it decides what's due.
+            let now = match lifecycle::database_time(&task_app).await {
+                Ok(now) => now,
+                Err(e) => {
+                    eprintln!("lifecycle: pass failed: {e:#}");
+                    task_app.metrics.lifecycle_failed(format!("pass failed: {e:#}"));
+                    return;
+                }
+            };
+            for result in lifecycle::pass(&task_app, now).await {
                 match result {
                     Ok(report) => {
                         if !report.is_empty() {
@@ -281,8 +291,8 @@ async fn apply_lifecycles(app: Arc<App>) {
                         task_app.metrics.lifecycle_done(&report);
                     }
                     Err((bucket, e)) => {
-                        eprintln!("lifecycle: bucket {bucket}: run failed: {e:#}");
-                        task_app.metrics.lifecycle_failed(format!("bucket {bucket}: run failed: {e:#}"));
+                        eprintln!("lifecycle: bucket {bucket}: sweep failed: {e:#}");
+                        task_app.metrics.lifecycle_failed(format!("bucket {bucket}: sweep failed: {e:#}"));
                     }
                 }
             }

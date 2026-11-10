@@ -393,12 +393,20 @@ midnight UTC: an object written at 10:30 on the 1st, under a rule of one day,
 expires at the start of the 3rd.
 
 Rules are applied in the background, not as objects are read: an expired
-object stays readable until a run gets to it. A bucket's rules run when they're
-set, and then after every midnight UTC, on one node at a time, which walks the
-whole bucket. A version written or deleted since a run read it is never
-mistaken for the one that was due, and deleting (or changing) the configuration
-stops a run in progress before its next expiration. What runs did shows on the
-dashboard's Jobs page.
+object stays readable until a sweep gets to it, up to about a day after it
+became due (S3 also takes its time). A bucket with rules is swept once a day,
+starting when the rules are set: one node at a time walks it in small steps,
+a minute apart, sized so that a sweep takes about 20 hours, going by how many
+versions the last one found. So the load is spread across the day and across
+buckets, rather than coming all at once. A bucket's first sweep reads at most
+10,000 versions a minute, since there's no last sweep to go by yet.
+
+Where a sweep has got to is saved as it goes, so if its node dies, another
+picks it up from there within minutes. A version written or deleted since a
+sweep read it is never mistaken for the one that was due, and deleting (or
+changing) the configuration stops a sweep before its next expiration. Every
+node uses the database's clock, so a node whose clock is off doesn't expire
+anything early. What sweeps did shows on the dashboard's Jobs page.
 
 Not supported, and refused with `501 NotImplemented`: transitions to other
 storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one),
