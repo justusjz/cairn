@@ -64,5 +64,17 @@ Done:
 
 Smaller improvements, done when they're needed:
 
+- **A queue of due lifecycle actions**, so that lifecycle sweeps read only
+  what's due, instead of every version under the rules' prefixes each day.
+  Writes would add the actions their versions become due for (expire this
+  version on day D; remove that one, now noncurrent, on day E; …) to a table
+  indexed by due time, from the two catalog functions every write and delete
+  goes through (`cairn_put_version`, `cairn_delete_key`), and sweeps would
+  take what's due from it. Its entries would only be hints, checked again
+  when they're executed as expirations are now, so writes only ever add to
+  it. Changing a bucket's rules would hold up its writes while the change
+  commits (as changing versioning does), and rebuild its queue by one sweep
+  of today's kind, which would also stay as an occasional backstop. Worth it
+  once buckets with rules hold hundreds of millions of versions.
 - Compacting more eagerly as disks fill up.
 - Preferring locally held data when packing.

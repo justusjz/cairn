@@ -26,6 +26,11 @@ use crate::{
 
 const DAY: Duration = Duration::from_secs(24 * 3600);
 
+/// The prefixes of rules for every key.
+fn everything() -> Vec<String> {
+    vec![String::new()]
+}
+
 async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
 }
@@ -154,11 +159,13 @@ async fn a_failed_step_is_taken_up_where_it_got_to() {
     // Only what was after where it got to.
     assert_eq!((report.removed, report.finished), (500, true));
     assert_eq!(sweep_state(&app).await, (None, 0, Some(1500)));
-    // A new configuration starts a new sweep, from the start, paced by the
-    // last one's size: a page a step.
+    // A new configuration starts a new sweep, from the start, and forgets
+    // the last one's size, which was of the old rules' keys: it goes at a
+    // first sweep's pace.
     configure(&app, MARKERS).await;
+    assert_eq!(sweep_state(&app).await, (None, 0, None));
     let report = step_at(&app, Duration::from_secs(11 * 60)).await.unwrap();
-    assert_eq!((report.removed, report.finished), (999, false));
+    assert_eq!((report.removed, report.finished), (1000, true));
 }
 
 async fn versions(app: &App, key: &str) -> i64 {
@@ -176,9 +183,11 @@ async fn objects_expire_after_their_days() {
          <Expiration><Days>1</Days></Expiration></Rule>",
     )
     .await;
-    // Due right away, but nothing is a day old yet.
+    // Due right away, but nothing is a day old yet. It only read the keys
+    // under the rule's prefix.
     let report = run_in(&app, 0).await.unwrap();
     assert!(report.is_empty(), "{report}");
+    assert_eq!(sweep_state(&app).await, (None, 0, Some(1)));
     // Not due again until midnight.
     assert_eq!(run_in(&app, 0).await, None);
     let report = run_in(&app, 2).await.unwrap();
@@ -261,7 +270,7 @@ async fn a_version_written_since_is_not_expired() {
         .get(0);
     let rules = super::Configuration::from_json(&config).unwrap();
     let client = app.pool.get().await.unwrap();
-    let (versions, _, _) = page(&client, BUCKET, "").await.unwrap().unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "", &everything()).await.unwrap().unwrap();
     let due: Vec<_> = rules
         .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
         .into_iter()
@@ -281,7 +290,7 @@ async fn a_version_written_since_is_not_expired() {
         "<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>2</Days></Expiration></Rule>",
     )
     .await;
-    let (versions, _, _) = page(&client, BUCKET, "").await.unwrap().unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "", &everything()).await.unwrap().unwrap();
     let due: Vec<_> = rules
         .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
         .into_iter()
@@ -347,10 +356,29 @@ async fn a_page_holds_whole_keys() {
         .await
         .unwrap();
     put(&app, "b", vec![1]).await;
-    let (versions, last, last_page) = page(&client, BUCKET, "").await.unwrap().unwrap();
+    let (versions, last, last_page) = page(&client, BUCKET, "", &everything()).await.unwrap().unwrap();
     assert_eq!((last.as_str(), last_page), ("a", false));
     assert_eq!(versions["a"].len(), super::PAGE as usize + 5);
-    let (versions, last, last_page) = page(&client, BUCKET, "a").await.unwrap().unwrap();
+    let (versions, last, last_page) = page(&client, BUCKET, "a", &everything()).await.unwrap().unwrap();
     assert_eq!((versions.len(), last.as_str(), last_page), (1, "b", true));
-    assert!(page(&client, BUCKET, "b").await.unwrap().is_none());
+    assert!(page(&client, BUCKET, "b", &everything()).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_walk_goes_from_prefix_to_prefix() {
+    let Some(app) = node().await else { return };
+    for key in ["a/1", "b/1", "c/1", "c/2", "d/1"] {
+        put(&app, key, vec![1]).await;
+    }
+    let client = app.pool.get().await.unwrap();
+    let prefixes = ["a/".to_owned(), "c/".to_owned(), "e/".to_owned()];
+    let keys = |page: &super::Page| page.keys().cloned().collect::<Vec<_>>();
+    let (first, last, last_page) = page(&client, BUCKET, "", &prefixes).await.unwrap().unwrap();
+    assert_eq!((keys(&first), last.as_str(), last_page), (vec!["a/1".to_owned()], "a/1", false));
+    let (second, last, last_page) = page(&client, BUCKET, &last, &prefixes).await.unwrap().unwrap();
+    assert_eq!(keys(&second), ["c/1", "c/2"]);
+    // "e/" may have keys yet.
+    assert!(!last_page);
+    assert!(page(&client, BUCKET, &last, &prefixes).await.unwrap().is_none());
+    assert!(page(&client, BUCKET, "", &[]).await.unwrap().is_none());
 }

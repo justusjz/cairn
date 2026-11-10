@@ -57,8 +57,9 @@ const SWEEP: Duration = Duration::from_secs(24 * 3600);
 /// How many steps a sweep is spread over: 20 hours' worth, leaving some of
 /// the day for steps that come late.
 const SWEEP_STEPS: i64 = 1200;
-/// How many pages a step of a bucket's first sweep reads, before there's a
-/// last sweep to go by: 10,000 versions a minute, about 14 million a day.
+/// How many pages a step of a bucket's first sweep (of its rules) reads,
+/// before there's a last sweep to go by: 10,000 versions a minute, about 14
+/// million a day, and more once it has taken longer (see `Sweep::pages`).
 const FIRST_SWEEP_PAGES: i64 = 10;
 /// How many versions a sweep reads at a time.
 const PAGE: i64 = 1000;
@@ -118,12 +119,20 @@ struct Sweep {
 }
 
 impl Sweep {
-    /// How many pages a step reads, for the sweep to take `SWEEP_STEPS`.
-    fn pages(&self) -> i64 {
-        match self.size {
+    /// How many pages a step taken at `now` reads, for the sweep to take
+    /// `SWEEP_STEPS`. Going by the last sweep's size, if there was one, and
+    /// faster the longer the sweep has taken beyond that: once more for every
+    /// `SWEEP_STEPS` minutes it has run, so that it catches up, however far
+    /// off that size was (or the first sweep's guess).
+    fn pages(&self, now: SystemTime) -> i64 {
+        let base = match self.size {
             None => FIRST_SWEEP_PAGES,
-            Some(size) => (size / (PAGE * SWEEP_STEPS) + 1).max(1),
-        }
+            Some(size) => size / (PAGE * SWEEP_STEPS) + 1,
+        };
+        let pace = (SWEEP_STEPS as u64) * STEP.as_secs();
+        let elapsed = self.started.as_ref().and_then(|(started, _)| now.duration_since(*started).ok());
+        let overdue = elapsed.map_or(0, |elapsed| elapsed.as_secs() / pace) as i64;
+        base.saturating_mul(1 + overdue)
     }
 }
 
@@ -248,9 +257,11 @@ async fn step(app: &Arc<App>, mut sweep: Sweep, now: SystemTime) -> anyhow::Resu
         Ok(report)
     };
     if rules.expires_objects() {
+        // Only the keys some rule may expire.
+        let prefixes = rules.prefixes();
         let mut end = false;
-        for _ in 0..sweep.pages() {
-            let Some((versions, last, last_page)) = page(&client, &sweep.bucket, &after).await? else {
+        for _ in 0..sweep.pages(now) {
+            let Some((versions, last, last_page)) = page(&client, &sweep.bucket, &after, &prefixes).await? else {
                 end = true;
                 break;
             };
@@ -313,21 +324,56 @@ async fn step(app: &Arc<App>, mut sweep: Sweep, now: SystemTime) -> anyhow::Resu
 /// The versions in a page: each key's, newest first.
 type Page = BTreeMap<String, Vec<Version>>;
 
-/// The next page of the bucket's versions after the key `after`, the last
-/// key in it, and whether it's the bucket's last page. `None` past the last
-/// key. A page holds whole keys only, so it ends before a key it can't hold
-/// all of, or holds just that one, whole, if it's the first.
-async fn page(client: &Object, bucket: &str, after: &str) -> anyhow::Result<Option<(Page, String, bool)>> {
+/// The next page of the bucket's versions after the key `after`, under
+/// `prefixes` (in order, none under another, as `Configuration::prefixes`
+/// gives them), the last key in it, and whether it's the last page. `None`
+/// past the last key. A page holds whole keys only, so it ends before a key
+/// it can't hold all of, or holds just that one, whole, if it's the first.
+async fn page(
+    client: &Object,
+    bucket: &str,
+    after: &str,
+    prefixes: &[String],
+) -> anyhow::Result<Option<(Page, String, bool)>> {
     const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, last_modified";
-    let rows = client
-        .query_cached(
-            &format!(
-                "SELECT {COLUMNS} FROM objects WHERE bucket = $1 AND key > $2
-                 ORDER BY key, id DESC LIMIT $3"
-            ),
-            &[&bucket, &after, &PAGE],
-        )
-        .await?;
+    // The ranges of keys under the prefixes, from the first that isn't
+    // behind `after`: on to the next once one has no keys left.
+    let ranges: Vec<(&String, Option<String>)> =
+        prefixes.iter().map(|prefix| (prefix, rules::prefix_end(prefix))).collect();
+    let mut next = ranges.iter().position(|(_, end)| end.as_deref().is_none_or(|end| end > after));
+    let (rows, last_range) = loop {
+        let Some(i) = next.filter(|&i| i < ranges.len()) else { return Ok(None) };
+        next = Some(i + 1);
+        let (prefix, end) = &ranges[i];
+        let rows = match &end {
+            Some(end) => {
+                client
+                    .query_cached(
+                        &format!(
+                            "SELECT {COLUMNS} FROM objects
+                             WHERE bucket = $1 AND key > $2 AND key >= $3 AND key < $4
+                             ORDER BY key, id DESC LIMIT $5"
+                        ),
+                        &[&bucket, &after, prefix, end, &PAGE],
+                    )
+                    .await?
+            }
+            None => {
+                client
+                    .query_cached(
+                        &format!(
+                            "SELECT {COLUMNS} FROM objects WHERE bucket = $1 AND key > $2 AND key >= $3
+                             ORDER BY key, id DESC LIMIT $4"
+                        ),
+                        &[&bucket, &after, prefix, &PAGE],
+                    )
+                    .await?
+            }
+        };
+        if !rows.is_empty() {
+            break (rows, i + 1 == ranges.len());
+        }
+    };
     fn add(versions: &mut BTreeMap<String, Vec<Version>>, row: &tokio_postgres::Row) {
         versions.entry(row.get(0)).or_default().push(Version {
             id: row.get(1),
@@ -353,7 +399,7 @@ async fn page(client: &Object, bucket: &str, after: &str) -> anyhow::Result<Opti
             rows.iter().for_each(|row| add(&mut versions, row));
         }
     }
-    let last_page = (rows.len() as i64) < PAGE;
+    let last_page = last_range && (rows.len() as i64) < PAGE;
     Ok(versions.last_key_value().map(|(last, _)| last.clone()).map(|last| (versions, last, last_page)))
 }
 
@@ -437,3 +483,29 @@ async fn abort(app: &Arc<App>, client: &Object, bucket: &str, key: &str, upload_
 
 #[cfg(test)]
 mod e2e;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sweeps_that_run_late_catch_up() {
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let sweep = |size: Option<i64>, started: Option<SystemTime>| Sweep {
+            bucket: String::new(),
+            config: String::new(),
+            started: started.map(|started| (started, String::new())),
+            seen: 0,
+            size,
+        };
+        let pace = STEP * SWEEP_STEPS as u32;
+        // 20 hours of steps for its size.
+        assert_eq!(sweep(Some(10), None).pages(start), 1);
+        assert_eq!(sweep(Some(PAGE * SWEEP_STEPS * 3), None).pages(start), 4);
+        assert_eq!(sweep(None, None).pages(start), FIRST_SWEEP_PAGES);
+        // Then once more for every 20 hours it's been going.
+        assert_eq!(sweep(Some(10), Some(start)).pages(start + pace / 2), 1);
+        assert_eq!(sweep(Some(10), Some(start)).pages(start + pace), 2);
+        assert_eq!(sweep(None, Some(start)).pages(start + pace * 3), FIRST_SWEEP_PAGES * 4);
+    }
+}

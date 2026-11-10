@@ -319,6 +319,26 @@ impl Configuration {
         self.enabled().any(|r| r.expiration.is_some() || r.noncurrent_expiration.is_some())
     }
 
+    /// The prefixes a sweep has to walk for the rules that expire objects or
+    /// versions: those of their keys, in order, none under another (just the
+    /// empty one, if one covers every key).
+    pub fn prefixes(&self) -> Vec<String> {
+        let mut prefixes: Vec<&str> = self
+            .enabled()
+            .filter(|r| r.expiration.is_some() || r.noncurrent_expiration.is_some())
+            .map(|r| r.filter.prefix.as_str())
+            .collect();
+        prefixes.sort_unstable();
+        let mut kept: Vec<String> = Vec::new();
+        for prefix in prefixes {
+            // Sorted, a prefix comes right before what it covers.
+            if !kept.last().is_some_and(|last| prefix.starts_with(last.as_str())) {
+                kept.push(prefix.to_owned());
+            }
+        }
+        kept
+    }
+
     /// Whether any rule aborts uploads.
     pub fn aborts_uploads(&self) -> bool {
         self.enabled().any(|r| r.abort_upload_days.is_some())
@@ -593,7 +613,22 @@ impl Expiration {
     }
 }
 
-/// A version of a key, as a lifecycle run reads it.
+/// The least text that sorts after every text starting with `prefix`, or
+/// `None` if there's none (or the prefix is empty): as `cairn_prefix_end`
+/// works it out, by code points, which is byte order in UTF-8.
+pub fn prefix_end(prefix: &str) -> Option<String> {
+    let mut chars: Vec<char> = prefix.chars().collect();
+    while let Some(last) = chars.pop() {
+        // The next code point that's a char, skipping the surrogates.
+        if let Some(next) = (last as u32 + 1..=0x10FFFF).find_map(char::from_u32) {
+            chars.push(next);
+            return Some(chars.into_iter().collect());
+        }
+    }
+    None
+}
+
+/// A version of a key, as a lifecycle sweep reads it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Version {
     /// Its row id, which grows with the order versions were written in.
@@ -899,6 +934,33 @@ mod tests {
         );
         // The current version never is.
         assert_eq!(rules.due("a", &versions[..1], Day(first.0 + 30)), vec![]);
+    }
+
+    #[test]
+    fn sweeps_walk_the_rules_prefixes() {
+        let rule = |id: &str, prefix: &str, action: &str| {
+            format!("<Rule><ID>{id}</ID><Prefix>{prefix}</Prefix><Status>Enabled</Status>{action}</Rule>")
+        };
+        let expire = "<Expiration><Days>1</Days></Expiration>";
+        let abort = "<AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation>\
+                     </AbortIncompleteMultipartUpload>";
+        let rules = parse(&[
+            rule("a", "logs/", expire),
+            rule("b", "logs/app/", expire),
+            rule("c", "tmp/", expire),
+            rule("d", "logs0", expire),
+            rule("e", "uploads/", abort),
+        ]
+        .concat())
+        .unwrap();
+        assert_eq!(rules.prefixes(), ["logs/", "logs0", "tmp/"]);
+        let everything = parse(&[rule("a", "logs/", expire), rule("b", "", expire)].concat()).unwrap();
+        assert_eq!(everything.prefixes(), [""]);
+        assert_eq!(prefix_end("logs/").as_deref(), Some("logs0"));
+        assert_eq!(prefix_end("a\u{10FFFF}").as_deref(), Some("b"));
+        assert_eq!(prefix_end("a\u{D7FF}").as_deref(), Some("a\u{E000}"));
+        assert_eq!(prefix_end("\u{10FFFF}"), None);
+        assert_eq!(prefix_end(""), None);
     }
 
     #[test]

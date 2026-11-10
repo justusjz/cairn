@@ -1259,8 +1259,8 @@ $$;
 
 -- T18: PutBucketLifecycleConfiguration and DeleteBucketLifecycle: sets (or,
 -- with NULL, removes) the bucket's lifecycle configuration, and starts a new
--- sweep of it now. (The size of the last sweep stays: it's the bucket's.) A
--- plain UPDATE of the bucket's row, as T16's: no invariant involves the
+-- sweep of it now. (The size of the last sweep goes: it's of the keys under
+-- the old rules' prefixes.) A plain UPDATE of the bucket's row, as T16's: no invariant involves the
 -- configuration, which a sweep checks itself (T17). Returns whether the
 -- bucket exists.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_set_lifecycle(p_bucket text, p_config text)
@@ -1268,7 +1268,8 @@ RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE buckets SET lifecycle = p_config,
                        lifecycle_due = CASE WHEN p_config IS NULL THEN NULL ELSE now() END,
-                       lifecycle_cursor = NULL, lifecycle_started = NULL, lifecycle_seen = 0
+                       lifecycle_cursor = NULL, lifecycle_started = NULL, lifecycle_seen = 0,
+                       lifecycle_size = NULL
     WHERE name = p_bucket;
     RETURN FOUND;
 END

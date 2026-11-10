@@ -395,7 +395,8 @@ expires at the start of the 3rd.
 Rules are applied in the background, not as objects are read: an expired
 object stays readable until a sweep gets to it, up to about a day after it
 became due (S3 also takes its time). A bucket with rules is swept once a day,
-starting when the rules are set: one node at a time walks it in small steps,
+starting when the rules are set: one node at a time walks it (only the keys
+under the prefixes of rules that expire anything) in small steps,
 a minute apart, sized so that a sweep takes about 20 hours, going by how many
 versions the last one found. So the load is spread across the day and across
 buckets, rather than coming all at once. A bucket's first sweep reads at most
