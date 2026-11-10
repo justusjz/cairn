@@ -33,6 +33,7 @@ mod listing;
 mod locking;
 mod metadata;
 mod multipart;
+mod post_object;
 
 /// The bucket every test node has.
 pub const BUCKET: &str = "bucket";

@@ -643,7 +643,7 @@ async fn buckets_have_default_keys() {
 
 /// Lets Cairn itself use exactly `keys`, as the KMS's admin grants SSE-S3's
 /// key: a policy on Cairn's own entity.
-async fn allow_cairn(app: &App, keys: &[&str]) {
+pub(super) async fn allow_cairn(app: &App, keys: &[&str]) {
     let kms = app.kms.as_ref().unwrap();
     let entity = kms.identify(Identity::Cairn).await.unwrap();
     assert_eq!(kms.cairn_entity(), Some(entity.clone()));

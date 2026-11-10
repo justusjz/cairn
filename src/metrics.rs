@@ -99,6 +99,8 @@ impl Op {
                 }
                 Method::GET => Op::ListObjects,
                 Method::POST if has("delete") => Op::DeleteObjects,
+                // POST Object.
+                Method::POST if crate::s3::objects::post::is_form(headers) => Op::PutObject,
                 _ => Op::Bucket,
             };
         }

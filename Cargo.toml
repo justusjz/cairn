@@ -41,6 +41,8 @@ rustls = { version = "0.23.46", default-features = false, features = ["ring", "s
 webpki-roots = "1.0.11"
 ring = "0.17"
 hkdf = "0.13.0"
+multer = { version = "3.1", default-features = false }
+futures-core = "0.3.34"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

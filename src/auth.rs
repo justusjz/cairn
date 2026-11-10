@@ -324,7 +324,7 @@ const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 
 /// Parses an `x-amz-date` (`YYYYMMDDTHHMMSSZ`, UTC) into Unix seconds; `None` if
 /// it isn't in exactly that form or names an impossible date/time.
-fn parse_amz_date(s: &str) -> Option<i64> {
+pub(crate) fn parse_amz_date(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
         return None;
@@ -586,6 +586,80 @@ fn verify_presigned_at(
     )
 }
 
+/// The signature of a POST Object form (see `s3::objects::post`): its policy
+/// signed with SigV4, in the fields `x-amz-algorithm`, `x-amz-credential`,
+/// `x-amz-date` and `x-amz-signature`.
+#[derive(Debug)]
+pub struct PostSignature {
+    pub access_key: String,
+    date: String,
+    region: String,
+    service: String,
+    /// The `policy` field, base64, as sent: what's signed.
+    policy: String,
+    signature: String,
+}
+
+impl PostSignature {
+    /// The signature a form's fields (`field` by lowercase name) carry, or
+    /// why they don't carry one. Its time has to be its credential's day; the
+    /// policy's expiration bounds how long it's valid, not the clock skew.
+    pub fn from_fields<'a>(field: impl Fn(&str) -> Option<&'a str>) -> Result<PostSignature, Rejection> {
+        let parameters_error = |message: &str| {
+            Rejection::new(StatusCode::BAD_REQUEST, "AuthorizationQueryParametersError", message)
+        };
+        let (Some(policy), Some(signature)) = (field("policy"), field("x-amz-signature")) else {
+            return Err(Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", "the form is not signed"));
+        };
+        if field("x-amz-algorithm") != Some("AWS4-HMAC-SHA256") {
+            return Err(parameters_error("X-Amz-Algorithm only supports \"AWS4-HMAC-SHA256\""));
+        }
+        let credential = field("x-amz-credential").unwrap_or("");
+        let mut parts = credential.split('/');
+        let (Some(access_key), Some(date), Some(region), Some(service), Some("aws4_request"), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next(), parts.next(), parts.next())
+        else {
+            return Err(parameters_error(
+                "Error parsing the X-Amz-Credential parameter; the Credential is mal-formed; \
+                 expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".",
+            ));
+        };
+        let datetime = field("x-amz-date").unwrap_or("");
+        if parse_amz_date(datetime).is_none() || datetime[..8] != *date {
+            return Err(Rejection::new(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "the form's x-amz-date is malformed or doesn't match its credential scope",
+            ));
+        }
+        Ok(PostSignature {
+            access_key: access_key.to_owned(),
+            date: date.to_owned(),
+            region: region.to_owned(),
+            service: service.to_owned(),
+            policy: policy.to_owned(),
+            signature: signature.to_owned(),
+        })
+    }
+
+    /// Checks the signature of the policy under the key `secret` derives for
+    /// the credential's scope.
+    pub fn verify(&self, secret: &str) -> Result<(), Rejection> {
+        let key = derive_signing_key(secret, &self.date, &self.region, &self.service);
+        let mismatch = || {
+            Rejection::new(
+                StatusCode::FORBIDDEN,
+                "SignatureDoesNotMatch",
+                "The request signature we calculated does not match the signature you provided.",
+            )
+        };
+        let sig = hex_decode(&self.signature).ok_or_else(mismatch)?;
+        let mut mac = HmacSha256::new_from_slice(&key).expect("any key length");
+        mac.update(self.policy.as_bytes());
+        mac.verify_slice(&sig).map_err(|_| mismatch())
+    }
+}
+
 /// Checks the signature of the canonical request the parts make, under the
 /// key `secret` derives for the credential's scope.
 #[allow(clippy::too_many_arguments)]
@@ -620,7 +694,7 @@ fn check_signature(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use hyper::HeaderMap;
 
@@ -890,5 +964,65 @@ mod tests {
         assert!(!test_verifier().verify_chunk(EMPTY_SHA256, &"0".repeat(64)));
         // a non-hex / wrong-length signature is rejected too
         assert!(!test_verifier().verify_chunk(EMPTY_SHA256, "nothex"));
+    }
+
+    /// AWS's example POST policy (sigv4-post-example), base64, as signed.
+    pub(crate) const AWS_POST_POLICY: &str = "eyAiZXhwaXJhdGlvbiI6ICIyMDE1LTEyLTMwVDEyOjAwOjAwLjAwMFoiLA0KICAiY29uZGl0aW9ucyI6IFsNCiAgICB7ImJ1Y2tldCI6ICJzaWd2NGV4YW1wbGVidWNrZXQifSwNCiAgICBbInN0YXJ0cy13aXRoIiwgIiRrZXkiLCAidXNlci91c2VyMS8iXSwNCiAgICB7ImFjbCI6ICJwdWJsaWMtcmVhZCJ9LA0KICAgIHsic3VjY2Vzc19hY3Rpb25fcmVkaXJlY3QiOiAiaHR0cDovL3NpZ3Y0ZXhhbXBsZWJ1Y2tldC5zMy5hbWF6b25hd3MuY29tL3N1Y2Nlc3NmdWxfdXBsb2FkLmh0bWwifSwNCiAgICBbInN0YXJ0cy13aXRoIiwgIiRDb250ZW50LVR5cGUiLCAiaW1hZ2UvIl0sDQogICAgeyJ4LWFtei1tZXRhLXV1aWQiOiAiMTQzNjUxMjM2NTEyNzQifSwNCiAgICB7IngtYW16LXNlcnZlci1zaWRlLWVuY3J5cHRpb24iOiAiQUVTMjU2In0sDQogICAgWyJzdGFydHMtd2l0aCIsICIkeC1hbXotbWV0YS10YWciLCAiIl0sDQoNCiAgICB7IngtYW16LWNyZWRlbnRpYWwiOiAiQUtJQUlPU0ZPRE5ON0VYQU1QTEUvMjAxNTEyMjkvdXMtZWFzdC0xL3MzL2F3czRfcmVxdWVzdCJ9LA0KICAgIHsieC1hbXotYWxnb3JpdGhtIjogIkFXUzQtSE1BQy1TSEEyNTYifSwNCiAgICB7IngtYW16LWRhdGUiOiAiMjAxNTEyMjlUMDAwMDAwWiIgfQ0KICBdDQp9";
+
+    /// The fields of AWS's example form, with `changed` replacing some.
+    fn aws_post_form(changed: &[(&'static str, &'static str)]) -> Vec<(&'static str, &'static str)> {
+        let mut fields = vec![
+            ("policy", AWS_POST_POLICY),
+            ("x-amz-algorithm", "AWS4-HMAC-SHA256"),
+            ("x-amz-credential", "AKIAIOSFODNN7EXAMPLE/20151229/us-east-1/s3/aws4_request"),
+            ("x-amz-date", "20151229T000000Z"),
+            ("x-amz-signature", "8afdbf4008c03f22c2cd3cdb72e4afbb1f6a588f3255ac628749a66d7f09699e"),
+        ];
+        for (name, value) in changed {
+            fields.retain(|(n, _)| n != name);
+            if !value.is_empty() {
+                fields.push((name, value));
+            }
+        }
+        fields
+    }
+
+    fn post_signature(fields: &[(&'static str, &'static str)]) -> Result<PostSignature, Rejection> {
+        PostSignature::from_fields(|name| fields.iter().find(|(n, _)| *n == name).map(|(_, v)| *v))
+    }
+
+    #[test]
+    fn verifies_aws_post_example() {
+        let signature = post_signature(&aws_post_form(&[])).unwrap();
+        assert_eq!(signature.access_key, "AKIAIOSFODNN7EXAMPLE");
+        assert_eq!(signature.verify(AWS_SECRET), Ok(()));
+        let code = |r: Result<(), Rejection>| r.unwrap_err().code;
+        assert_eq!(code(signature.verify("other")), "SignatureDoesNotMatch");
+        // Another policy, or another day's key.
+        let other = post_signature(&aws_post_form(&[("policy", "e30=")])).unwrap();
+        assert_eq!(code(other.verify(AWS_SECRET)), "SignatureDoesNotMatch");
+        let other = post_signature(&aws_post_form(&[
+            ("x-amz-credential", "AKIAIOSFODNN7EXAMPLE/20151230/us-east-1/s3/aws4_request"),
+            ("x-amz-date", "20151230T000000Z"),
+        ]))
+        .unwrap();
+        assert_eq!(code(other.verify(AWS_SECRET)), "SignatureDoesNotMatch");
+        let bad = post_signature(&aws_post_form(&[("x-amz-signature", "nothex")])).unwrap();
+        assert_eq!(code(bad.verify(AWS_SECRET)), "SignatureDoesNotMatch");
+    }
+
+    #[test]
+    fn refuses_malformed_post_signatures() {
+        let code = |changed: &[(&'static str, &'static str)]| post_signature(&aws_post_form(changed)).unwrap_err().code;
+        assert_eq!(code(&[("policy", "")]), "AccessDenied");
+        assert_eq!(code(&[("x-amz-signature", "")]), "AccessDenied");
+        assert_eq!(code(&[("x-amz-algorithm", "")]), "AuthorizationQueryParametersError");
+        assert_eq!(code(&[("x-amz-algorithm", "AWS4-HMAC-SHA1")]), "AuthorizationQueryParametersError");
+        assert_eq!(code(&[("x-amz-credential", "")]), "AuthorizationQueryParametersError");
+        assert_eq!(code(&[("x-amz-credential", "AKID/20151229/us-east-1/s3")]), "AuthorizationQueryParametersError");
+        assert_eq!(code(&[("x-amz-credential", "AKID/20151229/us-east-1/s3/aws4_request/x")]), "AuthorizationQueryParametersError");
+        assert_eq!(code(&[("x-amz-date", "")]), "AccessDenied");
+        assert_eq!(code(&[("x-amz-date", "20151229")]), "AccessDenied");
+        assert_eq!(code(&[("x-amz-date", "20151230T000000Z")]), "AccessDenied");
     }
 }

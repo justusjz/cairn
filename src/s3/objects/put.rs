@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
+use hyper::{Response, StatusCode, body::Body, body::Bytes, header};
 
 use crate::db::Cached;
 use crate::{
@@ -14,19 +14,24 @@ use crate::{
     s3::versions::current_object,
 };
 
+/// PutObject, and POST Object (see `post`), whose body is a part of a form.
 #[allow(clippy::too_many_arguments)]
-pub async fn put_object(
+pub async fn put_object<B>(
     app: &Arc<App>,
     bucket: &str,
     key: &str,
     content_type: &str,
     metadata: &str,
-    body: Incoming,
+    body: B,
     payload: Payload,
     conditions: &Preconditions,
     wanted: Wanted<'_>,
     role: Option<uuid::Uuid>,
-) -> anyhow::Result<Response<Full<Bytes>>> {
+) -> anyhow::Result<Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     // Fast-fail a conditional write (If-Match / If-None-Match) before streaming the
     // body, so a client "create if absent" against an existing key doesn't upload
     // the whole object just to be rejected. This is only an optimization — the

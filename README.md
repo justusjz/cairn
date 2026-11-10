@@ -226,6 +226,18 @@ supported: `aws s3 presign` makes SigV2 URLs unless its config has
 `signature_version = s3v4` under `s3`. For an SSE-C object, the URL has to be
 signed with the key's headers, and the client has to send them.
 
+**POST Object** (browser-based uploads) works as in S3: a `multipart/form-data`
+form posted to a bucket, with a POST policy signed with a role's credentials
+(SigV4, as boto3's `generate_presigned_post` makes them), uploads its file as
+that role, if the policy allows the form: until its expiration, with a key
+under a prefix, say, or of a size in `content-length-range`. A file over the
+size is refused as soon as it's over. The form's fields are what a PutObject's
+headers would be (content headers, `x-amz-meta-*`, checksums, SSE-S3, SSE-KMS,
+SSE-C, which is exempt from the policy's conditions, as in MinIO), and every
+one of them must be in the policy. `success_action_status` and
+`success_action_redirect` say how to answer. There are no CORS headers yet, so
+a browser can post a form, but not with `fetch` from another site.
+
 > [!NOTE]
 > Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,

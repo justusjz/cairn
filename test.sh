@@ -61,7 +61,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=102
+TOTAL=103
 STEP=0
 PASS=0
 FAIL=0
@@ -382,6 +382,34 @@ k = mac(("AWS4" + secret).encode(), datestamp)
 k = mac(mac(mac(k, region), "s3"), "aws4_request")
 sts = f"AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{hashlib.sha256(canonical.encode()).hexdigest()}"
 print(f"{u.scheme}://{u.netloc}{u.path}?{query}&X-Amz-Signature={hmac.new(k, sts.encode(), hashlib.sha256).hexdigest()}")
+PYEOF
+
+# POST Object: signs a form's policy as botocore's generate_presigned_post
+# does, and prints its fields, one `name=value` a line: post-sign.py <bucket>
+# <key> <max-size> [name=value...], each extra field covered by an eq condition.
+POST_SIGNER="$WORK_DIR/post-sign.py"
+cat >"$POST_SIGNER" <<'PYEOF'
+import sys, hashlib, hmac, json, base64
+from datetime import datetime, timedelta, timezone
+
+bucket, key, max_size = sys.argv[1], sys.argv[2], int(sys.argv[3])
+extra = [a.split("=", 1) for a in sys.argv[4:]]
+secret, region, akid = "cairnsecret", "us-east-1", "testkey"
+now = datetime.now(timezone.utc)
+amzdate, datestamp = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
+credential = f"{akid}/{datestamp}/{region}/s3/aws4_request"
+conditions = [{"bucket": bucket}, ["content-length-range", 0, max_size]]
+conditions += [{k: v} for k, v in extra]
+conditions.append(["starts-with", "$key", key[:-len("${filename}")]] if key.endswith("${filename}") else {"key": key})
+conditions += [{"x-amz-algorithm": "AWS4-HMAC-SHA256"}, {"x-amz-credential": credential}, {"x-amz-date": amzdate}]
+expiration = (now + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+policy = base64.b64encode(json.dumps({"expiration": expiration, "conditions": conditions}).encode()).decode()
+def mac(k, m): return hmac.new(k, m.encode(), hashlib.sha256).digest()
+k = mac(mac(mac(mac(("AWS4" + secret).encode(), datestamp), region), "s3"), "aws4_request")
+fields = [("key", key)] + extra + [("x-amz-algorithm", "AWS4-HMAC-SHA256"), ("x-amz-credential", credential),
+          ("x-amz-date", amzdate), ("policy", policy), ("x-amz-signature", hmac.new(k, policy.encode(), hashlib.sha256).hexdigest())]
+for name, value in fields:
+    print(f"{name}={value}")
 PYEOF
 
 # scurl <method> <pathquery> <payload-hash> <bodyfile|-> [extra "Header: val"...]
@@ -1257,6 +1285,26 @@ presigned_ok() {
     s3 del "s3://${BUCKET}/pre/up.txt" >/dev/null 2>&1
 }
 
+# POST Object: a form signed with a policy uploads with nothing but curl,
+# under its key prefix (the file's name for ${filename}), with the response
+# it asks for; a file over the policy's size is refused, and so is a form
+# signed with another secret.
+post_object_ok() {
+    local url="http://${SERVER_HOST}:${SERVER_PORT}/${BUCKET}" args=() line out="$WORK_DIR/post.out" code
+    while IFS= read -r line; do args+=(--form-string "$line"); done \
+        < <(python3 "$POST_SIGNER" "$BUCKET" 'post/${filename}' 100000 success_action_status=201 Content-Type=text/plain)
+    [ "${#args[@]}" -gt 0 ] || return 1
+    code=$(curl -s -o "$out" -w '%{http_code}' "${args[@]}" -F "file=@$SMALL;filename=small.txt" "$url")
+    [ "$code" = 201 ] && grep -q "<Key>post/small.txt</Key>" "$out" || return 1
+    check_roundtrip "$SMALL" "s3://${BUCKET}/post/small.txt" || return 1
+    code=$(curl -s -o "$out" -w '%{http_code}' "${args[@]}" -F "file=@$BIG;filename=big.bin" "$url")
+    [ "$code" = 400 ] && grep -q "<Code>EntityTooLarge</Code>" "$out" || return 1
+    args=("${args[@]/x-amz-signature=/x-amz-signature=0}")
+    code=$(curl -s -o "$out" -w '%{http_code}' "${args[@]}" -F "file=@$SMALL;filename=other.txt" "$url")
+    [ "$code" = 403 ] && grep -q "<Code>SignatureDoesNotMatch</Code>" "$out" || return 1
+    s3 del "s3://${BUCKET}/post/small.txt" >/dev/null 2>&1
+}
+
 # Operations Cairn doesn't implement are refused (501), not run as the plain
 # PUT/DELETE/GET they'd otherwise route to: the object and the bucket survive.
 unsupported_subresources_refused() {
@@ -2048,6 +2096,7 @@ run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
 run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
 run_test    "Presigned GET/PUT, response headers"   presigned_ok
+run_test    "POST Object with a signed policy"      post_object_ok
 run_test    "Listing parameters as in S3"           listing_parameters_ok
 run_test    "Request IDs in headers and errors"     request_id_ok
 run_test    "If-Match 404, chunked, ranges, names"  s3_details_ok

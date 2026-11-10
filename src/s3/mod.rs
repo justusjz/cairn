@@ -52,6 +52,7 @@ pub(crate) mod sse;
 pub(crate) mod sse_c;
 pub(crate) mod multipart;
 pub(crate) mod objects;
+pub(crate) mod post_policy;
 pub(crate) mod util;
 pub(crate) mod versions;
 
@@ -96,7 +97,13 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     app: Arc<App>,
 ) -> anyhow::Result<Response<ResBody>> {
-    // Authenticate every S3 request up front: look up the role the SigV4
+    // POST Object: a form posted to a bucket, which is signed in its body,
+    // not its headers (see `objects::post`).
+    if req.method() == Method::POST && objects::post::is_form(req.headers()) {
+        let path = req.uri().path().trim_start_matches('/').to_owned();
+        return Ok(box_response(objects::post::post_object(&app, req, &path).await?));
+    }
+    // Authenticate every other S3 request up front: look up the role the SigV4
     // credential names and verify the header signature with its secret. Needs
     // only the method/URI/query/headers, so it runs before any body is read. The
     // peer endpoint is a separate service and stays open for internal traffic.

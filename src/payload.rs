@@ -40,6 +40,8 @@ pub struct Payload {
     content_length: Option<u64>,
     /// The most data the body may hold (see `at_most`).
     max: Option<u64>,
+    /// The least data it may hold (see `at_least`).
+    min: Option<u64>,
     /// How many bytes of data have been decoded.
     decoded: u64,
     /// The SHA-256 of the body as sent, and the hex one it claims.
@@ -66,6 +68,11 @@ fn bad_request(code: &'static str, message: impl Into<String>) -> Rejection {
 /// S3's 400 for an upload over its size limit.
 pub fn too_large() -> Rejection {
     bad_request("EntityTooLarge", "Your proposed upload exceeds the maximum allowed size.")
+}
+
+/// S3's 400 for an upload under the size a POST policy requires.
+pub fn too_small() -> Rejection {
+    bad_request("EntityTooSmall", "Your proposed upload is smaller than the minimum allowed object size.")
 }
 
 fn bad_digest(algorithm: Algorithm) -> Rejection {
@@ -210,6 +217,7 @@ impl Payload {
             decoded_length: None,
             content_length: None,
             max: None,
+            min: None,
             decoded: 0,
             sha256: None,
             md5: None,
@@ -232,6 +240,13 @@ impl Payload {
         }
         self.max = Some(max);
         Ok(self)
+    }
+
+    /// Requires an upload's data to be at least `min` bytes, as a POST
+    /// policy can (see `s3::post_policy`): refused once it's all in.
+    pub fn at_least(mut self, min: u64) -> Payload {
+        self.min = Some(min);
+        self
     }
 
     /// Takes the next `chunk` of the body as sent, and returns the data in it.
@@ -267,6 +282,9 @@ impl Payload {
     /// its raw bytes.
     pub fn finish(self) -> Result<Option<(Algorithm, Vec<u8>)>, Rejection> {
         let mut checked = None;
+        if self.min.is_some_and(|min| self.decoded < min) {
+            return Err(too_small());
+        }
         if let Some(decoder) = &self.decoder {
             if !decoder.is_complete() || self.decoded_length != Some(self.decoded) {
                 return Err(bad_request(
@@ -403,6 +421,18 @@ mod tests {
         }
         payload.finish()?;
         Ok(data)
+    }
+
+    #[test]
+    fn requires_enough_data() {
+        let unsigned = ("x-amz-content-sha256", "UNSIGNED-PAYLOAD");
+        let read = |body: &[u8]| {
+            let mut payload = Payload::new(&headers(&[unsigned]), "secret", true).unwrap().at_least(4);
+            payload.decode(Bytes::copy_from_slice(body)).unwrap();
+            payload.finish()
+        };
+        assert!(read(b"data").is_ok());
+        assert_eq!(read(b"dat").unwrap_err().code, "EntityTooSmall");
     }
 
     #[test]
