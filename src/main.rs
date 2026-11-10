@@ -37,6 +37,7 @@ mod e2e;
 mod encryption;
 mod gc;
 mod kms;
+mod lifecycle;
 mod metrics;
 mod packer;
 mod payload;
@@ -168,6 +169,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     });
     tokio::spawn(heartbeat(app.clone(), peer_url));
     tokio::spawn(maintain(app.clone()));
+    tokio::spawn(apply_lifecycles(app.clone()));
     // The roles' identities in the KMS, now rather than in a minute.
     let identifying = app.clone();
     tokio::spawn(async move {
@@ -257,6 +259,38 @@ async fn maintain(app: Arc<App>) {
             app.metrics.maintenance_failed(format!("pass failed: {e}"));
         }
         app.metrics.pass_finished();
+    }
+}
+
+/// Lifecycle rules, on every node: once a minute, the runs of buckets that
+/// are due (see `lifecycle`). Apart from `maintain`, since a run walks a
+/// whole bucket, which can take a while.
+async fn apply_lifecycles(app: Arc<App>) {
+    loop {
+        tokio::time::sleep(MAINTENANCE_INTERVAL).await;
+        let task_app = app.clone();
+        // A task of its own, so that a panic (a bug) fails this pass, rather
+        // than ending lifecycle runs on this node.
+        let pass = tokio::spawn(async move {
+            for result in lifecycle::pass(&task_app, std::time::SystemTime::now()).await {
+                match result {
+                    Ok(report) => {
+                        if !report.is_empty() {
+                            eprintln!("lifecycle: {report}");
+                        }
+                        task_app.metrics.lifecycle_done(&report);
+                    }
+                    Err((bucket, e)) => {
+                        eprintln!("lifecycle: bucket {bucket}: run failed: {e:#}");
+                        task_app.metrics.lifecycle_failed(format!("bucket {bucket}: run failed: {e:#}"));
+                    }
+                }
+            }
+        });
+        if let Err(e) = pass.await {
+            eprintln!("lifecycle pass failed: {e}");
+            app.metrics.lifecycle_failed(format!("pass failed: {e}"));
+        }
     }
 }
 

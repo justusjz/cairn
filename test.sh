@@ -1153,7 +1153,8 @@ acl_ok() {
 }
 
 # Bucket sub-resource stubs: location/versioning succeed (200, empty config);
-# policy/cors/tagging/lifecycle are "not configured" (the client errors on 404).
+# policy/cors/tagging are "not configured" (the client errors on 404), and so
+# is lifecycle, until one is set.
 subresource_stubs_ok() {
     awss3 s3api get-bucket-location --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     awss3 s3api get-bucket-versioning --bucket "$BUCKET" >/dev/null 2>&1 || return 1
@@ -1161,6 +1162,28 @@ subresource_stubs_ok() {
     ! awss3 s3api get-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+}
+
+# A lifecycle configuration is bucket management (admin-only): writer can't
+# set one; the admin can, and it reads back, rule ID and all. Transitions are
+# refused (501), and the configuration can be deleted again.
+lifecycle_config_ok() {
+    local doc="$WORK_DIR/lifecycle.json" glacier="$WORK_DIR/lifecycle-glacier.json"
+    printf '%s' '{"Rules":[{"ID":"expire-logs","Filter":{"Prefix":"logs/"},"Status":"Enabled",
+        "Expiration":{"Days":30},"NoncurrentVersionExpiration":{"NoncurrentDays":7}}]}' > "$doc"
+    printf '%s' '{"Rules":[{"ID":"cold","Filter":{},"Status":"Enabled",
+        "Transitions":[{"Days":30,"StorageClass":"GLACIER"}]}]}' > "$glacier"
+    ! as_role writer writersecret s3api put-bucket-lifecycle-configuration --bucket "$VBUCKET" \
+        --lifecycle-configuration "file://$doc" >/dev/null 2>&1 || return 1
+    ! awss3 s3api put-bucket-lifecycle-configuration --bucket "$VBUCKET" \
+        --lifecycle-configuration "file://$glacier" >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-lifecycle-configuration --bucket "$VBUCKET" \
+        --lifecycle-configuration "file://$doc" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-lifecycle-configuration --bucket "$VBUCKET" \
+        --query 'Rules[0].[ID,Filter.Prefix,Expiration.Days,NoncurrentVersionExpiration.NoncurrentDays]' \
+        --output text 2>/dev/null)" = "$(printf 'expire-logs\tlogs/\t30\t7')" ] || return 1
+    awss3 s3api delete-bucket-lifecycle --bucket "$VBUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$VBUCKET" >/dev/null 2>&1
 }
 
 # ListMultipartUploads: aws-cli lists an incomplete upload under its prefix,
@@ -2072,6 +2095,7 @@ run_test    "DeleteBucket on non-empty bucket rejected" delete_nonempty_bucket_r
 run_test    "Deleted parts reaped without the GC"   immediate_reap_ok
 run_test    "Multipart leftovers reaped without GC" multipart_reap_ok
 run_test    "Enable versioning (admin-only)"         versioning_enable_ok
+run_test    "Lifecycle configuration (admin-only)"   lifecycle_config_ok
 run_test    "Versioned overwrite keeps old version"  versioned_overwrite_ok
 run_test    "Delete adds a delete marker"            delete_marker_ok
 run_test    "Deleting versions promotes the next"    delete_version_promotes_ok

@@ -425,7 +425,7 @@ export interface components {
         EventReport: {
             error: boolean;
             message: string;
-            /** @description `gc`, `packer` or `maintenance`. */
+            /** @description `gc`, `packer`, `lifecycle` or `maintenance`. */
             source: string;
             /** Format: double */
             time: number;

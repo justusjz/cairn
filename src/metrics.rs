@@ -309,6 +309,17 @@ impl Metrics {
         m.event("packer", true, message);
     }
 
+    /// A bucket's lifecycle run: an event, if it did anything.
+    pub fn lifecycle_done(&self, report: &crate::lifecycle::Report) {
+        if !report.is_empty() {
+            self.maintenance.lock().unwrap().event("lifecycle", false, report.to_string());
+        }
+    }
+
+    pub fn lifecycle_failed(&self, message: String) {
+        self.maintenance.lock().unwrap().event("lifecycle", true, message);
+    }
+
     pub fn maintenance_failed(&self, message: String) {
         self.maintenance
             .lock()
@@ -457,7 +468,7 @@ pub struct PackerTotals {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct EventReport {
     pub time: f64,
-    /// `gc`, `packer` or `maintenance`.
+    /// `gc`, `packer`, `lifecycle` or `maintenance`.
     pub source: String,
     pub error: bool,
     pub message: String,

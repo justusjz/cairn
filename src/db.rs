@@ -188,6 +188,7 @@ const MIGRATIONS: &[&str] = &[
     BUCKET_ENCRYPTION,
     SSE_S3,
     CHECKSUMS,
+    LIFECYCLE,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -827,6 +828,15 @@ ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_checksum CHECK (
     AND (checksum_type IS NULL OR checksum_type IN ('FULL_OBJECT', 'COMPOSITE'))
 ) NOT VALID;
 ALTER TABLE parts ADD COLUMN checksum text;
+"#;
+
+/// Migration 20: buckets' lifecycle configurations (see `lifecycle`): the
+/// rules, as JSON, and when the bucket's next lifecycle run is due, which a
+/// node claims it by moving forward. NULL for a bucket without rules.
+const LIFECYCLE: &str = r#"
+ALTER TABLE buckets ADD COLUMN lifecycle text;
+ALTER TABLE buckets ADD COLUMN lifecycle_due timestamptz;
+CREATE INDEX buckets_lifecycle_due ON buckets (lifecycle_due) WHERE lifecycle IS NOT NULL;
 "#;
 
 #[cfg(test)]

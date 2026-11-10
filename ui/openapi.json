@@ -1153,7 +1153,7 @@
           },
           "source": {
             "type": "string",
-            "description": "`gc`, `packer` or `maintenance`."
+            "description": "`gc`, `packer`, `lifecycle` or `maintenance`."
           },
           "time": {
             "type": "number",

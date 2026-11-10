@@ -353,8 +353,56 @@ aws s3api copy-object --bucket my-bucket --key some/key \
     --copy-source 'my-bucket/some/key?versionId=<version id>'
 ```
 
-Old versions take up space until they're deleted. There are no lifecycle rules
-yet to expire them automatically.
+Old versions take up space until they're deleted, by hand or by
+[lifecycle rules](#lifecycle-rules).
+
+## Lifecycle rules
+
+A bucket's lifecycle configuration expires objects automatically, as in S3.
+Setting one is bucket management, so only an admin can (a role that may only
+write can't make its writes expire, nor stop an admin's rules):
+
+```sh
+aws s3api put-bucket-lifecycle-configuration --bucket my-bucket \
+    --lifecycle-configuration '{"Rules": [{
+        "ID": "logs", "Filter": {"Prefix": "logs/"}, "Status": "Enabled",
+        "Expiration": {"Days": 30},
+        "NoncurrentVersionExpiration": {"NoncurrentDays": 7}}]}'
+aws s3api get-bucket-lifecycle-configuration --bucket my-bucket
+aws s3api delete-bucket-lifecycle --bucket my-bucket
+```
+
+What a rule can do:
+
+- **`Expiration`** with `Days` or a `Date`: the current version expires that
+  many days after it was written, or from that date on. Expiring is a delete,
+  as DeleteObject's: the object is gone in an unversioned bucket, and gets a
+  delete marker in a versioned one, keeping it as a noncurrent version.
+- **`Expiration`** with `ExpiredObjectDeleteMarker`: a delete marker that's
+  the only version of its key left is removed.
+- **`NoncurrentVersionExpiration`**: a noncurrent version is removed for good
+  `NoncurrentDays` after it became noncurrent (a newer version, or a delete
+  marker, was written), keeping the `NewerNoncurrentVersions` newest ones.
+- **`AbortIncompleteMultipartUpload`**: an upload is aborted
+  `DaysAfterInitiation` days after it was started.
+
+A rule's `Filter` picks objects by key prefix (`Prefix`), and by size
+(`ObjectSizeGreaterThan`, `ObjectSizeLessThan`; not for delete markers or
+uploads), alone or under `And`. As in S3, days are counted to the next
+midnight UTC: an object written at 10:30 on the 1st, under a rule of one day,
+expires at the start of the 3rd.
+
+Rules are applied in the background, not as objects are read: an expired
+object stays readable until a run gets to it. A bucket's rules run when they're
+set, and then after every midnight UTC, on one node at a time, which walks the
+whole bucket. A version written or deleted since a run read it is never
+mistaken for the one that was due, and deleting (or changing) the configuration
+stops a run in progress before its next expiration. What runs did shows on the
+dashboard's Jobs page.
+
+Not supported, and refused with `501 NotImplemented`: transitions to other
+storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one),
+and filters on tags (Cairn doesn't keep object tags).
 
 ## Limits
 

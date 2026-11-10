@@ -100,12 +100,6 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
             "NoSuchTagSet",
             "there is no tag set associated with the bucket",
         ))
-    } else if present("lifecycle") {
-        Some(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchLifecycleConfiguration",
-            "the lifecycle configuration does not exist",
-        ))
     } else {
         None
     }
@@ -267,7 +261,8 @@ const SUBRESOURCES: &[&str] = &[
 fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'static str] {
     match (bucket_level, method) {
         // ListObjectVersions, ListMultipartUploads, versioning, encryption,
-        // ownership controls (`acl`), and the stubs (`bucket_subresource_stub`).
+        // lifecycle, ownership controls (`acl`), and the stubs
+        // (`bucket_subresource_stub`).
         (true, &Method::GET) => &[
             "versioning",
             "encryption",
@@ -282,11 +277,12 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "tagging",
             "lifecycle",
         ],
-        // PutBucketVersioning, PutBucketEncryption, PutBucketAcl (`acl`).
-        (true, &Method::PUT) => &["versioning", "encryption", "acl"],
+        // PutBucketVersioning, PutBucketEncryption,
+        // PutBucketLifecycleConfiguration, PutBucketAcl (`acl`).
+        (true, &Method::PUT) => &["versioning", "encryption", "lifecycle", "acl"],
         (true, &Method::POST) => &["delete"],
-        // DeleteBucketEncryption.
-        (true, &Method::DELETE) => &["encryption"],
+        // DeleteBucketEncryption, DeleteBucketLifecycle.
+        (true, &Method::DELETE) => &["encryption", "lifecycle"],
         // GetObjectAcl (stubbed), ListParts.
         (false, &Method::GET) => &["acl", "uploadId"],
         // UploadPart / UploadPartCopy, PutObjectAcl (`acl`).
@@ -502,6 +498,8 @@ mod tests {
             (Method::GET, true, "uploads&prefix=a"),
             (Method::GET, true, "policy"),
             (Method::PUT, true, "versioning"),
+            (Method::PUT, true, "lifecycle"),
+            (Method::DELETE, true, "lifecycle"),
             (Method::PUT, true, ""),
             (Method::POST, true, "delete"),
             (Method::DELETE, true, ""),

@@ -51,6 +51,10 @@ Done:
   (projects, say), since a single kind of admin role isn't enough. Open: how
   dashboard users relate to S3 roles.
 
+- **Lifecycle transitions.** Moving objects between storage classes by
+  lifecycle rules, once Cairn has more than one (erasure-coded storage, say).
+  Expiration rules are done.
+
 ## Later
 
 - **Erasure coding.** Converting data to an erasure-coded layout in the
