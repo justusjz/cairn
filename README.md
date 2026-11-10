@@ -24,7 +24,7 @@ The schema is created automatically; just point Cairn at an empty database.
 
 Download the static binary from the
 [releases page](https://github.com/justusjz/cairn/releases) and extract it
-(replace `<version>` with the release you downloaded, e.g. `0.4.2`, and
+(replace `<version>` with the release you downloaded, e.g. `0.4.3`, and
 `x86_64` with `aarch64` on 64-bit ARM):
 
 ```sh
