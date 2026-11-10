@@ -17,6 +17,7 @@ use crate::{
     body::{FrameSender, ResBody, box_response, channel_body},
     encryption::{Key, Opener, Salt, segment_range},
     s3::conditional::{Precondition, Preconditions, not_modified},
+    s3::checksums::{ChecksumKey, Storing, StoredChecksum},
     s3::metadata,
     s3::sse::{self, Stored},
     s3::sse_c::CustomerKey,
@@ -42,6 +43,8 @@ pub(crate) struct ObjectVersion {
     pub lm_epoch: i64,
     /// The `x-amz-version-id` to report.
     pub version_id: Option<String>,
+    /// Its checksum, as it's stored (see `s3::checksums`), if it has one.
+    pub checksum: Option<StoredChecksum>,
 }
 
 /// Why a read found nothing to read. Each read reports it differently.
@@ -111,7 +114,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
                     floor(extract(epoch FROM o.last_modified))::bigint,
                     o.version_id, o.is_delete_marker, b.versioning, o.metadata, o.sse_c_key,
                     o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed, o.sse_kms_context,
-                    o.sse_s3
+                    o.sse_s3, o.checksum_algorithm, o.checksum_type, o.checksum
              FROM objects o JOIN buckets b ON b.name = o.bucket
              WHERE o.bucket = $1 AND o.key = $2
                AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",
@@ -144,6 +147,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
         last_modified_iso: row.get(5),
         lm_epoch: row.get(6),
         version_id: reported,
+        checksum: StoredChecksum::from_row(&row, 17),
     }))
 }
 
@@ -174,6 +178,7 @@ pub async fn get_object(
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
     role: Option<uuid::Uuid>,
+    checksum_mode: bool,
 ) -> anyhow::Result<Response<ResBody>> {
     let mut client = app.pool.get().await?;
     // Read the metadata, the ordered parts, and each part's locations in one
@@ -197,6 +202,7 @@ pub async fn get_object(
         last_modified,
         lm_epoch,
         version_id,
+        checksum,
         ..
     } = version;
     // An SSE-C object only with its key; before the conditions, which would
@@ -264,6 +270,10 @@ pub async fn get_object(
         .header(header::LAST_MODIFIED, last_modified);
     let builder = metadata::apply(builder, &metadata);
     let builder = sse::echo(builder, &encryption, customer_key);
+    let builder = match checksum.filter(|_| checksum_mode && !partial) {
+        Some(checksum) => checksum_headers(builder, &checksum, object_key.as_deref())?,
+        None => builder,
+    };
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,
@@ -623,6 +633,8 @@ pub async fn head_object(
     range_header: Option<&str>,
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
+    role: Option<uuid::Uuid>,
+    checksum_mode: bool,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     let ObjectVersion {
@@ -634,6 +646,7 @@ pub async fn head_object(
         last_modified,
         lm_epoch,
         version_id,
+        checksum,
         ..
     } = match lookup_version(&client, bucket, key, version_id).await? {
         Ok(version) => version,
@@ -682,6 +695,21 @@ pub async fn head_object(
         .header(header::LAST_MODIFIED, last_modified);
     let builder = metadata::apply(builder, &metadata);
     let builder = sse::echo(builder, &encryption, customer_key);
+    // Its checksum, if asked for: an encrypted one's sealed under its key,
+    // which, for an SSE-KMS one, is only asked of the KMS then.
+    let builder = match checksum.filter(|_| checksum_mode && !partial) {
+        Some(checksum) => {
+            let object_key = match encryption {
+                Stored::Plain => None,
+                _ => match sse::open(app, &encryption, customer_key, role, bucket, key).await? {
+                    Ok(object_key) => object_key,
+                    Err(refused) => return Ok(refused),
+                },
+            };
+            checksum_headers(builder, &checksum, object_key.as_deref())?
+        }
+        None => builder,
+    };
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,
@@ -691,4 +719,20 @@ pub async fn head_object(
         builder.status(StatusCode::OK)
     };
     Ok(with_version_id(builder.body(Full::new(Bytes::new())).unwrap(), version_id.as_deref()))
+}
+
+/// An object's checksum, as a read with `x-amz-checksum-mode: ENABLED` tells
+/// it (S3 tells none for a range): opened with its object key, if it's
+/// encrypted.
+fn checksum_headers(
+    builder: hyper::http::response::Builder,
+    checksum: &StoredChecksum,
+    object_key: Option<&Key>,
+) -> anyhow::Result<hyper::http::response::Builder> {
+    let checksum_key = object_key.map(ChecksumKey::new);
+    let storing = match &checksum_key {
+        Some(checksum_key) => Storing::Sealed(checksum_key),
+        None => Storing::Plain,
+    };
+    Ok(checksum.read(&storing)?.headers(builder))
 }

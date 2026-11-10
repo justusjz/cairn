@@ -63,7 +63,8 @@ async fn commit_object(tx: &Transaction<'_>, app: &App, blob: Uuid, key: &str) -
     tx.query_one(
         "SELECT status FROM pg_temp.cairn_commit_object(
              $1, ARRAY[$2::int], 0, 0, 65536, 0, 'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
-             $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, false, false, NULL, $5)",
+             $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, false,
+             NULL, NULL, NULL, false, NULL, $5)",
         &[&blob, &app.node, &BUCKET, &key, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -103,7 +104,7 @@ async fn copy_object(
 ) -> String {
     let size: i64 = source.2.iter().sum();
     tx.query_one(
-        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, NULL, NULL, NULL, NULL, false, $7)",
+        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, false, $7)",
         &[&source.0, &source.1, &source.2, &BUCKET, &key, &size, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -239,6 +240,7 @@ async fn a_conditional_write_decides_again_if_the_object_changed() {
             metadata: String::new(),
             conditions: crate::s3::conditional::Preconditions::from_headers(&headers),
             sealing: None,
+            checksum: crate::e2e::OBJECT_CHECKSUM,
         };
         let body = Full::new(hyper::body::Bytes::from_static(b"two"));
         crate::upload_part(&app2, body, &attach, Payload::unchecked()).await.unwrap()
@@ -353,7 +355,7 @@ async fn a_copy_after_a_delete_finds_the_source_changed() {
 
 /// Creates an upload for `key`, returning its ID.
 async fn create_upload(app: &App, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", Wanted::Plain, None).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", Wanted::Plain, None, None).await.unwrap();
     let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -368,6 +370,7 @@ async fn upload_part(app: &Arc<App>, upload_id: Uuid, number: i32, data: &[u8]) 
         part_number: number,
         key: None,
         sse_s3: false,
+        checksum: crate::e2e::PART_CHECKSUM,
     };
     let body = http_body_util::Full::new(hyper::body::Bytes::from(data.to_vec()));
     crate::upload_part(app, body, &attach, Payload::unchecked())
@@ -389,7 +392,7 @@ async fn a_part_upload_waits_for_complete() {
     let status: String = tx
         .query_one(
             "SELECT status FROM pg_temp.cairn_complete_upload(
-                 $1, $2, 'k', ARRAY(SELECT id FROM parts WHERE upload_id = $1), '{1}', $3, false, NULL, 'x')",
+                 $1, $2, 'k', ARRAY(SELECT id FROM parts WHERE upload_id = $1), '{1}', $3, NULL, NULL, NULL, false, NULL, 'x')",
             &[&upload_id, &BUCKET, &format!("{etag}-1")],
         )
         .await
@@ -538,6 +541,7 @@ async fn a_put_into_a_missing_bucket_writes_nothing() {
         metadata: String::new(),
         conditions: crate::s3::conditional::Preconditions::default(),
         sealing: None,
+        checksum: crate::e2e::OBJECT_CHECKSUM,
     };
     let body = http_body_util::Full::new(hyper::body::Bytes::from_static(b"data"));
     let result = crate::upload_part(&app, body, &attach, Payload::unchecked())

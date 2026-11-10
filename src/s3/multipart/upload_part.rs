@@ -7,7 +7,7 @@ use uuid::Uuid;
 use crate::{
     App, AttachTarget, UploadResult,
     payload::Payload,
-    s3::multipart::upload_encryption,
+    s3::multipart::upload,
     s3::sse,
     s3::sse_c::CustomerKey,
     s3::util::{format_s3_error, rejection_response},
@@ -54,13 +54,29 @@ pub async fn put_part(
     // only fail to stage at commit (the FK would reject it anyway). It must also
     // belong to the request's bucket/key: authorization only checked that bucket.
     // Its encryption never changes, so it's checked here, once.
-    let Some(encryption) = upload_encryption(app, &upload_id, bucket, key).await? else {
+    let Some(upload) = upload(app, &upload_id, bucket, key).await? else {
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchUpload",
             "the specified multipart upload does not exist",
         ));
     };
+    // An upload of an algorithm takes parts with checksums of it only (S3
+    // requires them; MinIO's 400).
+    if let Some((algorithm, _)) = upload.checksum
+        && payload.declared_algorithm() != Some(algorithm)
+    {
+        let got = payload.declared_algorithm().map_or("", |a| a.name());
+        return Ok(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            &format!(
+                "Invalid arguments provided for {bucket}/{key}: (checksum missing, want \"{}\", got \"{got}\")",
+                algorithm.name()
+            ),
+        ));
+    }
+    let encryption = upload.encryption.clone();
     if let Err(refused) = sse::check(&encryption, customer_key) {
         return Ok(refused);
     }
@@ -79,15 +95,21 @@ pub async fn put_part(
             part_number,
             key: upload_key,
             sse_s3: matches!(encryption, sse::Stored::S3(_)),
+            checksum: upload.part_checksum(),
         },
         payload,
     )
     .await?
     {
-        UploadResult::Committed { etag, .. } => {
+        UploadResult::Committed { etag, sent, .. } => {
             let builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, format!("\"{etag}\""));
+            // The checksum the client sent, as S3 echoes it.
+            let builder = match &sent {
+                Some(sent) => builder.header(sent.algorithm.header(), &sent.value),
+                None => builder,
+            };
             let builder = sse::echo(builder, &encryption, customer_key);
             Ok(builder.body(Full::new(Bytes::new())).unwrap())
         }

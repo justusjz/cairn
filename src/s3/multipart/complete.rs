@@ -15,7 +15,8 @@ use crate::{
     blobs::{ReapTarget, reap_blobs, reap_columns},
     db,
     s3::conditional::Preconditions,
-    s3::multipart::upload_encryption,
+    s3::checksums::{self, Algorithm, Checksum, ChecksumKey, Storing, Type},
+    s3::multipart::{Upload, checksum_columns, upload},
     s3::sse::{self, Stored},
     s3::sse_c::CustomerKey,
     s3::util::{format_s3_error, slow_down, with_version_id, xml_escape, xml_ok},
@@ -27,6 +28,8 @@ enum CompleteOutcome {
         bucket: String,
         key: String,
         etag: String,
+        /// The object's checksum, if it has one.
+        checksum: Option<Checksum>,
         /// Locations of the blobs freed by replacing the old version and by
         /// dropping the staged parts the client left out, to reap after commit.
         reap: Vec<ReapTarget>,
@@ -48,13 +51,42 @@ enum CompleteOutcome {
     Stale,
     /// An ETag couldn't be had (its key from the KMS, say): the response.
     Refused(Response<Full<Bytes>>),
+    /// The checksum it claims for the object isn't the object's.
+    BadDigest(Algorithm),
 }
 
-/// Parses a CompleteMultipartUpload body into (part_number, unquoted-etag) pairs,
-/// namespace-agnostically. Returns None on malformed XML.
-fn parse_complete_request(body: &str) -> Option<Vec<(i32, String)>> {
+/// The keys a completion may need: the client's, for an SSE-C upload's
+/// checksums, and the role the KMS is asked as, for an SSE-KMS one's.
+#[derive(Clone, Copy)]
+struct Keys<'a> {
+    customer: Option<&'a CustomerKey>,
+    role: Option<Uuid>,
+}
+
+/// What a CompleteMultipartUpload asks for.
+struct Request<'a> {
+    listed: &'a Listed,
+    claimed: &'a Claimed,
+    preconditions: &'a Preconditions,
+}
+
+/// The parts a CompleteMultipartUpload lists: each one's number, ETag, and
+/// the checksums listed with it.
+struct Listed {
+    numbers_and_etags: Vec<(i32, String)>,
+    checksums: Vec<Vec<(Algorithm, String)>>,
+}
+
+/// What a CompleteMultipartUpload claims about its object's checksum (see
+/// `checksums::claimed`).
+pub type Claimed = Option<checksums::Claim>;
+
+/// Parses a CompleteMultipartUpload body into its parts, namespace-
+/// agnostically. Returns None on malformed XML.
+fn parse_complete_request(body: &str) -> Option<Listed> {
     let doc = roxmltree::Document::parse(body).ok()?;
     let mut parts = Vec::new();
+    let mut checksums = Vec::new();
     for part in doc.descendants().filter(|n| n.tag_name().name() == "Part") {
         let part_number: i32 = part
             .children()
@@ -71,14 +103,25 @@ fn parse_complete_request(body: &str) -> Option<Vec<(i32, String)>> {
             .trim_matches('"')
             .to_owned();
         parts.push((part_number, etag));
+        checksums.push(
+            Algorithm::ALL
+                .into_iter()
+                .filter_map(|algorithm| {
+                    let element = algorithm.element();
+                    let value = part.children().find(|n| n.tag_name().name() == element)?.text()?;
+                    Some((algorithm, value.trim().to_owned()))
+                })
+                .collect(),
+        );
     }
-    Some(parts)
+    Some(Listed { numbers_and_etags: parts, checksums })
 }
 
 /// CompleteMultipartUpload: `POST /{bucket}/{key}?uploadId=U` with a part-list
 /// body. Assembles the listed parts into the object atomically. A retry of a
 /// completion that went through (its response lost, say) is answered as it
 /// was, as long as the version it made is still there.
+#[allow(clippy::too_many_arguments)]
 pub async fn complete_multipart_upload(
     app: &Arc<App>,
     bucket: &str,
@@ -87,6 +130,8 @@ pub async fn complete_multipart_upload(
     body: Bytes,
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
+    role: Option<Uuid>,
+    claimed: Claimed,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
@@ -105,8 +150,8 @@ pub async fn complete_multipart_upload(
             "request body is not valid UTF-8",
         ));
     };
-    let requested = match parse_complete_request(body_str) {
-        Some(parts) if !parts.is_empty() => parts,
+    let listed = match parse_complete_request(body_str) {
+        Some(listed) if !listed.numbers_and_etags.is_empty() => listed,
         _ => {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
@@ -115,6 +160,7 @@ pub async fn complete_multipart_upload(
             ));
         }
     };
+    let requested = &listed.numbers_and_etags;
     // S3 requires the parts in ascending (and thus distinct) part-number order.
     if !requested.windows(2).all(|w| w[0].0 < w[1].0) {
         return Ok(format_s3_error(
@@ -124,23 +170,39 @@ pub async fn complete_multipart_upload(
         ));
     }
 
-    // The object gets its upload's encryption; an SSE-C key isn't needed. One
-    // given must be the upload's (a retry, whose upload is gone, isn't checked).
-    let encryption = upload_encryption(app, &upload_id, bucket, key).await?;
-    if let (Some(encryption), Some(_)) = (&encryption, customer_key)
-        && let Err(refused) = sse::check(encryption, customer_key)
-    {
-        return Ok(refused);
+    // The object gets its upload's encryption; an SSE-C key isn't needed,
+    // unless the upload has an algorithm, whose checksums are sealed under
+    // it (S3 needs it then; MinIO's 400). One given must be the upload's (a
+    // retry, whose upload is gone, isn't checked).
+    let upload = upload(app, &upload_id, bucket, key).await?;
+    if let Some(upload) = &upload {
+        if matches!(upload.encryption, Stored::Customer { .. }) && upload.checksum.is_some() && customer_key.is_none() {
+            return Ok(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "Requests specifying Server Side Encryption with Customer provided keys must provide an \
+                 appropriate secret key.",
+            ));
+        }
+        if customer_key.is_some()
+            && let Err(refused) = sse::check(&upload.encryption, customer_key)
+        {
+            return Ok(refused);
+        }
     }
+    let encryption = upload.as_ref().map(|upload| upload.encryption.clone());
+    let keys = Keys { customer: customer_key, role };
     let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
-        let attempt = try_complete(app, &mut client, bucket, key, &upload_id, &requested, preconditions, encryption.as_ref());
+        let request = Request { listed: &listed, claimed: &claimed, preconditions };
+        let attempt = try_complete(app, &mut client, bucket, key, &upload_id, &request, upload.as_ref(), keys);
         match attempt.await {
             Ok(CompleteOutcome::Done {
                 bucket,
                 key,
                 etag,
+                checksum,
                 reap,
                 version_id,
             }) => {
@@ -148,11 +210,12 @@ pub async fn complete_multipart_upload(
                 let body = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                      <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-                     <Bucket>{}</Bucket><Key>{}</Key><ETag>\"{}\"</ETag>\
+                     <Bucket>{}</Bucket><Key>{}</Key><ETag>\"{}\"</ETag>{}\
                      </CompleteMultipartUploadResult>",
                     xml_escape(&bucket),
                     xml_escape(&key),
                     xml_escape(&etag),
+                    checksum.as_ref().map_or(String::new(), Checksum::xml),
                 );
                 let response = with_version_id(xml_ok(body), version_id.as_deref());
                 // A retry's upload is gone, but its version tells.
@@ -211,6 +274,7 @@ pub async fn complete_multipart_upload(
                     "at least one of the preconditions you specified did not hold",
                 ));
             }
+            Ok(CompleteOutcome::BadDigest(algorithm)) => return Ok(checksums::bad_digest(algorithm)),
             Ok(CompleteOutcome::Stale) => continue,
             Ok(CompleteOutcome::Refused(refused)) => return Ok(refused),
             Err(e) if e.downcast_ref::<tokio_postgres::Error>().is_some_and(db::is_conflict) => continue,
@@ -237,9 +301,40 @@ fn combined_etag(listed: &[(i32, String)]) -> Option<String> {
     Some(format!("{hex}-{}", listed.len()))
 }
 
+/// Whether the checksum a completion claims (if any) is `checksum`: of its
+/// algorithm and type, and its value. S3's BadDigest otherwise.
+fn check_claim(claimed: &Claimed, checksum: Option<&Checksum>) -> Option<CompleteOutcome> {
+    let (algorithm, value, kind) = claimed.as_ref()?;
+    let matches = checksum.is_some_and(|checksum| {
+        checksum.algorithm == *algorithm
+            && kind.is_none_or(|kind| kind == checksum.kind)
+            && checksums::matches(checksum, value)
+    });
+    (!matches).then_some(CompleteOutcome::BadDigest(*algorithm))
+}
+
+/// The key the checksums of an object (or upload) encrypted as `stored` are
+/// sealed under, if it's encrypted, or why it can't be had. `None` too for an
+/// SSE-C one without its key given (whose checksums can't be read).
+async fn checksum_key(
+    app: &App,
+    stored: &Stored,
+    keys: Keys<'_>,
+    bucket: &str,
+    key: &str,
+) -> anyhow::Result<Result<Option<ChecksumKey>, Response<Full<Bytes>>>> {
+    if matches!(stored, Stored::Customer { .. }) && keys.customer.is_none() {
+        return Ok(Ok(None));
+    }
+    Ok(sse::open(app, stored, keys.customer, keys.role, bucket, key)
+        .await?
+        .map(|object_key| object_key.map(|object_key| ChecksumKey::new(&object_key))))
+}
+
 /// The completion a retry repeats, whose upload is gone: the version it made,
 /// if that's still there and has the ETag the `combined` listed parts give,
 /// answered as it was; or else, there's no such upload.
+#[allow(clippy::too_many_arguments)]
 async fn completed(
     app: &App,
     client: &Object,
@@ -247,12 +342,15 @@ async fn completed(
     key: &str,
     upload_id: &Uuid,
     combined: Option<&str>,
+    claimed: &Claimed,
+    keys: Keys<'_>,
 ) -> anyhow::Result<CompleteOutcome> {
     let Some(combined) = combined else { return Ok(CompleteOutcome::NoSuchUpload) };
     let row = client
         .query_opt_cached(
             "SELECT o.etag, o.version_id, b.versioning, o.sse_c_key, o.sse_kms_key_id,
-                    o.sse_kms_data_key, o.sse_kms_sealed, o.sse_kms_context, o.sse_s3
+                    o.sse_kms_data_key, o.sse_kms_sealed, o.sse_kms_context, o.sse_s3,
+                    o.checksum_algorithm, o.checksum_type, o.checksum
              FROM objects o JOIN buckets b ON b.name = o.bucket
              WHERE o.bucket = $1 AND o.key = $2 AND o.upload_id = $3 LIMIT 1",
             &[&bucket, &key, upload_id],
@@ -267,11 +365,31 @@ async fn completed(
     if etag != combined {
         return Ok(CompleteOutcome::NoSuchUpload);
     }
+    // Its checksum, as it was answered with (an SSE-C one's only with its
+    // key, which the retry needn't give).
+    let checksum = match (checksum_columns(&row, 9), row.get::<_, Option<&str>>(11)) {
+        (Some((algorithm, kind)), Some(value)) => {
+            let value = match &stored {
+                Stored::Plain => Some(value.to_owned()),
+                _ => match checksum_key(app, &stored, keys, bucket, key).await? {
+                    Ok(Some(checksum_key)) => Some(checksum_key.open(value)?),
+                    Ok(None) => None,
+                    Err(refused) => return Ok(CompleteOutcome::Refused(refused)),
+                },
+            };
+            value.map(|value| Checksum { algorithm, kind, value })
+        }
+        _ => None,
+    };
+    if let Some(bad) = check_claim(claimed, checksum.as_ref()) {
+        return Ok(bad);
+    }
     let versioning: &str = row.get(2);
     Ok(CompleteOutcome::Done {
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         etag,
+        checksum,
         reap: Vec::new(),
         version_id: if versioning == "enabled" { row.get(1) } else { None },
     })
@@ -295,11 +413,46 @@ async fn completed_encryption(
     Ok(row.map_or(Stored::Plain, |row| Stored::from_row(&row, 0)))
 }
 
+/// A part staged under the upload, as the completion needs it.
+struct Staged {
+    id: i64,
+    /// Its ETag and checksum as clients know them (opened, if they're
+    /// sealed).
+    etag: String,
+    checksum: Option<String>,
+    /// Its plaintext's size.
+    size: u64,
+}
+
+/// The object's checksum, from its `parts`' (in order), if it gets one
+/// (`upload.object_checksum`) and they all have theirs: COMPOSITE, or
+/// FULL_OBJECT, combined (see `s3::checksums`).
+fn object_checksum(upload: &Upload, parts: &[&Staged]) -> anyhow::Result<Option<Checksum>> {
+    let Some((algorithm, kind)) = upload.object_checksum() else { return Ok(None) };
+    let mut raws = Vec::with_capacity(parts.len());
+    for part in parts {
+        let Some(value) = &part.checksum else { return Ok(None) };
+        let raw = algorithm
+            .decode(value)
+            .ok_or_else(|| anyhow::anyhow!("a stored {} checksum isn't one", algorithm.name()))?;
+        raws.push(raw);
+    }
+    let value = match kind {
+        Type::Composite => checksums::composite(algorithm, &raws),
+        Type::FullObject => checksums::encode(&checksums::combine_all(
+            algorithm,
+            raws.iter().zip(parts).map(|(raw, part)| (raw.as_slice(), part.size)),
+        )),
+    };
+    Ok(Some(Checksum { algorithm, kind, value }))
+}
+
 /// One attempt at the completion (`cairn_complete_upload`): matches the
-/// listed parts against the upload's (`encryption`, `None` if it's gone) by
-/// their ETags, which only Cairn can read (an SSE-S3 upload's are sealed),
-/// works out the object's ETag, and decides a conditional completion; the
-/// transaction checks that what this decided on is still so.
+/// listed parts against the upload's (`None` if it's gone) by their ETags and
+/// checksums, which only Cairn can read (an SSE-S3 upload's ETags are sealed,
+/// an encrypted one's checksums), works out the object's ETag and checksum,
+/// and decides a conditional completion; the transaction checks that what
+/// this decided on is still so.
 #[allow(clippy::too_many_arguments)]
 async fn try_complete(
     app: &App,
@@ -307,23 +460,50 @@ async fn try_complete(
     bucket: &str,
     key: &str,
     upload_id: &Uuid,
-    requested: &[(i32, String)],
-    preconditions: &Preconditions,
-    encryption: Option<&Stored>,
+    request: &Request<'_>,
+    upload: Option<&Upload>,
+    keys: Keys<'_>,
 ) -> anyhow::Result<CompleteOutcome> {
+    let requested = &request.listed.numbers_and_etags;
     let combined = combined_etag(requested);
-    let Some(encryption) = encryption else {
-        return completed(app, client, bucket, key, upload_id, combined.as_deref()).await;
+    let Some(upload) = upload else {
+        return completed(app, client, bucket, key, upload_id, combined.as_deref(), request.claimed, keys).await;
     };
+    let encryption = &upload.encryption;
     let etag_key = match sse::etag_key(app, encryption, bucket, key).await? {
         Ok(etag_key) => etag_key,
         Err(refused) => return Ok(CompleteOutcome::Refused(refused)),
     };
-    // The upload's staged parts, by number, with their ETags as clients know
-    // them.
+    // The key its checksums are sealed under, if they are, and there are
+    // any (`complete_multipart_upload` checked that an SSE-C one's is given).
+    let checksum_key = match (encryption, upload.object_checksum()) {
+        (Stored::Plain, _) | (_, None) => None,
+        _ => match checksum_key(app, encryption, keys, bucket, key).await? {
+            Ok(checksum_key) => checksum_key,
+            Err(refused) => return Ok(CompleteOutcome::Refused(refused)),
+        },
+    };
+    // How its checksums are stored: an encrypted one's only ever sealed. One
+    // whose key isn't had can't have checksums read or stored (it gets none:
+    // `complete_multipart_upload` sees that an SSE-C one of an algorithm
+    // comes with its key).
+    let storing = match (&checksum_key, encryption) {
+        (Some(checksum_key), _) => Some(Storing::Sealed(checksum_key)),
+        (None, Stored::Plain) => Some(Storing::Plain),
+        (None, _) => None,
+    };
+    anyhow::ensure!(
+        storing.is_some() || upload.object_checksum().is_none(),
+        "an encrypted upload's checksums can't be had without its key"
+    );
+    // The upload's staged parts, by number, with their ETags and checksums
+    // as clients know them.
     let mut staged = HashMap::new();
     for row in client
-        .query_cached("SELECT part_number, id, etag FROM parts WHERE upload_id = $1", &[upload_id])
+        .query_cached(
+            "SELECT part_number, id, etag, checksum, coalesce(plain_size, size) FROM parts WHERE upload_id = $1",
+            &[upload_id],
+        )
         .await?
     {
         let etag: String = row.get(2);
@@ -331,20 +511,47 @@ async fn try_complete(
             Some(etag_key) => etag_key.open(&etag)?,
             None => etag,
         };
-        staged.insert(row.get::<_, i32>(0), (row.get::<_, i64>(1), etag));
+        // A part's checksum is only had where the object gets one.
+        let checksum = match (row.get::<_, Option<&str>>(3), &storing) {
+            (Some(stored), Some(storing)) if upload.object_checksum().is_some() => Some(storing.read(stored)?),
+            _ => None,
+        };
+        let size = row.get::<_, i64>(4) as u64;
+        staged.insert(row.get::<_, i32>(0), Staged { id: row.get(1), etag, checksum, size });
     }
-    let mut part_ids = Vec::with_capacity(requested.len());
-    for (number, etag) in requested {
-        match staged.get(number) {
-            Some((id, staged)) if staged == etag => part_ids.push(*id),
-            _ => return Ok(CompleteOutcome::InvalidPart),
+    // Each listed part must be staged, with its ETag; and with its checksum
+    // if the upload has an algorithm, which S3 requires to be listed (one
+    // listed of the default, CRC64NVME, is checked too).
+    let algorithm = upload.object_checksum().map(|(algorithm, _)| algorithm);
+    let mut parts = Vec::with_capacity(requested.len());
+    for ((number, etag), listed) in requested.iter().zip(&request.listed.checksums) {
+        let Some(part) = staged.get(number).filter(|part| part.etag == *etag) else {
+            return Ok(CompleteOutcome::InvalidPart);
+        };
+        let listed = listed.iter().find(|(a, _)| Some(*a) == algorithm).map(|(_, value)| value);
+        match (listed, &part.checksum) {
+            (Some(listed), Some(checksum)) if listed == checksum => {}
+            (Some(_), _) => return Ok(CompleteOutcome::InvalidPart),
+            (None, _) if upload.checksum.is_some() => return Ok(CompleteOutcome::InvalidPart),
+            (None, _) => {}
         }
+        parts.push(part);
     }
     let Some(combined) = combined else { return Ok(CompleteOutcome::InvalidPart) };
+    let checksum = object_checksum(upload, &parts)?;
+    if let Some(bad) = check_claim(request.claimed, checksum.as_ref()) {
+        return Ok(bad);
+    }
     let stored_etag = match &etag_key {
         Some(etag_key) => etag_key.seal(&combined),
         None => combined.clone(),
     };
+    let stored_checksum = match (&checksum, &storing) {
+        (Some(checksum), Some(storing)) => Some(storing.store(&checksum.value)),
+        (Some(_), None) => unreachable!("an object gets a checksum only where its parts' can be read"),
+        (None, _) => None,
+    };
+    let preconditions = request.preconditions;
     let expected = if preconditions.has_write_conditions() {
         let current = match current_object(app, bucket, key).await? {
             Ok(current) => current,
@@ -361,11 +568,12 @@ async fn try_complete(
     } else {
         None
     };
+    let part_ids: Vec<i64> = parts.iter().map(|part| part.id).collect();
     let part_numbers: Vec<i32> = requested.iter().map(|(n, _)| *n).collect();
     let row = client
         .query_one_cached(
             "SELECT status, version_id, reap_blob, reap_node, reap_peer
-             FROM pg_temp.cairn_complete_upload($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+             FROM pg_temp.cairn_complete_upload($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
             &[
                 upload_id,
                 &bucket,
@@ -373,6 +581,9 @@ async fn try_complete(
                 &part_ids,
                 &part_numbers,
                 &stored_etag,
+                &checksum.as_ref().map(|c| c.algorithm.name()),
+                &checksum.as_ref().map(|c| c.kind.name()),
+                &stored_checksum,
                 &expected.is_some(),
                 &expected.flatten(),
                 &new_version_id(),
@@ -384,7 +595,9 @@ async fn try_complete(
     match row.get::<_, &str>(0) {
         "done" => {}
         // Completed meanwhile, by a request like this one, say.
-        "no_such_upload" => return completed(app, client, bucket, key, upload_id, Some(&combined)).await,
+        "no_such_upload" => {
+            return completed(app, client, bucket, key, upload_id, Some(&combined), request.claimed, keys).await;
+        }
         "stale" => return Ok(CompleteOutcome::Stale),
         "too_large" => return Ok(CompleteOutcome::TooLarge),
         "too_small" => return Ok(CompleteOutcome::TooSmall),
@@ -394,6 +607,7 @@ async fn try_complete(
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         etag: combined,
+        checksum,
         version_id: row.get(1),
         reap: reap_columns(&row, 2),
     })

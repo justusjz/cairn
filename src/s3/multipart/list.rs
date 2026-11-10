@@ -60,7 +60,8 @@ pub async fn list_multipart_uploads(
         .query_cached(
             "SELECT name AS key, is_prefix, upload_id,
                     to_char(initiated_at AT TIME ZONE 'UTC',
-                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS initiated
+                            'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS initiated,
+                    checksum_algorithm, checksum_type
              FROM pg_temp.cairn_list_uploads($1, $2, $3, $4, $5, $6)",
             &[&bucket, &prefix, &delim, &key_marker, &marker_id, &limit],
         )
@@ -84,9 +85,10 @@ pub async fn list_multipart_uploads(
         }
         let upload_id: Uuid = row.get("upload_id");
         let initiated: &str = row.get("initiated");
+        let checksum = crate::s3::checksums::listed(row, 4);
         uploads.push_str(&format!(
             "<Upload><Key>{}</Key><UploadId>{upload_id}</UploadId>{INITIATOR}{OWNER}\
-             <StorageClass>STANDARD</StorageClass><Initiated>{initiated}</Initiated></Upload>",
+             <StorageClass>STANDARD</StorageClass><Initiated>{initiated}</Initiated>{checksum}</Upload>",
             encoding.xml(row.get("key")),
         ));
     }

@@ -5,6 +5,7 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App,
+    s3::checksums::{self, Algorithm, Type},
     s3::sse::{self, Wanted},
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
@@ -20,6 +21,7 @@ pub async fn create_multipart_upload(
     metadata: &str,
     wanted: Wanted<'_>,
     role: Option<Uuid>,
+    checksum: Option<(Algorithm, Type)>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     if client
@@ -49,8 +51,9 @@ pub async fn create_multipart_upload(
         .execute_cached(
             "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, metadata,
                                             sse_c_key, sse_kms_key_id, sse_kms_data_key,
-                                            sse_kms_sealed, sse_kms_context, sse_s3, initiated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())",
+                                            sse_kms_sealed, sse_kms_context, sse_s3,
+                                            checksum_algorithm, checksum_type, initiated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())",
             &[
                 &upload_id,
                 &bucket,
@@ -63,6 +66,8 @@ pub async fn create_multipart_upload(
                 &sse.kms_sealed,
                 &sse.kms_context,
                 &sse.sse_s3,
+                &checksum.map(|(algorithm, _)| algorithm.name()),
+                &checksum.map(|(_, kind)| kind.name()),
             ],
         )
         .await?;
@@ -76,5 +81,11 @@ pub async fn create_multipart_upload(
         upload_id
     );
     let customer_key = wanted.customer();
-    Ok(sse::echo_onto(xml_ok(body), &stored, customer_key))
+    let mut response = sse::echo_onto(xml_ok(body), &stored, customer_key);
+    // The checksum it asked for, as S3 tells it.
+    if let Some((algorithm, kind)) = checksum {
+        response.headers_mut().insert(checksums::ALGORITHM, algorithm.name().parse().unwrap());
+        response.headers_mut().insert(checksums::TYPE, kind.name().parse().unwrap());
+    }
+    Ok(response)
 }

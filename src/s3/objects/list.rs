@@ -47,6 +47,9 @@ pub enum ListEntry {
         etag: Option<String>,
         last_modified: Timestamp,
         delete_marker: bool,
+        /// The elements telling its checksum's algorithm and type, if it has
+        /// one.
+        checksum: String,
     },
     /// The keys whose names continue past `prefix` with the delimiter, rolled
     /// up, and their totals, if the query asked for them.
@@ -103,7 +106,8 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
             "SELECT name, is_prefix, objects, size, etag,
                     to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
                     extract(epoch FROM last_modified)::float8, is_delete_marker,
-                    sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed
+                    sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed,
+                    checksum_algorithm, checksum_type
              FROM pg_temp.cairn_list_current($1, $2, $3, $4, $5, $6, $7)",
             &[&bucket, &q.prefix, &delim, &q.marker, &limit, &q.delete_markers, &q.totals],
         )
@@ -149,6 +153,7 @@ pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<
                     size: r.get(3),
                     last_modified: timestamp(r).expect("a key has a last-modified time"),
                     delete_marker: r.get(7),
+                    checksum: crate::s3::checksums::listed(r, 12),
                 }
             },
         );
@@ -240,10 +245,11 @@ pub async fn list_objects(
                 size,
                 etag,
                 last_modified,
+                checksum,
                 ..
             } => contents.push_str(&format!(
                 "<Contents><Key>{}</Key><LastModified>{}</LastModified>\
-                 <ETag>\"{}\"</ETag><Size>{}</Size>{owner}<StorageClass>STANDARD</StorageClass></Contents>",
+                 <ETag>\"{}\"</ETag>{checksum}<Size>{}</Size>{owner}<StorageClass>STANDARD</StorageClass></Contents>",
                 encoding.xml(key),
                 last_modified.iso,
                 xml_escape(etag.as_deref().unwrap_or("")),

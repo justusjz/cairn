@@ -61,7 +61,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=101
+TOTAL=102
 STEP=0
 PASS=0
 FAIL=0
@@ -596,6 +596,43 @@ sse_c_ok() {
     cmp -s "$BIG" "$out" || return 1
     for key in small.txt big.bin clear.bin; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "sse/$key" >/dev/null 2>&1 || return 1
+    done
+}
+
+# S3's checksums: a PUT's, the client's, told by a HEAD with checksum mode
+# and checked by the client as it downloads; a multipart upload's of an
+# algorithm, COMPOSITE, of its parts; a copy's of the algorithm it asks for,
+# FULL_OBJECT.
+checksums_ok() {
+    local out="$WORK_DIR/ck-out" sha crc told
+    crc32() { python3 -I -c 'import sys, zlib, base64
+print(base64.b64encode(zlib.crc32(open(sys.argv[1], "rb").read()).to_bytes(4, "big")).decode())' "$1"; }
+    sha=$(openssl dgst -sha256 -binary "$BIG" | base64)
+    awss3 s3api put-object --bucket "$BUCKET" --key ck/sha.bin --body "$BIG" --checksum-algorithm SHA256 \
+        >/dev/null 2>&1 || return 1
+    told=$(awss3 s3api head-object --bucket "$BUCKET" --key ck/sha.bin --checksum-mode ENABLED \
+        --query '[ChecksumType, ChecksumSHA256]' --output text 2>/dev/null)
+    [ "$told" = "FULL_OBJECT	$sha" ] || return 1
+    awss3 s3api get-object --bucket "$BUCKET" --key ck/sha.bin --checksum-mode ENABLED "$out" \
+        >/dev/null 2>&1 || return 1
+    cmp -s "$BIG" "$out" || return 1
+    crc=$(crc32 "$BIG")
+    awss3 s3api put-object --bucket "$BUCKET" --key ck/crc.bin --body "$BIG" --checksum-algorithm CRC32 \
+        >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key ck/crc.bin --checksum-mode ENABLED \
+        --query ChecksumCRC32 --output text 2>/dev/null)" = "$crc" ] || return 1
+    # Multipart (16 MiB in 8 MiB parts).
+    awss3 s3 cp "$MULTIPART" "s3://${BUCKET}/ck/multi.bin" --checksum-algorithm SHA256 >/dev/null 2>&1 || return 1
+    told=$(awss3 s3api head-object --bucket "$BUCKET" --key ck/multi.bin --checksum-mode ENABLED \
+        --query '[ChecksumType, ChecksumSHA256]' --output text 2>/dev/null)
+    case "$told" in "COMPOSITE	"*-2) ;; *) return 1 ;; esac
+    awss3 s3api copy-object --bucket "$BUCKET" --key ck/copy.bin --copy-source "${BUCKET}/ck/multi.bin" \
+        --checksum-algorithm CRC32 >/dev/null 2>&1 || return 1
+    told=$(awss3 s3api head-object --bucket "$BUCKET" --key ck/copy.bin --checksum-mode ENABLED \
+        --query '[ChecksumType, ChecksumCRC32]' --output text 2>/dev/null)
+    [ "$told" = "FULL_OBJECT	$(crc32 "$MULTIPART")" ] || return 1
+    for key in sha.bin crc.bin multi.bin copy.bin; do
+        awss3 s3api delete-object --bucket "$BUCKET" --key "ck/$key" >/dev/null 2>&1 || return 1
     done
 }
 
@@ -1953,6 +1990,7 @@ run_test    "CopyObject shares the source's data"   copy_shares_data_ok
 run_test    "CopyObject of multipart src is normal" copy_multipart_source_normal_ok
 run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok
 run_test    "Metadata stored, copied, replaced"     metadata_ok
+run_test    "Checksums stored, told, copied"         checksums_ok
 run_test    "SSE-C put/multipart/copy/get, wrong key" sse_c_ok
 run_test    "SSE-KMS put/multipart/copy/get, keys"   sse_kms_ok
 run_test    "SSE-S3 put/multipart/copy/get"          sse_s3_ok

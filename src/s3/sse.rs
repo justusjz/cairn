@@ -184,8 +184,23 @@ fn derive_etag_key(object_key: &Key) -> Zeroizing<Key> {
 /// nonce, the ETag sealed under the object's ETag key, and the tag. A fresh
 /// nonce each time, so the same ETag never looks the same twice.
 pub fn seal_etag(object_key: &Key, etag: &str) -> String {
-    let sealed = seal_object_bytes(&derive_etag_key(object_key), etag.as_bytes(), b"");
+    seal_hex(&derive_etag_key(object_key), etag.as_bytes())
+}
+
+/// `plain` sealed under `key` (with a fresh nonce), as hex: how a value of an
+/// encrypted object's is stored in the catalog (an SSE-S3 ETag, a checksum).
+pub fn seal_hex(key: &Key, plain: &[u8]) -> String {
+    let sealed = seal_object_bytes(key, plain, b"");
     sealed.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What `stored`, from `seal_hex` under `key`, holds.
+pub fn open_hex(key: &Key, stored: &str) -> Option<Vec<u8>> {
+    let bytes: Vec<u8> = (0..stored.len())
+        .step_by(2)
+        .map(|i| stored.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .collect::<Option<_>>()?;
+    unseal_object_bytes(key, &bytes, b"")
 }
 
 /// The ETag `stored` (from `seal_etag` under the same object key) holds. One
@@ -195,11 +210,7 @@ pub fn open_etag(object_key: &Key, stored: &str) -> Option<String> {
     if stored.len() < 2 * (NONCE_LEN + 16) {
         return Some(stored.to_owned());
     }
-    let bytes: Vec<u8> = (0..stored.len())
-        .step_by(2)
-        .map(|i| stored.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
-        .collect::<Option<_>>()?;
-    let plain = unseal_object_bytes(&derive_etag_key(object_key), &bytes, b"")?;
+    let plain = open_hex(&derive_etag_key(object_key), stored)?;
     String::from_utf8(plain).ok()
 }
 
@@ -722,7 +733,7 @@ fn seal_object_bytes(key: &Key, plain: &[u8], ad: &[u8]) -> Vec<u8> {
     let mut buffer = Zeroizing::new(plain.to_vec());
     let tag = XChaCha20Poly1305::new(key.into())
         .encrypt_inout_detached(&XNonce::from(nonce), ad, buffer.as_mut_slice().into())
-        .expect("a key or an ETag is far shorter than XChaCha20-Poly1305's limit");
+        .expect("a key, an ETag or a checksum is far shorter than XChaCha20-Poly1305's limit");
     [&nonce[..], &buffer, &tag].concat()
 }
 

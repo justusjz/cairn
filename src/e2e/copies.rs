@@ -67,7 +67,7 @@ async fn put_multipart(app: &Arc<App>, key: &str, parts: &[Vec<u8>]) {
 }
 
 async fn create_upload(app: &Arc<App>, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "", Wanted::Plain, None)
+    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "", Wanted::Plain, None, None)
         .await
         .unwrap();
     Uuid::parse_str(&xml_field(&body_text(response).await, "UploadId")).unwrap()
@@ -79,6 +79,7 @@ async fn put_part(app: &Arc<App>, upload_id: Uuid, part_number: i32, data: Vec<u
         part_number,
         key: None,
         sse_s3: false,
+        checksum: crate::e2e::PART_CHECKSUM,
     };
     let body = Full::new(Bytes::from(data));
     match crate::upload_part(app, body, &attach, Payload::unchecked())
@@ -99,7 +100,7 @@ async fn complete(app: &Arc<App>, key: &str, upload_id: Uuid, parts: &str) {
         &upload_id.to_string(),
         Bytes::from(body),
         &Preconditions::default(),
-        None,
+        None, None, None,
     )
     .await
     .unwrap();

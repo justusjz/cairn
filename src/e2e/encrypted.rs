@@ -48,7 +48,7 @@ async fn commit(
                     "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], $3, 0, 65536, 0, $4, $5, $6,
                      $7, $8, 'application/octet-stream', '', $9, NULL, NULL, NULL, NULL, false,
-                     false, NULL, $10)",
+                     NULL, NULL, NULL, false, NULL, $10)",
                     &[
                         &blob,
                         &app.node,
@@ -68,7 +68,7 @@ async fn commit(
             client
                 .query_one(
                     "SELECT status FROM pg_temp.cairn_commit_upload_part(
-                     $1, ARRAY[$2::int], $3, 0, 65536, 0, $4, $5, $6, $7, $8)",
+                     $1, ARRAY[$2::int], $3, 0, 65536, 0, $4, $5, $6, $7, $8, NULL)",
                     &[
                         &blob,
                         &app.node,
@@ -133,7 +133,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
         .query_one(
             "SELECT status FROM pg_temp.cairn_copy_object(
                  $1, ARRAY[$2::bigint], ARRAY[1016::bigint], $3, 'c', 1000, 'etag', 'x', '', $4,
-                 NULL, NULL, NULL, NULL, false, $5)",
+                 NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, false, $5)",
             &[&object_id, &part_id, &BUCKET, &&KEY_CHECK[..], &crate::s3::versions::new_version_id()],
         )
         .await
@@ -190,7 +190,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
         .query_one(
             "SELECT status FROM pg_temp.cairn_complete_upload(
                  $1, $2, 'm', ARRAY(SELECT id FROM parts WHERE upload_id = $1 ORDER BY part_number),
-                 ARRAY[1, 2], 'etag-2', false, NULL, $3)",
+                 ARRAY[1, 2], 'etag-2', NULL, NULL, NULL, false, NULL, $3)",
             &[&upload, &BUCKET, &crate::s3::versions::new_version_id()],
         )
         .await
@@ -245,7 +245,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
         .query_one(
             "SELECT status FROM pg_temp.cairn_complete_upload(
                  $1, $2, 's', ARRAY(SELECT id FROM parts WHERE upload_id = $1 ORDER BY part_number),
-                 ARRAY[1, 2], 'etag-2', false, NULL, $3)",
+                 ARRAY[1, 2], 'etag-2', NULL, NULL, NULL, false, NULL, $3)",
             &[&upload, &BUCKET, &crate::s3::versions::new_version_id()],
         )
         .await
@@ -266,7 +266,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
     let refused = client
         .query_one(
             "SELECT status FROM pg_temp.cairn_copy_part(
-                 $1, ARRAY[$2::bigint], ARRAY[1016::bigint], 1, 0, 10, 'etag', 0, $3, 1)",
+                 $1, ARRAY[$2::bigint], ARRAY[1016::bigint], 1, 0, 10, 'etag', 0, $3, 1, NULL)",
             &[&object_id, &part_id, &upload],
         )
         .await;
@@ -283,7 +283,8 @@ async fn sizes_salts_and_key_checks_carry_through() {
             .query_one(
                 "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], 1016, 0, 65536, 0, 'etag', $3, $4,
-                     $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, false, false, NULL, $6)",
+                     $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL,
+                     false, NULL, $6)",
                 &[
                     &blob,
                     &app.node,
@@ -358,7 +359,7 @@ async fn an_sse_c_object_reads_back_with_its_key() {
             None,
             None,
             &Preconditions::default(),
-            Some(&key),
+            Some(&key), None, false,
         )
         .await
         .unwrap();
@@ -415,7 +416,7 @@ async fn an_sse_c_object_needs_its_key() {
             None,
             None,
             &Preconditions::default(),
-            customer,
+            customer, None, false,
         )
         .await
         .unwrap();
@@ -425,11 +426,11 @@ async fn an_sse_c_object_needs_its_key() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("if-none-match", format!("\"{etag}\"").parse().unwrap());
     let conditions = Preconditions::from_headers(&headers);
-    let head = head_object(&app, BUCKET, "sealed", None, None, &conditions, None)
+    let head = head_object(&app, BUCKET, "sealed", None, None, &conditions, None, None, false)
         .await
         .unwrap();
     assert_eq!(head.status(), StatusCode::BAD_REQUEST);
-    let head = head_object(&app, BUCKET, "sealed", None, None, &conditions, Some(&key))
+    let head = head_object(&app, BUCKET, "sealed", None, None, &conditions, Some(&key), None, false)
         .await
         .unwrap();
     assert_eq!(head.status(), StatusCode::NOT_MODIFIED);
@@ -470,7 +471,7 @@ async fn tampering_past_the_crcs_is_caught() {
         None,
         &Preconditions::default(),
         Some(&key),
-        None,
+        None, false,
     )
     .await
     .unwrap();
@@ -546,6 +547,7 @@ async fn copies_keep_or_change_encryption() {
     let same = CopyKeys {
         source: Some(&k1),
         dest: Wanted::Customer(&k1), role: None,
+        checksum: None,
     };
     assert_eq!(
         copy(&app, "src", "same", same).await,
@@ -572,6 +574,7 @@ async fn copies_keep_or_change_encryption() {
             CopyKeys {
                 source: Some(&k1),
                 dest: Wanted::Customer(&k2), role: None,
+                checksum: None,
             },
             Some(&k2),
         ),
@@ -581,6 +584,7 @@ async fn copies_keep_or_change_encryption() {
             CopyKeys {
                 source: Some(&k1),
                 dest: Wanted::Plain, role: None,
+                checksum: None,
             },
             None,
         ),
@@ -590,6 +594,7 @@ async fn copies_keep_or_change_encryption() {
             CopyKeys {
                 source: None,
                 dest: Wanted::Customer(&k2), role: None,
+                checksum: None,
             },
             Some(&k2),
         ),
@@ -632,6 +637,7 @@ async fn copies_keep_or_change_encryption() {
         let keys = CopyKeys {
             source,
             dest: Wanted::Customer(&k1), role: None,
+            checksum: None,
         };
         assert_eq!(
             copy(&app, "src", "nope", keys).await.0,
@@ -646,6 +652,7 @@ async fn copies_keep_or_change_encryption() {
     let rotate = CopyKeys {
         source: Some(&k1),
         dest: Wanted::Customer(&k2), role: None,
+        checksum: None,
     };
     assert_eq!(copy(&app, "src", "src", rotate).await.0, StatusCode::OK);
     assert_eq!(
@@ -671,7 +678,7 @@ async fn part_copies_of_and_into_sse_c() {
         let app = app.clone();
         let customer = customer.map(|c| customer_key(c.key()));
         async move {
-            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", Wanted::new(customer.as_ref(), None), None)
+            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", Wanted::new(customer.as_ref(), None), None, None)
                 .await
                 .unwrap();
             use http_body_util::BodyExt;
@@ -729,7 +736,7 @@ async fn part_copies_of_and_into_sse_c() {
                 &upload_id,
                 body,
                 &Preconditions::default(),
-                None,
+                None, None, None,
             )
             .await
             .unwrap()
@@ -747,6 +754,7 @@ async fn part_copies_of_and_into_sse_c() {
             CopyKeys {
                 source: None,
                 dest: Wanted::Plain, role: None,
+                checksum: None,
             }
         )
         .await,
@@ -760,6 +768,7 @@ async fn part_copies_of_and_into_sse_c() {
             CopyKeys {
                 source: Some(&k1),
                 dest: Wanted::Plain, role: None,
+                checksum: None,
             }
         )
         .await,
@@ -781,6 +790,7 @@ async fn part_copies_of_and_into_sse_c() {
             CopyKeys {
                 source: None,
                 dest: Wanted::Plain, role: None,
+                checksum: None,
             }
         )
         .await,
@@ -794,6 +804,7 @@ async fn part_copies_of_and_into_sse_c() {
             CopyKeys {
                 source: None,
                 dest: Wanted::Customer(&k1), role: None,
+                checksum: None,
             }
         )
         .await,
@@ -807,6 +818,7 @@ async fn part_copies_of_and_into_sse_c() {
             CopyKeys {
                 source: None,
                 dest: Wanted::Customer(&k2), role: None,
+                checksum: None,
             }
         )
         .await,

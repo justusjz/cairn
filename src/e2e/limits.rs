@@ -48,7 +48,7 @@ async fn error_code(
 }
 
 async fn new_upload(app: &Arc<App>, key: &str) -> String {
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", Wanted::Plain, None)
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", Wanted::Plain, None, None)
         .await
         .unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -123,6 +123,7 @@ async fn objects_are_limited_to_5_tib() {
             part_number: n,
             key: None,
             sse_s3: false,
+            checksum: crate::e2e::PART_CHECKSUM,
         };
         let body = http_body_util::Full::new(Bytes::from_static(b"part"));
         let crate::UploadResult::Committed { etag, .. } =
@@ -163,7 +164,7 @@ async fn objects_are_limited_to_5_tib() {
         &upload,
         body,
         &Preconditions::default(),
-        None,
+        None, None, None,
     )
     .await
     .unwrap();

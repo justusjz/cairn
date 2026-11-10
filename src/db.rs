@@ -187,6 +187,7 @@ const MIGRATIONS: &[&str] = &[
     ROLE_IDS,
     BUCKET_ENCRYPTION,
     SSE_S3,
+    CHECKSUMS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -799,6 +800,33 @@ ALTER TABLE buckets ADD CONSTRAINT buckets_sse CHECK (
     OR (sse_algorithm = 'aws:kms' AND sse_kms_key_id IS NOT NULL)
     OR (sse_algorithm = 'AES256' AND sse_kms_key_id IS NULL)
 ) NOT VALID;
+"#;
+
+/// Migration 19: S3's checksums of objects and parts (see `s3::checksums`).
+/// An object's: its algorithm, type and value; an upload's: the algorithm
+/// and type its client asked for; a part's: its value, in its upload's
+/// algorithm. Values are as reported (base64), or sealed (hex) if encrypted.
+/// NULL for those from before. The checks are NOT VALID, as migration 14's.
+const CHECKSUMS: &str = r#"
+ALTER TABLE objects ADD COLUMN checksum_algorithm text;
+ALTER TABLE objects ADD COLUMN checksum_type text;
+ALTER TABLE objects ADD COLUMN checksum text;
+ALTER TABLE objects ADD CONSTRAINT objects_checksum CHECK (
+    (checksum_algorithm IS NULL) = (checksum IS NULL)
+    AND (checksum_algorithm IS NULL) = (checksum_type IS NULL)
+    AND (checksum_algorithm IS NULL
+         OR checksum_algorithm IN ('CRC32', 'CRC32C', 'CRC64NVME', 'SHA1', 'SHA256'))
+    AND (checksum_type IS NULL OR checksum_type IN ('FULL_OBJECT', 'COMPOSITE'))
+) NOT VALID;
+ALTER TABLE multipart_uploads ADD COLUMN checksum_algorithm text;
+ALTER TABLE multipart_uploads ADD COLUMN checksum_type text;
+ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_checksum CHECK (
+    (checksum_algorithm IS NULL) = (checksum_type IS NULL)
+    AND (checksum_algorithm IS NULL
+         OR checksum_algorithm IN ('CRC32', 'CRC32C', 'CRC64NVME', 'SHA1', 'SHA256'))
+    AND (checksum_type IS NULL OR checksum_type IN ('FULL_OBJECT', 'COMPOSITE'))
+) NOT VALID;
+ALTER TABLE parts ADD COLUMN checksum text;
 "#;
 
 #[cfg(test)]

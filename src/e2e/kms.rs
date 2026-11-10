@@ -60,6 +60,7 @@ async fn put_kms(
         metadata: String::new(),
         conditions: Preconditions::default(),
         sealing,
+        checksum: crate::e2e::OBJECT_CHECKSUM,
     };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
         .await
@@ -71,7 +72,7 @@ async fn put_kms(
 /// GetObject of (the `range` of) `key`, as `role`: its status, SSE headers
 /// and body.
 async fn get(app: &Arc<App>, role: Option<Uuid>, key: &str, range: Option<&str>) -> (StatusCode, Headers, Vec<u8>) {
-    let response = get_object(app, BUCKET, key, None, range, &Preconditions::default(), None, role)
+    let response = get_object(app, BUCKET, key, None, range, &Preconditions::default(), None, role, false)
         .await
         .unwrap();
     let (status, headers) = (response.status(), Headers::of(response.headers()));
@@ -163,7 +164,7 @@ async fn objects_round_trip_through_the_kms() {
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     assert!(body == plain[65530..=140000]);
 
-    let head = head_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None).await.unwrap();
+    let head = head_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None, None, false).await.unwrap();
     assert_eq!(Headers::of(head.headers()), Headers::kms("transit/cairn-test", None));
 
     let (_, salt, key_id, data_key) = stored(&app, "k").await;
@@ -200,13 +201,13 @@ async fn data_keys_open_only_for_their_context_and_object() {
         )
         .await
         .unwrap();
-    assert!(get_object(&app, BUCKET, "b", None, None, &Preconditions::default(), None, Some(r)).await.is_err());
+    assert!(get_object(&app, BUCKET, "b", None, None, &Preconditions::default(), None, Some(r), false).await.is_err());
     // a with another context.
     client
         .execute("UPDATE objects SET sse_kms_context = '{\"a\":\"2\",\"project\":\"x\"}' WHERE key = 'a'", &[])
         .await
         .unwrap();
-    assert!(get_object(&app, BUCKET, "a", None, None, &Preconditions::default(), None, Some(r)).await.is_err());
+    assert!(get_object(&app, BUCKET, "a", None, None, &Preconditions::default(), None, Some(r), false).await.is_err());
 }
 
 /// A key the KMS doesn't have (but would let the role use) is S3's
@@ -229,7 +230,13 @@ async fn put_part(app: &Arc<App>, role: Uuid, upload_id: Uuid, key: &str, part_n
     let encryption = upload_encryption(app, &upload_id, BUCKET, key).await.unwrap().unwrap();
     let upload_key = sse::open(app, &encryption, None, Some(role), BUCKET, key).await.unwrap().ok().unwrap();
     assert!(upload_key.is_some() == !encryption.is_plain());
-    let attach = AttachTarget::MultipartPart { upload_id, part_number, key: upload_key, sse_s3: matches!(encryption, Stored::S3(_)) };
+    let attach = AttachTarget::MultipartPart {
+        upload_id,
+        part_number,
+        key: upload_key,
+        sse_s3: matches!(encryption, Stored::S3(_)),
+        checksum: crate::e2e::PART_CHECKSUM,
+    };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
         .await
         .unwrap();
@@ -238,7 +245,7 @@ async fn put_part(app: &Arc<App>, role: Uuid, upload_id: Uuid, key: &str, part_n
 }
 
 async fn create(app: &Arc<App>, role: Uuid, key: &str, wanted: Wanted<'_>) -> (Uuid, Headers) {
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", wanted, Some(role)).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", wanted, Some(role), None).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let headers = Headers::of(response.headers());
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -247,7 +254,7 @@ async fn create(app: &Arc<App>, role: Uuid, key: &str, wanted: Wanted<'_>) -> (U
     (body[start..body.find("</UploadId>").unwrap()].parse().unwrap(), headers)
 }
 
-async fn complete(app: &Arc<App>, key: &str, upload_id: Uuid, etags: &[String]) -> (StatusCode, Headers) {
+async fn complete(app: &Arc<App>, role: Uuid, key: &str, upload_id: Uuid, etags: &[String]) -> (StatusCode, Headers) {
     let parts: String = etags
         .iter()
         .enumerate()
@@ -255,7 +262,7 @@ async fn complete(app: &Arc<App>, key: &str, upload_id: Uuid, etags: &[String]) 
         .collect();
     let body = Bytes::from(format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>"));
     let id = upload_id.to_string();
-    let response = complete_multipart_upload(app, BUCKET, key, &id, body, &Preconditions::default(), None)
+    let response = complete_multipart_upload(app, BUCKET, key, &id, body, &Preconditions::default(), None, Some(role), None)
         .await
         .unwrap();
     (response.status(), Headers::of(response.headers()))
@@ -276,9 +283,9 @@ async fn multipart_uploads_under_the_kms() {
         put_part(&app, r, upload_id, "k", 1, first.clone()).await,
         put_part(&app, r, upload_id, "k", 2, second.clone()).await,
     ];
-    assert_eq!(complete(&app, "k", upload_id, &etags).await, (StatusCode::OK, Headers::kms("transit/cairn-other", Some(r#"{"c":"d"}"#))));
+    assert_eq!(complete(&app, r, "k", upload_id, &etags).await, (StatusCode::OK, Headers::kms("transit/cairn-other", Some(r#"{"c":"d"}"#))));
     // A retry, whose upload is gone.
-    assert_eq!(complete(&app, "k", upload_id, &etags).await, (StatusCode::OK, told));
+    assert_eq!(complete(&app, r, "k", upload_id, &etags).await, (StatusCode::OK, told));
     let (status, headers, body) = get(&app, Some(r), "k", None).await;
     assert_eq!((status, headers), (StatusCode::OK, Headers::kms("transit/cairn-other", Some(r#"{"c":"d"}"#))));
     assert!(body == [first, second].concat());
@@ -301,7 +308,7 @@ async fn copy(
         "x",
         "",
         &Preconditions::default(),
-        CopyKeys { source, dest, role: Some(role) },
+        CopyKeys { source, dest, role: Some(role), checksum: None },
     )
     .await
     .unwrap();
@@ -395,7 +402,7 @@ async fn part_copies_of_and_into_kms() {
         let start = body.find("<ETag>\"").unwrap() + 7;
         etags.push(body[start..start + 32].to_owned());
     }
-    assert_eq!(complete(&app, "dst", upload_id, &etags).await.0, StatusCode::OK);
+    assert_eq!(complete(&app, r, "dst", upload_id, &etags).await.0, StatusCode::OK);
     let (status, headers, body) = get(&app, Some(r), "dst", None).await;
     assert_eq!((status, headers), (StatusCode::OK, Headers::kms("transit/cairn-test", None)));
     assert!(body == plain);
@@ -670,6 +677,7 @@ async fn put_s3(app: &Arc<App>, role: Uuid, key: &str, data: Vec<u8>) {
         metadata: String::new(),
         conditions: Preconditions::default(),
         sealing,
+        checksum: crate::e2e::OBJECT_CHECKSUM,
     };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
         .await
@@ -705,7 +713,7 @@ async fn sse_s3_uses_cairns_own_key() {
         assert!(body == data(len));
     }
     assert_eq!(client_kms.transit_calls(), calls, "it has the data key already");
-    let head = head_object(&app, BUCKET, "a", None, None, &Preconditions::default(), None).await.unwrap();
+    let head = head_object(&app, BUCKET, "a", None, None, &Preconditions::default(), None, None, false).await.unwrap();
     assert_eq!(Headers::of(head.headers()), s3);
 
     // b with a's sealed key: the same data key, but another object.
@@ -718,7 +726,7 @@ async fn sse_s3_uses_cairns_own_key() {
         )
         .await
         .unwrap();
-    assert!(get_object(&app, BUCKET, "b", None, None, &Preconditions::default(), None, None).await.is_err());
+    assert!(get_object(&app, BUCKET, "b", None, None, &Preconditions::default(), None, None, false).await.is_err());
 
     // Copies: to SSE-S3 share the parts; to SSE-KMS and back, or to plain,
     // they don't (an SSE-S3 object's ETag is its MD5, which takes reading).
@@ -742,7 +750,7 @@ async fn sse_s3_uses_cairns_own_key() {
         put_part(&app, bob, upload_id, "multi", 1, data(5 << 20)).await,
         put_part(&app, bob, upload_id, "multi", 2, data(10)).await,
     ];
-    assert_eq!(complete(&app, "multi", upload_id, &etags).await, (StatusCode::OK, s3.clone()));
+    assert_eq!(complete(&app, bob, "multi", upload_id, &etags).await, (StatusCode::OK, s3.clone()));
     assert!(get(&app, None, "multi", None).await.2 == [data(5 << 20), data(10)].concat());
 
     // As a bucket's default.
@@ -782,7 +790,7 @@ fn md5_hex(data: &[u8]) -> String {
 
 /// The ETag a GetObject of `key` answers with (unquoted).
 async fn etag_of(app: &Arc<App>, key: &str) -> String {
-    let response = get_object(app, BUCKET, key, None, None, &Preconditions::default(), None, None).await.unwrap();
+    let response = get_object(app, BUCKET, key, None, None, &Preconditions::default(), None, None, false).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     response.headers()[hyper::header::ETAG].to_str().unwrap().trim_matches('"').to_owned()
 }
@@ -801,7 +809,7 @@ async fn sse_s3_etags_are_md5s_stored_sealed() {
     put_s3(&app, bob, "k", plain.clone()).await;
     let md5 = md5_hex(&plain);
     assert_eq!(etag_of(&app, "k").await, md5);
-    let head = head_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None).await.unwrap();
+    let head = head_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None, None, false).await.unwrap();
     assert_eq!(head.headers()[hyper::header::ETAG].to_str().unwrap(), format!("\"{md5}\""));
     // Stored sealed: not the MD5, and not the same for the same content.
     put_s3(&app, bob, "k2", plain.clone()).await;
@@ -828,7 +836,7 @@ async fn sse_s3_etags_are_md5s_stored_sealed() {
         headers.insert(hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(), value.parse().unwrap());
         Preconditions::from_headers(&headers)
     };
-    let read = get_object(&app, BUCKET, "k", None, None, &conditional("if-none-match", &format!("\"{md5}\"")), None, None)
+    let read = get_object(&app, BUCKET, "k", None, None, &conditional("if-none-match", &format!("\"{md5}\"")), None, None, false)
         .await
         .unwrap();
     assert_eq!(read.status(), StatusCode::NOT_MODIFIED);
@@ -843,6 +851,7 @@ async fn sse_s3_etags_are_md5s_stored_sealed() {
                 metadata: String::new(),
                 conditions,
                 sealing,
+                checksum: crate::e2e::OBJECT_CHECKSUM,
             };
             crate::upload_part(&app, Full::new(Bytes::from(data(10))), &attach, Payload::unchecked()).await.unwrap()
         }
@@ -860,12 +869,12 @@ async fn sse_s3_etags_are_md5s_stored_sealed() {
         put_part(&app, bob, upload_id, "multi", 2, second.clone()).await,
     ];
     assert_eq!(etags, vec![md5_hex(&first), md5_hex(&second)]);
-    let parts = crate::s3::multipart::list_parts::list_parts(&app, BUCKET, "multi", &upload_id.to_string(), 0, 1000).await.unwrap();
+    let parts = crate::s3::multipart::list_parts::list_parts(&app, BUCKET, "multi", &upload_id.to_string(), 0, 1000, None, None).await.unwrap();
     let body = String::from_utf8(parts.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
     assert!(body.contains(&format!("<ETag>\"{}\"</ETag>", etags[1])), "{body}");
     // A part listed with a wrong ETag is no part of it.
     let wrong = vec![etags[0].clone(), md5_hex(b"other")];
-    let response = complete_multipart_upload(&app, BUCKET, "multi", &upload_id.to_string(), complete_body(&wrong), &Preconditions::default(), None)
+    let response = complete_multipart_upload(&app, BUCKET, "multi", &upload_id.to_string(), complete_body(&wrong), &Preconditions::default(), None, None, None)
         .await
         .unwrap();
     assert_eq!(code(response).await, (StatusCode::BAD_REQUEST, "InvalidPart".to_owned()));
@@ -877,7 +886,7 @@ async fn sse_s3_etags_are_md5s_stored_sealed() {
     };
     for _ in 0..2 {
         // The second time, a retry: its upload is gone, its version tells.
-        let response = complete_multipart_upload(&app, BUCKET, "multi", &upload_id.to_string(), complete_body(&etags), &Preconditions::default(), None)
+        let response = complete_multipart_upload(&app, BUCKET, "multi", &upload_id.to_string(), complete_body(&etags), &Preconditions::default(), None, None, None)
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
@@ -895,4 +904,37 @@ fn complete_body(etags: &[String]) -> Bytes {
         .map(|(i, etag)| format!("<Part><PartNumber>{}</PartNumber><ETag>\"{etag}\"</ETag></Part>", i + 1))
         .collect();
     Bytes::from(format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>"))
+}
+
+/// An SSE-KMS object's checksum is stored sealed under its key, which a HEAD
+/// asks the KMS for only to tell it, as the role asking.
+#[tokio::test]
+async fn checksums_under_the_kms() {
+    use crate::s3::checksums::{self, Algorithm};
+    let Some(app) = kms_node().await else { return };
+    let r = role(&app, "alice", ALL).await;
+    let plain = data(70_000);
+    put_kms(&app, r, "k", plain.clone(), &kms(None, &[])).await.unwrap();
+    let crc64 = checksums::encode(&checksums::digest(Algorithm::Crc64Nvme, &plain));
+    let stored: String = app
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT checksum FROM objects WHERE key = 'k'", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_ne!(stored, crc64, "stored sealed");
+    let head = |role| {
+        let app = app.clone();
+        async move { head_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None, role, true).await.unwrap() }
+    };
+    let told = head(Some(r)).await;
+    assert_eq!(told.status(), StatusCode::OK);
+    assert_eq!(told.headers()[Algorithm::Crc64Nvme.header()], crc64.as_str());
+    assert_eq!(told.headers()[checksums::TYPE], "FULL_OBJECT");
+    // A role the KMS doesn't let use the key can't have it.
+    let other = role(&app, "bob", &[]).await;
+    assert_eq!(head(Some(other)).await.status(), StatusCode::FORBIDDEN);
 }

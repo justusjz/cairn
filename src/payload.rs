@@ -20,116 +20,13 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use hyper::{HeaderMap, StatusCode, body::Bytes};
 use md5::Md5;
-use sha1::Sha1;
 use sha2::{Digest, Sha256};
 
 use crate::{
     auth::{Rejection, StreamingChunkVerifier},
     aws_chunked::{AwsChunkedDecoder, ChunkError},
+    s3::checksums::{Algorithm, Hasher as Checksum, SDK_ALGORITHM},
 };
-
-/// The checksum algorithms of S3's `x-amz-checksum-*` headers and trailers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Algorithm {
-    Crc32,
-    Crc32c,
-    Crc64Nvme,
-    Sha1,
-    Sha256,
-}
-
-impl Algorithm {
-    const ALL: [Algorithm; 5] = [
-        Algorithm::Crc32,
-        Algorithm::Crc32c,
-        Algorithm::Crc64Nvme,
-        Algorithm::Sha1,
-        Algorithm::Sha256,
-    ];
-
-    /// The header (or trailer) that carries it.
-    fn header(self) -> &'static str {
-        match self {
-            Algorithm::Crc32 => "x-amz-checksum-crc32",
-            Algorithm::Crc32c => "x-amz-checksum-crc32c",
-            Algorithm::Crc64Nvme => "x-amz-checksum-crc64nvme",
-            Algorithm::Sha1 => "x-amz-checksum-sha1",
-            Algorithm::Sha256 => "x-amz-checksum-sha256",
-        }
-    }
-
-    fn from_header(name: &str) -> Option<Algorithm> {
-        Algorithm::ALL.into_iter().find(|a| a.header().eq_ignore_ascii_case(name.trim()))
-    }
-
-    /// Its name, as S3's error messages give it.
-    fn name(self) -> &'static str {
-        match self {
-            Algorithm::Crc32 => "CRC32",
-            Algorithm::Crc32c => "CRC32C",
-            Algorithm::Crc64Nvme => "CRC64NVME",
-            Algorithm::Sha1 => "SHA1",
-            Algorithm::Sha256 => "SHA256",
-        }
-    }
-
-    /// How many bytes a checksum has.
-    fn len(self) -> usize {
-        match self {
-            Algorithm::Crc32 | Algorithm::Crc32c => 4,
-            Algorithm::Crc64Nvme => 8,
-            Algorithm::Sha1 => 20,
-            Algorithm::Sha256 => 32,
-        }
-    }
-
-    /// The checksum a base64 `value` names, if it's a valid one.
-    fn decode(self, value: &str) -> Option<Vec<u8>> {
-        STANDARD.decode(value.trim()).ok().filter(|bytes| bytes.len() == self.len())
-    }
-}
-
-/// A checksum being computed.
-enum Checksum {
-    Crc32(crc32fast::Hasher),
-    Crc32c(u32),
-    Crc64Nvme(crc64fast_nvme::Digest),
-    Sha1(Sha1),
-    Sha256(Sha256),
-}
-
-impl Checksum {
-    fn new(algorithm: Algorithm) -> Checksum {
-        match algorithm {
-            Algorithm::Crc32 => Checksum::Crc32(crc32fast::Hasher::new()),
-            Algorithm::Crc32c => Checksum::Crc32c(0),
-            Algorithm::Crc64Nvme => Checksum::Crc64Nvme(crc64fast_nvme::Digest::new()),
-            Algorithm::Sha1 => Checksum::Sha1(Sha1::new()),
-            Algorithm::Sha256 => Checksum::Sha256(Sha256::new()),
-        }
-    }
-
-    fn update(&mut self, data: &[u8]) {
-        match self {
-            Checksum::Crc32(h) => h.update(data),
-            Checksum::Crc32c(crc) => *crc = crc32c::crc32c_append(*crc, data),
-            Checksum::Crc64Nvme(h) => h.write(data),
-            Checksum::Sha1(h) => h.update(data),
-            Checksum::Sha256(h) => h.update(data),
-        }
-    }
-
-    /// The checksum's bytes, big-endian for the CRCs, as S3 encodes them.
-    fn finish(self) -> Vec<u8> {
-        match self {
-            Checksum::Crc32(h) => h.finalize().to_be_bytes().to_vec(),
-            Checksum::Crc32c(crc) => crc.to_be_bytes().to_vec(),
-            Checksum::Crc64Nvme(h) => h.sum64().to_be_bytes().to_vec(),
-            Checksum::Sha1(h) => h.finalize().to_vec(),
-            Checksum::Sha256(h) => h.finalize().to_vec(),
-        }
-    }
-}
 
 /// A request body as it arrives, and what it's checked against.
 pub struct Payload {
@@ -266,8 +163,38 @@ impl Payload {
                 })?;
                 payload.checksum = Some((algorithm, Checksum::new(algorithm), claimed));
             }
+            // An SDK names the algorithm of the checksum it sends, which S3
+            // requires to be sent, and to be of that algorithm.
+            if let Some(named) = header(SDK_ALGORITHM) {
+                match (Algorithm::from_name(named), payload.declared_algorithm()) {
+                    (Some(named), Some(sent)) if named != sent => return Err(bad_digest(named)),
+                    (Some(_), Some(_)) => {}
+                    (Some(named), None) => {
+                        return Err(bad_request(
+                            "InvalidRequest",
+                            format!(
+                                "x-amz-sdk-checksum-algorithm specified, but no corresponding \
+                                 {} header or trailer was sent.",
+                                named.header()
+                            ),
+                        ));
+                    }
+                    (None, _) => {
+                        return Err(bad_request(
+                            "InvalidRequest",
+                            "Value for x-amz-sdk-checksum-algorithm header is invalid.",
+                        ));
+                    }
+                }
+            }
         }
         Ok(payload)
+    }
+
+    /// The algorithm of the checksum the body declares it comes with (in an
+    /// `x-amz-checksum-*` header, or the trailer), if any.
+    pub fn declared_algorithm(&self) -> Option<Algorithm> {
+        self.checksum.as_ref().map(|(a, ..)| *a).or(self.trailer.as_ref().map(|(a, _)| *a))
     }
 
     /// The MD5 `Content-MD5` declares. Once `finish` succeeds, it's the data's.
@@ -335,8 +262,11 @@ impl Payload {
     }
 
     /// Checks, once the whole body has been read, that it was everything it
-    /// claimed to be.
-    pub fn finish(self) -> Result<(), Rejection> {
+    /// claimed to be, and returns the checksum it came with (in an
+    /// `x-amz-checksum-*` header, or the trailer), checked: its algorithm, and
+    /// its raw bytes.
+    pub fn finish(self) -> Result<Option<(Algorithm, Vec<u8>)>, Rejection> {
+        let mut checked = None;
         if let Some(decoder) = &self.decoder {
             if !decoder.is_complete() || self.decoded_length != Some(self.decoded) {
                 return Err(bad_request(
@@ -356,9 +286,11 @@ impl Payload {
                 if self.signed {
                     decoder.verify_trailer_signature().map_err(chunk_rejection)?;
                 }
-                if algorithm.decode(&claimed) != Some(checksum.finish()) {
+                let computed = checksum.finish();
+                if algorithm.decode(&claimed).as_ref() != Some(&computed) {
                     return Err(bad_digest(algorithm));
                 }
+                checked = Some((algorithm, computed));
             }
         }
         if let Some((hasher, claimed)) = self.sha256 {
@@ -381,12 +313,13 @@ impl Payload {
                 "The Content-MD5 you specified did not match what we received.",
             ));
         }
-        if let Some((algorithm, checksum, claimed)) = self.checksum
-            && checksum.finish() != claimed
-        {
-            return Err(bad_digest(algorithm));
+        if let Some((algorithm, checksum, claimed)) = self.checksum {
+            if checksum.finish() != claimed {
+                return Err(bad_digest(algorithm));
+            }
+            checked = Some((algorithm, claimed));
         }
-        Ok(())
+        Ok(checked)
     }
 }
 
@@ -547,11 +480,35 @@ mod tests {
     }
 
     #[test]
+    fn returns_the_checksum_it_checked() {
+        let crc = checksum(Algorithm::Crc32, b"data");
+        let pairs = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-checksum-crc32", crc.as_str())];
+        let mut payload = Payload::new(&headers(&pairs), "secret", true).unwrap();
+        payload.decode(Bytes::from_static(b"data")).unwrap();
+        let (algorithm, raw) = payload.finish().unwrap().unwrap();
+        assert_eq!((algorithm, STANDARD.encode(raw)), (Algorithm::Crc32, crc));
+    }
+
+    #[test]
+    fn checks_the_sdks_algorithm() {
+        let crc = checksum(Algorithm::Crc32, b"data");
+        let sent = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-checksum-crc32", crc.as_str())];
+        let with = |named: &'static str| [&sent[..], &[("x-amz-sdk-checksum-algorithm", named)]].concat();
+        assert_eq!(read(&with("CRC32"), b"data").unwrap(), b"data");
+        assert_eq!(read(&with("crc32"), b"data").unwrap(), b"data");
+        assert_eq!(code(read(&with("CRC32C"), b"data")), "BadDigest");
+        assert_eq!(code(read(&with("MD4"), b"data")), "InvalidRequest");
+        // Named, but not sent.
+        let unsent = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-sdk-checksum-algorithm", "CRC32")];
+        assert_eq!(code(read(&unsent, b"data")), "InvalidRequest");
+    }
+
+    #[test]
     fn ignores_checksum_headers_that_arent_the_bodys() {
         let pairs = [("x-amz-content-sha256", "UNSIGNED-PAYLOAD"), ("x-amz-checksum-crc32", "AAAAAA==")];
         let mut payload = Payload::new(&headers(&pairs), "secret", false).unwrap();
         payload.decode(Bytes::from_static(b"data")).unwrap();
-        assert_eq!(payload.finish(), Ok(()));
+        assert_eq!(payload.finish(), Ok(None));
     }
 
     /// An unsigned streaming body of `data`, in chunks of `chunk` bytes, with

@@ -501,8 +501,8 @@ $$;
 -- a write in a bucket with the given versioning state, with its content type,
 -- metadata (see `s3::metadata`) and encryption (see `s3::sse`): its SSE-C key
 -- check, or its SSE-KMS (or SSE-S3, if `p_sse_s3`) key, data key, sealed
--- object key and context (NULLs for what it isn't).
--- `p_size` is its plaintext's. `p_new_version_id` is
+-- object key and context (NULLs for what it isn't), and its checksum (see
+-- `s3::checksums`; NULLs for none). `p_size` is its plaintext's. `p_new_version_id` is
 -- the fresh version ID to use if the bucket is versioned. Returns the new
 -- row's id, and the version ID to report (NULL unless versioning is enabled).
 -- The caller holds B(b) shared (which gave it the versioning state), K(b,k), and
@@ -511,7 +511,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
     p_content_type text, p_metadata text, p_sse_c_key bytea, p_kms_key_id text,
     p_kms_data_key text, p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean,
-    p_new_version_id text,
+    p_checksum_algorithm text, p_checksum_type text, p_checksum text, p_new_version_id text,
     OUT id bigint, OUT version_id text
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -527,10 +527,11 @@ BEGIN
     PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);
     INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
                          size, etag, content_type, metadata, sse_c_key, sse_kms_key_id,
-                         sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3, last_modified)
+                         sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
+                         checksum_algorithm, checksum_type, checksum, last_modified)
     VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
-            p_kms_context, p_sse_s3, NOW())
+            p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, NOW())
     RETURNING objects.id INTO id;
     -- A write's version ID is reported only where it's a new one: S3 reports
     -- none for the null version (unversioned or suspended).
@@ -598,13 +599,15 @@ $$;
 -- it).
 -- `p_size` is the blob's (and the part's); an encrypted part also has its
 -- plaintext's size and its salt (NULL for a plain one), and an encrypted
--- object its encryption, as `cairn_put_version` takes it.
+-- object its encryption, as `cairn_put_version` takes it, as it does the
+-- object's checksum.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_blob uuid, p_nodes int[], p_size bigint, p_file_crc bigint, p_block_size int,
     p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
     p_bucket text, p_key text, p_content_type text, p_metadata text, p_sse_c_key bytea,
     p_kms_key_id text, p_kms_data_key text, p_kms_sealed bytea, p_kms_context text,
-    p_sse_s3 boolean, p_conditional boolean, p_expected bigint, p_new_version_id text,
+    p_sse_s3 boolean, p_checksum_algorithm text, p_checksum_type text, p_checksum text,
+    p_conditional boolean, p_expected bigint, p_new_version_id text,
     OUT status text, OUT present bigint, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -642,7 +645,7 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, coalesce(p_plain_size, p_size), p_etag, p_content_type,
         p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
-        p_sse_s3, p_new_version_id);
+        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_new_version_id);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -660,11 +663,11 @@ $$;
 -- displacing any part uploaded at that number before. Takes U(u) shared,
 -- P(u,n), then X: the blob exclusively, and the displaced part's blob. Or
 -- 'no_such_upload', or 'missing_locations'. Sizes and salt as for
--- `cairn_commit_object`.
+-- `cairn_commit_object`; `p_checksum` is the part's (see `s3::checksums`).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_upload_part(
     p_blob uuid, p_nodes int[], p_size bigint, p_file_crc bigint, p_block_size int,
     p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
-    p_upload uuid, p_part_number int,
+    p_upload uuid, p_part_number int, p_checksum text,
     OUT status text, OUT present bigint,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -694,9 +697,9 @@ BEGIN
     PERFORM pg_temp.cairn_mark_committed(p_blob, p_size, p_file_crc, p_block_size);
     DELETE FROM parts WHERE id = ANY(v_displaced);
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
-                       part_number, plain_size, enc_salt, created_at)
+                       part_number, plain_size, enc_salt, checksum, created_at)
     VALUES (p_blob, 0, p_size, p_etag, p_data_crc, NULL, p_upload, p_part_number,
-            p_plain_size, p_enc_salt, NOW());
+            p_plain_size, p_enc_salt, p_checksum, NOW());
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'committed';
@@ -723,7 +726,8 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_source_parts(
     p_object bigint, p_part_ids bigint[], p_part_sizes bigint[], p_locked uuid[],
     OUT blob_ids uuid[], OUT offsets bigint[], OUT sizes bigint[],
-    OUT etags text[], OUT crcs bigint[], OUT plain_sizes bigint[], OUT salts bytea[]
+    OUT etags text[], OUT crcs bigint[], OUT plain_sizes bigint[], OUT salts bytea[],
+    OUT checksums text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_ids bigint[];
@@ -735,8 +739,9 @@ BEGIN
            coalesce(array_agg(p.etag ORDER BY p.part_number), '{}'),
            coalesce(array_agg(p.crc64nvme ORDER BY p.part_number), '{}'),
            coalesce(array_agg(p.plain_size ORDER BY p.part_number), '{}'),
-           coalesce(array_agg(p.enc_salt ORDER BY p.part_number), '{}')
-    INTO v_ids, blob_ids, offsets, sizes, etags, crcs, plain_sizes, salts
+           coalesce(array_agg(p.enc_salt ORDER BY p.part_number), '{}'),
+           coalesce(array_agg(p.checksum ORDER BY p.part_number), '{}')
+    INTO v_ids, blob_ids, offsets, sizes, etags, crcs, plain_sizes, salts, checksums
     FROM parts p WHERE p.object_id = p_object;
     IF v_ids <> p_part_ids OR sizes <> p_part_sizes THEN
         blob_ids := NULL;
@@ -746,6 +751,7 @@ BEGIN
         crcs := NULL;
         plain_sizes := NULL;
         salts := NULL;
+        checksums := NULL;
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_check_on(v_ids, p_locked);
@@ -757,12 +763,15 @@ $$;
 -- time in ISO 8601, as CopyObject reports it), unless the source changed since the
 -- copy read it ('source_changed') or the bucket is gone ('no_such_bucket').
 -- Takes B(b) shared, K(b,k), then X: the source's blobs shared, and those of
--- the version it replaces.
+-- the version it replaces. The copy's checksum is Cairn's to work out; its
+-- parts keep the source's parts' checksums if `p_part_checksums` (they're in
+-- the copy's algorithm, and open under its key).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_source bigint, p_part_ids bigint[], p_part_sizes bigint[],
     p_bucket text, p_key text, p_size bigint, p_etag text, p_content_type text,
     p_metadata text, p_sse_c_key bytea, p_kms_key_id text, p_kms_data_key text,
-    p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean, p_new_version_id text,
+    p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean, p_checksum_algorithm text,
+    p_checksum_type text, p_checksum text, p_part_checksums boolean, p_new_version_id text,
     OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -800,16 +809,17 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_metadata,
         p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
-        p_sse_s3, p_new_version_id);
+        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_new_version_id);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
-                       part_number, plain_size, enc_salt, created_at)
+                       part_number, plain_size, enc_salt, checksum, created_at)
     SELECT t.blob_id, t.blob_offset, t.size, t.etag, t.crc, v.id, NULL, t.n, t.plain_size,
-           t.salt, NOW()
-    FROM unnest(s.blob_ids, s.offsets, s.sizes, s.etags, s.crcs, s.plain_sizes, s.salts)
-        WITH ORDINALITY AS t(blob_id, blob_offset, size, etag, crc, plain_size, salt, n);
+           t.salt, CASE WHEN p_part_checksums THEN t.checksum END, NOW()
+    FROM unnest(s.blob_ids, s.offsets, s.sizes, s.etags, s.crcs, s.plain_sizes, s.salts,
+                s.checksums)
+        WITH ORDINALITY AS t(blob_id, blob_offset, size, etag, crc, plain_size, salt, checksum, n);
     -- After inserting the new parts, so that a self-copy keeps its bytes.
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
@@ -821,11 +831,12 @@ $$;
 -- `p_index` (1-based), from `p_within` in it, as part `p_part_number` of the
 -- upload, displacing any part uploaded at that number before ('committed').
 -- Or 'no_such_upload', or 'source_changed'. Takes U(u) shared, P(u,n), then
--- X: the source's blobs shared, and the displaced part's blob.
+-- X: the source's blobs shared, and the displaced part's blob. `p_checksum`
+-- is the new part's (see `s3::checksums`).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_part(
     p_source bigint, p_part_ids bigint[], p_part_sizes bigint[],
     p_index int, p_within bigint, p_length bigint, p_etag text, p_crc bigint,
-    p_upload uuid, p_part_number int,
+    p_upload uuid, p_part_number int, p_checksum text,
     OUT status text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -864,9 +875,9 @@ BEGIN
     END IF;
     DELETE FROM parts WHERE id = ANY(v_displaced);
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
-                       part_number, created_at)
+                       part_number, checksum, created_at)
     VALUES (s.blob_ids[p_index], s.offsets[p_index] + p_within, p_length, p_etag, p_crc,
-            NULL, p_upload, p_part_number, NOW());
+            NULL, p_upload, p_part_number, p_checksum, NOW());
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'committed';
@@ -886,10 +897,13 @@ $$;
 -- ('stale', for Cairn to decide again), that every part but the last is
 -- large enough ('too_small') and they make an object S3 would store
 -- ('too_large'). Then publishes the listed parts as the key's new version,
--- deletes the staged parts left out, and the upload ('done').
+-- deletes the staged parts left out, and the upload ('done'). The object's
+-- checksum, like its ETag, Cairn works out from the listed parts' (a part's
+-- never changes: a part uploaded again is a new row).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_complete_upload(
     p_upload uuid, p_bucket text, p_key text, p_part_ids bigint[], p_part_numbers int[],
-    p_etag text, p_conditional boolean, p_expected bigint, p_new_version_id text,
+    p_etag text, p_checksum_algorithm text, p_checksum_type text, p_checksum text,
+    p_conditional boolean, p_expected bigint, p_new_version_id text,
     OUT status text, OUT version_id text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -962,7 +976,7 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, v_total, p_etag, u.content_type, u.metadata,
         u.sse_c_key, u.sse_kms_key_id, u.sse_kms_data_key, u.sse_kms_sealed, u.sse_kms_context,
-        u.sse_s3, p_new_version_id);
+        u.sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_new_version_id);
     version_id := v.version_id;
     UPDATE objects SET upload_id = p_upload WHERE id = v.id;
     UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);
@@ -1479,7 +1493,8 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_list_current(
     p_delete_markers boolean, p_totals boolean,
     OUT name text, OUT is_prefix boolean, OUT objects bigint, OUT size bigint, OUT etag text,
     OUT last_modified timestamptz, OUT is_delete_marker boolean,
-    OUT sse_s3 boolean, OUT sse_kms_key_id text, OUT sse_kms_data_key text, OUT sse_kms_sealed bytea
+    OUT sse_s3 boolean, OUT sse_kms_key_id text, OUT sse_kms_data_key text, OUT sse_kms_sealed bytea,
+    OUT checksum_algorithm text, OUT checksum_type text
 ) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_pfx text COLLATE "C" := p_prefix;
@@ -1500,14 +1515,16 @@ BEGIN
         IF v_end IS NULL THEN
             OPEN c FOR
                 SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker, o.sse_s3,
-                       o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed FROM objects o
+                       o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed,
+                       o.checksum_algorithm, o.checksum_type FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_from
                   AND (p_delete_markers OR NOT o.is_delete_marker)
                 ORDER BY o.key LIMIT p_limit - v_count;
         ELSE
             OPEN c FOR
                 SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker, o.sse_s3,
-                       o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed FROM objects o
+                       o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed,
+                       o.checksum_algorithm, o.checksum_type FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_from
                   AND o.key < v_end AND (p_delete_markers OR NOT o.is_delete_marker)
                 ORDER BY o.key LIMIT p_limit - v_count;
@@ -1529,6 +1546,8 @@ BEGIN
             sse_kms_key_id := r.sse_kms_key_id;
             sse_kms_data_key := r.sse_kms_data_key;
             sse_kms_sealed := r.sse_kms_sealed;
+            checksum_algorithm := r.checksum_algorithm;
+            checksum_type := r.checksum_type;
             RETURN NEXT;
             v_count := v_count + 1;
         END LOOP;
@@ -1549,6 +1568,8 @@ BEGIN
             sse_kms_key_id := NULL;
             sse_kms_data_key := NULL;
             sse_kms_sealed := NULL;
+            checksum_algorithm := NULL;
+            checksum_type := NULL;
             IF p_totals AND v_past IS NULL THEN
                 SELECT count(*), coalesce(sum(o.size), 0), max(o.last_modified)
                 INTO objects, size, last_modified
@@ -1580,7 +1601,8 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_list_versions(
     p_limit int,
     OUT name text, OUT is_prefix boolean, OUT version_id text, OUT is_latest boolean,
     OUT is_delete_marker boolean, OUT size bigint, OUT etag text, OUT last_modified timestamptz,
-    OUT sse_s3 boolean, OUT sse_kms_key_id text, OUT sse_kms_data_key text, OUT sse_kms_sealed bytea
+    OUT sse_s3 boolean, OUT sse_kms_key_id text, OUT sse_kms_data_key text, OUT sse_kms_sealed bytea,
+    OUT checksum_algorithm text, OUT checksum_type text
 ) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_pfx text COLLATE "C" := p_prefix;
@@ -1600,7 +1622,7 @@ BEGIN
         RETURN QUERY
             SELECT o.key::text, false, o.version_id, o.is_latest, o.is_delete_marker, o.size,
                    o.etag, o.last_modified, o.sse_s3, o.sse_kms_key_id, o.sse_kms_data_key,
-                   o.sse_kms_sealed
+                   o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type
             FROM objects o
             WHERE o.bucket = p_bucket COLLATE "default" AND o.key = v_marker
               AND o.id < p_id_marker
@@ -1614,7 +1636,7 @@ BEGIN
             OPEN c FOR
                 SELECT o.key, o.version_id, o.is_latest, o.is_delete_marker, o.size, o.etag,
                        o.last_modified, o.sse_s3, o.sse_kms_key_id, o.sse_kms_data_key,
-                       o.sse_kms_sealed
+                       o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type
                 FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from
                 ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
@@ -1622,7 +1644,7 @@ BEGIN
             OPEN c FOR
                 SELECT o.key, o.version_id, o.is_latest, o.is_delete_marker, o.size, o.etag,
                        o.last_modified, o.sse_s3, o.sse_kms_key_id, o.sse_kms_data_key,
-                       o.sse_kms_sealed
+                       o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type
                 FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from AND o.key < v_end
                 ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
@@ -1645,6 +1667,8 @@ BEGIN
             sse_kms_key_id := r.sse_kms_key_id;
             sse_kms_data_key := r.sse_kms_data_key;
             sse_kms_sealed := r.sse_kms_sealed;
+            checksum_algorithm := r.checksum_algorithm;
+            checksum_type := r.checksum_type;
             RETURN NEXT;
             v_count := v_count + 1;
         END LOOP;
@@ -1664,6 +1688,8 @@ BEGIN
             sse_kms_key_id := NULL;
             sse_kms_data_key := NULL;
             sse_kms_sealed := NULL;
+            checksum_algorithm := NULL;
+            checksum_type := NULL;
             RETURN NEXT;
             v_count := v_count + 1;
         END IF;
@@ -1682,7 +1708,8 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_list_uploads(
     p_bucket text, p_prefix text, p_delimiter text, p_key_marker text, p_upload_marker uuid,
     p_limit int,
-    OUT name text, OUT is_prefix boolean, OUT upload_id uuid, OUT initiated_at timestamptz
+    OUT name text, OUT is_prefix boolean, OUT upload_id uuid, OUT initiated_at timestamptz,
+    OUT checksum_algorithm text, OUT checksum_type text
 ) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_pfx text COLLATE "C" := p_prefix;
@@ -1698,7 +1725,8 @@ BEGIN
     IF p_upload_marker IS NOT NULL AND starts_with(v_marker, v_pfx)
        AND pg_temp.cairn_common_prefix(v_marker, v_pfx, v_delim) IS NULL THEN
         RETURN QUERY
-            SELECT u.key::text, false, u.upload_id, u.initiated_at
+            SELECT u.key::text, false, u.upload_id, u.initiated_at, u.checksum_algorithm,
+                   u.checksum_type
             FROM multipart_uploads u
             WHERE u.bucket = p_bucket COLLATE "default" AND u.key = v_marker
               AND u.upload_id > p_upload_marker
@@ -1708,13 +1736,13 @@ BEGIN
     WHILE v_count < p_limit LOOP
         IF v_end IS NULL THEN
             OPEN c FOR
-                SELECT u.key, u.upload_id, u.initiated_at
+                SELECT u.key, u.upload_id, u.initiated_at, u.checksum_algorithm, u.checksum_type
                 FROM multipart_uploads u
                 WHERE u.bucket = p_bucket COLLATE "default" AND u.key >= v_from
                 ORDER BY u.key, u.upload_id LIMIT p_limit - v_count;
         ELSE
             OPEN c FOR
-                SELECT u.key, u.upload_id, u.initiated_at
+                SELECT u.key, u.upload_id, u.initiated_at, u.checksum_algorithm, u.checksum_type
                 FROM multipart_uploads u
                 WHERE u.bucket = p_bucket COLLATE "default" AND u.key >= v_from AND u.key < v_end
                 ORDER BY u.key, u.upload_id LIMIT p_limit - v_count;
@@ -1729,6 +1757,8 @@ BEGIN
             is_prefix := false;
             upload_id := r.upload_id;
             initiated_at := r.initiated_at;
+            checksum_algorithm := r.checksum_algorithm;
+            checksum_type := r.checksum_type;
             RETURN NEXT;
             v_count := v_count + 1;
         END LOOP;
@@ -1739,6 +1769,8 @@ BEGIN
             is_prefix := true;
             upload_id := NULL;
             initiated_at := NULL;
+            checksum_algorithm := NULL;
+            checksum_type := NULL;
             RETURN NEXT;
             v_count := v_count + 1;
         END IF;

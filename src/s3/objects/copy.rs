@@ -18,7 +18,8 @@ use crate::{
     payload::Payload,
     s3::{
         conditional::{Precondition, Preconditions},
-        multipart::upload_encryption,
+        checksums::{self, Algorithm, Checksum, ChecksumKey, Storing, Type},
+        multipart::upload,
         sse::{self, Stored, Wanted},
         sse_c::CustomerKey,
         objects::get::{
@@ -51,6 +52,17 @@ struct SourcePart {
     size: i64,
     etag: String,
     crc64nvme: Option<i64>,
+    /// Its plaintext's size, if it's encrypted.
+    plain_size: Option<i64>,
+    /// Its checksum, as it's stored (in its object's algorithm).
+    checksum: Option<String>,
+}
+
+impl SourcePart {
+    /// What it contributes to its object.
+    fn object_size(&self) -> u64 {
+        self.plain_size.unwrap_or(self.size) as u64
+    }
 }
 
 /// The version a copy reads: its metadata, its parts, and where to read them
@@ -70,6 +82,8 @@ pub struct CopyKeys<'a> {
     pub dest: Wanted<'a>,
     /// Who the KMS is asked as, for SSE-KMS (see `kms`).
     pub role: Option<Uuid>,
+    /// The algorithm of the checksum it asks for (`x-amz-checksum-algorithm`).
+    pub checksum: Option<Algorithm>,
 }
 
 impl CopyKeys<'_> {
@@ -211,13 +225,14 @@ pub async fn copy_object(
         } else {
             (version.content_type.as_str(), version.metadata.as_str())
         };
-        let respond = |etag: &str, version_id: Option<&str>, last_modified: &str, stored: &Stored| {
+        let respond = |etag: &str, checksum: Option<&Checksum>, version_id: Option<&str>, last_modified: &str, stored: &Stored| {
+            let checksum = checksum.map_or(String::new(), Checksum::xml);
             let resp = with_version_id(
                 xml_ok(format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                      <CopyObjectResult>\
                      <LastModified>{last_modified}</LastModified>\
-                     <ETag>\"{etag}\"</ETag>\
+                     <ETag>\"{etag}\"</ETag>{checksum}\
                      </CopyObjectResult>"
                 )),
                 version_id,
@@ -230,16 +245,23 @@ pub async fn copy_object(
             Ok(key) => key,
             Err(refused) => return Ok(refused),
         };
+        // The copy's checksum: of the algorithm it asks for, else its
+        // source's, else S3's default; always FULL_OBJECT, as the copy isn't
+        // multipart (a COMPOSITE source's is worked out again, as MinIO does).
+        let checksum_algorithm = keys
+            .checksum
+            .or(version.checksum.as_ref().map(|checksum| checksum.algorithm))
+            .unwrap_or(Algorithm::Crc64Nvme);
         if !keys.shares(encryption) {
-            let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata };
+            let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, checksum: checksum_algorithm };
             let sealing = match sse::seal(app, keys.dest, keys.role, dest_bucket, dest_key).await? {
                 Ok(sealing) => sealing,
                 Err(refused) => return Ok(refused),
             };
             let stored = sealing.as_ref().map_or(Stored::Plain, |sealing| sealing.stored.clone());
             match stream_object_copy(app, &source, &dest, source_key, sealing).await {
-                Ok(Some((etag, version_id, last_modified))) => {
-                    return Ok(respond(&etag, version_id.as_deref(), &last_modified, &stored));
+                Ok(Some((etag, checksum, version_id, last_modified))) => {
+                    return Ok(respond(&etag, checksum.as_ref(), version_id.as_deref(), &last_modified, &stored));
                 }
                 Ok(None) => return Ok(no_such_bucket()),
                 // Its data went with it: copy what it is now.
@@ -254,8 +276,11 @@ pub async fn copy_object(
             [part] => (part.etag.clone(), part.etag.clone()),
             _ => {
                 let size = version.size as u64;
-                match hash_range(app, source.locations.clone(), 0, size).await {
-                    Ok((md5, _)) => (md5.clone(), md5),
+                match hash_range(app, source.locations.clone(), 0, size, Hashing::default()).await {
+                    Ok(hashes) => {
+                        let md5 = hashes.md5.expect("asked for");
+                        (md5.clone(), md5)
+                    }
                     // Its data went with it: copy what it is now.
                     Err(_) if source.changed(app).await? => continue,
                     Err(e) => return Err(e),
@@ -283,18 +308,26 @@ pub async fn copy_object(
                 unreachable!("an SSE-KMS or SSE-S3 copy shares only an encrypted source's parts")
             }
         };
+        // Its checksum, under the key it shares with its source, if it's
+        // encrypted.
+        let copied = match copy_checksum(app, &source, checksum_algorithm, source_key.as_deref()).await {
+            Ok(copied) => copied,
+            // Its data went with it: copy what it is now.
+            Err(_) if source.changed(app).await? => continue,
+            Err(e) => return Err(e),
+        };
         // CopyObject reports the new version's last-modified time in the body
         // (not just the ETag header). It comes from the commit itself: read
         // afterwards, a concurrent write to the key could have replaced the
         // version already.
-        let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata };
+        let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, checksum: checksum_algorithm };
         let (version_id, last_modified) =
-            match commit_object_copy(app, &source, &dest, &stored_etag, &stored).await? {
+            match commit_object_copy(app, &source, &dest, &stored_etag, &stored, &copied).await? {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
                 ObjectCopy::SourceChanged => continue, // copy what it is now
                 ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
             };
-        return Ok(respond(&etag, version_id.as_deref(), &last_modified, &stored));
+        return Ok(respond(&etag, Some(&copied.checksum), version_id.as_deref(), &last_modified, &stored));
     }
     Err(Contended("the copy source kept changing".to_owned()).into())
 }
@@ -311,6 +344,62 @@ struct Dest<'a> {
     key: &'a str,
     content_type: &'a str,
     metadata: &'a str,
+    /// The algorithm of its checksum (FULL_OBJECT).
+    checksum: Algorithm,
+}
+
+/// The checksum of a copy that shares its source's parts, as it's stored, and
+/// whether its parts keep theirs (they're of its algorithm).
+struct Copied {
+    checksum: Checksum,
+    stored: String,
+    part_checksums: bool,
+}
+
+/// Works out the checksum of a copy of `source` that shares its parts (and
+/// its key, `object_key`, if it's encrypted), of `algorithm`: the source's,
+/// if it's a FULL_OBJECT one of it; combined from its parts', if they have
+/// CRCs of it (a COMPOSITE one's, or a plain one's own CRC64NVME); else from
+/// its data, read.
+async fn copy_checksum(
+    app: &Arc<App>,
+    source: &Source,
+    algorithm: Algorithm,
+    object_key: Option<&Key>,
+) -> anyhow::Result<Copied> {
+    let checksum_key = object_key.map(ChecksumKey::new);
+    let storing = match &checksum_key {
+        Some(checksum_key) => Storing::Sealed(checksum_key),
+        None => Storing::Plain,
+    };
+    let same = source.version.checksum.as_ref().filter(|checksum| checksum.algorithm == algorithm);
+    if let Some(checksum) = same.filter(|checksum| checksum.kind == Type::FullObject) {
+        return Ok(Copied { checksum: checksum.read(&storing)?, stored: checksum.stored.clone(), part_checksums: true });
+    }
+    let combined = |raws: Vec<Vec<u8>>| {
+        let pieces = raws.iter().zip(&source.parts).map(|(raw, part)| (raw.as_slice(), part.object_size()));
+        Checksum::full(algorithm, &checksums::combine_all(algorithm, pieces))
+    };
+    let checksum = if same.is_some() && algorithm.combines() && source.parts.iter().all(|p| p.checksum.is_some()) {
+        let mut raws = Vec::with_capacity(source.parts.len());
+        for part in &source.parts {
+            let value = storing.read(part.checksum.as_deref().expect("checked"))?;
+            raws.push(algorithm.decode(&value).ok_or_else(|| anyhow::anyhow!("a stored checksum isn't one"))?);
+        }
+        combined(raws)
+    } else if algorithm == Algorithm::Crc64Nvme
+        && object_key.is_none()
+        && source.parts.iter().all(|p| p.crc64nvme.is_some())
+    {
+        combined(source.parts.iter().map(|p| (p.crc64nvme.expect("checked") as u64).to_be_bytes().to_vec()).collect())
+    } else {
+        let size = source.version.size as u64;
+        let hashing = Hashing { md5: false, checksum: Some(algorithm), key: object_key };
+        let hashes = hash_range(app, source.locations.clone(), 0, size, hashing).await?;
+        Checksum::full(algorithm, &hashes.checksum.expect("asked for"))
+    };
+    let stored = storing.store(&checksum.value);
+    Ok(Copied { checksum, stored, part_checksums: same.is_some() })
 }
 
 /// Copies `source` to `dest` as data, through the normal upload path: read
@@ -324,7 +413,7 @@ async fn stream_object_copy(
     dest: &Dest<'_>,
     source_key: Option<Zeroizing<Key>>,
     sealing: Option<Sealing>,
-) -> anyhow::Result<Option<(String, Option<String>, String)>> {
+) -> anyhow::Result<Option<(String, Option<Checksum>, Option<String>, String)>> {
     let (sender, body) = channel_body();
     let size = source.version.size as u64;
     let slices = select_parts_in_range(source.locations.clone(), 0, size, source_key.as_deref());
@@ -336,12 +425,14 @@ async fn stream_object_copy(
         metadata: dest.metadata.to_owned(),
         conditions: Preconditions::default(),
         sealing,
+        checksum: checksums::Wanted::Exactly(dest.checksum),
     };
     // The source stream is data from within Cairn (verified as it's read), so
     // there's nothing to check it against.
     match crate::upload_part(app, body, &attach, Payload::unchecked()).await? {
-        UploadResult::Committed { etag, version_id, last_modified } => Ok(Some((
+        UploadResult::Committed { etag, checksum, version_id, last_modified, .. } => Ok(Some((
             etag,
+            checksum,
             version_id,
             last_modified.expect("an object write reports its last-modified time"),
         ))),
@@ -380,6 +471,7 @@ async fn commit_object_copy(
     dest: &Dest<'_>,
     etag: &str,
     stored: &Stored,
+    copied: &Copied,
 ) -> anyhow::Result<ObjectCopy> {
     let (part_ids, part_sizes) = source.part_keys();
     let sse = stored.columns();
@@ -391,7 +483,7 @@ async fn commit_object_copy(
                 .query_one_cached(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                                                    $12, $13, $14, $15, $16)",
+                                                    $12, $13, $14, $15, $16, $17, $18, $19, $20)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -408,6 +500,10 @@ async fn commit_object_copy(
                         &sse.kms_sealed,
                         &sse.kms_context,
                         &sse.sse_s3,
+                        &copied.checksum.algorithm.name(),
+                        &copied.checksum.kind.name(),
+                        &copied.stored,
+                        &copied.part_checksums,
                         &new_version_id(),
                     ],
                 )
@@ -498,8 +594,14 @@ pub async fn copy_part(
 
     // Reject up front if the upload is gone, and require it to belong to the
     // request's bucket/key, and its key if it's SSE-C — as put_part does.
-    let Some(upload_encryption) = upload_encryption(app, &upload_id, bucket, key).await? else {
+    let Some(upload) = upload(app, &upload_id, bucket, key).await? else {
         return Ok(no_such_upload());
+    };
+    let upload_encryption = upload.encryption.clone();
+    // The new part's checksum is of its upload's algorithm (see `Upload`).
+    let part_checksum = match upload.part_checksum() {
+        checksums::Wanted::Exactly(algorithm) => Some(algorithm),
+        _ => None,
     };
     if let Err(refused) = sse::check(&upload_encryption, dest_key) {
         return Ok(refused);
@@ -539,12 +641,21 @@ pub async fn copy_part(
                 &format!("The specified copy range is larger than the maximum part size: {MAX_UPLOAD}"),
             ));
         }
-        let respond = |etag: &str| {
+        // The part's checksum is told for an upload of an algorithm (S3: "if
+        // the multipart upload request was created with" it).
+        let respond = |etag: &str, checksum: Option<&Checksum>| {
+            let checksum = match (checksum, upload.checksum) {
+                (Some(checksum), Some(_)) => {
+                    let element = checksum.algorithm.element();
+                    format!("<{element}>{}</{element}>", checksum.value)
+                }
+                _ => String::new(),
+            };
             let resp = xml_ok(format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                  <CopyPartResult>\
                  <LastModified>{}</LastModified>\
-                 <ETag>\"{etag}\"</ETag>\
+                 <ETag>\"{etag}\"</ETag>{checksum}\
                  </CopyPartResult>",
                 version.last_modified_iso
             ));
@@ -559,8 +670,8 @@ pub async fn copy_part(
                 Err(refused) => return Ok(refused),
             };
             return Ok(
-                match stream_part_copy(app, &source, start, end, upload_id, part_number, keys).await {
-                    Ok(Some(etag)) => respond(&etag),
+                match stream_part_copy(app, &source, start, end, upload_id, part_number, keys, upload.part_checksum()).await {
+                    Ok(Some((etag, checksum))) => respond(&etag, checksum.as_ref()),
                     Ok(None) => no_such_upload(),
                     // Its data went with it: copy what it is now.
                     Err(_) if source.changed(app).await? => continue,
@@ -570,16 +681,35 @@ pub async fn copy_part(
         };
         let part = &source.parts[index];
         let length = (end - start) as i64;
-        let (etag, crc) = if within == 0 && length == part.size {
-            (part.etag.clone(), part.crc64nvme)
+        let whole = within == 0 && length == part.size;
+        // A whole part's checksum may be had without reading it: its own
+        // (of its object's algorithm; a single PUT's is its object's), or its
+        // CRC64NVME. Both plain: the source is.
+        let known = part_checksum.filter(|_| whole).and_then(|algorithm| {
+            let object = version.checksum.as_ref().filter(|c| c.algorithm == algorithm);
+            let value = match object {
+                Some(_) if part.checksum.is_some() => part.checksum.clone(),
+                Some(c) if source.parts.len() == 1 && c.kind == Type::FullObject => Some(c.stored.clone()),
+                _ if algorithm == Algorithm::Crc64Nvme => {
+                    part.crc64nvme.map(|crc| checksums::encode(&(crc as u64).to_be_bytes()))
+                }
+                _ => None,
+            };
+            value.map(|value| Checksum { algorithm, kind: Type::FullObject, value })
+        });
+        let (etag, crc, checksum) = if whole && (part_checksum.is_none() || known.is_some()) {
+            (part.etag.clone(), part.crc64nvme, known)
         } else {
-            let (md5, crc) = match hash_range(app, source.locations.clone(), start, end).await {
+            let hashing = Hashing { md5: !whole, checksum: part_checksum, key: None };
+            let hashes = match hash_range(app, source.locations.clone(), start, end, hashing).await {
                 Ok(hashes) => hashes,
                 // Its data went with it: copy what it is now.
                 Err(_) if source.changed(app).await? => continue,
                 Err(e) => return Err(e),
             };
-            (md5, Some(crc as i64))
+            let etag = hashes.md5.unwrap_or_else(|| part.etag.clone());
+            let checksum = part_checksum.zip(hashes.checksum).map(|(a, raw)| Checksum::full(a, &raw));
+            (etag, Some(hashes.crc64nvme as i64), checksum)
         };
         let new_part = NewPart {
             index,
@@ -587,9 +717,10 @@ pub async fn copy_part(
             length,
             etag: &etag,
             crc,
+            checksum: checksum.as_ref().map(|checksum| checksum.value.as_str()),
         };
         match commit_part_copy(app, &source, &new_part, upload_id, part_number).await? {
-            PartCopy::Committed => return Ok(respond(&etag)),
+            PartCopy::Committed => return Ok(respond(&etag, checksum.as_ref())),
             PartCopy::NoSuchUpload => return Ok(no_such_upload()),
             PartCopy::SourceChanged => continue,
         }
@@ -640,6 +771,8 @@ struct NewPart<'a> {
     length: i64,
     etag: &'a str,
     crc: Option<i64>,
+    /// Its checksum (plain: so is the upload).
+    checksum: Option<&'a str>,
 }
 
 enum PartCopy {
@@ -668,7 +801,7 @@ async fn commit_part_copy(
             let row = client
                 .query_one_cached(
                     "SELECT status, reap_blob, reap_node, reap_peer
-                     FROM pg_temp.cairn_copy_part($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                     FROM pg_temp.cairn_copy_part($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -680,6 +813,7 @@ async fn commit_part_copy(
                         &new_part.crc,
                         &upload_id,
                         &part_number,
+                        &new_part.checksum,
                     ],
                 )
                 .await?;
@@ -712,6 +846,7 @@ async fn commit_part_copy(
 /// with the upload's (`keys`), if they're encrypted. For a range over several
 /// parts of the source, or of or into an encrypted one. `None` if the upload
 /// was completed or aborted meanwhile.
+#[allow(clippy::too_many_arguments)]
 async fn stream_part_copy(
     app: &Arc<App>,
     source: &Source,
@@ -720,7 +855,8 @@ async fn stream_part_copy(
     upload_id: Uuid,
     part_number: i32,
     keys: StreamKeys,
-) -> anyhow::Result<Option<String>> {
+    checksum: checksums::Wanted,
+) -> anyhow::Result<Option<(String, Option<Checksum>)>> {
     let (sender, source_body) = channel_body();
     let slices = select_parts_in_range(source.locations.clone(), start, end, keys.source.as_deref());
     spawn_range_stream(app.clone(), slices, sender);
@@ -729,11 +865,12 @@ async fn stream_part_copy(
         part_number,
         key: keys.dest,
         sse_s3: keys.dest_s3,
+        checksum,
     };
     // The source stream is data from within Cairn (verified against its block
     // checksums as it's read), so there's nothing to check it against.
     match crate::upload_part(app, source_body, &attach, Payload::unchecked()).await? {
-        UploadResult::Committed { etag, .. } => Ok(Some(etag)),
+        UploadResult::Committed { etag, checksum, .. } => Ok(Some((etag, checksum))),
         UploadResult::NoSuchUpload => Ok(None),
         // Nothing is checked, there are no conditions, and a part has no bucket
         // to check.
@@ -837,7 +974,7 @@ async fn source_parts<C: GenericClient>(
 ) -> Result<Vec<SourcePart>, tokio_postgres::Error> {
     let rows = client
         .query_cached(
-            "SELECT id, size, etag, crc64nvme FROM parts
+            "SELECT id, size, etag, crc64nvme, plain_size, checksum FROM parts
              WHERE object_id = $1 ORDER BY part_number",
             &[&object_id],
         )
@@ -849,6 +986,8 @@ async fn source_parts<C: GenericClient>(
             size: r.get(1),
             etag: r.get(2),
             crc64nvme: r.get(3),
+            plain_size: r.get(4),
+            checksum: r.get(5),
         })
         .collect())
 }
@@ -867,30 +1006,63 @@ fn part_holding(parts: &[SourcePart], start: u64, end: u64) -> Option<(usize, u6
     None
 }
 
-/// Reads bytes [start, end) of an object (its `parts`), verified like a GET,
-/// and returns their MD5 (hex) and CRC64/NVME: what a copy of them needs, and
-/// the catalog doesn't have.
+/// What `hash_range` works out: the MD5 (for an ETag), and a checksum of an
+/// algorithm, of data decrypted with `key`, if it's encrypted. CRC64/NVME
+/// always (a part's own).
+struct Hashing<'a> {
+    md5: bool,
+    checksum: Option<Algorithm>,
+    key: Option<&'a Key>,
+}
+
+impl Default for Hashing<'_> {
+    fn default() -> Self {
+        Hashing { md5: true, checksum: None, key: None }
+    }
+}
+
+/// What `hash_range` worked out: the MD5 in hex, the CRC64/NVME, and the
+/// checksum (raw).
+struct Hashes {
+    md5: Option<String>,
+    crc64nvme: u64,
+    checksum: Option<Vec<u8>>,
+}
+
+/// Reads bytes [start, end) of an object (its `parts`), verified (and
+/// decrypted) like a GET, and works out what a copy of them needs, and the
+/// catalog doesn't have.
 async fn hash_range(
     app: &Arc<App>,
     parts: Vec<PartLocation>,
     start: u64,
     end: u64,
-) -> anyhow::Result<(String, u64)> {
+    hashing: Hashing<'_>,
+) -> anyhow::Result<Hashes> {
     let (sender, mut body) = channel_body();
-    spawn_range_stream(app.clone(), select_parts_in_range(parts, start, end, None), sender);
-    let mut md5 = Md5::new();
+    spawn_range_stream(app.clone(), select_parts_in_range(parts, start, end, hashing.key), sender);
+    let mut md5 = hashing.md5.then(Md5::new);
     let mut crc = crc64fast_nvme::Digest::new();
+    let mut checksum = hashing.checksum.map(checksums::Hasher::new);
     let mut read = 0;
     while let Some(frame) = body.frame().await {
         if let Ok(data) = frame?.into_data() {
-            md5.update(&data);
+            if let Some(md5) = &mut md5 {
+                md5.update(&data);
+            }
+            if let Some(checksum) = &mut checksum {
+                checksum.update(&data);
+            }
             crc.write(&data);
             read += data.len() as u64;
         }
     }
     anyhow::ensure!(read == end - start, "the copy source was cut short");
-    let md5: String = md5.finalize().iter().map(|b| format!("{b:02x}")).collect();
-    Ok((md5, crc.sum64()))
+    Ok(Hashes {
+        md5: md5.map(|md5| md5.finalize().iter().map(|b| format!("{b:02x}")).collect()),
+        crc64nvme: crc.sum64(),
+        checksum: checksum.map(checksums::Hasher::finish),
+    })
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {

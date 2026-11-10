@@ -59,6 +59,7 @@ async fn upload_part(app: &Arc<App>, upload_id: &str, number: i32, data: Vec<u8>
         part_number: number,
         key: None,
         sse_s3: false,
+        checksum: crate::e2e::PART_CHECKSUM,
     };
     let body = Full::new(Bytes::from(data));
     match crate::upload_part(app, body, &attach, Payload::unchecked()).await? {
@@ -118,7 +119,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
         }
         // Part re-uploads racing each other, then a complete or an abort.
         12..=16 => {
-            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "", Wanted::Plain, None).await?).await;
+            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "", Wanted::Plain, None, None).await?).await;
             let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
             let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
             let mut parts = JoinSet::new();
@@ -144,7 +145,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
                     .map(|(n, etag)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"))
                     .collect();
                 let request = Bytes::from(format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>"));
-                let response = complete_multipart_upload(app, BUCKET, &a, &upload_id, request, &Preconditions::default(), None).await?;
+                let response = complete_multipart_upload(app, BUCKET, &a, &upload_id, request, &Preconditions::default(), None, None, None).await?;
                 let (status, body) = text(response).await;
                 anyhow::ensure!(status == StatusCode::OK, "complete: {status} {body}");
             }

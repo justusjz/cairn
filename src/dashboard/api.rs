@@ -635,6 +635,7 @@ pub(super) async fn listing(app: &App, bucket: &str, query: &ListQuery<'_>) -> R
                 etag,
                 last_modified,
                 delete_marker,
+                ..
             } => Entry::Object {
                 key,
                 size,
@@ -857,6 +858,7 @@ async fn download(
         None,
         // No role: the dashboard can't open SSE-KMS objects (see `s3::sse`).
         None,
+        false,
     )
     .await?;
     if resp.status() != StatusCode::OK {

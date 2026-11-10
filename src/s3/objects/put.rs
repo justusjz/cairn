@@ -7,6 +7,7 @@ use crate::db::Cached;
 use crate::{
     App, AttachTarget, UploadResult,
     payload::Payload,
+    s3::checksums::{self, Algorithm},
     s3::conditional::Preconditions,
     s3::sse::{self, Wanted},
     s3::util::{format_s3_error, rejection_response, with_version_id},
@@ -68,12 +69,18 @@ pub async fn put_object(
         metadata: metadata.to_owned(),
         conditions: conditions.clone(),
         sealing,
+        // The client's checksum, or S3's default.
+        checksum: checksums::Wanted::ClientsOr(Algorithm::Crc64Nvme),
     };
     match crate::upload_part(app, body, &attach, payload).await? {
-        UploadResult::Committed { etag, version_id, .. } => {
+        UploadResult::Committed { etag, checksum, version_id, .. } => {
             let builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, format!("\"{etag}\""));
+            let builder = match &checksum {
+                Some(checksum) => checksum.headers(builder),
+                None => builder,
+            };
             let builder = sse::echo(builder, &stored, customer_key);
             Ok(with_version_id(builder.body(Full::new(Bytes::new())).unwrap(), version_id.as_deref()))
         }

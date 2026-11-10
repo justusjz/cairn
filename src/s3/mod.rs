@@ -44,6 +44,7 @@ use crate::{
 };
 
 pub(crate) mod buckets;
+pub(crate) mod checksums;
 pub(crate) mod acl;
 pub(crate) mod conditional;
 pub(crate) mod metadata;
@@ -364,6 +365,11 @@ async fn handle_request(
     // Conditional-request headers (If-Match / If-None-Match / If-[Un]Modified-Since)
     // gate GET and HEAD; read them before the body-consuming arms.
     let preconditions = Preconditions::from_headers(req.headers());
+    // Whether a read asks for its object's checksum.
+    let checksum_mode = req
+        .headers()
+        .get(checksums::MODE)
+        .is_some_and(|mode| mode.as_bytes() == b"ENABLED");
     // GET, HEAD and DELETE may address one specific version of the object.
     let version_id = query_param(&query, "versionId");
     let addresses_version = matches!(*req.method(), Method::GET | Method::HEAD | Method::DELETE);
@@ -450,7 +456,8 @@ async fn handle_request(
             let marker = query_param(&query, "part-number-marker")
                 .and_then(|v| v.parse::<i32>().ok())
                 .unwrap_or(0);
-            let resp = list_parts(&app, &bucket, &key, &upload_id, marker, max_parts).await?;
+            let resp =
+                list_parts(&app, &bucket, &key, &upload_id, marker, max_parts, customer_key.as_ref(), role).await?;
             return Ok(box_response(resp));
         }
         return get_object(
@@ -462,6 +469,7 @@ async fn handle_request(
             &preconditions,
             customer_key.as_ref(),
             role,
+            checksum_mode,
         )
         .await
         .map(|response| overrides.apply(response));
@@ -509,6 +517,8 @@ async fn handle_request(
                 range.as_deref(),
                 &preconditions,
                 customer_key.as_ref(),
+                role,
+                checksum_mode,
             )
             .await?,
         ),
@@ -523,21 +533,31 @@ async fn handle_request(
         // CreateMultipartUpload
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {
             match metadata {
-                Ok(metadata) => {
-                    create_multipart_upload(&app, &bucket, &key, &content_type, &metadata, wanted, role).await?
-                }
+                Ok(metadata) => match checksums::requested_upload(req.headers()) {
+                    Ok(checksum) => {
+                        create_multipart_upload(&app, &bucket, &key, &content_type, &metadata, wanted, role, checksum)
+                            .await?
+                    }
+                    Err(refused) => refused,
+                },
                 Err(refused) => refused,
             }
         }
         // CompleteMultipartUpload
         // Its x-amz-checksum-* header is the object's, not the body's.
         hyper::Method::POST if query_param(&query, "uploadId").is_some() => {
+            let claimed = match checksums::claimed(req.headers()) {
+                Ok(claimed) => claimed,
+                Err(refused) => return Ok(box_response(refused)),
+            };
             match read_body(req, &principal.secret, false).await? {
                 Ok(body) => {
                     let upload_id = query_param(&query, "uploadId").unwrap_or_default();
                     let customer_key = customer_key.as_ref();
-                    complete_multipart_upload(&app, &bucket, &key, &upload_id, body, &preconditions, customer_key)
-                        .await?
+                    complete_multipart_upload(
+                        &app, &bucket, &key, &upload_id, body, &preconditions, customer_key, role, claimed,
+                    )
+                    .await?
                 }
                 Err(rejection) => util::rejection_response(&rejection),
             }
@@ -592,6 +612,15 @@ async fn handle_request(
                 }
                 metadata => metadata.unwrap_or_default(),
             };
+            // The algorithm of the checksum it asks for; S3's 400 for one it
+            // doesn't know.
+            let checksum = match req.headers().get(checksums::ALGORITHM) {
+                None => None,
+                Some(name) => match name.to_str().ok().and_then(checksums::Algorithm::from_name) {
+                    Some(algorithm) => Some(algorithm),
+                    None => return Ok(box_response(checksums::invalid())),
+                },
+            };
             copy_object(
                 &app,
                 &bucket,
@@ -601,12 +630,15 @@ async fn handle_request(
                 &content_type,
                 &metadata,
                 &copy_source_preconditions,
-                CopyKeys { source: source_key.as_ref(), dest: wanted, role },
+                CopyKeys { source: source_key.as_ref(), dest: wanted, role, checksum },
             )
             .await?
         }
         hyper::Method::PUT => match (payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)), metadata) {
             (Ok(payload), Ok(metadata)) => {
+                if let Err(refused) = checksums::check_put_type(req.headers(), payload.declared_algorithm()) {
+                    return Ok(box_response(refused));
+                }
                 let body = req.into_body();
                 put_object(&app, &bucket, &key, &content_type, &metadata, body, payload, &preconditions, wanted, role)
                     .await?
@@ -664,7 +696,7 @@ async fn read_body(
             return Ok(Err(too_big()));
         }
     }
-    Ok(payload.finish().map(|()| data.into()))
+    Ok(payload.finish().map(|_| data.into()))
 }
 
 /// The S3 error for a request whose handler failed: 503 if storage nodes are

@@ -42,6 +42,7 @@ async fn put_with(app: &Arc<App>, key: &str, metadata: String) {
         metadata,
         conditions: Preconditions::default(),
         sealing: None,
+        checksum: crate::e2e::OBJECT_CHECKSUM,
     };
     let body = Full::new(Bytes::from_static(b"data"));
     let result = crate::upload_part(app, body, &attach, Payload::unchecked()).await.unwrap();
@@ -51,8 +52,8 @@ async fn put_with(app: &Arc<App>, key: &str, metadata: String) {
 /// The headers of a GET and a HEAD of `key`, which must be the same.
 pub(super) async fn read_headers(app: &Arc<App>, key: &str) -> HeaderMap {
     let none = Preconditions::default();
-    let got = get_object(app, BUCKET, key, None, None, &none, None, None).await.unwrap();
-    let head = head_object(app, BUCKET, key, None, None, &none, None).await.unwrap();
+    let got = get_object(app, BUCKET, key, None, None, &none, None, None, false).await.unwrap();
+    let head = head_object(app, BUCKET, key, None, None, &none, None, None, false).await.unwrap();
     assert_eq!(got.status(), StatusCode::OK);
     assert_eq!(got.headers(), head.headers(), "a HEAD answers as a GET does");
     got.headers().clone()

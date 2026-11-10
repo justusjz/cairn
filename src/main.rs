@@ -771,6 +771,8 @@ enum AttachTarget {
         conditions: Preconditions,
         /// If it's encrypted: what with, and how that's stored.
         sealing: Option<Sealing>,
+        /// The checksum it's stored with (see `s3::checksums`).
+        checksum: s3::checksums::Wanted,
     },
     /// A part staged under an in-progress multipart upload, encrypted with
     /// `key` if the upload is encrypted (SSE-C, SSE-KMS or SSE-S3), whose
@@ -780,7 +782,25 @@ enum AttachTarget {
         part_number: i32,
         key: Option<zeroize::Zeroizing<encryption::Key>>,
         sse_s3: bool,
+        /// The checksum it's stored with: its upload's algorithm's.
+        checksum: s3::checksums::Wanted,
     },
+}
+
+impl AttachTarget {
+    fn checksum(&self) -> s3::checksums::Wanted {
+        match self {
+            AttachTarget::Object { checksum, .. } | AttachTarget::MultipartPart { checksum, .. } => *checksum,
+        }
+    }
+
+    /// The key it's encrypted with, if it is.
+    fn key(&self) -> Option<&encryption::Key> {
+        match self {
+            AttachTarget::Object { sealing, .. } => sealing.as_ref().map(|sealing| &*sealing.key),
+            AttachTarget::MultipartPart { key, .. } => key.as_deref(),
+        }
+    }
 }
 
 pub(crate) use s3::sse::Sealing;
@@ -788,11 +808,14 @@ pub(crate) use s3::sse::Sealing;
 /// The outcome of an upload: the committed part's ETag, or why it wasn't
 /// committed.
 enum UploadResult {
-    /// Committed, with the new part's ETag and, for an object write, the
-    /// `x-amz-version-id` to report for the version it created, and its
-    /// last-modified time (ISO 8601).
+    /// Committed, with the new part's ETag and checksum (if it's stored with
+    /// one) and, for an object write, the `x-amz-version-id` to report for
+    /// the version it created, and its last-modified time (ISO 8601).
     Committed {
         etag: String,
+        checksum: Option<s3::checksums::Checksum>,
+        /// The checksum the client sent with it, checked.
+        sent: Option<s3::checksums::Checksum>,
         version_id: Option<String>,
         last_modified: Option<String>,
     },
@@ -874,10 +897,23 @@ where
         }
         _ => (None, None),
     };
+    // The checksum it's stored with: the one the client sent, checked as
+    // it's read (see `Payload`), or one worked out here. A plain part's
+    // CRC64NVME is the writer's own of its data.
+    let sent = payload.declared_algorithm();
+    let checksum_algorithm = attach.checksum().algorithm(sent);
+    let mut checksum_hasher = match checksum_algorithm {
+        Some(algorithm) if Some(algorithm) != sent => match (algorithm, &sealer) {
+            (s3::checksums::Algorithm::Crc64Nvme, None) => None,
+            _ => Some(s3::checksums::Hasher::new(algorithm)),
+        },
+        _ => None,
+    };
     // 3. tee: read the client body once, decoding it (an `aws-chunked` body's
     // framing isn't the object) and checking it as it goes, hashing the data
     // for the ETag (or encrypting it), and fanning each chunk out to every
     // replica.
+    let mut client_checksum = None;
     let failure = loop {
         match body.frame().await {
             Some(Ok(frame)) => {
@@ -885,6 +921,9 @@ where
                 match payload.decode(chunk) {
                     Ok(data) => {
                         for piece in data {
+                            if let Some(hasher) = &mut checksum_hasher {
+                                hasher.update(&piece);
+                            }
                             if let Some(md5_tx) = &md5_tx {
                                 // Only fails if the task panicked; awaited below.
                                 let _ = md5_tx.send(piece.clone()).await;
@@ -903,7 +942,13 @@ where
                 }
             }
             Some(Err(e)) => break Some(Err(anyhow::Error::from(e))),
-            None => break payload.finish().err().map(Ok),
+            None => match payload.finish() {
+                Ok(checked) => {
+                    client_checksum = checked;
+                    break None;
+                }
+                Err(rejection) => break Some(Ok(rejection)),
+            },
         }
     };
     // The MD5 task has all there is.
@@ -958,6 +1003,21 @@ where
     };
     // On failure, `finish` deletes what the replicas stored itself.
     let written = writer.finish().await?;
+    // The checksum, as clients are told it, and as it's stored (sealed, if
+    // the part's encrypted: see `s3::checksums`).
+    let sent = client_checksum.as_ref().map(|(algorithm, raw)| s3::checksums::Checksum::full(*algorithm, raw));
+    let checksum = checksum_algorithm.map(|algorithm| {
+        let raw = match (client_checksum.take(), checksum_hasher.take()) {
+            (Some((sent, raw)), _) if sent == algorithm => raw,
+            (_, Some(hasher)) => hasher.finish(),
+            _ => written.data_crc.to_be_bytes().to_vec(),
+        };
+        s3::checksums::Checksum::full(algorithm, &raw)
+    });
+    let stored_checksum = checksum.as_ref().map(|checksum| match attach.key() {
+        Some(key) => s3::checksums::ChecksumKey::new(key).seal(&checksum.value),
+        None => checksum.value.clone(),
+    });
     // If this future is dropped before the blob is committed or discarded, the
     // blob is deleted in the background.
     let mut pending = blobs::DiscardOnDrop::new(app, written.blob_id);
@@ -989,11 +1049,12 @@ where
                 }
                 _ => None,
             };
-            match try_commit_part(&mut client, &written, attach, &stored_etag, encrypted.as_ref(), expected).await {
+            let stored = Stored { etag: &stored_etag, checksum: checksum.as_ref().zip(stored_checksum.as_deref()) };
+            match try_commit_part(&mut client, &written, attach, &stored, encrypted.as_ref(), expected).await {
                 Ok(CommitResult::Committed { reap, version_id, last_modified }) => {
                     // Reap the blobs this overwrite displaced; their rows are gone.
                     reap_blobs(app, reap);
-                    return Ok(UploadResult::Committed { etag, version_id, last_modified });
+                    return Ok(UploadResult::Committed { etag, checksum, sent, version_id, last_modified });
                 }
                 // Another write landed since it was decided: decide again.
                 Ok(CommitResult::Stale) => continue,
@@ -1051,14 +1112,26 @@ struct Encrypted {
     salt: encryption::Salt,
 }
 
+/// What's stored of a part's ETag and checksum: as they are, or sealed (an
+/// SSE-S3 one's ETag, an encrypted one's checksum).
+struct Stored<'a> {
+    etag: &'a str,
+    /// The checksum, and its value as it's stored.
+    checksum: Option<(&'a s3::checksums::Checksum, &'a str)>,
+}
+
 async fn try_commit_part(
     client: &mut Object,
     written: &Written,
     attach: &AttachTarget,
-    etag: &str,
+    stored: &Stored<'_>,
     encrypted: Option<&Encrypted>,
     expected: Option<Option<i64>>,
 ) -> Result<CommitResult, tokio_postgres::Error> {
+    let etag = stored.etag;
+    let checksum_algorithm = stored.checksum.map(|(c, _)| c.algorithm.name());
+    let checksum_type = stored.checksum.map(|(c, _)| c.kind.name());
+    let checksum = stored.checksum.map(|(_, value)| value);
     // CRCs are stored as their 64 bits, read as a signed BIGINT. The part's
     // covers just its data, and stays valid wherever it's moved later; the
     // blob's covers its whole file, for a scrub to check against.
@@ -1084,7 +1157,7 @@ async fn try_commit_part(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer, last_modified
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                                                       $11, $12, $13, $14, $15, $16, $17, $18,
-                                                      $19, $20, $21, $22)",
+                                                      $19, $20, $21, $22, $23, $24, $25)",
                     &[
                         &written.blob_id,
                         &written.nodes,
@@ -1105,6 +1178,9 @@ async fn try_commit_part(
                         &sse.kms_sealed,
                         &sse.kms_context,
                         &sse.sse_s3,
+                        &checksum_algorithm,
+                        &checksum_type,
+                        &checksum,
                         &expected.is_some(),
                         &expected.flatten(),
                         &s3::versions::new_version_id(),
@@ -1122,7 +1198,7 @@ async fn try_commit_part(
                 .query_one_cached(
                     "SELECT status, present, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_commit_upload_part($1, $2, $3, $4, $5, $6, $7, $8, $9,
-                                                           $10, $11)",
+                                                           $10, $11, $12)",
                     &[
                         &written.blob_id,
                         &written.nodes,
@@ -1135,6 +1211,7 @@ async fn try_commit_part(
                         &enc_salt,
                         upload_id,
                         part_number,
+                        &checksum,
                     ],
                 )
                 .await?;

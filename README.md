@@ -584,6 +584,18 @@ is stored. When writing, each replica reports a checksum of what it stored,
 and the upload fails unless every replica stored exactly the bytes that were
 sent.
 
+Objects keep their S3 checksums, as S3 does: the one the client uploaded
+(CRC32, CRC32C, CRC64NVME, SHA-1 or SHA-256), or else a CRC64NVME that Cairn
+computes. A multipart upload gets the algorithm and type (`COMPOSITE` or
+`FULL_OBJECT`) it was created with, or else a full-object CRC64NVME. An
+SSE-C upload created without an algorithm gets no checksum, so it can be
+completed without the key, as in S3. A read with `x-amz-checksum-mode:
+ENABLED` returns the checksum, so clients can verify what they download.
+Listings, ListParts, CompleteMultipartUpload and copies report checksums too.
+The checksums of encrypted objects are stored encrypted, as their data is, so
+they can't be used to test guesses at the content. Objects written by earlier
+versions of Cairn have no checksum, but a copy of one gets one.
+
 ## Packing
 
 Every blob takes up rows in the database (one per replica), and is the unit

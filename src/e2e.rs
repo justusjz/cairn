@@ -21,6 +21,7 @@ use crate::{
     writing::WritingSet,
 };
 
+mod checksums;
 mod concurrency;
 mod cleanup;
 mod copies;
@@ -35,6 +36,13 @@ mod multipart;
 
 /// The bucket every test node has.
 pub const BUCKET: &str = "bucket";
+
+/// The checksum an object written as a PUT is stored with, and a part of an
+/// upload without an algorithm (see `s3::checksums`).
+pub const OBJECT_CHECKSUM: crate::s3::checksums::Wanted =
+    crate::s3::checksums::Wanted::ClientsOr(crate::s3::checksums::Algorithm::Crc64Nvme);
+pub const PART_CHECKSUM: crate::s3::checksums::Wanted =
+    crate::s3::checksums::Wanted::Exactly(crate::s3::checksums::Algorithm::Crc64Nvme);
 
 /// A node of its own, on a fresh database, with the packer's `pack` config and
 /// test `hook`. `None` if there's no database to test against.
@@ -119,6 +127,7 @@ pub async fn put(app: &Arc<App>, key: &str, data: Vec<u8>) {
         metadata: String::new(),
         conditions: Preconditions::default(),
         sealing: None,
+        checksum: crate::e2e::OBJECT_CHECKSUM,
     };
     let body = Full::new(Bytes::from(data));
     let result = crate::upload_part(app, body, &attach, Payload::unchecked())
@@ -129,7 +138,7 @@ pub async fn put(app: &Arc<App>, key: &str, data: Vec<u8>) {
 
 /// Reads an object through GetObject; `None` if it doesn't exist.
 pub async fn get(app: &Arc<App>, key: &str) -> Option<Vec<u8>> {
-    let response = objects::get::get_object(app, BUCKET, key, None, None, &Preconditions::default(), None, None)
+    let response = objects::get::get_object(app, BUCKET, key, None, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
     if response.status() == StatusCode::NOT_FOUND {
@@ -167,6 +176,7 @@ pub async fn put_sealed(app: &Arc<App>, key: &str, data: Vec<u8>, customer: &cra
             key: zeroize::Zeroizing::new(*customer.key()),
             stored: crate::s3::sse::Stored::Customer { check: customer.new_check() },
         }),
+        checksum: crate::e2e::OBJECT_CHECKSUM,
     };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
         .await
@@ -182,7 +192,7 @@ pub async fn get_sealed(
     range: Option<&str>,
     customer: Option<&crate::s3::sse_c::CustomerKey>,
 ) -> (StatusCode, Vec<u8>) {
-    let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), customer, None)
+    let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), customer, None, false)
         .await
         .unwrap();
     let status = response.status();
