@@ -162,10 +162,12 @@ pub fn encode(cells: &[&[u8]], m: u32, su: usize) -> Vec<Vec<u8>> {
         .expect("a row of whole, even-sized cells within the supported counts encodes")
 }
 
-/// Decodes a row of a coded blob (k > 1) from any `k` of its cells, given by
-/// shard (data cells as long as they are, parity cells whole): returns every
-/// cell `wanted` asks for, data or parity, data cells cut to `lens` (by data
-/// shard). `None` if there are fewer than k cells.
+/// Decodes a row of a coded blob (k > 1), or the same bytes of each of its
+/// cells, `su` of them (see `blobs::reconstruct`), from any `k` of its
+/// cells, given by shard (data cells as long as they hold bytes of the
+/// range, parity cells whole): returns every cell `wanted` asks for, data or
+/// parity, data cells cut to `lens` (by data shard). `None` if there are
+/// fewer than k cells.
 pub fn decode(
     k: u32,
     m: u32,
@@ -281,6 +283,49 @@ mod tests {
         assert_eq!(l.cell(2, 1).len, 0, "the last row's cell 1 is empty");
         assert_eq!(l.row_len_on(2, 0), 4);
         assert_eq!(l.row_len_on(2, 4), 16);
+    }
+
+    /// The code works byte by byte across a row's cells: the same block of
+    /// each cell encodes and decodes as the whole cells do, which lets a
+    /// block be rebuilt from a block of each of k shards (`blobs::
+    /// reconstruct`). `reed_solomon_simd` doesn't promise it (it works in
+    /// 64-byte chunks of its shards), so this pins it: a version that breaks
+    /// it fails here. (A decoded block that came out wrong would fail its
+    /// checksum, never reach a client.)
+    #[test]
+    fn ranges_decode_as_whole_cells() {
+        let su = STRIPE_UNIT as usize;
+        let block = crate::checksum::BLOCK_SIZE as usize;
+        for (k, m) in [(2u32, 1u32), (4, 2), (8, 3), (10, 4)] {
+            let mut x = 0x9e37_79b9_7f4a_7c15_u64 ^ k as u64;
+            let cells: Vec<Vec<u8>> = (0..k)
+                .map(|_| {
+                    (0..su)
+                        .map(|_| {
+                            x ^= x << 13;
+                            x ^= x >> 7;
+                            x ^= x << 17;
+                            x as u8
+                        })
+                        .collect()
+                })
+                .collect();
+            let refs: Vec<&[u8]> = cells.iter().map(Vec::as_slice).collect();
+            let parity = encode(&refs, m, su);
+            let all: Vec<&Vec<u8>> = cells.iter().chain(parity.iter()).collect();
+            for (first, blocks) in [(0, 1), (7, 2), (15, 1)] {
+                let range = first * block..(first + blocks) * block;
+                // The first m cells are lost.
+                let present: BTreeMap<u32, Vec<u8>> =
+                    (m..k + m).map(|s| (s, all[s as usize][range.clone()].to_vec())).collect();
+                let lens = vec![range.len() as u64; k as usize];
+                let lost: Vec<u32> = (0..m).collect();
+                let got = decode(k, m, range.len(), &present, &lens, &lost).unwrap();
+                for s in lost {
+                    assert!(got[&s] == all[s as usize][range.clone()], "{k}+{m}, blocks {range:?}");
+                }
+            }
+        }
     }
 
     #[test]

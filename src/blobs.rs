@@ -465,9 +465,14 @@ async fn stream_coded(
                     }
                 }
             }
-            // `pos` may have moved within the cell before the stream failed.
-            let bytes = reconstruct(app, slice.blob_id, layout, &slice.locations, cell.row, cell.shard).await?;
-            let data = Bytes::copy_from_slice(&bytes[(pos - cell.start) as usize..(stop - cell.start) as usize]);
+            // Only the blocks of the cell that are still to be sent: `pos` may
+            // have moved within it before the stream failed.
+            let block = layout.block_size;
+            let (from, to) = ((pos - cell.start) / block * block, stop - cell.start);
+            let bytes =
+                reconstruct(app, slice.blob_id, layout, &slice.locations, cell.row, cell.shard, (from, to)).await?;
+            let skip = (pos - cell.start - from) as usize;
+            let data = Bytes::copy_from_slice(&bytes[skip..skip + (stop - pos) as usize]);
             if tx.send(Ok(Frame::data(data))).await.is_err() {
                 return Ok(());
             }
@@ -598,11 +603,16 @@ impl ShardStream {
     }
 }
 
-/// Decodes row `row`'s cell on shard `want` (data or parity) of a coded blob,
-/// from k other shards' cells of the row, from the nodes in `locations` (the
-/// one holding `want` itself is skipped), each verified against its own
-/// table. The result is verified against `want`'s table, which every shard's
-/// file holds.
+/// Decodes bytes [`from`, `to`) of row `row`'s cell on shard `want` (data or
+/// parity) of a coded blob, offsets within the cell: from the same bytes of k
+/// other shards' cells of the row, from the nodes in `locations` (the one
+/// holding `want` itself is skipped), each verified against its own table.
+/// The code works byte by byte across a row's cells, so a range decodes as
+/// the whole cells would (`shards::tests::ranges_decode_as_whole_cells`), and
+/// rebuilding a block costs a block of each of k shards, not their cells. The
+/// result is verified against `want`'s table, which every shard's file
+/// holds. `from` must be a multiple of the block size; the range is cut to
+/// the cell, so `to` may be any length past it.
 pub(crate) async fn reconstruct(
     app: &App,
     blob_id: Uuid,
@@ -610,13 +620,21 @@ pub(crate) async fn reconstruct(
     locations: &[Location],
     row: u64,
     want: u32,
+    (from, to): (u64, u64),
 ) -> io::Result<Vec<u8>> {
     let su = layout.stripe_unit;
     let k = layout.data_shards;
-    let len = layout.row_len_on(row, want);
-    if len == 0 {
+    let cell_len = layout.row_len_on(row, want);
+    let to = to.min(cell_len);
+    if from >= to {
         return Ok(Vec::new());
     }
+    // What's decoded and verified: the whole blocks the range is in.
+    let end = to.next_multiple_of(layout.block_size).min(cell_len);
+    // Whole blocks of every cell: the cells' blocks line up, since every
+    // shard holds the row at the same offset, and a stripe unit is whole
+    // blocks.
+    let width = to.next_multiple_of(layout.block_size).min(su) - from;
     let mut cells: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
     // Where a cell came from: the nodes to fetch `want`'s table from.
     let mut sources: Vec<&Location> = Vec::new();
@@ -625,15 +643,16 @@ pub(crate) async fn reconstruct(
         if cells.len() == k as usize {
             break;
         }
-        let cell_len = layout.row_len_on(row, shard);
-        if cell_len == 0 {
-            // The last row's empty cells are known: they hold nothing.
+        // What the cell holds of the range: the last row's short cells hold
+        // nothing past their end, which decodes as zeros.
+        let held = layout.row_len_on(row, shard).min(from + width).saturating_sub(from);
+        if held == 0 {
             cells.insert(shard, Vec::new());
             continue;
         }
         let file = ShardFile { blob_id, layout, shard };
         for location in locations.iter().filter(|l| l.shard == shard) {
-            match fetch_range(app, location, &file, row * su, cell_len).await {
+            match fetch_range(app, location, &file, row * su + from, held).await {
                 Ok(bytes) => {
                     cells.insert(shard, bytes);
                     sources.push(location);
@@ -649,21 +668,27 @@ pub(crate) async fn reconstruct(
             cells.len()
         )));
     }
-    let lens: Vec<u64> = (0..k).map(|s| layout.cell(row, s).len).collect();
-    let (m, unit) = (layout.parity_shards, su as usize);
-    let decoded = tokio::task::spawn_blocking(move || shards::decode(k, m, unit, &cells, &lens, &[want]))
+    // How much of the range each data cell holds, which a decoded one is cut
+    // to.
+    let lens: Vec<u64> = (0..k)
+        .map(|s| layout.cell(row, s).len.min(from + width).saturating_sub(from))
+        .collect();
+    let (m, width) = (layout.parity_shards, width as usize);
+    let decoded = tokio::task::spawn_blocking(move || shards::decode(k, m, width, &cells, &lens, &[want]))
         .await
         .map_err(io::Error::other)?
         .ok_or_else(|| io::Error::other("decoding failed"))?;
-    let cell = decoded.into_values().next().expect("decode returns what it's asked for");
+    let mut cell = decoded.into_values().next().expect("decode returns what it's asked for");
+    cell.truncate((end - from) as usize);
     // Checked against `want`'s own table, from any file that has it. Every
     // file holds a copy of it: one that disagrees is damaged (the decoded
     // cells all verified against their own tables), so its node checks its
     // file, and the next copy is asked.
     let blocks = layout.shard_blocks(want);
-    let start = row * su;
-    let (from, to) = blocks.aligned(start, start + len);
-    debug_assert_eq!((from, to), (start, start + len), "cells are whole blocks");
+    let (start, stop) = (row * su + from, row * su + end);
+    let range = (to - from) as usize;
+    let (from, to) = blocks.aligned(start, stop);
+    debug_assert_eq!((from, to), (start, stop), "the range is whole blocks of the shard");
     let file = ShardFile { blob_id, layout, shard: want };
     let mut last_error = io::Error::other("no node to read the shard's checksums from");
     for location in sources {
@@ -687,7 +712,10 @@ pub(crate) async fn reconstruct(
             (!sums.verify(block, chunk)).then_some(block)
         });
         match failed {
-            None => return Ok(cell),
+            None => {
+                cell.truncate(range);
+                return Ok(cell);
+            }
             Some(at) => {
                 let e = io::Error::new(
                     io::ErrorKind::InvalidData,

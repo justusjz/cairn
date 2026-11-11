@@ -380,7 +380,7 @@ async fn feed(
         };
         let cell = match direct {
             Some(cell) => cell,
-            None => crate::blobs::reconstruct(app, blob_id, layout, &live, row, shard).await?,
+            None => crate::blobs::reconstruct(app, blob_id, layout, &live, row, shard, (0, len)).await?,
         };
         summer.update(&cell);
         digest.write(&cell);

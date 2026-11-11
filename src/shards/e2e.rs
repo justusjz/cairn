@@ -449,9 +449,11 @@ async fn lost_bytes_shrink_as_rows_can_be_decoded() {
     let (_, holders) = shards_of(&cluster, blob_id).await;
     let [first, second, third] = [0, 1, 2].map(|s| &cluster.nodes[holders[s]]);
     // The first shard is damaged in rows 0 and 1, the second in row 0, and
-    // the third shard's file is away for a while.
+    // the third shard's file is away for a while. (Block 0 of row 1, which
+    // the third shard's short last cell holds bytes of: in block 1, it holds
+    // none, so that would decode without it.)
     flip(first, blob_id, 70_000);
-    flip(first, blob_id, MIB + 70_000);
+    flip(first, blob_id, MIB + 1000);
     flip(second, blob_id, 70_000);
     let path = third.store.blob_path(blob_id);
     let away = std::fs::read(&path).unwrap();
@@ -460,15 +462,15 @@ async fn lost_bytes_shrink_as_rows_can_be_decoded() {
     assert_eq!((report.damaged, report.lost), (1, 1), "{report}");
     let block = 64 * 1024;
     let row1 = 3 * MIB as i64;
-    assert_eq!(lost(first, blob_id).await, [(block, 2 * block), (row1 + block, row1 + 2 * block)]);
+    assert_eq!(lost(first, blob_id).await, [(block, 2 * block), (row1, row1 + block)]);
     std::fs::write(&path, &away).unwrap();
     // Row 1 decodes now; row 0 doesn't, with the second shard damaged there.
     let report = scrub(first, Scope::Everything).await;
     assert_eq!((report.damaged, report.lost), (1, 1), "{report}");
     assert_eq!(lost(first, blob_id).await, [(block, 2 * block)]);
-    let (status, got) = read(first, "k", Some(&format!("bytes={}-{}", row1 + block, row1 + block + 10))).await;
+    let (status, got) = read(first, "k", Some(&format!("bytes={}-{}", row1 + 1000, row1 + 1010))).await;
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
-    let at = (row1 + block) as usize;
+    let at = (row1 + 1000) as usize;
     assert_eq!(got.unwrap(), body[at..=at + 10]);
 }
 

@@ -372,8 +372,9 @@ async fn fetch(
     Ok(())
 }
 
-/// Rebuilds [start, stop) of a coded blob's shard, row by row, decoding each
-/// row's cell from the other shards (see `blobs::reconstruct`), to `copy`. A
+/// Rebuilds [start, stop) of a coded blob's shard, row by row, decoding those
+/// blocks of each row from the same blocks of the other shards (see
+/// `blobs::reconstruct`), to `copy`. A
 /// row that can't be decoded is written as zeros, and if this is a data
 /// shard, its bytes in that row are lost.
 #[allow(clippy::too_many_arguments)]
@@ -395,8 +396,9 @@ async fn rebuild(
         let row_start = row * su;
         let row_stop = (row_start + layout.row_len_on(row, shard)).min(stop);
         let (from, to) = ((pos - row_start) as usize, (row_stop - row_start) as usize);
-        match reconstruct(app, expected.blob_id, layout, others, row, shard).await {
-            Ok(cell) => copy.write(&cell[from..to]).await?,
+        // Only the blocks to rebuild, of k other shards.
+        match reconstruct(app, expected.blob_id, layout, others, row, shard, (from as u64, to as u64)).await {
+            Ok(cell) => copy.write(&cell).await?,
             Err(e) => {
                 eprintln!("blob {} (repair): shard {shard}'s row {row} can't be rebuilt: {e}", expected.blob_id);
                 if shard < layout.data_shards {
