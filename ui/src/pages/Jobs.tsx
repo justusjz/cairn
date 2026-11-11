@@ -1,3 +1,4 @@
+import { A } from "@solidjs/router";
 import { For, Show, createMemo, createSignal } from "solid-js";
 import { type Cluster, type Event, type Lifecycle, type LifecycleBucket, type Storage, api, statsError, statsOf } from "../api";
 import { Badge, Card, LiveDot, Loading, Panel, Table, act, poll } from "../components/ui";
@@ -294,7 +295,9 @@ function LifecycleRow(props: { bucket: LifecycleBucket }) {
   const due = () => b().due != null && b().due! <= now();
   return (
     <tr>
-      <td>{b().bucket}</td>
+      <td>
+        <A href={`/buckets/${encodeURIComponent(b().bucket)}/lifecycle`}>{b().bucket}</A>
+      </td>
       <td class="num">
         {num(b().enabled)}
         <Show when={b().enabled !== b().rules}>

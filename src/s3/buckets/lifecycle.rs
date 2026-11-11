@@ -77,7 +77,7 @@ pub async fn delete_bucket_lifecycle(app: &App, bucket: &str) -> anyhow::Result<
 }
 
 /// Sets the bucket's configuration (`cairn_set_lifecycle`). Whether it exists.
-async fn set(app: &App, bucket: &str, config: Option<&str>) -> anyhow::Result<bool> {
+pub(crate) async fn set(app: &App, bucket: &str, config: Option<&str>) -> anyhow::Result<bool> {
     Ok(app
         .pool
         .get()

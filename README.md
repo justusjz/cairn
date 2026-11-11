@@ -263,7 +263,8 @@ cluster:
   it's encrypted, the blobs its parts are stored in and the nodes holding
   them, and download any version (but an encrypted one: Cairn doesn't have
   an SSE-C object's key, and the KMS opens an SSE-KMS one only for a role).
-  Buckets can be created and (when empty) deleted.
+  Buckets can be created and (when empty) deleted, and their
+  [lifecycle rules](#lifecycle-rules) edited.
 - **Roles:** everything `cairn role` does: create and delete roles, grant and
   revoke permissions, rotate secrets, and toggle admin. Each role's ID and
   its identity in the KMS are shown, for granting it [KMS keys](#sse-kms).
@@ -379,6 +380,10 @@ aws s3api put-bucket-lifecycle-configuration --bucket my-bucket \
 aws s3api get-bucket-lifecycle-configuration --bucket my-bucket
 aws s3api delete-bucket-lifecycle --bucket my-bucket
 ```
+
+Or on the dashboard: a bucket's page links to an editor of its rules, which
+the dashboard checks as S3's requests are checked, and writes back in the same
+form, so S3 clients see the same rules.
 
 What a rule can do:
 

@@ -57,6 +57,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/buckets/{bucket}/lifecycle": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A bucket's lifecycle rules, as S3's GetBucketLifecycleConfiguration
+         *     gives them, but in the form they're stored in.
+         */
+        get: operations["get_bucket_lifecycle"];
+        /**
+         * Replaces a bucket's lifecycle rules, as S3's
+         *     PutBucketLifecycleConfiguration does, which starts a new sweep of them.
+         *     Rules without an ID get one.
+         */
+        put: operations["put_bucket_lifecycle"];
+        post?: never;
+        /**
+         * Removes a bucket's lifecycle rules, as S3's DeleteBucketLifecycle does:
+         *     nothing expires from then on.
+         */
+        delete: operations["delete_bucket_lifecycle"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets/{bucket}/object": {
         parameters: {
             query?: never;
@@ -319,6 +348,10 @@ export interface components {
             oldest_pending?: number | null;
             /** Format: int64 */
             pending: number;
+        };
+        /** @description A bucket's lifecycle rules, if it has any. */
+        BucketLifecycle: {
+            configuration?: components["schemas"]["LifecycleConfiguration"] | null;
         };
         BucketSummary: {
             /** Format: int64 */
@@ -618,6 +651,57 @@ export interface components {
             /** @description How many rules it has, and how many of them are enabled. */
             rules: number;
             sweep?: components["schemas"]["SweepProgress"] | null;
+        };
+        /** @description A bucket's lifecycle configuration. */
+        LifecycleConfiguration: {
+            rules: components["schemas"]["LifecycleRule"][];
+        };
+        /**
+         * Format: int64
+         * @description A day, UTC, as the number of days since 1970-01-01.
+         */
+        LifecycleDay: number;
+        /** @description `Expiration`: one of `days` and `date`, or `expired_object_delete_marker`. */
+        LifecycleExpiration: {
+            date?: components["schemas"]["LifecycleDay"] | null;
+            /** Format: int32 */
+            days?: number | null;
+            expired_object_delete_marker?: boolean;
+        };
+        /**
+         * @description Which objects a rule applies to: those with keys starting with `prefix`,
+         *     and sizes strictly between the bounds. All of them, by default.
+         */
+        LifecycleFilter: {
+            prefix?: string;
+            /** Format: int64 */
+            size_greater_than?: number | null;
+            /** Format: int64 */
+            size_less_than?: number | null;
+        };
+        /** @description `NoncurrentVersionExpiration`. */
+        LifecycleNoncurrentExpiration: {
+            /** Format: int32 */
+            days: number;
+            /**
+             * Format: int32
+             * @description How many of the newest noncurrent versions are kept regardless.
+             */
+            newer_versions?: number | null;
+        };
+        LifecycleRule: {
+            /**
+             * Format: int32
+             * @description `AbortIncompleteMultipartUpload`'s `DaysAfterInitiation`.
+             */
+            abort_upload_days?: number | null;
+            /** @description `Status`: a disabled rule is kept, but does nothing. */
+            enabled: boolean;
+            expiration?: components["schemas"]["LifecycleExpiration"] | null;
+            filter: components["schemas"]["LifecycleFilter"];
+            /** @description Its name, unique among the bucket's rules; one is made up if empty. */
+            id?: string;
+            noncurrent_expiration?: components["schemas"]["LifecycleNoncurrentExpiration"] | null;
         };
         /** @description A page of a bucket's keys, rolled up at `/` like a directory listing. */
         Listing: {
@@ -1027,6 +1111,119 @@ export interface operations {
                 content: {
                     "application/octet-stream": unknown;
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_bucket_lifecycle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketLifecycle"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_bucket_lifecycle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LifecycleConfiguration"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_bucket_lifecycle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {

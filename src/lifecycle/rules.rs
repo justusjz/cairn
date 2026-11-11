@@ -39,15 +39,19 @@ const MAX_ID_LENGTH: usize = 255;
 const MAX_NEWER_NONCURRENT: u32 = 100;
 
 /// A bucket's lifecycle configuration.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = LifecycleConfiguration)]
 pub struct Configuration {
     pub rules: Vec<Rule>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = LifecycleRule)]
 pub struct Rule {
+    /// Its name, unique among the bucket's rules; one is made up if empty.
+    #[serde(default)]
     pub id: String,
     /// `Status`: a disabled rule is kept, but does nothing.
     pub enabled: bool,
@@ -63,8 +67,9 @@ pub struct Rule {
 
 /// Which objects a rule applies to: those with keys starting with `prefix`,
 /// and sizes strictly between the bounds. All of them, by default.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = LifecycleFilter)]
 pub struct Filter {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub prefix: String,
@@ -75,8 +80,9 @@ pub struct Filter {
 }
 
 /// `Expiration`: one of `days` and `date`, or `expired_object_delete_marker`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = LifecycleExpiration)]
 pub struct Expiration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub days: Option<u32>,
@@ -87,8 +93,9 @@ pub struct Expiration {
 }
 
 /// `NoncurrentVersionExpiration`.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
+#[schema(as = LifecycleNoncurrentExpiration)]
 pub struct NoncurrentExpiration {
     pub days: u32,
     /// How many of the newest noncurrent versions are kept regardless.
@@ -97,8 +104,9 @@ pub struct NoncurrentExpiration {
 }
 
 /// A day, UTC, as the number of days since 1970-01-01.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(transparent)]
+#[schema(as = LifecycleDay)]
 pub struct Day(pub i64);
 
 const SECS_PER_DAY: i64 = 24 * 3600;
@@ -279,12 +287,32 @@ impl Configuration {
             return Err(Invalid::Argument(format!("a lifecycle configuration has at most {MAX_RULES} rules")));
         }
         let rules = rules.into_iter().map(Rule::parse).collect::<Result<Vec<_>, _>>()?;
-        let mut ids: Vec<&str> = rules.iter().map(|r| r.id.as_str()).collect();
-        ids.sort_unstable();
-        if ids.windows(2).any(|w| w[0] == w[1]) {
-            return Err(Invalid::Argument("Rule ID must be unique. Found same ID for more than one rule".to_owned()));
+        Configuration { rules }.check().map_err(Invalid::Argument)
+    }
+
+    /// Checks a configuration as it's given other than in S3's XML (by the
+    /// dashboard), for everything that parsing the XML checks too, and gives
+    /// the rules without an ID one. What's wrong, if anything.
+    pub fn check(mut self) -> Result<Configuration, String> {
+        if self.rules.is_empty() {
+            return Err("a lifecycle configuration needs at least one rule".to_owned());
         }
-        Ok(Configuration { rules })
+        if self.rules.len() > MAX_RULES {
+            return Err(format!("a lifecycle configuration has at most {MAX_RULES} rules"));
+        }
+        for rule in &mut self.rules {
+            rule.id = rule.id.trim().to_owned();
+            if rule.id.is_empty() {
+                rule.id = uuid::Uuid::new_v4().simple().to_string();
+            }
+            rule.check().map_err(|why| format!("rule {}: {why}", rule.id))?;
+        }
+        let mut ids: Vec<&str> = self.rules.iter().map(|r| r.id.as_str()).collect();
+        ids.sort_unstable();
+        if let Some(w) = ids.windows(2).find(|w| w[0] == w[1]) {
+            return Err(format!("Rule ID must be unique. Found same ID for more than one rule: {}", w[0]));
+        }
+        Ok(self)
     }
 
     /// As GetBucketLifecycleConfiguration answers.
@@ -394,6 +422,55 @@ impl Configuration {
 }
 
 impl Rule {
+    /// What's wrong with it, if anything (see `Configuration::check`).
+    fn check(&self) -> Result<(), String> {
+        if self.id.len() > MAX_ID_LENGTH {
+            return Err(format!("ID length should not exceed allowed limit of {MAX_ID_LENGTH}"));
+        }
+        let f = &self.filter;
+        if f.size_greater_than.is_some_and(|n| n < 0) || f.size_less_than.is_some_and(|n| n < 1) {
+            return Err("object sizes must be at least 0 (greater than) and 1 (less than)".to_owned());
+        }
+        if let (Some(greater), Some(less)) = (f.size_greater_than, f.size_less_than)
+            && greater >= less
+        {
+            return Err("ObjectSizeGreaterThan must be less than ObjectSizeLessThan".to_owned());
+        }
+        if let Some(e) = &self.expiration {
+            if e.days.is_some() && e.date.is_some() {
+                return Err("an Expiration has either Days or a Date".to_owned());
+            }
+            if e.expired_object_delete_marker && (e.days.is_some() || e.date.is_some()) {
+                return Err(
+                    "ExpiredObjectDeleteMarker cannot be specified with Days or Date in a Lifecycle Expiration Policy"
+                        .to_owned(),
+                );
+            }
+            if e.days == Some(0) {
+                return Err("Days must be at least 1".to_owned());
+            }
+        }
+        if let Some(n) = &self.noncurrent_expiration {
+            if n.days == 0 {
+                return Err("NoncurrentDays must be at least 1".to_owned());
+            }
+            if n.newer_versions.is_some_and(|v| v == 0 || v > MAX_NEWER_NONCURRENT) {
+                return Err(format!("NewerNoncurrentVersions must be between 1 and {MAX_NEWER_NONCURRENT}"));
+            }
+        }
+        if self.abort_upload_days == Some(0) {
+            return Err("DaysAfterInitiation must be at least 1".to_owned());
+        }
+        if self.abort_upload_days.is_some() && (f.size_greater_than.is_some() || f.size_less_than.is_some()) {
+            // An upload has no size yet.
+            return Err("AbortIncompleteMultipartUpload can't be used with an object size filter".to_owned());
+        }
+        if self.expiration.is_none() && self.noncurrent_expiration.is_none() && self.abort_upload_days.is_none() {
+            return Err("At least one action needs to be specified in a rule".to_owned());
+        }
+        Ok(())
+    }
+
     fn parse(node: Node) -> Result<Rule, Invalid> {
         only(
             node,
@@ -830,6 +907,27 @@ mod tests {
         ];
         for bad in unsupported {
             assert!(matches!(parse(&bad), Err(Invalid::Unsupported(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn checks_configurations_given_as_json() {
+        let check = |json: &str| Configuration::from_json(json).unwrap().check();
+        let ok = check(r#"{"rules":[{"enabled":true,"filter":{"prefix":"tmp/"},"expiration":{"days":1}}]}"#).unwrap();
+        assert_eq!(ok.rules[0].id.len(), 32);
+        for bad in [
+            r#"{"rules":[]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{}}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{},"expiration":{"days":0}}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{},"expiration":{"days":1,"date":20000}}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{},"expiration":{"days":1,"expired_object_delete_marker":true}}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{"size_greater_than":5,"size_less_than":5},"expiration":{"days":1}}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{},"noncurrent_expiration":{"days":1,"newer_versions":0}}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{"size_less_than":5},"abort_upload_days":1}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{},"expiration":{"days":1}},
+                         {"id":"a","enabled":true,"filter":{},"expiration":{"days":2}}]}"#,
+        ] {
+            assert!(check(bad).is_err(), "{bad}");
         }
     }
 

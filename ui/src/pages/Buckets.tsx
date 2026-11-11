@@ -188,6 +188,9 @@ export function BucketBrowser() {
           <input type="checkbox" checked={deleted()} onChange={(e) => navigate(bucketUrl(bucket(), prefix(), e.currentTarget.checked))} />
           Show deleted keys
         </label>
+        <A class="button" href={`/buckets/${enc(bucket())}/lifecycle`}>
+          Lifecycle rules
+        </A>
         <span class="spacer" />
         <form
           class="form-row"

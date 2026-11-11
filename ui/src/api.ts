@@ -21,6 +21,8 @@ export type Role = Schemas["RoleSummary"];
 export type Permission = Schemas["Permission"];
 export type Lifecycle = Schemas["Lifecycle"];
 export type LifecycleBucket = Schemas["LifecycleBucket"];
+export type LifecycleConfiguration = Schemas["LifecycleConfiguration"];
+export type LifecycleRule = Schemas["LifecycleRule"];
 
 /** Where the API is; also in the spec's `servers`. */
 const BASE = "/_dashboard/api";
@@ -81,6 +83,10 @@ export const api = {
     ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
   identifyRoles: () => ok(client.POST("/kms/identify")),
   lifecycle: () => ok(client.GET("/lifecycle")),
+  bucketLifecycle: (bucket: string) => ok(client.GET("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),
+  setBucketLifecycle: (bucket: string, configuration: LifecycleConfiguration) =>
+    ok(client.PUT("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket), body: configuration })),
+  deleteBucketLifecycle: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),
   setLifecycleRate: (rate: number) => ok(client.PUT("/lifecycle/rate", { body: { rate } })),
   revoke: (role: string, bucket: string, permission: Permission) =>
     ok(client.DELETE("/roles/{role}/grants", { params: { ...rolePath(role), query: { bucket, permission } } })),

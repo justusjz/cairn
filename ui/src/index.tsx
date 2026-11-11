@@ -3,6 +3,7 @@ import { render } from "solid-js/web";
 import { Toasts } from "./components/ui";
 import { BucketBrowser, BucketList, ObjectPage } from "./pages/Buckets";
 import Jobs from "./pages/Jobs";
+import Lifecycle from "./pages/Lifecycle";
 import Overview from "./pages/Overview";
 import Roles from "./pages/Roles";
 import Storage from "./pages/Storage";
@@ -64,6 +65,7 @@ render(
       <Route path="/buckets" component={BucketList} />
       <Route path="/buckets/:bucket" component={BucketBrowser} />
       <Route path="/buckets/:bucket/object" component={ObjectPage} />
+      <Route path="/buckets/:bucket/lifecycle" component={Lifecycle} />
       <Route path="/roles" component={Roles} />
       <Route path="*" component={NotFound} />
     </Router>

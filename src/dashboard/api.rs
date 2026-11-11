@@ -78,6 +78,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(identify_roles))
         .routes(routes!(grant, revoke))
         .routes(routes!(get_lifecycle))
+        .routes(routes!(get_bucket_lifecycle, put_bucket_lifecycle, delete_bucket_lifecycle))
         .routes(routes!(set_lifecycle_rate))
 }
 
@@ -1255,6 +1256,63 @@ mod e2e {
     use axum::http::HeaderMap;
 
     #[tokio::test]
+    async fn edits_lifecycle_rules() {
+        let Some(app) = node().await else { return };
+        let path = format!("/_dashboard/api/buckets/{}/lifecycle", crate::e2e::BUCKET);
+        let (status, _, body) = send(&app, request("GET", &path, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["configuration"], Value::Null);
+
+        let rules = serde_json::json!({"rules": [
+            {"enabled": true, "filter": {"prefix": "tmp/"}, "expiration": {"days": 1}},
+        ]});
+        let (status, _, _) = send(&app, request("PUT", &path, Some(rules))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, _, body) = send(&app, request("GET", &path, None)).await;
+        let stored: Value = serde_json::from_slice(&body).unwrap();
+        let rule = &stored["configuration"]["rules"][0];
+        assert_eq!(rule["filter"]["prefix"], "tmp/");
+        // It was given a name.
+        assert_eq!(rule["id"].as_str().unwrap().len(), 32);
+        // S3 sees the same rules.
+        let xml = crate::s3::buckets::lifecycle::get_bucket_lifecycle(&app, crate::e2e::BUCKET).await.unwrap();
+        let xml = xml.into_body().collect().await.unwrap().to_bytes();
+        assert!(std::str::from_utf8(&xml).unwrap().contains("<Prefix>tmp/</Prefix>"));
+        // And the Jobs page lists the bucket.
+        let (_, _, body) = send(&app, request("GET", "/_dashboard/api/lifecycle", None)).await;
+        let status_: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status_["buckets"][0]["bucket"], crate::e2e::BUCKET);
+        assert_eq!(status_["rate"], crate::settings::LIFECYCLE_RATE.default);
+
+        // Rules S3 would refuse are refused, with why.
+        let bad = serde_json::json!({"rules": [
+            {"id": "a", "enabled": true, "filter": {"size_less_than": 5}, "abort_upload_days": 1},
+        ]});
+        let (status, _, body) = send(&app, request("PUT", &path, Some(bad))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error_of(&body).contains("object size filter"), "{}", error_of(&body));
+        let unknown = serde_json::json!({"rules": [{"id": "a", "enabled": true, "filter": {"tag": "x"}}]});
+        assert!(send(&app, request("PUT", &path, Some(unknown))).await.0.is_client_error());
+        let missing = request("PUT", "/_dashboard/api/buckets/nope/lifecycle", Some(serde_json::json!({"rules": [
+            {"enabled": true, "filter": {}, "expiration": {"days": 1}},
+        ]})));
+        assert_eq!(send(&app, missing).await.0, StatusCode::NOT_FOUND);
+
+        // The rate, for the cluster.
+        let (status, _, _) =
+            send(&app, request("PUT", "/_dashboard/api/lifecycle/rate", Some(serde_json::json!({"rate": 5})))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        assert_eq!(crate::settings::LIFECYCLE_RATE.get(&app.pool.get().await.unwrap()).await.unwrap(), 5);
+        let negative = request("PUT", "/_dashboard/api/lifecycle/rate", Some(serde_json::json!({"rate": -1})));
+        assert_eq!(send(&app, negative).await.0, StatusCode::BAD_REQUEST);
+
+        let (status, _, _) = send(&app, request("DELETE", &path, None)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (_, _, body) = send(&app, request("GET", &path, None)).await;
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["configuration"], Value::Null);
+    }
+
+    #[tokio::test]
     async fn serves_the_dashboard() {
         let Some(app) = node().await else { return };
         put(&app, "dir/file.txt", b"hello".to_vec()).await;
@@ -1593,4 +1651,70 @@ async fn set_lifecycle_rate(State(app): AppState, Json(body): Json<NewRate>) -> 
     }
     crate::settings::LIFECYCLE_RATE.set(&app.pool.get().await?, body.rate).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// A bucket's lifecycle rules, if it has any.
+#[derive(Serialize, Deserialize, ToSchema)]
+struct BucketLifecycle {
+    configuration: Option<crate::lifecycle::rules::Configuration>,
+}
+
+/// A bucket's lifecycle rules, as S3's GetBucketLifecycleConfiguration
+/// gives them, but in the form they're stored in.
+#[utoipa::path(get, path = "/buckets/{bucket}/lifecycle", params(("bucket" = String, Path)), responses(
+    (status = 200, body = BucketLifecycle),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn get_bucket_lifecycle(State(app): AppState, Path(bucket): Path<String>) -> Result<Json<BucketLifecycle>> {
+    let row = app
+        .pool
+        .get()
+        .await?
+        .query_opt_cached("SELECT lifecycle FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no bucket named {bucket:?}")))?;
+    let configuration = match row.get::<_, Option<String>>(0) {
+        None => None,
+        Some(json) => Some(
+            crate::lifecycle::rules::Configuration::from_json(&json)
+                .map_err(|e| anyhow::anyhow!("bucket {bucket}'s lifecycle configuration doesn't parse: {e}"))?,
+        ),
+    };
+    Ok(Json(BucketLifecycle { configuration }))
+}
+
+/// Replaces a bucket's lifecycle rules, as S3's
+/// PutBucketLifecycleConfiguration does, which starts a new sweep of them.
+/// Rules without an ID get one.
+#[utoipa::path(put, path = "/buckets/{bucket}/lifecycle", params(("bucket" = String, Path)),
+    request_body = crate::lifecycle::rules::Configuration, responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn put_bucket_lifecycle(
+    State(app): AppState,
+    Path(bucket): Path<String>,
+    Json(body): Json<crate::lifecycle::rules::Configuration>,
+) -> Result<StatusCode> {
+    let configuration = body.check().map_err(ApiError::BadRequest)?;
+    match crate::s3::buckets::lifecycle::set(&app, &bucket, Some(&configuration.to_json())).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+    }
+}
+
+/// Removes a bucket's lifecycle rules, as S3's DeleteBucketLifecycle does:
+/// nothing expires from then on.
+#[utoipa::path(delete, path = "/buckets/{bucket}/lifecycle", params(("bucket" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_bucket_lifecycle(State(app): AppState, Path(bucket): Path<String>) -> Result<StatusCode> {
+    match crate::s3::buckets::lifecycle::set(&app, &bucket, None).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+    }
 }
