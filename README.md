@@ -719,6 +719,14 @@ again within the hour; once any copy turns out to hold the bytes after all
 (that node came back, or a file was restored from a backup), the lost ranges
 are cleared, and the other copies are repaired from it.
 
+Once bytes are known to be lost, a GET whose range overlaps them fails with
+`500 InternalError` before sending anything (rather than being cut off where
+the damage is), and so does a copy of them (CopyObject, UploadPartCopy), so
+that the damage doesn't spread to new objects unnoticed. A range that misses
+them reads as usual, and HEAD works. Damage the scrubber hasn't found yet still
+cuts a read off. The packer leaves a blob alone while a part of it is on lost
+data; once those objects are deleted, it's compacted as usual.
+
 What the scrubber finds is logged as a `CORRUPTION:` line, recorded in the
 database (`scrub_findings`), and counted in the node's metrics on the
 dashboard. Data written by versions of Cairn without checksums isn't checked.

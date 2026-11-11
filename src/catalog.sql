@@ -1422,6 +1422,13 @@ $$;
 -- index, least live data first, and stops once it has enough; consolidation
 -- first adds its candidates up without locking them, and only locks them once
 -- they're worth a job, since a row lock is a write.
+--
+-- Blobs with parts on lost data (`lost_ranges`, see `scrub`) aren't
+-- candidates: those parts would fail the job's verification, again after every
+-- lease. Lost data that no part uses anymore doesn't keep a blob from being
+-- compacted, which then drops it, and its lost ranges with it. Which blobs
+-- have lost data is a heuristic too: one that loses data after it's claimed
+-- just fails its job.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_claim(
     p_kind text, p_compact_threshold float8, p_max_sources bigint, p_small_size bigint,
     p_target_size bigint, p_budget bigint, p_lease_secs float8
@@ -1442,6 +1449,9 @@ BEGIN
             WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * 0.25
               AND dead_size >= size * p_compact_threshold
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
             ORDER BY size - dead_size
             LIMIT p_max_sources FOR UPDATE SKIP LOCKED
         LOOP
@@ -1458,6 +1468,9 @@ BEGIN
             SELECT blob_id, size - dead_size AS live FROM blobs
             WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * p_compact_threshold
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
             ORDER BY size - dead_size
             LIMIT p_max_sources FOR UPDATE SKIP LOCKED
         LOOP
@@ -1476,6 +1489,9 @@ BEGIN
             SELECT size FROM blobs
             WHERE state = 'committed' AND size <= 67108864 AND size <= p_small_size
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
             ORDER BY created_at
             LIMIT p_max_sources
         ) AS c;
@@ -1490,6 +1506,9 @@ BEGIN
             SELECT blob_id, size AS live FROM blobs
             WHERE state = 'committed' AND size <= 67108864 AND size <= p_small_size
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
             ORDER BY created_at
             LIMIT p_max_sources FOR UPDATE SKIP LOCKED
         LOOP

@@ -246,6 +246,12 @@ pub async fn get_object(
     // first) from this same snapshot.
     let parts = resolve_object_parts(&tx, object_id).await?;
     tx.commit().await?;
+    // Bytes that no replica holds intact fail the read before it starts,
+    // rather than cutting it off there.
+    if reads_lost(&client, &parts, range_start, range_end).await? {
+        eprintln!("refusing to read {bucket}/{key}: some of the range {range_start}-{range_end} is lost");
+        return Ok(box_response(lost_data()));
+    }
     // The key it's encrypted with, from the KMS for an SSE-KMS object: only
     // once it's certain to be read.
     let object_key = match sse::open(app, &encryption, customer_key, role, bucket, key).await? {
@@ -433,6 +439,49 @@ pub(crate) fn select_parts_in_range(
         });
     }
     slices
+}
+
+/// Whether any of the bytes [`start`, `end`) of an object, which is made of
+/// `parts`, are lost: intact on no replica, as the scrubber found (see
+/// `scrub`). The bytes of its blobs that a read would fetch, that is: whole
+/// segments, if it's encrypted.
+pub(crate) async fn reads_lost<C: GenericClient>(
+    client: &C,
+    parts: &[PartLocation],
+    start: u64,
+    end: u64,
+) -> Result<bool, tokio_postgres::Error> {
+    let slices = select_parts_in_range(parts.to_vec(), start, end, None);
+    if slices.is_empty() {
+        return Ok(false);
+    }
+    let (mut blobs, mut starts, mut stops) = (Vec::new(), Vec::new(), Vec::new());
+    for ReadSlice { blob, .. } in &slices {
+        blobs.push(blob.blob_id);
+        starts.push(blob.offset as i64);
+        stops.push((blob.offset + blob.length) as i64);
+    }
+    // Almost always, nothing is lost: a lookup per blob in an empty table.
+    let row = client
+        .query_one_cached(
+            "SELECT EXISTS (
+                 SELECT 1 FROM unnest($1::uuid[], $2::bigint[], $3::bigint[]) AS s(blob_id, start, stop)
+                 JOIN lost_ranges l ON l.blob_id = s.blob_id
+                 WHERE l.start < s.stop AND l.stop > s.start
+             )",
+            &[&blobs, &starts, &stops],
+        )
+        .await?;
+    Ok(row.get(0))
+}
+
+/// The answer to a read or copy of lost bytes.
+pub(crate) fn lost_data() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalError",
+        "some of the requested data is damaged on every replica, and can't be read",
+    )
 }
 
 /// Spawns a background task that streams each selected blob slice to `sender`,

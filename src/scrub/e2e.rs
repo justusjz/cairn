@@ -177,10 +177,11 @@ async fn reads_flag_damage() {
     assert_eq!((report.copies, report.damaged), (1, 1), "{report}");
     assert_eq!(query_i64(&app, &flagged).await, 0);
 
+    // Known to be lost now, so the read fails up front, flagging nothing.
     let response = objects::get::get_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
-    assert!(response.into_body().collect().await.is_err());
+    assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(query_i64(&app, &flagged).await, 0, "known damage isn't flagged again");
 }
@@ -400,4 +401,131 @@ async fn repairs_leave_nothing_behind() {
         .unwrap();
     let report = crate::gc::pass(a, crate::gc::Scope::everything()).await;
     assert!(!leftover.exists(), "{report}");
+}
+
+/// Reads (the `range` of) an object through GetObject: its status, and its
+/// body, if it arrived whole.
+async fn read(app: &Arc<App>, key: &str, range: Option<&str>) -> (hyper::StatusCode, Option<Vec<u8>>) {
+    let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), None, None, false)
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = response.into_body().collect().await.ok().map(|b| b.to_bytes().to_vec());
+    (status, body)
+}
+
+/// Once bytes are known to be lost, reads of them fail up front, and so do
+/// copies of them; reads of the rest, and HEAD, work as before.
+#[tokio::test]
+async fn lost_data_fails_up_front() {
+    use hyper::StatusCode;
+    let Some(app) = node().await else { return };
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 253) as u8).collect();
+    put(&app, "k", data.clone()).await;
+    let blob_id = blob_of(&app, "k").await;
+    flip(&app, blob_id, 70_000);
+    // Before the scrubber knows, a read is cut off at the damage.
+    assert_eq!(read(&app, "k", None).await, (StatusCode::OK, None));
+    assert_eq!(scrub(&app, Scope::Everything).await.lost, 1);
+
+    let (status, body) = read(&app, "k", None).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(String::from_utf8(body.unwrap()).unwrap().contains("InternalError"));
+    let (status, _) = read(&app, "k", Some("bytes=60000-70000")).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "it overlaps block 1");
+    let (status, body) = read(&app, "k", Some("bytes=0-65535")).await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT, "block 0 is intact");
+    assert_eq!(body.unwrap(), data[..65536]);
+    let (status, body) = read(&app, "k", Some("bytes=131072-")).await;
+    assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body.unwrap(), data[131072..]);
+    let head = objects::get::head_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::OK);
+
+    let source = format!("{BUCKET}/k");
+    let copy = objects::copy::copy_object(&app, BUCKET, "copy", &source, None, "text/plain", "", &Preconditions::default(), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(copy.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert!(get(&app, "copy").await.is_none());
+    let upload = crate::s3::multipart::create::create_multipart_upload(&app, BUCKET, "assembled", "application/octet-stream", "", crate::s3::sse::Wanted::Plain, None, None)
+        .await
+        .unwrap();
+    let body = upload.into_body().collect().await.unwrap().to_bytes();
+    let body = String::from_utf8(body.to_vec()).unwrap();
+    let upload_id = body.split("<UploadId>").nth(1).unwrap().split("</UploadId>").next().unwrap();
+    let copy_part = |range: &'static str| {
+        let (app, source, upload_id) = (app.clone(), source.clone(), upload_id.to_owned());
+        async move {
+            objects::copy::copy_part(&app, BUCKET, "assembled", &upload_id, "1", &source, Some(range), &Preconditions::default(), None, None, None)
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+    assert_eq!(copy_part("bytes=60000-70000").await, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(copy_part("bytes=0-60000").await, StatusCode::OK);
+
+    // Once the bytes are back, so are the reads.
+    flip(&app, blob_id, 70_000);
+    assert_eq!(scrub(&app, Scope::Everything).await.damaged, 0);
+    assert_eq!(read(&app, "k", None).await, (StatusCode::OK, Some(data)));
+}
+
+/// The packer leaves blobs whose parts are on lost data alone: those would
+/// fail its verification. Once no part is, the blob is packed as any other,
+/// and its lost data goes with it.
+#[tokio::test]
+async fn the_packer_leaves_lost_data_alone() {
+    let pack = packer::Config {
+        target_size: 1_000_000,
+        small_size: 250_000,
+        ..packer::Config::default()
+    };
+    let Some(app) = node_with(pack, None).await else { return };
+    let data = |i: u8| vec![i; 200_000];
+    for i in 0..6 {
+        put(&app, &format!("k{i}"), data(i)).await;
+    }
+    let damaged = blob_of(&app, "k0").await;
+    flip(&app, damaged, 10);
+    assert_eq!(scrub(&app, Scope::Everything).await.lost, 1);
+    let jobs = packer::pass(&app).await.unwrap();
+    assert_eq!(jobs.iter().map(|j| j.counts().0).sum::<usize>(), 5, "all but k0's");
+    assert_eq!(blob_of(&app, "k0").await, damaged, "still where it was");
+    let packed = blob_of(&app, "k1").await;
+    assert_ne!(packed, damaged);
+
+    // A block within k1's part of the packed blob is lost.
+    let offset: i64 = app
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT p.blob_offset FROM parts p JOIN objects o ON o.id = p.object_id WHERE o.key = 'k1'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let block = (offset as usize).div_ceil(65536);
+    flip(&app, packed, block * 65536 + 10);
+    assert_eq!(scrub(&app, Scope::Everything).await.lost, 2);
+    // Deleting k2 and k3 makes the blob worth compacting, but k1 is on lost
+    // data.
+    delete(&app, "k2").await;
+    delete(&app, "k3").await;
+    assert!(packer::pass(&app).await.unwrap().is_empty());
+    // Without k1, it's compacted.
+    delete(&app, "k1").await;
+    let jobs = packer::pass(&app).await.unwrap();
+    assert_eq!(jobs.len(), 1);
+    assert_ne!(blob_of(&app, "k4").await, packed);
+    assert_eq!(get(&app, "k4").await.unwrap(), data(4));
+    assert_eq!(get(&app, "k5").await.unwrap(), data(5));
+    assert_eq!(lost(&app, packed).await, [], "they went with the blob");
+    assert_eq!(lost(&app, damaged).await.len(), 1, "k0's are still there");
 }
