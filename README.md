@@ -323,7 +323,10 @@ TypeScript 7), so it needs network access.
 Buckets support S3 versioning, which keeps every version of an object instead
 of overwriting it. This is what makes Cairn a ransomware-resistant backup
 target: a client that can write and delete (e.g. restic) can't destroy the
-history, as long as it isn't granted `delete-version`.
+history, as long as it isn't granted `delete-version`, nor is an admin. Admins
+can set [lifecycle rules](#lifecycle-rules), which may remove old versions, as
+a bucket's owner can in S3; keep admin credentials away from the machines
+being backed up.
 
 An admin enables it per bucket with any S3 client:
 
@@ -361,8 +364,11 @@ Old versions take up space until they're deleted, by hand or by
 ## Lifecycle rules
 
 A bucket's lifecycle configuration expires objects automatically, as in S3.
-Setting one is bucket management, so only an admin can (a role that may only
-write can't make its writes expire, nor stop an admin's rules):
+Setting one is bucket management, as `PutLifecycleConfiguration` is its own
+permission in S3, so only an admin can, and needs no grant on the bucket's
+objects: the rules are carried out by Cairn, not as the admin. A role that may
+only write can't make its writes expire, nor stop an admin's rules. (S3 keeps
+versions from lifecycle rules with Object Lock, which Cairn doesn't have yet.)
 
 ```sh
 aws s3api put-bucket-lifecycle-configuration --bucket my-bucket \
@@ -408,10 +414,12 @@ cairn config --database "$DB" set lifecycle-rate 2000000
 cairn config --database "$DB" get              # every setting, with its default
 ```
 
-Or on the dashboard's Jobs page, which also shows each bucket's sweep, and how
-long a round of every bucket's sweep takes at the rate. If that's more than a
-day, sweeps fall behind, and expirations come that much later: raise the rate
-(and, if the database is the limit, its resources). The rate is the cluster's,
+Or on the dashboard's Jobs page, which also shows each bucket's sweep, the rate
+sweeps actually reach when they're busy, and how long a round of every
+bucket's sweep takes at it. If that's more than a day, sweeps fall behind, and
+expirations come that much later: raise the rate, or, if sweeps don't reach
+the rate set (one step at a time goes only as fast as the database answers),
+give the database more resources. The rate is the cluster's,
 not each node's: there's one lifecycle step at a time across the cluster,
 about once a minute, on whichever node takes it, and the buckets take turns,
 so that a huge one doesn't hold up the others.

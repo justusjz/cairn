@@ -111,7 +111,7 @@ impl std::fmt::Display for Report {
     }
 }
 
-/// A bucket's last whole sweep, as `buckets.lifecycle_last` keeps it. Times
+/// A bucket's last whole sweep, as `lifecycle_sweeps.last` keeps it. Times
 /// are seconds since the Unix epoch.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 pub struct LastSweep {
@@ -127,8 +127,9 @@ pub struct LastSweep {
 /// A bucket's sweep, as a step gets to it.
 struct Sweep {
     bucket: String,
-    /// Its configuration, as stored.
+    /// Its configuration, as stored, and its generation.
     config: String,
+    generation: i64,
     /// When it started, and the key it has got to; `None` if it's yet to.
     started: Option<(SystemTime, String)>,
     /// What it had done before this turn: read, expired, removed, aborted.
@@ -153,18 +154,55 @@ async fn take_step(app: &Arc<App>, now: SystemTime) -> anyhow::Result<Vec<Result
         return Ok(Vec::new());
     }
     let Some(previous) = claim(&client, now).await? else { return Ok(Vec::new()) };
+    let began = std::time::Instant::now();
     let share = previous.and_then(|previous| now.duration_since(previous).ok()).unwrap_or(STEP).min(MAX_SHARE);
     let mut budget = (((rate as f64) * share.as_secs_f64() / 3600.0) as i64).max(1);
     let mut results = Vec::new();
     let mut visited = Vec::new();
-    while budget > 0 {
-        let Some(sweep) = next_sweep(&client, now, &visited).await? else { break };
-        visited.push(sweep.bucket.clone());
-        let bucket = sweep.bucket.clone();
-        results.push(turn(app, &client, sweep, now, &mut budget).await.map_err(|e| (bucket, e)));
+    let mut read = 0;
+    // Whatever happens, the claim is let go of after, rather than holding up
+    // every step until its lease runs out.
+    let walked: anyhow::Result<()> = async {
+        while budget > 0 {
+            let Some(sweep) = next_sweep(&client, now, &visited).await? else { break };
+            visited.push(sweep.bucket.clone());
+            let bucket = sweep.bucket.clone();
+            let result = turn(app, &client, sweep, now, &mut budget).await;
+            read += result.as_ref().map_or(0, |report| report.read);
+            results.push(result.map_err(|e| (bucket, e)));
+        }
+        Ok(())
     }
-    client.execute_cached("UPDATE lifecycle_runs SET lease_until = NULL WHERE id", &[]).await?;
+    .await;
+    // A step that had more to do than its share shows the rate steps reach:
+    // its share, or less, if it took longer than the time it was the share of.
+    let busy = budget <= 0;
+    let secs = share.max(began.elapsed()).as_secs_f64();
+    release(&client, busy.then_some((read, secs)), now).await?;
+    walked?;
     Ok(results)
+}
+
+/// Lets go of the claim on the step, and if it was `busy` (the versions it
+/// read, and over how many seconds), counts it into the rate reached: an
+/// average weighted by time, which mostly forgets what was over an hour ago.
+async fn release(client: &Object, busy: Option<(i64, f64)>, now: SystemTime) -> anyhow::Result<()> {
+    let Some((read, secs)) = busy else {
+        client.execute_cached("UPDATE lifecycle_runs SET lease_until = NULL WHERE id", &[]).await?;
+        return Ok(());
+    };
+    let reached = read as f64 / secs * 3600.0;
+    let weight = (secs / 3600.0).min(1.0);
+    client
+        .execute_cached(
+            "UPDATE lifecycle_runs SET lease_until = NULL, reached_at = $3,
+                 reached_rate = CASE WHEN reached_rate IS NULL THEN $1::float8
+                                     ELSE reached_rate * (1 - $2::float8) + $1::float8 * $2::float8 END
+             WHERE id",
+            &[&reached, &weight, &now],
+        )
+        .await?;
+    Ok(())
 }
 
 /// The time by the database's clock.
@@ -201,11 +239,12 @@ async fn extend(client: &Object, now: SystemTime) -> anyhow::Result<()> {
 async fn next_sweep(client: &Object, now: SystemTime, visited: &[String]) -> anyhow::Result<Option<Sweep>> {
     let row = client
         .query_opt_cached(
-            "SELECT name, lifecycle, lifecycle_started, lifecycle_cursor, lifecycle_seen,
-                    lifecycle_expired, lifecycle_removed, lifecycle_aborted
-             FROM buckets
-             WHERE lifecycle IS NOT NULL AND lifecycle_due <= $1 AND NOT (name = ANY($2))
-             ORDER BY lifecycle_due LIMIT 1",
+            "SELECT b.name, b.lifecycle, s.started, s.cursor, s.seen, s.expired, s.removed, s.aborted,
+                    s.generation
+             FROM lifecycle_sweeps s JOIN buckets b ON b.name = s.bucket
+             WHERE s.due <= $1 AND NOT (s.bucket = ANY($2))
+               AND b.lifecycle IS NOT NULL AND b.lifecycle_generation = s.generation
+             ORDER BY s.due LIMIT 1",
             &[&now, &visited],
         )
         .await?;
@@ -215,6 +254,7 @@ async fn next_sweep(client: &Object, now: SystemTime, visited: &[String]) -> any
         Sweep {
             bucket: row.get(0),
             config: row.get(1),
+            generation: row.get(8),
             started: started.map(|started| (started, cursor.unwrap_or_default())),
             before: [row.get(4), row.get(5), row.get(6), row.get(7)],
         }
@@ -233,12 +273,12 @@ async fn save(
     let [read, expired, removed, aborted] = sweep.before;
     let updated = client
         .execute_cached(
-            "UPDATE buckets SET lifecycle_started = $3, lifecycle_cursor = $4, lifecycle_seen = $5,
-                 lifecycle_expired = $6, lifecycle_removed = $7, lifecycle_aborted = $8
-             WHERE name = $1 AND lifecycle = $2",
+            "UPDATE lifecycle_sweeps SET started = $3, cursor = $4, seen = $5,
+                 expired = $6, removed = $7, aborted = $8
+             WHERE bucket = $1 AND generation = $2",
             &[
                 &sweep.bucket,
-                &sweep.config,
+                &sweep.generation,
                 &started,
                 &cursor,
                 &(read + report.read),
@@ -256,8 +296,8 @@ async fn save(
 async fn yield_turn(client: &Object, sweep: &Sweep, now: SystemTime) -> anyhow::Result<bool> {
     let updated = client
         .execute_cached(
-            "UPDATE buckets SET lifecycle_due = $3 WHERE name = $1 AND lifecycle = $2",
-            &[&sweep.bucket, &sweep.config, &now],
+            "UPDATE lifecycle_sweeps SET due = $3 WHERE bucket = $1 AND generation = $2",
+            &[&sweep.bucket, &sweep.generation, &now],
         )
         .await?;
     Ok(updated > 0)
@@ -287,11 +327,10 @@ async fn finish(
     let next = (started + SWEEP).max(now);
     let updated = client
         .execute_cached(
-            "UPDATE buckets SET lifecycle_started = NULL, lifecycle_cursor = NULL, lifecycle_seen = 0,
-                 lifecycle_expired = 0, lifecycle_removed = 0, lifecycle_aborted = 0,
-                 lifecycle_last = $3, lifecycle_due = $4
-             WHERE name = $1 AND lifecycle = $2",
-            &[&sweep.bucket, &sweep.config, &last, &next],
+            "UPDATE lifecycle_sweeps SET started = NULL, cursor = NULL, seen = 0,
+                 expired = 0, removed = 0, aborted = 0, last = $3, due = $4
+             WHERE bucket = $1 AND generation = $2",
+            &[&sweep.bucket, &sweep.generation, &last, &next],
         )
         .await?;
     Ok(updated > 0)
@@ -332,7 +371,7 @@ async fn turn(
                 .flat_map(|(key, versions)| rules.due(key, versions, today).into_iter().map(|due| (key.clone(), due)))
                 .collect();
             for batch in due.chunks(BATCH) {
-                if !expire(app, client, &sweep.bucket, &sweep.config, batch, &mut report).await? {
+                if !expire(app, client, &sweep.bucket, sweep.generation, batch, &mut report).await? {
                     return interrupted(report);
                 }
             }
@@ -474,12 +513,12 @@ async fn page(
 
 /// Expires a batch of due versions (`cairn_lifecycle_expire`), counting
 /// those that still were in `report`. Whether the bucket's configuration was
-/// still `config` (and its bucket still there).
+/// still of `generation` (and its bucket still there).
 async fn expire(
     app: &Arc<App>,
     client: &Object,
     bucket: &str,
-    config: &str,
+    generation: i64,
     batch: &[(String, Due)],
     report: &mut Report,
 ) -> anyhow::Result<bool> {
@@ -501,7 +540,7 @@ async fn expire(
             .query_one_cached(
                 "SELECT status, applied, reap_blob, reap_node, reap_peer
                  FROM pg_temp.cairn_lifecycle_expire($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-                &[&bucket, &config, &keys, &ids, &version_ids, &kinds, &successors, &newer, &marker_ids],
+                &[&bucket, &generation, &keys, &ids, &version_ids, &kinds, &successors, &newer, &marker_ids],
             )
             .await;
         let row = match result {

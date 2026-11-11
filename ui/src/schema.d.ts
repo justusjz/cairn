@@ -533,7 +533,7 @@ export interface components {
             version?: string | null;
         };
         /**
-         * @description A bucket's last whole sweep, as `buckets.lifecycle_last` keeps it. Times
+         * @description A bucket's last whole sweep, as `lifecycle_sweeps.last` keeps it. Times
          *     are seconds since the Unix epoch.
          */
         LastSweep: {
@@ -573,14 +573,27 @@ export interface components {
              */
             rate: number;
             /**
+             * Format: double
+             * @description When that was last measured.
+             */
+            reached_at?: number | null;
+            /**
+             * Format: double
+             * @description The rate steps have actually reached when they had more to do than
+             *     their share (an average over about the last hour), if they have.
+             *     Below `rate` if a step at a time can't go faster.
+             */
+            reached_rate?: number | null;
+            /**
              * @description Whether some bucket has had no whole sweep yet, so that a round reads
              *     more than `round_versions`.
              */
             round_partial: boolean;
             /**
              * Format: double
-             * @description How long a round takes at the rate, in seconds (none if paused). Over
-             *     a day, sweeps fall behind, and expirations come that much later.
+             * @description How long a round takes at the rate reached, or set if it's lower (or
+             *     none was measured yet), in seconds; none if paused. Over a day, sweeps
+             *     fall behind, and expirations come that much later.
              */
             round_secs?: number | null;
             /**

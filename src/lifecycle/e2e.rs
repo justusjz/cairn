@@ -76,7 +76,7 @@ async fn sweep_state(app: &App) -> (Option<String>, i64, Option<i64>) {
         .await
         .unwrap()
         .query_one(
-            "SELECT lifecycle_cursor, lifecycle_seen, lifecycle_last FROM buckets WHERE name = $1",
+            "SELECT cursor, seen, last FROM lifecycle_sweeps WHERE bucket = $1",
             &[&BUCKET],
         )
         .await
@@ -187,7 +187,7 @@ async fn a_failed_step_is_taken_up_where_it_got_to() {
     let client = app.pool.get().await.unwrap();
     client
         .execute(
-            "UPDATE buckets SET lifecycle_started = now(), lifecycle_cursor = 'k01000', lifecycle_seen = 1000",
+            "UPDATE lifecycle_sweeps SET started = now(), cursor = 'k01000', seen = 1000",
             &[],
         )
         .await
@@ -302,15 +302,15 @@ async fn a_version_written_since_is_not_expired() {
         "<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>",
     )
     .await;
-    let config: String = app
+    let row = app
         .pool
         .get()
         .await
         .unwrap()
-        .query_one("SELECT lifecycle FROM buckets WHERE name = $1", &[&BUCKET])
+        .query_one("SELECT lifecycle, lifecycle_generation FROM buckets WHERE name = $1", &[&BUCKET])
         .await
-        .unwrap()
-        .get(0);
+        .unwrap();
+    let (config, generation): (String, i64) = (row.get(0), row.get(1));
     let rules = super::Configuration::from_json(&config).unwrap();
     let client = app.pool.get().await.unwrap();
     let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
@@ -324,7 +324,7 @@ async fn a_version_written_since_is_not_expired() {
     // was due.
     put(&app, "a", vec![2]).await;
     let mut report = Report::default();
-    assert!(expire(&app, &client, BUCKET, &config, &due, &mut report).await.unwrap());
+    assert!(expire(&app, &client, BUCKET, generation, &due, &mut report).await.unwrap());
     assert_eq!(report.expired, 0);
     assert_eq!(get(&app, "a").await, Some(vec![2]));
     // Nor is anything expired under a configuration that has changed since.
@@ -339,7 +339,7 @@ async fn a_version_written_since_is_not_expired() {
         .into_iter()
         .map(|due| ("a".to_owned(), due))
         .collect();
-    assert!(!expire(&app, &client, BUCKET, &config, &due, &mut report).await.unwrap());
+    assert!(!expire(&app, &client, BUCKET, generation, &due, &mut report).await.unwrap());
     assert_eq!(get(&app, "a").await, Some(vec![2]));
 }
 
@@ -424,4 +424,26 @@ async fn a_walk_goes_from_prefix_to_prefix() {
     assert!(!last_page);
     assert!(page(&client, BUCKET, &last, &prefixes, super::PAGE).await.unwrap().is_none());
     assert!(page(&client, BUCKET, "", &[], super::PAGE).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn steps_with_more_to_do_measure_the_rate_reached() {
+    let Some(app) = node().await else { return };
+    lone_markers(&app, BUCKET, 3000).await;
+    configure(&app, MARKERS).await;
+    set_rate(&app, 60_000).await;
+    let reached = |app: Arc<App>| async move {
+        let row = app.pool.get().await.unwrap().query_one("SELECT reached_rate FROM lifecycle_runs", &[]).await.unwrap();
+        row.get::<_, Option<f64>>(0)
+    };
+    // A step that read its whole share (1,000 versions in a minute) reached
+    // the rate set.
+    assert!(!step_at(&app, MINUTE).await.unwrap().finished);
+    let rate = reached(app.clone()).await.unwrap();
+    assert!((59_000.0..=60_001.0).contains(&rate), "{rate}");
+    // One that ran out of things to do doesn't count.
+    assert!(step_at(&app, MINUTE * 4).await.unwrap().finished);
+    assert_eq!(reached(app.clone()).await, Some(rate));
+    // Each step let go of its claim after.
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM lifecycle_runs WHERE lease_until IS NOT NULL").await, 0);
 }

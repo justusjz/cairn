@@ -51,6 +51,9 @@ Done:
   (projects, say), since a single kind of admin role isn't enough. Open: how
   dashboard users relate to S3 roles.
 
+- **Object Lock.** Retention periods and legal holds, which keep versions
+  from being deleted, by anyone or by lifecycle rules, as in S3: what makes
+  history safe from admin credentials too.
 - **Lifecycle transitions.** Moving objects between storage classes by
   lifecycle rules, once Cairn has more than one (erasure-coded storage, say).
   Expiration rules are done.

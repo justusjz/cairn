@@ -1173,12 +1173,13 @@ $$;
 --                 `p_successors` (which made it noncurrent when it did), and
 --                 at least `p_newer` versions newer than it; removed for good.
 --
--- `p_config` is the configuration the sweep follows: if the bucket's isn't
--- it anymore (it was changed or deleted since), nothing is done
+-- `p_generation` is the generation of the configuration the sweep follows:
+-- if the bucket's is another (it was changed or deleted since), nothing is
+-- done
 -- ('changed'). Returns 'expired', with which targets were, or
 -- 'no_such_bucket'.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_lifecycle_expire(
-    p_bucket text, p_config text, p_keys text[], p_ids bigint[], p_version_ids text[],
+    p_bucket text, p_generation bigint, p_keys text[], p_ids bigint[], p_version_ids text[],
     p_kinds text[], p_successors bigint[], p_newer int[], p_marker_ids text[],
     OUT status text, OUT applied boolean[],
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
@@ -1199,7 +1200,10 @@ BEGIN
         status := 'no_such_bucket';
         RETURN;
     END IF;
-    IF NOT EXISTS (SELECT 1 FROM buckets WHERE name = p_bucket AND lifecycle = p_config) THEN
+    IF NOT EXISTS (
+        SELECT 1 FROM buckets
+        WHERE name = p_bucket AND lifecycle IS NOT NULL AND lifecycle_generation = p_generation
+    ) THEN
         status := 'changed';
         RETURN;
     END IF;
@@ -1282,20 +1286,31 @@ END
 $$;
 
 -- T18: PutBucketLifecycleConfiguration and DeleteBucketLifecycle: sets (or,
--- with NULL, removes) the bucket's lifecycle configuration, and starts a new
--- sweep of it, which is due now. (The last whole sweep stays, for the
--- dashboard.) A plain UPDATE of the bucket's row, as T16's: no invariant involves the
--- configuration, which a sweep checks itself (T17). Returns whether the
--- bucket exists.
+-- with NULL, removes) the bucket's lifecycle configuration, with a new
+-- generation, and starts a new sweep of it, due now (the last whole sweep
+-- stays, for the dashboard), or drops its sweep. Plain UPDATEs of the
+-- bucket's row, as T16's: no invariant involves the configuration, which a
+-- sweep checks itself (T17). The sweep's row's FK check locks the bucket's
+-- row shared, which it updated already. Returns whether the bucket exists.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_set_lifecycle(p_bucket text, p_config text)
 RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    v_generation bigint;
 BEGIN
-    UPDATE buckets SET lifecycle = p_config,
-                       lifecycle_due = CASE WHEN p_config IS NULL THEN NULL ELSE now() END,
-                       lifecycle_started = NULL, lifecycle_cursor = NULL, lifecycle_seen = 0,
-                       lifecycle_expired = 0, lifecycle_removed = 0, lifecycle_aborted = 0
-    WHERE name = p_bucket;
-    RETURN FOUND;
+    UPDATE buckets SET lifecycle = p_config, lifecycle_generation = lifecycle_generation + 1
+    WHERE name = p_bucket
+    RETURNING lifecycle_generation INTO v_generation;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    IF p_config IS NULL THEN
+        DELETE FROM lifecycle_sweeps WHERE bucket = p_bucket;
+    ELSE
+        INSERT INTO lifecycle_sweeps (bucket, generation, due) VALUES (p_bucket, v_generation, now())
+        ON CONFLICT (bucket) DO UPDATE SET generation = v_generation, due = now(), started = NULL,
+            cursor = NULL, seen = 0, expired = 0, removed = 0, aborted = 0;
+    END IF;
+    RETURN true;
 END
 $$;
 

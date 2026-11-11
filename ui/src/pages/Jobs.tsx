@@ -196,6 +196,9 @@ function LifecycleView(props: { lifecycle: Lifecycle; refresh: () => void }) {
   const l = () => props.lifecycle;
   const [rate, setRate] = createSignal("");
   const late = () => (l().round_secs ?? 0) > DAY;
+  // Steps that had more to do than their share fell short of the rate set:
+  // one step at a time can't go faster (the database's latency, say).
+  const short = () => l().rate > 0 && l().reached_rate != null && l().reached_rate! < 0.9 * l().rate;
   const submit = async (e: SubmitEvent) => {
     e.preventDefault();
     const value = Number(rate().replaceAll(/[ ,_]/g, ""));
@@ -221,15 +224,31 @@ function LifecycleView(props: { lifecycle: Lifecycle; refresh: () => void }) {
         <Card
           label="Rate"
           value={l().rate === 0 ? "paused" : `${num(l().rate)}/h`}
-          note={`versions read per hour, across the cluster (default ${num(l().default_rate)})`}
-          tone={l().rate === 0 ? "warn" : ""}
+          note={
+            <>
+              versions read per hour, across the cluster (default {num(l().default_rate)})
+              <Show when={l().reached_rate != null}>
+                <div>
+                  reached {num(Math.round(l().reached_rate!))}/h when busy, {ago(l().reached_at)}
+                  {short() ? ": steps can't keep up with the rate set" : ""}
+                </div>
+              </Show>
+            </>
+          }
+          tone={l().rate === 0 || short() ? "warn" : ""}
         />
         <Card
           label="A round takes"
           value={round()}
           note={
-            `${num(l().round_versions)} versions in ${num(l().buckets.length)} buckets` +
-            (late() ? `: over a day, so expirations run up to ${duration((l().round_secs ?? 0) - DAY)} late. Raise the rate.` : "")
+            `${num(l().round_versions)} versions in ${num(l().buckets.length)} buckets, at ` +
+            (l().reached_rate != null && l().reached_rate! < l().rate ? "the rate reached" : "the rate set") +
+            (late()
+              ? `: over a day, so expirations run up to ${duration((l().round_secs ?? 0) - DAY)} late. ` +
+                (short()
+                  ? "Steps don't reach the rate set: the database's load or latency is the limit."
+                  : "Raise the rate.")
+              : "")
           }
           tone={late() || l().rate === 0 ? "warn" : ""}
         />

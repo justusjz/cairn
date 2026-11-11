@@ -1406,7 +1406,7 @@
       },
       "LastSweep": {
         "type": "object",
-        "description": "A bucket's last whole sweep, as `buckets.lifecycle_last` keeps it. Times\nare seconds since the Unix epoch.",
+        "description": "A bucket's last whole sweep, as `lifecycle_sweeps.last` keeps it. Times\nare seconds since the Unix epoch.",
         "required": [
           "started",
           "finished",
@@ -1479,6 +1479,22 @@
             "format": "int64",
             "description": "Object versions sweeps may read per hour, across the cluster; 0 if\nthey're paused."
           },
+          "reached_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When that was last measured."
+          },
+          "reached_rate": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "The rate steps have actually reached when they had more to do than\ntheir share (an average over about the last hour), if they have.\nBelow `rate` if a step at a time can't go faster."
+          },
           "round_partial": {
             "type": "boolean",
             "description": "Whether some bucket has had no whole sweep yet, so that a round reads\nmore than `round_versions`."
@@ -1489,7 +1505,7 @@
               "null"
             ],
             "format": "double",
-            "description": "How long a round takes at the rate, in seconds (none if paused). Over\na day, sweeps fall behind, and expirations come that much later."
+            "description": "How long a round takes at the rate reached, or set if it's lower (or\nnone was measured yet), in seconds; none if paused. Over a day, sweeps\nfall behind, and expirations come that much later."
           },
           "round_versions": {
             "type": "integer",

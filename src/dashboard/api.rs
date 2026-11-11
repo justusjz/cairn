@@ -1459,8 +1459,15 @@ struct Lifecycle {
     /// Whether some bucket has had no whole sweep yet, so that a round reads
     /// more than `round_versions`.
     round_partial: bool,
-    /// How long a round takes at the rate, in seconds (none if paused). Over
-    /// a day, sweeps fall behind, and expirations come that much later.
+    /// The rate steps have actually reached when they had more to do than
+    /// their share (an average over about the last hour), if they have.
+    /// Below `rate` if a step at a time can't go faster.
+    reached_rate: Option<f64>,
+    /// When that was last measured.
+    reached_at: Option<f64>,
+    /// How long a round takes at the rate reached, or set if it's lower (or
+    /// none was measured yet), in seconds; none if paused. Over a day, sweeps
+    /// fall behind, and expirations come that much later.
     round_secs: Option<f64>,
     /// When the last step began, and whether one is running now.
     last_step: Option<f64>,
@@ -1506,17 +1513,19 @@ async fn get_lifecycle(State(app): AppState) -> Result<Json<Lifecycle>> {
     let rate = crate::settings::LIFECYCLE_RATE.get(&client).await?;
     let runs = client
         .query_one_cached(
-            "SELECT extract(epoch FROM last_step)::float8, coalesce(lease_until > now(), false)
+            "SELECT extract(epoch FROM last_step)::float8, coalesce(lease_until > now(), false),
+                    reached_rate, extract(epoch FROM reached_at)::float8
              FROM lifecycle_runs WHERE id",
             &[],
         )
         .await?;
     let rows = client
         .query_cached(
-            "SELECT name, lifecycle, extract(epoch FROM lifecycle_due)::float8,
-                    extract(epoch FROM lifecycle_started)::float8, lifecycle_cursor, lifecycle_seen,
-                    lifecycle_expired, lifecycle_removed, lifecycle_aborted, lifecycle_last
-             FROM buckets WHERE lifecycle IS NOT NULL ORDER BY name",
+            "SELECT b.name, b.lifecycle, extract(epoch FROM s.due)::float8,
+                    extract(epoch FROM s.started)::float8, s.cursor, s.seen,
+                    s.expired, s.removed, s.aborted, s.last
+             FROM buckets b JOIN lifecycle_sweeps s ON s.bucket = b.name
+             WHERE b.lifecycle IS NOT NULL ORDER BY b.name",
             &[],
         )
         .await?;
@@ -1550,12 +1559,16 @@ async fn get_lifecycle(State(app): AppState) -> Result<Json<Lifecycle>> {
         }
         buckets.push(LifecycleBucket { bucket, rules, enabled, due: row.get(2), sweep, last });
     }
+    let reached_rate: Option<f64> = runs.get(2);
+    let effective = reached_rate.map_or(rate as f64, |reached| reached.min(rate as f64));
     Ok(Json(Lifecycle {
         rate,
+        reached_rate,
+        reached_at: runs.get(3),
         default_rate: crate::settings::LIFECYCLE_RATE.default,
         round_versions,
         round_partial,
-        round_secs: (rate > 0).then(|| round_versions as f64 / rate as f64 * 3600.0),
+        round_secs: (rate > 0 && effective > 0.0).then(|| round_versions as f64 / effective * 3600.0),
         last_step: runs.get(0),
         stepping: runs.get(1),
         buckets,
