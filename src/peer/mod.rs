@@ -94,6 +94,7 @@ pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/maintain", any(maintain))
         .route("/scrub", any(scrub))
+        .route("/move", any(move_shards))
         .route("/stats", get(stats))
         .route(
             "/blobs/{blob_id}",
@@ -142,6 +143,18 @@ async fn scrub(
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         format!("scrub: {report}\n"),
+    )
+        .into_response())
+}
+
+/// Moves the shards there are to move now (see `mover`), as the background
+/// mover would, and reports what it did once it's done. For tests, and for
+/// an operator who doesn't want to wait for the next pass.
+async fn move_shards(State(app): State<Arc<App>>) -> Result<Response, Failed> {
+    let report = crate::mover::pass(&app).await?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!("mover: {report}\n"),
     )
         .into_response())
 }
