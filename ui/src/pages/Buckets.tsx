@@ -229,6 +229,9 @@ export function BucketBrowser() {
                       <Show when={e.delete_marker}>
                         <Badge tone="warn">deleted</Badge>
                       </Show>
+                      <Show when={e.lost}>
+                        <Badge tone="bad">lost data</Badge>
+                      </Show>
                     </td>
                     <td class="num">{e.delete_marker ? "–" : bytes(e.size)}</td>
                     <td class="num mono subtle small">{e.etag ?? ""}</td>
@@ -305,6 +308,11 @@ export function ObjectPage() {
                         <Show when={v.delete_marker}>
                           <Badge tone="warn">delete marker</Badge>
                         </Show>
+                        <Show when={v.lost_bytes}>
+                          <A href="/integrity" class="badge-link">
+                            <Badge tone="bad">{bytes(v.lost_bytes)} lost</Badge>
+                          </A>
+                        </Show>
                         <span class="mono">version {v.version_id}</span>
                         <span class="subtle">{date(v.last_modified)}</span>
                         <span class="spacer" />
@@ -364,6 +372,12 @@ export function ObjectPage() {
                                       at {num(p.blob_offset)} of {bytes(p.blob_size)}
                                       {p.blob_size > p.size ? " (packed)" : ""}
                                     </div>
+                                    <Show when={p.lost.length}>
+                                      <div class="lost-ranges" title="intact on no replica: reads of these bytes fail">
+                                        <Badge tone="bad">lost</Badge> bytes{" "}
+                                        {p.lost.map(([a, b]) => `${num(a)}–${num(b - 1)}`).join(", ")} of the part
+                                      </div>
+                                    </Show>
                                   </td>
                                   <td>
                                     <Show when={p.nodes.length} fallback={<Badge tone="bad">no copies</Badge>}>

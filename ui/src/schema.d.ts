@@ -135,6 +135,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/integrity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_integrity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/kms/identify": {
         parameters: {
             query?: never;
@@ -438,6 +454,21 @@ export interface components {
              */
             server_errors: number;
         };
+        /** @description How much of the data the scrubber has checked (see `scrub`). */
+        Coverage: {
+            /**
+             * Format: int64
+             * @description Committed blobs from before checksums, which can't be checked.
+             */
+            legacy_blobs: number;
+            /** Format: int64 */
+            legacy_bytes: number;
+            /**
+             * @description What each node holds of checksummed data, and how recently it was
+             *     checked.
+             */
+            nodes: components["schemas"]["NodeCoverage"][];
+        };
         Disk: {
             /**
              * Format: int64
@@ -485,6 +516,8 @@ export interface components {
             kind: "object";
             /** Format: double */
             last_modified: number;
+            /** @description Whether some of its bytes are intact on no replica (see `scrub`). */
+            lost: boolean;
             /** Format: int64 */
             size: number;
         };
@@ -500,6 +533,33 @@ export interface components {
             /** Format: double */
             time: number;
         };
+        FindingInfo: {
+            /**
+             * Format: int64
+             * @description How many blocks failed; none if the whole file is at fault.
+             */
+            bad_blocks?: number | null;
+            blob_id: string;
+            detail: string;
+            /** Format: double */
+            found_at: number;
+            /** Format: int64 */
+            id: number;
+            /** Format: int32 */
+            node: number;
+            /**
+             * @description `repaired`, `lost` (intact on no replica; still open), or `gone` (the
+             *     blob was deleted); none while open.
+             */
+            outcome?: string | null;
+            /**
+             * @description `missing`, `damaged`, or `catalog` (every block intact, but not the
+             *     file's CRC).
+             */
+            problem: string;
+            /** Format: double */
+            resolved_at?: number | null;
+        };
         /** @description What garbage collection deleted since the node started. */
         GcTotals: {
             /** Format: int64 */
@@ -514,6 +574,34 @@ export interface components {
         Grant: {
             bucket: string;
             permission: components["schemas"]["Permission"];
+        };
+        /**
+         * @description What the scrubber found (see `scrub`): damaged and missing copies, and the
+         *     objects with data that's intact on no replica.
+         */
+        Integrity: {
+            /**
+             * @description The open findings, then those resolved in the last 30 days, newest
+             *     first, up to 200.
+             */
+            findings: components["schemas"]["FindingInfo"][];
+            /**
+             * @description The object versions (and uploads' parts) with lost bytes, the most
+             *     recently lost first, up to 500.
+             */
+            lost: components["schemas"]["LostObject"][];
+            /**
+             * Format: int64
+             * @description How many there are, all told.
+             */
+            lost_objects: number;
+            /** Format: int64 */
+            open_findings: number;
+            /**
+             * @description Findings of the last day, by node: many of them in a short time are a
+             *     sign of a failing disk.
+             */
+            recent: components["schemas"]["NodeFindings"][];
         };
         /** @description A login to the KMS as a role. */
         KmsLogin: {
@@ -709,6 +797,27 @@ export interface components {
             /** @description What to pass as `after` for the next page, if there is one. */
             next?: string | null;
         };
+        LostObject: {
+            bucket: string;
+            delete_marker: boolean;
+            key: string;
+            latest: boolean;
+            /**
+             * Format: int64
+             * @description How many of its stored bytes are lost.
+             */
+            lost_bytes: number;
+            /**
+             * Format: double
+             * @description When the first of them was found lost.
+             */
+            since: number;
+            /** Format: int64 */
+            size: number;
+            upload_id?: string | null;
+            /** @description The version; none for a part of an upload in progress. */
+            version_id?: string | null;
+        };
         MaintenanceReport: {
             /** @description The most recent things a pass did or failed at, oldest first. */
             events: components["schemas"]["EventReport"][];
@@ -774,6 +883,37 @@ export interface components {
         NewSecret: {
             /** @description At least 8 characters; one is generated if not given. */
             secret?: string | null;
+        };
+        /**
+         * @description The copies of committed, checksummed blobs a node holds, and how recently
+         *     they were known intact.
+         */
+        NodeCoverage: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            copies: number;
+            /** Format: int32 */
+            node: number;
+            /**
+             * Format: double
+             * @description When the least recently checked of the others was known intact.
+             */
+            oldest_checked?: number | null;
+            /**
+             * Format: int64
+             * @description Copies never checked (from before scrubbing), or flagged by a read:
+             *     checked next.
+             */
+            unchecked: number;
+            /** Format: int64 */
+            unchecked_bytes: number;
+        };
+        NodeFindings: {
+            /** Format: int64 */
+            findings: number;
+            /** Format: int32 */
+            node: number;
         };
         /** @description The committed blobs a node holds a copy of. */
         NodeHolding: {
@@ -873,6 +1013,11 @@ export interface components {
             /** Format: double */
             created_at: number;
             etag: string;
+            /**
+             * @description The byte ranges of the part (as stored) that are intact on no
+             *     replica, as [start, stop) from its start (see `scrub`).
+             */
+            lost: number[][];
             /** @description The nodes holding a copy of the blob. */
             nodes: number[];
             /** Format: int32 */
@@ -964,6 +1109,7 @@ export interface components {
         Storage: {
             backlog: components["schemas"]["Backlog"];
             blobs: components["schemas"]["BlobTotals"];
+            integrity: components["schemas"]["Coverage"];
             nodes: components["schemas"]["NodeHolding"][];
             objects: components["schemas"]["ObjectTotals"];
             packer: components["schemas"]["PackerSettings"];
@@ -993,6 +1139,11 @@ export interface components {
             /** Format: double */
             last_modified: number;
             latest: boolean;
+            /**
+             * Format: int64
+             * @description How many of its parts' bytes are intact on no replica.
+             */
+            lost_bytes: number;
             parts: components["schemas"]["PartInfo"][];
             /** Format: int64 */
             size: number;
@@ -1359,6 +1510,33 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Cluster"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_integrity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Integrity"];
                 };
             };
             "5XX": {

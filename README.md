@@ -256,6 +256,13 @@ cluster:
   rates, errors, throughput and latency over the last hour, by S3 operation.
 - **Storage:** how much data there is, how much of it has fewer live copies
   than the replication factor, and what each node holds.
+- **Integrity:** what the [scrubbers](#scrubbing) checked and found: per
+  node, how long a full check takes at its rate and how recently its data was
+  checked; damaged and missing copies, and whether they were repaired; and
+  the objects with data that's intact on no replica. The navigation shows how
+  many of those there are (in red), or else how many findings are still
+  open. The bucket explorer marks objects with lost data, and an object's
+  details name the bytes that are lost.
 - **Jobs:** how the background passes (garbage collection and packing) are
   doing on each node, what they still have to do, and what they did recently;
   and the [lifecycle](#lifecycle-rules) sweeps: each bucket's, how long a
@@ -728,8 +735,8 @@ cuts a read off. The packer leaves a blob alone while a part of it is on lost
 data; once those objects are deleted, it's compacted as usual.
 
 What the scrubber finds is logged as a `CORRUPTION:` line, recorded in the
-database (`scrub_findings`), and counted in the node's metrics on the
-dashboard. Data written by versions of Cairn without checksums isn't checked.
+database (`scrub_findings`), and shown on the dashboard's
+[Integrity](#dashboard) page. Data written by versions of Cairn without checksums isn't checked.
 
 `POST /scrub` on a node's peer endpoint checks what's due right away, at
 full speed (`?all`: every copy), and reports what it found.

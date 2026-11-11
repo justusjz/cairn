@@ -449,6 +449,31 @@
         }
       }
     },
+    "/integrity": {
+      "get": {
+        "operationId": "get_integrity",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Integrity"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/kms/identify": {
       "post": {
         "summary": "Logs in to the KMS as each role without an identity there yet, from this\nnode, now rather than at its next maintenance pass. Fails with what went\nwrong.",
@@ -1210,6 +1235,33 @@
           }
         }
       },
+      "Coverage": {
+        "type": "object",
+        "description": "How much of the data the scrubber has checked (see `scrub`).",
+        "required": [
+          "nodes",
+          "legacy_blobs",
+          "legacy_bytes"
+        ],
+        "properties": {
+          "legacy_blobs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Committed blobs from before checksums, which can't be checked."
+          },
+          "legacy_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NodeCoverage"
+            },
+            "description": "What each node holds of checksummed data, and how recently it was\nchecked."
+          }
+        }
+      },
       "Disk": {
         "type": "object",
         "required": [
@@ -1310,6 +1362,7 @@
               "size",
               "last_modified",
               "delete_marker",
+              "lost",
               "kind"
             ],
             "properties": {
@@ -1334,6 +1387,10 @@
               "last_modified": {
                 "type": "number",
                 "format": "double"
+              },
+              "lost": {
+                "type": "boolean",
+                "description": "Whether some of its bytes are intact on no replica (see `scrub`)."
               },
               "size": {
                 "type": "integer",
@@ -1376,6 +1433,63 @@
           },
           "time": {
             "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "FindingInfo": {
+        "type": "object",
+        "required": [
+          "id",
+          "blob_id",
+          "node",
+          "found_at",
+          "problem",
+          "detail"
+        ],
+        "properties": {
+          "bad_blocks": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many blocks failed; none if the whole file is at fault."
+          },
+          "blob_id": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "found_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "node": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "outcome": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`repaired`, `lost` (intact on no replica; still open), or `gone` (the\nblob was deleted); none while open."
+          },
+          "problem": {
+            "type": "string",
+            "description": "`missing`, `damaged`, or `catalog` (every block intact, but not the\nfile's CRC)."
+          },
+          "resolved_at": {
+            "type": [
+              "number",
+              "null"
+            ],
             "format": "double"
           }
         }
@@ -1424,6 +1538,49 @@
           },
           "permission": {
             "$ref": "#/components/schemas/Permission"
+          }
+        }
+      },
+      "Integrity": {
+        "type": "object",
+        "description": "What the scrubber found (see `scrub`): damaged and missing copies, and the\nobjects with data that's intact on no replica.",
+        "required": [
+          "findings",
+          "open_findings",
+          "recent",
+          "lost",
+          "lost_objects"
+        ],
+        "properties": {
+          "findings": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FindingInfo"
+            },
+            "description": "The open findings, then those resolved in the last 30 days, newest\nfirst, up to 200."
+          },
+          "lost": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LostObject"
+            },
+            "description": "The object versions (and uploads' parts) with lost bytes, the most\nrecently lost first, up to 500."
+          },
+          "lost_objects": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many there are, all told."
+          },
+          "open_findings": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "recent": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NodeFindings"
+            },
+            "description": "Findings of the last day, by node: many of them in a short time are a\nsign of a failing disk."
           }
         }
       },
@@ -1882,6 +2039,59 @@
           }
         }
       },
+      "LostObject": {
+        "type": "object",
+        "required": [
+          "bucket",
+          "key",
+          "latest",
+          "delete_marker",
+          "size",
+          "lost_bytes",
+          "since"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "delete_marker": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "latest": {
+            "type": "boolean"
+          },
+          "lost_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of its stored bytes are lost."
+          },
+          "since": {
+            "type": "number",
+            "format": "double",
+            "description": "When the first of them was found lost."
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "upload_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "version_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The version; none for a part of an upload in progress."
+          }
+        }
+      },
       "MaintenanceReport": {
         "type": "object",
         "required": [
@@ -2056,6 +2266,65 @@
               "null"
             ],
             "description": "At least 8 characters; one is generated if not given."
+          }
+        }
+      },
+      "NodeCoverage": {
+        "type": "object",
+        "description": "The copies of committed, checksummed blobs a node holds, and how recently\nthey were known intact.",
+        "required": [
+          "node",
+          "copies",
+          "bytes",
+          "unchecked",
+          "unchecked_bytes"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "copies": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "node": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "oldest_checked": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When the least recently checked of the others was known intact."
+          },
+          "unchecked": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Copies never checked (from before scrubbing), or flagged by a read:\nchecked next."
+          },
+          "unchecked_bytes": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "NodeFindings": {
+        "type": "object",
+        "required": [
+          "node",
+          "findings"
+        ],
+        "properties": {
+          "findings": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "node": {
+            "type": "integer",
+            "format": "int32"
           }
         }
       },
@@ -2313,7 +2582,8 @@
           "blob_size",
           "blob_state",
           "created_at",
-          "nodes"
+          "nodes",
+          "lost"
         ],
         "properties": {
           "blob_id": {
@@ -2344,6 +2614,17 @@
           },
           "etag": {
             "type": "string"
+          },
+          "lost": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "description": "The byte ranges of the part (as stored) that are intact on no\nreplica, as [start, stop) from its start (see `scrub`)."
           },
           "nodes": {
             "type": "array",
@@ -2561,7 +2842,8 @@
           "blobs",
           "objects",
           "backlog",
-          "packer"
+          "packer",
+          "integrity"
         ],
         "properties": {
           "backlog": {
@@ -2569,6 +2851,9 @@
           },
           "blobs": {
             "$ref": "#/components/schemas/BlobTotals"
+          },
+          "integrity": {
+            "$ref": "#/components/schemas/Coverage"
           },
           "nodes": {
             "type": "array",
@@ -2640,7 +2925,8 @@
           "delete_marker",
           "size",
           "last_modified",
-          "parts"
+          "parts",
+          "lost_bytes"
         ],
         "properties": {
           "content_type": {
@@ -2675,6 +2961,11 @@
           },
           "latest": {
             "type": "boolean"
+          },
+          "lost_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of its parts' bytes are intact on no replica."
           },
           "parts": {
             "type": "array",

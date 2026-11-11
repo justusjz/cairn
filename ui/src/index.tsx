@@ -1,7 +1,10 @@
 import { A, Route, Router, type RouteSectionProps } from "@solidjs/router";
 import { render } from "solid-js/web";
-import { Toasts } from "./components/ui";
+import { Show } from "solid-js";
+import { api } from "./api";
+import { Toasts, poll } from "./components/ui";
 import { BucketBrowser, BucketList, ObjectPage } from "./pages/Buckets";
+import Integrity from "./pages/Integrity";
 import Jobs from "./pages/Jobs";
 import Lifecycle from "./pages/Lifecycle";
 import Overview from "./pages/Overview";
@@ -12,10 +15,29 @@ import "./styles.css";
 const NAV: [string, string][] = [
   ["/", "Overview"],
   ["/storage", "Storage"],
+  ["/integrity", "Integrity"],
   ["/jobs", "Jobs"],
   ["/buckets", "Buckets"],
   ["/roles", "Roles"],
 ];
+
+/** A count next to the Integrity link, on every page: objects with lost data
+ * (bad), else open findings (being looked into, or a node down). */
+function IntegrityCount() {
+  const integrity = poll(api.integrity, 30000);
+  const lost = () => integrity.data()?.lost_objects ?? 0;
+  const open = () => integrity.data()?.open_findings ?? 0;
+  return (
+    <Show when={lost() || open()}>
+      <span
+        class={"nav-count " + (lost() ? "bad" : "warn")}
+        title={lost() ? `${lost()} objects with lost data` : `${open()} open findings`}
+      >
+        {lost() || open()}
+      </span>
+    </Show>
+  );
+}
 
 function Layout(props: RouteSectionProps) {
   return (
@@ -34,6 +56,7 @@ function Layout(props: RouteSectionProps) {
           {NAV.map(([href, label]) => (
             <A href={href} end={href === "/"} activeClass="active">
               {label}
+              {href === "/integrity" && <IntegrityCount />}
             </A>
           ))}
         </nav>
@@ -61,6 +84,7 @@ render(
     <Router root={Layout} base="/_dashboard" explicitLinks>
       <Route path="/" component={Overview} />
       <Route path="/storage" component={Storage} />
+      <Route path="/integrity" component={Integrity} />
       <Route path="/jobs" component={Jobs} />
       <Route path="/buckets" component={BucketList} />
       <Route path="/buckets/:bucket" component={BucketBrowser} />

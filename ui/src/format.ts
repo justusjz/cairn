@@ -26,6 +26,11 @@ export function rate(n: number): string {
   return num(Math.round(n));
 }
 
+/** `n` and a noun, in the plural unless it's one. */
+export function plural(n: number | null | undefined, noun: string, nouns = noun + "s"): string {
+  return `${num(n)} ${n === 1 ? noun : nouns}`;
+}
+
 export function pct(part: number, whole: number): string {
   if (!whole) return "–";
   const p = (100 * part) / whole;
