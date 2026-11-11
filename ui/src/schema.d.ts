@@ -127,6 +127,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/lifecycle": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * How lifecycle sweeps are going: the rate, how long a round takes at it,
+         *     and each bucket's sweep.
+         */
+        get: operations["get_lifecycle"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/lifecycle/rate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets the rate lifecycle sweeps go at, for the whole cluster. */
+        put: operations["set_lifecycle_rate"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/roles": {
         parameters: {
             query?: never;
@@ -495,6 +532,80 @@ export interface components {
             standby?: boolean | null;
             version?: string | null;
         };
+        /**
+         * @description A bucket's last whole sweep, as `buckets.lifecycle_last` keeps it. Times
+         *     are seconds since the Unix epoch.
+         */
+        LastSweep: {
+            /** Format: int64 */
+            aborted: number;
+            /** Format: int64 */
+            expired: number;
+            /** Format: double */
+            finished: number;
+            /**
+             * Format: int64
+             * @description Versions (and uploads) read.
+             */
+            read: number;
+            /** Format: int64 */
+            removed: number;
+            /** Format: double */
+            started: number;
+        };
+        /** @description How lifecycle sweeps are going (see `lifecycle`). */
+        Lifecycle: {
+            buckets: components["schemas"]["LifecycleBucket"][];
+            /**
+             * Format: int64
+             * @description The rate's default.
+             */
+            default_rate: number;
+            /**
+             * Format: double
+             * @description When the last step began, and whether one is running now.
+             */
+            last_step?: number | null;
+            /**
+             * Format: int64
+             * @description Object versions sweeps may read per hour, across the cluster; 0 if
+             *     they're paused.
+             */
+            rate: number;
+            /**
+             * @description Whether some bucket has had no whole sweep yet, so that a round reads
+             *     more than `round_versions`.
+             */
+            round_partial: boolean;
+            /**
+             * Format: double
+             * @description How long a round takes at the rate, in seconds (none if paused). Over
+             *     a day, sweeps fall behind, and expirations come that much later.
+             */
+            round_secs?: number | null;
+            /**
+             * Format: int64
+             * @description Versions a round of every bucket's sweep reads: the last whole sweep
+             *     of each, or what its first has read so far.
+             */
+            round_versions: number;
+            stepping: boolean;
+        };
+        /** @description A bucket's rules, and its sweep of them. */
+        LifecycleBucket: {
+            bucket: string;
+            /**
+             * Format: double
+             * @description When it gets its next turn: its next sweep, or, during one, its next
+             *     step (it's due if that's past).
+             */
+            due?: number | null;
+            enabled: number;
+            last?: components["schemas"]["LastSweep"] | null;
+            /** @description How many rules it has, and how many of them are enabled. */
+            rules: number;
+            sweep?: components["schemas"]["SweepProgress"] | null;
+        };
         /** @description A page of a bucket's keys, rolled up at `/` like a directory listing. */
         Listing: {
             entries: components["schemas"]["Entry"][];
@@ -548,6 +659,13 @@ export interface components {
         NewGrant: {
             bucket: string;
             permissions: components["schemas"]["Permission"][];
+        };
+        NewRate: {
+            /**
+             * Format: int64
+             * @description Object versions per hour, across the cluster; 0 pauses sweeps.
+             */
+            rate: number;
         };
         NewRole: {
             admin?: boolean;
@@ -728,6 +846,21 @@ export interface components {
             packer: components["schemas"]["PackerSettings"];
             replicas: components["schemas"]["ReplicaGroup"][];
             replication_factor: number;
+        };
+        /** @description A sweep in progress. */
+        SweepProgress: {
+            /** Format: int64 */
+            aborted: number;
+            /** Format: int64 */
+            expired: number;
+            /** @description The key it has got to. */
+            key: string;
+            /** Format: int64 */
+            read: number;
+            /** Format: int64 */
+            removed: number;
+            /** Format: double */
+            started: number;
         };
         VersionInfo: {
             content_type?: string | null;
@@ -1012,6 +1145,79 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Every role has its identity in the KMS */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_lifecycle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Lifecycle"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_lifecycle_rate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewRate"];
+            };
+        };
+        responses: {
+            /** @description Set */
             204: {
                 headers: {
                     [name: string]: unknown;

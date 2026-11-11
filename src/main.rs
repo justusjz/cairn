@@ -43,6 +43,7 @@ mod packer;
 mod payload;
 mod roles;
 mod s3;
+mod settings;
 mod store;
 mod writing;
 
@@ -80,6 +81,8 @@ enum Command {
     Serve(ServeArgs),
     /// Manage roles: S3 credentials and their bucket permissions.
     Role(roles::RoleArgs),
+    /// Show or change the cluster's settings.
+    Config(settings::ConfigArgs),
 }
 
 // Every flag can also be set through the environment variable named in its
@@ -128,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve_main(args).await,
         Command::Role(args) => roles::role_main(args).await,
+        Command::Config(args) => settings::config_main(args).await,
     }
 }
 

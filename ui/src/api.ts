@@ -19,6 +19,8 @@ export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
 export type Role = Schemas["RoleSummary"];
 export type Permission = Schemas["Permission"];
+export type Lifecycle = Schemas["Lifecycle"];
+export type LifecycleBucket = Schemas["LifecycleBucket"];
 
 /** Where the API is; also in the spec's `servers`. */
 const BASE = "/_dashboard/api";
@@ -78,6 +80,8 @@ export const api = {
   grant: (role: string, bucket: string, permissions: Permission[]) =>
     ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
   identifyRoles: () => ok(client.POST("/kms/identify")),
+  lifecycle: () => ok(client.GET("/lifecycle")),
+  setLifecycleRate: (rate: number) => ok(client.PUT("/lifecycle/rate", { body: { rate } })),
   revoke: (role: string, bucket: string, permission: Permission) =>
     ok(client.DELETE("/roles/{role}/grants", { params: { ...rolePath(role), query: { bucket, permission } } })),
 };

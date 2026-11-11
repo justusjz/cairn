@@ -1257,10 +1257,34 @@ BEGIN
 END
 $$;
 
+-- Claims the cluster's next lifecycle step (see `lifecycle`), if no node
+-- holds it (its lease has run out, if one did), and the last one began at
+-- least `p_gap` seconds before `p_now`: then takes a lease of `p_lease`
+-- seconds, and records the step as beginning at `p_now`. Returns whether it
+-- claimed it, and when the last step began. The single row, locked with SKIP
+-- LOCKED, so that it never waits: another node claiming it at the same time
+-- gets nothing.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_lifecycle_claim(
+    p_now timestamptz, p_lease double precision, p_gap double precision,
+    OUT claimed boolean, OUT previous timestamptz
+) LANGUAGE plpgsql AS $$
+BEGIN
+    SELECT last_step INTO previous FROM lifecycle_runs
+    WHERE id AND (lease_until IS NULL OR lease_until <= p_now)
+      AND (last_step IS NULL OR last_step <= p_now - make_interval(secs => p_gap))
+    FOR UPDATE SKIP LOCKED;
+    claimed := FOUND;
+    IF claimed THEN
+        UPDATE lifecycle_runs SET lease_until = p_now + make_interval(secs => p_lease), last_step = p_now
+        WHERE id;
+    END IF;
+END
+$$;
+
 -- T18: PutBucketLifecycleConfiguration and DeleteBucketLifecycle: sets (or,
 -- with NULL, removes) the bucket's lifecycle configuration, and starts a new
--- sweep of it now. (The size of the last sweep goes: it's of the keys under
--- the old rules' prefixes.) A plain UPDATE of the bucket's row, as T16's: no invariant involves the
+-- sweep of it, which is due now. (The last whole sweep stays, for the
+-- dashboard.) A plain UPDATE of the bucket's row, as T16's: no invariant involves the
 -- configuration, which a sweep checks itself (T17). Returns whether the
 -- bucket exists.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_set_lifecycle(p_bucket text, p_config text)
@@ -1268,8 +1292,8 @@ RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE buckets SET lifecycle = p_config,
                        lifecycle_due = CASE WHEN p_config IS NULL THEN NULL ELSE now() END,
-                       lifecycle_cursor = NULL, lifecycle_started = NULL, lifecycle_seen = 0,
-                       lifecycle_size = NULL
+                       lifecycle_started = NULL, lifecycle_cursor = NULL, lifecycle_seen = 0,
+                       lifecycle_expired = 0, lifecycle_removed = 0, lifecycle_aborted = 0
     WHERE name = p_bucket;
     RETURN FOUND;
 END

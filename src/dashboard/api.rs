@@ -77,6 +77,8 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_admin))
         .routes(routes!(identify_roles))
         .routes(routes!(grant, revoke))
+        .routes(routes!(get_lifecycle))
+        .routes(routes!(set_lifecycle_rate))
 }
 
 /// The API's OpenAPI spec, as committed in `ui/openapi.json`.
@@ -1439,4 +1441,143 @@ mod e2e {
             "re-creating a bucket succeeds"
         );
     }
+}
+
+// ─── Lifecycle ───────────────────────────────────────────────────────────────
+
+/// How lifecycle sweeps are going (see `lifecycle`).
+#[derive(Serialize, Deserialize, ToSchema)]
+struct Lifecycle {
+    /// Object versions sweeps may read per hour, across the cluster; 0 if
+    /// they're paused.
+    rate: i64,
+    /// The rate's default.
+    default_rate: i64,
+    /// Versions a round of every bucket's sweep reads: the last whole sweep
+    /// of each, or what its first has read so far.
+    round_versions: i64,
+    /// Whether some bucket has had no whole sweep yet, so that a round reads
+    /// more than `round_versions`.
+    round_partial: bool,
+    /// How long a round takes at the rate, in seconds (none if paused). Over
+    /// a day, sweeps fall behind, and expirations come that much later.
+    round_secs: Option<f64>,
+    /// When the last step began, and whether one is running now.
+    last_step: Option<f64>,
+    stepping: bool,
+    buckets: Vec<LifecycleBucket>,
+}
+
+/// A bucket's rules, and its sweep of them.
+#[derive(Serialize, Deserialize, ToSchema)]
+struct LifecycleBucket {
+    bucket: String,
+    /// How many rules it has, and how many of them are enabled.
+    rules: usize,
+    enabled: usize,
+    /// When it gets its next turn: its next sweep, or, during one, its next
+    /// step (it's due if that's past).
+    due: Option<f64>,
+    sweep: Option<SweepProgress>,
+    last: Option<crate::lifecycle::LastSweep>,
+}
+
+/// A sweep in progress.
+#[derive(Serialize, Deserialize, ToSchema)]
+struct SweepProgress {
+    started: f64,
+    /// The key it has got to.
+    key: String,
+    read: i64,
+    expired: i64,
+    removed: i64,
+    aborted: i64,
+}
+
+/// How lifecycle sweeps are going: the rate, how long a round takes at it,
+/// and each bucket's sweep.
+#[utoipa::path(get, path = "/lifecycle", responses(
+    (status = 200, body = Lifecycle),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn get_lifecycle(State(app): AppState) -> Result<Json<Lifecycle>> {
+    let client = app.pool.get().await?;
+    let rate = crate::settings::LIFECYCLE_RATE.get(&client).await?;
+    let runs = client
+        .query_one_cached(
+            "SELECT extract(epoch FROM last_step)::float8, coalesce(lease_until > now(), false)
+             FROM lifecycle_runs WHERE id",
+            &[],
+        )
+        .await?;
+    let rows = client
+        .query_cached(
+            "SELECT name, lifecycle, extract(epoch FROM lifecycle_due)::float8,
+                    extract(epoch FROM lifecycle_started)::float8, lifecycle_cursor, lifecycle_seen,
+                    lifecycle_expired, lifecycle_removed, lifecycle_aborted, lifecycle_last
+             FROM buckets WHERE lifecycle IS NOT NULL ORDER BY name",
+            &[],
+        )
+        .await?;
+    let mut buckets = Vec::new();
+    let (mut round_versions, mut round_partial) = (0, false);
+    for row in rows {
+        let bucket: String = row.get(0);
+        let config = crate::lifecycle::rules::Configuration::from_json(row.get(1));
+        let (rules, enabled) = match &config {
+            Ok(config) => (config.rules.len(), config.rules.iter().filter(|r| r.enabled).count()),
+            Err(_) => (0, 0),
+        };
+        let last: Option<String> = row.get(9);
+        let last = last.and_then(|last| serde_json::from_str::<crate::lifecycle::LastSweep>(&last).ok());
+        let started: Option<f64> = row.get(3);
+        let sweep = started.map(|started| SweepProgress {
+            started,
+            key: row.get::<_, Option<String>>(4).unwrap_or_default(),
+            read: row.get(5),
+            expired: row.get(6),
+            removed: row.get(7),
+            aborted: row.get(8),
+        });
+        let read_now = sweep.as_ref().map_or(0, |s| s.read);
+        match &last {
+            Some(last) => round_versions += last.read.max(read_now),
+            None => {
+                round_versions += read_now;
+                round_partial = true;
+            }
+        }
+        buckets.push(LifecycleBucket { bucket, rules, enabled, due: row.get(2), sweep, last });
+    }
+    Ok(Json(Lifecycle {
+        rate,
+        default_rate: crate::settings::LIFECYCLE_RATE.default,
+        round_versions,
+        round_partial,
+        round_secs: (rate > 0).then(|| round_versions as f64 / rate as f64 * 3600.0),
+        last_step: runs.get(0),
+        stepping: runs.get(1),
+        buckets,
+    }))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct NewRate {
+    /// Object versions per hour, across the cluster; 0 pauses sweeps.
+    rate: i64,
+}
+
+/// Sets the rate lifecycle sweeps go at, for the whole cluster.
+#[utoipa::path(put, path = "/lifecycle/rate", request_body = NewRate, responses(
+    (status = 204, description = "Set"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn set_lifecycle_rate(State(app): AppState, Json(body): Json<NewRate>) -> Result<StatusCode> {
+    if body.rate < 0 {
+        return Err(ApiError::BadRequest("the rate can't be negative".into()));
+    }
+    crate::settings::LIFECYCLE_RATE.set(&app.pool.get().await?, body.rate).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

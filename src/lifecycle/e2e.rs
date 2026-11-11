@@ -1,4 +1,4 @@
-//! Lifecycle runs against a real Postgres (see `e2e`), with the clock moved
+//! Lifecycle sweeps against a real Postgres (see `e2e`), with the clock moved
 //! ahead instead of waiting for days.
 
 use std::{
@@ -67,7 +67,8 @@ async fn run_in(app: &Arc<App>, days: u32) -> Option<Report> {
     report
 }
 
-/// The bucket's sweep state: its cursor, versions read, and size.
+/// The bucket's sweep state: its cursor, versions read so far, and how many
+/// the last whole sweep read.
 async fn sweep_state(app: &App) -> (Option<String>, i64, Option<i64>) {
     let row = app
         .pool
@@ -75,16 +76,22 @@ async fn sweep_state(app: &App) -> (Option<String>, i64, Option<i64>) {
         .await
         .unwrap()
         .query_one(
-            "SELECT lifecycle_cursor, lifecycle_seen, lifecycle_size FROM buckets WHERE name = $1",
+            "SELECT lifecycle_cursor, lifecycle_seen, lifecycle_last FROM buckets WHERE name = $1",
             &[&BUCKET],
         )
         .await
         .unwrap();
-    (row.get(0), row.get(1), row.get(2))
+    let last: Option<String> = row.get(2);
+    let last = last.map(|last| serde_json::from_str::<super::LastSweep>(&last).unwrap().read);
+    (row.get(0), row.get(1), last)
 }
 
-/// Gives the bucket `n` keys, `k00000` on, each only a delete marker.
-async fn lone_markers(app: &App, n: i32) {
+async fn set_rate(app: &App, rate: i64) {
+    crate::settings::LIFECYCLE_RATE.set(&app.pool.get().await.unwrap(), rate).await.unwrap();
+}
+
+/// Gives `bucket` `n` keys, `k00001` on, each only a delete marker.
+async fn lone_markers(app: &App, bucket: &str, n: i32) {
     app.pool
         .get()
         .await
@@ -94,7 +101,7 @@ async fn lone_markers(app: &App, n: i32) {
                                   content_type, last_modified)
              SELECT $1, 'k' || lpad(n::text, 5, '0'), 'v', true, true, 0, NULL, NULL, now()
              FROM generate_series(1, $2::int) AS n",
-            &[&BUCKET, &n],
+            &[&bucket, &n],
         )
         .await
         .unwrap();
@@ -103,68 +110,104 @@ async fn lone_markers(app: &App, n: i32) {
 const MARKERS: &str = "<Rule><ID>r</ID><Filter/><Status>Enabled</Status>\
      <Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration></Rule>";
 
+const MINUTE: Duration = Duration::from_secs(60);
+
 #[tokio::test]
-async fn a_sweep_is_spread_over_steps() {
+async fn sweeps_go_at_the_rate() {
     let Some(app) = node().await else { return };
-    enable_versioning(&app).await;
-    lone_markers(&app, 2500).await;
+    lone_markers(&app, BUCKET, 2500).await;
     configure(&app, MARKERS).await;
-    // As if the last sweep had found few versions: a page a step.
-    app.pool
-        .get()
-        .await
-        .unwrap()
-        .execute("UPDATE buckets SET lifecycle_size = 1", &[])
-        .await
-        .unwrap();
-    let minute = Duration::from_secs(60);
-    // A full page leaves its last key for the next, which may have more
-    // versions than fit.
+    // 1,000 versions a minute. The first step reads a minute's worth.
+    set_rate(&app, 60_000).await;
     let first = step_at(&app, Duration::ZERO).await.unwrap();
-    assert_eq!((first.removed, first.finished), (999, false));
-    assert_eq!(sweep_state(&app).await, (Some("k00999".to_owned()), 999, Some(1)));
-    // Not again until a minute later.
-    assert_eq!(step_at(&app, Duration::ZERO).await, None);
-    let second = step_at(&app, minute * 2).await.unwrap();
-    assert_eq!((second.removed, second.finished), (999, false));
-    // The last page ends the sweep, which recorded its size, and the next
-    // one is due a day after it started.
-    let third = step_at(&app, minute * 4).await.unwrap();
-    assert_eq!((third.removed, third.finished), (502, true));
+    assert_eq!((first.read, first.removed, first.finished), (1000, 1000, false));
+    assert_eq!(sweep_state(&app).await, (Some("k01000".to_owned()), 1000, None));
+    // The next step is a minute later at the earliest, and reads the share
+    // of the time since the last one began.
+    assert_eq!(step_at(&app, MINUTE / 2).await, None);
+    let second = step_at(&app, MINUTE * 2).await.unwrap();
+    assert_eq!((second.read, second.removed, second.finished), (1500, 1500, true));
     assert_eq!(sweep_state(&app).await, (None, 0, Some(2500)));
-    assert_eq!(step_at(&app, DAY - minute).await, None);
-    assert!(step_at(&app, DAY + minute).await.unwrap().finished);
+    // The next sweep is a day after this one started.
+    assert_eq!(step_at(&app, DAY - MINUTE).await, None);
+    assert!(step_at(&app, DAY + MINUTE).await.unwrap().finished);
+}
+
+#[tokio::test]
+async fn a_rate_of_0_pauses_sweeps() {
+    let Some(app) = node().await else { return };
+    lone_markers(&app, BUCKET, 10).await;
+    configure(&app, MARKERS).await;
+    set_rate(&app, 0).await;
+    assert_eq!(step_at(&app, MINUTE).await, None);
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM objects").await, 10);
+    set_rate(&app, 60_000).await;
+    assert_eq!(step_at(&app, MINUTE * 2).await.unwrap().removed, 10);
+}
+
+#[tokio::test]
+async fn buckets_take_turns() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    client.execute("INSERT INTO buckets (name) VALUES ('other')", &[]).await.unwrap();
+    for bucket in [BUCKET, "other"] {
+        lone_markers(&app, bucket, 1500).await;
+        let body = format!("<LifecycleConfiguration>{MARKERS}</LifecycleConfiguration>");
+        put_bucket_lifecycle(&app, bucket, Bytes::from(body)).await.unwrap();
+    }
+    set_rate(&app, 60_000).await;
+    let step = |after| {
+        let app = app.clone();
+        async move {
+            let results = pass(&app, SystemTime::now() + after).await;
+            results.into_iter().map(|r| r.map_err(|(_, e)| e).unwrap()).collect::<Vec<_>>()
+        }
+    };
+    let buckets = |reports: &[Report]| reports.iter().map(|r| r.bucket.clone()).collect::<Vec<_>>();
+    // Each gets a step's worth (about 1,000) in turn, rather than the first
+    // all it needs.
+    let first = step(MINUTE).await;
+    assert_eq!(buckets(&first), [BUCKET]);
+    let second = step(MINUTE * 2).await;
+    assert_eq!(buckets(&second), ["other"]);
+    assert!((1000..1010).contains(&second[0].read), "{second:?}");
+    // Then what's left of each.
+    let third = step(MINUTE * 3).await;
+    assert_eq!(buckets(&third), [BUCKET, "other"]);
+    assert!(third.iter().all(|r| r.finished), "{third:?}");
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM objects").await, 0);
 }
 
 #[tokio::test]
 async fn a_failed_step_is_taken_up_where_it_got_to() {
     let Some(app) = node().await else { return };
-    enable_versioning(&app).await;
-    lone_markers(&app, 1500).await;
+    lone_markers(&app, BUCKET, 1500).await;
     configure(&app, MARKERS).await;
-    // A step that read the first page, and died before the next was due.
-    app.pool
-        .get()
-        .await
-        .unwrap()
+    // A step that read the first page, and whose node died.
+    let client = app.pool.get().await.unwrap();
+    client
         .execute(
-            "UPDATE buckets SET lifecycle_started = now(), lifecycle_cursor = 'k01000',
-                                lifecycle_seen = 1000, lifecycle_due = now() + interval '10 minutes'",
+            "UPDATE buckets SET lifecycle_started = now(), lifecycle_cursor = 'k01000', lifecycle_seen = 1000",
             &[],
         )
         .await
         .unwrap();
-    assert_eq!(step_at(&app, Duration::from_secs(60)).await, None);
-    let report = step_at(&app, Duration::from_secs(11 * 60)).await.unwrap();
-    // Only what was after where it got to.
-    assert_eq!((report.removed, report.finished), (500, true));
+    client
+        .execute(
+            "UPDATE lifecycle_runs SET last_step = now(), lease_until = now() + interval '10 minutes'",
+            &[],
+        )
+        .await
+        .unwrap();
+    // No other node takes a step until its lease runs out.
+    assert_eq!(step_at(&app, MINUTE).await, None);
+    let report = step_at(&app, MINUTE * 11).await.unwrap();
+    // Then only what was after where it got to.
+    assert_eq!((report.read, report.finished), (500, true));
     assert_eq!(sweep_state(&app).await, (None, 0, Some(1500)));
-    // A new configuration starts a new sweep, from the start, and forgets
-    // the last one's size, which was of the old rules' keys: it goes at a
-    // first sweep's pace.
+    // A new configuration starts a new sweep, from the start.
     configure(&app, MARKERS).await;
-    assert_eq!(sweep_state(&app).await, (None, 0, None));
-    let report = step_at(&app, Duration::from_secs(11 * 60)).await.unwrap();
+    let report = step_at(&app, MINUTE * 13).await.unwrap();
     assert_eq!((report.removed, report.finished), (1000, true));
 }
 
@@ -188,8 +231,8 @@ async fn objects_expire_after_their_days() {
     let report = run_in(&app, 0).await.unwrap();
     assert!(report.is_empty(), "{report}");
     assert_eq!(sweep_state(&app).await, (None, 0, Some(1)));
-    // Not due again until midnight.
-    assert_eq!(run_in(&app, 0).await, None);
+    // Not due again until a day after.
+    assert_eq!(step_at(&app, MINUTE * 10).await, None);
     let report = run_in(&app, 2).await.unwrap();
     assert_eq!((report.expired, report.removed), (1, 0));
     assert_eq!(get(&app, "logs/a").await, None);
@@ -270,7 +313,7 @@ async fn a_version_written_since_is_not_expired() {
         .get(0);
     let rules = super::Configuration::from_json(&config).unwrap();
     let client = app.pool.get().await.unwrap();
-    let (versions, _, _) = page(&client, BUCKET, "", &everything()).await.unwrap().unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
     let due: Vec<_> = rules
         .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
         .into_iter()
@@ -290,7 +333,7 @@ async fn a_version_written_since_is_not_expired() {
         "<Rule><ID>r</ID><Filter/><Status>Enabled</Status><Expiration><Days>2</Days></Expiration></Rule>",
     )
     .await;
-    let (versions, _, _) = page(&client, BUCKET, "", &everything()).await.unwrap().unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
     let due: Vec<_> = rules
         .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
         .into_iter()
@@ -356,12 +399,12 @@ async fn a_page_holds_whole_keys() {
         .await
         .unwrap();
     put(&app, "b", vec![1]).await;
-    let (versions, last, last_page) = page(&client, BUCKET, "", &everything()).await.unwrap().unwrap();
+    let (versions, last, last_page) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
     assert_eq!((last.as_str(), last_page), ("a", false));
     assert_eq!(versions["a"].len(), super::PAGE as usize + 5);
-    let (versions, last, last_page) = page(&client, BUCKET, "a", &everything()).await.unwrap().unwrap();
+    let (versions, last, last_page) = page(&client, BUCKET, "a", &everything(), super::PAGE).await.unwrap().unwrap();
     assert_eq!((versions.len(), last.as_str(), last_page), (1, "b", true));
-    assert!(page(&client, BUCKET, "b", &everything()).await.unwrap().is_none());
+    assert!(page(&client, BUCKET, "b", &everything(), super::PAGE).await.unwrap().is_none());
 }
 
 #[tokio::test]
@@ -373,12 +416,12 @@ async fn a_walk_goes_from_prefix_to_prefix() {
     let client = app.pool.get().await.unwrap();
     let prefixes = ["a/".to_owned(), "c/".to_owned(), "e/".to_owned()];
     let keys = |page: &super::Page| page.keys().cloned().collect::<Vec<_>>();
-    let (first, last, last_page) = page(&client, BUCKET, "", &prefixes).await.unwrap().unwrap();
+    let (first, last, last_page) = page(&client, BUCKET, "", &prefixes, super::PAGE).await.unwrap().unwrap();
     assert_eq!((keys(&first), last.as_str(), last_page), (vec!["a/1".to_owned()], "a/1", false));
-    let (second, last, last_page) = page(&client, BUCKET, &last, &prefixes).await.unwrap().unwrap();
+    let (second, last, last_page) = page(&client, BUCKET, &last, &prefixes, super::PAGE).await.unwrap().unwrap();
     assert_eq!(keys(&second), ["c/1", "c/2"]);
     // "e/" may have keys yet.
     assert!(!last_page);
-    assert!(page(&client, BUCKET, &last, &prefixes).await.unwrap().is_none());
-    assert!(page(&client, BUCKET, "", &[]).await.unwrap().is_none());
+    assert!(page(&client, BUCKET, &last, &prefixes, super::PAGE).await.unwrap().is_none());
+    assert!(page(&client, BUCKET, "", &[], super::PAGE).await.unwrap().is_none());
 }

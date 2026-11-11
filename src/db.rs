@@ -830,19 +830,46 @@ ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_checksum CHECK (
 ALTER TABLE parts ADD COLUMN checksum text;
 "#;
 
-/// Migration 20: buckets' lifecycle configurations (see `lifecycle`): the
-/// rules, as JSON (NULL for none), and where the bucket's sweep of them is:
-/// when its next step is due (which a node claims it by moving forward), the
-/// key it has got to, when it started (NULL until it does), how many
-/// versions it has read so far, and how many the last whole sweep read,
-/// which paces the next one.
+/// Migration 20: lifecycle rules (see `lifecycle`), and the cluster's
+/// settings (see `settings`), of which the rate lifecycle sweeps go at is the
+/// first.
+///
+/// A bucket's rules, as JSON (NULL for none), and its sweep of them: when it
+/// gets its next turn (when its next sweep starts, or, during one, when it
+/// last had a turn), when the sweep started (NULL between sweeps), the key it
+/// has got to, how many versions it has read, and what it has done; and the
+/// last whole sweep, as JSON.
+///
+/// `lifecycle_runs` is the single row that sweeps take turns through: one
+/// step at a time in the whole cluster, under its lease, and when the last
+/// one started, which the next one's share of the rate is counted from.
 const LIFECYCLE: &str = r#"
-ALTER TABLE buckets ADD COLUMN lifecycle text;
-ALTER TABLE buckets ADD COLUMN lifecycle_due timestamptz;
-ALTER TABLE buckets ADD COLUMN lifecycle_cursor text;
-ALTER TABLE buckets ADD COLUMN lifecycle_started timestamptz;
-ALTER TABLE buckets ADD COLUMN lifecycle_seen bigint NOT NULL DEFAULT 0;
-ALTER TABLE buckets ADD COLUMN lifecycle_size bigint;
+CREATE TABLE settings (
+    name   text PRIMARY KEY,
+    value  text NOT NULL
+);
+CREATE TRIGGER settings_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON settings
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE lifecycle_runs (
+    id           boolean PRIMARY KEY DEFAULT true CHECK (id),
+    lease_until  timestamptz,
+    last_step    timestamptz
+);
+INSERT INTO lifecycle_runs DEFAULT VALUES;
+CREATE TRIGGER lifecycle_runs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON lifecycle_runs
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+ALTER TABLE buckets
+    ADD COLUMN lifecycle text,
+    ADD COLUMN lifecycle_due timestamptz,
+    ADD COLUMN lifecycle_started timestamptz,
+    ADD COLUMN lifecycle_cursor text,
+    ADD COLUMN lifecycle_seen bigint NOT NULL DEFAULT 0,
+    ADD COLUMN lifecycle_expired bigint NOT NULL DEFAULT 0,
+    ADD COLUMN lifecycle_removed bigint NOT NULL DEFAULT 0,
+    ADD COLUMN lifecycle_aborted bigint NOT NULL DEFAULT 0,
+    ADD COLUMN lifecycle_last text;
 CREATE INDEX buckets_lifecycle_due ON buckets (lifecycle_due) WHERE lifecycle IS NOT NULL;
 "#;
 
@@ -854,7 +881,7 @@ mod tests {
         let gate = super::MIGRATIONS
             .iter()
             .rev()
-            .find(|sql| sql.contains("FUNCTION cairn_require_protocol()"))
+            .find(|sql| sql.contains("FUNCTION cairn_require_protocol() RETURNS"))
             .unwrap();
         let check = format!("IS DISTINCT FROM '{}'", super::PROTOCOL);
         assert!(gate.contains(&check));
@@ -875,7 +902,7 @@ mod tests {
                 continue;
             }
             let trigger = format!("CREATE TRIGGER {table}_protocol ");
-            assert!(super::PROTOCOL_GATE.contains(&trigger), "{table} isn't gated");
+            assert!(schema.contains(&trigger), "{table} isn't gated");
         }
     }
 

@@ -256,7 +256,9 @@ cluster:
 - **Storage:** how much data there is, how much of it has fewer live copies
   than the replication factor, and what each node holds.
 - **Jobs:** how the background passes (garbage collection and packing) are
-  doing on each node, what they still have to do, and what they did recently.
+  doing on each node, what they still have to do, and what they did recently;
+  and the [lifecycle](#lifecycle-rules) sweeps: each bucket's, how long a
+  round of them takes, and the rate they go at, which can be changed there.
 - **Buckets:** browse buckets by prefix, see every version of a key with how
   it's encrypted, the blobs its parts are stored in and the nodes holding
   them, and download any version (but an encrypted one: Cairn doesn't have
@@ -393,21 +395,33 @@ midnight UTC: an object written at 10:30 on the 1st, under a rule of one day,
 expires at the start of the 3rd.
 
 Rules are applied in the background, not as objects are read: an expired
-object stays readable until a sweep gets to it, up to about a day after it
-became due (S3 also takes its time). A bucket with rules is swept once a day,
-starting when the rules are set: one node at a time walks it (only the keys
-under the prefixes of rules that expire anything) in small steps,
-a minute apart, sized so that a sweep takes about 20 hours, going by how many
-versions the last one found. So the load is spread across the day and across
-buckets, rather than coming all at once. A bucket's first sweep reads at most
-10,000 versions a minute, since there's no last sweep to go by yet.
+object stays readable until a sweep gets to it. Each bucket with rules is
+swept once a day, starting when the rules are set: a sweep walks the keys
+under the prefixes of the rules that expire anything, and expires what's due.
+
+Sweeps go at a rate you set for the whole cluster, in object versions read
+per hour (1,000,000 by default; 0 pauses them), so that however much there is
+to sweep, they never take more of the database than that:
+
+```sh
+cairn config --database "$DB" set lifecycle-rate 2000000
+cairn config --database "$DB" get              # every setting, with its default
+```
+
+Or on the dashboard's Jobs page, which also shows each bucket's sweep, and how
+long a round of every bucket's sweep takes at the rate. If that's more than a
+day, sweeps fall behind, and expirations come that much later: raise the rate
+(and, if the database is the limit, its resources). The rate is the cluster's,
+not each node's: there's one lifecycle step at a time across the cluster,
+about once a minute, on whichever node takes it, and the buckets take turns,
+so that a huge one doesn't hold up the others.
 
 Where a sweep has got to is saved as it goes, so if its node dies, another
-picks it up from there within minutes. A version written or deleted since a
+carries on from there within minutes. A version written or deleted since a
 sweep read it is never mistaken for the one that was due, and deleting (or
 changing) the configuration stops a sweep before its next expiration. Every
 node uses the database's clock, so a node whose clock is off doesn't expire
-anything early. What sweeps did shows on the dashboard's Jobs page.
+anything early.
 
 Not supported, and refused with `501 NotImplemented`: transitions to other
 storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one),

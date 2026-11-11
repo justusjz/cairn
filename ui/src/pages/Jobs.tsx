@@ -1,6 +1,6 @@
-import { For, Show, createMemo } from "solid-js";
-import { type Cluster, type Event, type Storage, api, statsError, statsOf } from "../api";
-import { Badge, Card, LiveDot, Loading, Panel, Table, poll } from "../components/ui";
+import { For, Show, createMemo, createSignal } from "solid-js";
+import { type Cluster, type Event, type Lifecycle, type LifecycleBucket, type Storage, api, statsError, statsOf } from "../api";
+import { Badge, Card, LiveDot, Loading, Panel, Table, act, poll } from "../components/ui";
 import { ago, bytes, date, duration, hex, now, num, pct } from "../format";
 
 export default function Jobs() {
@@ -153,6 +153,8 @@ function View(props: { cluster: Cluster; storage: Storage }) {
         </Table>
       </Panel>
 
+      <LifecyclePanel />
+
       <Panel title="Recent events" note="what passes did, and what failed; the last 100 per node">
         <div class="events">
           <Table count={events().length} empty="Nothing happened yet: passes that do nothing aren't listed." columns={["When", "Node", "Source", "Message"]}>
@@ -174,5 +176,153 @@ function View(props: { cluster: Cluster; storage: Storage }) {
         </div>
       </Panel>
     </>
+  );
+}
+
+const DAY = 86400;
+
+/** Lifecycle sweeps: the cluster's rate, whether a round of every bucket's
+ * sweep fits in a day at it, and each bucket's sweep. */
+function LifecyclePanel() {
+  const lifecycle = poll(api.lifecycle, 10000);
+  return (
+    <Show when={lifecycle.data()} fallback={<Loading error={lifecycle.error()} />}>
+      {(l) => <LifecycleView lifecycle={l()} refresh={lifecycle.refresh} />}
+    </Show>
+  );
+}
+
+function LifecycleView(props: { lifecycle: Lifecycle; refresh: () => void }) {
+  const l = () => props.lifecycle;
+  const [rate, setRate] = createSignal("");
+  const late = () => (l().round_secs ?? 0) > DAY;
+  const submit = async (e: SubmitEvent) => {
+    e.preventDefault();
+    const value = Number(rate().replaceAll(/[ ,_]/g, ""));
+    if (!Number.isInteger(value) || value < 0) {
+      await act(() => Promise.reject(new Error("The rate is a whole number of versions per hour, 0 or more.")));
+      return;
+    }
+    if (await act(() => api.setLifecycleRate(value), `Lifecycle rate set to ${num(value)} versions an hour`)) {
+      setRate("");
+      props.refresh();
+    }
+  };
+  const round = () => {
+    if (l().rate === 0) return "paused";
+    return (l().round_partial ? "≥ " : "") + duration(l().round_secs);
+  };
+  return (
+    <Panel
+      title="Lifecycle sweeps"
+      note="one step at a time across the cluster, about once a minute; each bucket with rules is swept once a day"
+    >
+      <div class="cards">
+        <Card
+          label="Rate"
+          value={l().rate === 0 ? "paused" : `${num(l().rate)}/h`}
+          note={`versions read per hour, across the cluster (default ${num(l().default_rate)})`}
+          tone={l().rate === 0 ? "warn" : ""}
+        />
+        <Card
+          label="A round takes"
+          value={round()}
+          note={
+            `${num(l().round_versions)} versions in ${num(l().buckets.length)} buckets` +
+            (late() ? `: over a day, so expirations run up to ${duration((l().round_secs ?? 0) - DAY)} late. Raise the rate.` : "")
+          }
+          tone={late() || l().rate === 0 ? "warn" : ""}
+        />
+        <Card
+          label="Last step"
+          value={l().stepping ? "running" : ago(l().last_step)}
+          note={l().last_step ? `began ${date(l().last_step)}` : "none yet"}
+          tone={l().stepping ? "accent" : ""}
+        />
+      </div>
+      <form class="form-row" onSubmit={submit}>
+        <input
+          type="text"
+          inputmode="numeric"
+          placeholder={`${num(l().rate)} versions an hour`}
+          aria-label="Lifecycle rate"
+          value={rate()}
+          onInput={(e) => setRate(e.currentTarget.value)}
+        />
+        <button class="primary" type="submit">
+          Set rate
+        </button>
+      </form>
+      <Table
+        count={l().buckets.length}
+        empty="No bucket has lifecycle rules."
+        columns={[
+          "Bucket",
+          { label: "Rules", num: true },
+          "Sweep",
+          "Last sweep",
+          { label: "Expired / removed / aborted", num: true },
+        ]}
+      >
+        <For each={l().buckets}>{(b) => <LifecycleRow bucket={b} />}</For>
+      </Table>
+    </Panel>
+  );
+}
+
+function LifecycleRow(props: { bucket: LifecycleBucket }) {
+  const b = () => props.bucket;
+  const due = () => b().due != null && b().due! <= now();
+  return (
+    <tr>
+      <td>{b().bucket}</td>
+      <td class="num">
+        {num(b().enabled)}
+        <Show when={b().enabled !== b().rules}>
+          <span class="subtle"> of {num(b().rules)}</span>
+        </Show>
+      </td>
+      <td>
+        <Show
+          when={b().sweep}
+          fallback={<span class="subtle">{due() ? "due, waiting for its turn" : `next in ${duration((b().due ?? now()) - now())}`}</span>}
+        >
+          {(s) => (
+            <>
+              <Badge tone="accent">in progress</Badge> {num(s().read)} read
+              <Show when={b().last?.read}>{(total) => <> ({pct(s().read, total())})</>}</Show>
+              <div class="subtle small">
+                started {ago(s().started)} · at <span class="mono">{s().key || "the start"}</span>
+              </div>
+            </>
+          )}
+        </Show>
+      </td>
+      <td>
+        <Show when={b().last} fallback={<span class="subtle">none yet</span>}>
+          {(last) => (
+            <>
+              took {duration(last().finished - last().started)}
+              <Show when={last().finished - last().started > DAY}>
+                {" "}
+                <Badge tone="warn">over a day</Badge>
+              </Show>
+              <div class="subtle small">
+                {num(last().read)} read · ended {ago(last().finished)}
+              </div>
+            </>
+          )}
+        </Show>
+      </td>
+      <td class="num">
+        <Show when={b().last} fallback="–">
+          {(last) => (
+            <>
+              {num(last().expired)} / {num(last().removed)} / {num(last().aborted)}
+            </>
+          )}
+        </Show>
+      </td>
+    </tr>
   );
 }

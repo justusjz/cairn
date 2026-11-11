@@ -349,6 +349,80 @@
         }
       }
     },
+    "/lifecycle": {
+      "get": {
+        "summary": "How lifecycle sweeps are going: the rate, how long a round takes at it,\nand each bucket's sweep.",
+        "operationId": "get_lifecycle",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Lifecycle"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/lifecycle/rate": {
+      "put": {
+        "summary": "Sets the rate lifecycle sweeps go at, for the whole cluster.",
+        "operationId": "set_lifecycle_rate",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewRate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/roles": {
       "get": {
         "operationId": "list_roles",
@@ -1330,6 +1404,154 @@
           }
         }
       },
+      "LastSweep": {
+        "type": "object",
+        "description": "A bucket's last whole sweep, as `buckets.lifecycle_last` keeps it. Times\nare seconds since the Unix epoch.",
+        "required": [
+          "started",
+          "finished",
+          "read",
+          "expired",
+          "removed",
+          "aborted"
+        ],
+        "properties": {
+          "aborted": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expired": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "finished": {
+            "type": "number",
+            "format": "double"
+          },
+          "read": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Versions (and uploads) read."
+          },
+          "removed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "started": {
+            "type": "number",
+            "format": "double"
+          }
+        }
+      },
+      "Lifecycle": {
+        "type": "object",
+        "description": "How lifecycle sweeps are going (see `lifecycle`).",
+        "required": [
+          "rate",
+          "default_rate",
+          "round_versions",
+          "round_partial",
+          "stepping",
+          "buckets"
+        ],
+        "properties": {
+          "buckets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LifecycleBucket"
+            }
+          },
+          "default_rate": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The rate's default."
+          },
+          "last_step": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When the last step began, and whether one is running now."
+          },
+          "rate": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Object versions sweeps may read per hour, across the cluster; 0 if\nthey're paused."
+          },
+          "round_partial": {
+            "type": "boolean",
+            "description": "Whether some bucket has had no whole sweep yet, so that a round reads\nmore than `round_versions`."
+          },
+          "round_secs": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "How long a round takes at the rate, in seconds (none if paused). Over\na day, sweeps fall behind, and expirations come that much later."
+          },
+          "round_versions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Versions a round of every bucket's sweep reads: the last whole sweep\nof each, or what its first has read so far."
+          },
+          "stepping": {
+            "type": "boolean"
+          }
+        }
+      },
+      "LifecycleBucket": {
+        "type": "object",
+        "description": "A bucket's rules, and its sweep of them.",
+        "required": [
+          "bucket",
+          "rules",
+          "enabled"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "due": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When it gets its next turn: its next sweep, or, during one, its next\nstep (it's due if that's past)."
+          },
+          "enabled": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "last": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LastSweep"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rules": {
+            "type": "integer",
+            "description": "How many rules it has, and how many of them are enabled.",
+            "minimum": 0
+          },
+          "sweep": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SweepProgress"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "Listing": {
         "type": "object",
         "description": "A page of a bucket's keys, rolled up at `/` like a directory listing.",
@@ -1476,6 +1698,19 @@
             "items": {
               "$ref": "#/components/schemas/Permission"
             }
+          }
+        }
+      },
+      "NewRate": {
+        "type": "object",
+        "required": [
+          "rate"
+        ],
+        "properties": {
+          "rate": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Object versions per hour, across the cluster; 0 pauses sweeps."
           }
         }
       },
@@ -1993,6 +2228,44 @@
           "replication_factor": {
             "type": "integer",
             "minimum": 0
+          }
+        }
+      },
+      "SweepProgress": {
+        "type": "object",
+        "description": "A sweep in progress.",
+        "required": [
+          "started",
+          "key",
+          "read",
+          "expired",
+          "removed",
+          "aborted"
+        ],
+        "properties": {
+          "aborted": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "expired": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "key": {
+            "type": "string",
+            "description": "The key it has got to."
+          },
+          "read": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "removed": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "started": {
+            "type": "number",
+            "format": "double"
           }
         }
       },
