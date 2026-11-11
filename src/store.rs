@@ -5,15 +5,15 @@ use std::path::PathBuf;
 use tokio::fs;
 use uuid::Uuid;
 
-/// How many shard directories blobs are spread over: 256 × 256.
-pub const SHARDS: u32 = 1 << 16;
+/// How many directories blobs are spread over: 256 × 256.
+pub const DIRS: u32 = 1 << 16;
 /// What a blob's repaired copy is named, after its blob ID, until it
 /// replaces the blob's file.
 const REPAIR_SUFFIX: &str = ".repair";
 
-/// What's in a shard directory.
+/// What's in a blob directory.
 #[derive(Default)]
-pub struct Shard {
+pub struct Dir {
     /// The blobs with a file there.
     pub blobs: Vec<Uuid>,
     /// The blobs with a repaired copy there, and when it was last written.
@@ -72,22 +72,22 @@ impl Store {
         ))
     }
 
-    /// The two-level shard directory of a blob, named after four random hex
+    /// The two-level directory of a blob, named after four random hex
     /// digits of its ID, so blobs spread evenly. That's the leading digits of a
     /// (fully random) v4 ID, which blobs written before v7 IDs have. A v7 ID
     /// starts with its timestamp, which would put every blob of the same ~50
-    /// days in one directory, so it's sharded by its trailing (random) digits.
+    /// days in one directory, so it's spread by its trailing (random) digits.
     fn get_blob_dir(&self, blob_id: Uuid) -> PathBuf {
         let hex = blob_id.simple().to_string();
-        let shard = if blob_id.get_version_num() == 7 {
+        let dir = if blob_id.get_version_num() == 7 {
             &hex[28..32]
         } else {
             &hex[0..4]
         };
-        self.data_dir.join(&shard[0..2]).join(&shard[2..4])
+        self.data_dir.join(&dir[0..2]).join(&dir[2..4])
     }
 
-    /// Creates (truncating) the on-disk file for a blob, making its sharded
+    /// Creates (truncating) the on-disk file for a blob, making its
     /// directory if needed. The caller streams the bytes in and fsyncs before
     /// announcing this node as a durable location.
     pub async fn create_blob(&self, blob_id: Uuid) -> anyhow::Result<fs::File> {
@@ -95,7 +95,7 @@ impl Store {
         let blob_id = blob_id.to_string();
         let path = blob_dir.join(&blob_id);
         // `create_dir_all` and `File::create` aren't atomic: a concurrent GC can
-        // rmdir the just-made (empty) shard between them, so the create can hit
+        // rmdir the just-made (empty) dir between them, so the create can hit
         // NotFound. Recreate the dir and retry rather than failing the upload. A
         // single GC pass touches a dir once, so one retry covers it; the bound
         // guards against pathological overlapping passes.
@@ -172,10 +172,10 @@ impl Store {
         }
     }
 
-    /// Deletes a repaired copy that a crash left behind, which `list_shard`
+    /// Deletes a repaired copy that a crash left behind, which `list_dir`
     /// found. Idempotent.
-    pub async fn remove_stale_repair(&self, shard: u32, blob_id: Uuid) -> anyhow::Result<()> {
-        let path = self.shard_dir(shard).join(format!("{blob_id}{REPAIR_SUFFIX}"));
+    pub async fn remove_stale_repair(&self, dir: u32, blob_id: Uuid) -> anyhow::Result<()> {
+        let path = self.dir_path(dir).join(format!("{blob_id}{REPAIR_SUFFIX}"));
         match fs::remove_file(path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -183,18 +183,18 @@ impl Store {
         }
     }
 
-    /// The directory of shard `shard` (`0..SHARDS`), named by its four hex
+    /// The path of directory `dir` (`0..DIRS`), named by its four hex
     /// digits like a blob's (see `get_blob_dir`).
-    fn shard_dir(&self, shard: u32) -> PathBuf {
+    fn dir_path(&self, dir: u32) -> PathBuf {
         self.data_dir
-            .join(format!("{:02x}", shard >> 8))
-            .join(format!("{:02x}", shard & 0xff))
+            .join(format!("{:02x}", dir >> 8))
+            .join(format!("{:02x}", dir & 0xff))
     }
 
-    /// The files in shard `shard`: blobs', and repaired copies.
-    pub async fn list_shard(&self, shard: u32) -> anyhow::Result<Shard> {
-        let mut listing = Shard::default();
-        let mut files = match fs::read_dir(self.shard_dir(shard)).await {
+    /// The files in directory `dir`: blobs', and repaired copies.
+    pub async fn list_dir(&self, dir: u32) -> anyhow::Result<Dir> {
+        let mut listing = Dir::default();
+        let mut files = match fs::read_dir(self.dir_path(dir)).await {
             Ok(files) => files,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(listing),
             Err(e) => return Err(e.into()),
@@ -215,14 +215,14 @@ impl Store {
         Ok(listing)
     }
 
-    /// Removes shard `shard`'s directory if it's empty, and then its parent if
+    /// Removes directory `dir` if it's empty, and then its parent if
     /// that's empty too. Returns how many directories it removed.
     ///
     /// `rmdir` only removes an empty directory, so this never risks a blob: a
-    /// shard that isn't empty, or is repopulated meanwhile, just stays, and
-    /// `create_blob` recreates shards on demand.
-    pub async fn remove_shard_if_empty(&self, shard: u32) -> usize {
-        let dir = self.shard_dir(shard);
+    /// directory that isn't empty, or is repopulated meanwhile, just stays,
+    /// and `create_blob` recreates directories on demand.
+    pub async fn remove_dir_if_empty(&self, dir: u32) -> usize {
+        let dir = self.dir_path(dir);
         if fs::remove_dir(&dir).await.is_err() {
             return 0;
         }
@@ -233,7 +233,7 @@ impl Store {
     }
 
     /// Every blob with a local file, for tests. Walks the directories that
-    /// exist, rather than listing every shard.
+    /// exist, rather than listing every one.
     #[cfg(test)]
     pub async fn list_local_blobs(&self) -> anyhow::Result<Vec<Uuid>> {
         let mut blobs = Vec::new();
@@ -262,7 +262,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn blobs_shard_by_random_digits() {
+    fn blobs_spread_by_random_digits() {
         let store = Store {
             node_id: Uuid::nil(),
             data_dir: PathBuf::from("/d"),
@@ -271,7 +271,7 @@ mod tests {
         assert_eq!(store.get_blob_dir(v4), PathBuf::from("/d/3f/2a"));
         let v7 = Uuid::parse_str("01a102b0-8108-7c42-b0c9-39a46612af32").unwrap();
         assert_eq!(store.get_blob_dir(v7), PathBuf::from("/d/af/32"));
-        assert_eq!(store.shard_dir(0xaf32), PathBuf::from("/d/af/32"));
+        assert_eq!(store.dir_path(0xaf32), PathBuf::from("/d/af/32"));
         // Blobs created back to back still spread out.
         let dirs: std::collections::HashSet<_> =
             (0..64).map(|_| store.get_blob_dir(Uuid::now_v7())).collect();

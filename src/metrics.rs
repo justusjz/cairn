@@ -182,7 +182,7 @@ struct Maintenance {
     running_since: Option<f64>,
     last_started: Option<f64>,
     last_duration: Option<f64>,
-    /// Where the GC's file sweep is, of `store::SHARDS`.
+    /// Where the GC's file sweep is, of `store::DIRS` (blob directories).
     sweep_shard: u32,
     gc_pending: u64,
     gc_files: u64,
@@ -404,7 +404,7 @@ impl Metrics {
                 last_started: m.last_started,
                 last_duration: m.last_duration,
                 sweep_shard: m.sweep_shard,
-                shards: crate::store::SHARDS,
+                shards: crate::store::DIRS,
                 gc: GcTotals {
                     pending: m.gc_pending,
                     files: m.gc_files,
@@ -476,7 +476,8 @@ pub struct MaintenanceReport {
     pub last_started: Option<f64>,
     /// How many seconds the last pass took.
     pub last_duration: Option<f64>,
-    /// Where the GC's file sweep is, of `shards`.
+    /// Where the GC's file sweep is, of `shards` (blob directories; the
+    /// names are the dashboard's).
     pub sweep_shard: u32,
     pub shards: u32,
     pub gc: GcTotals,
