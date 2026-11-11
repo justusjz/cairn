@@ -110,8 +110,8 @@ impl Store {
         }
     }
 
-    /// Where a blob's file lives, for tests that tamper with it.
-    #[cfg(test)]
+    /// Where a blob's file lives: for the scrubber, which reads it with
+    /// blocking I/O, and for tests that tamper with it.
     pub fn blob_path(&self, blob_id: Uuid) -> PathBuf {
         self.get_blob_dir(blob_id).join(blob_id.to_string())
     }

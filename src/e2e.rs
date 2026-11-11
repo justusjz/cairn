@@ -89,6 +89,7 @@ pub async fn node_replicating(
         store,
         node,
         replication_factor,
+        scrub_rate: 0,
         writing: WritingSet::default(),
         pack,
         metrics: Arc::default(),

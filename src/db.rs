@@ -189,6 +189,7 @@ const MIGRATIONS: &[&str] = &[
     SSE_S3,
     CHECKSUMS,
     LIFECYCLE,
+    SCRUBBING,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -888,6 +889,42 @@ CREATE TRIGGER lifecycle_sweeps_protocol BEFORE INSERT OR UPDATE OR DELETE OR TR
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
+/// Migration 21: scrubbing (see `scrub`). Each copy of a blob records when it
+/// was last known intact: when its replica wrote it, then when the scrubber
+/// last checked it. NULL for copies from before, which come first;
+/// `-infinity` for one a read found damaged or missing, which comes next. The
+/// index is the order the scrubber takes a node's copies in.
+///
+/// `scrub_findings` records the damaged and missing copies the scrubber
+/// found: at most one open finding per copy, resolved when the copy is found
+/// intact again (`repaired`), or its blob or node is gone (`gone`). A copy
+/// whose bytes are intact nowhere (`lost`) stays open. No FK to
+/// the blob, since a finding outlives it. `bad_blocks` lists the blocks that
+/// failed, NULL if the whole file is at fault (missing, the wrong length or
+/// blob ID).
+const SCRUBBING: &str = r#"
+ALTER TABLE blob_locations ADD COLUMN checked_at timestamptz;
+CREATE INDEX blob_locations_scrub ON blob_locations (node, checked_at NULLS FIRST);
+
+CREATE TABLE scrub_findings (
+    id          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    blob_id     uuid NOT NULL,
+    node        int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    found_at    timestamptz NOT NULL,
+    problem     text NOT NULL CHECK (problem IN ('missing', 'damaged', 'catalog')),
+    bad_blocks  bigint[],
+    detail      text NOT NULL,
+    outcome     text CHECK (outcome IN ('repaired', 'lost', 'gone')),
+    resolved_at timestamptz
+);
+CREATE UNIQUE INDEX scrub_findings_open ON scrub_findings (blob_id, node)
+    WHERE resolved_at IS NULL;
+CREATE INDEX scrub_findings_resolved ON scrub_findings (resolved_at)
+    WHERE resolved_at IS NOT NULL;
+CREATE TRIGGER scrub_findings_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON scrub_findings
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -916,6 +953,7 @@ mod tests {
             if dropped.contains(&table) || ungated.contains(&table) {
                 continue;
             }
+            // Tables from after the gate get theirs in their own migration.
             let trigger = format!("CREATE TRIGGER {table}_protocol ");
             assert!(schema.contains(&trigger), "{table} isn't gated");
         }

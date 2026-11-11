@@ -167,7 +167,8 @@
 --    covers the source key): then the copy starts over ('source_changed').
 --
 -- Statements that run on their own (the pending blob and location inserts,
--- CreateMultipartUpload, role creation and updates, the heartbeat) hold
+-- CreateMultipartUpload, role creation and updates, the heartbeat, the
+-- scrubber's and reads' updates of a location's `checked_at`) hold
 -- nothing that anyone waits for while they wait, so they can't be part of a
 -- cycle either. (A location insert's FK checks lock its node's row shared,
 -- but nothing ever locks a node's row exclusively.) An insert whose FK checks

@@ -183,9 +183,9 @@ pub(crate) struct BlobSlice {
 /// forwarded, block by block. So when a replica fails mid-stream, returns a
 /// short read, or serves a block that doesn't match its checksum, the read moves
 /// on to the next replica from the first unsent block, and the client never
-/// sees the bad bytes. A corrupt block is logged loudly; repairing it is left to
-/// a future scrub/repair job. Blobs written before checksums existed are
-/// streamed unverified, but still with failover.
+/// sees the bad bytes. A corrupt block is logged loudly, and the copy is
+/// flagged for its node's scrubber to check. Blobs written before checksums
+/// existed are streamed unverified, but still with failover.
 ///
 /// On failure, `slice` is narrowed to the bytes that weren't forwarded.
 pub(crate) async fn stream_blob_range(
@@ -235,9 +235,15 @@ pub(crate) async fn stream_blob_range(
         .await;
         match result {
             Ok(()) => return Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            // The catalog places the blob on that node, so it ought to have
+            // it, unless it was deleted meanwhile; then flagging it does
+            // nothing. Either way, its node checks its copy next.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                crate::scrub::suspect(app, blob_id, *node);
+            }
             Err(e) if e.kind() == io::ErrorKind::InvalidData => {
                 eprintln!("CORRUPTION: blob {blob_id} on node {node} ({peer_url}): {e}");
+                crate::scrub::suspect(app, blob_id, *node);
             }
             Err(e) => eprintln!("reading blob {blob_id} from {peer_url} failed: {e}"),
         }

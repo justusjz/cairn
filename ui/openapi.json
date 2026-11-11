@@ -1372,7 +1372,7 @@
           },
           "source": {
             "type": "string",
-            "description": "`gc`, `packer`, `lifecycle` or `maintenance`."
+            "description": "`gc`, `packer`, `lifecycle`, `scrub` or `maintenance`."
           },
           "time": {
             "type": "number",
@@ -1891,6 +1891,7 @@
           "shards",
           "gc",
           "packer",
+          "scrub",
           "events"
         ],
         "properties": {
@@ -1939,6 +1940,9 @@
             ],
             "format": "double",
             "description": "When the pass that's running started."
+          },
+          "scrub": {
+            "$ref": "#/components/schemas/ScrubTotals"
           },
           "shards": {
             "type": "integer",
@@ -2090,6 +2094,7 @@
               "node_id",
               "version",
               "replication_factor",
+              "scrub_rate",
               "now"
             ],
             "properties": {
@@ -2135,6 +2140,12 @@
               },
               "replication_factor": {
                 "type": "integer",
+                "minimum": 0
+              },
+              "scrub_rate": {
+                "type": "integer",
+                "format": "int64",
+                "description": "How many bytes per second its scrubber reads; 0 if it's off.",
                 "minimum": 0
               },
               "version": {
@@ -2456,6 +2467,38 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "ScrubTotals": {
+        "type": "object",
+        "description": "What the scrubber did since the node started: the copies it checked (and\ntheir bytes), how many of them it found damaged or missing, and how many\nof its passes failed.",
+        "required": [
+          "copies",
+          "bytes",
+          "damaged",
+          "failed"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "copies": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "damaged": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
           }
         }
       },

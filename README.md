@@ -107,6 +107,7 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--kms-auth-role <NAME>` | `CAIRN_KMS_AUTH_ROLE` | `s3` | The role of that auth method Cairn's logins use. |
 | `--kms-sse-s3-key <ID>` | `CAIRN_KMS_SSE_S3_KEY` | none | The key for [SSE-S3](#sse-s3) (`<mount>/<key>`), which Cairn uses as itself. Without it, SSE-S3 is refused. |
 | `--kms-ca-cert <PATH>` | `CAIRN_KMS_CA_CERT` | public roots | PEM file of the CA certificates to trust for the KMS's TLS. |
+| `--scrub-rate <RATE>` | `CAIRN_SCRUB_RATE` | `25MiB` | How many bytes per second the [scrubber](#scrubbing) reads, e.g. `100MB`. `0` turns it off. |
 
 On SIGTERM or Ctrl-C, a node stops accepting connections and finishes the
 requests in flight before it exits; a second signal exits right away. Anything
@@ -691,6 +692,30 @@ Listings, ListParts, CompleteMultipartUpload and copies report checksums too.
 The checksums of encrypted objects are stored encrypted, as their data is, so
 they can't be used to test guesses at the content. Objects written by earlier
 versions of Cairn have no checksum, but a copy of one gets one.
+
+### Scrubbing
+
+Every node checks the data it holds in the background, so that damage is
+found before a client runs into it, even in data nobody reads. It reads each
+copy from its own disk (not the page cache), and checks it as a whole: every
+block against its checksum, the file's length and blob ID, and a CRC of the
+whole file that the database keeps. It reads at a fixed rate,
+`--scrub-rate` (25 MiB/s by default), copies that have gone unchecked longest
+first, and checks a copy at most once a week. So a node checks all it holds
+every *held bytes ÷ rate*: at 25 MiB/s, which is about 2 TiB a day, that's
+every 2 days for 4 TiB, and every 8 days for 16 TiB. Set the rate to what the
+disks can spare next to the clients' reads: 25 MiB/s is about a seventh of a
+hard disk, and little for an SSD.
+
+A read that runs into a damaged or missing copy has that copy checked next.
+What the scrubber finds is logged as a `CORRUPTION:` line, recorded in the
+database (`scrub_findings`), and counted in the node's metrics on the
+dashboard. Damaged copies aren't repaired yet (reads go on failing over to
+intact copies); that's next. Data written by versions of Cairn without
+checksums isn't checked.
+
+`POST /scrub` on a node's peer endpoint checks what's due right away, at
+full speed (`?all`: every copy), and reports what it found.
 
 ## Packing
 

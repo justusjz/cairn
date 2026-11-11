@@ -269,6 +269,8 @@ pub struct NodeStats {
     pub node_id: String,
     pub version: String,
     pub replication_factor: usize,
+    /// How many bytes per second its scrubber reads; 0 if it's off.
+    pub scrub_rate: u64,
     /// The node's clock, in seconds since the Unix epoch.
     pub now: f64,
     /// The filesystem of its data dir, if it could tell.
@@ -369,6 +371,7 @@ pub async fn node_stats(app: &App) -> NodeStats {
         node_id: app.store.get_node_id().to_string(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
         replication_factor: app.replication_factor,
+        scrub_rate: app.scrub_rate,
         now: now_secs(),
         disk,
         disk_error,

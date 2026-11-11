@@ -495,7 +495,7 @@ export interface components {
         EventReport: {
             error: boolean;
             message: string;
-            /** @description `gc`, `packer`, `lifecycle` or `maintenance`. */
+            /** @description `gc`, `packer`, `lifecycle`, `scrub` or `maintenance`. */
             source: string;
             /** Format: double */
             time: number;
@@ -730,6 +730,7 @@ export interface components {
              * @description When the pass that's running started.
              */
             running_since?: number | null;
+            scrub: components["schemas"]["ScrubTotals"];
             /** Format: int32 */
             shards: number;
             /**
@@ -800,6 +801,11 @@ export interface components {
              */
             now: number;
             replication_factor: number;
+            /**
+             * Format: int64
+             * @description How many bytes per second its scrubber reads; 0 if it's off.
+             */
+            scrub_rate: number;
             version: string;
         };
         /**
@@ -918,6 +924,21 @@ export interface components {
              */
             kms_entity_id?: string | null;
             name: string;
+        };
+        /**
+         * @description What the scrubber did since the node started: the copies it checked (and
+         *     their bytes), how many of them it found damaged or missing, and how many
+         *     of its passes failed.
+         */
+        ScrubTotals: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            copies: number;
+            /** Format: int64 */
+            damaged: number;
+            /** Format: int64 */
+            failed: number;
         };
         /** @description A role's secret, which is shown only this once. */
         Secret: {

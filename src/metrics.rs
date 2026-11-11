@@ -193,6 +193,10 @@ struct Maintenance {
     pack_blobs: u64,
     pack_parts: u64,
     pack_bytes: u64,
+    scrub_copies: u64,
+    scrub_bytes: u64,
+    scrub_damaged: u64,
+    scrub_failed: u64,
     /// The most recent things a pass did or failed at, oldest first.
     events: VecDeque<Event>,
 }
@@ -320,6 +324,23 @@ impl Metrics {
         self.maintenance.lock().unwrap().event("lifecycle", true, message);
     }
 
+    /// The scrubber checked a copy of `bytes`, and found `damage`, if any.
+    pub fn scrub_checked(&self, bytes: u64, damage: Option<String>) {
+        let mut m = self.maintenance.lock().unwrap();
+        m.scrub_copies += 1;
+        m.scrub_bytes += bytes;
+        if let Some(message) = damage {
+            m.scrub_damaged += 1;
+            m.event("scrub", true, message);
+        }
+    }
+
+    pub fn scrub_failed(&self, message: String) {
+        let mut m = self.maintenance.lock().unwrap();
+        m.scrub_failed += 1;
+        m.event("scrub", true, message);
+    }
+
     pub fn maintenance_failed(&self, message: String) {
         self.maintenance
             .lock()
@@ -387,6 +408,12 @@ impl Metrics {
                     parts: m.pack_parts,
                     bytes: m.pack_bytes,
                 },
+                scrub: ScrubTotals {
+                    copies: m.scrub_copies,
+                    bytes: m.scrub_bytes,
+                    damaged: m.scrub_damaged,
+                    failed: m.scrub_failed,
+                },
                 events,
             },
         }
@@ -442,6 +469,7 @@ pub struct MaintenanceReport {
     pub shards: u32,
     pub gc: GcTotals,
     pub packer: PackerTotals,
+    pub scrub: ScrubTotals,
     /// The most recent things a pass did or failed at, oldest first.
     pub events: Vec<EventReport>,
 }
@@ -465,10 +493,21 @@ pub struct PackerTotals {
     pub bytes: u64,
 }
 
+/// What the scrubber did since the node started: the copies it checked (and
+/// their bytes), how many of them it found damaged or missing, and how many
+/// of its passes failed.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ScrubTotals {
+    pub copies: u64,
+    pub bytes: u64,
+    pub damaged: u64,
+    pub failed: u64,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct EventReport {
     pub time: f64,
-    /// `gc`, `packer`, `lifecycle` or `maintenance`.
+    /// `gc`, `packer`, `lifecycle`, `scrub` or `maintenance`.
     pub source: String,
     pub error: bool,
     pub message: String,
