@@ -8,7 +8,7 @@ use uuid::Uuid;
 use super::{Pacer, Report, Scope, pass, tidy_findings};
 use crate::{
     App,
-    e2e::{BUCKET, delete, get, node_with, put, query_i64},
+    e2e::{BUCKET, Cluster, cluster, delete, get, node_with, put, query_i64},
     packer,
     s3::{conditional::Preconditions, objects},
 };
@@ -107,26 +107,21 @@ async fn finds_damage() {
     flip(&app, blob_id, 70_000);
     flip(&app, blob_id, 200_000 + 4 * 3);
 
+    // There's no other replica to repair it from: those blocks are lost.
     let report = scrub(&app, Scope::Everything).await;
-    assert_eq!((report.copies, report.damaged), (2, 1), "{report}");
-    assert_eq!(
-        findings(&app, blob_id).await,
-        [("damaged".to_owned(), Some(vec![1, 3]), None)]
-    );
-    // Found again, it's still the one finding.
+    assert_eq!((report.copies, report.damaged, report.lost), (2, 1, 1), "{report}");
+    assert_eq!(findings(&app, blob_id).await, [damaged(Some(vec![1, 3]), "lost")]);
+    assert_eq!(lost(&app, blob_id).await, [(65536, 131072), (196608, 200000)]);
+    // Found again, it's still the one finding, and only what's lost now.
     flip(&app, blob_id, 200_000 + 4 * 3);
     assert_eq!(scrub(&app, Scope::Everything).await.damaged, 1);
-    assert_eq!(
-        findings(&app, blob_id).await,
-        [("damaged".to_owned(), Some(vec![1]), None)]
-    );
+    assert_eq!(findings(&app, blob_id).await, [damaged(Some(vec![1]), "lost")]);
+    assert_eq!(lost(&app, blob_id).await, [(65536, 131072)]);
 
     flip(&app, blob_id, 70_000);
     assert_eq!(scrub(&app, Scope::Everything).await.damaged, 0);
-    assert_eq!(
-        findings(&app, blob_id).await,
-        [("damaged".to_owned(), Some(vec![1]), Some("repaired".to_owned()))]
-    );
+    assert_eq!(findings(&app, blob_id).await, [damaged(Some(vec![1]), "repaired")]);
+    assert_eq!(lost(&app, blob_id).await, []);
     assert_eq!(get(&app, "damaged").await.unwrap(), vec![7; 200_000]);
 }
 
@@ -145,8 +140,10 @@ async fn finds_missing_and_wrong_files() {
 
     let report = scrub(&app, Scope::Everything).await;
     assert_eq!((report.missing, report.damaged), (1, 1), "{report}");
-    assert_eq!(findings(&app, missing).await, [("missing".to_owned(), None, None)]);
-    assert_eq!(findings(&app, truncated).await, [("damaged".to_owned(), None, None)]);
+    let lost_whole = |problem: &str| (problem.to_owned(), None, Some("lost".to_owned()));
+    assert_eq!(findings(&app, missing).await, [lost_whole("missing")]);
+    assert_eq!(findings(&app, truncated).await, [lost_whole("damaged")]);
+    assert_eq!(lost(&app, truncated).await, [(0, 1000)]);
 
     // Once its blob is deleted, a copy's finding is resolved.
     delete(&app, "missing").await;
@@ -155,6 +152,7 @@ async fn finds_missing_and_wrong_files() {
         findings(&app, missing).await,
         [("missing".to_owned(), None, Some("gone".to_owned()))]
     );
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM lost_ranges").await, 1, "with its blob");
 }
 
 /// A read that runs into a damaged copy has it checked next, even though it
@@ -208,6 +206,26 @@ async fn skips_blobs_from_before_checksums() {
     assert_eq!(scrub(&app, Scope::Due).await.legacy, 0);
 }
 
+/// A finding of damage, as `findings` lists it.
+fn damaged(bad_blocks: Option<Vec<i64>>, outcome: &str) -> (String, Option<Vec<i64>>, Option<String>) {
+    ("damaged".to_owned(), bad_blocks, Some(outcome.to_owned()))
+}
+
+/// The lost ranges of a blob.
+pub async fn lost(app: &App, blob_id: Uuid) -> Vec<(i64, i64)> {
+    let client = app.pool.get().await.unwrap();
+    client
+        .query(
+            "SELECT start, stop FROM lost_ranges WHERE blob_id = $1 ORDER BY start",
+            &[&blob_id],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect()
+}
+
 /// Waits until `sql` counts `n`.
 async fn wait_for(app: &App, sql: &str, n: i64) {
     for _ in 0..100 {
@@ -217,4 +235,169 @@ async fn wait_for(app: &App, sql: &str, n: i64) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("{sql} never counted {n}");
+}
+
+/// Every node's file of a blob, as bytes.
+fn files(cluster: &Cluster, blob_id: Uuid) -> Vec<Vec<u8>> {
+    cluster
+        .nodes
+        .iter()
+        .map(|app| std::fs::read(app.store.blob_path(blob_id)).unwrap())
+        .collect()
+}
+
+/// A damaged copy is repaired from another replica, whatever the damage: its
+/// file ends up as the other's, byte for byte.
+#[tokio::test]
+async fn repairs_from_other_replicas() {
+    let Some(cluster) = cluster(2, 2).await else { return };
+    let [a, _] = &cluster.nodes[..] else { unreachable!() };
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    put(a, "k", data.clone()).await;
+    let blob_id = blob_of(a, "k").await;
+    let intact = files(&cluster, blob_id)[1].clone();
+    let path = a.store.blob_path(blob_id);
+    type Damage = Box<dyn Fn(&mut Vec<u8>)>;
+    let damage: [(&str, Damage); 5] = [
+        ("a flipped bit", Box::new(|b| b[100_000] ^= 1)),
+        ("a damaged checksum", Box::new(|b| b[300_000 + 4] ^= 1)),
+        ("another blob's ID", Box::new(|b| *b.last_mut().unwrap() ^= 1)),
+        ("a truncated file", Box::new(|b| b.truncate(1000))),
+        ("a missing file", Box::new(|b| b.clear())),
+    ];
+    for (what, damage) in damage {
+        let mut bytes = intact.clone();
+        damage(&mut bytes);
+        if bytes.is_empty() {
+            std::fs::remove_file(&path).unwrap();
+        } else {
+            std::fs::write(&path, &bytes).unwrap();
+        }
+        let report = scrub(a, Scope::Everything).await;
+        assert_eq!((report.damaged + report.missing, report.repaired), (1, 1), "{what}: {report}");
+        assert_eq!(std::fs::read(&path).unwrap(), intact, "{what}");
+    }
+    let found = findings(a, blob_id).await;
+    assert_eq!(found.len(), 5);
+    assert!(found.iter().all(|(_, _, outcome)| outcome.as_deref() == Some("repaired")));
+    assert_eq!(get(a, "k").await.unwrap(), data);
+    assert_eq!(scrub(a, Scope::Everything).await.damaged, 0);
+}
+
+/// Two copies damaged in different blocks are each repaired from the other.
+#[tokio::test]
+async fn copies_repair_each_other() {
+    let Some(cluster) = cluster(2, 2).await else { return };
+    let [a, b] = &cluster.nodes[..] else { unreachable!() };
+    put(a, "k", vec![5; 300_000]).await;
+    let blob_id = blob_of(a, "k").await;
+    let intact = files(&cluster, blob_id)[0].clone();
+    flip(a, blob_id, 10);
+    flip(b, blob_id, 200_000);
+    assert_eq!(scrub(a, Scope::Everything).await.repaired, 1);
+    assert_eq!(scrub(b, Scope::Everything).await.repaired, 1);
+    assert_eq!(files(&cluster, blob_id), [intact.clone(), intact]);
+}
+
+/// A block damaged on every copy is lost: the copies are left as they are,
+/// until a copy turns up intact, which the others are then repaired from.
+#[tokio::test]
+async fn data_intact_nowhere_is_lost() {
+    let Some(cluster) = cluster(2, 2).await else { return };
+    let [a, b] = &cluster.nodes[..] else { unreachable!() };
+    put(a, "k", vec![6; 300_000]).await;
+    let blob_id = blob_of(a, "k").await;
+    let intact = files(&cluster, blob_id)[0].clone();
+    flip(a, blob_id, 70_000);
+    flip(a, blob_id, 200_000);
+    flip(b, blob_id, 70_000);
+    let damaged_a = files(&cluster, blob_id)[0].clone();
+    let report = scrub(a, Scope::Everything).await;
+    assert_eq!((report.lost, report.repaired), (1, 0), "{report}");
+    assert_eq!(lost(a, blob_id).await, [(65536, 131072)], "block 3 was fetched");
+    assert_eq!(files(&cluster, blob_id)[0], damaged_a, "left as it is");
+    assert_eq!(scrub(b, Scope::Everything).await.lost, 1);
+    assert_eq!(findings(a, blob_id).await.len(), 2);
+
+    // The bytes turn up, on b (restored from a backup, say).
+    std::fs::write(b.store.blob_path(blob_id), &intact).unwrap();
+    let report = scrub(b, Scope::Everything).await;
+    assert_eq!((report.damaged, report.copies), (0, 1), "{report}");
+    assert_eq!(lost(a, blob_id).await, []);
+    // a's copy was flagged, so it's repaired next, though it isn't due.
+    let report = scrub(a, Scope::Due).await;
+    assert_eq!(report.repaired, 1, "{report}");
+    assert_eq!(files(&cluster, blob_id), [intact.clone(), intact]);
+    let outcomes: Vec<_> = findings(a, blob_id).await.into_iter().map(|f| f.2).collect();
+    assert_eq!(outcomes, [Some("repaired".to_owned()), Some("repaired".to_owned())]);
+}
+
+/// With the other replica's node down, damage can't be repaired, and is only
+/// lost as far as can be told: it's tried again within the hour.
+#[tokio::test]
+async fn a_node_down_is_retried_soon() {
+    let Some(cluster) = cluster(2, 2).await else { return };
+    let [a, _] = &cluster.nodes[..] else { unreachable!() };
+    put(a, "k", vec![9; 1000]).await;
+    let blob_id = blob_of(a, "k").await;
+    flip(a, blob_id, 10);
+    cluster.stop(1).await;
+    set_checked(a, blob_id, "NULL").await;
+    let report = scrub(a, Scope::Due).await;
+    assert_eq!(report.lost, 1, "{report}");
+    let soon = format!(
+        "SELECT count(*) FROM blob_locations
+         WHERE blob_id = '{blob_id}' AND node = {}
+           AND checked_at BETWEEN NOW() - INTERVAL '7 days' + INTERVAL '59 minutes'
+                              AND NOW() - INTERVAL '7 days' + INTERVAL '61 minutes'",
+        a.node
+    );
+    assert_eq!(query_i64(a, &soon).await, 1);
+}
+
+/// A repair whose blob goes away meanwhile leaves no file behind, and one a
+/// crash cut short leaves a file the GC deletes after a day.
+#[tokio::test]
+async fn repairs_leave_nothing_behind() {
+    let Some(cluster) = cluster(2, 2).await else { return };
+    let [a, _] = &cluster.nodes[..] else { unreachable!() };
+    put(a, "k", vec![1; 1000]).await;
+    let blob_id = blob_of(a, "k").await;
+    let client = a.pool.get().await.unwrap();
+    let (size, crc): (i64, i64) = {
+        let row = client
+            .query_one("SELECT size, crc64nvme FROM blobs WHERE blob_id = $1", &[&blob_id])
+            .await
+            .unwrap();
+        (row.get(0), row.get(1))
+    };
+    client
+        .batch_execute(&format!(
+            "SET cairn.protocol = '{}';
+             DELETE FROM blob_locations WHERE blob_id = '{blob_id}' AND node = {}",
+            crate::db::PROTOCOL,
+            a.node
+        ))
+        .await
+        .unwrap();
+    std::fs::remove_file(a.store.blob_path(blob_id)).unwrap();
+    let layout = crate::checksum::BlockLayout {
+        block_size: crate::checksum::BLOCK_SIZE as u64,
+        blob_size: size as u64,
+    };
+    let outcome = super::repair::repair(a, blob_id, layout, crc as u64, None, &Pacer::new(None))
+        .await
+        .unwrap();
+    assert_eq!(outcome, super::repair::Outcome::Repaired);
+    assert!(a.store.open_blob(blob_id).await.unwrap().is_none(), "it's not a's anymore");
+
+    let leftover = a.store.blob_path(blob_id).with_file_name(format!("{blob_id}.repair"));
+    std::fs::write(&leftover, b"half a copy").unwrap();
+    crate::gc::pass(a, crate::gc::Scope::everything()).await;
+    assert!(leftover.exists(), "it may be a repair in progress");
+    let file = std::fs::File::options().write(true).open(&leftover).unwrap();
+    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(25 * 3600))
+        .unwrap();
+    let report = crate::gc::pass(a, crate::gc::Scope::everything()).await;
+    assert!(!leftover.exists(), "{report}");
 }

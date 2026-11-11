@@ -708,11 +708,20 @@ disks can spare next to the clients' reads: 25 MiB/s is about a seventh of a
 hard disk, and little for an SSD.
 
 A read that runs into a damaged or missing copy has that copy checked next.
+
+A damaged or missing copy is repaired: rebuilt from its own intact blocks and
+the other replicas' (so a bad block costs one block of network traffic), and
+checked against the database's CRC before it replaces the old file. Copies
+damaged in different places repair each other. Bytes that no replica holds
+intact are *lost*: the copies are left as they are, and the lost byte ranges
+are recorded (`lost_ranges`). If a replica's node was down, the scrubber tries
+again within the hour; once any copy turns out to hold the bytes after all
+(that node came back, or a file was restored from a backup), the lost ranges
+are cleared, and the other copies are repaired from it.
+
 What the scrubber finds is logged as a `CORRUPTION:` line, recorded in the
 database (`scrub_findings`), and counted in the node's metrics on the
-dashboard. Damaged copies aren't repaired yet (reads go on failing over to
-intact copies); that's next. Data written by versions of Cairn without
-checksums isn't checked.
+dashboard. Data written by versions of Cairn without checksums isn't checked.
 
 `POST /scrub` on a node's peer endpoint checks what's due right away, at
 full speed (`?all`: every copy), and reports what it found.

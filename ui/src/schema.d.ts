@@ -927,8 +927,9 @@ export interface components {
         };
         /**
          * @description What the scrubber did since the node started: the copies it checked (and
-         *     their bytes), how many of them it found damaged or missing, and how many
-         *     of its passes failed.
+         *     their bytes), how many of them it found damaged or missing, how many of
+         *     those it repaired, and how many have data that's intact nowhere, and how
+         *     many of its passes failed.
          */
         ScrubTotals: {
             /** Format: int64 */
@@ -939,6 +940,10 @@ export interface components {
             damaged: number;
             /** Format: int64 */
             failed: number;
+            /** Format: int64 */
+            lost: number;
+            /** Format: int64 */
+            repaired: number;
         };
         /** @description A role's secret, which is shown only this once. */
         Secret: {

@@ -9,6 +9,7 @@ use std::{sync::Arc, time::Duration};
 
 use http_body_util::{BodyExt, Full};
 use hyper::{StatusCode, body::Bytes};
+use deadpool_postgres::Pool;
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
@@ -58,6 +59,16 @@ pub async fn node_replicating(
     hook: Option<Hook>,
     replication_factor: usize,
 ) -> Option<Arc<App>> {
+    let pool = fresh_database().await?;
+    // A single node holds every blob, so peers never contact it.
+    let app = node_on(&pool, "http://127.0.0.1:1", pack, hook, replication_factor).await;
+    create_bucket(&app).await;
+    Some(app)
+}
+
+/// A pool of connections to a fresh database. `None` if there's no database
+/// to test against.
+async fn fresh_database() -> Option<Pool> {
     let Ok(url) = std::env::var("CAIRN_TEST_DATABASE") else {
         eprintln!("skipped: set CAIRN_TEST_DATABASE to run the end-to-end tests");
         return None;
@@ -70,22 +81,25 @@ pub async fn node_replicating(
         .await
         .unwrap();
     let (server, _) = url.rsplit_once('/').expect("the URL names a database");
-    let pool = crate::db::connect(&format!("{server}/{name}")).await.unwrap();
+    Some(crate::db::connect(&format!("{server}/{name}")).await.unwrap())
+}
+
+/// A node with a data dir of its own, registered in the database of `pool`
+/// as reachable at `peer_url`.
+async fn node_on(
+    pool: &Pool,
+    peer_url: &str,
+    pack: Config,
+    hook: Option<Hook>,
+    replication_factor: usize,
+) -> Arc<App> {
     let dir = std::env::temp_dir().join(format!("cairn-e2e-{}", Uuid::new_v4()));
     let store = Store::new(dir.to_string_lossy().into_owned()).unwrap();
-    // A single node holds every blob, so peers never contact it.
-    let peer_url = "http://127.0.0.1:1";
-    let node = crate::register_node(&pool, &store, peer_url)
+    let node = crate::register_node(pool, &store, peer_url)
         .await
         .unwrap();
-    pool.get()
-        .await
-        .unwrap()
-        .execute("INSERT INTO buckets (name) VALUES ($1)", &[&BUCKET])
-        .await
-        .unwrap();
-    Some(Arc::new(App {
-        pool,
+    Arc::new(App {
+        pool: pool.clone(),
         store,
         node,
         replication_factor,
@@ -98,7 +112,77 @@ pub async fn node_replicating(
         allow_sse_c_over_http: false,
         kms: None,
         pack_hook: hook,
-    }))
+    })
+}
+
+async fn create_bucket(app: &App) {
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute("INSERT INTO buckets (name) VALUES ($1)", &[&BUCKET])
+        .await
+        .unwrap();
+}
+
+/// Nodes on one database, each serving its peer endpoint (on a port of its
+/// own), and heartbeating, as `cairn serve` does.
+pub struct Cluster {
+    pub nodes: Vec<Arc<App>>,
+    tasks: Vec<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+/// A cluster of `n` nodes writing `replication_factor` replicas of every
+/// blob. `None` if there's no database to test against.
+pub async fn cluster(n: usize, replication_factor: usize) -> Option<Cluster> {
+    let pool = fresh_database().await?;
+    let mut cluster = Cluster {
+        nodes: Vec::new(),
+        tasks: Vec::new(),
+    };
+    for _ in 0..n {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_url = format!("http://{}", listener.local_addr().unwrap());
+        let app = node_on(&pool, &peer_url, Config::default(), None, replication_factor).await;
+        let router = crate::peer::router(app.clone());
+        let serving = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let beating = tokio::spawn(crate::heartbeat(app.clone(), peer_url));
+        cluster.nodes.push(app);
+        cluster.tasks.push(vec![serving, beating]);
+    }
+    create_bucket(&cluster.nodes[0]).await;
+    Some(cluster)
+}
+
+impl Cluster {
+    /// Takes node `i` down: it stops serving and heartbeating, and is last
+    /// seen a minute ago.
+    pub async fn stop(&self, i: usize) {
+        for task in &self.tasks[i] {
+            task.abort();
+        }
+        let app = &self.nodes[i];
+        app.pool
+            .get()
+            .await
+            .unwrap()
+            .execute(
+                "UPDATE nodes SET last_seen = NOW() - INTERVAL '1 minute' WHERE id = $1",
+                &[&app.node],
+            )
+            .await
+            .unwrap();
+    }
+}
+
+impl Drop for Cluster {
+    fn drop(&mut self) {
+        for task in self.tasks.iter().flatten() {
+            task.abort();
+        }
+    }
 }
 
 /// A node with a KMS: the OpenBao that `CAIRN_TEST_OPENBAO` points at (see

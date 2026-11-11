@@ -46,7 +46,7 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-const PROTOCOL: &str = "3";
+pub(crate) const PROTOCOL: &str = "3";
 
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
@@ -190,6 +190,7 @@ const MIGRATIONS: &[&str] = &[
     CHECKSUMS,
     LIFECYCLE,
     SCRUBBING,
+    LOST_RANGES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -922,6 +923,22 @@ CREATE UNIQUE INDEX scrub_findings_open ON scrub_findings (blob_id, node)
 CREATE INDEX scrub_findings_resolved ON scrub_findings (resolved_at)
     WHERE resolved_at IS NOT NULL;
 CREATE TRIGGER scrub_findings_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON scrub_findings
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 22: lost data (see `scrub`). The byte ranges [start, stop) of a
+/// blob that no copy of it holds intact, as far as the scrubber could find
+/// out. They go once some copy turns out to hold them after all, and with
+/// their blob.
+const LOST_RANGES: &str = r#"
+CREATE TABLE lost_ranges (
+    blob_id  uuid NOT NULL REFERENCES blobs(blob_id) ON DELETE CASCADE,
+    start    bigint NOT NULL CHECK (start >= 0),
+    stop     bigint NOT NULL CHECK (stop > start),
+    found_at timestamptz NOT NULL,
+    PRIMARY KEY (blob_id, start)
+);
+CREATE TRIGGER lost_ranges_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON lost_ranges
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

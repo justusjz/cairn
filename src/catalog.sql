@@ -67,8 +67,9 @@
 --           before they're deleted.
 --   R(r)    The role's row. Shared: granting it a permission. Exclusive (by
 --           deleting it): deleting the role.
---   X(x)    The blob's row. Shared: referencing it, or changing or deleting
---           a part on it. Exclusive: committing it, deleting it, removing a
+--   X(x)    The blob's row. Shared: referencing it, changing or deleting
+--           a part on it, or changing its `lost_ranges` (the scrubber,
+--           which locks the row with nothing else). Exclusive: committing it, deleting it, removing a
 --           location, moving parts off or onto it (the packer). All of a
 --           transaction's blobs are locked by one call of `cairn_lock_blobs`.
 --
@@ -168,9 +169,9 @@
 --
 -- Statements that run on their own (the pending blob and location inserts,
 -- CreateMultipartUpload, role creation and updates, the heartbeat, the
--- scrubber's and reads' updates of a location's `checked_at`) hold
--- nothing that anyone waits for while they wait, so they can't be part of a
--- cycle either. (A location insert's FK checks lock its node's row shared,
+-- scrubber's and reads' updates of a location's `checked_at`, and the
+-- scrubber's changes to `scrub_findings`) hold nothing that anyone waits for
+-- while they wait, so they can't be part of a cycle either. (A location insert's FK checks lock its node's row shared,
 -- but nothing ever locks a node's row exclusively.) An insert whose FK checks
 -- would lock rows out of order (a grant's: the role, then the bucket) is a
 -- function that locks them in order first (`cairn_grant`). The GC

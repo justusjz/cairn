@@ -7,6 +7,18 @@ use uuid::Uuid;
 
 /// How many shard directories blobs are spread over: 256 × 256.
 pub const SHARDS: u32 = 1 << 16;
+/// What a blob's repaired copy is named, after its blob ID, until it
+/// replaces the blob's file.
+const REPAIR_SUFFIX: &str = ".repair";
+
+/// What's in a shard directory.
+#[derive(Default)]
+pub struct Shard {
+    /// The blobs with a file there.
+    pub blobs: Vec<Uuid>,
+    /// The blobs with a repaired copy there, and when it was last written.
+    pub repairs: Vec<(Uuid, std::time::SystemTime)>,
+}
 
 pub struct Store {
     node_id: Uuid,
@@ -127,6 +139,50 @@ impl Store {
         }
     }
 
+    /// Where the new copy of a blob is written while it's repaired: next to
+    /// the blob's file, under a name that isn't a blob ID, so that nothing
+    /// takes it for one (see `scrub::repair`).
+    fn repair_path(&self, blob_id: Uuid) -> PathBuf {
+        self.get_blob_dir(blob_id).join(format!("{blob_id}{REPAIR_SUFFIX}"))
+    }
+
+    /// Creates (truncating) the file a blob's repaired copy is written to.
+    pub async fn create_repair(&self, blob_id: Uuid) -> anyhow::Result<fs::File> {
+        fs::create_dir_all(self.get_blob_dir(blob_id)).await?;
+        Ok(fs::File::create(self.repair_path(blob_id)).await?)
+    }
+
+    /// Replaces a blob's file with its repaired copy, which must be synced
+    /// already, and syncs the directory, so that the replacement survives a
+    /// crash. Atomic: a reader opens the old file or the new one, and one
+    /// that has the old one open goes on reading it.
+    pub async fn install_repair(&self, blob_id: Uuid) -> anyhow::Result<()> {
+        let dir = self.get_blob_dir(blob_id);
+        fs::rename(self.repair_path(blob_id), dir.join(blob_id.to_string())).await?;
+        fs::File::open(&dir).await?.sync_all().await?;
+        Ok(())
+    }
+
+    /// Deletes a repaired copy that won't be installed. Idempotent.
+    pub async fn remove_repair(&self, blob_id: Uuid) -> anyhow::Result<()> {
+        match fs::remove_file(self.repair_path(blob_id)).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Deletes a repaired copy that a crash left behind, which `list_shard`
+    /// found. Idempotent.
+    pub async fn remove_stale_repair(&self, shard: u32, blob_id: Uuid) -> anyhow::Result<()> {
+        let path = self.shard_dir(shard).join(format!("{blob_id}{REPAIR_SUFFIX}"));
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// The directory of shard `shard` (`0..SHARDS`), named by its four hex
     /// digits like a blob's (see `get_blob_dir`).
     fn shard_dir(&self, shard: u32) -> PathBuf {
@@ -135,20 +191,28 @@ impl Store {
             .join(format!("{:02x}", shard & 0xff))
     }
 
-    /// The blobs with a file in shard `shard`.
-    pub async fn list_shard(&self, shard: u32) -> anyhow::Result<Vec<Uuid>> {
+    /// The files in shard `shard`: blobs', and repaired copies.
+    pub async fn list_shard(&self, shard: u32) -> anyhow::Result<Shard> {
+        let mut listing = Shard::default();
         let mut files = match fs::read_dir(self.shard_dir(shard)).await {
             Ok(files) => files,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(listing),
             Err(e) => return Err(e.into()),
         };
-        let mut blobs = Vec::new();
         while let Some(f) = files.next_entry().await? {
-            if let Some(id) = f.file_name().to_str().and_then(|n| Uuid::parse_str(n).ok()) {
-                blobs.push(id);
+            let Some(name) = f.file_name().to_str().map(str::to_owned) else { continue };
+            if let Ok(id) = Uuid::parse_str(&name) {
+                listing.blobs.push(id);
+            } else if let Some(id) = name.strip_suffix(REPAIR_SUFFIX)
+                && let Ok(id) = Uuid::parse_str(id)
+            {
+                // Gone meanwhile (its repair finished, say): then it's no leftover.
+                if let Ok(modified) = f.metadata().await.and_then(|m| m.modified()) {
+                    listing.repairs.push((id, modified));
+                }
             }
         }
-        Ok(blobs)
+        Ok(listing)
     }
 
     /// Removes shard `shard`'s directory if it's empty, and then its parent if

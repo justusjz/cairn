@@ -196,6 +196,8 @@ struct Maintenance {
     scrub_copies: u64,
     scrub_bytes: u64,
     scrub_damaged: u64,
+    scrub_repaired: u64,
+    scrub_lost: u64,
     scrub_failed: u64,
     /// The most recent things a pass did or failed at, oldest first.
     events: VecDeque<Event>,
@@ -335,6 +337,14 @@ impl Metrics {
         }
     }
 
+    pub fn scrub_repaired(&self) {
+        self.maintenance.lock().unwrap().scrub_repaired += 1;
+    }
+
+    pub fn scrub_lost(&self) {
+        self.maintenance.lock().unwrap().scrub_lost += 1;
+    }
+
     pub fn scrub_failed(&self, message: String) {
         let mut m = self.maintenance.lock().unwrap();
         m.scrub_failed += 1;
@@ -412,6 +422,8 @@ impl Metrics {
                     copies: m.scrub_copies,
                     bytes: m.scrub_bytes,
                     damaged: m.scrub_damaged,
+                    repaired: m.scrub_repaired,
+                    lost: m.scrub_lost,
                     failed: m.scrub_failed,
                 },
                 events,
@@ -494,13 +506,16 @@ pub struct PackerTotals {
 }
 
 /// What the scrubber did since the node started: the copies it checked (and
-/// their bytes), how many of them it found damaged or missing, and how many
-/// of its passes failed.
+/// their bytes), how many of them it found damaged or missing, how many of
+/// those it repaired, and how many have data that's intact nowhere, and how
+/// many of its passes failed.
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct ScrubTotals {
     pub copies: u64,
     pub bytes: u64,
     pub damaged: u64,
+    pub repaired: u64,
+    pub lost: u64,
     pub failed: u64,
 }
 

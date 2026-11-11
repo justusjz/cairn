@@ -17,8 +17,12 @@
 //! copy damaged or missing flags it (`suspect`), and the copy's node checks it
 //! next.
 //!
-//! What it finds goes to `scrub_findings`, and to the log as `CORRUPTION:`.
-//! Repairing is yet to come. Blobs from before checksums can't be checked, and
+//! A damaged or missing copy is repaired from intact blocks: its own, and the
+//! other replicas' (see `repair`). Bytes that no replica holds intact are lost:
+//! their ranges go to `lost_ranges`, until some copy turns out to hold them
+//! after all (a node that was down comes back, say), and the others are then
+//! repaired from it. What the scrubber finds goes to `scrub_findings`, and to
+//! the log as `CORRUPTION:`. Blobs from before checksums can't be checked, and
 //! are skipped.
 
 use std::{
@@ -49,6 +53,9 @@ const CHUNK: u64 = 1024 * 1024;
 /// How much reading time the pacer saves up while the scrubber has nothing to
 /// read, to read in a burst after.
 const BURST: Duration = Duration::from_secs(1);
+/// How soon a copy is checked again when that may go better: its repair
+/// failed, or the nodes that may hold its lost blocks were down.
+const RETRY: Duration = Duration::from_secs(3600);
 /// Resolved findings are dropped after this long.
 const KEEP_FINDINGS_DAYS: i32 = 90;
 
@@ -166,6 +173,10 @@ pub struct Report {
     pub bytes: u64,
     pub damaged: u64,
     pub missing: u64,
+    /// Of the damaged and missing copies, those repaired, and those with
+    /// blocks that are intact nowhere.
+    pub repaired: u64,
+    pub lost: u64,
     pub legacy: u64,
 }
 
@@ -173,8 +184,15 @@ impl std::fmt::Display for Report {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "checked {} copies ({} bytes): {} damaged, {} missing; skipped {} from before checksums",
-            self.copies, self.bytes, self.damaged, self.missing, self.legacy
+            "checked {} copies ({} bytes): {} damaged, {} missing, of which {} repaired, \
+             {} with lost data; skipped {} from before checksums",
+            self.copies,
+            self.bytes,
+            self.damaged,
+            self.missing,
+            self.repaired,
+            self.lost,
+            self.legacy
         )
     }
 }
@@ -234,7 +252,18 @@ pub async fn pass(app: &Arc<App>, scope: Scope, pacer: &Arc<Mutex<Pacer>>) -> an
         }
         for copy in copies {
             let verdict = check(app, &copy, pacer).await?;
-            record(app, &copy, now, &verdict, &mut report).await?;
+            let repaired = match (&verdict, copy.layout, copy.crc) {
+                (Verdict::Missing, Some(layout), Some(crc)) => {
+                    Some(repair::repair(app, copy.blob_id, layout, crc, None, pacer).await)
+                }
+                (Verdict::Damaged { bad_blocks, .. }, Some(layout), Some(crc)) => {
+                    let bad = bad_blocks.as_deref();
+                    Some(repair::repair(app, copy.blob_id, layout, crc, bad, pacer).await)
+                }
+                _ => None,
+            };
+            let repaired = repaired.map(|r| r.map_err(|e| format!("{e:#}")));
+            record(app, &copy, now, scope, &verdict, repaired, &mut report).await?;
         }
     }
 }
@@ -423,19 +452,22 @@ fn drop_cached(file: &File, offset: u64, len: u64) {
 }
 
 /// Records what checking a copy found, as of `now`: that the copy was
-/// checked, and what's wrong with it, if anything. Nothing is recorded if
-/// the copy changed since the pass found it: if its location is gone (the
-/// blob was deleted, and with it its file, so it's no wonder it's missing),
-/// or a read flagged it meanwhile (then it's checked again next).
+/// checked, what's wrong with it, if anything, and how its repair went.
+/// Nothing is recorded if the copy changed since the pass found it: if its
+/// location is gone (the blob was deleted, and with it its file, so it's no
+/// wonder it's missing), or a read flagged it meanwhile (then it's checked
+/// again next).
 async fn record(
     app: &App,
     copy: &Copy,
     now: f64,
+    scope: Scope,
     verdict: &Verdict,
+    repaired: Option<Result<repair::Outcome, String>>,
     report: &mut Report,
 ) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
-    // The location as the pass found it, marked checked.
+    // The location as the pass found it, marked checked as of `$3`.
     let checked = "UPDATE blob_locations SET checked_at = to_timestamp($3)
                    WHERE blob_id = $1 AND node = $2
                      AND extract(epoch FROM checked_at)::float8 IS NOT DISTINCT FROM $4::float8
@@ -444,65 +476,182 @@ async fn record(
     let (problem, bad_blocks, detail) = match verdict {
         Verdict::Intact | Verdict::Legacy => {
             // Intact again: whatever was found before has been put right.
-            client
-                .execute_cached(
+            let rows = client
+                .query_cached(
                     &format!(
-                        "WITH checked AS ({checked})
-                         UPDATE scrub_findings f SET outcome = 'repaired', resolved_at = NOW()
-                         FROM checked
-                         WHERE f.blob_id = checked.blob_id AND f.node = checked.node
-                           AND f.resolved_at IS NULL"
+                        "WITH checked AS ({checked}),
+                         resolved AS (
+                             UPDATE scrub_findings f SET outcome = 'repaired', resolved_at = NOW()
+                             FROM checked
+                             WHERE f.blob_id = checked.blob_id AND f.node = checked.node
+                               AND f.resolved_at IS NULL
+                         )
+                         SELECT 1 FROM checked"
                     ),
                     &[&copy.blob_id, &app.node, &now, &copy.checked_at],
                 )
                 .await?;
+            drop(client);
             if *verdict == Verdict::Legacy {
                 report.legacy += 1;
-            } else {
-                report.copies += 1;
-                report.bytes += bytes;
-                app.metrics.scrub_checked(bytes, None);
+                return Ok(());
+            }
+            report.copies += 1;
+            report.bytes += bytes;
+            app.metrics.scrub_checked(bytes, None);
+            if !rows.is_empty() {
+                found_intact(app, copy.blob_id).await?;
             }
             return Ok(());
         }
         Verdict::Missing => ("missing", None, "the file is missing".to_owned()),
         Verdict::Damaged { bad_blocks, detail } => ("damaged", bad_blocks.clone(), detail.clone()),
     };
+    // What became of it. A retry comes within the hour, rather than in its
+    // turn, when it may fare better then: when a repair failed, or nodes that
+    // may hold the lost blocks are down. (Not in a pass over everything, which
+    // would retry it right away.)
+    let (problem, detail, outcome, resolved, retry, lost) = match &repaired {
+        Some(Ok(repair::Outcome::Repaired)) => {
+            (problem, format!("{detail}; repaired"), Some("repaired"), true, false, None)
+        }
+        Some(Ok(repair::Outcome::Lost {
+            ranges,
+            provisional,
+        })) => {
+            let bytes: i64 = ranges.iter().map(|(start, stop)| stop - start).sum();
+            let mut detail = format!("{detail}; {bytes} bytes are intact on no replica");
+            if *provisional {
+                detail.push_str(" that's up");
+            }
+            (problem, detail, Some("lost"), false, *provisional, Some(ranges.as_slice()))
+        }
+        Some(Ok(repair::Outcome::Mismatch(mismatch))) => {
+            ("catalog", format!("{detail}; {mismatch}"), None, false, false, None)
+        }
+        Some(Err(e)) => (problem, format!("{detail}; repair failed: {e}"), None, false, true, None),
+        None => (problem, detail, None, false, false, None),
+    };
+    let checked_at = match scope {
+        Scope::Due if retry => now - MIN_INTERVAL.as_secs_f64() + RETRY.as_secs_f64(),
+        _ => now,
+    };
     let recorded = client
         .query_cached(
             &format!(
                 "WITH checked AS ({checked})
-                 INSERT INTO scrub_findings (blob_id, node, found_at, problem, bad_blocks, detail)
-                 SELECT blob_id, node, NOW(), $5, $6, $7 FROM checked
+                 INSERT INTO scrub_findings
+                     (blob_id, node, found_at, problem, bad_blocks, detail, outcome)
+                 SELECT blob_id, node, NOW(), $5, $6, $7, $8 FROM checked
                  ON CONFLICT (blob_id, node) WHERE resolved_at IS NULL DO UPDATE
                      SET problem = EXCLUDED.problem, bad_blocks = EXCLUDED.bad_blocks,
-                         detail = EXCLUDED.detail
+                         detail = EXCLUDED.detail, outcome = EXCLUDED.outcome
                  RETURNING id"
             ),
             &[
                 &copy.blob_id,
                 &app.node,
-                &now,
+                &checked_at,
                 &copy.checked_at,
                 &problem,
                 &bad_blocks,
                 &detail,
+                &outcome,
             ],
         )
         .await?;
-    if recorded.is_empty() {
+    let Some(finding) = recorded.first() else {
         return Ok(());
+    };
+    // Upserted open, then resolved, since a resolved row isn't in the
+    // partial index that the upsert finds an open finding by.
+    if resolved {
+        client
+            .execute_cached(
+                "UPDATE scrub_findings SET resolved_at = NOW() WHERE id = $1",
+                &[&finding.get::<_, i64>(0)],
+            )
+            .await?;
     }
+    drop(client);
     report.copies += 1;
     report.bytes += bytes;
     match verdict {
         Verdict::Missing => report.missing += 1,
         _ => report.damaged += 1,
     }
+    if resolved {
+        report.repaired += 1;
+        found_intact(app, copy.blob_id).await?;
+    }
+    if let Some(ranges) = lost {
+        report.lost += 1;
+        set_lost(app, copy.blob_id, ranges).await?;
+    }
     let message = format!("blob {} on node {} (scrub): {detail}", copy.blob_id, app.node);
     eprintln!("CORRUPTION: {message}");
     app.metrics.scrub_checked(bytes, Some(message));
+    match outcome {
+        Some("repaired") => app.metrics.scrub_repaired(),
+        Some("lost") => app.metrics.scrub_lost(),
+        _ => {}
+    }
     Ok(())
+}
+
+/// Records that some copy of a blob is intact: whatever was lost of it isn't.
+/// Its other copies may have been found damaged, but not repaired for want of
+/// intact blocks: they're flagged, so that their nodes repair them next.
+async fn found_intact(app: &App, blob_id: Uuid) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
+    let any = "SELECT EXISTS (SELECT 1 FROM lost_ranges WHERE blob_id = $1)";
+    // Almost always nothing is lost: that's one cheap query.
+    if !client.query_one_cached(any, &[&blob_id]).await?.get::<_, bool>(0) {
+        return Ok(());
+    }
+    drop(client);
+    if set_lost(app, blob_id, &[]).await? {
+        app.pool
+            .get()
+            .await?
+            .execute_cached(
+                "UPDATE blob_locations SET checked_at = '-infinity'
+                 WHERE blob_id = $1 AND node <> $2",
+                &[&blob_id, &app.node],
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// Replaces the lost ranges of a blob with `ranges` (byte offsets, [start,
+/// stop)). Whether any were dropped. Under the blob's row lock (X shared, see
+/// `catalog.sql`), so that it can't interleave with the blob's deletion.
+async fn set_lost(app: &App, blob_id: Uuid, ranges: &[(i64, i64)]) -> anyhow::Result<bool> {
+    let mut client = app.pool.get().await?;
+    let tx = client.transaction().await?;
+    let blob = tx
+        .query_opt("SELECT 1 FROM blobs WHERE blob_id = $1 FOR KEY SHARE", &[&blob_id])
+        .await?;
+    if blob.is_none() {
+        return Ok(false);
+    }
+    let (starts, stops): (Vec<i64>, Vec<i64>) = ranges.iter().copied().unzip();
+    let dropped = tx
+        .execute(
+            "DELETE FROM lost_ranges WHERE blob_id = $1 AND start <> ALL($2)",
+            &[&blob_id, &starts],
+        )
+        .await?;
+    tx.execute(
+        "INSERT INTO lost_ranges (blob_id, start, stop, found_at)
+         SELECT $1, s, e, NOW() FROM unnest($2::bigint[], $3::bigint[]) AS t(s, e)
+         ON CONFLICT (blob_id, start) DO UPDATE SET stop = EXCLUDED.stop",
+        &[&blob_id, &starts, &stops],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(dropped > 0)
 }
 
 /// Resolves the open findings of this node whose copies are gone (their blob
@@ -556,6 +705,8 @@ pub fn suspect(app: &App, blob_id: Uuid, node: i32) {
         }
     });
 }
+
+mod repair;
 
 #[cfg(test)]
 mod e2e;

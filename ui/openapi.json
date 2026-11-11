@@ -2472,11 +2472,13 @@
       },
       "ScrubTotals": {
         "type": "object",
-        "description": "What the scrubber did since the node started: the copies it checked (and\ntheir bytes), how many of them it found damaged or missing, and how many\nof its passes failed.",
+        "description": "What the scrubber did since the node started: the copies it checked (and\ntheir bytes), how many of them it found damaged or missing, how many of\nthose it repaired, and how many have data that's intact nowhere, and how\nmany of its passes failed.",
         "required": [
           "copies",
           "bytes",
           "damaged",
+          "repaired",
+          "lost",
           "failed"
         ],
         "properties": {
@@ -2496,6 +2498,16 @@
             "minimum": 0
           },
           "failed": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "lost": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "repaired": {
             "type": "integer",
             "format": "int64",
             "minimum": 0
