@@ -51,6 +51,9 @@ use crate::{
 pub(crate) mod buckets;
 pub(crate) mod checksums;
 pub(crate) mod acl;
+// Not used by requests yet (see `plans/policies.md`, step 3).
+#[allow(dead_code)]
+pub(crate) mod actions;
 pub(crate) mod conditional;
 pub(crate) mod hosting;
 pub(crate) mod metadata;
@@ -908,7 +911,7 @@ pub(crate) const BUCKET_CONFIGURATION: &[&str] = &[
 /// `write` for the rest. A copy also needs `read` on
 /// its source bucket. DeleteObjects only needs one of `write` / `delete-version`
 /// here; it checks each entry against them itself.
-fn authorize(
+pub(crate) fn authorize(
     principal: &Principal,
     method: &Method,
     bucket: &str,

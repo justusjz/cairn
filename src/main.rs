@@ -45,6 +45,9 @@ mod mover;
 mod nodes;
 mod packer;
 mod payload;
+// Not used by requests yet (see `plans/policies.md`, step 3).
+#[allow(dead_code)]
+mod policy;
 mod roles;
 mod s3;
 mod scrub;

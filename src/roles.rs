@@ -96,6 +96,22 @@ impl Principal {
         }
     }
 
+    /// A role with these grants, for tests.
+    #[cfg(test)]
+    pub fn for_test(admin: bool, grants: &[(Permission, &str)]) -> Principal {
+        let on = |wanted: Permission| {
+            grants.iter().filter(|(p, _)| *p == wanted).map(|(_, b)| b.to_string()).collect()
+        };
+        Principal {
+            id: uuid::Uuid::nil(),
+            secret: String::new(),
+            admin,
+            read: on(Permission::Read),
+            write: on(Permission::Write),
+            delete_version: on(Permission::DeleteVersion),
+        }
+    }
+
     /// Whether the role may learn that `bucket` exists: admins see every bucket,
     /// others only the ones they hold a grant on.
     pub fn can_see(&self, bucket: &str) -> bool {
