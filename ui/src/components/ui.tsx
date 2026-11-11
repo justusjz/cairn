@@ -1,12 +1,18 @@
 // Small building blocks shared by the pages.
 
 import { For, type JSX, Show, createSignal, onCleanup, onMount } from "solid-js";
+import { createStore, reconcile } from "solid-js/store";
 
 /** Data fetched now and every `every` ms after (paused while the tab is
  * hidden), until the calling component goes away. Keeps the last data on a
- * failed refresh, and reports the failure. */
+ * failed refresh, and reports the failure.
+ *
+ * Fresh data is reconciled into the last (items matched by `id`), so what
+ * didn't change keeps its identity: a `<For>` row isn't re-created on every
+ * refresh, and keeps what's typed or opened in it. */
 export function poll<T>(fetch: () => Promise<T>, every?: number) {
-  const [data, setData] = createSignal<T>();
+  const [store, setStore] = createStore<{ value?: T }>({});
+  const data = () => store.value;
   const [error, setError] = createSignal<string>();
   let alive = true;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -15,7 +21,7 @@ export function poll<T>(fetch: () => Promise<T>, every?: number) {
     try {
       const value = await fetch();
       if (!alive) return;
-      setData(() => value);
+      setStore("value", reconcile(value));
       setError(undefined);
     } catch (e) {
       if (alive) setError((e as Error).message);
