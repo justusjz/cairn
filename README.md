@@ -256,12 +256,15 @@ cluster:
 - **Storage:** how much data there is, how much of it has fewer live copies
   than the replication factor, and what each node holds.
 - **Jobs:** how the background passes (garbage collection and packing) are
-  doing on each node, what they still have to do, and what they did recently.
+  doing on each node, what they still have to do, and what they did recently;
+  and the [lifecycle](#lifecycle-rules) sweeps: each bucket's, how long a
+  round of them takes, and the rate they go at, which can be changed there.
 - **Buckets:** browse buckets by prefix, see every version of a key with how
   it's encrypted, the blobs its parts are stored in and the nodes holding
   them, and download any version (but an encrypted one: Cairn doesn't have
   an SSE-C object's key, and the KMS opens an SSE-KMS one only for a role).
-  Buckets can be created and (when empty) deleted.
+  Buckets can be created and (when empty) deleted, and their
+  [lifecycle rules](#lifecycle-rules) edited.
 - **Roles:** everything `cairn role` does: create and delete roles, grant and
   revoke permissions, rotate secrets, and toggle admin. Each role's ID and
   its identity in the KMS are shown, for granting it [KMS keys](#sse-kms).
@@ -321,7 +324,10 @@ TypeScript 7), so it needs network access.
 Buckets support S3 versioning, which keeps every version of an object instead
 of overwriting it. This is what makes Cairn a ransomware-resistant backup
 target: a client that can write and delete (e.g. restic) can't destroy the
-history, as long as it isn't granted `delete-version`.
+history, as long as it isn't granted `delete-version`, nor is an admin. Admins
+can set [lifecycle rules](#lifecycle-rules), which may remove old versions, as
+a bucket's owner can in S3; keep admin credentials away from the machines
+being backed up.
 
 An admin enables it per bucket with any S3 client:
 
@@ -353,8 +359,86 @@ aws s3api copy-object --bucket my-bucket --key some/key \
     --copy-source 'my-bucket/some/key?versionId=<version id>'
 ```
 
-Old versions take up space until they're deleted. There are no lifecycle rules
-yet to expire them automatically.
+Old versions take up space until they're deleted, by hand or by
+[lifecycle rules](#lifecycle-rules).
+
+## Lifecycle rules
+
+A bucket's lifecycle configuration expires objects automatically, as in S3.
+Setting one is bucket management, as `PutLifecycleConfiguration` is its own
+permission in S3, so only an admin can, and needs no grant on the bucket's
+objects: the rules are carried out by Cairn, not as the admin. A role that may
+only write can't make its writes expire, nor stop an admin's rules. (S3 keeps
+versions from lifecycle rules with Object Lock, which Cairn doesn't have yet.)
+
+```sh
+aws s3api put-bucket-lifecycle-configuration --bucket my-bucket \
+    --lifecycle-configuration '{"Rules": [{
+        "ID": "logs", "Filter": {"Prefix": "logs/"}, "Status": "Enabled",
+        "Expiration": {"Days": 30},
+        "NoncurrentVersionExpiration": {"NoncurrentDays": 7}}]}'
+aws s3api get-bucket-lifecycle-configuration --bucket my-bucket
+aws s3api delete-bucket-lifecycle --bucket my-bucket
+```
+
+Or on the dashboard: a bucket's page links to an editor of its rules, which
+the dashboard checks as S3's requests are checked, and writes back in the same
+form, so S3 clients see the same rules.
+
+What a rule can do:
+
+- **`Expiration`** with `Days` or a `Date`: the current version expires that
+  many days after it was written, or from that date on. Expiring is a delete,
+  as DeleteObject's: the object is gone in an unversioned bucket, and gets a
+  delete marker in a versioned one, keeping it as a noncurrent version.
+- **`Expiration`** with `ExpiredObjectDeleteMarker`: a delete marker that's
+  the only version of its key left is removed.
+- **`NoncurrentVersionExpiration`**: a noncurrent version is removed for good
+  `NoncurrentDays` after it became noncurrent (a newer version, or a delete
+  marker, was written), keeping the `NewerNoncurrentVersions` newest ones.
+- **`AbortIncompleteMultipartUpload`**: an upload is aborted
+  `DaysAfterInitiation` days after it was started.
+
+A rule's `Filter` picks objects by key prefix (`Prefix`), and by size
+(`ObjectSizeGreaterThan`, `ObjectSizeLessThan`; not for delete markers or
+uploads), alone or under `And`. As in S3, days are counted to the next
+midnight UTC: an object written at 10:30 on the 1st, under a rule of one day,
+expires at the start of the 3rd.
+
+Rules are applied in the background, not as objects are read: an expired
+object stays readable until a sweep gets to it. Each bucket with rules is
+swept once a day, starting when the rules are set: a sweep walks the keys
+under the prefixes of the rules that expire anything, and expires what's due.
+
+Sweeps go at a rate you set for the whole cluster, in object versions read
+per hour (1,000,000 by default; 0 pauses them), so that however much there is
+to sweep, they never take more of the database than that:
+
+```sh
+cairn config --database "$DB" set lifecycle-rate 2000000
+cairn config --database "$DB" get              # every setting, with its default
+```
+
+Or on the dashboard's Jobs page, which also shows each bucket's sweep, the rate
+sweeps actually reach when they're busy, and how long a round of every
+bucket's sweep takes at it. If that's more than a day, sweeps fall behind, and
+expirations come that much later: raise the rate, or, if sweeps don't reach
+the rate set (one step at a time goes only as fast as the database answers),
+give the database more resources. The rate is the cluster's,
+not each node's: there's one lifecycle step at a time across the cluster,
+about once a minute, on whichever node takes it, and the buckets take turns,
+so that a huge one doesn't hold up the others.
+
+Where a sweep has got to is saved as it goes, so if its node dies, another
+carries on from there within minutes. A version written or deleted since a
+sweep read it is never mistaken for the one that was due, and deleting (or
+changing) the configuration stops a sweep before its next expiration. Every
+node uses the database's clock, so a node whose clock is off doesn't expire
+anything early.
+
+Not supported, and refused with `501 NotImplemented`: transitions to other
+storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one),
+and filters on tags (Cairn doesn't keep object tags).
 
 ## Limits
 

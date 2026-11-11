@@ -205,7 +205,7 @@ button.danger:hover { background: var(--bad-soft); }
 button.small, .button.small { padding: 2px 8px; font-size: 12px; }
 button:disabled { opacity: .5; cursor: default; }
 
-input[type=text], input[type=password], input[type=search], select {
+input[type=text], input[type=password], input[type=search], input[type=date], select {
   font: inherit;
   padding: 5px 9px;
   border-radius: 6px;
@@ -304,3 +304,8 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
   main { padding: 16px 12px 40px; }
   .grid.cols-2, .grid.cols-3 { grid-template-columns: 1fr; }
 }
+
+/* A lifecycle rule's form: a row per part, labelled on the left. */
+.rule { display: grid; gap: 10px; }
+.rule .label { flex: 0 0 150px; color: var(--muted); }
+.rule label.check.label { color: var(--text); }

@@ -37,11 +37,13 @@ mod e2e;
 mod encryption;
 mod gc;
 mod kms;
+mod lifecycle;
 mod metrics;
 mod packer;
 mod payload;
 mod roles;
 mod s3;
+mod settings;
 mod store;
 mod writing;
 
@@ -79,6 +81,8 @@ enum Command {
     Serve(ServeArgs),
     /// Manage roles: S3 credentials and their bucket permissions.
     Role(roles::RoleArgs),
+    /// Show or change the cluster's settings.
+    Config(settings::ConfigArgs),
 }
 
 // Every flag can also be set through the environment variable named in its
@@ -127,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve_main(args).await,
         Command::Role(args) => roles::role_main(args).await,
+        Command::Config(args) => settings::config_main(args).await,
     }
 }
 
@@ -168,6 +173,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     });
     tokio::spawn(heartbeat(app.clone(), peer_url));
     tokio::spawn(maintain(app.clone()));
+    tokio::spawn(apply_lifecycles(app.clone()));
     // The roles' identities in the KMS, now rather than in a minute.
     let identifying = app.clone();
     tokio::spawn(async move {
@@ -257,6 +263,48 @@ async fn maintain(app: Arc<App>) {
             app.metrics.maintenance_failed(format!("pass failed: {e}"));
         }
         app.metrics.pass_finished();
+    }
+}
+
+/// Lifecycle rules, on every node: once a minute, the steps of buckets'
+/// sweeps that are due (see `lifecycle`). Apart from `maintain`, so that
+/// neither holds up the other.
+async fn apply_lifecycles(app: Arc<App>) {
+    loop {
+        tokio::time::sleep(MAINTENANCE_INTERVAL).await;
+        let task_app = app.clone();
+        // A task of its own, so that a panic (a bug) fails this pass, rather
+        // than ending lifecycle sweeps on this node.
+        let pass = tokio::spawn(async move {
+            // The database's clock, which every node shares, rather than this
+            // node's, which may be off: it decides what's due.
+            let now = match lifecycle::database_time(&task_app).await {
+                Ok(now) => now,
+                Err(e) => {
+                    eprintln!("lifecycle: pass failed: {e:#}");
+                    task_app.metrics.lifecycle_failed(format!("pass failed: {e:#}"));
+                    return;
+                }
+            };
+            for result in lifecycle::pass(&task_app, now).await {
+                match result {
+                    Ok(report) => {
+                        if !report.is_empty() {
+                            eprintln!("lifecycle: {report}");
+                        }
+                        task_app.metrics.lifecycle_done(&report);
+                    }
+                    Err((bucket, e)) => {
+                        eprintln!("lifecycle: bucket {bucket}: sweep failed: {e:#}");
+                        task_app.metrics.lifecycle_failed(format!("bucket {bucket}: sweep failed: {e:#}"));
+                    }
+                }
+            }
+        });
+        if let Err(e) = pass.await {
+            eprintln!("lifecycle pass failed: {e}");
+            app.metrics.lifecycle_failed(format!("pass failed: {e}"));
+        }
     }
 }
 

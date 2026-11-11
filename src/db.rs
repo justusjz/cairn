@@ -188,6 +188,7 @@ const MIGRATIONS: &[&str] = &[
     BUCKET_ENCRYPTION,
     SSE_S3,
     CHECKSUMS,
+    LIFECYCLE,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -829,6 +830,64 @@ ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_checksum CHECK (
 ALTER TABLE parts ADD COLUMN checksum text;
 "#;
 
+/// Migration 20: lifecycle rules (see `lifecycle`), and the cluster's
+/// settings (see `settings`), of which the rate lifecycle sweeps go at is the
+/// first.
+///
+/// A bucket's rules stay with it, as JSON (NULL for none), with a number
+/// that every change of them increases, which sweeps check theirs against.
+/// Its sweep of them has a row of its own in `lifecycle_sweeps`, so that a
+/// sweep's progress doesn't update the row of the bucket, which every write
+/// in it locks: when it gets its next turn (when its next sweep starts, or,
+/// during one, when it last had a turn), when the sweep started (NULL between
+/// sweeps), the key it has got to, how many versions it has read, and what it
+/// has done; and the last whole sweep, as JSON.
+///
+/// `lifecycle_runs` is the single row that sweeps take turns through: one
+/// step at a time in the whole cluster, under its lease, when the last one
+/// began (which the next one's share of the rate is counted from), and the
+/// rate steps have actually reached, when they had more to do than their
+/// share (an average, over about an hour).
+const LIFECYCLE: &str = r#"
+CREATE TABLE settings (
+    name   text PRIMARY KEY,
+    value  text NOT NULL
+);
+CREATE TRIGGER settings_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON settings
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE lifecycle_runs (
+    id            boolean PRIMARY KEY DEFAULT true CHECK (id),
+    lease_until   timestamptz,
+    last_step     timestamptz,
+    reached_rate  double precision,
+    reached_at    timestamptz
+);
+INSERT INTO lifecycle_runs DEFAULT VALUES;
+CREATE TRIGGER lifecycle_runs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON lifecycle_runs
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+ALTER TABLE buckets
+    ADD COLUMN lifecycle text,
+    ADD COLUMN lifecycle_generation bigint NOT NULL DEFAULT 0;
+
+CREATE TABLE lifecycle_sweeps (
+    bucket      text PRIMARY KEY REFERENCES buckets(name) ON DELETE CASCADE,
+    generation  bigint NOT NULL,
+    due         timestamptz NOT NULL,
+    started     timestamptz,
+    cursor      text,
+    seen        bigint NOT NULL DEFAULT 0,
+    expired     bigint NOT NULL DEFAULT 0,
+    removed     bigint NOT NULL DEFAULT 0,
+    aborted     bigint NOT NULL DEFAULT 0,
+    last        text
+);
+CREATE INDEX lifecycle_sweeps_due ON lifecycle_sweeps (due);
+CREATE TRIGGER lifecycle_sweeps_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON lifecycle_sweeps
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -837,7 +896,7 @@ mod tests {
         let gate = super::MIGRATIONS
             .iter()
             .rev()
-            .find(|sql| sql.contains("FUNCTION cairn_require_protocol()"))
+            .find(|sql| sql.contains("FUNCTION cairn_require_protocol() RETURNS"))
             .unwrap();
         let check = format!("IS DISTINCT FROM '{}'", super::PROTOCOL);
         assert!(gate.contains(&check));
@@ -858,7 +917,7 @@ mod tests {
                 continue;
             }
             let trigger = format!("CREATE TRIGGER {table}_protocol ");
-            assert!(super::PROTOCOL_GATE.contains(&trigger), "{table} isn't gated");
+            assert!(schema.contains(&trigger), "{table} isn't gated");
         }
     }
 

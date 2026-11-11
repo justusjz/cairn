@@ -17,6 +17,7 @@ use crate::{
             head::head_bucket,
             list::list_buckets,
             encryption::{default_request, delete_bucket_encryption, get_bucket_encryption, put_bucket_encryption},
+            lifecycle::{delete_bucket_lifecycle, get_bucket_lifecycle, put_bucket_lifecycle},
             versioning::{get_bucket_versioning, put_bucket_versioning},
         },
         conditional::Preconditions,
@@ -190,8 +191,9 @@ async fn handle_request(
         // query up front and match on an owned method — mirroring the object branch
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
-        // Bucket sub-resource GETs: versioning is real; the rest (acl/location/
-        // policy/cors/tagging/lifecycle/object-lock) are stubbed — Cairn implements
+        // Bucket sub-resource GETs: versioning, encryption and lifecycle are
+        // real; the rest (acl/location/policy/cors/tagging/object-lock) are
+        // stubbed — Cairn implements
         // none of them, so answer as S3 does for an unconfigured bucket before
         // falling through to a listing.
         if *req.method() == hyper::Method::GET {
@@ -200,6 +202,9 @@ async fn handle_request(
             }
             if query_param(&query, "encryption").is_some() {
                 return Ok(box_response(get_bucket_encryption(&app, &bucket).await?));
+            }
+            if query_param(&query, "lifecycle").is_some() {
+                return Ok(box_response(get_bucket_lifecycle(&app, &bucket).await?));
             }
             if query_param(&query, "ownershipControls").is_some() {
                 return Ok(box_response(acl::ownership_controls()));
@@ -328,6 +333,18 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
+            // PutBucketLifecycleConfiguration: PUT /{bucket}?lifecycle with a
+            // <LifecycleConfiguration> body, which must declare a checksum, as
+            // in S3: it says what to delete.
+            hyper::Method::PUT if query_param(&query, "lifecycle").is_some() => {
+                if !payload::has_body_checksum(req.headers()) {
+                    return Ok(box_response(missing_checksum()));
+                }
+                match read_body(req, &principal.secret, true).await? {
+                    Ok(body) => put_bucket_lifecycle(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
             // PutBucketAcl: there are no ACLs (`acl`).
             hyper::Method::PUT if query_param(&query, "acl").is_some() => {
                 acl::put_bucket_acl(&app, &bucket, req.headers()).await?
@@ -353,6 +370,9 @@ async fn handle_request(
             }
             hyper::Method::DELETE if query_param(&query, "encryption").is_some() => {
                 delete_bucket_encryption(&app, &bucket).await?
+            }
+            hyper::Method::DELETE if query_param(&query, "lifecycle").is_some() => {
+                delete_bucket_lifecycle(&app, &bucket).await?
             }
             hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),

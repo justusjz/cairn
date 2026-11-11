@@ -1156,6 +1156,164 @@ BEGIN
 END
 $$;
 
+-- T17: a lifecycle sweep's expirations (see `lifecycle`). Takes B(b) shared
+-- and K(b,k) for every key, then X on the blobs of every part they may
+-- remove, as DeleteObjects does (T8). Each target is a version the sweep found
+-- due, by its row id, with what made it due, which is checked again under the
+-- locks, before anything changes, so that a version written or deleted since
+-- isn't mistaken for it:
+--
+--   'current'     still the key's current version, and not a delete marker;
+--                 deleted as a DeleteObject without a version ID would (a
+--                 delete marker in a versioned bucket). `p_marker_ids` holds
+--                 a fresh version ID for that marker.
+--   'marker'      still the key's current version, a delete marker, and its
+--                 only one; removed for good.
+--   'noncurrent'  not the current version, the version after it still
+--                 `p_successors` (which made it noncurrent when it did), and
+--                 at least `p_newer` versions newer than it; removed for good.
+--
+-- `p_generation` is the generation of the configuration the sweep follows:
+-- if the bucket's is another (it was changed or deleted since), nothing is
+-- done
+-- ('changed'). Returns 'expired', with which targets were, or
+-- 'no_such_bucket'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_lifecycle_expire(
+    p_bucket text, p_generation bigint, p_keys text[], p_ids bigint[], p_version_ids text[],
+    p_kinds text[], p_successors bigint[], p_newer int[], p_marker_ids text[],
+    OUT status text, OUT applied boolean[],
+    OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_versioning text;
+    v_ok boolean;
+    v_freed bigint[] := '{}';
+    f record;
+    v_locked uuid[];
+BEGIN
+    reap_blob := '{}';
+    reap_node := '{}';
+    reap_peer := '{}';
+    applied := '{}';
+    v_versioning := pg_temp.cairn_lock_bucket(p_bucket);
+    IF v_versioning IS NULL THEN
+        status := 'no_such_bucket';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM buckets
+        WHERE name = p_bucket AND lifecycle IS NOT NULL AND lifecycle_generation = p_generation
+    ) THEN
+        status := 'changed';
+        RETURN;
+    END IF;
+    PERFORM pg_temp.cairn_lock_keys(p_bucket, p_keys);
+    -- Every check before any change, so that one target's expiration can't
+    -- make another's look undue (removing the version after it, say).
+    FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP
+        IF p_kinds[i] = 'current' THEN
+            v_ok := pg_temp.cairn_current_version(p_bucket, p_keys[i]) IS NOT DISTINCT FROM p_ids[i];
+        ELSIF p_kinds[i] = 'marker' THEN
+            v_ok := EXISTS (
+                SELECT 1 FROM objects
+                WHERE id = p_ids[i] AND bucket = p_bucket AND key = p_keys[i]
+                  AND is_latest AND is_delete_marker
+            ) AND NOT EXISTS (
+                SELECT 1 FROM objects
+                WHERE bucket = p_bucket AND key = p_keys[i] AND id <> p_ids[i]
+            );
+        ELSIF p_kinds[i] = 'noncurrent' THEN
+            v_ok := EXISTS (
+                SELECT 1 FROM objects
+                WHERE id = p_ids[i] AND bucket = p_bucket AND key = p_keys[i] AND NOT is_latest
+            ) AND (
+                SELECT min(id) FROM objects
+                WHERE bucket = p_bucket AND key = p_keys[i] AND id > p_ids[i]
+            ) IS NOT DISTINCT FROM p_successors[i] AND (
+                SELECT count(*) FROM objects
+                WHERE bucket = p_bucket AND key = p_keys[i] AND id > p_ids[i]
+            ) >= p_newer[i];
+        ELSE
+            RAISE EXCEPTION 'cairn_lifecycle_expire: unknown kind %', p_kinds[i];
+        END IF;
+        applied := applied || v_ok;
+    END LOOP;
+    FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP
+        CONTINUE WHEN NOT applied[i];
+        v_freed := v_freed || pg_temp.cairn_freed_by_delete(
+            p_bucket, p_keys[i], v_versioning,
+            CASE WHEN p_kinds[i] = 'current' THEN NULL ELSE p_version_ids[i] END);
+    END LOOP;
+    SELECT * INTO f FROM pg_temp.cairn_freeable(v_freed);
+    v_locked := pg_temp.cairn_lock_blobs(f.blobs, f.exclusive);
+    PERFORM pg_temp.cairn_check_on(v_freed, v_locked);
+    FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP
+        CONTINUE WHEN NOT applied[i];
+        IF p_kinds[i] = 'current' THEN
+            PERFORM pg_temp.cairn_delete_key(p_bucket, p_keys[i], v_versioning, NULL, p_marker_ids[i]);
+        ELSE
+            PERFORM pg_temp.cairn_delete_key(p_bucket, p_keys[i], v_versioning, p_version_ids[i], NULL);
+        END IF;
+    END LOOP;
+    SELECT * INTO reap_blob, reap_node, reap_peer
+    FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
+    status := 'expired';
+END
+$$;
+
+-- Claims the cluster's next lifecycle step (see `lifecycle`), if no node
+-- holds it (its lease has run out, if one did), and the last one began at
+-- least `p_gap` seconds before `p_now`: then takes a lease of `p_lease`
+-- seconds, and records the step as beginning at `p_now`. Returns whether it
+-- claimed it, and when the last step began. The single row, locked with SKIP
+-- LOCKED, so that it never waits: another node claiming it at the same time
+-- gets nothing.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_lifecycle_claim(
+    p_now timestamptz, p_lease double precision, p_gap double precision,
+    OUT claimed boolean, OUT previous timestamptz
+) LANGUAGE plpgsql AS $$
+BEGIN
+    SELECT last_step INTO previous FROM lifecycle_runs
+    WHERE id AND (lease_until IS NULL OR lease_until <= p_now)
+      AND (last_step IS NULL OR last_step <= p_now - make_interval(secs => p_gap))
+    FOR UPDATE SKIP LOCKED;
+    claimed := FOUND;
+    IF claimed THEN
+        UPDATE lifecycle_runs SET lease_until = p_now + make_interval(secs => p_lease), last_step = p_now
+        WHERE id;
+    END IF;
+END
+$$;
+
+-- T18: PutBucketLifecycleConfiguration and DeleteBucketLifecycle: sets (or,
+-- with NULL, removes) the bucket's lifecycle configuration, with a new
+-- generation, and starts a new sweep of it, due now (the last whole sweep
+-- stays, for the dashboard), or drops its sweep. Plain UPDATEs of the
+-- bucket's row, as T16's: no invariant involves the configuration, which a
+-- sweep checks itself (T17). The sweep's row's FK check locks the bucket's
+-- row shared, which it updated already. Returns whether the bucket exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_lifecycle(p_bucket text, p_config text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    v_generation bigint;
+BEGIN
+    UPDATE buckets SET lifecycle = p_config, lifecycle_generation = lifecycle_generation + 1
+    WHERE name = p_bucket
+    RETURNING lifecycle_generation INTO v_generation;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    IF p_config IS NULL THEN
+        DELETE FROM lifecycle_sweeps WHERE bucket = p_bucket;
+    ELSE
+        INSERT INTO lifecycle_sweeps (bucket, generation, due) VALUES (p_bucket, v_generation, now())
+        ON CONFLICT (bucket) DO UPDATE SET generation = v_generation, due = now(), started = NULL,
+            cursor = NULL, seen = 0, expired = 0, removed = 0, aborted = 0;
+    END IF;
+    RETURN true;
+END
+$$;
+
 -- Deletes a role. Takes G on the role's grants (in order), which go with it
 -- (a cascade), then R (by deleting the row). Returns whether there was one.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_role(p_role text)
