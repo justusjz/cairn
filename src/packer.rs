@@ -23,6 +23,12 @@
 //!   when their part is deleted; `blobs.dead_size` counts them. A job takes
 //!   several such blobs at once, so their survivors are packed into fewer,
 //!   fuller blobs.
+//! - **Upgrade** rewrites a blob from before checksums into a checksummed one,
+//!   which the scrubber can then check (see `scrub`), one blob per job, the
+//!   oldest first, after the other jobs, a minute's worth at the scrub rate
+//!   per pass. Its bytes can only be verified once copied, by its parts' MD5s,
+//!   so its replicas are tried one at a time; if none matches, its parts are
+//!   lost (`lost_ranges`).
 //!
 //! Within a job, parts are laid out by age band, then bucket, then age. Data
 //! that has lived long is likely to live on (the generational hypothesis), so
@@ -157,6 +163,7 @@ impl std::fmt::Display for JobReport {
         let kind = match self.kind {
             Kind::Compact => "compacted",
             Kind::Consolidate => "consolidated",
+            Kind::Upgrade => "upgraded",
         };
         write!(
             f,
@@ -169,10 +176,12 @@ impl std::fmt::Display for JobReport {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Compact,
     Consolidate,
+    /// Rewrites a blob from before checksums into a checksummed one.
+    Upgrade,
 }
 
 /// Runs packing jobs until there's nothing left worth packing (or the pass hits
@@ -200,7 +209,117 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
             }
         }
     }
+    // Upgrades read at the scrub rate, since they stand in for scrubbing the
+    // blobs they upgrade: a minute's worth per pass. None if scrubbing is off.
+    if app.scrub_rate > 0 {
+        let budget = app.scrub_rate * crate::MAINTENANCE_INTERVAL.as_secs();
+        reports.extend(upgrade(app, budget).await?);
+    }
     Ok(reports)
+}
+
+/// Upgrades blobs from before checksums, oldest first, one per job, until
+/// their bytes add up to `budget` (but at least one). A failed job is logged,
+/// and its blob stays leased, so the next one is tried.
+pub(crate) async fn upgrade(app: &Arc<App>, budget: u64) -> anyhow::Result<Vec<JobReport>> {
+    let mut reports = Vec::new();
+    let mut spent = 0;
+    while spent < budget.max(1) {
+        let Some(sources) = claim(app, Kind::Upgrade).await? else {
+            break;
+        };
+        let size: i64 = app
+            .pool
+            .get()
+            .await?
+            .query_one_cached("SELECT coalesce(sum(size), 0)::bigint FROM blobs WHERE blob_id = ANY($1)", &[&sources])
+            .await?
+            .get(0);
+        spent += size.max(1) as u64;
+        match run_upgrade(app, &sources).await {
+            Ok(report) => reports.push(report),
+            Err(e) => {
+                let message = format!("upgrading blob {} failed: {e:#}", sources[0]);
+                eprintln!("packer: {message}");
+                app.metrics.pack_failed(message);
+            }
+        }
+    }
+    Ok(reports)
+}
+
+/// Upgrades a blob from before checksums. Its bytes can't be verified as
+/// they're read, only once they're copied, by its parts' MD5s (their ETags).
+/// So its replicas are tried one at a time, each as the only source, until
+/// one gives a copy that verifies. If none does, though every one was read,
+/// its parts are intact nowhere: their bytes go to `lost_ranges` (see
+/// `scrub`), which keeps reads off them, and the blob is left as it is.
+async fn run_upgrade(app: &Arc<App>, sources: &[Uuid]) -> anyhow::Result<JobReport> {
+    let blob_id = sources[0];
+    let replicas: Vec<(i32, bool)> = app
+        .pool
+        .get()
+        .await?
+        .query_cached(
+            "SELECT bl.node, n.last_seen > NOW() - INTERVAL '10 seconds'
+             FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+             WHERE bl.blob_id = $1
+             ORDER BY bl.node = $2 DESC, n.last_seen DESC",
+            &[&blob_id, &app.node],
+        )
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    let mut last_error = anyhow::anyhow!("it has no replica on a live node");
+    let mut mismatched = 0;
+    for &(node, live) in &replicas {
+        if !live {
+            continue;
+        }
+        let mut outputs = Vec::new();
+        let result = pack(app, Kind::Upgrade, sources, &mut outputs, Some(node)).await;
+        if result.is_err() {
+            for output in outputs {
+                crate::blobs::discard(app, output).await;
+            }
+        }
+        match result {
+            Ok(report) => return Ok(report),
+            Err(e) => {
+                if let Some(Mismatch(detail)) = e.downcast_ref::<Mismatch>() {
+                    eprintln!("CORRUPTION: blob {blob_id} on node {node} (upgrade): {detail}");
+                    mismatched += 1;
+                }
+                last_error = e;
+            }
+        }
+    }
+    if mismatched > 0 && mismatched == replicas.len() {
+        let client = app.pool.get().await?;
+        let mut ranges: Vec<(i64, i64)> = client
+            .query_cached(
+                "SELECT DISTINCT blob_offset, blob_offset + size FROM parts
+                 WHERE blob_id = $1 AND size > 0 ORDER BY 1",
+                &[&blob_id],
+            )
+            .await?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+        drop(client);
+        // Merged, since lost ranges don't overlap.
+        ranges.dedup_by(|next, prev| {
+            let overlaps = next.0 <= prev.1;
+            if overlaps {
+                prev.1 = prev.1.max(next.1);
+            }
+            overlaps
+        });
+        crate::scrub::set_lost(app, blob_id, &ranges).await?;
+        anyhow::bail!("its parts match their checksums on no replica: they're lost");
+    }
+    Err(last_error)
 }
 
 /// Takes the garbage log, in batches: the blobs that parts were deleted from
@@ -241,6 +360,7 @@ async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
     let kind = match kind {
         Kind::Compact => "compact",
         Kind::Consolidate => "consolidate",
+        Kind::Upgrade => "upgrade",
     };
     let budget = OUTPUTS_PER_JOB * config.target_size;
     let sources: Vec<Uuid> = app
@@ -309,7 +429,7 @@ struct Run {
 /// (left to the GC if that fails too), and the sources stay leased.
 async fn run_job(app: &Arc<App>, kind: Kind, sources: &[Uuid]) -> anyhow::Result<JobReport> {
     let mut outputs = Vec::new();
-    let result = pack(app, kind, sources, &mut outputs).await;
+    let result = pack(app, kind, sources, &mut outputs, None).await;
     if result.is_err() {
         for blob_id in outputs {
             if let Err(e) = crate::blobs::abandon(app, blob_id).await {
@@ -321,15 +441,23 @@ async fn run_job(app: &Arc<App>, kind: Kind, sources: &[Uuid]) -> anyhow::Result
 }
 
 /// The body of [`run_job`]. Adds each new blob to `outputs` once it exists.
+/// Reads the sources from their replica on node `only`, if given, else from
+/// any.
 async fn pack(
     app: &Arc<App>,
     kind: Kind,
     sources: &[Uuid],
     outputs: &mut Vec<Uuid>,
+    only: Option<i32>,
 ) -> anyhow::Result<JobReport> {
     let client = app.pool.get().await?;
     let mut parts = load_parts(&client, sources).await?;
-    let blobs = load_blobs(&client, app.node, sources).await?;
+    let mut blobs = load_blobs(&client, app.node, sources).await?;
+    if let Some(node) = only {
+        for (_, locations) in blobs.values_mut() {
+            locations.retain(|(n, _)| *n == node);
+        }
+    }
     drop(client);
     let report = |parts: &[Part], runs: &[Run], written: &[Written]| JobReport {
         kind,
@@ -633,8 +761,21 @@ async fn verify(app: &App, written: &Written, parts: &[Part]) -> anyhow::Result<
     };
     let (read, checked) = tokio::join!(read, check);
     read?;
-    checked.map_err(|e| anyhow::anyhow!("blob {}: {e}", written.blob_id))
+    checked.map_err(|e| Mismatch(format!("new blob {}: {e}", written.blob_id)).into())
 }
+
+/// A new blob's parts don't match their checksums: what was copied into it
+/// isn't what was stored.
+#[derive(Debug)]
+struct Mismatch(String);
+
+impl std::fmt::Display for Mismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Mismatch {}
 
 /// Checks the parts in a stream of the new blob's bytes. The parts must be in
 /// order of their new offsets; they may overlap.

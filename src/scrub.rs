@@ -23,7 +23,7 @@
 //! after all (a node that was down comes back, say), and the others are then
 //! repaired from it. What the scrubber finds goes to `scrub_findings`, and to
 //! the log as `CORRUPTION:`. Blobs from before checksums can't be checked, and
-//! are skipped.
+//! are skipped, until the packer upgrades them (see `packer`).
 
 use std::{
     fs::File,
@@ -627,7 +627,7 @@ async fn found_intact(app: &App, blob_id: Uuid) -> anyhow::Result<()> {
 /// Replaces the lost ranges of a blob with `ranges` (byte offsets, [start,
 /// stop)). Whether any were dropped. Under the blob's row lock (X shared, see
 /// `catalog.sql`), so that it can't interleave with the blob's deletion.
-async fn set_lost(app: &App, blob_id: Uuid, ranges: &[(i64, i64)]) -> anyhow::Result<bool> {
+pub(crate) async fn set_lost(app: &App, blob_id: Uuid, ranges: &[(i64, i64)]) -> anyhow::Result<bool> {
     let mut client = app.pool.get().await?;
     let tx = client.transaction().await?;
     let blob = tx
@@ -680,7 +680,10 @@ async fn tidy_findings(app: &App) -> anyhow::Result<()> {
 /// Flags a copy that a read found damaged or missing, so that its node
 /// checks it next. In the background: the read mustn't wait for it. A copy
 /// already known to be damaged isn't flagged again, or every read of it would
-/// have it checked again.
+/// have it checked again. Only as far as a statement can tell, though: one
+/// that waits for the scrubber recording a finding for the copy re-checks the
+/// location row, but not the finding (F2 in `catalog.sql`), so it flags the
+/// copy anyway, which is then checked once more. That's harmless.
 pub fn suspect(app: &App, blob_id: Uuid, node: i32) {
     let pool = app.pool.clone();
     tokio::spawn(async move {

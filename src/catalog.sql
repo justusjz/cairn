@@ -1411,7 +1411,8 @@ END
 $$;
 
 -- T14: claims the source blobs for a packing job, if there's one worth
--- running (see `packer::claim`): `p_kind` is 'compact' or 'consolidate'.
+-- running (see `packer::claim`): `p_kind` is 'compact', 'consolidate' or
+-- 'upgrade' (a blob from before checksums, one at a time).
 -- Takes candidates, skipping those another transaction has locked (it never
 -- waits), until their live bytes would exceed `p_budget`, and leases them.
 -- Returns them, or an empty array if the job isn't worth it. The lease is a
@@ -1476,6 +1477,23 @@ BEGIN
         LOOP
             EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
             v_total := v_total + r.live;
+            v_sources := v_sources || r.blob_id;
+        END LOOP;
+        IF cardinality(v_sources) = 0 THEN
+            RETURN '{}';
+        END IF;
+    ELSIF p_kind = 'upgrade' THEN
+        -- One blob from before checksums, the oldest, off `blobs_legacy`.
+        FOR r IN
+            SELECT blob_id FROM blobs
+            WHERE state = 'committed' AND block_size IS NULL
+              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
+            ORDER BY created_at
+            LIMIT 1 FOR UPDATE SKIP LOCKED
+        LOOP
             v_sources := v_sources || r.blob_id;
         END LOOP;
         IF cardinality(v_sources) = 0 THEN

@@ -191,6 +191,7 @@ const MIGRATIONS: &[&str] = &[
     LIFECYCLE,
     SCRUBBING,
     LOST_RANGES,
+    LEGACY_BLOBS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -940,6 +941,14 @@ CREATE TABLE lost_ranges (
 );
 CREATE TRIGGER lost_ranges_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON lost_ranges
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 23: the blobs from before checksums, which the packer upgrades to
+/// checksummed ones, oldest first (see `packer`). Every node looks for one in
+/// every pass, so it's read off an index, which empties as they're upgraded.
+const LEGACY_BLOBS: &str = r#"
+CREATE INDEX blobs_legacy ON blobs (created_at)
+    WHERE state = 'committed' AND block_size IS NULL;
 "#;
 
 #[cfg(test)]

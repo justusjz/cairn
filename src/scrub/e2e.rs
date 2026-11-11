@@ -424,8 +424,14 @@ async fn lost_data_fails_up_front() {
     put(&app, "k", data.clone()).await;
     let blob_id = blob_of(&app, "k").await;
     flip(&app, blob_id, 70_000);
-    // Before the scrubber knows, a read is cut off at the damage.
+    // Before the scrubber knows, a read is cut off at the damage, and flags
+    // the copy (waited for, since a flag that lands while the scrubber
+    // records what it found has it check the copy again).
     assert_eq!(read(&app, "k", None).await, (StatusCode::OK, None));
+    let flagged = format!(
+        "SELECT count(*) FROM blob_locations WHERE blob_id = '{blob_id}' AND checked_at = '-infinity'"
+    );
+    wait_for(&app, &flagged, 1).await;
     assert_eq!(scrub(&app, Scope::Everything).await.lost, 1);
 
     let (status, body) = read(&app, "k", None).await;
@@ -528,4 +534,115 @@ async fn the_packer_leaves_lost_data_alone() {
     assert_eq!(get(&app, "k5").await.unwrap(), data(5));
     assert_eq!(lost(&app, packed).await, [], "they went with the blob");
     assert_eq!(lost(&app, damaged).await.len(), 1, "k0's are still there");
+}
+
+/// Makes an object's blob one from before checksums, as an old version of
+/// Cairn wrote it: its files bare data, and no checksums in the catalog but
+/// its parts' MD5s (their ETags).
+async fn make_legacy(nodes: &[Arc<App>], key: &str) -> Uuid {
+    let app = &nodes[0];
+    let blob_id = blob_of(app, key).await;
+    let client = app.pool.get().await.unwrap();
+    let size: i64 = client
+        .query_one("SELECT size FROM blobs WHERE blob_id = $1", &[&blob_id])
+        .await
+        .unwrap()
+        .get(0);
+    client
+        .batch_execute(&format!(
+            "SET cairn.protocol = '{}';
+             UPDATE blobs SET block_size = NULL, crc64nvme = NULL WHERE blob_id = '{blob_id}';
+             UPDATE parts SET crc64nvme = NULL WHERE blob_id = '{blob_id}';",
+            crate::db::PROTOCOL
+        ))
+        .await
+        .unwrap();
+    for node in nodes {
+        let path = node.store.blob_path(blob_id);
+        if let Ok(bytes) = std::fs::read(&path) {
+            std::fs::write(&path, &bytes[..size as usize]).unwrap();
+        }
+    }
+    blob_id
+}
+
+/// Whether a blob is checksummed.
+async fn checksummed(app: &App, blob_id: Uuid) -> bool {
+    let client = app.pool.get().await.unwrap();
+    client
+        .query_one("SELECT block_size IS NOT NULL FROM blobs WHERE blob_id = $1", &[&blob_id])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// Blobs from before checksums are upgraded, oldest first, as many as the
+/// budget allows, and then scrubbed like any other.
+#[tokio::test]
+async fn upgrades_blobs_from_before_checksums() {
+    let Some(app) = node().await else { return };
+    let mut old = Vec::new();
+    for i in 0..3u8 {
+        let data: Vec<u8> = (0..300_000u32).map(|j| (j % 241) as u8 ^ i).collect();
+        put(&app, &format!("old{i}"), data.clone()).await;
+        old.push((make_legacy(std::slice::from_ref(&app), &format!("old{i}")).await, data));
+    }
+    assert_eq!(scrub(&app, Scope::Everything).await.legacy, 3, "skipped, can't be checked");
+    // With scrubbing off (as in tests), a pass doesn't upgrade.
+    assert!(packer::pass(&app).await.unwrap().is_empty());
+
+    // A budget smaller than a blob still upgrades one: the oldest.
+    let reports = packer::upgrade(&app, 1).await.unwrap();
+    assert_eq!(reports.len(), 1);
+    assert!(checksummed(&app, blob_of(&app, "old0").await).await);
+    assert!(!checksummed(&app, old[1].0).await);
+    assert_eq!(packer::upgrade(&app, u64::MAX).await.unwrap().len(), 2);
+    for (i, (blob_id, data)) in old.iter().enumerate() {
+        let key = format!("old{i}");
+        assert_ne!(blob_of(&app, &key).await, *blob_id, "{key} moved");
+        assert_eq!(get(&app, &key).await.unwrap(), *data);
+    }
+    assert!(packer::upgrade(&app, u64::MAX).await.unwrap().is_empty());
+    let report = scrub(&app, Scope::Everything).await;
+    assert_eq!((report.copies, report.legacy, report.damaged), (3, 0, 0), "{report}");
+}
+
+/// A replica whose copy doesn't match its parts' MD5s is passed over for the
+/// next; with none that does, the parts are lost.
+#[tokio::test]
+async fn upgrades_from_an_intact_replica() {
+    let Some(cluster) = cluster(2, 2).await else { return };
+    let [a, b] = &cluster.nodes[..] else { unreachable!() };
+    let data: Vec<u8> = (0..300_000u32).map(|j| (j % 239) as u8).collect();
+    put(a, "repairable", data.clone()).await;
+    put(a, "lost", data.clone()).await;
+    let repairable = make_legacy(&cluster.nodes, "repairable").await;
+    let lost_blob = make_legacy(&cluster.nodes, "lost").await;
+    flip(a, repairable, 1000);
+    flip(a, lost_blob, 1000);
+    flip(b, lost_blob, 2000);
+
+    let reports = packer::upgrade(a, u64::MAX).await.unwrap();
+    assert_eq!(reports.len(), 1, "only one could be upgraded");
+    assert!(checksummed(a, blob_of(a, "repairable").await).await);
+    assert_eq!(get(a, "repairable").await.unwrap(), data);
+    let report = scrub(b, Scope::Everything).await;
+    assert_eq!((report.copies, report.damaged), (1, 0), "b's new copy is intact: {report}");
+
+    assert_eq!(blob_of(a, "lost").await, lost_blob, "left as it is");
+    assert_eq!(lost(a, lost_blob).await, [(0, 300_000)]);
+    let (status, _) = read(a, "lost", None).await;
+    assert_eq!(status, hyper::StatusCode::INTERNAL_SERVER_ERROR);
+    // It isn't tried again, even once its lease runs out.
+    a.pool
+        .get()
+        .await
+        .unwrap()
+        .batch_execute(&format!(
+            "SET cairn.protocol = '{}'; UPDATE blobs SET pack_lease_until = NULL",
+            crate::db::PROTOCOL
+        ))
+        .await
+        .unwrap();
+    assert!(packer::upgrade(a, u64::MAX).await.unwrap().is_empty());
 }

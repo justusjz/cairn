@@ -678,7 +678,8 @@ same block on another replica, so the client only ever gets intact data. If no
 replica has an intact copy of a block, the response is cut off there (its
 `Content-Length` tells the client it's incomplete), and the node logs a
 `CORRUPTION:` line naming the blob and node. Data written by earlier versions
-of Cairn has no checksums and is read unverified.
+of Cairn has no checksums and is read unverified, until the packer
+[rewrites it with checksums](#scrubbing).
 
 Every request body is checked against everything the request claims about it,
 as S3 checks it: the SHA-256 it's signed with (`x-amz-content-sha256`), the
@@ -736,7 +737,14 @@ data; once those objects are deleted, it's compacted as usual.
 
 What the scrubber finds is logged as a `CORRUPTION:` line, recorded in the
 database (`scrub_findings`), and shown on the dashboard's
-[Integrity](#dashboard) page. Data written by versions of Cairn without checksums isn't checked.
+[Integrity](#dashboard) page.
+
+Data written by versions of Cairn without checksums can't be checked as it
+is. The packer rewrites it with checksums, the oldest first, reading at the
+scrub rate (and not at all if scrubbing is off), and verifying each object's
+bytes against its MD5 (its ETag). A replica whose copy doesn't match is passed
+over for the next; if none matches, the data is recorded as lost. The
+Integrity page shows how much is still left.
 
 `POST /scrub` on a node's peer endpoint checks what's due right away, at
 full speed (`?all`: every copy), and reports what it found.
