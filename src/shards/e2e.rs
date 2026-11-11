@@ -491,3 +491,46 @@ async fn a_shard_has_one_location() {
     let locations = format!("SELECT count(*) FROM blob_locations WHERE blob_id = '{blob_id}'");
     assert_eq!(query_i64(a, &locations).await, 1);
 }
+
+/// The `parity-shards` setting overrides every node's `--replication-factor`
+/// once the nodes have read it, for uploads and coding alike; unset, the
+/// flag counts again. Blobs keep the layout they were written with.
+#[tokio::test]
+async fn parity_shards_overrides_the_flag() {
+    let Some(cluster) = cluster_with(4, 1, pack(), None).await else { return };
+    let a = &cluster.nodes[0];
+    let client = a.pool.get().await.unwrap();
+    put(a, "flag", data(40, 1000)).await;
+    crate::settings::PARITY_SHARDS.set(&client, 2).await.unwrap();
+    refresh(&cluster).await;
+    put(a, "setting", data(41, 2 * MIB)).await;
+    assert_eq!(layout_of(&cluster, "flag").await, (1, 0, 1));
+    assert_eq!(layout_of(&cluster, "setting").await, (1, 2, 3));
+    set_data_shards(a, 2).await;
+    client
+        .batch_execute(
+            "UPDATE blobs SET created_at = created_at - INTERVAL '8 days';
+             UPDATE parts SET created_at = created_at - INTERVAL '8 days';",
+        )
+        .await
+        .unwrap();
+    packer::pass(a).await.unwrap();
+    assert_eq!(layout_of(&cluster, "setting").await, (2, 2, 4), "coded with the setting's parity shards");
+    crate::settings::PARITY_SHARDS.unset(&client).await.unwrap();
+    refresh(&cluster).await;
+    put(a, "flag again", data(42, 1000)).await;
+    assert_eq!(layout_of(&cluster, "flag again").await, (1, 0, 1));
+}
+
+/// Has every node read the settings, as a heartbeat does.
+async fn refresh(cluster: &Cluster) {
+    for node in &cluster.nodes {
+        crate::refresh_settings(node).await.unwrap();
+    }
+}
+
+/// An object's blob's data and parity shards, and how many locations it has.
+async fn layout_of(cluster: &Cluster, key: &str) -> (u32, u32, usize) {
+    let (layout, holders) = shards_of(cluster, blob_of(&cluster.nodes[0], key).await).await;
+    (layout.data_shards, layout.parity_shards, holders.len())
+}

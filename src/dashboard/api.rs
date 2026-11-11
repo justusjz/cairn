@@ -81,6 +81,9 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(get_lifecycle))
         .routes(routes!(get_bucket_lifecycle, put_bucket_lifecycle, delete_bucket_lifecycle))
         .routes(routes!(set_lifecycle_rate))
+        .routes(routes!(set_setting))
+        .routes(routes!(remove_node))
+        .routes(routes!(keep_node))
 }
 
 /// The API's OpenAPI spec, as committed in `ui/openapi.json`.
@@ -170,7 +173,7 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
     }
     Ok(Cluster {
         this_node: app.node,
-        replication_factor: app.replication_factor,
+        replication_factor: app.replication_factor(),
         now: crate::metrics::now_secs(),
         nodes,
     })
@@ -318,6 +321,12 @@ struct PackerSettings {
     /// must be. One data shard: it isn't.
     data_shards: i64,
     parity_shards: u32,
+    /// The `parity-shards` setting, if it's set; else every node goes by its
+    /// `--replication-factor`.
+    parity_setting: Option<i64>,
+    /// The most data and parity shards the settings allow.
+    max_data_shards: i64,
+    max_parity_shards: i64,
     cold_age_secs: u64,
     /// Whether it's coded now: also takes as many live nodes as shards.
     coding: bool,
@@ -499,7 +508,7 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
         )
         .await?;
     Ok(Storage {
-        replication_factor: app.replication_factor,
+        replication_factor: app.replication_factor(),
         nodes,
         replicas,
         blobs: BlobTotals {
@@ -540,6 +549,9 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             max_sources: app.pack.max_sources,
             data_shards: crate::settings::DATA_SHARDS.get(&client).await?,
             parity_shards: app.parity_shards(),
+            parity_setting: crate::settings::PARITY_SHARDS.get_set(&client).await?,
+            max_data_shards: crate::settings::DATA_SHARDS.max,
+            max_parity_shards: crate::settings::PARITY_SHARDS.max,
             cold_age_secs: app.pack.cold_age.as_secs(),
             coding: crate::packer::coding(app).await?.is_some(),
         },
@@ -1705,6 +1717,51 @@ mod e2e {
         builder.body(axum::body::Body::from(body)).unwrap()
     }
 
+    /// The redundancy settings, and removing nodes, as the dashboard
+    /// changes them.
+    #[tokio::test]
+    async fn sets_redundancy_and_removes_nodes() {
+        let Some(app) = node().await else { return };
+        let client = app.pool.get().await.unwrap();
+        let set = |name: &str, value: Value| {
+            request("PUT", &format!("/_dashboard/api/settings/{name}"), Some(serde_json::json!({"value": value})))
+        };
+        // A single node: 3 copies take more than it has.
+        let (status, _, body) = send(&app, set("parity-shards", 2.into())).await;
+        assert_eq!(status, StatusCode::OK);
+        let warnings = serde_json::from_slice::<Value>(&body).unwrap()["warnings"].clone();
+        assert!(warnings[0].as_str().unwrap().contains("uploads fail"), "{warnings}");
+        assert_eq!(crate::settings::PARITY_SHARDS.get_set(&client).await.unwrap(), Some(2));
+        assert_eq!(app.parity_shards(), 2, "the node answering goes by it at once");
+        let storage = serde_json::to_value(storage(&app).await.unwrap()).unwrap();
+        assert_eq!(storage["packer"]["parity_setting"], 2);
+        let (status, _, _) = send(&app, set("parity-shards", Value::Null)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(crate::settings::PARITY_SHARDS.get_set(&client).await.unwrap(), None);
+        assert_eq!(app.parity_shards(), 0, "the flag again");
+        let (status, _, _) = send(&app, set("repair-after", 30.into())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(crate::settings::REPAIR_AFTER.get(&client).await.unwrap(), 30);
+        let (status, _, body) = send(&app, set("data-shards", 0.into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error_of(&body).contains("from 1 to"), "{}", error_of(&body));
+        assert_eq!(send(&app, set("lifecycle-rate", 1.into())).await.0, StatusCode::NOT_FOUND);
+
+        let node = app.node;
+        let remove = request("POST", &format!("/_dashboard/api/nodes/{node}/remove"), None);
+        let (status, _, body) = send(&app, remove).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["shards"], 0);
+        let again = request("POST", &format!("/_dashboard/api/nodes/{node}/remove"), None);
+        assert_eq!(send(&app, again).await.0, StatusCode::CONFLICT);
+        let keep = request("POST", &format!("/_dashboard/api/nodes/{node}/keep"), None);
+        assert_eq!(send(&app, keep).await.0, StatusCode::NO_CONTENT);
+        let cluster = serde_json::to_value(cluster(&app).await.unwrap()).unwrap();
+        assert_eq!(cluster["nodes"][0]["state"], "active");
+        let missing = request("POST", "/_dashboard/api/nodes/9999/keep", None);
+        assert_eq!(send(&app, missing).await.0, StatusCode::NOT_FOUND);
+    }
+
     fn error_of(body: &[u8]) -> String {
         serde_json::from_slice::<Value>(body).unwrap()["error"]
             .as_str()
@@ -2099,6 +2156,108 @@ struct NewRate {
 }
 
 /// Sets the rate lifecycle sweeps go at, for the whole cluster.
+/// A cluster setting's new value; `null` unsets it (it's back to its
+/// default, or for `parity-shards`, every node goes by its flag again).
+#[derive(Deserialize, ToSchema)]
+struct NewSetting {
+    value: Option<i64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct SettingChanged {
+    /// What's wrong with the cluster's layouts now, if anything: too few
+    /// nodes for them, say.
+    warnings: Vec<String>,
+}
+
+/// The settings that the dashboard changes this way: those of how blobs are
+/// stored, and repaired.
+const REDUNDANCY: &[&crate::settings::Setting] = &[
+    &crate::settings::DATA_SHARDS,
+    &crate::settings::PARITY_SHARDS,
+    &crate::settings::REPAIR_AFTER,
+];
+
+/// Sets one of the redundancy settings (`data-shards`, `parity-shards`,
+/// `repair-after`), for the whole cluster, as `cairn config set` does. The
+/// node answering goes by it right away, the others within a heartbeat.
+#[utoipa::path(put, path = "/settings/{name}", params(("name" = String, Path)),
+    request_body = NewSetting, responses(
+        (status = 200, body = SettingChanged),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn set_setting(
+    State(app): AppState,
+    Path(name): Path<String>,
+    Json(body): Json<NewSetting>,
+) -> Result<Json<SettingChanged>> {
+    let Some(setting) = REDUNDANCY.iter().find(|s| s.name == name) else {
+        return Err(ApiError::NotFound(format!("no setting {name:?} to set here")));
+    };
+    let client = app.pool.get().await?;
+    match body.value {
+        Some(value) if value < setting.min || value > setting.max => {
+            return Err(ApiError::BadRequest(format!(
+                "{name} must be from {} to {}",
+                setting.min, setting.max
+            )));
+        }
+        Some(value) => setting.set(&client, value).await?,
+        None => setting.unset(&client).await?,
+    }
+    crate::refresh_settings(&app).await?;
+    let warnings = if setting.name == crate::settings::REPAIR_AFTER.name {
+        Vec::new()
+    } else {
+        crate::settings::placement_warnings(&client).await?
+    };
+    Ok(Json(SettingChanged { warnings }))
+}
+
+#[derive(Serialize, ToSchema)]
+struct NodeRemoved {
+    /// The shards it holds, which move to other nodes.
+    shards: i64,
+}
+
+/// Starts removing a node, as `cairn node remove` does: it gets no new
+/// shards, and its shards move to the other nodes (see `mover`).
+#[utoipa::path(post, path = "/nodes/{id}/remove", params(("id" = i32, Path)), responses(
+    (status = 200, body = NodeRemoved),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn remove_node(State(app): AppState, Path(id): Path<i32>) -> Result<Json<NodeRemoved>> {
+    match crate::nodes::remove(&app.pool.get().await?, id).await? {
+        Ok(shards) => Ok(Json(NodeRemoved { shards })),
+        Err(why) => Err(node_unchanged(id, why)),
+    }
+}
+
+/// Keeps a node that's being removed, or was, as `cairn node keep` does: it
+/// gets shards again; those that moved stay where they are.
+#[utoipa::path(post, path = "/nodes/{id}/keep", params(("id" = i32, Path)), responses(
+    (status = 204, description = "Kept"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn keep_node(State(app): AppState, Path(id): Path<i32>) -> Result<StatusCode> {
+    match crate::nodes::keep(&app.pool.get().await?, id).await? {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(why) => Err(node_unchanged(id, why)),
+    }
+}
+
+/// Why a node's state didn't change, as an error.
+fn node_unchanged(id: i32, why: String) -> ApiError {
+    if why == "doesn't exist" {
+        ApiError::NotFound(format!("node {id} {why}"))
+    } else {
+        ApiError::Conflict(format!("node {id} {why}"))
+    }
+}
+
 #[utoipa::path(put, path = "/lifecycle/rate", request_body = NewRate, responses(
     (status = 204, description = "Set"),
     (status = "4XX", body = ErrorBody),

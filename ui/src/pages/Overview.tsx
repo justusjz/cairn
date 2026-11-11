@@ -1,7 +1,7 @@
 import { For, Show, createMemo, createSignal } from "solid-js";
 import { type Cluster, api, diskOf, statsError, statsOf } from "../api";
 import { LineChart } from "../components/LineChart";
-import { Badge, Bar, Card, LiveDot, Loading, Panel, Table, poll } from "../components/ui";
+import { Badge, Bar, Card, LiveDot, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { ago, bytes, duration, num, pct, rate } from "../format";
 import { mergeHistory, opsTotals, recentRates, series } from "../metrics";
 
@@ -16,12 +16,29 @@ export default function Overview() {
   const cluster = poll(api.cluster, 5000);
   return (
     <Show when={cluster.data()} fallback={<Loading error={cluster.error()} />}>
-      {(c) => <View cluster={c()} />}
+      {(c) => <View cluster={c()} refresh={cluster.refresh} />}
     </Show>
   );
 }
 
-function View(props: { cluster: Cluster }) {
+function View(props: { cluster: Cluster; refresh: () => void }) {
+  // Removing a node moves all of its shards to the others, so it's asked
+  // first; keeping one isn't.
+  const remove = async (id: number) => {
+    const live = props.cluster.nodes.find((n) => n.id === id)?.live;
+    const how = live ? "copied from it while it's up" : "rebuilt from the other shards, since it's down";
+    if (!confirm(`Remove node #${id}? It gets no new data, and all of its shards move to the other nodes, ${how}.`)) {
+      return;
+    }
+    const done = await act(() => api.removeNode(id));
+    if (done) {
+      toast(`Node #${id} is being removed: ${num(done.value.shards)} shards move to the other nodes`);
+      props.refresh();
+    }
+  };
+  const keep = async (id: number) => {
+    if (await act(() => api.keepNode(id), `Node #${id} is kept: it gets new data again`)) props.refresh();
+  };
   const [span, setSpan] = createSignal(900);
   const nodes = () => props.cluster.nodes;
   const live = () => nodes().filter((n) => n.live);
@@ -136,7 +153,7 @@ function View(props: { cluster: Cluster }) {
         <Panel title="Nodes" note="a node is live if it was seen in the last 10 s">
           <Table
             count={nodes().length}
-            columns={["Node", "Peer URL", "Status", "Version", "Disk", { label: "Requests", num: true }, { label: "In flight", num: true }, "Last maintenance"]}
+            columns={["Node", "Peer URL", "Status", "Version", "Disk", { label: "Requests", num: true }, { label: "In flight", num: true }, "Last maintenance", ""]}
           >
             <For each={nodes()}>
               {(n) => {
@@ -198,6 +215,20 @@ function View(props: { cluster: Cluster }) {
                         <Show when={!m()!.running_since} fallback={<Badge tone="accent">running</Badge>}>
                           {m()!.last_started ? ago(m()!.last_started) : "not yet"}
                         </Show>
+                      </Show>
+                    </td>
+                    <td>
+                      <Show
+                        when={n.state === "active"}
+                        fallback={
+                          <button type="button" onClick={() => keep(n.id)} title="It gets new data again; what moved stays moved">
+                            Keep
+                          </button>
+                        }
+                      >
+                        <button type="button" onClick={() => remove(n.id)} title="Move its shards to the other nodes">
+                          Remove
+                        </button>
                       </Show>
                     </td>
                   </tr>

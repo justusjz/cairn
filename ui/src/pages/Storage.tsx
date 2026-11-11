@@ -1,21 +1,21 @@
-import { For, Show, createMemo } from "solid-js";
+import { For, Show, createMemo, createSignal } from "solid-js";
 import { type Cluster, type Storage as StorageInfo, api, diskOf } from "../api";
 
 type ReplicaGroup = StorageInfo["replicas"][number];
-import { Badge, Bar, Card, LiveDot, Loading, Panel, Table, poll } from "../components/ui";
-import { bytes, num, pct } from "../format";
+import { Badge, Bar, Card, LiveDot, Loading, Panel, Table, act, poll, toast } from "../components/ui";
+import { bytes, num, pct, plural } from "../format";
 
 export default function Storage() {
   // The catalog's numbers take a scan, so they're refreshed less often.
   const data = poll(() => Promise.all([api.storage(), api.cluster()]), 30000);
   return (
     <Show when={data.data()} fallback={<Loading error={data.error()} />}>
-      {(d) => <View storage={d()[0]} cluster={d()[1]} />}
+      {(d) => <View storage={d()[0]} cluster={d()[1]} refresh={data.refresh} />}
     </Show>
   );
 }
 
-function View(props: { storage: StorageInfo; cluster: Cluster }) {
+function View(props: { storage: StorageInfo; cluster: Cluster; refresh: () => void }) {
   const s = () => props.storage;
   const rf = () => s().replication_factor;
   // A blob is readable with as many live shards as it has data shards (one
@@ -81,6 +81,8 @@ function View(props: { storage: StorageInfo; cluster: Cluster }) {
           tone={health().lost ? "bad" : "ok"}
         />
       </div>
+
+      <Redundancy storage={s()} cluster={props.cluster} refresh={props.refresh} />
 
       <div class="grid cols-2">
         <Panel
@@ -158,5 +160,132 @@ function View(props: { storage: StorageInfo; cluster: Cluster }) {
         </Panel>
       </div>
     </>
+  );
+}
+
+/** The cluster's redundancy settings: how many nodes every blob survives
+ * losing (parity shards), what cold data is coded into (data shards), and
+ * when a node that's down has its shards rebuilt. */
+function Redundancy(props: { storage: StorageInfo; cluster: Cluster; refresh: () => void }) {
+  const pk = () => props.storage.packer;
+  const after = () => props.storage.backlog.repair_after;
+  const active = () => props.cluster.nodes.filter((n) => n.state === "active").length;
+  const set = async (name: string, value: number | null, done: string) => {
+    const result = await act(() => api.setSetting(name, value), done);
+    if (result) {
+      for (const warning of result.value.warnings) toast(warning, true);
+      props.refresh();
+    }
+  };
+  return (
+    <Panel
+      title="Redundancy"
+      note={`for the whole cluster · nodes go by a change within a heartbeat; blobs keep the layout they were written with · ${num(active())} active nodes`}
+    >
+      <Table count={3} columns={["Setting", "Now", "", "Change"]}>
+        <SettingRow
+          label="Parity shards"
+          value={`${num(pk().parity_shards)}`}
+          note={
+            pk().parity_setting == null
+              ? `from each node's --replication-factor (${num(pk().parity_shards + 1)} copies on this one); set it here for the whole cluster`
+              : `every new blob survives losing ${plural(pk().parity_shards, "node", "nodes")}: ` +
+                `${plural(pk().parity_shards + 1, "copy", "copies")}, or ${plural(pk().parity_shards, "parity shard", "parity shards")} when coded`
+          }
+          placeholder="parity shards"
+          min={0}
+          max={pk().max_parity_shards}
+          onSet={(v) => set("parity-shards", v, `Parity shards set to ${num(v)}: ${num(v + 1)} copies of every new blob`)}
+          unset={
+            pk().parity_setting == null
+              ? undefined
+              : { label: "Use the nodes' flags", run: () => set("parity-shards", null, "Every node goes by its --replication-factor again") }
+          }
+        />
+        <SettingRow
+          label="Data shards"
+          value={pk().data_shards > 1 ? `coded ${pk().data_shards}+${pk().parity_shards}` : "off"}
+          note={
+            pk().data_shards > 1
+              ? `cold data (a week old) is erasure-coded into ${num(pk().data_shards)} data shards` +
+                (pk().coding ? "" : `, once ${num(pk().data_shards + pk().parity_shards)} nodes are live`)
+              : "1 keeps every blob replicated; more erasure-codes cold data, which takes as many nodes as data and parity shards"
+          }
+          placeholder="data shards"
+          min={1}
+          max={pk().max_data_shards}
+          onSet={(v) =>
+            set("data-shards", v, v > 1 ? `Cold data is coded ${num(v)}+${num(pk().parity_shards)} from now on` : "Erasure coding is off")
+          }
+        />
+        <SettingRow
+          label="Repair after"
+          value={after() > 0 ? `${num(after())} min` : "off"}
+          note={
+            after() > 0
+              ? "a node down that long has its shards rebuilt on the others, without being removed"
+              : "a node that's down keeps its shards until it's removed (Overview: Remove)"
+          }
+          placeholder="minutes, 0 for off"
+          min={0}
+          onSet={(v) =>
+            set("repair-after", v, v > 0 ? `Nodes down for ${num(v)} min have their shards rebuilt` : "Repair of nodes that are down is off")
+          }
+        />
+      </Table>
+    </Panel>
+  );
+}
+
+/** A setting's row: its value, what it means, and a form to change it. */
+function SettingRow(props: {
+  label: string;
+  value: string;
+  note: string;
+  placeholder: string;
+  min: number;
+  max?: number;
+  onSet: (value: number) => void;
+  unset?: { label: string; run: () => void };
+}) {
+  const [input, setInput] = createSignal("");
+  const submit = (e: SubmitEvent) => {
+    e.preventDefault();
+    const value = Number(input().trim());
+    if (input().trim() === "" || !Number.isInteger(value) || value < props.min || (props.max != null && value > props.max)) {
+      toast(`${props.label}: a whole number from ${props.min}${props.max != null ? ` to ${props.max}` : " up"}`, true);
+      return;
+    }
+    props.onSet(value);
+    setInput("");
+  };
+  return (
+    <tr>
+      <td>{props.label}</td>
+      <td>
+        <strong>{props.value}</strong>
+      </td>
+      <td class="subtle small">{props.note}</td>
+      <td>
+        <form class="form-row" onSubmit={submit}>
+          <input
+            type="text"
+            inputmode="numeric"
+            placeholder={props.placeholder}
+            aria-label={props.label}
+            value={input()}
+            onInput={(e) => setInput(e.currentTarget.value)}
+          />
+          <button class="primary" type="submit">
+            Set
+          </button>
+          <Show when={props.unset}>
+            <button type="button" onClick={() => props.unset!.run()}>
+              {props.unset!.label}
+            </button>
+          </Show>
+        </form>
+      </td>
+    </tr>
   );
 }

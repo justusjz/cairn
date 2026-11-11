@@ -41,9 +41,10 @@ Done:
   shards to the others, copied from it while it's up, else rebuilt from the
   other shards; the `repair-after` setting rebuilds a node's shards once it
   has been down that long. Implemented.
-- **Replication factor in the database.** One setting for the whole cluster,
-  instead of a `serve` flag that every node must agree on. Open: how existing
-  clusters move over.
+- **Replication factor in the database.** The `parity-shards` setting, next
+  to `data-shards`: unset, every node goes by its `--replication-factor` as
+  before; once set, it overrides the flags. Implemented; the flag can go in
+  a later release.
 - **Cluster status.** A `cairn status` command that shows which nodes are
   down, and how much data is below the replication factor. (The dashboard's
   Storage page shows this already.)

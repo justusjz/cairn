@@ -370,7 +370,7 @@ pub async fn node_stats(app: &App) -> NodeStats {
         node: app.node,
         node_id: app.store.get_node_id().to_string(),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        replication_factor: app.replication_factor,
+        replication_factor: app.replication_factor(),
         scrub_rate: app.scrub_rate,
         now: now_secs(),
         disk,

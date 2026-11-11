@@ -540,7 +540,6 @@
     },
     "/lifecycle/rate": {
       "put": {
-        "summary": "Sets the rate lifecycle sweeps go at, for the whole cluster.",
         "operationId": "set_lifecycle_rate",
         "requestBody": {
           "content": {
@@ -555,6 +554,92 @@
         "responses": {
           "204": {
             "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/nodes/{id}/keep": {
+      "post": {
+        "summary": "Keeps a node that's being removed, or was, as `cairn node keep` does: it\ngets shards again; those that moved stay where they are.",
+        "operationId": "keep_node",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Kept"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/nodes/{id}/remove": {
+      "post": {
+        "summary": "Starts removing a node, as `cairn node remove` does: it gets no new\nshards, and its shards move to the other nodes (see `mover`).",
+        "operationId": "remove_node",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NodeRemoved"
+                }
+              }
+            }
           },
           "4XX": {
             "content": {
@@ -866,6 +951,61 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Secret"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/settings/{name}": {
+      "put": {
+        "summary": "Sets one of the redundancy settings (`data-shards`, `parity-shards`,\n`repair-after`), for the whole cluster, as `cairn config set` does. The\nnode answering goes by it right away, the others within a heartbeat.",
+        "operationId": "set_setting",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSetting"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SettingChanged"
                 }
               }
             }
@@ -2296,6 +2436,19 @@
           }
         }
       },
+      "NewSetting": {
+        "type": "object",
+        "description": "Sets the rate lifecycle sweeps go at, for the whole cluster.\nA cluster setting's new value; `null` unsets it (it's back to its\ndefault, or for `parity-shards`, every node goes by its flag again).",
+        "properties": {
+          "value": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          }
+        }
+      },
       "NodeCoverage": {
         "type": "object",
         "description": "The copies of committed, checksummed blobs a node holds, and how recently\nthey were known intact.",
@@ -2375,6 +2528,19 @@
           "node": {
             "type": "integer",
             "format": "int32"
+          }
+        }
+      },
+      "NodeRemoved": {
+        "type": "object",
+        "required": [
+          "shards"
+        ],
+        "properties": {
+          "shards": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The shards it holds, which move to other nodes."
           }
         }
       },
@@ -2540,6 +2706,8 @@
           "max_sources",
           "data_shards",
           "parity_shards",
+          "max_data_shards",
+          "max_parity_shards",
           "cold_age_secs",
           "coding"
         ],
@@ -2562,9 +2730,26 @@
             "format": "int64",
             "description": "What cold data is erasure-coded into (the `data-shards` setting, and\nthe parity shards that `--replication-factor` gives), and how old it\nmust be. One data shard: it isn't."
           },
+          "max_data_shards": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The most data and parity shards the settings allow."
+          },
+          "max_parity_shards": {
+            "type": "integer",
+            "format": "int64"
+          },
           "max_sources": {
             "type": "integer",
             "format": "int64"
+          },
+          "parity_setting": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The `parity-shards` setting, if it's set; else every node goes by its\n`--replication-factor`."
           },
           "parity_shards": {
             "type": "integer",
@@ -2869,6 +3054,21 @@
           },
           "secret": {
             "type": "string"
+          }
+        }
+      },
+      "SettingChanged": {
+        "type": "object",
+        "required": [
+          "warnings"
+        ],
+        "properties": {
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "What's wrong with the cluster's layouts now, if anything: too few\nnodes for them, say."
           }
         }
       },

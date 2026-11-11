@@ -98,7 +98,7 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--listen-client <ADDR>` | `CAIRN_LISTEN_CLIENT` | *required* | Bind address for the S3 API. |
 | `--listen-peer <ADDR>` | `CAIRN_LISTEN_PEER` | `127.0.0.1:9431` | Bind address for the peer endpoint (replica traffic between nodes). Always runs. |
 | `--peer-url <URL>` | `CAIRN_PEER_URL` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
-| `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on. |
+| `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on, until the cluster's `parity-shards` setting is set (see below), which overrides it on every node. |
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
@@ -156,6 +156,19 @@ holds the data.
 With replication factor `N`, writes succeed as long as at least `N` nodes are
 live; if fewer than `N` are available, uploads are rejected (metadata operations
 still work, since they live in Postgres).
+
+The replication factor is better set once for the whole cluster, in the
+database, than on every node, where the nodes can disagree. It's the
+`parity-shards` setting plus 1: the copies besides the first. Once it's set,
+every node goes by it (within a heartbeat), and ignores its flag:
+
+```sh
+cairn config --database "$DB" set parity-shards 2     # 3 copies of every new blob
+cairn config --database "$DB" unset parity-shards     # back to each node's flag
+```
+
+A change applies to blobs written from then on; existing blobs keep their
+copies.
 
 Data that has gone cold can be stored with less overhead than full copies,
 with the same tolerance for lost nodes: see [Erasure coding](#erasure-coding).
@@ -289,8 +302,12 @@ cluster:
 
 - **Overview:** which nodes are live, how full their disks are, and request
   rates, errors, throughput and latency over the last hour, by S3 operation.
-- **Storage:** how much data there is, how much of it has fewer live copies
-  than the replication factor, and what each node holds.
+  Nodes can be [removed](#removing-nodes-and-repair) (and kept) there.
+- **Storage:** how much data there is, in which layouts (replicated, or
+  [erasure-coded](#erasure-coding)), how much of it has fewer live shards
+  than it should, and what each node holds; and the redundancy settings,
+  which can be changed there: `parity-shards`, `data-shards` and
+  `repair-after`.
 - **Integrity:** what the [scrubbers](#scrubbing) checked and found: per
   node, how long a full check takes at its rate and how recently its data was
   checked; damaged and missing copies, and whether they were repaired; and
@@ -813,15 +830,17 @@ The nodes coordinate through the database, so each blob is packed only once.
 Every blob is stored as *k* data shards and *m* parity shards, each on a node
 of its own, any *k* of which hold all of its data. Replication is *k* = 1: the
 one data shard is the blob, and each parity shard is a copy of it. Uploads are
-always replicated, with *m* = `--replication-factor` − 1. Once data has gone
+always replicated, with *m* the `parity-shards` setting (or, while it isn't
+set, each node's `--replication-factor` − 1). Once data has gone
 cold, the packer can rewrite it with *k* > 1, which survives losing as many
 nodes, *m*, but stores *(k + m) / k* times the data rather than *m + 1* times:
 with replication factor 3, coding 4+2 stores 1.5× instead of 3×.
 
-Coding is off until you choose *k*, for the whole cluster:
+Coding is off until you choose *k*, for the whole cluster, next to *m*:
 
 ```sh
-cairn config --database "$DB" set data-shards 4
+cairn config --database "$DB" set parity-shards 2
+cairn config --database "$DB" set data-shards 4      # cold data is coded 4+2
 ```
 
 Cairn never picks *k* itself: only you know how many nodes the cluster will

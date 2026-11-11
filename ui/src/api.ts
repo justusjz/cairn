@@ -92,6 +92,13 @@ export const api = {
     ok(client.PUT("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket), body: configuration })),
   deleteBucketLifecycle: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),
   setLifecycleRate: (rate: number) => ok(client.PUT("/lifecycle/rate", { body: { rate } })),
+  /** Sets a redundancy setting (`data-shards`, `parity-shards`,
+   * `repair-after`); `null` unsets it. Resolves to what's wrong with the
+   * cluster's layouts now, if anything. */
+  setSetting: (name: string, value: number | null) =>
+    ok(client.PUT("/settings/{name}", { params: { path: { name } }, body: { value } })),
+  removeNode: (id: number) => ok(client.POST("/nodes/{id}/remove", { params: { path: { id } } })),
+  keepNode: (id: number) => ok(client.POST("/nodes/{id}/keep", { params: { path: { id } } })),
   revoke: (role: string, bucket: string, permission: Permission) =>
     ok(client.DELETE("/roles/{role}/grants", { params: { ...rolePath(role), query: { bucket, permission } } })),
 };

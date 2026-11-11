@@ -1,6 +1,7 @@
 //! `cairn node`: the cluster's nodes, and removing them (see `mover`).
 
 use clap::{Args, Subcommand};
+use deadpool_postgres::GenericClient;
 
 use crate::db::Cached;
 
@@ -53,40 +54,55 @@ pub async fn node_main(args: NodeArgs) -> anyhow::Result<()> {
                 println!("{id:>4}  {state:<9} {live:<5} {shards:>10}  {url}");
             }
         }
-        NodeCommand::Remove { id } => {
-            let row = client
-                .query_opt_cached(
-                    "UPDATE nodes SET state = 'removing', state_since = NOW() WHERE id = $1 AND state = 'active'
-                     RETURNING (SELECT count(*) FROM blob_locations bl WHERE bl.node = $1)",
-                    &[&id],
-                )
-                .await?;
-            match row {
-                Some(row) => {
-                    let shards: i64 = row.get(0);
-                    println!(
-                        "node {id} is being removed: its {shards} shards move to other nodes \
-                         (`cairn node list` shows how many are left)"
-                    );
-                }
-                None => anyhow::bail!("node {id} {}", not_active(&client, id).await?),
-            }
-        }
-        NodeCommand::Keep { id } => {
-            let updated = client
-                .execute_cached("UPDATE nodes SET state = 'active', state_since = NOW() WHERE id = $1 AND state <> 'active'", &[&id])
-                .await?;
-            if updated == 0 {
-                anyhow::bail!("node {id} {}", not_active(&client, id).await?);
-            }
-            println!("node {id} is kept: it gets new shards again");
-        }
+        NodeCommand::Remove { id } => match remove(&client, id).await? {
+            Ok(shards) => println!(
+                "node {id} is being removed: its {shards} shards move to other nodes \
+                 (`cairn node list` shows how many are left)"
+            ),
+            Err(why) => anyhow::bail!("node {id} {why}"),
+        },
+        NodeCommand::Keep { id } => match keep(&client, id).await? {
+            Ok(()) => println!("node {id} is kept: it gets new shards again"),
+            Err(why) => anyhow::bail!("node {id} {why}"),
+        },
     }
     Ok(())
 }
 
-/// Why a node couldn't change its state.
-async fn not_active(client: &deadpool_postgres::Object, id: i32) -> anyhow::Result<String> {
+/// Starts removing node `id`: it gets no new shards, and its shards move to
+/// other nodes (see `mover`). How many it holds; or why it can't be removed
+/// (it doesn't exist, or isn't active).
+pub async fn remove<C: GenericClient>(client: &C, id: i32) -> anyhow::Result<Result<i64, String>> {
+    let row = client
+        .query_opt_cached(
+            "UPDATE nodes SET state = 'removing', state_since = NOW() WHERE id = $1 AND state = 'active'
+             RETURNING (SELECT count(*) FROM blob_locations bl WHERE bl.node = $1)",
+            &[&id],
+        )
+        .await?;
+    match row {
+        Some(row) => Ok(Ok(row.get(0))),
+        None => Ok(Err(not_changed(client, id).await?)),
+    }
+}
+
+/// Keeps node `id`, which is being removed, or was: it gets shards again.
+/// Or why it can't be kept (it doesn't exist, or is active).
+pub async fn keep<C: GenericClient>(client: &C, id: i32) -> anyhow::Result<Result<(), String>> {
+    let updated = client
+        .execute_cached(
+            "UPDATE nodes SET state = 'active', state_since = NOW() WHERE id = $1 AND state <> 'active'",
+            &[&id],
+        )
+        .await?;
+    if updated == 0 {
+        return Ok(Err(not_changed(client, id).await?));
+    }
+    Ok(Ok(()))
+}
+
+/// Why a node's state didn't change.
+async fn not_changed<C: GenericClient>(client: &C, id: i32) -> anyhow::Result<String> {
     let state = client.query_opt_cached("SELECT state FROM nodes WHERE id = $1", &[&id]).await?;
     Ok(match state {
         None => "doesn't exist".to_owned(),

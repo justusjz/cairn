@@ -57,7 +57,11 @@ pub struct App {
     store: Store,
     /// This node's number (`nodes.id`), which locations refer to it by.
     node: i32,
-    replication_factor: usize,
+    /// `--replication-factor`, which the `parity-shards` setting overrides.
+    replication_flag: usize,
+    /// The `parity-shards` setting as of the last heartbeat; -1 while it's
+    /// not set (see `refresh_settings`).
+    parity_setting: std::sync::atomic::AtomicI64,
     /// How many bytes per second the scrubber reads; 0 if it's off.
     scrub_rate: u64,
     writing: WritingSet,
@@ -76,12 +80,39 @@ pub struct App {
 }
 
 impl App {
-    /// How many parity shards a new blob gets: as many as there are replicas
-    /// besides the blob's one data shard, so that coded blobs survive losing
-    /// as many nodes as replicated ones (see `shards`).
+    /// How many parity shards a new blob gets, replicated or coded (see
+    /// `shards`): the `parity-shards` setting, or while it isn't set, as many
+    /// as there are replicas besides the first (`--replication-factor` − 1).
     pub(crate) fn parity_shards(&self) -> u32 {
-        self.replication_factor.saturating_sub(1) as u32
+        match self.parity_setting.load(std::sync::atomic::Ordering::Relaxed) {
+            parity if parity >= 0 => parity as u32,
+            _ => self.replication_flag.saturating_sub(1) as u32,
+        }
     }
+
+    /// How many copies a new replicated blob gets: its parity shards, and
+    /// the one data shard.
+    pub(crate) fn replication_factor(&self) -> usize {
+        self.parity_shards() as usize + 1
+    }
+}
+
+/// Reads the settings every node keeps a copy of, which it goes by between
+/// heartbeats: `parity-shards`, which uploads would otherwise read every
+/// time. Says so when it overrides `--replication-factor`.
+async fn refresh_settings(app: &App) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
+    let parity = settings::PARITY_SHARDS.get_set(&client).await?.unwrap_or(-1);
+    let before = app.parity_setting.swap(parity, std::sync::atomic::Ordering::Relaxed);
+    if parity != before && parity >= 0 && parity as usize + 1 != app.replication_flag {
+        eprintln!(
+            "parity-shards is set to {parity}: new blobs get {} copies, or {parity} parity shards, \
+             whatever --replication-factor {} says",
+            parity + 1,
+            app.replication_flag
+        );
+    }
+    Ok(())
 }
 
 #[derive(Parser, Debug)]
@@ -124,7 +155,9 @@ struct ServeArgs {
     /// only if the bind address isn't routable (e.g. 0.0.0.0).
     #[arg(long, env = "CAIRN_PEER_URL")]
     peer_url: Option<String>,
-    /// How many replicas every blob is stored on.
+    /// How many replicas every blob is stored on, until the cluster's
+    /// `parity-shards` setting says otherwise (a replication factor of it
+    /// plus 1), which overrides this on every node.
     #[arg(long, env = "CAIRN_REPLICATION_FACTOR", default_value_t = 1)]
     replication_factor: usize,
     /// Local directory for blobs.
@@ -184,7 +217,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         pool,
         store,
         node,
-        replication_factor: args.replication_factor,
+        replication_flag: args.replication_factor,
+        parity_setting: std::sync::atomic::AtomicI64::new(-1),
         scrub_rate: args.scrub_rate,
         writing: WritingSet::default(),
         pack: packer::Config::default(),
@@ -196,6 +230,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         #[cfg(test)]
         pack_hook: None,
     });
+    refresh_settings(&app).await?;
     tokio::spawn(heartbeat(app.clone(), peer_url));
     tokio::spawn(maintain(app.clone()));
     tokio::spawn(apply_lifecycles(app.clone()));
@@ -361,6 +396,9 @@ async fn heartbeat(app: Arc<App>, peer_url: String) {
         interval.tick().await;
         if let Err(e) = register_node(&app.pool, &app.store, &peer_url).await {
             eprintln!("heartbeat failed: {e}");
+        }
+        if let Err(e) = refresh_settings(&app).await {
+            eprintln!("reading the settings failed: {e:#}");
         }
     }
 }
@@ -822,6 +860,8 @@ pub(crate) struct BlobWriter {
     /// Each sink's shard, and the CRC of the file it stored.
     sinks: JoinSet<anyhow::Result<(u32, u64)>>,
     coding: Coding,
+    /// Its parity shards, as of when it started: the setting may change.
+    parity_shards: u32,
     /// The CRC of the blob's bytes.
     crc: crc64fast_nvme::Digest,
     size: u64,
@@ -883,7 +923,8 @@ impl BlobWriter {
         // before the insert, since that may have happened by then; if the
         // insert is still underway when the discard runs, the GC has the row.
         let mut pending = blobs::DiscardOnDrop::new(app, blob_id);
-        let shard_count = (data_shards + app.parity_shards()) as usize;
+        let parity_shards = app.parity_shards();
+        let shard_count = (data_shards + parity_shards) as usize;
         // Independent of each other, so they're sent together, and take one
         // round trip between them.
         let (inserted, locations) = tokio::join!(insert, choose_nodes(&client, shard_count));
@@ -903,7 +944,7 @@ impl BlobWriter {
         };
         let coding = match size {
             Some(size) if data_shards > 1 => {
-                let layout = shards::Layout::new(size, data_shards, app.parity_shards());
+                let layout = shards::Layout::new(size, data_shards, parity_shards);
                 Coding::Coded {
                     layout,
                     row: Vec::new(),
@@ -959,6 +1000,7 @@ impl BlobWriter {
             senders,
             sinks,
             coding,
+            parity_shards,
             crc: crc64fast_nvme::Digest::new(),
             size: 0,
             settled: false,
@@ -1042,7 +1084,7 @@ impl BlobWriter {
         let expected: Result<(shards::Layout, Vec<u64>), String> = match &mut self.coding {
             Coding::Replicated { summer } => {
                 let summer = std::mem::replace(summer, BlobSummer::new(checksum::BLOCK_SIZE));
-                let layout = shards::Layout::new(self.size, 1, self.app.parity_shards());
+                let layout = shards::Layout::new(self.size, 1, self.parity_shards);
                 let file = ShardFile { blob_id, layout, shard: 0 };
                 let mut crc = self.crc.clone();
                 crc.write(&blob_file::trailer(&file, &[summer.finish()]));

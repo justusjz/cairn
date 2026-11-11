@@ -200,9 +200,48 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Sets the rate lifecycle sweeps go at, for the whole cluster. */
         put: operations["set_lifecycle_rate"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{id}/keep": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Keeps a node that's being removed, or was, as `cairn node keep` does: it
+         *     gets shards again; those that moved stay where they are.
+         */
+        post: operations["keep_node"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Starts removing a node, as `cairn node remove` does: it gets no new
+         *     shards, and its shards move to the other nodes (see `mover`).
+         */
+        post: operations["remove_node"];
         delete?: never;
         options?: never;
         head?: never;
@@ -286,6 +325,27 @@ export interface paths {
         put?: never;
         /** Replaces a role's secret. */
         post: operations["rotate_secret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/settings/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets one of the redundancy settings (`data-shards`, `parity-shards`,
+         *     `repair-after`), for the whole cluster, as `cairn config set` does. The
+         *     node answering goes by it right away, the others within a heartbeat.
+         */
+        put: operations["set_setting"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -908,6 +968,15 @@ export interface components {
             secret?: string | null;
         };
         /**
+         * @description Sets the rate lifecycle sweeps go at, for the whole cluster.
+         *     A cluster setting's new value; `null` unsets it (it's back to its
+         *     default, or for `parity-shards`, every node goes by its flag again).
+         */
+        NewSetting: {
+            /** Format: int64 */
+            value?: number | null;
+        };
+        /**
          * @description The copies of committed, checksummed blobs a node holds, and how recently
          *     they were known intact.
          */
@@ -949,6 +1018,13 @@ export interface components {
             bytes: number;
             /** Format: int32 */
             node: number;
+        };
+        NodeRemoved: {
+            /**
+             * Format: int64
+             * @description The shards it holds, which move to other nodes.
+             */
+            shards: number;
         };
         /**
          * @description What a node reports about itself, for the dashboard of any node (see
@@ -1015,8 +1091,21 @@ export interface components {
              *     must be. One data shard: it isn't.
              */
             data_shards: number;
+            /**
+             * Format: int64
+             * @description The most data and parity shards the settings allow.
+             */
+            max_data_shards: number;
+            /** Format: int64 */
+            max_parity_shards: number;
             /** Format: int64 */
             max_sources: number;
+            /**
+             * Format: int64
+             * @description The `parity-shards` setting, if it's set; else every node goes by its
+             *     `--replication-factor`.
+             */
+            parity_setting?: number | null;
             /** Format: int32 */
             parity_shards: number;
             /** Format: int64 */
@@ -1146,6 +1235,13 @@ export interface components {
         Secret: {
             name: string;
             secret: string;
+        };
+        SettingChanged: {
+            /**
+             * @description What's wrong with the cluster's layouts now, if anything: too few
+             *     nodes for them, say.
+             */
+            warnings: string[];
         };
         SlotCounts: components["schemas"]["Counts"] & {
             /**
@@ -1708,6 +1804,79 @@ export interface operations {
             };
         };
     };
+    keep_node: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Kept */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    remove_node: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeRemoved"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_roles: {
         parameters: {
             query?: never;
@@ -1951,6 +2120,47 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Secret"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_setting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSetting"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingChanged"];
                 };
             };
             "4XX": {
