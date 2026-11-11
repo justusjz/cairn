@@ -43,6 +43,7 @@ async fn put_with(app: &Arc<App>, key: &str, metadata: String) {
         conditions: Preconditions::default(),
         sealing: None,
         checksum: crate::e2e::OBJECT_CHECKSUM,
+        tags: String::new(),
     };
     let body = Full::new(Bytes::from_static(b"data"));
     let result = crate::upload_part(app, body, &attach, Payload::unchecked()).await.unwrap();
@@ -100,7 +101,7 @@ async fn a_copy_keeps_or_replaces_metadata() {
     let replacement = stored(&[("x-amz-meta-b", "2")]);
 
     // COPY (the default): the source's, whatever the request says.
-    let response = copy_object(&app, BUCKET, "kept", &source, None, "a/b", &replacement, &none, Default::default())
+    let response = copy_object(&app, BUCKET, "kept", &source, None, "a/b", &replacement, None, &none, Default::default())
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
@@ -113,7 +114,7 @@ async fn a_copy_keeps_or_replaces_metadata() {
     // REPLACE: the request's, all of it; a copy onto the source itself too.
     for dest in ["replaced", "src"] {
         let response =
-            copy_object(&app, BUCKET, dest, &source, Some("REPLACE"), "a/b", &replacement, &none, Default::default())
+            copy_object(&app, BUCKET, dest, &source, Some("REPLACE"), "a/b", &replacement, None, &none, Default::default())
                 .await
                 .unwrap();
         assert_eq!(response.status(), StatusCode::OK, "{dest}");

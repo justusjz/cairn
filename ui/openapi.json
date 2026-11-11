@@ -1217,7 +1217,8 @@
           "versions",
           "version_bytes",
           "uploads",
-          "roles"
+          "roles",
+          "tags"
         ],
         "properties": {
           "bytes": {
@@ -1247,6 +1248,13 @@
             "type": "integer",
             "format": "int64",
             "description": "Roles with a grant on the bucket."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags (PutBucketTagging), sorted by key."
           },
           "uploads": {
             "type": "integer",
@@ -2088,7 +2096,7 @@
       },
       "LifecycleFilter": {
         "type": "object",
-        "description": "Which objects a rule applies to: those with keys starting with `prefix`,\nand sizes strictly between the bounds. All of them, by default.",
+        "description": "Which objects a rule applies to: those with keys starting with `prefix`,\nsizes strictly between the bounds, and each of `tags` (with that value;\nother tags don't matter). All of them, by default. A delete marker has no\nsize, and no tags: a filter on tags never matches one.",
         "properties": {
           "prefix": {
             "type": "string"
@@ -2106,6 +2114,29 @@
               "null"
             ],
             "format": "int64"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LifecycleFilterTag"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "LifecycleFilterTag": {
+        "type": "object",
+        "description": "A tag a filter asks for (see `s3::tags`).",
+        "required": [
+          "key",
+          "value"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
           }
         },
         "additionalProperties": false
@@ -3178,6 +3209,22 @@
           }
         }
       },
+      "Tag": {
+        "type": "object",
+        "description": "A tag of a bucket or an object version (see `s3::tags`).",
+        "required": [
+          "key",
+          "value"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
       "VersionInfo": {
         "type": "object",
         "required": [
@@ -3186,6 +3233,7 @@
           "delete_marker",
           "size",
           "last_modified",
+          "tags",
           "parts",
           "lost_bytes"
         ],
@@ -3237,6 +3285,13 @@
           "size": {
             "type": "integer",
             "format": "int64"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags, sorted by key."
           },
           "version_id": {
             "type": "string"

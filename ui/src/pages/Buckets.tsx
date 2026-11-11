@@ -6,6 +6,26 @@ import { bytes, date, num } from "../format";
 
 const enc = encodeURIComponent;
 
+/** Tags of a bucket or an object version (PutBucketTagging,
+ * PutObjectTagging), as `key=value` badges; shown, not edited. */
+function TagList(props: { tags: { key: string; value: string }[] }) {
+  return (
+    <Show when={props.tags.length} fallback={<span class="subtle">none</span>}>
+      <span class="tag-list">
+        <For each={props.tags}>
+          {(t) => (
+            <Badge>
+              <span class="mono">
+                {t.key}={t.value}
+              </span>
+            </Badge>
+          )}
+        </For>
+      </span>
+    </Show>
+  );
+}
+
 export function bucketUrl(bucket: string, prefix = "", deleted = false) {
   const query = new URLSearchParams();
   if (prefix) query.set("prefix", prefix);
@@ -59,6 +79,7 @@ export function BucketList() {
                 { label: "Older versions", num: true },
                 { label: "Uploads", num: true },
                 { label: "Roles", num: true },
+                "Tags",
                 "Created",
                 "",
               ]}
@@ -92,6 +113,9 @@ export function BucketList() {
                     <td class="num">{b.versions > b.objects ? `${num(b.versions - b.objects)} · ${bytes(b.version_bytes - b.bytes)}` : "–"}</td>
                     <td class="num">{num(b.uploads)}</td>
                     <td class="num">{num(b.roles)}</td>
+                    <td>
+                      <TagList tags={b.tags} />
+                    </td>
                     <td>{date(b.created_at)}</td>
                     <td class="actions">
                       <button class="small danger" onClick={() => remove(b.name)}>
@@ -353,6 +377,10 @@ export function ObjectPage() {
                                 </Switch>
                               )}
                             </Show>
+                          </dd>
+                          <dt>Tags</dt>
+                          <dd>
+                            <TagList tags={v.tags} />
                           </dd>
                         </dl>
                         <div class="parts">

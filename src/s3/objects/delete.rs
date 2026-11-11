@@ -176,7 +176,7 @@ pub fn missing_checksum() -> Response<Full<Bytes>> {
     format_s3_error(
         StatusCode::BAD_REQUEST,
         "InvalidRequest",
-        "missing required integrity header: Content-MD5 or x-amz-checksum-*",
+        "Missing required header for this request: Content-MD5 OR x-amz-checksum-*",
     )
 }
 

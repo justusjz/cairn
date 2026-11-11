@@ -141,7 +141,7 @@ cleanup() {
         [ -n "$pid" ] && kill -9 "$pid" 2>/dev/null
     done
     wait 2>/dev/null
-    podman rm -f "$PG_CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$PG_CONTAINER" >/dev/null 2>&1
     rm -rf "$WORK_DIR"
 }
 # On Ctrl+C / SIGTERM, exit (running cleanup via the EXIT trap) rather than
@@ -157,7 +157,7 @@ done
 
 # ─── 1. Postgres ─────────────────────────────────────────────────────────────
 info "Starting Postgres ($PG_IMAGE) on port $PG_PORT..."
-podman rm -f "$PG_CONTAINER" >/dev/null 2>&1
+podman rm -f -v "$PG_CONTAINER" >/dev/null 2>&1
 podman run -d --rm --name "$PG_CONTAINER" \
     -e POSTGRES_USER="$PG_USER" \
     -e POSTGRES_PASSWORD="$PG_PASS" \

@@ -64,7 +64,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=105
+TOTAL=108
 STEP=0
 PASS=0
 FAIL=0
@@ -144,7 +144,7 @@ cleanup() {
         kill "$SERVER_PID" 2>/dev/null
         wait "$SERVER_PID" 2>/dev/null
     fi
-    podman rm -f "$PG_CONTAINER" "$BAO_CONTAINER" >/dev/null 2>&1
+    podman rm -f -v "$PG_CONTAINER" "$BAO_CONTAINER" >/dev/null 2>&1
     rm -rf "$WORK_DIR"
 }
 # On Ctrl+C / SIGTERM, exit (running cleanup via the EXIT trap) rather than
@@ -160,7 +160,7 @@ done
 
 # ─── 1. Postgres ─────────────────────────────────────────────────────────────
 info "Starting Postgres ($PG_IMAGE) on port $PG_PORT..."
-podman rm -f "$PG_CONTAINER" >/dev/null 2>&1
+podman rm -f -v "$PG_CONTAINER" >/dev/null 2>&1
 podman run -d --rm --name "$PG_CONTAINER" \
     -e POSTGRES_USER="$PG_USER" \
     -e POSTGRES_PASSWORD="$PG_PASS" \
@@ -179,7 +179,7 @@ info "Postgres is ready."
 
 # ─── 1b. OpenBao ─────────────────────────────────────────────────────────────
 info "Starting OpenBao ($BAO_IMAGE) on port $BAO_PORT..."
-podman rm -f "$BAO_CONTAINER" >/dev/null 2>&1
+podman rm -f -v "$BAO_CONTAINER" >/dev/null 2>&1
 podman run -d --rm --name "$BAO_CONTAINER" -e BAO_DEV_ROOT_TOKEN_ID=root \
     -p "127.0.0.1:${BAO_PORT}:8200" "$BAO_IMAGE" server -dev -dev-listen-address=0.0.0.0:8200 \
     >/dev/null || fatal "could not start OpenBao container"
@@ -1189,10 +1189,106 @@ acl_ok() {
     s3 info "s3://${BUCKET}/big.bin" >/dev/null 2>&1
 }
 
+# Tags: an object's from its PUT (sorted, as S3 hands them back), counted on
+# HEAD; replaced in place by PutObjectTagging (no new version, the same ETag),
+# per version; kept or replaced by a copy (a lowercase directive is refused,
+# as in S3); given by an upload, but refused on its parts; a bucket's; and
+# S3's errors for tags it doesn't take.
+tagging_ok() {
+    local tags etag version newer out="$WORK_DIR/tag-out"
+    tags_of() { awss3 s3api get-object-tagging --bucket "$1" --key "$2" ${3:+--version-id "$3"} \
+        --query 'TagSet[].[Key,Value]' --output text 2>/dev/null; }
+    awss3 s3api put-object --bucket "$BUCKET" --key tag/a.bin --body "$SMALL" --tagging 'z=1&a=b%20c' \
+        >/dev/null 2>&1 || return 1
+    [ "$(tags_of "$BUCKET" tag/a.bin)" = "$(printf 'a\tb c\nz\t1')" ] || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key tag/a.bin --query TagCount --output text 2>/dev/null)" \
+        = 2 ] || return 1
+    etag=$(awss3 s3api head-object --bucket "$BUCKET" --key tag/a.bin --query ETag --output text 2>/dev/null)
+    awss3 s3api put-object-tagging --bucket "$BUCKET" --key tag/a.bin \
+        --tagging 'TagSet=[{Key=k,Value=v}]' >/dev/null 2>&1 || return 1
+    [ "$(tags_of "$BUCKET" tag/a.bin)" = "$(printf 'k\tv')" ] || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key tag/a.bin --query ETag --output text 2>/dev/null)" \
+        = "$etag" ] || return 1
+    # Copies keep the source's, or take the request's.
+    awss3 s3api copy-object --bucket "$BUCKET" --key tag/kept.bin --copy-source "${BUCKET}/tag/a.bin" \
+        --tagging 'ignored=1' >/dev/null 2>&1 || return 1
+    [ "$(tags_of "$BUCKET" tag/kept.bin)" = "$(printf 'k\tv')" ] || return 1
+    awss3 s3api copy-object --bucket "$BUCKET" --key tag/new.bin --copy-source "${BUCKET}/tag/a.bin" \
+        --tagging-directive REPLACE --tagging 'n=1' >/dev/null 2>&1 || return 1
+    [ "$(tags_of "$BUCKET" tag/new.bin)" = "$(printf 'n\t1')" ] || return 1
+    ! awss3 s3api copy-object --bucket "$BUCKET" --key tag/x.bin --copy-source "${BUCKET}/tag/a.bin" \
+        --tagging-directive replace --tagging 'n=1' >"$out" 2>&1 || return 1
+    grep -q "Unknown tagging directive" "$out" || return 1
+    awss3 s3api delete-object-tagging --bucket "$BUCKET" --key tag/a.bin >/dev/null 2>&1 || return 1
+    [ -z "$(tags_of "$BUCKET" tag/a.bin)" ] || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key tag/a.bin --query TagCount --output text 2>/dev/null)" \
+        = None ] || return 1
+    # S3's errors.
+    ! awss3 s3api put-object --bucket "$BUCKET" --key tag/bad.bin --body "$SMALL" --tagging 'a=1&a=2' \
+        >"$out" 2>&1 || return 1
+    grep -q "InvalidArgument" "$out" || return 1
+    ! awss3 s3api put-object-tagging --bucket "$BUCKET" --key tag/a.bin \
+        --tagging 'TagSet=[{Key=aws:x,Value=v}]' >"$out" 2>&1 || return 1
+    grep -q "InvalidTag" "$out" || return 1
+    # An upload's, from its creation (the parts can't have any).
+    local uid; uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key tag/up.bin --tagging 'u=1' \
+        --query UploadId --output text 2>/dev/null) || return 1
+    etag=$(awss3 s3api upload-part --bucket "$BUCKET" --key tag/up.bin --upload-id "$uid" --part-number 1 \
+        --body "$SMALL" --query ETag --output text 2>/dev/null) || return 1
+    awss3 s3api complete-multipart-upload --bucket "$BUCKET" --key tag/up.bin --upload-id "$uid" \
+        --multipart-upload "{\"Parts\":[{\"PartNumber\":1,\"ETag\":$etag}]}" >/dev/null 2>&1 || return 1
+    [ "$(tags_of "$BUCKET" tag/up.bin)" = "$(printf 'u\t1')" ] || return 1
+    # Each version its own, in a versioned bucket.
+    version=$(awss3 s3api put-object --bucket "$VBUCKET" --key tag/v.bin --body "$SMALL" --tagging 'v=1' \
+        --query VersionId --output text 2>/dev/null) || return 1
+    newer=$(awss3 s3api put-object --bucket "$VBUCKET" --key tag/v.bin --body "$SMALL" --tagging 'v=2' \
+        --query VersionId --output text 2>/dev/null) || return 1
+    awss3 s3api put-object-tagging --bucket "$VBUCKET" --key tag/v.bin --version-id "$version" \
+        --tagging 'TagSet=[{Key=v,Value=old}]' >/dev/null 2>&1 || return 1
+    [ "$(tags_of "$VBUCKET" tag/v.bin "$version")" = "$(printf 'v\told')" ] || return 1
+    [ "$(tags_of "$VBUCKET" tag/v.bin)" = "$(printf 'v\t2')" ] || return 1
+    for v in "$version" "$newer"; do
+        awss3 s3api delete-object --bucket "$VBUCKET" --key tag/v.bin --version-id "$v" >/dev/null 2>&1 || return 1
+    done
+    # A bucket's.
+    ! awss3 s3api get-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-tagging --bucket "$BUCKET" --tagging 'TagSet=[{Key=team,Value=storage}]' \
+        >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-tagging --bucket "$BUCKET" --query 'TagSet[].[Key,Value]' --output text \
+        2>/dev/null)" = "$(printf 'team\tstorage')" ] || return 1
+    awss3 s3api delete-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    for key in a.bin kept.bin new.bin up.bin; do
+        awss3 s3api delete-object --bucket "$BUCKET" --key "tag/$key" >/dev/null 2>&1 || return 1
+    done
+}
+
+# Changing an object's tags is a write: reader (`read`) may read them, not
+# change them; writer (`write`, not `delete-version`) may change a version's.
+tagging_roles_ok() {
+    local r=(as_role reader readersecret) w=(as_role writer writersecret)
+    awss3 s3api put-object --bucket "$BUCKET" --key tag/r.bin --body "$SMALL" --tagging 'r=1' \
+        >/dev/null 2>&1 || return 1
+    [ "$("${r[@]}" s3api get-object-tagging --bucket "$BUCKET" --key tag/r.bin \
+        --query 'TagSet[0].Value' --output text 2>/dev/null)" = 1 ] || return 1
+    ! "${r[@]}" s3api put-object-tagging --bucket "$BUCKET" --key tag/r.bin \
+        --tagging 'TagSet=[{Key=r,Value=2}]' >/dev/null 2>&1 || return 1
+    ! "${r[@]}" s3api delete-object-tagging --bucket "$BUCKET" --key tag/r.bin >/dev/null 2>&1 || return 1
+    ! "${r[@]}" s3api put-bucket-tagging --bucket "$BUCKET" --tagging 'TagSet=[{Key=a,Value=b}]' \
+        >/dev/null 2>&1 || return 1
+    awss3 s3api delete-object --bucket "$BUCKET" --key tag/r.bin >/dev/null 2>&1 || return 1
+    "${w[@]}" s3api put-object --bucket "$OBUCKET" --key tag/w.bin --body "$SMALL" >/dev/null 2>&1 || return 1
+    "${w[@]}" s3api put-object-tagging --bucket "$OBUCKET" --key tag/w.bin --version-id null \
+        --tagging 'TagSet=[{Key=w,Value=1}]' >/dev/null 2>&1 || return 1
+    "${w[@]}" s3api delete-object-tagging --bucket "$OBUCKET" --key tag/w.bin --version-id null \
+        >/dev/null 2>&1 || return 1
+    "${w[@]}" s3api delete-object --bucket "$OBUCKET" --key tag/w.bin >/dev/null 2>&1
+}
+
 # Bucket sub-resource stubs: location/versioning/accelerate/request payment/
 # logging/notification succeed (200, empty or default config);
-# policy/tagging/website/replication are "not configured" (the client errors
-# on 404), and so are CORS and lifecycle, until one is set.
+# policy/website/replication are "not configured" (the client errors on 404),
+# and so are CORS, tags and lifecycle, until they're set.
 subresource_stubs_ok() {
     awss3 s3api get-bucket-location --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     awss3 s3api get-bucket-versioning --bucket "$BUCKET" >/dev/null 2>&1 || return 1
@@ -1260,12 +1356,15 @@ cors_ok() {
 }
 
 # A lifecycle configuration is bucket management (admin-only): writer can't
-# set one; the admin can, and it reads back, rule ID and all. Transitions are
+# set one; the admin can, and it reads back, rule ID and tag filters and all.
+# Transitions are
 # refused (501), and the configuration can be deleted again.
 lifecycle_config_ok() {
     local doc="$WORK_DIR/lifecycle.json" glacier="$WORK_DIR/lifecycle-glacier.json"
     printf '%s' '{"Rules":[{"ID":"expire-logs","Filter":{"Prefix":"logs/"},"Status":"Enabled",
-        "Expiration":{"Days":30},"NoncurrentVersionExpiration":{"NoncurrentDays":7}}]}' > "$doc"
+        "Expiration":{"Days":30},"NoncurrentVersionExpiration":{"NoncurrentDays":7}},
+        {"ID":"tmp","Filter":{"And":{"Prefix":"x/","Tags":[{"Key":"tmp","Value":"yes"},{"Key":"k","Value":""}]}},
+        "Status":"Enabled","Expiration":{"Days":1}}]}' > "$doc"
     printf '%s' '{"Rules":[{"ID":"cold","Filter":{},"Status":"Enabled",
         "Transitions":[{"Days":30,"StorageClass":"GLACIER"}]}]}' > "$glacier"
     ! as_role writer writersecret s3api put-bucket-lifecycle-configuration --bucket "$VBUCKET" \
@@ -1277,6 +1376,10 @@ lifecycle_config_ok() {
     [ "$(awss3 s3api get-bucket-lifecycle-configuration --bucket "$VBUCKET" \
         --query 'Rules[0].[ID,Filter.Prefix,Expiration.Days,NoncurrentVersionExpiration.NoncurrentDays]' \
         --output text 2>/dev/null)" = "$(printf 'expire-logs\tlogs/\t30\t7')" ] || return 1
+    # A rule filtering on tags, as written (S3 sorts nothing here).
+    [ "$(awss3 s3api get-bucket-lifecycle-configuration --bucket "$VBUCKET" \
+        --query 'Rules[1].Filter.And.[Prefix, Tags[0].Key, Tags[0].Value, Tags[1].Key]' \
+        --output text 2>/dev/null)" = "$(printf 'x/\ttmp\tyes\tk')" ] || return 1
     awss3 s3api delete-bucket-lifecycle --bucket "$VBUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$VBUCKET" >/dev/null 2>&1
 }
@@ -1426,12 +1529,12 @@ post_object_ok() {
 # Operations Cairn doesn't implement are refused (501), not run as the plain
 # PUT/DELETE/GET they'd otherwise route to: the object and the bucket survive.
 unsupported_subresources_refused() {
-    local path="/${BUCKET}/small.txt" xml="$WORK_DIR/tagging.xml"
-    printf '<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>' >"$xml"
+    local path="/${BUCKET}/small.txt" xml="$WORK_DIR/legal-hold.xml"
+    printf '<LegalHold><Status>ON</Status></LegalHold>' >"$xml"
     local hash; hash=$(sha256sum "$xml" | cut -d' ' -f1)
-    [ "$(scurl PUT "$path?tagging" "$hash" "$xml")" = 501 ] || return 1
+    [ "$(scurl PUT "$path?legal-hold" "$hash" "$xml")" = 501 ] || return 1
     [ "$(scurl PUT "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
-    [ "$(scurl DELETE "$path?tagging" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl DELETE "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl GET "$path?partNumber=1" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "/${BUCKET}?policy" "$EMPTY_SHA256" -)" = 501 ] || return 1
     check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
@@ -2214,6 +2317,7 @@ run_test    "Packer compacts mostly-dead blobs"      pack_compacts_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "CORS configuration and preflights"     cors_ok
+run_test    "Object and bucket tags"                tagging_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
 run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
 run_test    "Presigned GET/PUT, response headers"   presigned_ok
@@ -2225,6 +2329,7 @@ run_test    "A PUT over 5 GiB is refused"           too_large_refused
 run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets
 run_test    "Read-only role can read, not write"    reader_permissions_ok
+run_test    "Tags: read with read, changed with write" tagging_roles_ok
 run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
 run_test    "Admin manages buckets, not objects"    admin_scope_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok

@@ -93,12 +93,6 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
             "NoSuchBucketPolicy",
             "the bucket policy does not exist",
         ))
-    } else if present("tagging") {
-        Some(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchTagSet",
-            "there is no tag set associated with the bucket",
-        ))
     } else if present("website") {
         Some(format_s3_error(
             StatusCode::NOT_FOUND,
@@ -306,19 +300,21 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "notification",
         ],
         // PutBucketVersioning, PutBucketEncryption,
-        // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketAcl (`acl`).
-        (true, &Method::PUT) => &["versioning", "encryption", "lifecycle", "cors", "acl"],
+        // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketTagging,
+        // PutBucketAcl (`acl`).
+        (true, &Method::PUT) => &["versioning", "encryption", "lifecycle", "cors", "tagging", "acl"],
         (true, &Method::POST) => &["delete"],
-        // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors.
-        (true, &Method::DELETE) => &["encryption", "lifecycle", "cors"],
-        // GetObjectAcl (stubbed), ListParts.
-        (false, &Method::GET) => &["acl", "uploadId"],
-        // UploadPart / UploadPartCopy, PutObjectAcl (`acl`).
-        (false, &Method::PUT) => &["uploadId", "partNumber", "acl"],
+        // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
+        // DeleteBucketTagging.
+        (true, &Method::DELETE) => &["encryption", "lifecycle", "cors", "tagging"],
+        // GetObjectAcl (stubbed), ListParts, GetObjectTagging.
+        (false, &Method::GET) => &["acl", "uploadId", "tagging"],
+        // UploadPart / UploadPartCopy, PutObjectAcl (`acl`), PutObjectTagging.
+        (false, &Method::PUT) => &["uploadId", "partNumber", "acl", "tagging"],
         // CreateMultipartUpload / CompleteMultipartUpload.
         (false, &Method::POST) => &["uploads", "uploadId"],
-        // AbortMultipartUpload.
-        (false, &Method::DELETE) => &["uploadId"],
+        // AbortMultipartUpload, DeleteObjectTagging.
+        (false, &Method::DELETE) => &["uploadId", "tagging"],
         _ => &[],
     }
 }
@@ -545,6 +541,11 @@ mod tests {
             (Method::GET, true, "website"),
             (Method::PUT, true, "cors"),
             (Method::DELETE, true, "cors"),
+            (Method::PUT, false, "tagging"),
+            (Method::DELETE, false, "tagging&versionId=null"),
+            (Method::GET, false, "tagging"),
+            (Method::PUT, true, "tagging"),
+            (Method::DELETE, true, "tagging"),
             (Method::GET, false, "uploadId=u&max-parts=2"),
             (Method::DELETE, false, "versionId=null"),
             (Method::DELETE, false, "uploadId=u"),
@@ -554,9 +555,7 @@ mod tests {
         // Each of these used to run as the plain operation: overwriting the
         // object, deleting it or the bucket, or serving the wrong bytes.
         for (method, bucket_level, query) in [
-            (Method::PUT, false, "tagging"),
             (Method::PUT, false, "retention&versionId=null"),
-            (Method::DELETE, false, "tagging"),
             (Method::GET, false, "attributes"),
             (Method::GET, false, "partNumber=1"),
             (Method::HEAD, false, "partNumber=1"),

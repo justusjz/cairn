@@ -138,6 +138,9 @@ impl CopyKeys<'_> {
 /// REPLACE). Under COPY the destination inherits the source's content-type and
 /// metadata; under REPLACE it takes `request_content_type` and
 /// `request_metadata` (the request's own Content-Type and metadata).
+///
+/// Likewise, the copy keeps its source's tags, unless `request_tags` (stored
+/// form, see `s3::tags`) replace them (`x-amz-tagging-directive: REPLACE`).
 #[allow(clippy::too_many_arguments)]
 pub async fn copy_object(
     app: &Arc<App>,
@@ -147,6 +150,7 @@ pub async fn copy_object(
     metadata_directive: Option<&str>,
     request_content_type: &str,
     request_metadata: &str,
+    request_tags: Option<&str>,
     preconditions: &Preconditions,
     keys: CopyKeys<'_>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
@@ -170,7 +174,7 @@ pub async fn copy_object(
     // version onto its own key is allowed: that's how an old version is restored.
     // So is changing its encryption (another key, or none), which is only
     // known once the source is read: a request without encryption headers
-    // decrypts an SSE-KMS source.
+    // decrypts an SSE-KMS source. And replacing its tags (as S3 allows).
     let same_object = src_bucket == dest_bucket && src_key == dest_key && src_version.is_none();
     let client = app.pool.get().await?;
     if client
@@ -193,7 +197,7 @@ pub async fn copy_object(
         if let Err(refused) = sse::check(encryption, keys.source) {
             return Ok(refused);
         }
-        if same_object && !replace && keys.keeps(encryption) {
+        if same_object && !replace && request_tags.is_none() && keys.keeps(encryption) {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
@@ -235,6 +239,9 @@ pub async fn copy_object(
         } else {
             (version.content_type.as_str(), version.metadata.as_str())
         };
+        // The source's tags as they were read with it: a copy made as the
+        // source's tags change has the old ones or the new.
+        let tags = request_tags.unwrap_or(&version.tags);
         let respond = |etag: &str, checksum: Option<&Checksum>, version_id: Option<&str>, last_modified: &str, stored: &Stored| {
             let checksum = checksum.map_or(String::new(), Checksum::xml);
             let resp = with_version_id(
@@ -263,7 +270,7 @@ pub async fn copy_object(
             .or(version.checksum.as_ref().map(|checksum| checksum.algorithm))
             .unwrap_or(Algorithm::Crc64Nvme);
         if !keys.shares(encryption) {
-            let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, checksum: checksum_algorithm };
+            let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, tags, checksum: checksum_algorithm };
             let sealing = match sse::seal(app, keys.dest, keys.role, dest_bucket, dest_key).await? {
                 Ok(sealing) => sealing,
                 Err(refused) => return Ok(refused),
@@ -341,7 +348,7 @@ pub async fn copy_object(
         // (not just the ETag header). It comes from the commit itself: read
         // afterwards, a concurrent write to the key could have replaced the
         // version already.
-        let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, checksum: checksum_algorithm };
+        let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, tags, checksum: checksum_algorithm };
         let (version_id, last_modified) =
             match commit_object_copy(app, &source, &dest, &stored_etag, &stored, &copied).await? {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
@@ -365,6 +372,8 @@ struct Dest<'a> {
     key: &'a str,
     content_type: &'a str,
     metadata: &'a str,
+    /// Its tags, stored form.
+    tags: &'a str,
     /// The algorithm of its checksum (FULL_OBJECT).
     checksum: Algorithm,
 }
@@ -456,6 +465,7 @@ async fn stream_object_copy(
         conditions: Preconditions::default(),
         sealing,
         checksum: checksums::Wanted::Exactly(dest.checksum),
+        tags: dest.tags.to_owned(),
     };
     // The source stream is data from within Cairn (verified as it's read), so
     // there's nothing to check it against.
@@ -513,7 +523,8 @@ async fn commit_object_copy(
                 .query_one_cached(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
-                                                    $12, $13, $14, $15, $16, $17, $18, $19, $20)",
+                                                    $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                                                    $21)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -533,6 +544,7 @@ async fn commit_object_copy(
                         &copied.checksum.algorithm.name(),
                         &copied.checksum.kind.name(),
                         &copied.stored,
+                        &dest.tags,
                         &copied.part_checksums,
                         &new_version_id(),
                     ],

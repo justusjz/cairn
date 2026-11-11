@@ -25,6 +25,7 @@ async fn try_put(app: &Arc<App>, key: &str, data: Vec<u8>) -> anyhow::Result<()>
         conditions: Preconditions::default(),
         sealing: None,
         checksum: crate::e2e::OBJECT_CHECKSUM,
+        tags: String::new(),
     };
     let body = Full::new(Bytes::from(data));
     let result = crate::upload_part(app, body, &attach, Payload::unchecked()).await?;

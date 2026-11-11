@@ -178,6 +178,7 @@ form.grant { margin-top: 6px; }
 .badge.warn { background: var(--warn-soft); color: var(--warn); }
 .badge.bad { background: var(--bad-soft); color: var(--bad); }
 .badge.accent { background: var(--accent-soft); color: var(--accent); }
+.tag-list { display: inline-flex; flex-wrap: wrap; gap: 4px; }
 
 .chip {
   display: inline-flex;

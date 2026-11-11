@@ -17,6 +17,7 @@ use crate::{
             delete::delete_bucket,
             head::head_bucket,
             list::list_buckets,
+            tagging::{delete_bucket_tagging, get_bucket_tagging, put_bucket_tagging},
             encryption::{default_request, delete_bucket_encryption, get_bucket_encryption, put_bucket_encryption},
             lifecycle::{delete_bucket_lifecycle, get_bucket_lifecycle, put_bucket_lifecycle},
             versioning::{get_bucket_versioning, put_bucket_versioning},
@@ -36,6 +37,7 @@ use crate::{
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
             list_versions::list_object_versions,
             put::put_object,
+            tagging::{delete_object_tagging, get_object_tagging, put_object_tagging},
         },
         util::{
             bucket_subresource_stub, decode_continuation_token, decode_path_param, format_s3_error,
@@ -54,6 +56,7 @@ pub(crate) mod hosting;
 pub(crate) mod metadata;
 pub(crate) mod sse;
 pub(crate) mod sse_c;
+pub(crate) mod tags;
 pub(crate) mod multipart;
 pub(crate) mod objects;
 pub(crate) mod post_policy;
@@ -223,8 +226,8 @@ async fn handle_request(
         // query up front and match on an owned method — mirroring the object branch
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
-        // Bucket sub-resource GETs: versioning, encryption, lifecycle and
-        // CORS are real; the rest (acl, location, policy, tagging,
+        // Bucket sub-resource GETs: versioning, encryption, lifecycle, CORS
+        // and tagging are real; the rest (acl, location, policy,
         // object-lock, website, ...) are stubbed — Cairn implements none of
         // them, so answer as S3 does for an unconfigured bucket before
         // falling through to a listing.
@@ -240,6 +243,9 @@ async fn handle_request(
             }
             if query_param(&query, "cors").is_some() {
                 return Ok(box_response(get_bucket_cors(&app, &bucket).await?));
+            }
+            if query_param(&query, "tagging").is_some() {
+                return Ok(box_response(get_bucket_tagging(&app, &bucket).await?));
             }
             if query_param(&query, "ownershipControls").is_some() {
                 return Ok(box_response(acl::ownership_controls()));
@@ -391,6 +397,17 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
+            // PutBucketTagging: PUT /{bucket}?tagging with a <Tagging> body,
+            // which must declare a checksum, as in S3.
+            hyper::Method::PUT if query_param(&query, "tagging").is_some() => {
+                if !payload::has_body_checksum(req.headers()) {
+                    return Ok(box_response(missing_checksum()));
+                }
+                match read_body(req, &principal.secret, true).await? {
+                    Ok(body) => put_bucket_tagging(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
             // PutBucketAcl: there are no ACLs (`acl`).
             hyper::Method::PUT if query_param(&query, "acl").is_some() => {
                 acl::put_bucket_acl(&app, &bucket, req.headers()).await?
@@ -423,6 +440,9 @@ async fn handle_request(
             hyper::Method::DELETE if query_param(&query, "cors").is_some() => {
                 delete_bucket_cors(&app, &bucket).await?
             }
+            hyper::Method::DELETE if query_param(&query, "tagging").is_some() => {
+                delete_bucket_tagging(&app, &bucket).await?
+            }
             hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
         };
@@ -446,11 +466,28 @@ async fn handle_request(
         .headers()
         .get(checksums::MODE)
         .is_some_and(|mode| mode.as_bytes() == b"ENABLED");
-    // GET, HEAD and DELETE may address one specific version of the object.
+    // GET, HEAD and DELETE may address one specific version of the object,
+    // as may the tagging requests.
     let version_id = query_param(&query, "versionId");
-    let addresses_version = matches!(*req.method(), Method::GET | Method::HEAD | Method::DELETE);
+    let tagging = query_param(&query, "tagging").is_some()
+        && matches!(*req.method(), Method::GET | Method::PUT | Method::DELETE);
+    let addresses_version = tagging || matches!(*req.method(), Method::GET | Method::HEAD | Method::DELETE);
     if let Some(v) = version_id.as_deref().filter(|v| addresses_version && !is_version_id(v)) {
         return Ok(box_response(invalid_version_id("versionId", v)));
+    }
+    // GetObjectTagging, PutObjectTagging (with a <Tagging> body) and
+    // DeleteObjectTagging: an SSE-C object's tags need no key, as in S3.
+    if tagging {
+        let version_id = version_id.as_deref();
+        let resp = match req.method().clone() {
+            Method::GET => get_object_tagging(&app, &bucket, &key, version_id).await?,
+            Method::PUT => match read_body(req, &principal.secret, true).await? {
+                Ok(body) => put_object_tagging(&app, &bucket, &key, version_id, body).await?,
+                Err(rejection) => util::rejection_response(&rejection),
+            },
+            _ => delete_object_tagging(&app, &bucket, &key, version_id).await?,
+        };
+        return Ok(box_response(resp));
     }
     // SSE-C: the key the request names for its object, if any. Refused if it's
     // malformed, or didn't come over HTTPS.
@@ -583,6 +620,24 @@ async fn handle_request(
     // The metadata a write stores with its object, or why it's refused. Only
     // the writes that take the request's metadata look at it.
     let metadata = metadata::from_request(req.headers());
+    // Likewise its tags (stored form; see `tags`).
+    let tags = match req.headers().get(tags::HEADER) {
+        None => Ok(String::new()),
+        Some(value) => tags::Tags::from_header(value.as_bytes()).map(|tags| tags.stored()),
+    };
+    // S3 refuses them where they can't go: an upload's are given when it's
+    // created.
+    let tags_out_of_place = || {
+        format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "The specified header is not valid in this context")
+    };
+    // CopyObject's `x-amz-tagging-directive`: whether the copy takes the
+    // request's tags (REPLACE) or keeps its source's (COPY, the default).
+    // Case-sensitive, as in S3.
+    let replaces_tags = match req.headers().get(tags::DIRECTIVE).map(|v| v.as_bytes()) {
+        None | Some(b"COPY") => Ok(false),
+        Some(b"REPLACE") => Ok(true),
+        Some(_) => Err(format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "Unknown tagging directive.")),
+    };
     let resp = match req.method().clone() {
         hyper::Method::HEAD => overrides.apply(
             head_object(
@@ -608,20 +663,25 @@ async fn handle_request(
         }
         // CreateMultipartUpload
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {
-            match metadata {
-                Ok(metadata) => match checksums::requested_upload(req.headers()) {
+            match (metadata, tags) {
+                (Ok(metadata), Ok(tags)) => match checksums::requested_upload(req.headers()) {
                     Ok(checksum) => {
-                        create_multipart_upload(&app, &bucket, &key, &content_type, &metadata, wanted, role, checksum)
-                            .await?
+                        create_multipart_upload(
+                            &app, &bucket, &key, &content_type, &metadata, &tags, wanted, role, checksum,
+                        )
+                        .await?
                     }
                     Err(refused) => refused,
                 },
-                Err(refused) => refused,
+                (Err(refused), _) | (_, Err(refused)) => refused,
             }
         }
         // CompleteMultipartUpload
         // Its x-amz-checksum-* header is the object's, not the body's.
         hyper::Method::POST if query_param(&query, "uploadId").is_some() => {
+            if req.headers().contains_key(tags::HEADER) {
+                return Ok(box_response(tags_out_of_place()));
+            }
             let claimed = match checksums::claimed(req.headers()) {
                 Ok(claimed) => claimed,
                 Err(refused) => return Ok(box_response(refused)),
@@ -666,6 +726,9 @@ async fn handle_request(
         }
         // UploadPart
         hyper::Method::PUT if query_param(&query, "uploadId").is_some() => {
+            if req.headers().contains_key(tags::HEADER) {
+                return Ok(box_response(tags_out_of_place()));
+            }
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
             let part_number = query_param(&query, "partNumber").unwrap_or_default();
             match payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)) {
@@ -681,6 +744,15 @@ async fn handle_request(
         // variant, UploadPartCopy, is handled above). The source is read
         // server-side, so the request body is ignored.
         hyper::Method::PUT if copy_source.is_some() => {
+            // The request's tags only matter if they replace the source's.
+            let tags = match replaces_tags {
+                Ok(false) => None,
+                Ok(true) => match tags {
+                    Ok(tags) => Some(tags),
+                    Err(refused) => return Ok(box_response(refused)),
+                },
+                Err(refused) => return Ok(box_response(refused)),
+            };
             // The request's metadata only matters if it replaces the source's.
             let metadata = match metadata {
                 Err(refused) if replaces_metadata(metadata_directive.as_deref()) => {
@@ -705,22 +777,25 @@ async fn handle_request(
                 metadata_directive.as_deref(),
                 &content_type,
                 &metadata,
+                tags.as_deref(),
                 &copy_source_preconditions,
                 CopyKeys { source: source_key.as_ref(), dest: wanted, role, checksum },
             )
             .await?
         }
-        hyper::Method::PUT => match (payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)), metadata) {
-            (Ok(payload), Ok(metadata)) => {
+        hyper::Method::PUT => match (payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)), metadata, tags) {
+            (Ok(payload), Ok(metadata), Ok(tags)) => {
                 if let Err(refused) = checksums::check_put_type(req.headers(), payload.declared_algorithm()) {
                     return Ok(box_response(refused));
                 }
                 let body = req.into_body();
-                put_object(&app, &bucket, &key, &content_type, &metadata, body, payload, &preconditions, wanted, role)
-                    .await?
+                put_object(
+                    &app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &preconditions, wanted, role,
+                )
+                .await?
             }
-            (Err(rejection), _) => util::rejection_response(&rejection),
-            (_, Err(refused)) => refused,
+            (Err(rejection), _, _) => util::rejection_response(&rejection),
+            (_, Err(refused), _) | (_, _, Err(refused)) => refused,
         },
         _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
     };
@@ -877,9 +952,12 @@ fn authorize(
             };
             principal.can(Permission::Write, bucket) && source_ok
         }
+        // (DeleteObjectTagging changes a version's tags, as PutObjectTagging
+        // does: `write`.)
         Method::DELETE
             if query_param(query, "versionId").is_some()
-                && query_param(query, "uploadId").is_none() =>
+                && query_param(query, "uploadId").is_none()
+                && query_param(query, "tagging").is_none() =>
         {
             principal.can(Permission::DeleteVersion, bucket)
         }

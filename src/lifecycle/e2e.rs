@@ -20,9 +20,18 @@ use crate::{
             versioning::put_bucket_versioning,
         },
         multipart::create::create_multipart_upload,
+        objects::tagging::put_object_tagging,
         sse::Wanted,
     },
 };
+
+/// Sets `key`'s tags to `pairs`.
+async fn tag(app: &App, key: &str, pairs: &[(&str, &str)]) {
+    let tags: String = pairs.iter().map(|(k, v)| format!("<Tag><Key>{k}</Key><Value>{v}</Value></Tag>")).collect();
+    let body = format!("<Tagging><TagSet>{tags}</TagSet></Tagging>");
+    let response = put_object_tagging(app, BUCKET, key, None, Bytes::from(body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+}
 
 const DAY: Duration = Duration::from_secs(24 * 3600);
 
@@ -344,6 +353,85 @@ async fn a_version_written_since_is_not_expired() {
 }
 
 #[tokio::test]
+async fn tagged_objects_expire() {
+    let Some(app) = node().await else { return };
+    enable_versioning(&app).await;
+    for key in ["a", "b", "c"] {
+        put(&app, key, vec![1]).await;
+    }
+    tag(&app, "a", &[("tmp", "yes"), ("other", "1")]).await;
+    tag(&app, "b", &[("tmp", "no")]).await;
+    put(&app, "d", vec![1]).await;
+    tag(&app, "d", &[("tmp", "yes")]).await;
+    // Tags are a version's: d's new version has none, its old one keeps
+    // its own.
+    put(&app, "d", vec![2]).await;
+    configure(
+        &app,
+        "<Rule><ID>r</ID><Filter><Tag><Key>tmp</Key><Value>yes</Value></Tag></Filter><Status>Enabled</Status>\
+         <Expiration><Days>1</Days></Expiration>\
+         <NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule>",
+    )
+    .await;
+    let report = run_in(&app, 3).await.unwrap();
+    // a's current version gets a delete marker, and d's old version goes;
+    // its current one, which has no tags, stays.
+    assert_eq!((report.expired, report.removed), (1, 1), "{report}");
+    assert_eq!(get(&app, "a").await, None);
+    assert_eq!(get(&app, "b").await, Some(vec![1]));
+    assert_eq!(get(&app, "c").await, Some(vec![1]));
+    assert_eq!(get(&app, "d").await, Some(vec![2]));
+    // a's version is noncurrent now, still tagged: it goes next.
+    let report = run_in(&app, 6).await.unwrap();
+    assert_eq!((report.expired, report.removed), (0, 1), "{report}");
+    assert_eq!(versions(&app, "a").await, 1);
+    assert_eq!(versions(&app, "d").await, 1);
+}
+
+#[tokio::test]
+async fn a_version_retagged_since_is_not_expired() {
+    let Some(app) = node().await else { return };
+    put(&app, "a", vec![1]).await;
+    tag(&app, "a", &[("tmp", "yes")]).await;
+    configure(
+        &app,
+        "<Rule><ID>r</ID><Filter><Tag><Key>tmp</Key><Value>yes</Value></Tag></Filter><Status>Enabled</Status>\
+         <Expiration><Days>1</Days></Expiration></Rule>",
+    )
+    .await;
+    let row = app
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT lifecycle, lifecycle_generation FROM buckets WHERE name = $1", &[&BUCKET])
+        .await
+        .unwrap();
+    let (config, generation): (String, i64) = (row.get(0), row.get(1));
+    let rules = super::Configuration::from_json(&config).unwrap();
+    let client = app.pool.get().await.unwrap();
+    let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
+    let due: Vec<_> = rules
+        .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
+        .into_iter()
+        .map(|due| ("a".to_owned(), due))
+        .collect();
+    assert_eq!(due.len(), 1);
+    // Re-tagged after the sweep read it: the rule no longer applies to it,
+    // though it's the same version.
+    tag(&app, "a", &[("tmp", "no")]).await;
+    let mut report = Report::default();
+    assert!(expire(&app, &client, BUCKET, generation, &due, &mut report).await.unwrap());
+    assert_eq!(report.expired, 0);
+    assert_eq!(get(&app, "a").await, Some(vec![1]));
+    // Tagged as it was read again, it's due again.
+    tag(&app, "a", &[("tmp", "yes")]).await;
+    assert!(expire(&app, &client, BUCKET, generation, &due, &mut report).await.unwrap());
+    assert_eq!(report.expired, 1);
+    assert_eq!(get(&app, "a").await, None);
+}
+
+#[tokio::test]
 async fn deleting_the_configuration_stops_expirations() {
     let Some(app) = node().await else { return };
     put(&app, "a", vec![1]).await;
@@ -367,7 +455,7 @@ async fn deleting_the_configuration_stops_expirations() {
 async fn incomplete_uploads_are_aborted() {
     let Some(app) = node().await else { return };
     for key in ["tmp/a", "b"] {
-        let response = create_multipart_upload(&app, BUCKET, key, "x", "", Wanted::Plain, None, None).await.unwrap();
+        let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
     configure(

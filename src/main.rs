@@ -1261,6 +1261,8 @@ enum AttachTarget {
         sealing: Option<Sealing>,
         /// The checksum it's stored with (see `s3::checksums`).
         checksum: s3::checksums::Wanted,
+        /// Its tags, stored form (see `s3::tags`).
+        tags: String,
     },
     /// A part staged under an in-progress multipart upload, encrypted with
     /// `key` if the upload is encrypted (SSE-C, SSE-KMS or SSE-S3), whose
@@ -1652,6 +1654,7 @@ async fn try_commit_part(
             content_type,
             metadata,
             sealing,
+            tags,
             ..
         } => {
             let plain = s3::sse::Stored::Plain;
@@ -1662,7 +1665,7 @@ async fn try_commit_part(
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                                                       $11, $12, $13, $14, $15, $16, $17, $18,
                                                       $19, $20, $21, $22, $23, $24, $25, $26,
-                                                      $27, $28, $29, $30)",
+                                                      $27, $28, $29, $30, $31)",
                     &[
                         &written.blob_id,
                         &nodes,
@@ -1691,6 +1694,7 @@ async fn try_commit_part(
                         &checksum_algorithm,
                         &checksum_type,
                         &checksum,
+                        tags,
                         &expected.is_some(),
                         &expected.flatten(),
                         &s3::versions::new_version_id(),

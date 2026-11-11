@@ -443,7 +443,7 @@ async fn page(
     prefixes: &[String],
     limit: i64,
 ) -> anyhow::Result<Option<(Page, String, bool)>> {
-    const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, last_modified";
+    const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, last_modified, tags";
     // The ranges of keys under the prefixes, from the first that isn't
     // behind `after`: on to the next once one has no keys left.
     let ranges: Vec<(&String, Option<String>)> =
@@ -490,6 +490,7 @@ async fn page(
             delete_marker: row.get(4),
             size: row.get(5),
             last_modified: row.get(6),
+            tags: row.get(7),
         })
     }
     let mut versions = BTreeMap::new();
@@ -534,13 +535,15 @@ async fn expire(
         })
         .unzip();
     let marker_ids: Vec<String> = batch.iter().map(|_| new_version_id()).collect();
+    // The tags each had as it was read, which it must still have.
+    let tags: Vec<&str> = batch.iter().map(|(_, due)| due.version.tags.as_str()).collect();
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         let result = client
             .query_one_cached(
                 "SELECT status, applied, reap_blob, reap_node, reap_peer
-                 FROM pg_temp.cairn_lifecycle_expire($1, $2, $3, $4, $5, $6, $7, $8, $9)",
-                &[&bucket, &generation, &keys, &ids, &version_ids, &kinds, &successors, &newer, &marker_ids],
+                 FROM pg_temp.cairn_lifecycle_expire($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+                &[&bucket, &generation, &keys, &ids, &version_ids, &kinds, &successors, &newer, &marker_ids, &tags],
             )
             .await;
         let row = match result {

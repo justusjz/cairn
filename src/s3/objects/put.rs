@@ -15,6 +15,7 @@ use crate::{
 };
 
 /// PutObject, and POST Object (see `post`), whose body is a part of a form.
+/// `tags` are the object's, stored form (see `s3::tags`).
 #[allow(clippy::too_many_arguments)]
 pub async fn put_object<B>(
     app: &Arc<App>,
@@ -22,6 +23,7 @@ pub async fn put_object<B>(
     key: &str,
     content_type: &str,
     metadata: &str,
+    tags: &str,
     body: B,
     payload: Payload,
     conditions: &Preconditions,
@@ -76,6 +78,7 @@ where
         sealing,
         // The client's checksum, or S3's default.
         checksum: checksums::Wanted::ClientsOr(Algorithm::Crc64Nvme),
+        tags: tags.to_owned(),
     };
     match crate::upload_part(app, body, &attach, payload).await? {
         UploadResult::Committed { etag, checksum, version_id, .. } => {

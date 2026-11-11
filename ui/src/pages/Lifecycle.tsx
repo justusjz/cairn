@@ -17,6 +17,9 @@ type Draft = {
   prefix: string;
   greater: string;
   less: string;
+  /** Tags the objects must have, with these values (as typed: S3 doesn't
+   * trim them). */
+  tags: { key: string; value: string }[];
   /** What happens to current versions. */
   current: "none" | "days" | "date" | "markers";
   currentDays: string;
@@ -39,6 +42,7 @@ function fromRule(r: LifecycleRule): Draft {
     prefix: r.filter.prefix ?? "",
     greater: text(r.filter.size_greater_than),
     less: text(r.filter.size_less_than),
+    tags: (r.filter.tags ?? []).map((t) => ({ ...t })),
     current: e?.expired_object_delete_marker ? "markers" : e?.date != null ? "date" : e?.days != null ? "days" : "none",
     currentDays: text(e?.days),
     currentDate: e?.date != null ? new Date(e.date * DAY_MS).toISOString().slice(0, 10) : "",
@@ -56,6 +60,7 @@ const blank = (): Draft => ({
   prefix: "",
   greater: "",
   less: "",
+  tags: [],
   current: "days",
   currentDays: "30",
   currentDate: "",
@@ -96,6 +101,7 @@ function toRule(d: Draft, n: number): LifecycleRule {
       prefix: d.prefix,
       size_greater_than: number(d.greater, "the smallest size", n),
       size_less_than: number(d.less, "the largest size", n),
+      tags: d.tags,
     },
     expiration,
     noncurrent_expiration: d.noncurrent
@@ -113,6 +119,7 @@ function describe(d: Draft): string {
   let which = d.prefix ? `Objects under "${d.prefix}"` : "All objects";
   if (d.greater.trim()) which += ` larger than ${d.greater.trim()} bytes`;
   if (d.less.trim()) which += `${d.greater.trim() ? " and" : ""} smaller than ${d.less.trim()} bytes`;
+  if (d.tags.length) which += ` tagged ${d.tags.map((t) => `${t.key}=${t.value}`).join(", ")}`;
   const what: string[] = [];
   if (d.current === "days") what.push(`expire ${days(d.currentDays)} after they're written`);
   if (d.current === "date") what.push(`expire from ${d.currentDate || "?"} on`);
@@ -239,6 +246,36 @@ function RuleEditor(props: { draft: Draft; n: number; update: (change: Partial<D
           {input("prefix", "key prefix (all keys if empty)", "Key prefix", false)}
           {input("greater", "larger than (bytes)", "Larger than", true, "160px")}
           {input("less", "smaller than (bytes)", "Smaller than", true, "160px")}
+        </div>
+        <For each={d().tags}>
+          {(t, j) => {
+            const set = (change: Partial<{ key: string; value: string }>) =>
+              props.update({ tags: d().tags.map((u, k) => (k === j() ? { ...u, ...change } : u)) });
+            return (
+              <div class="form-row">
+                <span class="label">{j() === 0 ? "Tagged" : "and"}</span>
+                <input type="text" placeholder="tag key" aria-label="Tag key" value={t.key} onInput={(e) => set({ key: e.currentTarget.value })} />
+                <span>=</span>
+                <input
+                  type="text"
+                  placeholder="value (may be empty)"
+                  aria-label="Tag value"
+                  value={t.value}
+                  onInput={(e) => set({ value: e.currentTarget.value })}
+                />
+                <button class="small" onClick={() => props.update({ tags: d().tags.filter((_, k) => k !== j()) })}>
+                  Remove tag
+                </button>
+              </div>
+            );
+          }}
+        </For>
+        <div class="form-row">
+          <span class="label" />
+          <button class="small" onClick={() => props.update({ tags: [...d().tags, { key: "", value: "" }] })}>
+            Add tag
+          </button>
+          <span class="subtle">objects must have every tag, with its value; rules with tags can't abort uploads or remove delete markers</span>
         </div>
         <div class="form-row">
           <span class="label">Current versions</span>

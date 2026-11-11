@@ -515,7 +515,8 @@ $$;
 -- metadata (see `s3::metadata`) and encryption (see `s3::sse`): its SSE-C key
 -- check, or its SSE-KMS (or SSE-S3, if `p_sse_s3`) key, data key, sealed
 -- object key and context (NULLs for what it isn't), and its checksum (see
--- `s3::checksums`; NULLs for none). `p_size` is its plaintext's. `p_new_version_id` is
+-- `s3::checksums`; NULLs for none), and its tags (see `s3::tags`). `p_size`
+-- is its plaintext's. `p_new_version_id` is
 -- the fresh version ID to use if the bucket is versioned. Returns the new
 -- row's id, and the version ID to report (NULL unless versioning is enabled).
 -- The caller holds B(b) shared (which gave it the versioning state), K(b,k), and
@@ -524,7 +525,8 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
     p_content_type text, p_metadata text, p_sse_c_key bytea, p_kms_key_id text,
     p_kms_data_key text, p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean,
-    p_checksum_algorithm text, p_checksum_type text, p_checksum text, p_new_version_id text,
+    p_checksum_algorithm text, p_checksum_type text, p_checksum text, p_tags text,
+    p_new_version_id text,
     OUT id bigint, OUT version_id text
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -541,10 +543,11 @@ BEGIN
     INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
                          size, etag, content_type, metadata, sse_c_key, sse_kms_key_id,
                          sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
-                         checksum_algorithm, checksum_type, checksum, last_modified)
+                         checksum_algorithm, checksum_type, checksum, tags, last_modified)
     VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
-            p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, NOW())
+            p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags,
+            NOW())
     RETURNING objects.id INTO id;
     -- A write's version ID is reported only where it's a new one: S3 reports
     -- none for the null version (unversioned or suspended).
@@ -616,7 +619,7 @@ $$;
 -- `p_size` is the blob's (and the part's); an encrypted part also has its
 -- plaintext's size and its salt (NULL for a plain one), and an encrypted
 -- object its encryption, as `cairn_put_version` takes it, as it does the
--- object's checksum.
+-- object's checksum and tags.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_blob uuid, p_nodes int[], p_shards smallint[], p_size bigint, p_block_size int,
     p_data_shards smallint, p_parity_shards smallint, p_stripe_unit int, p_shard_crcs bigint[],
@@ -624,7 +627,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_bucket text, p_key text, p_content_type text, p_metadata text, p_sse_c_key bytea,
     p_kms_key_id text, p_kms_data_key text, p_kms_sealed bytea, p_kms_context text,
     p_sse_s3 boolean, p_checksum_algorithm text, p_checksum_type text, p_checksum text,
-    p_conditional boolean, p_expected bigint, p_new_version_id text,
+    p_tags text, p_conditional boolean, p_expected bigint, p_new_version_id text,
     OUT status text, OUT present bigint, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -663,7 +666,7 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, coalesce(p_plain_size, p_size), p_etag, p_content_type,
         p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
-        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_new_version_id);
+        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags, p_new_version_id);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -791,7 +794,8 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_bucket text, p_key text, p_size bigint, p_etag text, p_content_type text,
     p_metadata text, p_sse_c_key bytea, p_kms_key_id text, p_kms_data_key text,
     p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean, p_checksum_algorithm text,
-    p_checksum_type text, p_checksum text, p_part_checksums boolean, p_new_version_id text,
+    p_checksum_type text, p_checksum text, p_tags text, p_part_checksums boolean,
+    p_new_version_id text,
     OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -829,7 +833,7 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_metadata,
         p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
-        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_new_version_id);
+        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags, p_new_version_id);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -944,7 +948,8 @@ BEGIN
     reap_peer := '{}';
     -- An upload's bucket exists as long as the upload does.
     v_versioning := pg_temp.cairn_lock_bucket(p_bucket);
-    -- The upload defines the object's content type, metadata and encryption.
+    -- The upload defines the object's content type, metadata, encryption and
+    -- tags.
     -- It must belong to the request's bucket and key: authorization only
     -- checked the bucket.
     SELECT * INTO u
@@ -996,7 +1001,7 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, v_total, p_etag, u.content_type, u.metadata,
         u.sse_c_key, u.sse_kms_key_id, u.sse_kms_data_key, u.sse_kms_sealed, u.sse_kms_context,
-        u.sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_new_version_id);
+        u.sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, u.tags, p_new_version_id);
     version_id := v.version_id;
     UPDATE objects SET upload_id = p_upload WHERE id = v.id;
     UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);
@@ -1193,6 +1198,11 @@ $$;
 --                 `p_successors` (which made it noncurrent when it did), and
 --                 at least `p_newer` versions newer than it; removed for good.
 --
+-- A 'current' or 'noncurrent' target must also still have the tags the sweep
+-- read, `p_tags` (stored form): a version re-tagged since may no longer match
+-- the rule's filter. A tag change doesn't make a new version, but it takes
+-- K(b,k) (T22), so it can't happen while this holds the key.
+--
 -- `p_generation` is the generation of the configuration the sweep follows:
 -- if the bucket's is another (it was changed or deleted since), nothing is
 -- done
@@ -1200,7 +1210,7 @@ $$;
 -- 'no_such_bucket'.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_lifecycle_expire(
     p_bucket text, p_generation bigint, p_keys text[], p_ids bigint[], p_version_ids text[],
-    p_kinds text[], p_successors bigint[], p_newer int[], p_marker_ids text[],
+    p_kinds text[], p_successors bigint[], p_newer int[], p_marker_ids text[], p_tags text[],
     OUT status text, OUT applied boolean[],
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -1232,7 +1242,8 @@ BEGIN
     -- make another's look undue (removing the version after it, say).
     FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP
         IF p_kinds[i] = 'current' THEN
-            v_ok := pg_temp.cairn_current_version(p_bucket, p_keys[i]) IS NOT DISTINCT FROM p_ids[i];
+            v_ok := pg_temp.cairn_current_version(p_bucket, p_keys[i]) IS NOT DISTINCT FROM p_ids[i]
+                AND EXISTS (SELECT 1 FROM objects WHERE id = p_ids[i] AND tags = p_tags[i]);
         ELSIF p_kinds[i] = 'marker' THEN
             v_ok := EXISTS (
                 SELECT 1 FROM objects
@@ -1246,6 +1257,7 @@ BEGIN
             v_ok := EXISTS (
                 SELECT 1 FROM objects
                 WHERE id = p_ids[i] AND bucket = p_bucket AND key = p_keys[i] AND NOT is_latest
+                  AND tags = p_tags[i]
             ) AND (
                 SELECT min(id) FROM objects
                 WHERE bucket = p_bucket AND key = p_keys[i] AND id > p_ids[i]
@@ -1302,6 +1314,57 @@ BEGIN
         UPDATE lifecycle_runs SET lease_until = p_now + make_interval(secs => p_lease), last_step = p_now
         WHERE id;
     END IF;
+END
+$$;
+
+-- T22: PutObjectTagging and DeleteObjectTagging: sets the tags (stored form,
+-- see `s3::tags`; empty for none) of the version `p_version_id` of the key,
+-- or of its current version if NULL, in place: it's no new version, and its
+-- ETag and last-modified time stay. Takes B(b) shared and K(b,k): object rows
+-- only change under K (I1), and a lifecycle sweep re-checks a version's tags
+-- under it (T17). Returns 'tagged', or 'no_such_bucket', 'no_such_key',
+-- 'no_such_version', or 'delete_marker' (which has no tags); and the
+-- bucket's versioning state and the version's ID (for the last two, and
+-- 'tagged'), which the response reports.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_tags(
+    p_bucket text, p_key text, p_version_id text, p_tags text,
+    OUT status text, OUT versioning text, OUT version_id text
+) LANGUAGE plpgsql AS $$
+DECLARE
+    o record;
+BEGIN
+    versioning := pg_temp.cairn_lock_bucket(p_bucket);
+    IF versioning IS NULL THEN
+        status := 'no_such_bucket';
+        RETURN;
+    END IF;
+    PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
+    SELECT ob.id, ob.version_id, ob.is_delete_marker INTO o
+    FROM objects ob
+    WHERE ob.bucket = p_bucket AND ob.key = p_key
+      AND CASE WHEN p_version_id IS NULL THEN ob.is_latest ELSE ob.version_id = p_version_id END;
+    IF NOT FOUND THEN
+        status := CASE WHEN p_version_id IS NULL THEN 'no_such_key' ELSE 'no_such_version' END;
+        RETURN;
+    END IF;
+    version_id := o.version_id;
+    IF o.is_delete_marker THEN
+        status := 'delete_marker';
+        RETURN;
+    END IF;
+    UPDATE objects SET tags = p_tags WHERE id = o.id;
+    status := 'tagged';
+END
+$$;
+
+-- T23: PutBucketTagging and DeleteBucketTagging: sets (or, with NULL,
+-- removes) the bucket's tags. A plain UPDATE of the bucket's row, as T21's.
+-- Returns whether the bucket exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_bucket_tags(p_bucket text, p_tags text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE buckets SET tags = p_tags WHERE name = p_bucket;
+    RETURN FOUND;
 END
 $$;
 

@@ -2,8 +2,8 @@
 //! `<LifecycleConfiguration>` writes them, how they're stored (JSON, in
 //! `buckets.lifecycle`), and what they make due.
 //!
-//! Each rule picks objects by a filter (a key prefix, and bounds on their
-//! size), and says what happens to them, and when:
+//! Each rule picks objects by a filter (a key prefix, bounds on their size,
+//! and tags they must have), and says what happens to them, and when:
 //!
 //! - `Expiration`: the current version expires a number of days after it was
 //!   written, or from a date on. Or, with `ExpiredObjectDeleteMarker`, a
@@ -19,17 +19,20 @@
 //! under a rule of 1 day, expires at midnight starting the 3rd.
 //!
 //! Not supported, and refused when asked for: transitions to other storage
-//! classes (Cairn has one), and filters on tags (Cairn doesn't keep them).
-//! Both would be more fields here, and more kinds of `Due`; the stored JSON
-//! refuses fields it doesn't know (`deny_unknown_fields`), so that a node too
-//! old to know a newer rule's field skips the bucket instead of applying the
-//! rule without it.
+//! classes (Cairn has one). That would be more fields here, and more kinds
+//! of `Due`; the stored JSON refuses fields it doesn't know
+//! (`deny_unknown_fields`), so that a node too old to know a newer rule's
+//! field skips the bucket instead of applying the rule without it (as nodes
+//! from before tag filters do with a rule that has one).
+//!
+//! What S3 takes, and its errors, follow S3 itself where it was observed
+//! (see `plans/tagging.md`).
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::s3::util::xml_escape;
+use crate::s3::{tags::Tags, util::xml_escape};
 
 /// The most rules a configuration may have, as in S3.
 const MAX_RULES: usize = 1000;
@@ -37,6 +40,11 @@ const MAX_RULES: usize = 1000;
 const MAX_ID_LENGTH: usize = 255;
 /// The most noncurrent versions a rule may keep, as in S3.
 const MAX_NEWER_NONCURRENT: u32 = 100;
+
+/// S3's refusals of actions that can't go with a filter (400 InvalidRequest).
+const EODM_WITH_TAGS: &str = "ExpiredObjectDeleteMarker cannot be specified with Tags.";
+const ABORT_WITH_TAGS: &str = "AbortIncompleteMultipartUpload cannot be specified with Tags.";
+const ABORT_WITH_SIZE: &str = "AbortIncompleteMultipartUpload cannot be specified with Object Size.";
 
 /// A bucket's lifecycle configuration.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -66,7 +74,9 @@ pub struct Rule {
 }
 
 /// Which objects a rule applies to: those with keys starting with `prefix`,
-/// and sizes strictly between the bounds. All of them, by default.
+/// sizes strictly between the bounds, and each of `tags` (with that value;
+/// other tags don't matter). All of them, by default. A delete marker has no
+/// size, and no tags: a filter on tags never matches one.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 #[schema(as = LifecycleFilter)]
@@ -77,6 +87,17 @@ pub struct Filter {
     pub size_greater_than: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_less_than: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<FilterTag>,
+}
+
+/// A tag a filter asks for (see `s3::tags`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(as = LifecycleFilterTag)]
+pub struct FilterTag {
+    pub key: String,
+    pub value: String,
 }
 
 /// `Expiration`: one of `days` and `date`, or `expired_object_delete_marker`.
@@ -221,6 +242,8 @@ pub enum Invalid {
     Malformed(String),
     /// 400 InvalidArgument: the document, with a value S3 doesn't allow.
     Argument(String),
+    /// 400 InvalidRequest: likewise, where S3 answers so.
+    Request(String),
     /// 501 NotImplemented: something S3 has and Cairn doesn't.
     Unsupported(String),
 }
@@ -265,9 +288,6 @@ fn only(node: Node, known: &[&str]) -> Result<(), Invalid> {
     }
 }
 
-fn tags_unsupported() -> Invalid {
-    Invalid::Unsupported("lifecycle rules can't filter on tags: Cairn doesn't keep object tags".to_owned())
-}
 
 impl Configuration {
     /// Parses a `<LifecycleConfiguration>`, as PutBucketLifecycleConfiguration
@@ -414,6 +434,7 @@ impl Configuration {
 
     /// Whether the upload of `key` created at `initiated` is due to be
     /// aborted, as of `today`.
+    /// (A rule that aborts uploads has no size or tag filter.)
     pub fn aborts(&self, key: &str, initiated: SystemTime, today: Day) -> bool {
         self.enabled().any(|r| {
             key.starts_with(&r.filter.prefix) && r.abort_upload_days.is_some_and(|days| initiated <= today.cutoff(days))
@@ -436,9 +457,13 @@ impl Rule {
         {
             return Err("ObjectSizeGreaterThan must be less than ObjectSizeLessThan".to_owned());
         }
+        f.check_tags()?;
         if let Some(e) = &self.expiration {
             if e.days.is_some() && e.date.is_some() {
                 return Err("an Expiration has either Days or a Date".to_owned());
+            }
+            if e.expired_object_delete_marker && !f.tags.is_empty() {
+                return Err(EODM_WITH_TAGS.to_owned());
             }
             if e.expired_object_delete_marker && (e.days.is_some() || e.date.is_some()) {
                 return Err(
@@ -461,9 +486,13 @@ impl Rule {
         if self.abort_upload_days == Some(0) {
             return Err("DaysAfterInitiation must be at least 1".to_owned());
         }
+        if self.abort_upload_days.is_some() && !f.tags.is_empty() {
+            // An upload has no tags yet.
+            return Err(ABORT_WITH_TAGS.to_owned());
+        }
         if self.abort_upload_days.is_some() && (f.size_greater_than.is_some() || f.size_less_than.is_some()) {
             // An upload has no size yet.
-            return Err("AbortIncompleteMultipartUpload can't be used with an object size filter".to_owned());
+            return Err(ABORT_WITH_SIZE.to_owned());
         }
         if self.expiration.is_none() && self.noncurrent_expiration.is_none() && self.abort_upload_days.is_none() {
             return Err("At least one action needs to be specified in a rule".to_owned());
@@ -541,11 +570,19 @@ impl Rule {
             }
             _ => return Err(Invalid::Malformed("more than one AbortIncompleteMultipartUpload".to_owned())),
         };
+        // S3 refuses an ExpiredObjectDeleteMarker with tags even if it's
+        // false.
+        let marker = children(node, "Expiration").iter().any(|e| !children(*e, "ExpiredObjectDeleteMarker").is_empty());
+        if marker && !filter.tags.is_empty() {
+            return Err(Invalid::Request(EODM_WITH_TAGS.to_owned()));
+        }
+        if abort_upload_days.is_some() && !filter.tags.is_empty() {
+            // An upload has no tags yet.
+            return Err(Invalid::Request(ABORT_WITH_TAGS.to_owned()));
+        }
         if abort_upload_days.is_some() && (filter.size_greater_than.is_some() || filter.size_less_than.is_some()) {
             // An upload has no size yet.
-            return Err(Invalid::Argument(
-                "AbortIncompleteMultipartUpload can't be used with an object size filter".to_owned(),
-            ));
+            return Err(Invalid::Request(ABORT_WITH_SIZE.to_owned()));
         }
         if expiration.is_none() && noncurrent_expiration.is_none() && abort_upload_days.is_none() {
             return Err(Invalid::Argument("At least one action needs to be specified in a rule".to_owned()));
@@ -588,41 +625,82 @@ impl Rule {
 }
 
 impl Filter {
-    /// A `<Filter>`: empty, or one condition, or several under `<And>`.
+    /// A `<Filter>`: empty, or one condition, or at least two under `<And>`
+    /// (S3 refuses an `<And>` of fewer).
     fn parse(node: Node) -> Result<Filter, Invalid> {
         const CONDITIONS: &[&str] = &["Prefix", "Tag", "ObjectSizeGreaterThan", "ObjectSizeLessThan"];
         let mut known = CONDITIONS.to_vec();
         known.push("And");
         only(node, &known)?;
-        let conditions = node.children().filter(|n| n.is_element()).count();
+        let elements = |node: Node| node.children().filter(|n| n.is_element()).count();
         let source = match &children(node, "And")[..] {
-            [] if conditions <= 1 => node,
-            [and] if conditions == 1 => {
+            [] if elements(node) <= 1 => node,
+            [and] if elements(node) == 1 => {
                 only(*and, CONDITIONS)?;
+                if elements(*and) < 2 {
+                    return Err(Invalid::Malformed("an And has at least two conditions".to_owned()));
+                }
                 *and
             }
             _ => return Err(Invalid::Malformed("a Filter has one condition, or several under And".to_owned())),
         };
-        if !children(source, "Tag").is_empty() {
-            return Err(tags_unsupported());
+        let mut tags = Vec::new();
+        for tag in children(source, "Tag") {
+            only(tag, &["Key", "Value"])?;
+            // As written: S3 doesn't trim them.
+            let raw = |name| match &children(tag, name)[..] {
+                [field] => Ok(field.text().unwrap_or("").to_owned()),
+                _ => Err(Invalid::Malformed("a Tag has one Key and one Value".to_owned())),
+            };
+            tags.push(FilterTag { key: raw("Key")?, value: raw("Value")? });
         }
         let filter = Filter {
             prefix: text(source, "Prefix")?.unwrap_or_default(),
             size_greater_than: number(source, "ObjectSizeGreaterThan", 0i64)?,
             size_less_than: number(source, "ObjectSizeLessThan", 1i64)?,
+            tags,
         };
         if let (Some(greater), Some(less)) = (filter.size_greater_than, filter.size_less_than)
             && greater >= less
         {
             return Err(Invalid::Argument("ObjectSizeGreaterThan must be less than ObjectSizeLessThan".to_owned()));
         }
+        filter.check_tags().map_err(Invalid::Request)?;
         Ok(filter)
+    }
+
+    /// What's wrong with its tags, if anything, as S3 says it (400
+    /// InvalidRequest). S3 checks only their lengths here, and that each key
+    /// is there once: not their characters, nor an `aws:` prefix.
+    fn check_tags(&self) -> Result<(), String> {
+        for tag in &self.tags {
+            let length = tag.key.encode_utf16().count();
+            if length == 0 || length > crate::s3::tags::MAX_KEY {
+                return Err("A Tag's Key must be a length between 1 and 128.".to_owned());
+            }
+            if tag.value.encode_utf16().count() > crate::s3::tags::MAX_VALUE {
+                return Err("A Tag's Value must be a length between 0 and 256.".to_owned());
+            }
+        }
+        let mut keys: Vec<&str> = self.tags.iter().map(|tag| tag.key.as_str()).collect();
+        keys.sort_unstable();
+        if keys.windows(2).any(|w| w[0] == w[1]) {
+            return Err("Duplicate Tag Keys are not allowed.".to_owned());
+        }
+        Ok(())
     }
 
     fn write_xml(&self, out: &mut String) {
         let mut conditions = Vec::new();
         if !self.prefix.is_empty() {
             conditions.push(format!("<Prefix>{}</Prefix>", xml_escape(&self.prefix)));
+        }
+        for tag in &self.tags {
+            conditions.push(format!(
+                "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                xml_escape(&tag.key),
+                xml_escape(&tag.value)
+            ));
         }
         if let Some(n) = self.size_greater_than {
             conditions.push(format!("<ObjectSizeGreaterThan>{n}</ObjectSizeGreaterThan>"));
@@ -638,12 +716,16 @@ impl Filter {
     }
 
     /// Whether `version` of `key` passes it. A delete marker has no size, so
-    /// only its key counts.
+    /// only its key counts, and no tags.
     fn matches(&self, key: &str, version: &Version) -> bool {
         key.starts_with(&self.prefix)
             && (version.delete_marker
                 || (self.size_greater_than.is_none_or(|n| version.size > n)
                     && self.size_less_than.is_none_or(|n| version.size < n)))
+            && (self.tags.is_empty() || {
+                let tags = Tags::from_stored(&version.tags);
+                self.tags.iter().all(|tag| tags.get(&tag.key) == Some(tag.value.as_str()))
+            })
     }
 }
 
@@ -715,6 +797,8 @@ pub struct Version {
     pub delete_marker: bool,
     pub size: i64,
     pub last_modified: SystemTime,
+    /// Its tags, stored form (see `s3::tags`).
+    pub tags: String,
 }
 
 /// A version that a rule made due, and what made it so, as
@@ -823,7 +907,7 @@ mod tests {
         );
         assert_eq!(
             parsed.rules[1].filter,
-            Filter { prefix: "a&b".to_owned(), size_greater_than: Some(10), size_less_than: Some(20) }
+            Filter { prefix: "a&b".to_owned(), size_greater_than: Some(10), size_less_than: Some(20), tags: Vec::new() }
         );
         assert_eq!(parsed.rules[1].noncurrent_expiration, Some(NoncurrentExpiration { days: 7, newer_versions: Some(3) }));
         assert_eq!(parsed.rules[2].expiration.as_ref().unwrap().date, Some(day(2027, 1, 1)));
@@ -863,6 +947,14 @@ mod tests {
                 "<Filter/><Status>Enabled</Status><NoncurrentVersionExpiration>\
                  <NewerNoncurrentVersions>1</NewerNoncurrentVersions></NoncurrentVersionExpiration>",
             )),
+            // As S3 refuses them: an And of fewer than two conditions, two
+            // Tags without one, a Tag without its Key or Value.
+            config(&rule(&format!("<Filter><And><Prefix>a</Prefix></And></Filter><Status>Enabled</Status>{expire}"))),
+            config(&rule(&format!("<Filter><And>{}</And></Filter><Status>Enabled</Status>{expire}", tag("a", "1")))),
+            config(&rule(&format!("<Filter><And></And></Filter><Status>Enabled</Status>{expire}"))),
+            config(&rule(&format!("<Filter>{}{}</Filter><Status>Enabled</Status>{expire}", tag("a", "1"), tag("b", "1")))),
+            config(&rule(&format!("<Filter><Tag><Key>a</Key></Tag></Filter><Status>Enabled</Status>{expire}"))),
+            config(&rule(&format!("<Filter><Tag><Value>a</Value></Tag></Filter><Status>Enabled</Status>{expire}"))),
         ];
         for bad in malformed {
             assert!(matches!(Configuration::parse(&bad), Err(Invalid::Malformed(_))), "{bad}");
@@ -880,11 +972,6 @@ mod tests {
                  <ObjectSizeLessThan>5</ObjectSizeLessThan></And></Filter><Status>Enabled</Status>{expire}"
             )),
             rule(
-                "<Filter><ObjectSizeGreaterThan>5</ObjectSizeGreaterThan></Filter><Status>Enabled</Status>\
-                 <AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation>\
-                 </AbortIncompleteMultipartUpload>",
-            ),
-            rule(
                 "<Filter/><Status>Enabled</Status><NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays>\
                  <NewerNoncurrentVersions>101</NewerNoncurrentVersions></NoncurrentVersionExpiration>",
             ),
@@ -894,12 +981,59 @@ mod tests {
         for bad in invalid {
             assert!(matches!(parse(&bad), Err(Invalid::Argument(_))), "{bad}");
         }
+        // S3's 400 InvalidRequest, with its messages.
+        let abort = "<AbortIncompleteMultipartUpload><DaysAfterInitiation>1</DaysAfterInitiation>\
+                     </AbortIncompleteMultipartUpload>";
+        let marker = |on: &str| format!("<Expiration><ExpiredObjectDeleteMarker>{on}</ExpiredObjectDeleteMarker></Expiration>");
+        let request = [
+            (
+                rule(&format!("<Filter><ObjectSizeGreaterThan>5</ObjectSizeGreaterThan></Filter><Status>Enabled</Status>{abort}")),
+                "AbortIncompleteMultipartUpload cannot be specified with Object Size.",
+            ),
+            (
+                rule(&format!("<Filter>{}</Filter><Status>Enabled</Status>{expire}{abort}", tag("a", "1"))),
+                "AbortIncompleteMultipartUpload cannot be specified with Tags.",
+            ),
+            (
+                rule(&format!(
+                    "<Filter><And><Prefix>x/</Prefix>{}</And></Filter><Status>Enabled</Status>{abort}",
+                    tag("a", "1")
+                )),
+                "AbortIncompleteMultipartUpload cannot be specified with Tags.",
+            ),
+            (
+                rule(&format!("<Filter>{}</Filter><Status>Enabled</Status>{}", tag("a", "1"), marker("true"))),
+                "ExpiredObjectDeleteMarker cannot be specified with Tags.",
+            ),
+            (
+                rule(&format!("<Filter>{}</Filter><Status>Enabled</Status>{}", tag("a", "1"), marker("false"))),
+                "ExpiredObjectDeleteMarker cannot be specified with Tags.",
+            ),
+            (
+                rule(&format!("<Filter>{}</Filter><Status>Enabled</Status>{expire}", tag("", "1"))),
+                "A Tag's Key must be a length between 1 and 128.",
+            ),
+            (
+                rule(&format!("<Filter>{}</Filter><Status>Enabled</Status>{expire}", tag(&"a".repeat(129), "1"))),
+                "A Tag's Key must be a length between 1 and 128.",
+            ),
+            (
+                rule(&format!("<Filter>{}</Filter><Status>Enabled</Status>{expire}", tag("a", &"v".repeat(257)))),
+                "A Tag's Value must be a length between 0 and 256.",
+            ),
+            (
+                rule(&format!(
+                    "<Filter><And><Prefix>x/</Prefix>{}{}</And></Filter><Status>Enabled</Status>{expire}",
+                    tag("a", "1"),
+                    tag("a", "2")
+                )),
+                "Duplicate Tag Keys are not allowed.",
+            ),
+        ];
+        for (bad, why) in request {
+            assert_eq!(parse(&bad), Err(Invalid::Request(why.to_owned())), "{bad}");
+        }
         let unsupported = [
-            rule(&format!("<Filter><Tag><Key>a</Key><Value>b</Value></Tag></Filter><Status>Enabled</Status>{expire}")),
-            rule(&format!(
-                "<Filter><And><Prefix>a</Prefix><Tag><Key>a</Key><Value>b</Value></Tag></And></Filter>\
-                 <Status>Enabled</Status>{expire}"
-            )),
             rule(
                 "<Filter/><Status>Enabled</Status><Transition><Days>1</Days>\
                  <StorageClass>GLACIER</StorageClass></Transition>",
@@ -933,12 +1067,106 @@ mod tests {
 
     #[test]
     fn stored_configurations_refuse_unknown_fields() {
-        let json = r#"{"rules":[{"id":"a","enabled":true,"filter":{"tags":[["k","v"]]},"expiration":{"days":1}}]}"#;
+        let json = r#"{"rules":[{"id":"a","enabled":true,"filter":{"storage":"x"},"expiration":{"days":1}}]}"#;
         assert!(Configuration::from_json(json).is_err());
     }
 
+    fn tag(key: &str, value: &str) -> String {
+        format!("<Tag><Key>{key}</Key><Value>{value}</Value></Tag>")
+    }
+
+    #[test]
+    fn tag_filters_parse_and_round_trip() {
+        let expire = "<Status>Enabled</Status><Expiration><Days>1</Days></Expiration>";
+        // S3 takes what it wouldn't as an object's tag here, and keeps keys
+        // as they're written.
+        let rules = parse(&format!(
+            "<Rule><ID>a</ID><Filter>{}</Filter>{expire}</Rule>\
+             <Rule><ID>b</ID><Filter><And><Prefix>x/</Prefix>{}{}<ObjectSizeLessThan>9</ObjectSizeLessThan>\
+             </And></Filter>{expire}</Rule>\
+             <Rule><ID>c</ID><Filter>{}</Filter><Status>Enabled</Status>\
+             <NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule>",
+            tag(" a ", ""),
+            tag("aws:x", "v!"),
+            tag("k", "2"),
+            tag("a", "1"),
+        ))
+        .unwrap();
+        let tags = |rule: usize| -> Vec<(&str, &str)> {
+            rules.rules[rule].filter.tags.iter().map(|t| (t.key.as_str(), t.value.as_str())).collect()
+        };
+        assert_eq!(tags(0), [(" a ", "")]);
+        assert_eq!(tags(1), [("aws:x", "v!"), ("k", "2")]);
+        assert_eq!(rules.rules[1].filter.prefix, "x/");
+        let xml = rules.to_xml();
+        assert!(xml.contains("<Filter><Tag><Key> a </Key><Value></Value></Tag></Filter>"), "{xml}");
+        assert!(
+            xml.contains(
+                "<Filter><And><Prefix>x/</Prefix><Tag><Key>aws:x</Key><Value>v!</Value></Tag>\
+                 <Tag><Key>k</Key><Value>2</Value></Tag><ObjectSizeLessThan>9</ObjectSizeLessThan></And></Filter>"
+            ),
+            "{xml}"
+        );
+        assert_eq!(Configuration::parse(&xml).unwrap(), rules);
+        assert_eq!(Configuration::from_json(&rules.to_json()).unwrap(), rules);
+        // As the dashboard gives them, checked the same.
+        let check = |json: &str| Configuration::from_json(json).unwrap().check();
+        check(r#"{"rules":[{"id":"a","enabled":true,"filter":{"tags":[{"key":"k","value":"v"}]},"expiration":{"days":1}}]}"#)
+            .unwrap();
+        for bad in [
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{"tags":[{"key":"","value":"v"}]},"expiration":{"days":1}}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{"tags":[{"key":"k","value":"1"},{"key":"k","value":"2"}]},"expiration":{"days":1}}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{"tags":[{"key":"k","value":"v"}]},"abort_upload_days":1}]}"#,
+            r#"{"rules":[{"id":"a","enabled":true,"filter":{"tags":[{"key":"k","value":"v"}]},"expiration":{"expired_object_delete_marker":true}}]}"#,
+        ] {
+            assert!(check(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn tag_filters_match_versions_with_every_tag() {
+        let rules = parse(&format!(
+            "<Rule><ID>r</ID><Filter><And><Prefix>logs/</Prefix>{}{}</And></Filter><Status>Enabled</Status>\
+             <Expiration><Days>1</Days></Expiration>\
+             <NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule>",
+            tag("a", "1"),
+            tag("b", ""),
+        ))
+        .unwrap();
+        let first = day(2026, 1, 1);
+        let later = Day(first.0 + 5);
+        let tagged = |id, latest, marker, tags: &str| Version { tags: tags.to_owned(), ..version(id, at(first, 10), latest, marker, 10) };
+        // Every tag, with its value; others don't matter.
+        assert_eq!(kinds(&rules.due("logs/x", &[tagged(1, true, false, "a=1&b=&c=3")], later)), vec![(1, Kind::Current)]);
+        for tags in ["", "a=1", "a=1&b=x", "a=2&b=", "b="] {
+            assert_eq!(rules.due("logs/x", &[tagged(1, true, false, tags)], later), vec![], "{tags}");
+        }
+        // Not under the prefix.
+        assert_eq!(rules.due("other", &[tagged(1, true, false, "a=1&b=")], later), vec![]);
+        // A noncurrent version by its own tags, not its successor's.
+        let versions = [tagged(3, true, false, ""), tagged(2, false, false, "a=1&b="), tagged(1, false, false, "a=1")];
+        assert_eq!(
+            kinds(&rules.due("logs/x", &versions, later)),
+            vec![(2, Kind::Noncurrent { successor: 3, newer: 1 })]
+        );
+        // A delete marker has no tags.
+        let versions = [tagged(2, true, true, ""), tagged(1, false, false, "a=1&b=")];
+        assert_eq!(
+            kinds(&rules.due("logs/x", &versions, later)),
+            vec![(1, Kind::Noncurrent { successor: 2, newer: 1 })]
+        );
+    }
+
     fn version(id: i64, written: SystemTime, latest: bool, marker: bool, size: i64) -> Version {
-        Version { id, version_id: format!("v{id}"), is_latest: latest, delete_marker: marker, size, last_modified: written }
+        Version {
+            id,
+            version_id: format!("v{id}"),
+            is_latest: latest,
+            delete_marker: marker,
+            size,
+            last_modified: written,
+            tags: String::new(),
+        }
     }
 
     fn kinds(due: &[Due]) -> Vec<(i64, Kind)> {

@@ -46,6 +46,7 @@ use crate::{
         objects::put::put_object,
         post_policy::{Fields, Policy, field},
         sse, sse_c,
+        tags::{On, Tags},
         util::{self, format_s3_error, rejection_response, xml_escape},
     },
 };
@@ -353,6 +354,15 @@ where
         Ok(metadata) => metadata,
         Err(refused) => return Ok(refused),
     };
+    // Its tags: a `<Tagging>` document, as S3 takes them in a form (not a
+    // header's form), with PutObjectTagging's errors.
+    let tags = match field(&fields, "tagging") {
+        None => String::new(),
+        Some(document) => match Tags::from_xml(document.as_bytes(), On::Object) {
+            Ok(tags) => tags.stored(),
+            Err(refused) => return Ok(refused),
+        },
+    };
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -371,7 +381,7 @@ where
     let conditions = Preconditions::default();
     let role = Some(principal.id);
     let body = FileBody(file);
-    let response = match put_object(app, &bucket, &key, &content_type, &metadata, body, payload, &conditions, wanted, role)
+    let response = match put_object(app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &conditions, wanted, role)
         .await
     {
         Ok(response) => response,

@@ -757,6 +757,23 @@ pub(super) struct BucketSummary {
     uploads: i64,
     /// Roles with a grant on the bucket.
     roles: i64,
+    /// Its tags (PutBucketTagging), sorted by key.
+    tags: Vec<Tag>,
+}
+
+/// A tag of a bucket or an object version (see `s3::tags`).
+#[derive(Serialize, ToSchema)]
+pub(super) struct Tag {
+    key: String,
+    value: String,
+}
+
+/// Tags as the dashboard shows them, from their stored form.
+fn tag_list(stored: &str) -> Vec<Tag> {
+    crate::s3::tags::Tags::from_stored(stored)
+        .iter()
+        .map(|(key, value)| Tag { key: key.to_owned(), value: value.to_owned() })
+        .collect()
 }
 
 #[utoipa::path(get, path = "/buckets", responses(
@@ -807,6 +824,12 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         .collect();
     let roles =
         counts("SELECT bucket, count(DISTINCT role) FROM role_grants GROUP BY bucket").await?;
+    let mut tags: HashMap<String, String> = client
+        .query_cached("SELECT name, tags FROM buckets WHERE tags IS NOT NULL", &[])
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
     Ok(buckets
         .into_iter()
         .map(|b| {
@@ -816,6 +839,7 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
                 uploads: uploads.get(&b.name).copied().unwrap_or(0),
                 roles: roles.get(&b.name).copied().unwrap_or(0),
                 default_kms_key: defaults.remove(&b.name),
+                tags: tags.remove(&b.name).as_deref().map(tag_list).unwrap_or_default(),
                 name: b.name,
                 created_at: b.created_at.epoch,
                 versioning: b.versioning,
@@ -1045,6 +1069,8 @@ struct VersionInfo {
     last_modified: f64,
     /// How it's encrypted; none if it isn't.
     encryption: Option<EncryptionInfo>,
+    /// Its tags, sorted by key.
+    tags: Vec<Tag>,
     parts: Vec<PartInfo>,
     /// How many of its parts' bytes are intact on no replica.
     lost_bytes: i64,
@@ -1136,7 +1162,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
         .query_cached(
             "SELECT id, version_id, is_latest, is_delete_marker, size, etag, content_type,
                     extract(epoch FROM last_modified)::float8, sse_c_key, sse_kms_key_id,
-                    sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3
+                    sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3, tags
              FROM objects WHERE bucket = $1 AND key = $2
              ORDER BY id DESC LIMIT $3",
             &[&bucket, &key, &MAX_VERSIONS],
@@ -1229,6 +1255,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
             content_type: v.get(6),
             last_modified: v.get(7),
             encryption: EncryptionInfo::of(stored),
+            tags: tag_list(v.get(14)),
             lost_bytes: parts.iter().flat_map(|p| &p.lost).map(|[a, b]| b - a).sum(),
             parts,
         });
@@ -1814,7 +1841,7 @@ mod e2e {
         ]});
         let (status, _, body) = send(&app, request("PUT", &path, Some(bad))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(error_of(&body).contains("object size filter"), "{}", error_of(&body));
+        assert!(error_of(&body).contains("cannot be specified with Object Size"), "{}", error_of(&body));
         let unknown = serde_json::json!({"rules": [{"id": "a", "enabled": true, "filter": {"tag": "x"}}]});
         assert!(send(&app, request("PUT", &path, Some(unknown))).await.0.is_client_error());
         let missing = request("PUT", "/_dashboard/api/buckets/nope/lifecycle", Some(serde_json::json!({"rules": [

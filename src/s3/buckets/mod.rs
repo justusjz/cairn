@@ -5,4 +5,5 @@ pub mod encryption;
 pub mod head;
 pub mod lifecycle;
 pub mod list;
+pub mod tagging;
 pub mod versioning;

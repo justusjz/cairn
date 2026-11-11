@@ -457,12 +457,12 @@ async fn lost_data_fails_up_front() {
     assert_eq!(head.status(), StatusCode::OK);
 
     let source = format!("{BUCKET}/k");
-    let copy = objects::copy::copy_object(&app, BUCKET, "copy", &source, None, "text/plain", "", &Preconditions::default(), Default::default())
+    let copy = objects::copy::copy_object(&app, BUCKET, "copy", &source, None, "text/plain", "", None, &Preconditions::default(), Default::default())
         .await
         .unwrap();
     assert_eq!(copy.status(), StatusCode::INTERNAL_SERVER_ERROR);
     assert!(get(&app, "copy").await.is_none());
-    let upload = crate::s3::multipart::create::create_multipart_upload(&app, BUCKET, "assembled", "application/octet-stream", "", crate::s3::sse::Wanted::Plain, None, None)
+    let upload = crate::s3::multipart::create::create_multipart_upload(&app, BUCKET, "assembled", "application/octet-stream", "", "", crate::s3::sse::Wanted::Plain, None, None)
         .await
         .unwrap();
     let body = upload.into_body().collect().await.unwrap().to_bytes();

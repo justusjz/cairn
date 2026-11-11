@@ -12,13 +12,16 @@ use crate::{
 
 /// CreateMultipartUpload: `POST /{bucket}/{key}?uploads`. Stages an upload and
 /// hands back its UploadId. Nothing about the live object changes until
-/// CompleteMultipartUpload.
+/// CompleteMultipartUpload. `tags` are the object's, stored form (see
+/// `s3::tags`): an upload's tags are fixed now, as in S3.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_multipart_upload(
     app: &App,
     bucket: &str,
     key: &str,
     content_type: &str,
     metadata: &str,
+    tags: &str,
     wanted: Wanted<'_>,
     role: Option<Uuid>,
     checksum: Option<(Algorithm, Type)>,
@@ -36,7 +39,7 @@ pub async fn create_multipart_upload(
         ));
     }
     drop(client);
-    // The content type and metadata are captured now and applied to the object
+    // The content type, metadata and tags are captured now and applied to the object
     // at completion; so is its encryption, which its parts need: the check of
     // an SSE-C upload's key, or the sealed key of an SSE-KMS one (see `sse`).
     let upload_id = Uuid::now_v7();
@@ -52,8 +55,8 @@ pub async fn create_multipart_upload(
             "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, metadata,
                                             sse_c_key, sse_kms_key_id, sse_kms_data_key,
                                             sse_kms_sealed, sse_kms_context, sse_s3,
-                                            checksum_algorithm, checksum_type, initiated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())",
+                                            checksum_algorithm, checksum_type, tags, initiated_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())",
             &[
                 &upload_id,
                 &bucket,
@@ -68,6 +71,7 @@ pub async fn create_multipart_upload(
                 &sse.sse_s3,
                 &checksum.map(|(algorithm, _)| algorithm.name()),
                 &checksum.map(|(_, kind)| kind.name()),
+                &tags,
             ],
         )
         .await?;

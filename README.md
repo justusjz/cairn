@@ -232,11 +232,12 @@ What a role may do:
 - **admin** (`--admin`): create and delete buckets, configure their
   [versioning](#versioning), HEAD any bucket and read its configuration, and
   see every bucket in ListBuckets. Admin does **not** grant access to objects.
-- **`read`** on a bucket: GetObject, HeadObject, ListObjects, and being the
-  source of a CopyObject / UploadPartCopy.
+- **`read`** on a bucket: GetObject, HeadObject, ListObjects, reading an
+  object's [tags](#tags), and being the source of a CopyObject /
+  UploadPartCopy.
 - **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads
-  (listing them and their parts too, to resume one), and being the destination
-  of a copy. In a versioned bucket, a delete only adds a
+  (listing them and their parts too, to resume one), changing an object's
+  tags (any version's), and being the destination of a copy. In a versioned bucket, a delete only adds a
   delete marker.
 - **`delete-version`** on a bucket: DeleteObject(s) naming a version ID, which
   removes that version for good.
@@ -476,9 +477,12 @@ What a rule can do:
 - **`AbortIncompleteMultipartUpload`**: an upload is aborted
   `DaysAfterInitiation` days after it was started.
 
-A rule's `Filter` picks objects by key prefix (`Prefix`), and by size
+A rule's `Filter` picks objects by key prefix (`Prefix`), by size
 (`ObjectSizeGreaterThan`, `ObjectSizeLessThan`; not for delete markers or
-uploads), alone or under `And`. As in S3, days are counted to the next
+uploads), and by [tags](#tags) (`Tag`: a version must have each, with that
+value; a noncurrent version by its own tags; never a delete marker or an
+upload, so not with `ExpiredObjectDeleteMarker` or
+`AbortIncompleteMultipartUpload`), one alone, or several under `And`. As in S3, days are counted to the next
 midnight UTC: an object written at 10:30 on the 1st, under a rule of one day,
 expires at the start of the 3rd.
 
@@ -509,13 +513,49 @@ so that a huge one doesn't hold up the others.
 Where a sweep has got to is saved as it goes, so if its node dies, another
 carries on from there within minutes. A version written or deleted since a
 sweep read it is never mistaken for the one that was due, and deleting (or
-changing) the configuration stops a sweep before its next expiration. Every
+changing) the configuration stops a sweep before its next expiration. Nor is
+a version whose tags changed since a sweep read it. Every
 node uses the database's clock, so a node whose clock is off doesn't expire
 anything early.
 
 Not supported, and refused with `501 NotImplemented`: transitions to other
-storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one),
-and filters on tags (Cairn doesn't keep object tags).
+storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one).
+
+## Tags
+
+Objects and buckets have tags, as in S3: key-value pairs for your own use, and
+for [lifecycle rules](#lifecycle-rules) to pick objects by. An object version
+has up to 10, given with its write (`x-amz-tagging`: PutObject, CopyObject,
+CreateMultipartUpload; POST Object's `tagging` field) or set later:
+
+```sh
+aws s3api put-object --bucket my-bucket --key a.log --body a.log --tagging 'tmp=yes&team=storage'
+aws s3api put-object-tagging --bucket my-bucket --key a.log \
+    --tagging 'TagSet=[{Key=tmp,Value=no}]'      # replaces them all; --version-id for another version
+aws s3api get-object-tagging --bucket my-bucket --key a.log
+aws s3api delete-object-tagging --bucket my-bucket --key a.log
+```
+
+Changing an object's tags doesn't make a new version, nor change its ETag or
+Last-Modified. GetObject and HeadObject tell how many it has
+(`x-amz-tagging-count`). A copy keeps its source's, unless
+`x-amz-tagging-directive: REPLACE` gives it the request's; an upload's are
+given when it's created. Reading them takes `read`, changing them `write`.
+
+A bucket has up to 50, which only an admin may set:
+
+```sh
+aws s3api put-bucket-tagging --bucket my-bucket --tagging 'TagSet=[{Key=team,Value=storage}]'
+aws s3api get-bucket-tagging --bucket my-bucket
+aws s3api delete-bucket-tagging --bucket my-bucket
+```
+
+Keys are 1 to 128 characters, values up to 256; both may have letters,
+digits, spaces and `+ - = . _ : / @`, and keys can't start with `aws:`, as in
+S3. Tags are stored in plaintext, whatever an object's
+[encryption](#encryption), as S3 keeps them: an SSE-C object's are read and
+changed without its key, and lifecycle sweeps, which have no keys, read them.
+Don't put secrets in them. The dashboard shows both.
 
 ## CORS
 
@@ -563,9 +603,9 @@ before it's stored, so no disk ever holds it in the clear.
 - The algorithm is XChaCha20-Poly1305 (S3's API calls SSE-C and SSE-S3
   `AES256`, and Cairn answers the same way), in 64 KiB segments, so a range
   reads only the segments it covers, and altered data is detected.
-- Only the content is encrypted. Its key (name), size, times, Content-Type
-  and metadata (`x-amz-meta-*` and the like) are stored as they are, as in S3:
-  don't put anything secret there.
+- Only the content is encrypted. Its key (name), size, times, Content-Type,
+  metadata (`x-amz-meta-*` and the like) and [tags](#tags) are stored as they
+  are, as in S3: don't put anything secret there.
 - An SSE-C or SSE-KMS object's ETag is random, not the MD5 of its content,
   as in S3. An SSE-S3 object's is the MD5, as in S3 (clients like s3cmd check
   it), but it's stored encrypted, with a fresh nonce each time, so that the

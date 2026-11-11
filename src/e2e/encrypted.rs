@@ -49,7 +49,7 @@ async fn commit(
                      $1, ARRAY[$2::int], ARRAY[0::smallint], $3, 65536, 1::smallint, 0::smallint, 1048576,
                      ARRAY[0::bigint], 0, $4, $4, $5, $6,
                      $7, $8, 'application/octet-stream', '', $9, NULL, NULL, NULL, NULL, false,
-                     NULL, NULL, NULL, false, NULL, $10)",
+                     NULL, NULL, NULL, '', false, NULL, $10)",
                     &[
                         &blob,
                         &app.node,
@@ -135,7 +135,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
         .query_one(
             "SELECT status FROM pg_temp.cairn_copy_object(
                  $1, ARRAY[$2::bigint], ARRAY[1016::bigint], $3, 'c', 1000, 'etag', 'x', '', $4,
-                 NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, false, $5)",
+                 NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, '', false, $5)",
             &[&object_id, &part_id, &BUCKET, &&KEY_CHECK[..], &crate::s3::versions::new_version_id()],
         )
         .await
@@ -287,7 +287,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
                      $1, ARRAY[$2::int], ARRAY[0::smallint], 1016, 65536, 1::smallint, 0::smallint, 1048576,
                      ARRAY[0::bigint], 0, 'etag', 'etag', $3, $4,
                      $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL,
-                     false, NULL, $6)",
+                     '', false, NULL, $6)",
                 &[
                     &blob,
                     &app.node,
@@ -505,7 +505,7 @@ async fn copy(app: &Arc<App>, src: &str, dst: &str, keys: CopyKeys<'_>) -> (Stat
         &format!("{BUCKET}/{src}"),
         None,
         "x",
-        "",
+        "", None,
         &Preconditions::default(),
         keys,
     )
@@ -681,7 +681,7 @@ async fn part_copies_of_and_into_sse_c() {
         let app = app.clone();
         let customer = customer.map(|c| customer_key(c.key()));
         async move {
-            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", Wanted::new(customer.as_ref(), None), None, None)
+            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", "", Wanted::new(customer.as_ref(), None), None, None)
                 .await
                 .unwrap();
             use http_body_util::BodyExt;

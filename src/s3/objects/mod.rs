@@ -5,3 +5,4 @@ pub mod list;
 pub mod list_versions;
 pub mod post;
 pub mod put;
+pub mod tagging;

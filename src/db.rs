@@ -195,6 +195,7 @@ const MIGRATIONS: &[&str] = &[
     SHARDS,
     NODE_STATES,
     BUCKET_CORS,
+    TAGGING,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1031,6 +1032,14 @@ ALTER TABLE nodes ADD COLUMN state_since timestamptz NOT NULL DEFAULT NOW();
 /// doesn't know it merely answers without CORS headers.
 const BUCKET_CORS: &str = r#"
 ALTER TABLE buckets ADD COLUMN cors text;
+"#;
+
+/// Tags (see `s3::tags`): an object version's and an upload's, in their
+/// stored form, empty for none; a bucket's, NULL for none.
+const TAGGING: &str = r#"
+ALTER TABLE objects ADD COLUMN tags text NOT NULL DEFAULT '';
+ALTER TABLE multipart_uploads ADD COLUMN tags text NOT NULL DEFAULT '';
+ALTER TABLE buckets ADD COLUMN tags text;
 "#;
 
 #[cfg(test)]

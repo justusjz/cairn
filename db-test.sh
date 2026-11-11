@@ -21,11 +21,11 @@ BAO_PORT=18201
 set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-cleanup() { podman rm -f "$PG_CONTAINER" "$BAO_CONTAINER" >/dev/null 2>&1; }
+cleanup() { podman rm -f -v "$PG_CONTAINER" "$BAO_CONTAINER" >/dev/null 2>&1; }
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-podman rm -f "$PG_CONTAINER" "$BAO_CONTAINER" >/dev/null 2>&1
+podman rm -f -v "$PG_CONTAINER" "$BAO_CONTAINER" >/dev/null 2>&1
 podman run -d --rm --name "$BAO_CONTAINER" \
     -e BAO_DEV_ROOT_TOKEN_ID=root \
     -p "127.0.0.1:${BAO_PORT}:8200" \

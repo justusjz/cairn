@@ -467,6 +467,8 @@ export interface components {
              * @description Roles with a grant on the bucket.
              */
             roles: number;
+            /** @description Its tags (PutBucketTagging), sorted by key. */
+            tags: components["schemas"]["Tag"][];
             /** Format: int64 */
             uploads: number;
             /** Format: int64 */
@@ -840,7 +842,9 @@ export interface components {
         };
         /**
          * @description Which objects a rule applies to: those with keys starting with `prefix`,
-         *     and sizes strictly between the bounds. All of them, by default.
+         *     sizes strictly between the bounds, and each of `tags` (with that value;
+         *     other tags don't matter). All of them, by default. A delete marker has no
+         *     size, and no tags: a filter on tags never matches one.
          */
         LifecycleFilter: {
             prefix?: string;
@@ -848,6 +852,12 @@ export interface components {
             size_greater_than?: number | null;
             /** Format: int64 */
             size_less_than?: number | null;
+            tags?: components["schemas"]["LifecycleFilterTag"][];
+        };
+        /** @description A tag a filter asks for (see `s3::tags`). */
+        LifecycleFilterTag: {
+            key: string;
+            value: string;
         };
         /** @description `NoncurrentVersionExpiration`. */
         LifecycleNoncurrentExpiration: {
@@ -1279,6 +1289,11 @@ export interface components {
             /** Format: double */
             started: number;
         };
+        /** @description A tag of a bucket or an object version (see `s3::tags`). */
+        Tag: {
+            key: string;
+            value: string;
+        };
         VersionInfo: {
             content_type?: string | null;
             delete_marker: boolean;
@@ -1295,6 +1310,8 @@ export interface components {
             parts: components["schemas"]["PartInfo"][];
             /** Format: int64 */
             size: number;
+            /** @description Its tags, sorted by key. */
+            tags: components["schemas"]["Tag"][];
             version_id: string;
         };
         /**

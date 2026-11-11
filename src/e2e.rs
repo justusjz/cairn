@@ -36,6 +36,7 @@ mod locking;
 mod metadata;
 mod multipart;
 mod post_object;
+mod tagging;
 
 /// The bucket every test node has.
 pub const BUCKET: &str = "bucket";
@@ -94,8 +95,7 @@ async fn node_on(
     hook: Option<Hook>,
     replication_factor: usize,
 ) -> Arc<App> {
-    let dir = std::env::temp_dir().join(format!("cairn-e2e-{}", Uuid::new_v4()));
-    let store = Store::new(dir.to_string_lossy().into_owned()).unwrap();
+    let store = Store::new(data_dir().to_string_lossy().into_owned()).unwrap();
     let node = crate::register_node(pool, &store, peer_url)
         .await
         .unwrap();
@@ -116,6 +116,30 @@ async fn node_on(
         kms: None,
         pack_hook: hook,
     })
+}
+
+/// The data dirs of the nodes the tests made, all removed as the tests'
+/// process exits: a test's node may well outlive it (in a task it spawned),
+/// and the dirs would add up in the temp dir (often in memory) otherwise.
+static DATA_DIRS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// A fresh data dir for a node, removed when the tests are done.
+fn data_dir() -> std::path::PathBuf {
+    static ON_EXIT: std::sync::Once = std::sync::Once::new();
+    extern "C" fn remove_data_dirs() {
+        let dirs = std::mem::take(&mut *DATA_DIRS.lock().unwrap_or_else(|e| e.into_inner()));
+        for dir in dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    // SAFETY: registers a function that only removes files; it runs once,
+    // as `exit` does, after the tests are done.
+    ON_EXIT.call_once(|| unsafe {
+        libc::atexit(remove_data_dirs);
+    });
+    let dir = std::env::temp_dir().join(format!("cairn-e2e-{}", Uuid::new_v4()));
+    DATA_DIRS.lock().unwrap_or_else(|e| e.into_inner()).push(dir.clone());
+    dir
 }
 
 async fn create_bucket(app: &App) {
@@ -228,6 +252,7 @@ pub async fn put(app: &Arc<App>, key: &str, data: Vec<u8>) {
         conditions: Preconditions::default(),
         sealing: None,
         checksum: crate::e2e::OBJECT_CHECKSUM,
+        tags: String::new(),
     };
     let body = Full::new(Bytes::from(data));
     let result = crate::upload_part(app, body, &attach, Payload::unchecked())
@@ -277,6 +302,7 @@ pub async fn put_sealed(app: &Arc<App>, key: &str, data: Vec<u8>, customer: &cra
             stored: crate::s3::sse::Stored::Customer { check: customer.new_check() },
         }),
         checksum: crate::e2e::OBJECT_CHECKSUM,
+        tags: String::new(),
     };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
         .await

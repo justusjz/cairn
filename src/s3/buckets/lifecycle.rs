@@ -57,6 +57,9 @@ pub async fn put_bucket_lifecycle(app: &App, bucket: &str, body: Bytes) -> anyho
         Err(Invalid::Argument(why)) => {
             return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", &why));
         }
+        Err(Invalid::Request(why)) => {
+            return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", &why));
+        }
         Err(Invalid::Unsupported(why)) => {
             return Ok(format_s3_error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", &why));
         }
