@@ -14,15 +14,13 @@
 //!
 //! The values are kept as they're reported (base64, with any `-N`). An
 //! encrypted object's (and its parts') would let whoever holds the catalog
-//! test guesses at the plaintext, so they're stored sealed under a key of the
-//! object's (`ChecksumKey`), as SSE-S3 ETags are; algorithm and type aren't.
+//! test guesses at the plaintext, so they're stored sealed under its key, as
+//! SSE-S3 ETags are (`encryption::Storing`); algorithm and type aren't.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
-use zeroize::Zeroizing;
-
-use crate::encryption::Key;
+use crate::encryption::{Field, Owner, Storing};
 
 /// The algorithms of S3's `x-amz-checksum-*` headers and trailers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -448,62 +446,10 @@ impl StoredChecksum {
         })
     }
 
-    /// The checksum, as clients know it.
-    pub fn read(&self, storing: &Storing) -> anyhow::Result<Checksum> {
-        Ok(Checksum { algorithm: self.algorithm, kind: self.kind, value: storing.read(&self.stored)? })
-    }
-}
-
-/// The key an encrypted object's (or upload's) checksums are sealed under,
-/// derived from its object key (SSE-C's: the client's) with HKDF.
-pub struct ChecksumKey(Zeroizing<Key>);
-
-/// HKDF's info for the checksum key; ETags' differs (see `s3::sse`).
-const CHECKSUM_KEY_INFO: &[u8] = b"cairn checksum v1";
-
-impl ChecksumKey {
-    pub fn new(object_key: &Key) -> ChecksumKey {
-        let mut key = Zeroizing::new([0; 32]);
-        hkdf::Hkdf::<sha2::Sha256>::new(None, object_key)
-            .expand(CHECKSUM_KEY_INFO, key.as_mut_slice())
-            .expect("32 bytes is a valid HKDF output length");
-        ChecksumKey(key)
-    }
-
-    /// `value`, sealed to store: hex of a fresh nonce, the sealed value, and
-    /// the tag, as an SSE-S3 ETag is.
-    pub fn seal(&self, value: &str) -> String {
-        crate::s3::sse::seal_hex(&self.0, value.as_bytes())
-    }
-
-    /// The value `stored` (from `seal` under the same key) holds.
-    pub fn open(&self, stored: &str) -> anyhow::Result<String> {
-        crate::s3::sse::open_hex(&self.0, stored)
-            .and_then(|plain| String::from_utf8(plain).ok())
-            .ok_or_else(|| anyhow::anyhow!("a stored checksum doesn't open under its key"))
-    }
-}
-
-/// How an object's (or upload's) checksums are stored: as they are (plain),
-/// or sealed (encrypted, under its `ChecksumKey`).
-pub enum Storing<'a> {
-    Plain,
-    Sealed(&'a ChecksumKey),
-}
-
-impl Storing<'_> {
-    pub fn store(&self, value: &str) -> String {
-        match self {
-            Storing::Plain => value.to_owned(),
-            Storing::Sealed(key) => key.seal(value),
-        }
-    }
-
-    pub fn read(&self, stored: &str) -> anyhow::Result<String> {
-        match self {
-            Storing::Plain => Ok(stored.to_owned()),
-            Storing::Sealed(key) => key.open(stored),
-        }
+    /// The checksum of the object at `bucket`/`key`, as clients know it.
+    pub fn read(&self, storing: Storing, bucket: &str, key: &str) -> anyhow::Result<Checksum> {
+        let value = storing.read(Field::Checksum, Owner::Object { bucket, key }, &self.stored)?;
+        Ok(Checksum { algorithm: self.algorithm, kind: self.kind, value })
     }
 }
 
@@ -543,15 +489,6 @@ mod tests {
         let parts = vec![digest(Algorithm::Sha256, b"a"), digest(Algorithm::Sha256, b"b")];
         let expected = encode(&Sha256::digest([parts[0].clone(), parts[1].clone()].concat()));
         assert_eq!(composite(Algorithm::Sha256, &parts), format!("{expected}-2"));
-    }
-
-    #[test]
-    fn sealed_values_open() {
-        let key = ChecksumKey::new(&[7; 32]);
-        let sealed = key.seal("AAAAAA==");
-        assert_ne!(sealed, key.seal("AAAAAA=="), "a fresh nonce each time");
-        assert_eq!(key.open(&sealed).unwrap(), "AAAAAA==");
-        assert!(ChecksumKey::new(&[8; 32]).open(&sealed).is_err());
     }
 
     fn upload(pairs: &[(&'static str, &str)]) -> Result<Option<(Algorithm, Type)>, u16> {

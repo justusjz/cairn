@@ -5,7 +5,7 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App,
-    s3::checksums::{ChecksumKey, Storing},
+    encryption::{Field, Owner, Salt, Storing},
     s3::multipart::{Upload, checksum_columns},
     s3::sse::{self, Stored},
     s3::sse_c::CustomerKey,
@@ -61,7 +61,7 @@ pub async fn list_parts(
         .query_cached(
             "SELECT part_number, etag, coalesce(plain_size, size),
                     to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-                    checksum
+                    checksum, enc_salt
              FROM parts WHERE upload_id = $1 AND part_number > $2
              ORDER BY part_number LIMIT $3",
             &[&upload, &part_number_marker, &limit],
@@ -90,7 +90,7 @@ pub async fn list_parts(
         Stored::Customer { .. } if customer_key.is_none() => None,
         _ if !has_checksums => None,
         _ => match sse::open(app, encryption, customer_key, role, bucket, key).await? {
-            Ok(object_key) => object_key.map(|object_key| ChecksumKey::new(&object_key)),
+            Ok(object_key) => object_key,
             Err(refused) => return Ok(refused),
         },
     };
@@ -129,14 +129,27 @@ pub async fn list_parts(
     for row in kept {
         let (number, etag, size, modified): (i32, &str, i64, &str) =
             (row.get(0), row.get(1), row.get(2), row.get(3));
+        // Its values, sealed as its own, if the upload is encrypted (see
+        // `encryption`), by its salt.
+        let salt: Option<Salt> = row
+            .get::<_, Option<&[u8]>>(5)
+            .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)"));
+        let owner = || match &salt {
+            Some(salt) => Ok(Owner::Part(salt)),
+            None => Err(anyhow::anyhow!("a part of an encrypted upload has no salt")),
+        };
         let etag = match &etag_key {
-            Some(etag_key) => etag_key.open(etag)?,
+            Some(etag_key) => etag_key.open(owner()?, etag)?,
             None => etag.to_owned(),
         };
         let checksum = match (algorithm, &storing, row.get::<_, Option<&str>>(4)) {
             (Some(algorithm), Some(storing), Some(stored)) => {
+                let value = match storing {
+                    Storing::Plain => stored.to_owned(),
+                    Storing::Sealed(_) => storing.read(Field::Checksum, owner()?, stored)?,
+                };
                 let element = algorithm.element();
-                format!("<{element}>{}</{element}>", storing.read(stored)?)
+                format!("<{element}>{}</{element}>", value)
             }
             _ => String::new(),
         };

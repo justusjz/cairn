@@ -15,9 +15,9 @@ use crate::{
     blobs::{BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, layout_at, location_at, stream_blob_range},
     shards::Layout,
     body::{FrameSender, ResBody, box_response, channel_body},
-    encryption::{Key, Opener, Salt, segment_range},
+    encryption::{Key, Opener, Salt, Storing, segment_range},
     s3::conditional::{Precondition, Preconditions, not_modified},
-    s3::checksums::{ChecksumKey, Storing, StoredChecksum},
+    s3::checksums::StoredChecksum,
     s3::metadata,
     s3::sse::{self, Stored},
     s3::sse_c::CustomerKey,
@@ -277,7 +277,7 @@ pub async fn get_object(
     let builder = metadata::apply(builder, &metadata);
     let builder = sse::echo(builder, &encryption, customer_key);
     let builder = match checksum.filter(|_| checksum_mode && !partial) {
-        Some(checksum) => checksum_headers(builder, &checksum, object_key.as_deref())?,
+        Some(checksum) => checksum_headers(builder, &checksum, object_key.as_deref(), bucket, key)?,
         None => builder,
     };
     let builder = if partial {
@@ -752,7 +752,7 @@ pub async fn head_object(
                     Err(refused) => return Ok(refused),
                 },
             };
-            checksum_headers(builder, &checksum, object_key.as_deref())?
+            checksum_headers(builder, &checksum, object_key.as_deref(), bucket, key)?
         }
         None => builder,
     };
@@ -769,16 +769,14 @@ pub async fn head_object(
 
 /// An object's checksum, as a read with `x-amz-checksum-mode: ENABLED` tells
 /// it (S3 tells none for a range): opened with its object key, if it's
-/// encrypted.
+/// encrypted, as the object at `bucket`/`key`'s.
 fn checksum_headers(
     builder: hyper::http::response::Builder,
     checksum: &StoredChecksum,
     object_key: Option<&Key>,
+    bucket: &str,
+    key: &str,
 ) -> anyhow::Result<hyper::http::response::Builder> {
-    let checksum_key = object_key.map(ChecksumKey::new);
-    let storing = match &checksum_key {
-        Some(checksum_key) => Storing::Sealed(checksum_key),
-        None => Storing::Plain,
-    };
-    Ok(checksum.read(&storing)?.headers(builder))
+    let storing = object_key.map_or(Storing::Plain, Storing::Sealed);
+    Ok(checksum.read(storing, bucket, key)?.headers(builder))
 }

@@ -14,11 +14,11 @@ use crate::{
     blobs::{reap_blobs, reap_columns},
     body::channel_body,
     db,
-    encryption::Key,
+    encryption::{Field, Key, Owner, Salt, Storing},
     payload::Payload,
     s3::{
         conditional::{Precondition, Preconditions},
-        checksums::{self, Algorithm, Checksum, ChecksumKey, Storing, Type},
+        checksums::{self, Algorithm, Checksum, Type},
         multipart::upload,
         sse::{self, Stored, Wanted},
         sse_c::CustomerKey,
@@ -57,6 +57,8 @@ struct SourcePart {
     plain_size: Option<i64>,
     /// Its checksum, as it's stored (in its object's algorithm).
     checksum: Option<String>,
+    /// Its salt, if it's encrypted.
+    salt: Option<Salt>,
 }
 
 impl SourcePart {
@@ -278,9 +280,18 @@ pub async fn copy_object(
             }
         }
         // The copy's ETag, as clients know it, and as it's stored (an SSE-S3
-        // one's sealed, under the object key the copy shares).
+        // one's sealed again, as the copy's, under the object key it shares).
+        let dest_owner = Owner::Object { bucket: dest_bucket, key: dest_key };
         let (etag, stored_etag) = match source.parts.as_slice() {
-            _ if !encryption.is_plain() => (source_etag.clone(), version.etag.clone()),
+            _ if !encryption.is_plain() => {
+                let stored = match (encryption, &source_key) {
+                    (Stored::S3(_), Some(object_key)) => {
+                        crate::encryption::seal_value(object_key, Field::Etag, dest_owner, &source_etag)
+                    }
+                    _ => version.etag.clone(),
+                };
+                (source_etag.clone(), stored)
+            }
             [part] => (part.etag.clone(), part.etag.clone()),
             _ => {
                 let size = version.size as u64;
@@ -318,7 +329,9 @@ pub async fn copy_object(
         };
         // Its checksum, under the key it shares with its source, if it's
         // encrypted.
-        let copied = match copy_checksum(app, &source, checksum_algorithm, source_key.as_deref()).await {
+        let source_owner = Owner::Object { bucket: &src_bucket, key: &src_key };
+        let owners = (source_owner, dest_owner);
+        let copied = match copy_checksum(app, &source, checksum_algorithm, source_key.as_deref(), owners).await {
             Ok(copied) => copied,
             // Its data went with it: copy what it is now.
             Err(_) if source.changed(app).await? => continue,
@@ -368,21 +381,27 @@ struct Copied {
 /// its key, `object_key`, if it's encrypted), of `algorithm`: the source's,
 /// if it's a FULL_OBJECT one of it; combined from its parts', if they have
 /// CRCs of it (a COMPOSITE one's, or a plain one's own CRC64NVME); else from
-/// its data, read.
+/// its data, read. `owners` are the source object's and the copy's: an
+/// encrypted checksum is sealed as its object's (see `encryption`), so the
+/// copy's is sealed again, even where it's the source's.
 async fn copy_checksum(
     app: &Arc<App>,
     source: &Source,
     algorithm: Algorithm,
     object_key: Option<&Key>,
+    (source_owner, dest_owner): (Owner<'_>, Owner<'_>),
 ) -> anyhow::Result<Copied> {
-    let checksum_key = object_key.map(ChecksumKey::new);
-    let storing = match &checksum_key {
-        Some(checksum_key) => Storing::Sealed(checksum_key),
-        None => Storing::Plain,
+    let storing = object_key.map_or(Storing::Plain, Storing::Sealed);
+    let stored = |checksum: Checksum, part_checksums| Copied {
+        stored: storing.store(Field::Checksum, dest_owner, &checksum.value),
+        checksum,
+        part_checksums,
     };
     let same = source.version.checksum.as_ref().filter(|checksum| checksum.algorithm == algorithm);
     if let Some(checksum) = same.filter(|checksum| checksum.kind == Type::FullObject) {
-        return Ok(Copied { checksum: checksum.read(&storing)?, stored: checksum.stored.clone(), part_checksums: true });
+        let value = storing.read(Field::Checksum, source_owner, &checksum.stored)?;
+        let checksum = Checksum { algorithm: checksum.algorithm, kind: checksum.kind, value };
+        return Ok(stored(checksum, true));
     }
     let combined = |raws: Vec<Vec<u8>>| {
         let pieces = raws.iter().zip(&source.parts).map(|(raw, part)| (raw.as_slice(), part.object_size()));
@@ -391,7 +410,11 @@ async fn copy_checksum(
     let checksum = if same.is_some() && algorithm.combines() && source.parts.iter().all(|p| p.checksum.is_some()) {
         let mut raws = Vec::with_capacity(source.parts.len());
         for part in &source.parts {
-            let value = storing.read(part.checksum.as_deref().expect("checked"))?;
+            let owner = match (&storing, &part.salt) {
+                (Storing::Sealed(_), None) => anyhow::bail!("an encrypted object's part has no salt"),
+                (_, salt) => salt.as_ref().map_or(source_owner, Owner::Part),
+            };
+            let value = storing.read(Field::Checksum, owner, part.checksum.as_deref().expect("checked"))?;
             raws.push(algorithm.decode(&value).ok_or_else(|| anyhow::anyhow!("a stored checksum isn't one"))?);
         }
         combined(raws)
@@ -406,8 +429,7 @@ async fn copy_checksum(
         let hashes = hash_range(app, source.locations.clone(), 0, size, hashing).await?;
         Checksum::full(algorithm, &hashes.checksum.expect("asked for"))
     };
-    let stored = storing.store(&checksum.value);
-    Ok(Copied { checksum, stored, part_checksums: same.is_some() })
+    Ok(stored(checksum, same.is_some()))
 }
 
 /// Copies `source` to `dest` as data, through the normal upload path: read
@@ -987,7 +1009,7 @@ async fn source_parts<C: GenericClient>(
 ) -> Result<Vec<SourcePart>, tokio_postgres::Error> {
     let rows = client
         .query_cached(
-            "SELECT id, size, etag, crc64nvme, plain_size, checksum FROM parts
+            "SELECT id, size, etag, crc64nvme, plain_size, checksum, enc_salt FROM parts
              WHERE object_id = $1 ORDER BY part_number",
             &[&object_id],
         )
@@ -1001,6 +1023,9 @@ async fn source_parts<C: GenericClient>(
             crc64nvme: r.get(3),
             plain_size: r.get(4),
             checksum: r.get(5),
+            salt: r
+                .get::<_, Option<&[u8]>>(6)
+                .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)")),
         })
         .collect())
 }

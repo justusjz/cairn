@@ -22,9 +22,8 @@
 //!
 //! An SSE-S3 object's ETag is its content's MD5, as in S3, which would let
 //! whoever holds the database test guesses at the content. So it's stored
-//! encrypted (`seal_etag`), as MinIO stores it, under a key derived from the
-//! object key, with a nonce of its own, and decrypted where it's answered with
-//! (`plain_etag`). Postgres never compares ETags: conditional writes and
+//! sealed under the object key, as MinIO stores it (see `encryption`), and
+//! opened where it's answered with (`plain_etag`). Postgres never compares ETags: conditional writes and
 //! CompleteMultipartUpload decide in Cairn, and the catalog only checks that
 //! what they decided on is still there (see `catalog.sql`).
 //!
@@ -39,7 +38,6 @@ use std::collections::BTreeMap;
 
 use anyhow::Context as _;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use chacha20poly1305::{AeadInOut, KeyInit, XChaCha20Poly1305, XNonce, aead::Tag};
 use http_body_util::Full;
 use hyper::{HeaderMap, Response, StatusCode, body::Bytes, http::response::Builder};
 use tokio_postgres::Row;
@@ -48,7 +46,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     App,
-    encryption::Key,
+    encryption::{self, Field, Key, Owner},
     kms::{Identity, KeyId, KmsError},
     s3::sse_c::CustomerKey,
     s3::util::format_s3_error,
@@ -168,55 +166,9 @@ impl Stored {
     }
 }
 
-/// The info of the key an SSE-S3 object's ETags are sealed under (HKDF from
-/// its object key).
-const ETAG_KEY_INFO: &[u8] = b"cairn sse-s3 etag v1";
-
-fn derive_etag_key(object_key: &Key) -> Zeroizing<Key> {
-    let mut key = Zeroizing::new([0; 32]);
-    hkdf::Hkdf::<sha2::Sha256>::new(None, object_key)
-        .expand(ETAG_KEY_INFO, key.as_mut_slice())
-        .expect("32 bytes is a valid HKDF output length");
-    key
-}
-
-/// An SSE-S3 object's (or its part's) ETag as it's stored: hex of a random
-/// nonce, the ETag sealed under the object's ETag key, and the tag. A fresh
-/// nonce each time, so the same ETag never looks the same twice.
-pub fn seal_etag(object_key: &Key, etag: &str) -> String {
-    seal_hex(&derive_etag_key(object_key), etag.as_bytes())
-}
-
-/// `plain` sealed under `key` (with a fresh nonce), as hex: how a value of an
-/// encrypted object's is stored in the catalog (an SSE-S3 ETag, a checksum).
-pub fn seal_hex(key: &Key, plain: &[u8]) -> String {
-    let sealed = seal_object_bytes(key, plain, b"");
-    sealed.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// What `stored`, from `seal_hex` under `key`, holds.
-pub fn open_hex(key: &Key, stored: &str) -> Option<Vec<u8>> {
-    let bytes: Vec<u8> = (0..stored.len())
-        .step_by(2)
-        .map(|i| stored.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
-        .collect::<Option<_>>()?;
-    unseal_object_bytes(key, &bytes, b"")
-}
-
-/// The ETag `stored` (from `seal_etag` under the same object key) holds. One
-/// stored as it was (an SSE-S3 object's from before ETags were sealed, which
-/// was its salt) is too short to be sealed, and is taken as it is.
-pub fn open_etag(object_key: &Key, stored: &str) -> Option<String> {
-    if stored.len() < 2 * (NONCE_LEN + 16) {
-        return Some(stored.to_owned());
-    }
-    let plain = open_hex(&derive_etag_key(object_key), stored)?;
-    String::from_utf8(plain).ok()
-}
-
-/// The ETag of an object (or a part of one) encrypted as `stored`, at
-/// `bucket`/`key`, whose ETag is stored as `etag`, as it's answered with:
-/// decrypted, if it's SSE-S3's; as it is, otherwise.
+/// The ETag of an object encrypted as `stored`, at `bucket`/`key`, whose ETag
+/// is stored as `etag`, as it's answered with: decrypted, if it's SSE-S3's;
+/// as it is, otherwise.
 pub async fn plain_etag(
     app: &App,
     stored: &Stored,
@@ -229,25 +181,26 @@ pub async fn plain_etag(
         Ok(object_key) => object_key,
         Err(refused) => return Ok(Err(refused)),
     };
-    match open_etag(&object_key, etag) {
+    match encryption::open_value(&object_key, Field::Etag, Owner::Object { bucket, key }, etag) {
         Some(etag) => Ok(Ok(etag)),
         None => anyhow::bail!("the stored ETag of {bucket}/{key} doesn't open under its key"),
     }
 }
 
-/// The key an SSE-S3 object's (or upload's) ETags are sealed under, opened
-/// once for many: its parts', say.
+/// The key an SSE-S3 object (or upload) seals its ETags under, its object
+/// key, opened once for many: its parts', say.
 pub struct EtagKey(Zeroizing<Key>);
 
 impl EtagKey {
-    /// The ETag `stored` holds.
-    pub fn open(&self, stored: &str) -> anyhow::Result<String> {
-        open_etag(&self.0, stored).ok_or_else(|| anyhow::anyhow!("a stored ETag doesn't open under its key"))
+    /// The ETag `stored`, the `owner`'s, holds.
+    pub fn open(&self, owner: Owner, stored: &str) -> anyhow::Result<String> {
+        encryption::open_value(&self.0, Field::Etag, owner, stored)
+            .ok_or_else(|| anyhow::anyhow!("a stored ETag of {owner:?} doesn't open under its key"))
     }
 
-    /// `etag`, sealed to store.
-    pub fn seal(&self, etag: &str) -> String {
-        seal_etag(&self.0, etag)
+    /// `etag`, the `owner`'s, sealed to store.
+    pub fn seal(&self, owner: Owner, etag: &str) -> String {
+        encryption::seal_value(&self.0, Field::Etag, owner, etag)
     }
 }
 
@@ -715,42 +668,15 @@ fn associated_data(context: Option<&str>, bucket: &str, key: &str) -> Vec<u8> {
 }
 
 fn seal_object_key(data_key: &Key, object_key: &Key, ad: &[u8]) -> Vec<u8> {
-    seal_object_bytes(data_key, object_key, ad)
+    encryption::seal_bytes(data_key, object_key, ad)
 }
 
 fn unseal_object_key(data_key: &Key, sealed: &[u8], ad: &[u8]) -> Option<Zeroizing<Key>> {
     if sealed.len() != SEALED_LEN {
         return None;
     }
-    let plain = Zeroizing::new(unseal_object_bytes(data_key, sealed, ad)?);
+    let plain = encryption::open_bytes(data_key, sealed, ad)?;
     Some(Zeroizing::new(Key::try_from(plain.as_slice()).ok()?))
-}
-
-/// `plain`, sealed under `key` with a random nonce: nonce, ciphertext, tag.
-fn seal_object_bytes(key: &Key, plain: &[u8], ad: &[u8]) -> Vec<u8> {
-    let mut nonce = [0; NONCE_LEN];
-    getrandom::fill(&mut nonce).expect("the OS random number generator failed");
-    let mut buffer = Zeroizing::new(plain.to_vec());
-    let tag = XChaCha20Poly1305::new(key.into())
-        .encrypt_inout_detached(&XNonce::from(nonce), ad, buffer.as_mut_slice().into())
-        .expect("a key, an ETag or a checksum is far shorter than XChaCha20-Poly1305's limit");
-    [&nonce[..], &buffer, &tag].concat()
-}
-
-/// What `seal_object_bytes` sealed, if `sealed` is that, under `key`.
-fn unseal_object_bytes(key: &Key, sealed: &[u8], ad: &[u8]) -> Option<Vec<u8>> {
-    if sealed.len() < NONCE_LEN + 16 {
-        return None;
-    }
-    let (nonce, rest) = sealed.split_at(NONCE_LEN);
-    let (ciphertext, tag) = rest.split_at(rest.len() - 16);
-    let nonce = XNonce::try_from(nonce).ok()?;
-    let tag = Tag::<XChaCha20Poly1305>::try_from(tag).ok()?;
-    let mut plain = ciphertext.to_vec();
-    XChaCha20Poly1305::new(key.into())
-        .decrypt_inout_detached(&nonce, ad, plain.as_mut_slice().into(), &tag)
-        .ok()?;
-    Some(plain)
 }
 
 /// The headers S3 answers about a stored object's encryption with: SSE-C's
@@ -879,24 +805,6 @@ mod tests {
             assert!(unseal_object_key(&data_key, &flipped, b"ad").is_none());
         }
         assert!(unseal_object_key(&data_key, &sealed[1..], b"ad").is_none());
-    }
-
-    #[test]
-    fn etags_are_sealed_with_fresh_nonces() {
-        let (key, other) = ([5; 32], [6; 32]);
-        let etag = "0123456789abcdef0123456789abcdef";
-        let sealed = seal_etag(&key, etag);
-        assert_ne!(sealed, seal_etag(&key, etag), "the same ETag never looks the same");
-        assert_eq!(open_etag(&key, &sealed).as_deref(), Some(etag));
-        assert_eq!(open_etag(&other, &sealed), None);
-        assert_eq!(open_etag(&key, &sealed[2..]), None);
-        assert_eq!(open_etag(&key, &format!("zz{}", &sealed[2..])), None);
-        // One from before ETags were sealed is taken as it is.
-        assert_eq!(open_etag(&key, etag).as_deref(), Some(etag));
-        let multipart = format!("{etag}-10000");
-        assert_eq!(open_etag(&key, &seal_etag(&key, &multipart)), Some(multipart));
-        // Not the key the data is sealed under.
-        assert_ne!(*derive_etag_key(&key), key);
     }
 
     #[test]

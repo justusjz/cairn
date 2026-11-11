@@ -9,10 +9,12 @@ use uuid::Uuid;
 
 use super::{BUCKET, customer_key, node_with, put, put_sealed};
 use crate::{
-    App, AttachTarget, UploadResult, packer,
+    App, AttachTarget, UploadResult,
+    encryption::{self, Field, Owner, Salt},
+    packer,
     payload::Payload,
     s3::{
-        checksums::{self, Algorithm, ChecksumKey, Type, Wanted},
+        checksums::{self, Algorithm, Type, Wanted},
         conditional::Preconditions,
         multipart::{
             complete::complete_multipart_upload, create::create_multipart_upload, list_parts::list_parts,
@@ -339,24 +341,28 @@ async fn sse_c_uploads() {
     assert_eq!(told(&app, "c", Some(&customer), None).await, Some((format!("CRC32:{composite}"), "COMPOSITE".into())));
     assert_ne!(stored(&app, "c").await.2, Some(composite), "stored sealed");
     // Nor are its parts': none of them is stored as it's told.
-    let parts: Vec<String> = app
+    let parts: Vec<(String, Vec<u8>)> = app
         .pool
         .get()
         .await
         .unwrap()
         .query(
-            "SELECT p.checksum FROM parts p JOIN objects o ON o.id = p.object_id WHERE o.key = 'c'",
+            "SELECT p.checksum, p.enc_salt FROM parts p JOIN objects o ON o.id = p.object_id
+             WHERE o.key = 'c' ORDER BY p.part_number",
             &[],
         )
         .await
         .unwrap()
         .iter()
-        .map(|row| row.get(0))
+        .map(|row| (row.get(0), row.get(1)))
         .collect();
     assert_eq!(parts.len(), 2);
-    for part in &parts {
+    let salts: Vec<Salt> = parts.iter().map(|(_, salt)| salt.as_slice().try_into().unwrap()).collect();
+    for (i, (part, _)) in parts.iter().enumerate() {
         assert!(*part != l1[0].1 && *part != l2[0].1, "a part's checksum is stored in plaintext");
-        assert!(ChecksumKey::new(customer.key()).open(part).is_ok(), "sealed under the client's key");
+        let open = |salt| encryption::open_value(customer.key(), Field::Checksum, Owner::Part(salt), part);
+        assert!(open(&salts[i]).is_some(), "sealed under the client's key, as the part's");
+        assert!(open(&salts[1 - i]).is_none(), "not as another part's");
     }
 
     // Without an algorithm: no checksum, and no key needed.

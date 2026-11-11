@@ -4,6 +4,7 @@ use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 use std::collections::HashMap;
 
@@ -15,7 +16,8 @@ use crate::{
     blobs::{ReapTarget, reap_blobs, reap_columns},
     db,
     s3::conditional::Preconditions,
-    s3::checksums::{self, Algorithm, Checksum, ChecksumKey, Storing, Type},
+    encryption::{Field, Key, Owner, Salt, Storing},
+    s3::checksums::{self, Algorithm, Checksum, Type},
     s3::multipart::{Upload, checksum_columns, upload},
     s3::sse::{self, Stored},
     s3::sse_c::CustomerKey,
@@ -314,21 +316,20 @@ fn check_claim(claimed: &Claimed, checksum: Option<&Checksum>) -> Option<Complet
 }
 
 /// The key the checksums of an object (or upload) encrypted as `stored` are
-/// sealed under, if it's encrypted, or why it can't be had. `None` too for an
-/// SSE-C one without its key given (whose checksums can't be read).
+/// sealed under, its object key, if it's encrypted, or why it can't be had.
+/// `None` too for an SSE-C one without its key given (whose checksums can't
+/// be read).
 async fn checksum_key(
     app: &App,
     stored: &Stored,
     keys: Keys<'_>,
     bucket: &str,
     key: &str,
-) -> anyhow::Result<Result<Option<ChecksumKey>, Response<Full<Bytes>>>> {
+) -> anyhow::Result<Result<Option<Zeroizing<Key>>, Response<Full<Bytes>>>> {
     if matches!(stored, Stored::Customer { .. }) && keys.customer.is_none() {
         return Ok(Ok(None));
     }
-    Ok(sse::open(app, stored, keys.customer, keys.role, bucket, key)
-        .await?
-        .map(|object_key| object_key.map(|object_key| ChecksumKey::new(&object_key))))
+    sse::open(app, stored, keys.customer, keys.role, bucket, key).await
 }
 
 /// The completion a retry repeats, whose upload is gone: the version it made,
@@ -372,7 +373,10 @@ async fn completed(
             let value = match &stored {
                 Stored::Plain => Some(value.to_owned()),
                 _ => match checksum_key(app, &stored, keys, bucket, key).await? {
-                    Ok(Some(checksum_key)) => Some(checksum_key.open(value)?),
+                    Ok(Some(checksum_key)) => {
+                        let owner = Owner::Object { bucket, key };
+                        Some(Storing::Sealed(&checksum_key).read(Field::Checksum, owner, value)?)
+                    }
                     Ok(None) => None,
                     Err(refused) => return Ok(CompleteOutcome::Refused(refused)),
                 },
@@ -501,19 +505,32 @@ async fn try_complete(
     let mut staged = HashMap::new();
     for row in client
         .query_cached(
-            "SELECT part_number, id, etag, checksum, coalesce(plain_size, size) FROM parts WHERE upload_id = $1",
+            "SELECT part_number, id, etag, checksum, coalesce(plain_size, size), enc_salt
+             FROM parts WHERE upload_id = $1",
             &[upload_id],
         )
         .await?
     {
+        // Its values, sealed as its own, if the upload is encrypted (see
+        // `encryption`), by its salt.
+        let salt: Option<Salt> = row
+            .get::<_, Option<&[u8]>>(5)
+            .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)"));
+        let owner = || match &salt {
+            Some(salt) => Ok(Owner::Part(salt)),
+            None => Err(anyhow::anyhow!("a part of an encrypted upload has no salt")),
+        };
         let etag: String = row.get(2);
         let etag = match &etag_key {
-            Some(etag_key) => etag_key.open(&etag)?,
+            Some(etag_key) => etag_key.open(owner()?, &etag)?,
             None => etag,
         };
         // A part's checksum is only had where the object gets one.
         let checksum = match (row.get::<_, Option<&str>>(3), &storing) {
-            (Some(stored), Some(storing)) if upload.object_checksum().is_some() => Some(storing.read(stored)?),
+            (Some(stored), Some(Storing::Plain)) if upload.object_checksum().is_some() => Some(stored.to_owned()),
+            (Some(stored), Some(storing)) if upload.object_checksum().is_some() => {
+                Some(storing.read(Field::Checksum, owner()?, stored)?)
+            }
             _ => None,
         };
         let size = row.get::<_, i64>(4) as u64;
@@ -543,11 +560,11 @@ async fn try_complete(
         return Ok(bad);
     }
     let stored_etag = match &etag_key {
-        Some(etag_key) => etag_key.seal(&combined),
+        Some(etag_key) => etag_key.seal(Owner::Object { bucket, key }, &combined),
         None => combined.clone(),
     };
     let stored_checksum = match (&checksum, &storing) {
-        (Some(checksum), Some(storing)) => Some(storing.store(&checksum.value)),
+        (Some(checksum), Some(storing)) => Some(storing.store(Field::Checksum, Owner::Object { bucket, key }, &checksum.value)),
         (Some(_), None) => unreachable!("an object gets a checksum only where its parts' can be read"),
         (None, _) => None,
     };

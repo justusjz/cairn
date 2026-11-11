@@ -620,7 +620,7 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_blob uuid, p_nodes int[], p_shards smallint[], p_size bigint, p_block_size int,
     p_data_shards smallint, p_parity_shards smallint, p_stripe_unit int, p_shard_crcs bigint[],
-    p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
+    p_data_crc bigint, p_etag text, p_part_etag text, p_plain_size bigint, p_enc_salt bytea,
     p_bucket text, p_key text, p_content_type text, p_metadata text, p_sse_c_key bytea,
     p_kms_key_id text, p_kms_data_key text, p_kms_sealed bytea, p_kms_context text,
     p_sse_s3 boolean, p_checksum_algorithm text, p_checksum_type text, p_checksum text,
@@ -669,7 +669,7 @@ BEGIN
     INTO last_modified FROM objects o WHERE o.id = v.id;
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
                        part_number, plain_size, enc_salt, created_at)
-    VALUES (p_blob, 0, p_size, p_etag, p_data_crc, v.id, NULL, 1, p_plain_size, p_enc_salt,
+    VALUES (p_blob, 0, p_size, p_part_etag, p_data_crc, v.id, NULL, 1, p_plain_size, p_enc_salt,
             NOW());
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));

@@ -47,7 +47,7 @@ async fn commit(
                 .query_one(
                     "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], ARRAY[0::smallint], $3, 65536, 1::smallint, 0::smallint, 1048576,
-                     ARRAY[0::bigint], 0, $4, $5, $6,
+                     ARRAY[0::bigint], 0, $4, $4, $5, $6,
                      $7, $8, 'application/octet-stream', '', $9, NULL, NULL, NULL, NULL, false,
                      NULL, NULL, NULL, false, NULL, $10)",
                     &[
@@ -285,7 +285,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
             .query_one(
                 "SELECT status FROM pg_temp.cairn_commit_object(
                      $1, ARRAY[$2::int], ARRAY[0::smallint], 1016, 65536, 1::smallint, 0::smallint, 1048576,
-                     ARRAY[0::bigint], 0, 'etag', $3, $4,
+                     ARRAY[0::bigint], 0, 'etag', 'etag', $3, $4,
                      $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL,
                      false, NULL, $6)",
                 &[

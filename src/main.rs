@@ -13,6 +13,7 @@ use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use uuid::Uuid;
 
 use crate::db::Cached;
+use crate::encryption::{Field, Owner};
 use crate::auth::Rejection;
 use crate::blob_file::ShardFile;
 use crate::blobs::{Location, ReapTarget, reap_blobs};
@@ -1466,15 +1467,23 @@ where
         },
         _ => unreachable!("a part's ETag is its salt, or its MD5 claimed or worked out"),
     };
-    let stored_etag = if sse_s3 {
-        let key = match attach {
-            AttachTarget::Object { sealing: Some(sealing), .. } => &sealing.key,
-            AttachTarget::MultipartPart { key: Some(key), .. } => key,
-            _ => unreachable!("an SSE-S3 part has its key"),
-        };
-        s3::sse::seal_etag(key, &etag)
-    } else {
-        etag.clone()
+    // Whose the values stored are: a single PUT's object's (whose one part
+    // keeps an ETag of its own too), or a multipart part's. An encrypted
+    // one's are sealed under its key (an ETag only if it's SSE-S3's, an MD5:
+    // see `encryption`).
+    let part_owner = encrypted.as_ref().map(|encrypted| Owner::Part(&encrypted.salt));
+    let owner = match attach {
+        AttachTarget::Object { bucket, key, .. } => Some(Owner::Object { bucket, key }),
+        AttachTarget::MultipartPart { .. } => part_owner,
+    };
+    let seal = |field, owner: Option<Owner>, value: &str| match (attach.key(), owner) {
+        (Some(key), Some(owner)) => encryption::seal_value(key, field, owner, value),
+        (Some(_), None) => unreachable!("an encrypted part has a salt"),
+        (None, _) => value.to_owned(),
+    };
+    let (stored_etag, stored_part_etag) = match sse_s3 {
+        true => (seal(Field::Etag, owner, &etag), seal(Field::Etag, part_owner, &etag)),
+        false => (etag.clone(), etag.clone()),
     };
     // On failure, `finish` deletes what the replicas stored itself.
     let written = writer.finish().await?;
@@ -1489,10 +1498,7 @@ where
         };
         s3::checksums::Checksum::full(algorithm, &raw)
     });
-    let stored_checksum = checksum.as_ref().map(|checksum| match attach.key() {
-        Some(key) => s3::checksums::ChecksumKey::new(key).seal(&checksum.value),
-        None => checksum.value.clone(),
-    });
+    let stored_checksum = checksum.as_ref().map(|checksum| seal(Field::Checksum, owner, &checksum.value));
     // If this future is dropped before the blob is committed or discarded, the
     // blob is deleted in the background.
     let mut pending = blobs::DiscardOnDrop::new(app, written.blob_id);
@@ -1524,7 +1530,11 @@ where
                 }
                 _ => None,
             };
-            let stored = Stored { etag: &stored_etag, checksum: checksum.as_ref().zip(stored_checksum.as_deref()) };
+            let stored = Stored {
+                etag: &stored_etag,
+                part_etag: &stored_part_etag,
+                checksum: checksum.as_ref().zip(stored_checksum.as_deref()),
+            };
             match try_commit_part(&mut client, &written, attach, &stored, encrypted.as_ref(), expected).await {
                 Ok(CommitResult::Committed { reap, version_id, last_modified }) => {
                     // Reap the blobs this overwrite displaced; their rows are gone.
@@ -1591,6 +1601,8 @@ struct Encrypted {
 /// SSE-S3 one's ETag, an encrypted one's checksum).
 struct Stored<'a> {
     etag: &'a str,
+    /// A single PUT's part's (see `encryption::Owner`).
+    part_etag: &'a str,
     /// The checksum, and its value as it's stored.
     checksum: Option<(&'a s3::checksums::Checksum, &'a str)>,
 }
@@ -1604,6 +1616,7 @@ async fn try_commit_part(
     expected: Option<Option<i64>>,
 ) -> Result<CommitResult, tokio_postgres::Error> {
     let etag = stored.etag;
+    let part_etag = stored.part_etag;
     let checksum_algorithm = stored.checksum.map(|(c, _)| c.algorithm.name());
     let checksum_type = stored.checksum.map(|(c, _)| c.kind.name());
     let checksum = stored.checksum.map(|(_, value)| value);
@@ -1637,7 +1650,7 @@ async fn try_commit_part(
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                                                       $11, $12, $13, $14, $15, $16, $17, $18,
                                                       $19, $20, $21, $22, $23, $24, $25, $26,
-                                                      $27, $28, $29)",
+                                                      $27, $28, $29, $30)",
                     &[
                         &written.blob_id,
                         &nodes,
@@ -1650,6 +1663,7 @@ async fn try_commit_part(
                         &shard_crcs,
                         &data_crc,
                         &etag,
+                        &part_etag,
                         &plain_size,
                         &enc_salt,
                         bucket,

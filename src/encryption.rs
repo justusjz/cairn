@@ -1,4 +1,28 @@
-//! The format of an encrypted part.
+//! How an encrypted object is stored.
+//!
+//! Every encrypted object has one key: for SSE-KMS and SSE-S3 a random one,
+//! stored wrapped by the KMS, which only opens for the object's name (see
+//! `s3::sse`); for SSE-C the client's own. Everything of the object that's
+//! encrypted is encrypted under that key, with XChaCha20-Poly1305, and
+//! nothing else is:
+//!
+//! - its parts' data, in segments (below);
+//! - small values: an SSE-S3 object's ETags (its content's MD5), and an
+//!   encrypted object's checksums, each sealed whole, with a random nonce in
+//!   front of it (`seal_value`). Its associated data says what the value is
+//!   and whose: a part's (by its salt, which travels with the part when the
+//!   packer moves it or a copy shares it) or the object's (by its name), so a
+//!   value doesn't open as another, or as another's.
+//!
+//! A part's nonces start with its random 16-byte salt, a value's are 24
+//! random bytes, so no two repeat under one key.
+//!
+//! What this protects against: whoever reads the catalog or the blobs can't
+//! read anything encrypted. What it doesn't: whoever can write the catalog is
+//! trusted to say which parts make up an object, and which version of a name
+//! is current; it could delete objects anyway.
+//!
+//! ## Parts
 //!
 //! A part's plaintext is cut into segments of [`SEGMENT`] bytes (the last may
 //! be shorter, and is empty only for an empty part), and each is sealed with
@@ -27,6 +51,7 @@
 
 use bytes::{Bytes, BytesMut};
 use chacha20poly1305::{AeadInOut, KeyInit, XChaCha20Poly1305, XNonce, aead::Tag};
+use zeroize::Zeroizing;
 
 /// Plaintext bytes per segment.
 pub const SEGMENT: u64 = 64 * 1024;
@@ -163,6 +188,137 @@ impl Sealer {
         self.index += 1;
         segment.freeze()
     }
+}
+
+/// Bytes of a small value's nonce.
+const VALUE_NONCE: usize = 24;
+
+/// `plain`, sealed under `key` with `ad` and a random nonce: nonce,
+/// ciphertext, tag. For small values, and for wrapping keys (`s3::sse`).
+pub fn seal_bytes(key: &Key, plain: &[u8], ad: &[u8]) -> Vec<u8> {
+    let mut nonce = [0; VALUE_NONCE];
+    getrandom::fill(&mut nonce).expect("the OS random number generator failed");
+    let mut buffer = Zeroizing::new(plain.to_vec());
+    let tag = XChaCha20Poly1305::new(key.into())
+        .encrypt_inout_detached(&XNonce::from(nonce), ad, buffer.as_mut_slice().into())
+        .expect("a key, an ETag or a checksum is far shorter than XChaCha20-Poly1305's limit");
+    [&nonce[..], &buffer, &tag].concat()
+}
+
+/// What `seal_bytes` sealed, if `sealed` is that, under `key` and with `ad`.
+pub fn open_bytes(key: &Key, sealed: &[u8], ad: &[u8]) -> Option<Zeroizing<Vec<u8>>> {
+    if sealed.len() < VALUE_NONCE + TAG as usize {
+        return None;
+    }
+    let (nonce, rest) = sealed.split_at(VALUE_NONCE);
+    let (ciphertext, tag) = rest.split_at(rest.len() - TAG as usize);
+    let nonce = XNonce::try_from(nonce).ok()?;
+    let tag = Tag::<XChaCha20Poly1305>::try_from(tag).ok()?;
+    let mut plain = Zeroizing::new(ciphertext.to_vec());
+    XChaCha20Poly1305::new(key.into())
+        .decrypt_inout_detached(&nonce, ad, plain.as_mut_slice().into(), &tag)
+        .ok()?;
+    Some(plain)
+}
+
+/// Which of its values an object (or part) keeps sealed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Field {
+    Etag,
+    Checksum,
+}
+
+/// Whose a sealed value is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Owner<'a> {
+    /// A part's, by its salt.
+    Part(&'a Salt),
+    /// An object's (or an upload's, for the object it's to make), by its name.
+    Object { bucket: &'a str, key: &'a str },
+}
+
+/// The associated data a value is sealed with: what it is, and whose.
+///
+/// ```text
+/// "cairn value v1" ‖ kind (1 byte) ‖ binding
+///
+/// kind:    1 part ETag, 2 part checksum, 3 object ETag, 4 object checksum
+/// binding: the part's salt (16 bytes), or
+///          len(bucket) (4 bytes, big-endian) ‖ bucket ‖ len(key) (4) ‖ key
+/// ```
+fn value_ad(field: Field, owner: Owner) -> Vec<u8> {
+    let kind = match (owner, field) {
+        (Owner::Part(_), Field::Etag) => 1,
+        (Owner::Part(_), Field::Checksum) => 2,
+        (Owner::Object { .. }, Field::Etag) => 3,
+        (Owner::Object { .. }, Field::Checksum) => 4,
+    };
+    let mut ad = b"cairn value v1".to_vec();
+    ad.push(kind);
+    match owner {
+        Owner::Part(salt) => ad.extend_from_slice(salt),
+        Owner::Object { bucket, key } => {
+            for name in [bucket, key] {
+                ad.extend_from_slice(&(name.len() as u32).to_be_bytes());
+                ad.extend_from_slice(name.as_bytes());
+            }
+        }
+    }
+    ad
+}
+
+/// `value`, the `field` of `owner`, sealed under its object's `key`, as it's
+/// stored: hex of nonce, ciphertext and tag.
+pub fn seal_value(key: &Key, field: Field, owner: Owner, value: &str) -> String {
+    hex(&seal_bytes(key, value.as_bytes(), &value_ad(field, owner)))
+}
+
+/// The value `stored` (from `seal_value`, with the same key, field and owner)
+/// holds, if it's that.
+pub fn open_value(key: &Key, field: Field, owner: Owner, stored: &str) -> Option<String> {
+    let plain = open_bytes(key, &unhex(stored)?, &value_ad(field, owner))?;
+    String::from_utf8(plain.to_vec()).ok()
+}
+
+/// How an object's (or upload's) values are stored: as they are (plain), or
+/// sealed under its key.
+#[derive(Clone, Copy)]
+pub enum Storing<'a> {
+    Plain,
+    Sealed(&'a Key),
+}
+
+impl Storing<'_> {
+    /// `value`, the `field` of `owner`, as it's to be stored.
+    pub fn store(&self, field: Field, owner: Owner, value: &str) -> String {
+        match self {
+            Storing::Plain => value.to_owned(),
+            Storing::Sealed(key) => seal_value(key, field, owner, value),
+        }
+    }
+
+    /// The value `stored`, the `field` of `owner`, holds.
+    pub fn read(&self, field: Field, owner: Owner, stored: &str) -> anyhow::Result<String> {
+        match self {
+            Storing::Plain => Ok(stored.to_owned()),
+            Storing::Sealed(key) => open_value(key, field, owner, stored)
+                .ok_or_else(|| anyhow::anyhow!("a stored {field:?} of {owner:?} doesn't open under its key")),
+        }
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn unhex(hex: &str) -> Option<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| hex.get(i..i + 2).and_then(|h| u8::from_str_radix(h, 16).ok()))
+        .collect()
 }
 
 /// A segment that didn't decrypt: the wrong key, or damaged or altered bytes.
@@ -454,5 +610,40 @@ mod tests {
         let (stored, _) = sealer.finish();
         assert!(open(&KEY, &stored, 100, 0, 100).is_err());
         assert_ne!(stored.to_vec(), seal(&data, 100));
+    }
+
+    #[test]
+    fn values_open_only_as_what_and_whose_they_are() {
+        let (salt, other_salt) = ([1; SALT_LEN], [2; SALT_LEN]);
+        let part = Owner::Part(&salt);
+        let object = Owner::Object { bucket: "b", key: "k" };
+        let sealed = seal_value(&KEY, Field::Checksum, part, "AAAAAA==");
+        assert_ne!(sealed, seal_value(&KEY, Field::Checksum, part, "AAAAAA=="), "a fresh nonce each time");
+        assert_eq!(open_value(&KEY, Field::Checksum, part, &sealed).as_deref(), Some("AAAAAA=="));
+        // Not under another key, as another field, or as another's.
+        assert_eq!(open_value(&[8; 32], Field::Checksum, part, &sealed), None);
+        assert_eq!(open_value(&KEY, Field::Etag, part, &sealed), None);
+        assert_eq!(open_value(&KEY, Field::Checksum, Owner::Part(&other_salt), &sealed), None);
+        assert_eq!(open_value(&KEY, Field::Checksum, object, &sealed), None);
+        let sealed = seal_value(&KEY, Field::Etag, object, "e");
+        assert_eq!(open_value(&KEY, Field::Etag, object, &sealed).as_deref(), Some("e"));
+        assert_eq!(open_value(&KEY, Field::Checksum, object, &sealed), None);
+        for other in [("b", "k2"), ("b2", "k"), ("bk", ""), ("", "bk")] {
+            let owner = Owner::Object { bucket: other.0, key: other.1 };
+            assert_eq!(open_value(&KEY, Field::Etag, owner, &sealed), None, "{other:?}");
+        }
+        // Damaged.
+        assert_eq!(open_value(&KEY, Field::Etag, object, &sealed[2..]), None);
+        assert_eq!(open_value(&KEY, Field::Etag, object, &sealed[1..]), None);
+        assert_eq!(open_value(&KEY, Field::Etag, object, &format!("zz{}", &sealed[2..])), None);
+    }
+
+    #[test]
+    fn value_associated_data_is_stable() {
+        assert_eq!(value_ad(Field::Etag, Owner::Part(&[0xab; SALT_LEN])), [&b"cairn value v1\x01"[..], &[0xab; 16]].concat());
+        assert_eq!(
+            value_ad(Field::Checksum, Owner::Object { bucket: "b", key: "kk" }),
+            b"cairn value v1\x04\0\0\0\x01b\0\0\0\x02kk"
+        );
     }
 }

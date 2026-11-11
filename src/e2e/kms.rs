@@ -894,6 +894,18 @@ async fn sse_s3_etags_are_md5s_stored_sealed() {
         assert!(body.contains(&format!("<ETag>\"{combined}\"</ETag>")), "{body}");
     }
     assert_eq!(etag_of(&app, "multi").await, combined);
+
+    // A copy shares its source's object key, and its ETag is sealed again,
+    // as its own: its source's, moved over in the catalog, doesn't open.
+    assert_eq!(copy(&app, bob, "multi", "copy", None, Wanted::S3).await.0, StatusCode::OK);
+    assert_eq!(etag_of(&app, "copy").await, combined);
+    let client = app.pool.get().await.unwrap();
+    client
+        .execute("UPDATE objects SET etag = (SELECT etag FROM objects WHERE key = 'multi') WHERE key = 'copy'", &[])
+        .await
+        .unwrap();
+    let read = get_object(&app, BUCKET, "copy", None, None, &Preconditions::default(), None, None, false).await;
+    assert!(read.is_err(), "another object's sealed ETag opened as the copy's");
 }
 
 /// A CompleteMultipartUpload body listing `etags` as parts 1, 2, ...

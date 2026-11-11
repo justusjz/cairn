@@ -1112,6 +1112,9 @@ struct PartInfo {
     /// The byte ranges of the part (as stored) that are intact on no
     /// replica, as [start, stop) from its start (see `scrub`).
     lost: Vec<[i64; 2]>,
+    /// Its salt, if it's encrypted, which its sealed ETag is bound to.
+    #[serde(skip)]
+    salt: Option<crate::encryption::Salt>,
 }
 
 #[utoipa::path(get, path = "/buckets/{bucket}/object", params(("bucket" = String, Path), KeyParams),
@@ -1147,7 +1150,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
                     p.blob_offset, b.size, b.state, extract(epoch FROM p.created_at)::float8,
                     ARRAY(SELECT l.node FROM blob_locations l
                           WHERE l.blob_id = p.blob_id ORDER BY l.node),
-                    b.data_shards::int
+                    b.data_shards::int, p.enc_salt
              FROM parts p JOIN blobs b ON b.blob_id = p.blob_id
              WHERE p.object_id = ANY($1)
              ORDER BY p.object_id, p.part_number",
@@ -1170,6 +1173,9 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
             nodes: p.get(10),
             data_shards: p.get(11),
             lost: Vec::new(),
+            salt: p
+                .get::<_, Option<&[u8]>>(12)
+                .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)")),
         });
     }
     // Where the parts' blobs have lost data, if anywhere.
@@ -1207,9 +1213,11 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
         // An SSE-S3 version's ETags (and its parts') are stored sealed; Cairn
         // can open them, as it can the version itself.
         if let Some(etag_key) = crate::s3::sse::etag_key(app, &stored, bucket, key).await?.ok().flatten() {
-            etag = etag.map(|e| etag_key.open(&e)).transpose()?;
+            let object = crate::encryption::Owner::Object { bucket, key };
+            etag = etag.map(|e| etag_key.open(object, &e)).transpose()?;
             for part in &mut parts {
-                part.etag = etag_key.open(&part.etag)?;
+                let salt = part.salt.ok_or_else(|| anyhow::anyhow!("an SSE-S3 object's part has no salt"))?;
+                part.etag = etag_key.open(crate::encryption::Owner::Part(&salt), &part.etag)?;
             }
         }
         infos.push(VersionInfo {

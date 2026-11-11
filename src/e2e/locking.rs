@@ -63,7 +63,8 @@ async fn commit_object(tx: &Transaction<'_>, app: &App, blob: Uuid, key: &str) -
     tx.query_one(
         "SELECT status FROM pg_temp.cairn_commit_object(
              $1, ARRAY[$2::int], ARRAY[0::smallint], 0, 65536, 1::smallint, 0::smallint, 1048576,
-                     ARRAY[0::bigint], 0, 'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
+                     ARRAY[0::bigint], 0, 'd41d8cd98f00b204e9800998ecf8427e',
+                     'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
              $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, false,
              NULL, NULL, NULL, false, NULL, $5)",
         &[&blob, &app.node, &BUCKET, &key, &crate::s3::versions::new_version_id()],
