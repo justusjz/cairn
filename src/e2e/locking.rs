@@ -213,6 +213,39 @@ async fn default_encryption_waits_only_for_bucket_changes() {
     assert!(!missing);
 }
 
+/// T21: setting a bucket's CORS configuration doesn't wait for writes (B
+/// shared), but does wait for a change of the versioning state (B
+/// exclusive); and there's none for a missing bucket.
+#[tokio::test]
+async fn cors_waits_only_for_bucket_changes() {
+    let Some(app) = node().await else { return };
+    let set = "SELECT pg_temp.cairn_set_cors($1, '{\"rules\":[]}')";
+    let mut held = connection(&app).await;
+    let tx = held.transaction().await.unwrap();
+    tx.query_one("SELECT pg_temp.cairn_lock_bucket($1)", &[&BUCKET]).await.unwrap();
+    let setting = connection(&app).await;
+    let done: bool = tokio::time::timeout(Duration::from_secs(5), setting.query_one(set, &[&BUCKET]))
+        .await
+        .expect("it doesn't wait for a write")
+        .unwrap()
+        .get(0);
+    assert!(done);
+    tx.commit().await.unwrap();
+
+    let tx = held.transaction().await.unwrap();
+    tx.query_one("SELECT pg_temp.cairn_set_versioning($1, 'enabled')", &[&BUCKET]).await.unwrap();
+    let app2 = app.clone();
+    let setting = tokio::spawn(async move {
+        let client = connection(&app2).await;
+        client.query_one(set, &[&BUCKET]).await.unwrap().get::<_, bool>(0)
+    });
+    assert_waits(&setting).await;
+    tx.commit().await.unwrap();
+    assert!(setting.await.unwrap());
+    let missing: bool = connection(&app).await.query_one(set, &[&"nope"]).await.unwrap().get(0);
+    assert!(!missing);
+}
+
 /// I1: a conditional write is decided (by Cairn) against the current object,
 /// and lands only if that's still the current one when it holds the key: one
 /// that another write replaced meanwhile makes it decide again, against the

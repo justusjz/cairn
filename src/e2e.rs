@@ -26,6 +26,7 @@ mod checksums;
 mod concurrency;
 mod cleanup;
 mod copies;
+mod cors;
 mod deadlocks;
 mod encrypted;
 mod kms;

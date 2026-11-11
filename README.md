@@ -284,8 +284,9 @@ size is refused as soon as it's over. The form's fields are what a PutObject's
 headers would be (content headers, `x-amz-meta-*`, checksums, SSE-S3, SSE-KMS,
 SSE-C, which is exempt from the policy's conditions, as in MinIO), and every
 one of them must be in the policy. `success_action_status` and
-`success_action_redirect` say how to answer. There are no CORS headers yet, so
-a browser can post a form, but not with `fetch` from another site.
+`success_action_redirect` say how to answer. For a page on another site to
+send it with `fetch` (or to use a presigned URL), the bucket needs a
+[CORS configuration](#cors).
 
 > [!NOTE]
 > Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
@@ -499,6 +500,33 @@ anything early.
 Not supported, and refused with `501 NotImplemented`: transitions to other
 storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one),
 and filters on tags (Cairn doesn't keep object tags).
+
+## CORS
+
+A bucket's CORS configuration lets web pages on other sites use it from the
+browser, with presigned URLs or POST Object, as in S3. Setting one is bucket
+management, so only an admin can:
+
+```sh
+aws s3api put-bucket-cors --bucket my-bucket --cors-configuration '{"CORSRules": [{
+    "AllowedOrigins": ["https://app.example.com"], "AllowedMethods": ["GET", "PUT", "POST"],
+    "AllowedHeaders": ["content-type", "x-amz-*"], "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3000}]}'
+aws s3api get-bucket-cors --bucket my-bucket
+aws s3api delete-bucket-cors --bucket my-bucket
+```
+
+A request is allowed by the first rule that allows its origin (one `*` in an
+`AllowedOrigin` stands for anything, `*` alone for any origin) and its method,
+and, for a browser's preflight (an unsigned `OPTIONS`), every header it asks to
+send (`AllowedHeader`, which may have one `*` too, matched regardless of case).
+A preflight that no rule allows is refused with `403 AccessForbidden`. Every
+other response to a request from an allowed origin gets its CORS headers,
+errors too, so that the page can read them. CORS doesn't grant anything: a
+request still has to be signed by a role that may make it.
+
+There's no CORS setting for the whole cluster, only these, per bucket, as in
+S3.
 
 ## Limits
 

@@ -12,6 +12,7 @@ use crate::{
     roles::{Permission, Principal},
     s3::{
         buckets::{
+            cors::{self, delete_bucket_cors, get_bucket_cors, put_bucket_cors},
             create::create_bucket,
             delete::delete_bucket,
             head::head_bucket,
@@ -79,9 +80,12 @@ pub async fn handle(
     let mut id = [0u8; 8];
     getrandom::fill(&mut id).expect("the OS random number generator failed");
     let id: String = id.iter().map(|b| format!("{b:02X}")).collect();
+    // A request from another origin gets CORS headers on its response,
+    // whatever the response is, if its bucket allows it (see `cors`).
+    let cross = cors::Cross::of(req.method(), req.headers(), &bucket_of(req.uri().path()));
     let mut response = REQUEST_ID
         .scope(id.clone(), async {
-            handle_request(req, app).await.unwrap_or_else(|e| {
+            handle_request(req, app.clone()).await.unwrap_or_else(|e| {
                 eprintln!("{what} failed (request {id}): {e:#}");
                 error_response(&e)
             })
@@ -91,13 +95,34 @@ pub async fn handle(
         "x-amz-request-id",
         id.parse().expect("hex is a header value"),
     );
+    if let Some(cross) = cross
+        && let Err(e) = cross.apply(&app, &mut response).await
+    {
+        eprintln!("{what}: CORS headers failed (request {id}): {e:#}");
+    }
     response
+}
+
+/// The bucket a request's path names, decoded; empty if it names none.
+fn bucket_of(path: &str) -> String {
+    let path = path.trim_start_matches('/');
+    decode_path_param(path.split_once('/').map_or(path, |(bucket, _)| bucket))
 }
 
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     app: Arc<App>,
 ) -> anyhow::Result<Response<ResBody>> {
+    // A browser's CORS preflight, which is never signed (see `cors`).
+    if req.method() == Method::OPTIONS {
+        let path = req.uri().path().trim_start_matches('/');
+        let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
+        if !bucket.is_empty() {
+            let bucket = decode_path_param(bucket);
+            let response = cors::preflight(&app, req.headers(), &bucket, !key.is_empty()).await?;
+            return Ok(box_response(response));
+        }
+    }
     // POST Object: a form posted to a bucket, which is signed in its body,
     // not its headers (see `objects::post`).
     if req.method() == Method::POST && objects::post::is_form(req.headers()) {
@@ -191,10 +216,10 @@ async fn handle_request(
         // query up front and match on an owned method — mirroring the object branch
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
-        // Bucket sub-resource GETs: versioning, encryption and lifecycle are
-        // real; the rest (acl/location/policy/cors/tagging/object-lock) are
-        // stubbed — Cairn implements
-        // none of them, so answer as S3 does for an unconfigured bucket before
+        // Bucket sub-resource GETs: versioning, encryption, lifecycle and
+        // CORS are real; the rest (acl, location, policy, tagging,
+        // object-lock, website, ...) are stubbed — Cairn implements none of
+        // them, so answer as S3 does for an unconfigured bucket before
         // falling through to a listing.
         if *req.method() == hyper::Method::GET {
             if query_param(&query, "versioning").is_some() {
@@ -205,6 +230,9 @@ async fn handle_request(
             }
             if query_param(&query, "lifecycle").is_some() {
                 return Ok(box_response(get_bucket_lifecycle(&app, &bucket).await?));
+            }
+            if query_param(&query, "cors").is_some() {
+                return Ok(box_response(get_bucket_cors(&app, &bucket).await?));
             }
             if query_param(&query, "ownershipControls").is_some() {
                 return Ok(box_response(acl::ownership_controls()));
@@ -345,6 +373,17 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
+            // PutBucketCors: PUT /{bucket}?cors with a <CORSConfiguration>
+            // body, which must declare a checksum, as in S3.
+            hyper::Method::PUT if query_param(&query, "cors").is_some() => {
+                if !payload::has_body_checksum(req.headers()) {
+                    return Ok(box_response(missing_checksum()));
+                }
+                match read_body(req, &principal.secret, true).await? {
+                    Ok(body) => put_bucket_cors(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
             // PutBucketAcl: there are no ACLs (`acl`).
             hyper::Method::PUT if query_param(&query, "acl").is_some() => {
                 acl::put_bucket_acl(&app, &bucket, req.headers()).await?
@@ -373,6 +412,9 @@ async fn handle_request(
             }
             hyper::Method::DELETE if query_param(&query, "lifecycle").is_some() => {
                 delete_bucket_lifecycle(&app, &bucket).await?
+            }
+            hyper::Method::DELETE if query_param(&query, "cors").is_some() => {
+                delete_bucket_cors(&app, &bucket).await?
             }
             hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
@@ -755,7 +797,7 @@ fn forbidden(code: &str, message: &str) -> Response<ResBody> {
 
 /// The subresources a bucket's configuration is read from, which a role that
 /// may see the bucket may read.
-const BUCKET_CONFIGURATION: &[&str] = &[
+pub(crate) const BUCKET_CONFIGURATION: &[&str] = &[
     "versioning",
     "encryption",
     "ownershipControls",
@@ -766,6 +808,12 @@ const BUCKET_CONFIGURATION: &[&str] = &[
     "cors",
     "tagging",
     "lifecycle",
+    "website",
+    "replication",
+    "accelerate",
+    "requestPayment",
+    "logging",
+    "notification",
 ];
 
 /// Whether `principal` may make this request against `bucket` (`key` empty for a

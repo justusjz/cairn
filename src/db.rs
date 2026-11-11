@@ -194,6 +194,7 @@ const MIGRATIONS: &[&str] = &[
     LEGACY_BLOBS,
     SHARDS,
     NODE_STATES,
+    BUCKET_CORS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1022,6 +1023,14 @@ ALTER TABLE nodes ADD COLUMN state text NOT NULL DEFAULT 'active'
 -- When the state last changed: a removal only finishes once no upload that
 -- may have chosen the node before is still pending.
 ALTER TABLE nodes ADD COLUMN state_since timestamptz NOT NULL DEFAULT NOW();
+"#;
+
+/// Migration 26: a bucket's CORS configuration (see `s3::buckets::cors`), as
+/// PutBucketCors sets it, as JSON; NULL if it has none. No new lock protocol:
+/// it's set by a plain UPDATE of the bucket's row (T21), and a Cairn that
+/// doesn't know it merely answers without CORS headers.
+const BUCKET_CORS: &str = r#"
+ALTER TABLE buckets ADD COLUMN cors text;
 "#;
 
 #[cfg(test)]

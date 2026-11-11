@@ -1305,6 +1305,18 @@ BEGIN
 END
 $$;
 
+-- T21: PutBucketCors and DeleteBucketCors: sets (or, with NULL, removes) the
+-- bucket's CORS configuration. A plain UPDATE of the bucket's row, as T16's:
+-- no invariant involves the configuration, which requests read as they're
+-- answered, not under B. Returns whether the bucket exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_cors(p_bucket text, p_config text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE buckets SET cors = p_config WHERE name = p_bucket;
+    RETURN FOUND;
+END
+$$;
+
 -- T18: PutBucketLifecycleConfiguration and DeleteBucketLifecycle: sets (or,
 -- with NULL, removes) the bucket's lifecycle configuration, with a new
 -- generation, and starts a new sweep of it, due now (the last whole sweep

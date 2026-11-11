@@ -1,3 +1,4 @@
+pub mod cors;
 pub mod create;
 pub mod delete;
 pub mod encryption;

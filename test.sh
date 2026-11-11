@@ -61,7 +61,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=103
+TOTAL=105
 STEP=0
 PASS=0
 FAIL=0
@@ -1152,9 +1152,10 @@ acl_ok() {
     s3 info "s3://${BUCKET}/big.bin" >/dev/null 2>&1
 }
 
-# Bucket sub-resource stubs: location/versioning succeed (200, empty config);
-# policy/cors/tagging are "not configured" (the client errors on 404), and so
-# is lifecycle, until one is set.
+# Bucket sub-resource stubs: location/versioning/accelerate/request payment/
+# logging/notification succeed (200, empty or default config);
+# policy/tagging/website/replication are "not configured" (the client errors
+# on 404), and so are CORS and lifecycle, until one is set.
 subresource_stubs_ok() {
     awss3 s3api get-bucket-location --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     awss3 s3api get-bucket-versioning --bucket "$BUCKET" >/dev/null 2>&1 || return 1
@@ -1162,6 +1163,63 @@ subresource_stubs_ok() {
     ! awss3 s3api get-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-website --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-replication --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    awss3 s3api get-bucket-accelerate-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-request-payment --bucket "$BUCKET" --query Payer --output text 2>/dev/null)" \
+        = BucketOwner ] || return 1
+    awss3 s3api get-bucket-logging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    awss3 s3api get-bucket-notification-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+}
+
+# CORS: a configuration is bucket management (admin-only), reads back, and
+# answers browsers' preflights (unsigned) and the requests they allow, with
+# CORS headers even on errors; a request from another origin gets none.
+cors_ok() {
+    local url="http://${SERVER_HOST}:${SERVER_PORT}/${BUCKET}" doc="$WORK_DIR/cors.json" out pre
+    printf '%s' '{"CORSRules":[{"ID":"app","AllowedOrigins":["https://*.example.com"],
+        "AllowedMethods":["GET","PUT"],"AllowedHeaders":["content-type","x-amz-*"],
+        "ExposeHeaders":["ETag"],"MaxAgeSeconds":600}]}' > "$doc"
+    # No configuration yet: a preflight is refused.
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS -H 'Origin: https://app.example.com' \
+        -H 'Access-Control-Request-Method: GET' "$url/small.txt")" = 403 ] || return 1
+    ! as_role writer writersecret s3api put-bucket-cors --bucket "$BUCKET" \
+        --cors-configuration "file://$doc" >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-cors --bucket "$BUCKET" --cors-configuration "file://$doc" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-cors --bucket "$BUCKET" \
+        --query 'CORSRules[0].[ID,AllowedOrigins[0],MaxAgeSeconds]' --output text 2>/dev/null)" \
+        = "$(printf 'app\thttps://*.example.com\t600')" ] || return 1
+    # The preflight of a presigned PUT a page would make.
+    out=$(curl -s -D - -o /dev/null -X OPTIONS -H 'Origin: https://app.example.com' \
+        -H 'Access-Control-Request-Method: PUT' -H 'Access-Control-Request-Headers: content-type' \
+        "$url/cors/up.txt" | tr -d '\r')
+    echo "$out" | grep -q '^HTTP/1.1 200' || return 1
+    echo "$out" | grep -qi '^access-control-allow-origin: https://app.example.com$' || return 1
+    echo "$out" | grep -qi '^access-control-allow-methods: GET, PUT$' || return 1
+    echo "$out" | grep -qi '^access-control-allow-headers: content-type$' || return 1
+    echo "$out" | grep -qi '^access-control-max-age: 600$' || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS -H 'Origin: https://app.example.com' \
+        -H 'Access-Control-Request-Method: DELETE' "$url/cors/up.txt")" = 403 ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -X OPTIONS -H 'Origin: https://app.example.org' \
+        -H 'Access-Control-Request-Method: PUT' "$url/cors/up.txt")" = 403 ] || return 1
+    # The PUT itself, and a GET of what it wrote, presigned.
+    pre=$(python3 "$PRESIGNER" PUT "$url/cors/up.txt" 60) || return 1
+    out=$(curl -s -D - -o /dev/null -T "$SMALL" -H 'Origin: https://app.example.com' "$pre" | tr -d '\r')
+    echo "$out" | grep -q '^HTTP/1.1 200' || return 1
+    echo "$out" | grep -qi '^access-control-allow-origin: https://app.example.com$' || return 1
+    echo "$out" | grep -qi '^access-control-expose-headers: ETag$' || return 1
+    pre=$(python3 "$PRESIGNER" GET "$url/cors/up.txt" 60) || return 1
+    curl -s -D - -o /dev/null -H 'Origin: https://app.example.com' "$pre" \
+        | grep -qi '^access-control-allow-origin: https://app.example.com' || return 1
+    curl -s -D - -o /dev/null -H 'Origin: https://app.example.org' "$pre" \
+        | grep -qi '^access-control-allow-origin' && return 1
+    # An error (here, an unsigned request) can be read by the page too.
+    out=$(curl -s -D - -o /dev/null -H 'Origin: https://app.example.com' "$url/cors/up.txt" | tr -d '\r')
+    echo "$out" | grep -q '^HTTP/1.1 403' || return 1
+    echo "$out" | grep -qi '^access-control-allow-origin: https://app.example.com$' || return 1
+    awss3 s3api delete-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    s3 del "s3://${BUCKET}/cors/up.txt" >/dev/null 2>&1
 }
 
 # A lifecycle configuration is bucket management (admin-only): writer can't
@@ -2117,6 +2175,7 @@ run_test    "Packer leaves too little alone"         pack_below_thresholds_ok
 run_test    "Packer compacts mostly-dead blobs"      pack_compacts_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
+run_test    "CORS configuration and preflights"     cors_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
 run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
 run_test    "Presigned GET/PUT, response headers"   presigned_ok

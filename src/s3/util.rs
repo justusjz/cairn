@@ -52,11 +52,16 @@ pub fn stub_acl() -> Response<Full<Bytes>> {
     )
 }
 
+const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
+const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+
 /// Read-only stubs for the bucket sub-resource GETs S3 clients probe (s3cmd
-/// `info`, minio-go's `cp` preflight). Cairn implements none of these features,
-/// so we answer exactly as S3 does for an unconfigured bucket: `location` and
-/// `versioning` return a 200 empty config; the rest return their "not configured"
-/// 404. Returns `None` for a normal listing GET (no recognised sub-resource).
+/// `info`, minio-go's `cp` preflight, Terraform's refresh of a bucket). Cairn
+/// implements none of these features, so we answer exactly as S3 does for an
+/// unconfigured bucket (and as MinIO's stubs do): `location`, `versioning`,
+/// `accelerate`, `requestPayment`, `logging` and `notification` return a 200
+/// empty (or default) config; the rest return their "not configured" 404.
+/// Returns `None` for a normal listing GET (no recognised sub-resource).
 ///
 /// Existence-agnostic, like [`stub_acl`] — clients probe these on buckets they're
 /// already using.
@@ -88,18 +93,35 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
             "NoSuchBucketPolicy",
             "the bucket policy does not exist",
         ))
-    } else if present("cors") {
-        Some(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchCORSConfiguration",
-            "the CORS configuration does not exist",
-        ))
     } else if present("tagging") {
         Some(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchTagSet",
             "there is no tag set associated with the bucket",
         ))
+    } else if present("website") {
+        Some(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "NoSuchWebsiteConfiguration",
+            "The specified bucket does not have a website configuration",
+        ))
+    } else if present("replication") {
+        Some(format_s3_error(
+            StatusCode::NOT_FOUND,
+            "ReplicationConfigurationNotFoundError",
+            "The replication configuration was not found",
+        ))
+    } else if present("accelerate") {
+        Some(xml_ok(format!("{XML}<AccelerateConfiguration xmlns=\"{S3_XMLNS}\"/>")))
+    } else if present("requestPayment") {
+        Some(xml_ok(format!(
+            "{XML}<RequestPaymentConfiguration xmlns=\"{S3_XMLNS}\"><Payer>BucketOwner</Payer>\
+             </RequestPaymentConfiguration>"
+        )))
+    } else if present("logging") {
+        Some(xml_ok(format!("{XML}<BucketLoggingStatus xmlns=\"{S3_XMLNS}\"/>")))
+    } else if present("notification") {
+        Some(xml_ok(format!("{XML}<NotificationConfiguration xmlns=\"{S3_XMLNS}\"/>")))
     } else {
         None
     }
@@ -276,13 +298,19 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "cors",
             "tagging",
             "lifecycle",
+            "website",
+            "replication",
+            "accelerate",
+            "requestPayment",
+            "logging",
+            "notification",
         ],
         // PutBucketVersioning, PutBucketEncryption,
-        // PutBucketLifecycleConfiguration, PutBucketAcl (`acl`).
-        (true, &Method::PUT) => &["versioning", "encryption", "lifecycle", "acl"],
+        // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketAcl (`acl`).
+        (true, &Method::PUT) => &["versioning", "encryption", "lifecycle", "cors", "acl"],
         (true, &Method::POST) => &["delete"],
-        // DeleteBucketEncryption, DeleteBucketLifecycle.
-        (true, &Method::DELETE) => &["encryption", "lifecycle"],
+        // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors.
+        (true, &Method::DELETE) => &["encryption", "lifecycle", "cors"],
         // GetObjectAcl (stubbed), ListParts.
         (false, &Method::GET) => &["acl", "uploadId"],
         // UploadPart / UploadPartCopy, PutObjectAcl (`acl`).
@@ -514,6 +542,9 @@ mod tests {
             (Method::PUT, false, "acl"),
             (Method::PUT, true, "acl"),
             (Method::GET, true, "ownershipControls"),
+            (Method::GET, true, "website"),
+            (Method::PUT, true, "cors"),
+            (Method::DELETE, true, "cors"),
             (Method::GET, false, "uploadId=u&max-parts=2"),
             (Method::DELETE, false, "versionId=null"),
             (Method::DELETE, false, "uploadId=u"),
@@ -532,9 +563,9 @@ mod tests {
             (Method::POST, false, "restore"),
             (Method::PUT, true, "policy"),
             (Method::DELETE, true, "policy"),
-            (Method::DELETE, true, "cors"),
-            (Method::GET, true, "website"),
-            (Method::GET, true, "prefix=a&%77ebsite"),
+            (Method::DELETE, true, "website"),
+            (Method::GET, true, "inventory"),
+            (Method::GET, true, "prefix=a&%69nventory"),
         ] {
             assert_eq!(
                 refused(method.clone(), bucket_level, query),

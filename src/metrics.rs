@@ -93,10 +93,8 @@ impl Op {
         if key.is_empty() {
             return match *method {
                 Method::GET if has("versions") => Op::ListObjects,
-                Method::GET if has("versioning") => Op::Bucket,
-                Method::GET if crate::s3::util::bucket_subresource_stub(query).is_some() => {
-                    Op::Bucket
-                }
+                // The bucket's configuration.
+                Method::GET if crate::s3::BUCKET_CONFIGURATION.iter().any(|c| has(c)) => Op::Bucket,
                 Method::GET => Op::ListObjects,
                 Method::POST if has("delete") => Op::DeleteObjects,
                 // POST Object.
@@ -627,6 +625,8 @@ mod tests {
         assert_eq!(classify(Method::GET, "/b", "versions"), Op::ListObjects);
         assert_eq!(classify(Method::GET, "/b", "versioning"), Op::Bucket);
         assert_eq!(classify(Method::GET, "/b", "location"), Op::Bucket);
+        assert_eq!(classify(Method::GET, "/b", "cors"), Op::Bucket);
+        assert_eq!(classify(Method::OPTIONS, "/b/k", ""), Op::Bucket);
         assert_eq!(classify(Method::PUT, "/b", ""), Op::Bucket);
         assert_eq!(classify(Method::POST, "/b", "delete"), Op::DeleteObjects);
         assert_eq!(classify(Method::GET, "/b/k", ""), Op::GetObject);
