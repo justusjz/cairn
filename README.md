@@ -101,6 +101,7 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on, until the cluster's `parity-shards` setting is set (see below), which overrides it on every node. |
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
+| `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
 | `--kms-jwt-key <PATH>` | `CAIRN_KMS_JWT_KEY` | *required with a KMS* | PEM file of the Ed25519 private key Cairn signs its roles' logins to the KMS with. The same on every node. |
 | `--kms-auth-mount <PATH>` | `CAIRN_KMS_AUTH_MOUNT` | `cairn` | Where the KMS's JWT auth method for Cairn is mounted. |
@@ -113,6 +114,21 @@ On SIGTERM or Ctrl-C, a node stops accepting connections and finishes the
 requests in flight before it exits; a second signal exits right away. Anything
 cut off is cleaned up by [garbage collection](#garbage-collection), as after a
 crash.
+
+### Virtual-hosted-style requests
+
+Clients reach a bucket path-style by default (`s3.example.com/bucket/key`).
+With `--domain s3.example.com`, they may also name it in the host, as
+`bucket.s3.example.com/key`, which some clients do by default. A request to
+any other host (the domain itself, an IP address) is still path-style, so both
+work side by side. As in S3, the bucket is all of the host before the domain,
+so `my.bucket.s3.example.com` is the bucket `my.bucket`.
+
+Cairn only reads the `Host` header, which the proxy in front of it must pass on
+as the client sent it (the request's signature covers it, too). DNS and TLS
+are up to you: a wildcard record for `*.s3.example.com`, and a certificate for
+it. A wildcard certificate covers one label only, so it doesn't cover buckets
+with dots in their names; clients reach those path-style instead, as with S3.
 
 ## Running a highly-available cluster
 

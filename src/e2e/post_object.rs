@@ -142,7 +142,7 @@ where
     for (name, value) in headers {
         request = request.header(*name, *value);
     }
-    post_object(app, request.body(body).unwrap(), path).await.unwrap()
+    post_object(app, request.body(body).unwrap(), path, false).await.unwrap()
 }
 
 async fn post(app: &Arc<App>, body: Vec<u8>) -> Response<Full<Bytes>> {
@@ -205,6 +205,24 @@ async fn uploads_a_file() {
     assert_eq!(read.headers()["content-type"], "text/plain");
     assert_eq!(read.headers()["x-amz-meta-origin"], "server-a");
     assert_eq!(get(&app, "uploads/note.txt").await.unwrap(), data);
+}
+
+/// A form posted to the bucket's host (see `s3::hosting`), whose object's URL
+/// is on that host too.
+#[tokio::test]
+async fn uploads_to_a_virtual_host() {
+    let Some(app) = node().await else { return };
+    let signer = role(&app, true).await;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("{BUCKET}.cairn.test"))
+        .header("content-type", format!("multipart/form-data; boundary={BOUNDARY}"));
+    let body = Full::new(Bytes::from(form(&keyed(&signer, "k", "", &[]), "f", b"hosted", &[])));
+    let response = post_object(&app, request.body(body).unwrap(), BUCKET, true).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.headers()["location"], format!("http://{BUCKET}.cairn.test/k").as_str());
+    assert_eq!(get(&app, "k").await.unwrap(), b"hosted");
 }
 
 #[tokio::test]
@@ -436,7 +454,7 @@ async fn refuses_malformed_forms() {
     assert_eq!(outcome(response).await, (StatusCode::BAD_REQUEST, "MaxPostPreDataLengthExceededError".to_owned()));
     // Not a form: no boundary.
     let request = Request::builder().method("POST").uri("/bucket").header("content-type", "multipart/form-data");
-    let response = post_object(&app, request.body(Full::new(Bytes::new())).unwrap(), BUCKET).await.unwrap();
+    let response = post_object(&app, request.body(Full::new(Bytes::new())).unwrap(), BUCKET, false).await.unwrap();
     assert_eq!(outcome(response).await, malformed);
     // To an object, or signed twice.
     let ok = || Full::new(Bytes::from(form(&keyed(&signer, "k", "", &[]), "f", b"x", &[])));

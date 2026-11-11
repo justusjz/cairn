@@ -41,6 +41,7 @@ use crate::{
             bucket_subresource_stub, decode_continuation_token, decode_path_param, format_s3_error,
             query_param, stub_acl,
         },
+        hosting::Route,
         versions::{invalid_version_id, is_version_id},
     },
 };
@@ -49,6 +50,7 @@ pub(crate) mod buckets;
 pub(crate) mod checksums;
 pub(crate) mod acl;
 pub(crate) mod conditional;
+pub(crate) mod hosting;
 pub(crate) mod metadata;
 pub(crate) mod sse;
 pub(crate) mod sse_c;
@@ -71,21 +73,23 @@ pub fn request_id() -> Option<String> {
 /// Handles an S3 request, as S3 answers: every response has an ID of its own
 /// (`x-amz-request-id`), which an error document names too, so a client can
 /// tell which request it got. A handler that fails answers with a 500 (or a
-/// 503), logged with `what` the request was.
+/// 503), logged with `what` the request was. It goes where `route` says (see
+/// `hosting`).
 pub async fn handle(
     req: Request<hyper::body::Incoming>,
     app: Arc<App>,
     what: &str,
+    route: &Route,
 ) -> Response<ResBody> {
     let mut id = [0u8; 8];
     getrandom::fill(&mut id).expect("the OS random number generator failed");
     let id: String = id.iter().map(|b| format!("{b:02X}")).collect();
     // A request from another origin gets CORS headers on its response,
     // whatever the response is, if its bucket allows it (see `cors`).
-    let cross = cors::Cross::of(req.method(), req.headers(), &bucket_of(req.uri().path()));
+    let cross = cors::Cross::of(req.method(), req.headers(), &bucket_of(&route.path));
     let mut response = REQUEST_ID
         .scope(id.clone(), async {
-            handle_request(req, app.clone()).await.unwrap_or_else(|e| {
+            handle_request(req, app.clone(), route).await.unwrap_or_else(|e| {
                 eprintln!("{what} failed (request {id}): {e:#}");
                 error_response(&e)
             })
@@ -112,10 +116,11 @@ fn bucket_of(path: &str) -> String {
 async fn handle_request(
     req: Request<hyper::body::Incoming>,
     app: Arc<App>,
+    route: &Route,
 ) -> anyhow::Result<Response<ResBody>> {
     // A browser's CORS preflight, which is never signed (see `cors`).
     if req.method() == Method::OPTIONS {
-        let path = req.uri().path().trim_start_matches('/');
+        let path = route.path.trim_start_matches('/');
         let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
         if !bucket.is_empty() {
             let bucket = decode_path_param(bucket);
@@ -126,8 +131,8 @@ async fn handle_request(
     // POST Object: a form posted to a bucket, which is signed in its body,
     // not its headers (see `objects::post`).
     if req.method() == Method::POST && objects::post::is_form(req.headers()) {
-        let path = req.uri().path().trim_start_matches('/').to_owned();
-        return Ok(box_response(objects::post::post_object(&app, req, &path).await?));
+        let path = route.path.trim_start_matches('/').to_owned();
+        return Ok(box_response(objects::post::post_object(&app, req, &path, route.virtual_host).await?));
     }
     // Authenticate every other S3 request up front: look up the role the SigV4
     // credential names and verify the header signature with its secret. Needs
@@ -143,6 +148,8 @@ async fn handle_request(
             "the access key ID does not exist",
         ));
     };
+    // Against the path the client signed, which isn't the route's if the
+    // bucket was in its host.
     if let Err(rejection) = crate::auth::verify_sigv4(
         req.method().as_str(),
         req.uri().path(),
@@ -156,10 +163,10 @@ async fn handle_request(
     // whole path and query once, before anything decodes them.
     let mut query_values =
         req.uri().query().unwrap_or("").split('&').map(|p| p.split_once('=').map_or("", |(_, v)| v));
-    if !util::is_well_formed(req.uri().path()) || !query_values.all(util::is_well_formed) {
+    if !util::is_well_formed(&route.path) || !query_values.all(util::is_well_formed) {
         return Ok(box_response(util::unsupported_characters()));
     }
-    let path = req.uri().path().trim_start_matches('/');
+    let path = route.path.trim_start_matches('/');
     if path.is_empty() {
         let resp = match req.method() {
             &hyper::Method::GET => {

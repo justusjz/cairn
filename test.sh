@@ -42,6 +42,9 @@ WORK_DIR="$(mktemp -d /tmp/s3-smoke.XXXXXX)"
 CARGO_ARGS+=(--data-dir "$WORK_DIR/data")   # required; per-run blob dir
 # No TLS proxy here, so SSE-C keys come over plain HTTP.
 CARGO_ARGS+=(--allow-sse-c-over-http)
+# Virtual-hosted-style requests to bucket.localhost, which resolves to this
+# host without any DNS.
+CARGO_ARGS+=(--domain localhost)
 # SSE-KMS, with keys in OpenBao's Transit engine, used as each role (see
 # `kms`), logged in to with a throwaway key.
 CARGO_ARGS+=(--kms-address "http://127.0.0.1:${BAO_PORT}" --kms-jwt-key "$WORK_DIR/kms-jwt.pem"
@@ -295,6 +298,14 @@ as_role() {
     aws --endpoint-url "http://${SERVER_HOST}:${SERVER_PORT}" "$@"
 }
 awss3() { as_role "$ACCESS_KEY" "$SECRET_KEY" "$@"; }
+# aws-cli with virtual-hosted-style addressing: bucket.localhost:port/key.
+AWSCFG_VHOST="$WORK_DIR/awscfg-vhost"
+sed 's/addressing_style = path/addressing_style = virtual/' "$AWSCFG" >"$AWSCFG_VHOST"
+awsvhost() {
+    AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+    AWS_DEFAULT_REGION=us-east-1 AWS_EC2_METADATA_DISABLED=true AWS_CONFIG_FILE="$AWSCFG_VHOST" \
+    aws --endpoint-url "http://localhost:${SERVER_PORT}" "$@"
+}
 
 # mcli (minio-go, what Mimir uses)
 MCFG="$WORK_DIR/mc"
@@ -510,6 +521,32 @@ copy_small_ok() {
         --copy-source "${BUCKET}/small.txt" >/dev/null 2>&1 || return 1
     check_roundtrip "$SMALL" "s3://${BUCKET}/copy/small.txt" || return 1
     awss3 s3api delete-object --bucket "$BUCKET" --key copy/small.txt >/dev/null 2>&1
+}
+
+# Virtual-hosted-style requests (`--domain localhost`), in buckets with and
+# without dots: a bucket made, filled, listed, copied out of, read and
+# emptied through its host. Taken as path-style, creating the bucket (PUT /)
+# would fail, and listing it (GET /) would list the buckets instead. Both
+# styles reach the same bucket.
+vhost_ok() {
+    local b
+    for b in vhost-test vhost.dotted-test; do
+        awsvhost --debug s3api create-bucket --bucket "$b" 2>&1 \
+            | grep -q "https\?://${b}\.localhost:${SERVER_PORT}/" || return 1
+        cairn_role grant "$ACCESS_KEY" "$b" read write >/dev/null 2>&1 || return 1
+        awsvhost s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+        awsvhost s3api put-object --bucket "$b" --key dir/small.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+        awsvhost s3api copy-object --bucket "$b" --key copy.txt \
+            --copy-source "${BUCKET}/small.txt" >/dev/null 2>&1 || return 1
+        [ "$(awsvhost s3api list-objects-v2 --bucket "$b" --query 'Contents[].Key' --output text 2>/dev/null)" \
+            = "copy.txt	dir/small.txt" ] || return 1
+        awsvhost s3api get-object --bucket "$b" --key dir/small.txt "$WORK_DIR/vhost.out" >/dev/null 2>&1 || return 1
+        cmp -s "$SMALL" "$WORK_DIR/vhost.out" || return 1
+        check_roundtrip "$SMALL" "s3://${b}/copy.txt" || return 1
+        awsvhost s3api delete-object --bucket "$b" --key dir/small.txt >/dev/null 2>&1 || return 1
+        awsvhost s3api delete-object --bucket "$b" --key copy.txt >/dev/null 2>&1 || return 1
+        awsvhost s3api delete-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    done
 }
 
 # CopyObject only copies metadata: the copy shares the source's data, so no
@@ -2115,6 +2152,7 @@ run_test    "Ranged GET (single part) matches"      range_ok big.bin 1000000 100
 run_test    "Ranged GET across multipart boundary"  range_ok multi.bin 5242875 5242884 "$MULTIPART"
 expect_fail "Unsatisfiable range is rejected"       awss3 s3api get-object --bucket "${BUCKET}" --key big.bin --range "bytes=99999999-100000000" "$WORK_DIR/x416"
 run_test    "CopyObject (small object)"             copy_small_ok
+run_test    "Virtual-hosted-style requests"         vhost_ok
 run_test    "CopyObject shares the source's data"   copy_shares_data_ok
 run_test    "CopyObject of multipart src is normal" copy_multipart_source_normal_ok
 run_test    "CopyObject REPLACE sets content-type"  copy_replace_content_type_ok

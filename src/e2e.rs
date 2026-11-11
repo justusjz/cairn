@@ -112,6 +112,7 @@ async fn node_on(
         dashboard: crate::dashboard::Dashboard::new(peer_url),
         peers: crate::peer::PeerClient::new(),
         allow_sse_c_over_http: false,
+        domain: None,
         kms: None,
         pack_hook: hook,
     })

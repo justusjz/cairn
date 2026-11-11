@@ -195,8 +195,14 @@ impl Body for FileBody {
 }
 
 /// Handles a form posted to `/{bucket}` (or refuses one posted elsewhere).
-/// `path` is the request's, without its leading `/`.
-pub async fn post_object<B>(app: &Arc<App>, req: Request<B>, path: &str) -> anyhow::Result<Response<Full<Bytes>>>
+/// `path` is the request's route (see `s3::hosting`), without its leading
+/// `/`; `virtual_host` whether its bucket was in its host.
+pub async fn post_object<B>(
+    app: &Arc<App>,
+    req: Request<B>,
+    path: &str,
+    virtual_host: bool,
+) -> anyhow::Result<Response<Full<Bytes>>>
 where
     B: Body<Data = Bytes> + Unpin + Send + 'static,
     B::Error: Into<BoxError>,
@@ -221,7 +227,7 @@ where
     let content_type = req.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
     let Ok(boundary) = multer::parse_boundary(content_type) else { return Ok(malformed("")) };
     let secure = sse_c::secure(req.headers(), app.allow_sse_c_over_http);
-    let location = object_location(req.headers(), &bucket);
+    let location = object_location(req.headers(), &bucket, virtual_host);
     let in_file = Arc::new(AtomicBool::new(false));
     let stream = RequestStream { body: req.into_body(), read: 0, in_file: in_file.clone() };
     let mut form = multer::Multipart::new(stream, boundary.clone());
@@ -435,12 +441,16 @@ const KEY_ESCAPES: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remov
 /// Characters escaped in a query parameter's value.
 const QUERY_ESCAPES: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'~');
 
-/// The URL of `bucket` (path-style), as the client reached it, if it said
-/// how (`Host`): the object's is this and its key.
-fn object_location(headers: &HeaderMap, bucket: &str) -> Option<String> {
+/// The URL of `bucket`, as the client reached it, if it said how (`Host`):
+/// the host itself if it's the bucket's (`virtual_host`), else the bucket's
+/// path on it. The object's is this and its key.
+fn object_location(headers: &HeaderMap, bucket: &str, virtual_host: bool) -> Option<String> {
     let host = headers.get(header::HOST)?.to_str().ok()?;
     let scheme = if sse_c::secure(headers, false) { "https" } else { "http" };
-    Some(format!("{scheme}://{host}/{}", utf8_percent_encode(bucket, KEY_ESCAPES)))
+    Some(match virtual_host {
+        true => format!("{scheme}://{host}"),
+        false => format!("{scheme}://{host}/{}", utf8_percent_encode(bucket, KEY_ESCAPES)),
+    })
 }
 
 /// The response to a successful upload, as the form asks for it: a redirect

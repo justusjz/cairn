@@ -73,6 +73,9 @@ pub struct App {
     peers: peer::PeerClient,
     /// Whether SSE-C keys are accepted over plain HTTP (see `s3::sse_c`).
     allow_sse_c_over_http: bool,
+    /// `--domain`: the domain buckets are subdomains of, for virtual-hosted
+    /// requests (see `s3::hosting`).
+    domain: Option<String>,
     /// The KMS SSE-KMS keeps its keys in, if there's one (see `s3::sse`).
     kms: Option<Arc<kms::Kms>>,
     /// Lets a test step in at set points of a packing job.
@@ -169,6 +172,12 @@ struct ServeArgs {
     /// encrypted itself: the key travels in a header.
     #[arg(long, env = "CAIRN_ALLOW_SSE_C_OVER_HTTP")]
     allow_sse_c_over_http: bool,
+    /// The domain the S3 API is reached at, e.g. s3.example.com, to take
+    /// virtual-hosted-style requests: to bucket.s3.example.com/key, for
+    /// /bucket/key. Path-style requests work either way. The proxy in front
+    /// must pass `Host` on as the client sent it.
+    #[arg(long, env = "CAIRN_DOMAIN", value_parser = s3::hosting::parse_domain)]
+    domain: Option<String>,
     /// How many bytes per second the scrubber reads, checking this node's
     /// data against its checksums: e.g. 25MiB (the default), 100MB. 0 turns
     /// it off.
@@ -227,6 +236,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         dashboard: dashboard::Dashboard::new(&peer_url),
         peers: peer::PeerClient::new(),
         allow_sse_c_over_http: args.allow_sse_c_over_http,
+        domain: args.domain,
         kms,
         #[cfg(test)]
         pack_hook: None,
@@ -454,12 +464,14 @@ async fn serve_client(
             let service = service_fn(move |req| {
                 let app = app.clone();
                 async move {
-                    let what = format!("{} {}", req.method(), req.uri().path());
+                    // Where the request goes, wherever it names its bucket.
+                    let route = s3::hosting::Route::of(app.domain.as_deref(), req.headers(), req.uri().path());
+                    let what = format!("{} {}", req.method(), route.path);
                     let started = std::time::Instant::now();
                     let in_flight = app.metrics.begin();
                     let op = metrics::Op::classify(
                         req.method(),
-                        req.uri().path(),
+                        &route.path,
                         req.uri().query().unwrap_or(""),
                         req.headers(),
                     );
@@ -468,7 +480,7 @@ async fn serve_client(
                     // makes one): returning it to hyper would drop the
                     // connection without one, which clients take as a network
                     // fault and retry with backoff.
-                    let res = s3::handle(req, app.clone(), &what).await;
+                    let res = s3::handle(req, app.clone(), &what, &route).await;
                     let (parts, body) = res.into_parts();
                     let body =
                         app.metrics
