@@ -163,6 +163,33 @@ impl Drop for DiscardOnDrop {
     }
 }
 
+/// Deletes this node's file of a blob, unless the catalog places a shard of
+/// it here, or it's being written: a reap may come after a shard of the blob
+/// moved here (see `mover`), whose file it mustn't take. Under the file's
+/// lock, which a shard moving here holds from before its location moves until
+/// its file has the blob's name, so the check and the deletion can't straddle
+/// a move.
+pub(crate) async fn remove_unplaced(app: &App, blob_id: Uuid) -> anyhow::Result<()> {
+    let _file = app.writing.lock_file(blob_id).await;
+    if app.writing.contains(blob_id) {
+        return Ok(());
+    }
+    let placed = app
+        .pool
+        .get()
+        .await?
+        .query_opt_cached(
+            "SELECT 1 FROM blob_locations WHERE blob_id = $1 AND node = $2",
+            &[&blob_id, &app.node],
+        )
+        .await?
+        .is_some();
+    if !placed {
+        app.store.remove_blob(blob_id).await?;
+    }
+    Ok(())
+}
+
 /// Best-effort: once a set of blobs has been removed from the catalog, ask each
 /// holder to delete the file from disk *now*: locally if that's us, else via the
 /// peer's `DELETE /blobs/{id}`. The rows are already gone, so any deletion that
@@ -176,7 +203,7 @@ pub(crate) fn reap_blobs(app: &Arc<App>, targets: Vec<ReapTarget>) {
     tokio::spawn(async move {
         for (blob_id, node, peer_url) in targets {
             let result = if node == app.node {
-                app.store.remove_blob(blob_id).await
+                remove_unplaced(&app, blob_id).await
             } else {
                 delete_from_replica(&app.peers, &peer_url, blob_id).await
             };
@@ -676,7 +703,7 @@ pub(crate) async fn reconstruct(
 
 /// Reads [`offset`, `offset + len`) of the shard `location` holds (whole
 /// blocks), verified against its table.
-async fn fetch_range(
+pub(crate) async fn fetch_range(
     app: &App,
     location: &Location,
     file: &ShardFile,

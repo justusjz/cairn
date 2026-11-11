@@ -193,6 +193,7 @@ const MIGRATIONS: &[&str] = &[
     LOST_RANGES,
     LEGACY_BLOBS,
     SHARDS,
+    NODE_STATES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1009,6 +1010,18 @@ ALTER TABLE blobs
 CREATE INDEX blobs_replicated ON blobs (created_at)
     WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
       AND size > 67108864;
+"#;
+
+/// Migration 25: nodes can be removed (see `mover`). A node being removed
+/// gets no new shards, and its shards move to other nodes; once it holds none,
+/// it's removed. No new lock protocol: 4, which migration 24 introduced, is
+/// released together with this.
+const NODE_STATES: &str = r#"
+ALTER TABLE nodes ADD COLUMN state text NOT NULL DEFAULT 'active'
+    CHECK (state IN ('active', 'removing', 'removed'));
+-- When the state last changed: a removal only finishes once no upload that
+-- may have chosen the node before is still pending.
+ALTER TABLE nodes ADD COLUMN state_since timestamptz NOT NULL DEFAULT NOW();
 "#;
 
 #[cfg(test)]

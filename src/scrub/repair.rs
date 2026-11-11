@@ -153,7 +153,7 @@ async fn repair_once(
         app.store.install_repair(blob_id).await?;
         // Installed: it's the blob's file now, unless the blob is gone.
         if !location_exists(app, blob_id).await? {
-            app.store.remove_blob(blob_id).await?;
+            crate::blobs::remove_unplaced(app, blob_id).await?;
         }
         Ok(Outcome::Repaired)
     }
@@ -172,7 +172,7 @@ async fn repair_once(
 /// copy of all of them; the first whose copies give the catalog's CRC is
 /// taken, so a damaged copy in one file doesn't keep this one from being
 /// repaired. If none does, the first file's, which the caller finds wrong.
-async fn trailer(
+pub(crate) async fn trailer(
     app: &App,
     expected: &ShardFile,
     others: &[Location],

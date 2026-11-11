@@ -120,7 +120,8 @@
 --       parts in a later statement (`cairn_drop_unreferenced_blobs`).
 --     - Committing: lock exclusively, then check it's pending and count its
 --       locations. Locations are only removed together with their blob, or
---       (in the future) under X(x) exclusive.
+--       by a move (`cairn_move_shard`), which holds X(x) exclusive, and
+--       checks the blob is committed after taking it.
 --     - Deleting a pending blob (GC, and `blobs::abandon` for failed uploads
 --       and packing jobs): the GC locks the stale ones with SKIP LOCKED,
 --       re-checking that they're pending (F2), and so never touches one being
@@ -136,8 +137,12 @@
 --     a compare-and-swap on the part row. Its sources and new blobs are
 --     locked exclusively up front, so no one else changes those part rows
 --     while it does.
--- I8. `dead_size` and the packer's leases are heuristics: nothing depends on
---     them for correctness.
+-- I8. `dead_size` and the packer's leases (which the mover takes too) are
+--     heuristics: nothing depends on them for correctness.
+-- I9. A blob has at most one location per shard, and a node at most one
+--     shard of a blob: the unique indexes on blob_locations. A move checks
+--     both under X(x) exclusive, before it swaps the location; the only
+--     other inserts are a pending blob's sinks, each with a shard of its own.
 --
 -- DEADLOCKS
 --
@@ -175,7 +180,7 @@
 -- but nothing ever locks a node's row exclusively.) An insert whose FK checks
 -- would lock rows out of order (a grant's: the role, then the bucket) is a
 -- function that locks them in order first (`cairn_grant`). The GC
--- and the packer's claim use SKIP LOCKED, so they never wait at all. What
+-- and the packer's and the mover's claims use SKIP LOCKED, so they never wait at all. What
 -- remains is DDL (migrations), whose table locks a running cluster can
 -- deadlock with; the retry covers that.
 
@@ -1670,6 +1675,94 @@ BEGIN
     FROM pg_temp.cairn_drop_unreferenced_blobs(v_touched);
     UPDATE blobs SET pack_lease_until = NULL WHERE blob_id = ANY(p_sources);
     status := 'committed';
+END
+$$;
+
+-- T19: moves shard `p_shard` of a blob from node `p_from` to node `p_to`,
+-- which has stored it (see `mover`). Takes X(x) exclusive, then checks that
+-- the blob is committed ('gone' otherwise: deleted, say), that the file
+-- `p_to` stored is the shard the catalog describes (its CRC64/NVME is the
+-- shard's, 'mismatch' otherwise), that the shard is still on `p_from`
+-- ('gone' otherwise: another move took it), and that `p_to` holds no shard
+-- of the blob ('occupied'). Then swaps the location, resolves the old copy's
+-- open scrub findings ('moved'), and returns the old node's peer URL, to
+-- reap its file. Locations are only removed together with their blob, or
+-- here (I5).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_move_shard(
+    p_blob uuid, p_shard smallint, p_from int, p_to int, p_crc bigint,
+    OUT status text, OUT reap_peer text
+) LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_temp.cairn_lock_blobs(ARRAY[p_blob], ARRAY[true]);
+    PERFORM 1 FROM blobs WHERE blob_id = p_blob AND state = 'committed';
+    IF NOT FOUND THEN
+        status := 'gone';
+        RETURN;
+    END IF;
+    PERFORM 1 FROM blobs WHERE blob_id = p_blob AND shard_crcs[p_shard + 1] = p_crc;
+    IF NOT FOUND THEN
+        status := 'mismatch';
+        RETURN;
+    END IF;
+    PERFORM 1 FROM blob_locations WHERE blob_id = p_blob AND node = p_from AND shard = p_shard;
+    IF NOT FOUND THEN
+        status := 'gone';
+        RETURN;
+    END IF;
+    PERFORM 1 FROM blob_locations WHERE blob_id = p_blob AND node = p_to;
+    IF FOUND THEN
+        status := 'occupied';
+        RETURN;
+    END IF;
+    SELECT peer_url INTO reap_peer FROM nodes WHERE id = p_from;
+    DELETE FROM blob_locations WHERE blob_id = p_blob AND node = p_from AND shard = p_shard;
+    -- Checksummed on its way to the disk, and checked against the catalog:
+    -- the copy is known intact as of now.
+    INSERT INTO blob_locations (blob_id, node, shard, checked_at)
+    VALUES (p_blob, p_to, p_shard, NOW());
+    UPDATE scrub_findings SET outcome = 'gone', resolved_at = NOW()
+    WHERE blob_id = p_blob AND node = p_from AND resolved_at IS NULL;
+    status := 'moved';
+END
+$$;
+
+-- T20: claims up to `p_limit` blobs with shards to move (see `mover`): on
+-- nodes that aren't active (being removed), or on active nodes that have
+-- been down for more than `p_after_secs` (NULL: never), skipping those
+-- another transaction has locked (it never waits) or a job has leased; the
+-- blobs with the fewest live shards beyond their data shards first. Leases
+-- them, as the packer's claim does (I8).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_claim_moves(
+    p_after_secs float8, p_limit int, p_lease_secs float8
+) RETURNS uuid[] LANGUAGE plpgsql AS $$
+DECLARE
+    v_claimed uuid[] := '{}';
+    r record;
+BEGIN
+    FOR r IN
+        SELECT b.blob_id FROM blobs b
+        JOIN (
+            SELECT bl.blob_id,
+                   count(*) FILTER (WHERE n.last_seen > NOW() - INTERVAL '10 seconds') AS live
+            FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+            WHERE bl.blob_id IN (
+                SELECT m.blob_id FROM blob_locations m JOIN nodes mn ON mn.id = m.node
+                WHERE mn.state <> 'active'
+                   OR mn.last_seen < NOW() - make_interval(secs => p_after_secs)
+            )
+            GROUP BY bl.blob_id
+        ) AS s ON s.blob_id = b.blob_id
+        WHERE b.state = 'committed'
+          AND (b.pack_lease_until IS NULL OR b.pack_lease_until < NOW())
+        ORDER BY s.live - b.data_shards, b.blob_id
+        LIMIT p_limit
+        FOR UPDATE OF b SKIP LOCKED
+    LOOP
+        v_claimed := v_claimed || r.blob_id;
+    END LOOP;
+    UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => p_lease_secs)
+    WHERE blob_id = ANY(v_claimed);
+    RETURN v_claimed;
 END
 $$;
 

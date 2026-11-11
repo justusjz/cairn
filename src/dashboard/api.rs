@@ -109,6 +109,9 @@ pub(super) struct ClusterNode {
     free_space: i64,
     /// Seen within the last 10 seconds.
     live: bool,
+    /// `active`, `removing` (its shards are moving to other nodes, see
+    /// `mover`) or `removed`.
+    state: String,
     /// What the node reported, if it's live and answered.
     stats: Option<NodeStats>,
     /// Why a live node's stats are missing.
@@ -130,7 +133,7 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
     let rows = client
         .query_cached(
             "SELECT id, node_id, peer_url, extract(epoch FROM last_seen)::float8, free_space,
-                    last_seen > NOW() - INTERVAL '10 seconds'
+                    last_seen > NOW() - INTERVAL '10 seconds', state
              FROM nodes ORDER BY id",
             &[],
         )
@@ -145,6 +148,7 @@ pub(super) async fn cluster(app: &Arc<App>) -> anyhow::Result<Cluster> {
             last_seen: r.get(3),
             free_space: r.get(4),
             live: r.get(5),
+            state: r.get(6),
             stats: None,
             stats_error: None,
         })
@@ -290,6 +294,11 @@ struct Backlog {
     /// coding is on (see `packer::coding`).
     convert: i64,
     convert_bytes: i64,
+    /// Shards to move off nodes being removed, or down for longer than the
+    /// `repair-after` setting (see `mover`); and that setting, in minutes (0:
+    /// off).
+    moves: i64,
+    repair_after: i64,
     /// Entries of the garbage log the packer hasn't folded yet: one per blob
     /// that a statement deleted parts from.
     garbage_log: i64,
@@ -469,6 +478,16 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             &[],
         )
         .await?;
+    let repair_after = crate::settings::REPAIR_AFTER.get(&client).await?;
+    let after = (repair_after > 0).then_some(repair_after as f64 * 60.0);
+    let moves: i64 = client
+        .query_one_cached(
+            "SELECT count(*) FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+             WHERE n.state <> 'active' OR n.last_seen < NOW() - make_interval(secs => $1)",
+            &[&after],
+        )
+        .await?
+        .get(0);
     let m = client
         .query_one_cached(
             "SELECT (SELECT count(*) FROM multipart_uploads),
@@ -507,6 +526,8 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             compact_garbage_bytes: b.get(10),
             convert: b.get(11),
             convert_bytes: b.get(12),
+            moves,
+            repair_after,
             garbage_log: m.get(3),
             uploads: m.get(0),
             oldest_upload: m.get(1),

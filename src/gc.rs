@@ -230,10 +230,10 @@ async fn sweep_dir(app: &App, dir: u32, report: &mut Report) -> anyhow::Result<(
     if !files.is_empty() {
         delete_orphans(app, files, report).await?;
     }
-    for (blob_id, modified) in listing.repairs {
+    for (name, blob_id, modified) in listing.staged {
         if modified.elapsed().is_ok_and(|age| age > STALE_REPAIR) {
-            eprintln!("gc: deleting the repaired copy of blob {blob_id} a crash left");
-            app.store.remove_stale_repair(dir, blob_id).await?;
+            eprintln!("gc: deleting {name}, a repaired copy or moving shard of blob {blob_id} a crash left");
+            app.store.remove_stale(dir, &name).await?;
             report.files += 1;
         }
     }
@@ -254,10 +254,13 @@ async fn delete_orphans(app: &App, files: Vec<Uuid>, report: &mut Report) -> any
         .iter()
         .map(|r| r.get(0))
         .collect();
+    drop(client);
     for blob_id in files {
         if !held.contains(&blob_id) {
+            // Checked again, under the file's lock: a shard may have moved
+            // here since (see `mover`).
             eprintln!("gc: deleting orphaned file of blob {blob_id}");
-            app.store.remove_blob(blob_id).await?;
+            crate::blobs::remove_unplaced(app, blob_id).await?;
             report.files += 1;
         }
     }

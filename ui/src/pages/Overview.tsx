@@ -150,6 +150,9 @@ function View(props: { cluster: Cluster }) {
                       <Show when={n.id === props.cluster.this_node}>
                         <Badge tone="accent">this node</Badge>
                       </Show>
+                      <Show when={n.state !== "active"}>
+                        <Badge tone="warn">{n.state}</Badge>
+                      </Show>
                     </td>
                     <td class="mono">
                       {n.peer_url}

@@ -237,8 +237,8 @@ fn damaged(app: &App, blob_id: Uuid, e: std::io::Error) -> Failed {
 }
 
 /// Streams the body straight to disk (and announces the location), without
-/// buffering the whole blob in memory: our shard of the blob, `?shard=`
-/// (see `write_blob_streaming`). Answers with the CRC of the file we
+/// buffering the whole blob in memory: our shard of the blob, `?shard=`,
+/// moved here from node `?replaces=` if given (see `write_blob_streaming`). Answers with the CRC of the file we
 /// stored, so the writer can check that we got exactly the bytes it sent.
 async fn put_blob(
     State(app): State<Arc<App>>,
@@ -253,14 +253,20 @@ async fn put_blob(
     let Some(shard) = parse_shard(&query, blob_id) else {
         return Ok(StatusCode::BAD_REQUEST.into_response());
     };
-    let crc = crate::write_blob_streaming(&app, &shard, body).await?;
+    let replaces = match param(&query, "replaces").map(|v| v.parse::<i32>()) {
+        None => None,
+        Some(Ok(node)) => Some(node),
+        Some(Err(_)) => return Ok(StatusCode::BAD_REQUEST.into_response()),
+    };
+    let crc = crate::write_blob_streaming(&app, &shard, replaces, body).await?;
     let crc = HeaderValue::from_str(&format!("{crc:016x}"))?;
     Ok(([(CRC64_HEADER, crc)], ()).into_response())
 }
 
 /// Best-effort happy-path reap: the coordinator dropped this blob's catalog
-/// rows and is asking us to delete the file now (idempotent; a missing file is
-/// fine). The GC is the backstop if this is missed.
+/// rows (or moved our shard of it elsewhere) and is asking us to delete the
+/// file now (idempotent; a missing file is fine), unless a shard of the blob
+/// has moved here since. The GC is the backstop if this is missed.
 async fn delete_blob(
     State(app): State<Arc<App>>,
     Path(blob_id): Path<String>,
@@ -268,7 +274,7 @@ async fn delete_blob(
     let Ok(blob_id) = Uuid::parse_str(&blob_id) else {
         return Ok(StatusCode::BAD_REQUEST.into_response());
     };
-    app.store.remove_blob(blob_id).await?;
+    crate::blobs::remove_unplaced(&app, blob_id).await?;
     Ok(StatusCode::OK.into_response())
 }
 

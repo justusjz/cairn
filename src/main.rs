@@ -40,6 +40,8 @@ mod gc;
 mod kms;
 mod lifecycle;
 mod metrics;
+mod mover;
+mod nodes;
 mod packer;
 mod payload;
 mod roles;
@@ -97,6 +99,8 @@ enum Command {
     Role(roles::RoleArgs),
     /// Show or change the cluster's settings.
     Config(settings::ConfigArgs),
+    /// List the cluster's nodes, or remove one.
+    Node(nodes::NodeArgs),
 }
 
 // Every flag can also be set through the environment variable named in its
@@ -151,6 +155,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => serve_main(args).await,
         Command::Role(args) => roles::role_main(args).await,
         Command::Config(args) => settings::config_main(args).await,
+        Command::Node(args) => nodes::node_main(args).await,
     }
 }
 
@@ -195,6 +200,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(maintain(app.clone()));
     tokio::spawn(apply_lifecycles(app.clone()));
     tokio::spawn(scrub::run(app.clone()));
+    tokio::spawn(mover::run(app.clone()));
     // The roles' identities in the KMS, now rather than in a minute.
     let identifying = app.clone();
     tokio::spawn(async move {
@@ -455,11 +461,14 @@ async fn serve_peer(
 }
 
 /// Chooses `count` live nodes for the shards of a new blob, those with the
-/// most free space first: the node for shard i is the i-th.
+/// most free space first: the node for shard i is the i-th. Nodes being
+/// removed get none (see `mover`).
 async fn choose_nodes(client: &Object, count: usize) -> anyhow::Result<Vec<Location>> {
     let nodes = client
         .query_cached(
-            "SELECT id, peer_url FROM nodes WHERE last_seen > NOW() - INTERVAL '10 seconds' ORDER BY free_space DESC",
+            "SELECT id, peer_url FROM nodes
+             WHERE state = 'active' AND last_seen > NOW() - INTERVAL '10 seconds'
+             ORDER BY free_space DESC",
             &[],
         )
         .await?;
@@ -508,27 +517,34 @@ impl ShardWrite {
         }
     }
 
-    /// The query of the PUT that asks a peer for it (see `peer::parse_shard`).
-    fn query(&self) -> String {
-        match self {
+    /// The query of the PUT that asks a peer for it, moving it from node
+    /// `replaces` if given (see `peer::parse_shard`).
+    fn query(&self, replaces: Option<i32>) -> String {
+        let mut query = match self {
             ShardWrite::Replica { shard, .. } => format!("?shard={shard}"),
             // A coded shard's layout names the shard too.
             ShardWrite::Coded(file) => format!("?{}", &peer::layout_query(file)[1..]),
+        };
+        if let Some(node) = replaces {
+            query.push_str(&format!("&replaces={node}"));
         }
+        query
     }
 }
 
-/// Streams a shard (one side of the writer's fan-out) to the node at
-/// `peer_url`, returning the CRC64/NVME it reports for the file it stored.
-async fn upload_to_peer(
+/// Streams a shard (one side of the writer's fan-out, or a move from node
+/// `replaces`) to the node at `peer_url`, returning the CRC64/NVME it
+/// reports for the file it stored.
+pub(crate) async fn upload_to_peer(
     peers: &peer::PeerClient,
     peer_url: &str,
     write: &ShardWrite,
+    replaces: Option<i32>,
     body: body::ResBody,
 ) -> anyhow::Result<u64> {
     let req = Request::builder()
         .method(Method::PUT)
-        .uri(format!("{peer_url}/blobs/{}{}", write.blob_id(), write.query()))
+        .uri(format!("{peer_url}/blobs/{}{}", write.blob_id(), write.query(replaces)))
         .body(body)?;
     let res = peers.request(req).await?;
     if res.status() != StatusCode::OK {
@@ -547,7 +563,16 @@ async fn upload_to_peer(
 /// the shard. Returns the CRC64/NVME of the whole file written. Shared by
 /// the peer PUT endpoint (an `Incoming`) and the local sink of `BlobWriter`
 /// (a channel-backed body) — hence the generic body.
-async fn write_blob_streaming<B>(app: &App, write: &ShardWrite, body: B) -> anyhow::Result<u64>
+///
+/// With `replaces`, the shard of a committed blob moves here from that node
+/// (see `mover`): the location moves, if the file is the one the catalog
+/// describes, and the shard is still there.
+async fn write_blob_streaming<B>(
+    app: &App,
+    write: &ShardWrite,
+    replaces: Option<i32>,
+    body: B,
+) -> anyhow::Result<u64>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
@@ -557,18 +582,66 @@ where
     // GC's file sweep won't treat this in-flight file (no location yet) as an
     // orphan. The guard drops after the location insert below.
     let _writing = app.writing.begin(blob_id);
-    match write_and_announce(app, write, body).await {
+    // A shard moving here is written to a file of its own, and only becomes
+    // the blob's file once its location has moved: the node may hold another
+    // shard of the blob already, whose file mustn't be touched.
+    let staged = replaces.map(|_| app.store.move_path(blob_id));
+    match write_and_announce(app, write, replaces, staged.as_deref(), body).await {
         Ok(crc) => Ok(crc),
         Err(failure) => {
             // Delete the file right away, unless its location may have been
             // recorded after all: then a commit may count on it, and it's left
             // to the GC to judge. That's only after a lost connection: an
             // error Postgres reports means the insert was rolled back.
-            if !failure.maybe_announced {
-                let _ = app.store.remove_blob(blob_id).await;
+            match &staged {
+                None if !failure.maybe_announced => {
+                    let _ = app.store.remove_blob(blob_id).await;
+                }
+                None => {}
+                Some(path) => settle_move(app, write, path, failure.maybe_announced).await,
             }
             Err(failure.error)
         }
+    }
+}
+
+/// Settles a shard that failed to move here, staged at `path`: it's deleted,
+/// unless the move may have committed after all (a lost connection). Then
+/// the catalog is asked: if the shard's location is here, the file becomes
+/// the blob's; if the catalog can't be asked, it's left to the GC, and a
+/// location without its file is the scrubber's to repair.
+async fn settle_move(app: &App, write: &ShardWrite, path: &std::path::Path, maybe_moved: bool) {
+    let blob_id = write.blob_id();
+    let _file = app.writing.lock_file(blob_id).await;
+    let moved = if maybe_moved {
+        let shard = write.shard() as i16;
+        let query = async {
+            let client = app.pool.get().await?;
+            let row = client
+                .query_opt_cached(
+                    "SELECT 1 FROM blob_locations WHERE blob_id = $1 AND node = $2 AND shard = $3",
+                    &[&blob_id, &app.node, &shard],
+                )
+                .await?;
+            anyhow::Ok(row.is_some())
+        };
+        match query.await {
+            Ok(moved) => moved,
+            Err(e) => {
+                eprintln!("blob {blob_id}: can't tell whether a shard moved here, leaving it to the GC: {e:#}");
+                return;
+            }
+        }
+    } else {
+        false
+    };
+    let settled = if moved {
+        app.store.install_move(path, blob_id).await
+    } else {
+        app.store.remove_at(path).await
+    };
+    if let Err(e) = settled {
+        eprintln!("blob {blob_id}: settling a shard that moved here failed: {e:#}");
     }
 }
 
@@ -589,13 +662,22 @@ impl<E: Into<anyhow::Error>> From<E> for WriteFailure {
 }
 
 /// The body of `write_blob_streaming`.
-async fn write_and_announce<B>(app: &App, write: &ShardWrite, mut body: B) -> Result<u64, WriteFailure>
+async fn write_and_announce<B>(
+    app: &App,
+    write: &ShardWrite,
+    replaces: Option<i32>,
+    staged: Option<&std::path::Path>,
+    mut body: B,
+) -> Result<u64, WriteFailure>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     let blob_id = write.blob_id();
-    let mut file = app.store.create_blob(blob_id).await?;
+    let mut file = match staged {
+        Some(path) => app.store.create_at(path).await?,
+        None => app.store.create_blob(blob_id).await?,
+    };
     // The checksums are computed from the bytes as received, before they hit
     // the disk, so the table catches anything that goes wrong on the way down.
     let mut summer = BlobSummer::new(checksum::BLOCK_SIZE);
@@ -651,26 +733,65 @@ where
     file.sync_all().await?;
     let client = app.pool.get().await?;
     let shard = write.shard() as i16;
-    // The blob may be gone (its upload given up): then this fails its FK check.
-    if let Err(e) = client
-        .execute_cached(
-            // The bytes were checksummed on their way to the disk, and the
-            // writer compares the CRC: the copy is known intact as of now.
-            // A repeated insert is fine; another node's location for the
-            // same shard isn't (`blob_locations_shard`), and fails the write.
-            "INSERT INTO blob_locations (blob_id, node, shard, checked_at) VALUES ($1, $2, $3, NOW())
-             ON CONFLICT (blob_id, node) DO NOTHING",
-            &[&blob_id, &app.node, &shard],
-        )
-        .await
-    {
-        let maybe_announced = e.code().is_none();
-        return Err(WriteFailure {
-            error: e.into(),
-            maybe_announced,
-        });
+    let crc = file_crc.sum64();
+    let mut file_lock = None;
+    let announced = match replaces {
+        // The blob may be gone (its upload given up): then this fails its FK
+        // check.
+        None => client
+            .execute_cached(
+                // The bytes were checksummed on their way to the disk, and the
+                // writer compares the CRC: the copy is known intact as of now.
+                // A repeated insert is fine; another node's location for the
+                // same shard isn't (`blob_locations_shard`), and fails the
+                // write.
+                "INSERT INTO blob_locations (blob_id, node, shard, checked_at) VALUES ($1, $2, $3, NOW())
+                 ON CONFLICT (blob_id, node) DO NOTHING",
+                &[&blob_id, &app.node, &shard],
+            )
+            .await
+            .map(|_| None),
+        Some(from) => {
+            // Held until the file has the blob's name (see `remove_unplaced`).
+            file_lock = Some(app.writing.lock_file(blob_id).await);
+            client
+                .query_one_cached(
+                    "SELECT status FROM pg_temp.cairn_move_shard($1, $2, $3, $4, $5)",
+                    &[&blob_id, &shard, &from, &app.node, &(crc as i64)],
+                )
+                .await
+                .map(|row| Some(row.get::<_, String>(0)))
+        }
+    };
+    match announced {
+        Ok(None) => {}
+        Ok(Some(status)) if status == "moved" => {
+            // Its location is here now: it's the blob's file. Failing that,
+            // the location has no file, which reads fail over from, and the
+            // scrubber repairs.
+            if let Some(path) = staged
+                && let Err(e) = app.store.install_move(path, blob_id).await
+            {
+                eprintln!("CORRUPTION: blob {blob_id}: shard {shard} moved here, but its file couldn't be installed: {e:#}");
+                let _ = app.store.remove_at(path).await;
+                crate::scrub::suspect(app, blob_id, app.node);
+                return Err(e.into());
+            }
+            drop(file_lock);
+        }
+        // Nothing changed: the file is of no use.
+        Ok(Some(status)) => {
+            return Err(anyhow::anyhow!("blob {blob_id}: shard {shard} wasn't moved here: {status}").into());
+        }
+        Err(e) => {
+            let maybe_announced = e.code().is_none();
+            return Err(WriteFailure {
+                error: e.into(),
+                maybe_announced,
+            });
+        }
     }
-    Ok(file_crc.sum64())
+    Ok(crc)
 }
 
 /// How a `BlobWriter` turns the blob's bytes into its shards.
@@ -818,12 +939,12 @@ impl BlobWriter {
             let shard = location.shard;
             if location.node == app.node {
                 let app = app.clone();
-                sinks.spawn(async move { Ok((shard, write_blob_streaming(&app, &write, body).await?)) });
+                sinks.spawn(async move { Ok((shard, write_blob_streaming(&app, &write, None, body).await?)) });
             } else {
                 let peers = app.peers.clone();
                 sinks.spawn(async move {
                     let peer_url = location.peer_url;
-                    match upload_to_peer(&peers, &peer_url, &write, body).await {
+                    match upload_to_peer(&peers, &peer_url, &write, None, body).await {
                         Ok(crc) => Ok((shard, crc)),
                         Err(e) => Err(Unavailable(format!("node {peer_url}: {e:#}")).into()),
                     }

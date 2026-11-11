@@ -10,14 +10,20 @@ pub const DIRS: u32 = 1 << 16;
 /// What a blob's repaired copy is named, after its blob ID, until it
 /// replaces the blob's file.
 const REPAIR_SUFFIX: &str = ".repair";
+/// What a shard moving here is named, after its blob ID and before a random
+/// part (every move has a file of its own), until its location has moved and
+/// it becomes the blob's file (see `mover`).
+const MOVE_INFIX: &str = ".move.";
 
 /// What's in a blob directory.
 #[derive(Default)]
 pub struct Dir {
     /// The blobs with a file there.
     pub blobs: Vec<Uuid>,
-    /// The blobs with a repaired copy there, and when it was last written.
-    pub repairs: Vec<(Uuid, std::time::SystemTime)>,
+    /// The files on their way to becoming a blob's: repaired copies, and
+    /// shards moving here. Their names, their blobs, and when they were last
+    /// written.
+    pub staged: Vec<(String, Uuid, std::time::SystemTime)>,
 }
 
 pub struct Store {
@@ -172,10 +178,45 @@ impl Store {
         }
     }
 
-    /// Deletes a repaired copy that a crash left behind, which `list_dir`
-    /// found. Idempotent.
-    pub async fn remove_stale_repair(&self, dir: u32, blob_id: Uuid) -> anyhow::Result<()> {
-        let path = self.dir_path(dir).join(format!("{blob_id}{REPAIR_SUFFIX}"));
+    /// Where a shard moving here is written: next to the blob's file, under a
+    /// name of its own, so that it never touches a file the node already has
+    /// of the blob, which may be another shard's.
+    pub fn move_path(&self, blob_id: Uuid) -> PathBuf {
+        self.get_blob_dir(blob_id)
+            .join(format!("{blob_id}{MOVE_INFIX}{}", Uuid::new_v4().simple()))
+    }
+
+    /// Creates (truncating) the file at `path` (a `move_path`), making its
+    /// directory if needed.
+    pub async fn create_at(&self, path: &std::path::Path) -> anyhow::Result<fs::File> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).await?;
+        }
+        Ok(fs::File::create(path).await?)
+    }
+
+    /// Makes the shard that moved here, at `path` (synced already), the
+    /// blob's file, and syncs the directory, as `install_repair` does.
+    pub async fn install_move(&self, path: &std::path::Path, blob_id: Uuid) -> anyhow::Result<()> {
+        let dir = self.get_blob_dir(blob_id);
+        fs::rename(path, dir.join(blob_id.to_string())).await?;
+        fs::File::open(&dir).await?.sync_all().await?;
+        Ok(())
+    }
+
+    /// Deletes a file at `path` that won't become a blob's. Idempotent.
+    pub async fn remove_at(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        match fs::remove_file(path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Deletes a staged file (a repaired copy, or a moving shard) that a crash
+    /// left behind, which `list_dir` found, by its name. Idempotent.
+    pub async fn remove_stale(&self, dir: u32, name: &str) -> anyhow::Result<()> {
+        let path = self.dir_path(dir).join(name);
         match fs::remove_file(path).await {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -191,7 +232,7 @@ impl Store {
             .join(format!("{:02x}", dir & 0xff))
     }
 
-    /// The files in directory `dir`: blobs', and repaired copies.
+    /// The files in directory `dir`: blobs', and staged ones.
     pub async fn list_dir(&self, dir: u32) -> anyhow::Result<Dir> {
         let mut listing = Dir::default();
         let mut files = match fs::read_dir(self.dir_path(dir)).await {
@@ -203,12 +244,14 @@ impl Store {
             let Some(name) = f.file_name().to_str().map(str::to_owned) else { continue };
             if let Ok(id) = Uuid::parse_str(&name) {
                 listing.blobs.push(id);
-            } else if let Some(id) = name.strip_suffix(REPAIR_SUFFIX)
+            } else if let Some(id) = name
+                .strip_suffix(REPAIR_SUFFIX)
+                .or_else(|| name.split_once(MOVE_INFIX).map(|(id, _)| id))
                 && let Ok(id) = Uuid::parse_str(id)
             {
                 // Gone meanwhile (its repair finished, say): then it's no leftover.
                 if let Ok(modified) = f.metadata().await.and_then(|m| m.modified()) {
-                    listing.repairs.push((id, modified));
+                    listing.staged.push((name.clone(), id, modified));
                 }
             }
         }

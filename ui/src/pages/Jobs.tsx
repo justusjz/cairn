@@ -61,6 +61,16 @@ function View(props: { cluster: Cluster; storage: Storage }) {
           }
           tone={pk().data_shards > 1 && !pk().coding ? "warn" : ""}
         />
+        <Card
+          label="To move"
+          value={num(bl().moves)}
+          note={
+            bl().repair_after > 0
+              ? `shards on nodes being removed, or down for over ${bl().repair_after} min`
+              : "shards on nodes being removed; a node that's down waits for cairn node remove"
+          }
+          tone={bl().moves ? "warn" : ""}
+        />
         <Card label="Garbage log" value={num(bl().garbage_log)} note="deleted parts, folded on the next packer pass" />
         <Card
           label="Pending blobs"

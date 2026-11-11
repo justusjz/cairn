@@ -160,6 +160,38 @@ still work, since they live in Postgres).
 Data that has gone cold can be stored with less overhead than full copies,
 with the same tolerance for lost nodes: see [Erasure coding](#erasure-coding).
 
+### Removing nodes, and repair
+
+Every blob is stored as shards, each on a node of its own (a copy of the
+blob, or a piece of it if it's [erasure-coded](#erasure-coding)). To take a
+node out of the cluster, remove it:
+
+```sh
+cairn node --database "$DB" list          # nodes, their state, the shards they hold
+cairn node --database "$DB" remove 3
+```
+
+A node that's being removed gets no new data, and every node moves its shards
+to other nodes in the background: copied from it while it's up, so redundancy
+never drops, or rebuilt from the other shards if it's down, which is how a
+node that's gone for good is replaced. The blobs with the least redundancy
+left go first. A shard moves only to a node that holds no other shard of its
+blob, so with no such node to spare, it waits. Once the node holds nothing,
+its state is `removed`, and it can be shut down. `cairn node keep 3` stops a
+removal; whatever has moved stays moved.
+
+A node that's merely down keeps its shards: reads get them from the others
+meanwhile, and nothing moves, since rebuilding moves a lot of data, and a
+node back from a reboot needs none of it. To have a node's shards rebuilt
+once it has been down for long enough, without removing it, set:
+
+```sh
+cairn config --database "$DB" set repair-after 60   # minutes; 0, the default, is off
+```
+
+The dashboard's Overview shows each node's state, and its Jobs page how many
+shards are waiting to move.
+
 ## Roles and permissions
 
 A **role** is a set of S3 credentials: its name is the access key ID, and it has

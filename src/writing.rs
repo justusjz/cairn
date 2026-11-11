@@ -1,5 +1,5 @@
-use std::collections::HashSet;
-use std::sync::Mutex;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
 use uuid::Uuid;
 
@@ -12,6 +12,8 @@ use uuid::Uuid;
 #[derive(Default)]
 pub struct WritingSet {
     ids: Mutex<HashSet<Uuid>>,
+    /// The blobs whose files are locked (see `lock_file`).
+    files: Mutex<HashMap<Uuid, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl WritingSet {
@@ -35,5 +37,39 @@ pub struct WritingGuard<'a> {
 impl Drop for WritingGuard<'_> {
     fn drop(&mut self) {
         self.set.ids.lock().unwrap().remove(&self.blob_id);
+    }
+}
+
+/// A lock on what a blob's file on this node is (see `WritingSet::lock_file`).
+pub struct FileLock<'a> {
+    set: &'a WritingSet,
+    blob_id: Uuid,
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl WritingSet {
+    /// Locks what blob `blob_id`'s file on this node is. A shard moving here
+    /// holds it while its location moves and its file takes the blob's name
+    /// (see `mover`); a deletion of the file for having no location holds it
+    /// while it checks that, and deletes. So a deletion that found no location
+    /// can't take a file whose location was recorded meanwhile.
+    pub async fn lock_file(&self, blob_id: Uuid) -> FileLock<'_> {
+        let lock = self.files.lock().unwrap().entry(blob_id).or_default().clone();
+        FileLock {
+            set: self,
+            blob_id,
+            guard: Some(lock.lock_owned().await),
+        }
+    }
+}
+
+impl Drop for FileLock<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let mut files = self.set.files.lock().unwrap();
+        // Forget the lock once nobody holds or waits for it.
+        if files.get(&self.blob_id).is_some_and(|lock| Arc::strong_count(lock) == 1) {
+            files.remove(&self.blob_id);
+        }
     }
 }

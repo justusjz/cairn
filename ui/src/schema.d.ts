@@ -344,6 +344,13 @@ export interface components {
              *     that a statement deleted parts from.
              */
             garbage_log: number;
+            /**
+             * Format: int64
+             * @description Shards to move off nodes being removed, or down for longer than the
+             *     `repair-after` setting (see `mover`); and that setting, in minutes (0:
+             *     off).
+             */
+            moves: number;
             /** Format: double */
             oldest_upload?: number | null;
             /**
@@ -353,6 +360,8 @@ export interface components {
             packing: number;
             /** Format: int64 */
             packing_bytes: number;
+            /** Format: int64 */
+            repair_after: number;
             /** Format: int64 */
             upload_bytes: number;
             /** Format: int64 */
@@ -434,6 +443,11 @@ export interface components {
             live: boolean;
             node_id: string;
             peer_url: string;
+            /**
+             * @description `active`, `removing` (its shards are moving to other nodes, see
+             *     `mover`) or `removed`.
+             */
+            state: string;
             stats?: components["schemas"]["NodeStats"] | null;
             /** @description Why a live node's stats are missing. */
             stats_error?: string | null;

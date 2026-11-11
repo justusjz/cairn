@@ -44,8 +44,22 @@ pub const DATA_SHARDS: Setting = Setting {
            parity shards (1 keeps replicas only)",
 };
 
+/// How many minutes a node may be down before its shards are rebuilt on
+/// other nodes (see `mover`); 0, the default, waits for an operator to
+/// remove it (`cairn node remove`). Rebuilding moves a lot of data, and a
+/// node that's back after a reboot needs none of it, so it's the operator's
+/// to turn on.
+pub const REPAIR_AFTER: Setting = Setting {
+    name: "repair-after",
+    default: 0,
+    min: 0,
+    max: i64::MAX,
+    help: "minutes a node may be down before its shards are rebuilt elsewhere \
+           (0: only once it's removed with cairn node remove)",
+};
+
 /// Every setting.
-pub const ALL: &[&Setting] = &[&LIFECYCLE_RATE, &DATA_SHARDS];
+pub const ALL: &[&Setting] = &[&LIFECYCLE_RATE, &DATA_SHARDS, &REPAIR_AFTER];
 
 /// The setting named `name`, if there's one.
 pub fn named(name: &str) -> Option<&'static Setting> {

@@ -545,7 +545,7 @@ async fn the_packer_leaves_lost_data_alone() {
 /// Makes an object's blob one from before checksums, as an old version of
 /// Cairn wrote it: its files bare data, and no checksums in the catalog but
 /// its parts' MD5s (their ETags).
-async fn make_legacy(nodes: &[Arc<App>], key: &str) -> Uuid {
+pub(crate) async fn make_legacy(nodes: &[Arc<App>], key: &str) -> Uuid {
     let app = &nodes[0];
     let blob_id = blob_of(app, key).await;
     let client = app.pool.get().await.unwrap();

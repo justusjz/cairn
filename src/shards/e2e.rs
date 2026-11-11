@@ -23,7 +23,7 @@ const MIB: usize = 1024 * 1024;
 
 /// Packs into blobs of 8 MiB, and codes blobs over 1 MiB as soon as they're
 /// written.
-fn pack() -> Config {
+pub(crate) fn pack() -> Config {
     Config {
         target_size: 8 * MIB as u64,
         small_size: MIB as u64,
@@ -35,20 +35,20 @@ fn pack() -> Config {
 /// A cluster of `n` nodes writing blobs with `replication_factor` replicas,
 /// and so `replication_factor` − 1 parity shards, that codes cold data into
 /// `data_shards` data shards. `None` if there's no database to test against.
-async fn coding(n: usize, replication_factor: usize, data_shards: i64, hook: Option<Hook>) -> Option<Cluster> {
+pub(crate) async fn coding(n: usize, replication_factor: usize, data_shards: i64, hook: Option<Hook>) -> Option<Cluster> {
     let cluster = cluster_with(n, replication_factor, pack(), hook).await?;
     set_data_shards(&cluster.nodes[0], data_shards).await;
     Some(cluster)
 }
 
-async fn set_data_shards(app: &App, data_shards: i64) {
+pub(crate) async fn set_data_shards(app: &App, data_shards: i64) {
     let client = app.pool.get().await.unwrap();
     crate::settings::DATA_SHARDS.set(&client, data_shards).await.unwrap();
 }
 
 /// Bytes that don't repeat at the scale of a stripe unit, so that a cell put
 /// in the wrong place shows.
-fn data(seed: u64, len: usize) -> Vec<u8> {
+pub(crate) fn data(seed: u64, len: usize) -> Vec<u8> {
     let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
     (0..len)
         .map(|_| {
@@ -61,7 +61,7 @@ fn data(seed: u64, len: usize) -> Vec<u8> {
 }
 
 /// The blob holding an object's data.
-async fn blob_of(app: &App, key: &str) -> Uuid {
+pub(crate) async fn blob_of(app: &App, key: &str) -> Uuid {
     let client = app.pool.get().await.unwrap();
     client
         .query_one(
@@ -75,7 +75,7 @@ async fn blob_of(app: &App, key: &str) -> Uuid {
 }
 
 /// A blob's layout, and which of the cluster's nodes holds each shard.
-async fn shards_of(cluster: &Cluster, blob_id: Uuid) -> (Layout, Vec<usize>) {
+pub(crate) async fn shards_of(cluster: &Cluster, blob_id: Uuid) -> (Layout, Vec<usize>) {
     let client = cluster.nodes[0].pool.get().await.unwrap();
     let row = client
         .query_one(&format!("SELECT {LAYOUT_COLUMNS} FROM blobs b WHERE b.blob_id = $1"), &[&blob_id])
@@ -98,7 +98,7 @@ async fn shards_of(cluster: &Cluster, blob_id: Uuid) -> (Layout, Vec<usize>) {
 }
 
 /// Checks every shard's file of a blob against the catalog's CRC of it.
-async fn assert_intact(cluster: &Cluster, blob_id: Uuid) {
+pub(crate) async fn assert_intact(cluster: &Cluster, blob_id: Uuid) {
     let (layout, holders) = shards_of(cluster, blob_id).await;
     let client = cluster.nodes[0].pool.get().await.unwrap();
     let crcs: Vec<i64> = client
@@ -121,7 +121,7 @@ async fn assert_intact(cluster: &Cluster, blob_id: Uuid) {
 
 /// Reads (the `range` of) an object: its status, and its body if it came
 /// whole.
-async fn read(app: &Arc<App>, key: &str, range: Option<&str>) -> (StatusCode, Option<Vec<u8>>) {
+pub(crate) async fn read(app: &Arc<App>, key: &str, range: Option<&str>) -> (StatusCode, Option<Vec<u8>>) {
     let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
@@ -131,7 +131,7 @@ async fn read(app: &Arc<App>, key: &str, range: Option<&str>) -> (StatusCode, Op
 }
 
 /// Reads an object whole, and in ranges that cross cells, rows and the end.
-async fn assert_reads(app: &Arc<App>, key: &str, body: &[u8]) {
+pub(crate) async fn assert_reads(app: &Arc<App>, key: &str, body: &[u8]) {
     assert_eq!(get(app, key).await.unwrap(), body, "{key}");
     let last = body.len() - 1;
     for (from, to) in [(0, 10), (MIB - 5, MIB + 5), (3 * MIB - 1, 4 * MIB + 2), (last - 3, last)] {
@@ -142,7 +142,7 @@ async fn assert_reads(app: &Arc<App>, key: &str, body: &[u8]) {
 }
 
 /// Flips a bit of the file a node holds of a blob.
-fn flip(app: &App, blob_id: Uuid, at: usize) {
+pub(crate) fn flip(app: &App, blob_id: Uuid, at: usize) {
     let path = app.store.blob_path(blob_id);
     let mut bytes = std::fs::read(&path).unwrap();
     bytes[at] ^= 1;
@@ -184,8 +184,13 @@ async fn wait_flagged(app: &App, blob_id: Uuid) {
 /// A cluster of 4 nodes coding 3+1, with one object of a little over 5 MiB
 /// coded: six rows of 3 MiB, the last one short. The object's data, and its
 /// blob.
-async fn coded_object(hook: Option<Hook>) -> Option<(Cluster, Vec<u8>, Uuid)> {
-    let cluster = coding(4, 2, 3, hook).await?;
+pub(crate) async fn coded_object(hook: Option<Hook>) -> Option<(Cluster, Vec<u8>, Uuid)> {
+    coded_object_on(4, hook).await
+}
+
+/// Like `coded_object`, on a cluster of `n` nodes.
+pub(crate) async fn coded_object_on(n: usize, hook: Option<Hook>) -> Option<(Cluster, Vec<u8>, Uuid)> {
+    let cluster = coding(n, 2, 3, hook).await?;
     let a = &cluster.nodes[0];
     let body = data(1, 5 * MIB + 12345);
     put(a, "k", body.clone()).await;
@@ -479,7 +484,7 @@ async fn a_shard_has_one_location() {
     let other = &cluster.nodes[1 - holders[0]];
     let write = crate::ShardWrite::Replica { blob_id, shard: 0 };
     let body = http_body_util::Full::new(hyper::body::Bytes::from(vec![1; 10]));
-    assert!(crate::write_blob_streaming(other, &write, body).await.is_err());
+    assert!(crate::write_blob_streaming(other, &write, None, body).await.is_err());
     assert!(other.store.open_blob(blob_id).await.unwrap().is_none(), "its file is gone");
     let locations = format!("SELECT count(*) FROM blob_locations WHERE blob_id = '{blob_id}'");
     assert_eq!(query_i64(a, &locations).await, 1);

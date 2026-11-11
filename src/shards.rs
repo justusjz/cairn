@@ -225,7 +225,7 @@ fn pad(cell: &[u8], su: usize) -> std::borrow::Cow<'_, [u8]> {
 }
 
 #[cfg(test)]
-mod e2e;
+pub(crate) mod e2e;
 
 #[cfg(test)]
 mod tests {

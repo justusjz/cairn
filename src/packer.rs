@@ -295,6 +295,14 @@ pub(crate) async fn upgrade(app: &Arc<App>, budget: u64) -> anyhow::Result<Vec<J
     Ok(reports)
 }
 
+/// Upgrades blob `blob_id` from before checksums, which the caller has
+/// leased: for the mover, which can't move its shards as they are (see
+/// `mover`), since their bytes can't be verified as they're copied. Its new
+/// blob goes to active nodes, as every new blob does.
+pub(crate) async fn upgrade_blob(app: &Arc<App>, blob_id: Uuid) -> anyhow::Result<JobReport> {
+    run_upgrade(app, &[blob_id], coding(app).await?).await
+}
+
 /// Upgrades a blob from before checksums. Its bytes can't be verified as
 /// they're read, only once they're copied, by its parts' MD5s (their ETags).
 /// So its replicas are tried one at a time, each as the only source, until
@@ -382,7 +390,8 @@ pub(crate) async fn coding(app: &App) -> anyhow::Result<Option<u32>> {
     // Live as `choose_nodes` counts them.
     let live: i64 = client
         .query_one_cached(
-            "SELECT count(*) FROM nodes WHERE last_seen > NOW() - INTERVAL '10 seconds'",
+            "SELECT count(*) FROM nodes
+             WHERE state = 'active' AND last_seen > NOW() - INTERVAL '10 seconds'",
             &[],
         )
         .await?

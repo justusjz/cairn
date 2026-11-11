@@ -941,6 +941,8 @@
           "compact_garbage_bytes",
           "convert",
           "convert_bytes",
+          "moves",
+          "repair_after",
           "garbage_log",
           "uploads",
           "upload_bytes"
@@ -978,6 +980,11 @@
             "format": "int64",
             "description": "Entries of the garbage log the packer hasn't folded yet: one per blob\nthat a statement deleted parts from."
           },
+          "moves": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Shards to move off nodes being removed, or down for longer than the\n`repair-after` setting (see `mover`); and that setting, in minutes (0:\noff)."
+          },
           "oldest_upload": {
             "type": [
               "number",
@@ -991,6 +998,10 @@
             "description": "Blobs leased by packing jobs, right now."
           },
           "packing_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "repair_after": {
             "type": "integer",
             "format": "int64"
           },
@@ -1153,7 +1164,8 @@
           "peer_url",
           "last_seen",
           "free_space",
-          "live"
+          "live",
+          "state"
         ],
         "properties": {
           "free_space": {
@@ -1178,6 +1190,10 @@
           },
           "peer_url": {
             "type": "string"
+          },
+          "state": {
+            "type": "string",
+            "description": "`active`, `removing` (its shards are moving to other nodes, see\n`mover`) or `removed`."
           },
           "stats": {
             "oneOf": [

@@ -851,10 +851,10 @@ pub fn suspect(app: &App, blob_id: Uuid, node: i32) {
     });
 }
 
-mod repair;
+pub(crate) mod repair;
 
 #[cfg(test)]
-mod e2e;
+pub(crate) mod e2e;
 
 #[cfg(test)]
 mod tests {
