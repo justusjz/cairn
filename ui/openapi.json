@@ -1059,6 +1059,26 @@
   },
   "components": {
     "schemas": {
+      "AccessKey": {
+        "type": "object",
+        "required": [
+          "id",
+          "active",
+          "created_at"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean"
+          },
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "id": {
+            "type": "string"
+          }
+        }
+      },
       "AdminFlag": {
         "type": "object",
         "required": [
@@ -3006,7 +3026,9 @@
           "id",
           "admin",
           "created_at",
-          "grants"
+          "grants",
+          "keys",
+          "policies"
         ],
         "properties": {
           "admin": {
@@ -3026,6 +3048,13 @@
             "type": "string",
             "description": "Its ID, which never changes or comes back: its name (alias) in the\nKMS's auth mount for Cairn."
           },
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessKey"
+            },
+            "description": "Its access keys, oldest first (never their secrets)."
+          },
           "kms_entity_id": {
             "type": [
               "string",
@@ -3035,6 +3064,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "policies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The names of its inline policies."
           }
         }
       },

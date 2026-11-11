@@ -247,6 +247,28 @@ async fn cors_waits_only_for_bucket_changes() {
     assert!(!missing);
 }
 
+/// I10: a user's second access key, made but not committed, holds the
+/// user's row: a third waits for it, and then finds two.
+#[tokio::test]
+async fn a_users_keys_are_counted_after_its_row_is_held() {
+    let Some(app) = node().await else { return };
+    crate::roles::create(&connection(&app).await, "u", None, false).await.unwrap();
+    let make = "SELECT pg_temp.cairn_create_key('u', $1, 'secretsecret', 2)";
+    let mut held = connection(&app).await;
+    let tx = held.transaction().await.unwrap();
+    let made: String = tx.query_one(make, &[&"SECOND"]).await.unwrap().get(0);
+    assert_eq!(made, "created");
+    let app2 = app.clone();
+    let third = tokio::spawn(async move {
+        connection(&app2).await.query_one(make, &[&"THIRD"]).await.unwrap().get::<_, String>(0)
+    });
+    assert_waits(&third).await;
+    tx.commit().await.unwrap();
+    assert_eq!(third.await.unwrap(), "too_many");
+    let keys = "SELECT count(*) FROM access_keys k JOIN roles r ON r.id = k.role_id WHERE r.name = 'u'";
+    assert_eq!(query_i64(&app, keys).await, 2);
+}
+
 /// I1: a conditional write is decided (by Cairn) against the current object,
 /// and lands only if that's still the current one when it holds the key: one
 /// that another write replaced meanwhile makes it decide again, against the

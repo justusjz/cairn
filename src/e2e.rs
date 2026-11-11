@@ -36,6 +36,7 @@ mod locking;
 mod metadata;
 mod multipart;
 mod post_object;
+mod users;
 mod tagging;
 
 /// The bucket every test node has.
@@ -113,6 +114,7 @@ async fn node_on(
         dashboard: crate::dashboard::Dashboard::new(peer_url),
         peers: crate::peer::PeerClient::new(),
         allow_sse_c_over_http: false,
+        trusted_proxies: Vec::new(),
         domain: None,
         kms: None,
         pack_hook: hook,

@@ -15,7 +15,7 @@ pub mod s3_actions;
 
 use std::collections::HashMap;
 
-pub use condition::{Support, support};
+pub use condition::{Network, Support, date, support};
 use condition::Condition;
 use pattern::{Pattern, Syntax, arn_matches, arn_parts};
 use s3_actions::{ACTIONS, Applies};
@@ -54,6 +54,8 @@ impl Context {
         self.values.insert(key.to_ascii_lowercase(), vec![value.into()]);
     }
 
+    /// A multivalued key's values (none of Cairn's requests have one yet).
+    #[cfg(test)]
     pub fn set_all(&mut self, key: &str, values: Vec<String>) {
         self.values.insert(key.to_ascii_lowercase(), values);
     }
@@ -91,23 +93,41 @@ pub enum Decision {
     NotApplicable,
 }
 
-/// Whether a request is allowed by `identity` (the user's policies; none for
-/// an anonymous request) and `bucket` (the bucket's policy, if it has one):
-/// an explicit Deny in either denies; else an Allow in either allows; else
-/// it's denied.
-pub fn decide<'p>(identity: impl IntoIterator<Item = &'p Policy>, bucket: Option<&'p Policy>, request: &Request) -> bool {
+/// The verdict on a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    Allow,
+    /// A statement denies it, in an identity policy (`identity`) or the
+    /// bucket's.
+    ExplicitDeny { identity: bool },
+    /// Nothing allows it.
+    ImplicitDeny,
+}
+
+/// The verdict on a request by `identity` (the user's policies; none count
+/// for an anonymous request) and `bucket` (the bucket's policy, if it has
+/// one): an explicit Deny in either denies; else an Allow in either allows;
+/// else it's denied.
+pub fn verdict<'p>(
+    identity: impl IntoIterator<Item = &'p Policy>,
+    bucket: Option<&'p Policy>,
+    request: &Request,
+) -> Verdict {
     let mut allowed = false;
     let anonymous = request.principal == Principal::Anonymous;
-    // An anonymous request has no identity policies.
-    let identity = identity.into_iter().filter(|_| !anonymous);
-    for policy in identity.chain(bucket) {
+    for policy in identity.into_iter().filter(|_| !anonymous) {
         match policy.evaluate(request) {
-            Decision::Deny => return false,
+            Decision::Deny => return Verdict::ExplicitDeny { identity: true },
             Decision::Allow => allowed = true,
             Decision::NotApplicable => {}
         }
     }
-    allowed
+    match bucket.map(|policy| policy.evaluate(request)) {
+        Some(Decision::Deny) => return Verdict::ExplicitDeny { identity: false },
+        Some(Decision::Allow) => allowed = true,
+        _ => {}
+    }
+    if allowed { Verdict::Allow } else { Verdict::ImplicitDeny }
 }
 
 /// What a policy is attached to, which decides what it may say.
@@ -231,10 +251,31 @@ impl Policy {
         self.statements.iter().filter_map(|s| s.principals.as_ref())
     }
 
-    /// Whether some statement allows everyone (`"Principal": "*"`), with or
-    /// without conditions.
-    pub fn allows_everyone(&self) -> bool {
-        self.statements.iter().any(|s| s.allow && s.principals.as_ref().is_some_and(|p| p.everyone && !p.not))
+    /// Whether the policy makes its bucket public, as Block Public Access
+    /// defines it: some Allow is for everyone, without a condition that
+    /// limits it to fixed values of a key that only some principals or
+    /// networks have (an address, a VPC endpoint, an account, ...).
+    pub fn is_public(&self) -> bool {
+        const LIMITING: &[&str] = &[
+            "aws:SourceIp",
+            "aws:SourceArn",
+            "aws:SourceVpc",
+            "aws:SourceVpce",
+            "aws:SourceOwner",
+            "aws:SourceAccount",
+            "aws:PrincipalArn",
+            "aws:PrincipalAccount",
+            "aws:PrincipalOrgID",
+            "aws:userid",
+            "s3:x-amz-server-side-encryption-aws-kms-key-id",
+            "s3:DataAccessPointArn",
+            "s3:DataAccessPointAccount",
+        ];
+        self.statements.iter().any(|s| {
+            let everyone = s.principals.as_ref().is_some_and(|p| p.everyone && !p.not);
+            let limited = LIMITING.iter().any(|key| s.conditions.iter().any(|c| c.fixes(key)));
+            s.allow && everyone && !limited
+        })
     }
 
     /// The policy as S3 keeps it, and gives back: compact; with a version

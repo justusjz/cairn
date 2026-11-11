@@ -25,7 +25,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use futures_core::Stream;
 use http_body_util::Full;
 use hyper::{
-    HeaderMap, Request, Response, StatusCode,
+    HeaderMap, Method, Request, Response, StatusCode,
     body::{Body, Bytes, Frame},
     header::{self, HeaderName, HeaderValue},
 };
@@ -34,11 +34,10 @@ use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
 use crate::{
     App,
     auth::PostSignature,
-    db::Cached,
     payload::Payload,
-    roles::{Permission, Principal},
+    roles::Principal,
     s3::{
-        acl,
+        access, acl, actions,
         buckets::encryption::default_request,
         checksums,
         conditional::Preconditions,
@@ -203,6 +202,7 @@ pub async fn post_object<B>(
     req: Request<B>,
     path: &str,
     virtual_host: bool,
+    peer: Option<std::net::IpAddr>,
 ) -> anyhow::Result<Response<Full<Bytes>>>
 where
     B: Body<Data = Bytes> + Unpin + Send + 'static,
@@ -307,15 +307,7 @@ where
     if let Err(rejection) = policy.check(&fields, &bucket, now) {
         return Ok(rejection_response(&rejection));
     }
-    // As a PutObject: the role needs to write to the bucket, and a bucket
-    // that isn't there is a 404 to anyone.
-    if !principal.can(Permission::Write, &bucket) {
-        let exists = client.query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket]).await?.is_some();
-        return Ok(match exists {
-            true => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
-            false => format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist"),
-        });
-    }
+    let account = crate::roles::account(&client).await?;
     drop(client);
     let key = match field(&fields, "key") {
         Some(key) if !key.is_empty() => key.to_owned(),
@@ -333,6 +325,23 @@ where
         Ok(headers) => headers,
         Err(refused) => return Ok(refused),
     };
+    // As a PutObject (its tags and ACL too, if it sets them; see
+    // `actions`), by the user's policies and the bucket's, and a bucket that
+    // isn't there is a 404 to anyone.
+    let mut tagged = headers.clone();
+    if field(&fields, "tagging").is_some() {
+        tagged.insert("x-amz-tagging", HeaderValue::from_static("form"));
+    }
+    let operation = actions::operation(&Method::PUT, &bucket, &key, "", &tagged).expect("a PUT is an operation");
+    let origin = access::Origin { peer, trusted_proxies: &app.trusted_proxies, signed: None, form: true };
+    let mut access = access::Access::new(Some(&principal), &account, &Method::POST, &headers, "", &origin)?;
+    let exists = access.load(app, &bucket).await?;
+    if let Some((check, verdict)) = access.first_denied(&operation.checks) {
+        return Ok(match exists {
+            true => access.denied(check, verdict),
+            false => format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist"),
+        });
+    }
     let customer_key = match sse_c::requested(&headers, &sse_c::HEADERS, secure) {
         Ok(key) => key,
         Err(refused) => return Ok(refused),

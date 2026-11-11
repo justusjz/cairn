@@ -253,14 +253,31 @@ fn presigned(query: &str) -> bool {
     query_value(query, "X-Amz-Algorithm").is_some()
 }
 
-/// The access key ID a SigV4-signed request claims (from its `Authorization`
-/// credential, or a presigned URL's), used to look up the secret to verify it
-/// with. `None` for an unsigned or malformed request.
-pub fn access_key(headers: &HeaderMap, query: &str) -> Option<String> {
-    match headers.contains_key("authorization") {
-        true => Authorization::from_headers(headers).map(|a| a.access_key),
-        false => Authorization::from_query(query).map(|a| a.access_key),
-    }
+/// What a signed request says about its signature, as policies' condition
+/// keys see it (see `s3::access`).
+pub struct Signed {
+    pub access_key: String,
+    /// The credential's region.
+    pub region: String,
+    /// Signed in its query (a presigned URL), rather than its headers.
+    pub presigned: bool,
+    /// When it was signed (`X-Amz-Date`), as SigV4 writes it.
+    pub date: Option<String>,
+}
+
+/// The signature a request claims to have (not checked), or `None` for an
+/// unsigned or malformed one.
+pub fn signed(headers: &HeaderMap, query: &str) -> Option<Signed> {
+    let presigned = !headers.contains_key("authorization");
+    let authorization = match presigned {
+        false => Authorization::from_headers(headers)?,
+        true => Authorization::from_query(query)?,
+    };
+    let date = match presigned {
+        false => headers.get("x-amz-date").and_then(|v| v.to_str().ok()).map(str::to_owned),
+        true => query_value(query, "X-Amz-Date"),
+    };
+    Some(Signed { access_key: authorization.access_key, region: authorization.region, presigned, date })
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -822,10 +839,11 @@ pub(crate) mod tests {
     #[test]
     fn verifies_a_presigned_url() {
         let signed_at = parse_amz_date("20130524T000000Z").unwrap();
-        assert_eq!(
-            access_key(&aws_host(), AWS_PRESIGNED).as_deref(),
-            Some("AKIAIOSFODNN7EXAMPLE")
-        );
+        let claimed = super::signed(&aws_host(), AWS_PRESIGNED).unwrap();
+        assert_eq!(claimed.access_key, "AKIAIOSFODNN7EXAMPLE");
+        assert!(claimed.presigned);
+        assert_eq!(claimed.region, "us-east-1");
+        assert_eq!(claimed.date.as_deref(), Some("20130524T000000Z"));
         // Valid for its day, and from a little before it, as the clock may be off.
         for now in [signed_at - 60, signed_at, signed_at + 86_400] {
             assert_eq!(

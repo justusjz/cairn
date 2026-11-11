@@ -45,8 +45,6 @@ mod mover;
 mod nodes;
 mod packer;
 mod payload;
-// Not used by requests yet (see `plans/policies.md`, step 3).
-#[allow(dead_code)]
 mod policy;
 mod roles;
 mod s3;
@@ -78,6 +76,9 @@ pub struct App {
     peers: peer::PeerClient,
     /// Whether SSE-C keys are accepted over plain HTTP (see `s3::sse_c`).
     allow_sse_c_over_http: bool,
+    /// `--trusted-proxy`: the proxies whose `X-Forwarded-For` and
+    /// `X-Forwarded-Proto` policies believe (see `s3::access`).
+    trusted_proxies: Vec<policy::Network>,
     /// `--domain`: the domain buckets are subdomains of, for virtual-hosted
     /// requests (see `s3::hosting`).
     domain: Option<String>,
@@ -153,8 +154,11 @@ struct Cli {
 enum Command {
     /// Run a storage node.
     Serve(ServeArgs),
-    /// Manage roles: S3 credentials and their bucket permissions.
-    Role(roles::RoleArgs),
+    /// Manage users: their S3 access keys, bucket permissions and policies.
+    #[command(alias = "role")]
+    User(roles::RoleArgs),
+    /// Show, set or delete a bucket's policy, whatever it allows.
+    BucketPolicy(s3::buckets::policy::BucketPolicyArgs),
     /// Show or change the cluster's settings.
     Config(settings::ConfigArgs),
     /// List the cluster's nodes, or remove one.
@@ -195,6 +199,13 @@ struct ServeArgs {
     /// encrypted itself: the key travels in a header.
     #[arg(long, env = "CAIRN_ALLOW_SSE_C_OVER_HTTP")]
     allow_sse_c_over_http: bool,
+    /// An address (or CIDR block) of a proxy in front of Cairn, whose
+    /// `X-Forwarded-For` and `X-Forwarded-Proto` bucket policies believe, for
+    /// `aws:SourceIp` and `aws:SecureTransport`. From anyone else, the
+    /// connection's own address counts, and it's not HTTPS. May be given
+    /// several times (or comma-separated, in the environment).
+    #[arg(long = "trusted-proxy", env = "CAIRN_TRUSTED_PROXIES", value_delimiter = ',', value_parser = parse_network)]
+    trusted_proxies: Vec<policy::Network>,
     /// The domain the S3 API is reached at, e.g. s3.example.com, to take
     /// virtual-hosted-style requests: to bucket.s3.example.com/key, for
     /// /bucket/key. Path-style requests work either way. The proxy in front
@@ -219,10 +230,16 @@ pub(crate) const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve_main(args).await,
-        Command::Role(args) => roles::role_main(args).await,
+        Command::User(args) => roles::role_main(args).await,
+        Command::BucketPolicy(args) => s3::buckets::policy::bucket_policy_main(args).await,
         Command::Config(args) => settings::config_main(args).await,
         Command::Node(args) => nodes::node_main(args).await,
     }
+}
+
+/// A `--trusted-proxy`: an address, or a CIDR block.
+fn parse_network(text: &str) -> Result<policy::Network, String> {
+    policy::Network::parse(text.trim()).ok_or_else(|| format!("{text:?} is not an address or a CIDR block"))
 }
 
 async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
@@ -260,6 +277,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         dashboard: dashboard::Dashboard::new(&peer_url),
         peers: peer::PeerClient::new(),
         allow_sse_c_over_http: args.allow_sse_c_over_http,
+        trusted_proxies: args.trusted_proxies.clone(),
         domain: args.domain,
         kms,
         #[cfg(test)]
@@ -477,7 +495,7 @@ async fn serve_client(
     let graceful = GracefulShutdown::new();
     tokio::pin!(shutdown);
     loop {
-        let (stream, _peer_addr) = tokio::select! {
+        let (stream, peer_addr) = tokio::select! {
             accepted = listener.accept() => accepted?,
             () = &mut shutdown => break,
         };
@@ -504,7 +522,7 @@ async fn serve_client(
                     // makes one): returning it to hyper would drop the
                     // connection without one, which clients take as a network
                     // fault and retry with backoff.
-                    let res = s3::handle(req, app.clone(), &what, &route).await;
+                    let res = s3::handle(req, app.clone(), &what, &route, peer_addr.ip()).await;
                     let (parts, body) = res.into_parts();
                     let body =
                         app.metrics

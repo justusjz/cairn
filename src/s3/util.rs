@@ -87,12 +87,6 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
             "ObjectLockConfigurationNotFoundError",
             "object lock configuration does not exist for this bucket",
         ))
-    } else if present("policy") {
-        Some(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchBucketPolicy",
-            "the bucket policy does not exist",
-        ))
     } else if present("website") {
         Some(format_s3_error(
             StatusCode::NOT_FOUND,
@@ -289,6 +283,7 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "location",
             "object-lock",
             "policy",
+            "policyStatus",
             "cors",
             "tagging",
             "lifecycle",
@@ -301,12 +296,12 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
         ],
         // PutBucketVersioning, PutBucketEncryption,
         // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketTagging,
-        // PutBucketAcl (`acl`).
-        (true, &Method::PUT) => &["versioning", "encryption", "lifecycle", "cors", "tagging", "acl"],
+        // PutBucketPolicy, PutBucketAcl (`acl`).
+        (true, &Method::PUT) => &["versioning", "encryption", "lifecycle", "cors", "tagging", "policy", "acl"],
         (true, &Method::POST) => &["delete"],
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
-        // DeleteBucketTagging.
-        (true, &Method::DELETE) => &["encryption", "lifecycle", "cors", "tagging"],
+        // DeleteBucketTagging, DeleteBucketPolicy.
+        (true, &Method::DELETE) => &["encryption", "lifecycle", "cors", "tagging", "policy"],
         // GetObjectAcl (stubbed), ListParts, GetObjectTagging.
         (false, &Method::GET) => &["acl", "uploadId", "tagging"],
         // UploadPart / UploadPartCopy, PutObjectAcl (`acl`), PutObjectTagging.
@@ -521,6 +516,9 @@ mod tests {
             (Method::GET, true, "versions&key-marker=a"),
             (Method::GET, true, "uploads&prefix=a"),
             (Method::GET, true, "policy"),
+            (Method::GET, true, "policyStatus"),
+            (Method::PUT, true, "policy"),
+            (Method::DELETE, true, "policy"),
             (Method::PUT, true, "versioning"),
             (Method::PUT, true, "lifecycle"),
             (Method::DELETE, true, "lifecycle"),
@@ -560,8 +558,6 @@ mod tests {
             (Method::GET, false, "partNumber=1"),
             (Method::HEAD, false, "partNumber=1"),
             (Method::POST, false, "restore"),
-            (Method::PUT, true, "policy"),
-            (Method::DELETE, true, "policy"),
             (Method::DELETE, true, "website"),
             (Method::GET, true, "inventory"),
             (Method::GET, true, "prefix=a&%69nventory"),

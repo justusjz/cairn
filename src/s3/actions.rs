@@ -63,30 +63,47 @@ pub struct Operation {
 
 /// Reading a bucket's configuration: the operation's name, and its action.
 type Read = (&'static str, &'static str);
-/// Writing it: the names of the operations that set and delete it (none, if
-/// it can't be deleted), and their action.
-type Write = (&'static str, &'static str, &'static str);
+/// Writing it: the operation that sets it and its action, and the one that
+/// deletes it (none, if it can't be) and its action.
+type Write = (&'static str, &'static str, &'static str, &'static str);
 
 /// A bucket configuration's subresource, and its reads and writes.
 const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
-    ("versioning", ("GetBucketVersioning", "s3:GetBucketVersioning"), Some(("PutBucketVersioning", "", "s3:PutBucketVersioning"))),
+    (
+        "versioning",
+        ("GetBucketVersioning", "s3:GetBucketVersioning"),
+        Some(("PutBucketVersioning", "s3:PutBucketVersioning", "", "")),
+    ),
     (
         "encryption",
         ("GetBucketEncryption", "s3:GetEncryptionConfiguration"),
-        Some(("PutBucketEncryption", "DeleteBucketEncryption", "s3:PutEncryptionConfiguration")),
+        Some(("PutBucketEncryption", "s3:PutEncryptionConfiguration", "DeleteBucketEncryption", "s3:PutEncryptionConfiguration")),
     ),
     (
         "lifecycle",
         ("GetBucketLifecycleConfiguration", "s3:GetLifecycleConfiguration"),
-        Some(("PutBucketLifecycleConfiguration", "DeleteBucketLifecycle", "s3:PutLifecycleConfiguration")),
+        Some(("PutBucketLifecycleConfiguration", "s3:PutLifecycleConfiguration", "DeleteBucketLifecycle", "s3:PutLifecycleConfiguration")),
     ),
-    ("cors", ("GetBucketCors", "s3:GetBucketCORS"), Some(("PutBucketCors", "DeleteBucketCors", "s3:PutBucketCORS"))),
-    ("tagging", ("GetBucketTagging", "s3:GetBucketTagging"), Some(("PutBucketTagging", "DeleteBucketTagging", "s3:PutBucketTagging"))),
-    ("acl", ("GetBucketAcl", "s3:GetBucketAcl"), Some(("PutBucketAcl", "", "s3:PutBucketAcl"))),
+    (
+        "cors",
+        ("GetBucketCors", "s3:GetBucketCORS"),
+        Some(("PutBucketCors", "s3:PutBucketCORS", "DeleteBucketCors", "s3:PutBucketCORS")),
+    ),
+    (
+        "tagging",
+        ("GetBucketTagging", "s3:GetBucketTagging"),
+        Some(("PutBucketTagging", "s3:PutBucketTagging", "DeleteBucketTagging", "s3:PutBucketTagging")),
+    ),
+    (
+        "policy",
+        ("GetBucketPolicy", "s3:GetBucketPolicy"),
+        Some(("PutBucketPolicy", "s3:PutBucketPolicy", "DeleteBucketPolicy", "s3:DeleteBucketPolicy")),
+    ),
+    ("policyStatus", ("GetBucketPolicyStatus", "s3:GetBucketPolicyStatus"), None),
+    ("acl", ("GetBucketAcl", "s3:GetBucketAcl"), Some(("PutBucketAcl", "s3:PutBucketAcl", "", ""))),
     ("ownershipControls", ("GetBucketOwnershipControls", "s3:GetBucketOwnershipControls"), None),
     ("location", ("GetBucketLocation", "s3:GetBucketLocation"), None),
     ("object-lock", ("GetObjectLockConfiguration", "s3:GetBucketObjectLockConfiguration"), None),
-    ("policy", ("GetBucketPolicy", "s3:GetBucketPolicy"), None),
     ("website", ("GetBucketWebsite", "s3:GetBucketWebsite"), None),
     ("replication", ("GetBucketReplication", "s3:GetReplicationConfiguration"), None),
     ("accelerate", ("GetBucketAccelerateConfiguration", "s3:GetAccelerateConfiguration"), None),
@@ -97,9 +114,12 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
 
 /// The actions that read a bucket's configuration, which anyone the bucket
 /// is visible to may (see the built-in policies). Not its policy, which
-/// names who may do what.
+/// names who may do what, nor whether that makes it public.
 fn configuration_reads() -> impl Iterator<Item = &'static str> {
-    CONFIGURATION.iter().map(|(_, (_, action), _)| *action).filter(|a| *a != "s3:GetBucketPolicy")
+    CONFIGURATION
+        .iter()
+        .map(|(_, (_, action), _)| *action)
+        .filter(|a| !matches!(*a, "s3:GetBucketPolicy" | "s3:GetBucketPolicyStatus"))
 }
 
 /// Whether a request's headers set an ACL.
@@ -133,7 +153,7 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
                 one(name, "s3:ListBucket", on_bucket())
             }
             (Method::HEAD, _) => one("HeadBucket", "s3:ListBucket", on_bucket()),
-            (Method::PUT, Some((_, _, Some((name, _, action))))) => one(name, action, on_bucket()),
+            (Method::PUT, Some((_, _, Some((name, action, _, _))))) => one(name, action, on_bucket()),
             (Method::PUT, Some(_)) => None,
             (Method::PUT, None) => {
                 let mut checks = vec![check("s3:CreateBucket", on_bucket())];
@@ -142,7 +162,9 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
                 }
                 Some(Operation { name: "CreateBucket", checks })
             }
-            (Method::DELETE, Some((_, _, Some((_, name, action))))) if !name.is_empty() => one(name, action, on_bucket()),
+            (Method::DELETE, Some((_, _, Some((_, _, name, action))))) if !name.is_empty() => {
+                one(name, action, on_bucket())
+            }
             (Method::DELETE, Some(_)) => None,
             (Method::DELETE, None) => one("DeleteBucket", "s3:DeleteBucket", on_bucket()),
             // Each key is checked on its own.
@@ -194,9 +216,7 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
         Method::PUT if copies => {
             let mut operation = writes("CopyObject");
             // Only tags the copy is given (not the source's) are set.
-            let replaces = headers
-                .get("x-amz-tagging-directive")
-                .is_some_and(|d| d.as_bytes().eq_ignore_ascii_case(b"REPLACE"));
+            let replaces = headers.get("x-amz-tagging-directive").is_some_and(|d| d.as_bytes() == b"REPLACE");
             if !replaces {
                 operation.checks.retain(|c| c.action != "s3:PutObjectTagging");
             }
@@ -268,9 +288,17 @@ pub fn grant_policy(permission: crate::roles::Permission, bucket: &str) -> Strin
 /// What `admin` allows, as a policy: managing every bucket (making,
 /// deleting, listing and configuring them), not what's in them.
 pub fn admin_policy() -> String {
-    let mut actions: Vec<&str> = vec!["s3:CreateBucket", "s3:DeleteBucket", "s3:GetBucketPolicy"];
+    let mut actions: Vec<&str> =
+        vec!["s3:CreateBucket", "s3:DeleteBucket", "s3:GetBucketPolicy", "s3:GetBucketPolicyStatus"];
     actions.extend(configuration_reads());
-    actions.extend(CONFIGURATION.iter().filter_map(|(_, _, write)| write.map(|(_, _, action)| action)));
+    for (_, _, write) in CONFIGURATION {
+        if let Some((_, put, _, delete)) = write {
+            actions.push(put);
+            if !delete.is_empty() && delete != put {
+                actions.push(delete);
+            }
+        }
+    }
     let actions = actions.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(",");
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[\
@@ -283,7 +311,7 @@ pub fn admin_policy() -> String {
 mod tests {
     use super::*;
     use crate::policy::{
-        Context, Kind, Policy, Principal, Request, decide,
+        Context, Kind, Policy, Principal, Request, Verdict, verdict,
         s3_actions::{ACTIONS, Applies},
     };
     use crate::roles::Permission;
@@ -302,7 +330,7 @@ mod tests {
         let mut requests = vec![(Method::GET, "", "", "", none())];
         for (name, _, write) in CONFIGURATION {
             requests.push((Method::GET, "b", "", name, none()));
-            if let Some((_, delete, _)) = write {
+            if let Some((_, _, delete, _)) = write {
                 requests.push((Method::PUT, "b", "", name, none()));
                 if !delete.is_empty() {
                     requests.push((Method::DELETE, "b", "", name, none()));
@@ -416,7 +444,7 @@ mod tests {
                 resource: &resource,
                 context: &context,
             };
-            decide(policies, None, &request)
+            verdict(policies, None, &request) == Verdict::Allow
         })
     }
 
@@ -460,7 +488,7 @@ mod tests {
         // bucket policy is for admins only, not everyone who sees the bucket.
         assert_eq!(
             differences,
-            [("GetBucketPolicy", true, false), ("HeadBucket", true, false)],
+            [("GetBucketPolicy", true, false), ("GetBucketPolicyStatus", true, false), ("HeadBucket", true, false)],
             "{differences:?}"
         );
     }

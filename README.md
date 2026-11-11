@@ -48,7 +48,7 @@ docker run -d --name cairn -p 9000:9000 \
     -e CAIRN_DATABASE="postgres://user:pass@db.internal:5432/cairn" \
     -v cairn-data:/var/lib/cairn \
     ghcr.io/justusjz/cairn:<version>
-docker exec cairn cairn role create admin --admin
+docker exec cairn cairn user create admin --admin
 ```
 
 For a cluster, also set `CAIRN_PEER_URL` to an address the other nodes can
@@ -66,23 +66,23 @@ cairn serve \
 ```
 
 The S3 API is now served on `:9000`. Every request must be signed (SigV4) with
-the credentials of a role, and a fresh database has none. Create an admin role
-to manage buckets, and an application role with access to a bucket (see
-[Roles and permissions](#roles-and-permissions)):
+the credentials of a user, and a fresh database has none. Create an admin user
+to manage buckets, and an application user with access to a bucket (see
+[Users and permissions](#users-and-permissions)):
 
 ```sh
 DB="postgres://user:pass@localhost:5432/cairn"
-cairn role --database "$DB" create admin --admin        # prints a generated secret
-cairn role --database "$DB" create app                  # prints a generated secret
+cairn user --database "$DB" create admin --admin        # prints a generated secret
+cairn user --database "$DB" create app                  # prints a generated secret
 ```
 
-Create a bucket as the admin, grant the application role access to it, and use
+Create a bucket as the admin, grant the application user access to it, and use
 it:
 
 ```sh
 s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
     --access_key=admin --secret_key=<admin secret> mb s3://my-bucket
-cairn role --database "$DB" grant app my-bucket read write
+cairn user --database "$DB" grant app my-bucket read write
 s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
     --access_key=app --secret_key=<app secret> put file.txt s3://my-bucket/
 ```
@@ -90,7 +90,7 @@ s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
 ### `serve` flags
 
 Every flag can also be set through its environment variable; a flag on the
-command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
+command line wins. `cairn user` reads `CAIRN_DATABASE` as well.
 
 | Flag | Environment | Default | Description |
 | --- | --- | --- | --- |
@@ -101,6 +101,7 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on, until the cluster's `parity-shards` setting is set (see below), which overrides it on every node. |
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
+| `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
 | `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
 | `--kms-jwt-key <PATH>` | `CAIRN_KMS_JWT_KEY` | *required with a KMS* | PEM file of the Ed25519 private key Cairn signs its roles' logins to the KMS with. The same on every node. |
@@ -223,33 +224,70 @@ cairn config --database "$DB" set repair-after 60   # minutes; 0, the default, i
 The dashboard's Overview shows each node's state, and its Jobs page how many
 shards are waiting to move.
 
-## Roles and permissions
+## Users and permissions
 
-A **role** is a set of S3 credentials: its name is the access key ID, and it has
-a secret. Roles are stored in Postgres, so every node picks up a change on the
-very next request; there is nothing to restart or sync.
+A **user** (called a role before; `cairn role` still works) is who makes S3
+requests. It has **access keys**: up to two, as in IAM, each an access key ID
+and a secret; its first key's ID is the user's name. Users are stored in
+Postgres, so every node picks up a change on the very next request; there is
+nothing to restart or sync.
 
-What a role may do:
+What a user may do is decided by policies, in IAM's policy language, as in
+S3: an explicit `Deny` in any that applies wins; else an `Allow` in any
+allows; else it's denied. They are:
 
-- **admin** (`--admin`): create and delete buckets, configure their
-  [versioning](#versioning), HEAD any bucket and read its configuration, and
-  see every bucket in ListBuckets. Admin does **not** grant access to objects.
-- **`read`** on a bucket: GetObject, HeadObject, ListObjects, reading an
-  object's [tags](#tags), and being the source of a CopyObject /
-  UploadPartCopy.
-- **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads
-  (listing them and their parts too, to resume one), changing an object's
-  tags (any version's), and being the destination of a copy. In a versioned bucket, a delete only adds a
-  delete marker.
-- **`delete-version`** on a bucket: DeleteObject(s) naming a version ID, which
-  removes that version for good.
+- its **grants**, the simple way, which are built-in policies:
+  - **admin** (`--admin`): create and delete buckets, configure them
+    ([versioning](#versioning), lifecycle, CORS, tags, policies, ...), read
+    their configuration, and see every bucket in ListBuckets. Admin does
+    **not** grant access to objects, nor HEAD a bucket (that's
+    `s3:ListBucket`, as in S3: listing what's in it).
+  - **`read`** on a bucket: GetObject, HeadObject, HeadBucket, ListObjects,
+    reading an object's [tags](#tags), and being the source of a
+    CopyObject / UploadPartCopy.
+  - **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads
+    (listing them and their parts too, to resume one), changing an object's
+    tags (any version's), and being the destination of a copy. In a
+    versioned bucket, a delete only adds a delete marker.
+  - **`delete-version`** on a bucket: DeleteObject(s) naming a version ID,
+    which removes that version for good.
+- its **inline policies**: identity policies of its own, for anything finer
+  (per key prefix, by condition, ...), set with `cairn user policy`;
+- each bucket's **bucket policy**, set with PutBucketPolicy (by an admin), as
+  in S3. A bucket policy can allow other users, or anyone: unsigned requests
+  are **anonymous**, and only a bucket policy with `"Principal": "*"` can
+  allow them (a public bucket, say). Users are named in policies as
+  `arn:aws:iam::<account>:user/<name>`; the cluster is one account, whose ID
+  `cairn user list` shows.
 
-A role sees only the buckets it holds a grant on (or all of them, if admin).
-Permissions are per bucket; there are no per-key permissions. A bucket must
-exist before you can grant access to it, so the setup order is: an admin creates
-the bucket (with any S3 client), then you grant roles access. Deleting a bucket
-removes its grants, so a bucket re-created under the same name starts with no
-access for anyone.
+```sh
+aws s3api put-bucket-policy --bucket my-bucket --policy '{"Version": "2012-10-17", "Statement": [
+    {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+     "Resource": "arn:aws:s3:::my-bucket/public/*"}]}'
+```
+
+Policies are checked as S3 checks them when they're set (with S3's error
+messages), and decide requests as S3's do, condition keys and all. A policy
+naming a condition key Cairn can't decide yet (an object's existing tags,
+say) is refused with `501 NotImplemented`, rather than taken and decided
+wrongly. A denied request gets S3's `403 AccessDenied`, which tells a user
+why (`... with an explicit deny in a resource-based policy`); a key that
+doesn't exist is a 403 too, to whom may not list the bucket, so that keys
+can't be found by guessing.
+
+`aws:SourceIp` and `aws:SecureTransport` (and so policies that ask for an
+address, or for HTTPS) take the client's address and protocol from
+`X-Forwarded-For` and `X-Forwarded-Proto` only if the request came from a
+`--trusted-proxy`; otherwise, the connection's own address counts, and it's
+not HTTPS (Cairn speaks only HTTP).
+
+A user sees the buckets it holds a grant on in ListBuckets (or all of them,
+if a policy allows it `s3:ListAllMyBuckets`, as admin does). A bucket must
+exist before you can grant access to it, so the setup order is: an admin
+creates the bucket (with any S3 client), then you grant users access.
+Deleting a bucket removes its grants, so a bucket re-created under the same
+name starts with no access for anyone; inline policies name buckets by name,
+and outlive them, as in AWS.
 
 There are no ACLs: as with S3's default for new buckets ("bucket owner
 enforced"), access is a matter of grants alone. A request that asks for an ACL
@@ -263,18 +301,27 @@ hyphens, starting and ending with a letter or digit, not formatted like an IP
 address, and without the prefixes and suffixes S3 reserves (such as `xn--` or
 `-s3alias`).
 
-Manage roles with `cairn role --database <URL> <command>`:
+Manage users with `cairn user --database <URL> <command>`:
 
 | Command | Description |
 | --- | --- |
-| `create <name> [--admin] [--secret <S>]` | Create a role. Prints a generated 40-char secret unless `--secret` is given (min. 8 chars). |
-| `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret (`--rotate-secret` prints the new one). |
-| `delete <name>` | Delete a role and all its grants. |
+| `create <name> [--admin] [--secret <S>]` | Create a user, with an access key named as it. Prints a generated 40-char secret unless `--secret` is given (min. 8 chars). |
+| `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret of the key named as the user (`--rotate-secret` prints the new one). |
+| `delete <name>` | Delete a user, with its keys, grants and policies. |
 | `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket. |
 | `revoke <name> <bucket> [read\|write\|delete-version]...` | Revoke permissions on a bucket; all of them if none are listed. |
-| `list` | List roles, their admin flag, and their grants (secrets are not shown). |
+| `key create <name> [--id <ID>] [--secret <S>]` | Make the user another access key (at most two). Prints its ID and secret. |
+| `key activate\|deactivate\|delete <ID>` | Let a key sign requests, stop it, or delete it. |
+| `policy put <name> <policy> <file>` | Set an inline policy (JSON; `-` reads stdin). A user's policies hold at most 2048 characters together, as in IAM. |
+| `policy get\|delete <name> <policy>` | Show or delete an inline policy. |
+| `list` | List users, their ARNs, admin flags, keys, grants and policies (secrets are not shown). |
 
-Secrets are stored in plaintext in the `roles` table: SigV4 is an HMAC scheme,
+A bucket policy can deny everyone everything, its admins too, as in S3. The
+superadmin, with access to the database, can always remove it, as an AWS
+account's root user can: `cairn bucket-policy --database <URL> delete
+<bucket>` (or `get`, or `put <bucket> <file>`).
+
+Secrets are stored in plaintext in the `access_keys` table: SigV4 is an HMAC scheme,
 so verifying a signature needs the secret itself. Restrict access to the
 database accordingly.
 
@@ -284,7 +331,7 @@ clocks of nodes and clients in sync (e.g. NTP); otherwise requests fail with
 `RequestTimeTooSkewed`.
 
 **Presigned URLs** (SigV4 in the query string) work as in S3: a URL signed
-with a role's credentials makes exactly that request, as that role, for as
+with a user's credentials makes exactly that request, as that user, for as
 long as it says (`X-Amz-Expires`, at most 7 days), with nothing but an HTTP
 client, a browser say. Its body is unsigned. GetObject and HeadObject take
 S3's `response-*` parameters (`response-content-disposition`,
@@ -295,9 +342,10 @@ supported: `aws s3 presign` makes SigV2 URLs unless its config has
 signed with the key's headers, and the client has to send them.
 
 **POST Object** (browser-based uploads) works as in S3: a `multipart/form-data`
-form posted to a bucket, with a POST policy signed with a role's credentials
+form posted to a bucket, with a POST policy signed with a user's credentials
 (SigV4, as boto3's `generate_presigned_post` makes them), uploads its file as
-that role, if the policy allows the form: until its expiration, with a key
+that user, if the policy allows the form (and the user may make that
+PutObject): until its expiration, with a key
 under a prefix, say, or of a size in `content-length-range`. A file over the
 size is refused as soon as it's over. The form's fields are what a PutObject's
 headers would be (content headers, `x-amz-meta-*`, checksums, SSE-S3, SSE-KMS,
@@ -581,7 +629,8 @@ send (`AllowedHeader`, which may have one `*` too, matched regardless of case).
 A preflight that no rule allows is refused with `403 AccessForbidden`. Every
 other response to a request from an allowed origin gets its CORS headers,
 errors too, so that the page can read them. CORS doesn't grant anything: a
-request still has to be signed by a role that may make it.
+request still has to be allowed, signed by a user that may make it, or
+anonymous and allowed by the bucket's policy.
 
 There's no CORS setting for the whole cluster, only these, per bucket, as in
 S3.

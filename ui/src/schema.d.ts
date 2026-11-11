@@ -372,6 +372,12 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AccessKey: {
+            active: boolean;
+            /** Format: double */
+            created_at: number;
+            id: string;
+        };
         AdminFlag: {
             admin: boolean;
         };
@@ -1226,12 +1232,16 @@ export interface components {
              *     KMS's auth mount for Cairn.
              */
             id: string;
+            /** @description Its access keys, oldest first (never their secrets). */
+            keys: components["schemas"]["AccessKey"][];
             /**
              * @description Its identity (entity) in the KMS, which key owners grant keys to;
              *     none until Cairn has logged in as it, or without a KMS.
              */
             kms_entity_id?: string | null;
             name: string;
+            /** @description The names of its inline policies. */
+            policies: string[];
         };
         /**
          * @description What the scrubber did since the node started: the copies it checked (and

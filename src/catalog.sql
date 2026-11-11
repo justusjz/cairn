@@ -65,8 +65,9 @@
 --           with the other's S in either mode.
 --   G(g)    The role_grants rows. Locked (exclusively, in primary-key order)
 --           before they're deleted.
---   R(r)    The role's row. Shared: granting it a permission. Exclusive (by
---           deleting it): deleting the role.
+--   R(r)    The role's (user's) row. Shared: granting it a permission.
+--           Exclusive: giving it an access key, or setting an inline
+--           policy (I10); deleting the user (by deleting the row).
 --   X(x)    The blob's row. Shared: referencing it, changing or deleting
 --           a part on it, or changing its `lost_ranges` (the scrubber,
 --           which locks the row with nothing else). Exclusive: committing it, deleting it, removing a
@@ -146,6 +147,11 @@
 --     change the locations; the only other inserts are a pending blob's
 --     sinks, each with a shard of its own. A committed blob has a location
 --     for each of its shards: they change together, under X(x) exclusive.
+-- I10. A user has at most two access keys, and its inline policies hold at
+--     most 2048 characters (but whitespace) together, as in IAM: making a
+--     key, or setting a policy, holds R(r) exclusively, and counts what the
+--     user has in a later statement (T23, T24). Deleting a key or a policy
+--     only takes from either.
 --
 -- DEADLOCKS
 --
@@ -1380,6 +1386,68 @@ RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE buckets SET cors = p_config WHERE name = p_bucket;
     RETURN FOUND;
+END
+$$;
+
+-- T22: PutBucketPolicy and DeleteBucketPolicy: sets (or, with NULL, removes)
+-- the bucket's policy. A plain UPDATE of the bucket's row, as T16's: no
+-- invariant involves the policy, which requests read as they begin, not
+-- under B. Returns whether the bucket exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_policy(p_bucket text, p_policy text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE buckets SET policy = p_policy WHERE name = p_bucket;
+    RETURN FOUND;
+END
+$$;
+
+-- T23: gives a user an access key, unless it has `p_max` already (I10).
+-- Takes R(r) exclusively, then counts its keys. The key's FK check locks the
+-- row shared, which it holds already; its trigger keeps `roles.secret` (see
+-- migration 29), on the same row. Returns 'created', 'no_such_user',
+-- 'too_many' or 'taken' (another key has the ID).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_create_key(p_user text, p_id text, p_secret text, p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_role uuid;
+BEGIN
+    SELECT id INTO v_role FROM roles WHERE name = p_user FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_user';
+    END IF;
+    IF (SELECT count(*) FROM access_keys WHERE role_id = v_role) >= p_max THEN
+        RETURN 'too_many';
+    END IF;
+    INSERT INTO access_keys (access_key_id, role_id, secret) VALUES (p_id, v_role, p_secret)
+    ON CONFLICT DO NOTHING;
+    IF NOT FOUND THEN
+        RETURN 'taken';
+    END IF;
+    RETURN 'created';
+END
+$$;
+
+-- T24: sets a user's inline policy `p_name`, unless its policies would hold
+-- more than `p_max` characters (but whitespace) together (I10). Takes R(r)
+-- exclusively, then sizes the others. Returns 'set', 'no_such_user' or
+-- 'too_big'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_put_policy(p_user text, p_name text, p_document text, p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_role uuid;
+BEGIN
+    SELECT id INTO v_role FROM roles WHERE name = p_user FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_user';
+    END IF;
+    IF (SELECT coalesce(sum(length(regexp_replace(document, '\s', '', 'g'))), 0)
+        FROM role_policies WHERE role_id = v_role AND name <> p_name)
+       + length(regexp_replace(p_document, '\s', '', 'g')) > p_max THEN
+        RETURN 'too_big';
+    END IF;
+    INSERT INTO role_policies (role_id, name, document) VALUES (v_role, p_name, p_document)
+    ON CONFLICT (role_id, name) DO UPDATE SET document = EXCLUDED.document;
+    RETURN 'set';
 END
 $$;
 

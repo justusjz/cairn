@@ -1372,6 +1372,17 @@ pub(super) struct RoleSummary {
     admin: bool,
     created_at: f64,
     grants: Vec<Grant>,
+    /// Its access keys, oldest first (never their secrets).
+    keys: Vec<AccessKey>,
+    /// The names of its inline policies.
+    policies: Vec<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct AccessKey {
+    id: String,
+    active: bool,
+    created_at: f64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1399,6 +1410,12 @@ async fn list_roles(State(app): AppState) -> Result<Json<Vec<RoleSummary>>> {
                 .into_iter()
                 .map(|(bucket, permission)| Grant { bucket, permission })
                 .collect(),
+            keys: r
+                .keys
+                .into_iter()
+                .map(|k| AccessKey { id: k.id, active: k.active, created_at: k.created_at })
+                .collect(),
+            policies: r.policies,
         })
         .collect();
     Ok(Json(roles))
@@ -2017,7 +2034,7 @@ mod e2e {
         let uri = format!("{api}/roles/nobody");
         let (status, _, body) = send(&app, request("DELETE", &uri, None)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(error_of(&body), "no role named \"nobody\"");
+        assert_eq!(error_of(&body), "no user named \"nobody\"");
 
         // Unknown API routes are JSON 404s; everything else is the UI.
         let (status, _, body) = send(&app, request("GET", &format!("{api}/nope"), None)).await;

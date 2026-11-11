@@ -66,7 +66,8 @@ async fn install_functions(client: &tokio_postgres::Client) -> Result<(), tokio_
     client
         .batch_execute(&format!(
             "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED;
-             SET cairn.protocol = '{PROTOCOL}'"
+             SET cairn.protocol = '{PROTOCOL}';
+             SET cairn.users = '1'"
         ))
         .await?;
     client.batch_execute(CATALOG_FUNCTIONS).await
@@ -197,6 +198,7 @@ const MIGRATIONS: &[&str] = &[
     BUCKET_CORS,
     TAGGING,
     LAYOUTS,
+    USERS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1058,6 +1060,85 @@ CREATE INDEX blobs_large ON blobs (data_shards, parity_shards)
     WHERE state = 'committed' AND block_size IS NOT NULL AND size > 67108864;
 CREATE INDEX blobs_copies ON blobs (parity_shards)
     WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL;
+"#;
+
+/// Migration 29: users (still the `roles` table, which Cairns before this
+/// one read) get access keys of their own, several, and inline identity
+/// policies; buckets get bucket policies; and the cluster is an account, by
+/// a 12-digit ID, as IAM's principals name them (see `policy`, and
+/// `plans/policies.md`). Each role's key becomes its first access key, by
+/// the role's name. No new lock protocol: keys and policies are plain rows of
+/// their user, and a bucket's policy a plain UPDATE of its row, as its
+/// encryption is (T16); no invariant of the catalog involves them.
+///
+/// Older Cairns keep reading `roles.secret`, so that's kept as the secret of
+/// the key named as the user (an unusable one, if that key is inactive or
+/// gone), and they can't change users anymore: only sessions that declare
+/// `cairn.users` (`install_functions`) may write `roles`, as a Cairn that
+/// knows no access keys would make users without any, or change a secret
+/// that no longer counts.
+const USERS: &str = r#"
+CREATE TABLE accounts (
+    id         text PRIMARY KEY CHECK (id ~ '^[0-9]{12}$'),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO accounts (id) VALUES (lpad(floor(random() * 1e12)::bigint::text, 12, '0'));
+
+CREATE TABLE access_keys (
+    access_key_id text PRIMARY KEY,
+    role_id       uuid NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+    secret        text NOT NULL,
+    active        boolean NOT NULL DEFAULT true,
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX access_keys_role ON access_keys (role_id);
+INSERT INTO access_keys (access_key_id, role_id, secret, created_at)
+    SELECT name, id, secret, created_at FROM roles;
+
+CREATE TABLE role_policies (
+    role_id  uuid NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+    name     text NOT NULL,
+    document text NOT NULL,
+    PRIMARY KEY (role_id, name)
+);
+
+ALTER TABLE buckets ADD COLUMN policy text;
+
+CREATE TRIGGER accounts_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON accounts
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER access_keys_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON access_keys
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER role_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON role_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE FUNCTION cairn_require_users() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.users', true) IS DISTINCT FROM '1' THEN
+        RAISE EXCEPTION 'this Cairn is too old to change users, which have access keys now; upgrade it'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER roles_users BEFORE INSERT OR DELETE OR TRUNCATE OR UPDATE OF name, secret ON roles
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+
+-- What older Cairns authenticate with: the secret of the key named as the
+-- user, while it's active.
+CREATE FUNCTION cairn_legacy_secret() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    v_key access_keys;
+BEGIN
+    v_key := CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    UPDATE roles r SET secret = coalesce(
+        (SELECT k.secret FROM access_keys k WHERE k.access_key_id = r.name AND k.role_id = r.id AND k.active),
+        'unusable:' || gen_random_uuid() || gen_random_uuid())
+    WHERE r.id = v_key.role_id AND r.name = v_key.access_key_id;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER access_keys_legacy AFTER INSERT OR UPDATE OR DELETE ON access_keys
+    FOR EACH ROW EXECUTE FUNCTION cairn_legacy_secret();
 "#;
 
 #[cfg(test)]

@@ -166,9 +166,10 @@ fn parse_delete_request(body: &str) -> Option<(Vec<Target>, bool)> {
 /// DeleteObjects (batch): `POST /{bucket}?delete` with a `<Delete>` body listing
 /// keys, each optionally with a version ID. The body has been checked against
 /// its integrity headers (see `Payload`), of which S3 requires one here
-/// ([`missing_checksum`]). Authorization is per entry, as in S3: an entry naming
-/// a version needs `may_delete_versions`, any other needs `may_write`; a denied
-/// entry is reported as an AccessDenied `<Error>` and the rest still proceed.
+/// ([`missing_checksum`]). Authorization is per entry, as in S3: whether
+/// `allowed` the entry's key, and whether it names a version
+/// (`s3:DeleteObjectVersion`, else `s3:DeleteObject`); a denied entry is
+/// reported as an AccessDenied `<Error>` and the rest still proceed.
 /// The error for a DeleteObjects without an integrity header. The body *is*
 /// the list of things to destroy, so S3 requires one: Content-MD5 (minio-go)
 /// or an x-amz-checksum-* (aws-cli).
@@ -184,8 +185,7 @@ pub async fn delete_objects(
     app: &Arc<App>,
     bucket: &str,
     body: Bytes,
-    may_write: bool,
-    may_delete_versions: bool,
+    allowed: &(dyn Fn(&str, bool) -> bool + Sync),
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let Ok(body_str) = std::str::from_utf8(&body) else {
         return Ok(format_s3_error(
@@ -220,10 +220,7 @@ pub async fn delete_objects(
         .into_iter()
         .partition(|t| t.version_id.as_deref().is_some_and(|v| !is_version_id(v)));
     let (permitted, denied): (Vec<Target>, Vec<Target>) =
-        targets.into_iter().partition(|t| match t.version_id {
-            Some(_) => may_delete_versions,
-            None => may_write,
-        });
+        targets.into_iter().partition(|t| allowed(&t.key, t.version_id.is_some()));
     let outcomes = match delete_targets(app, bucket, &permitted).await? {
         DeleteStatus::Deleted(outcomes) => outcomes,
         DeleteStatus::NoSuchBucket => {

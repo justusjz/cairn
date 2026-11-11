@@ -64,7 +64,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=108
+TOTAL=110
 STEP=0
 PASS=0
 FAIL=0
@@ -1536,7 +1536,7 @@ unsupported_subresources_refused() {
     [ "$(scurl PUT "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl GET "$path?partNumber=1" "$EMPTY_SHA256" -)" = 501 ] || return 1
-    [ "$(scurl DELETE "/${BUCKET}?policy" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl DELETE "/${BUCKET}?website" "$EMPTY_SHA256" -)" = 501 ] || return 1
     check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
 }
 
@@ -2147,10 +2147,104 @@ list_buckets_filtered_ok() {
 
 # Admin is bucket management only: bucketadmin can create, HEAD, and delete a
 # bucket, but can't touch objects without a grant.
+cairn_user() { (cd "$SCRIPT_DIR" && cargo run -q -- user --database "$DB_URL" "$@"); }
+cairn_bucket_policy() { (cd "$SCRIPT_DIR" && cargo run -q -- bucket-policy --database "$DB_URL" "$@"); }
+
+# Bucket policies: only an admin sets one; it reads back as S3 keeps it, and
+# decides requests as S3's does: anonymous ones (a public prefix, and nothing
+# else: a missing key there is a 403, as the policy doesn't allow listing),
+# and a user's (allowed what it has no grant for, denied what its grant would
+# allow, with S3's messages). One that denies everyone, its admins too, the
+# superadmin can still remove.
+bucket_policy_ok() {
+    local b="pol-$(date +%s)" doc="$WORK_DIR/policy.json" deny="$WORK_DIR/deny-all.json" out arn account url
+    url="http://${SERVER_HOST}:${SERVER_PORT}/$b"
+    arn=$(cairn_user list | sed -n 's|^  \(arn:aws:iam::[0-9]*:user/writer\)$|\1|p')
+    account=$(echo "$arn" | cut -d: -f5)
+    [ -n "$account" ] || return 1
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    cairn_role grant "$ACCESS_KEY" "$b" read write >/dev/null 2>&1 || return 1
+    cairn_role grant writer "$b" write >/dev/null 2>&1 || return 1
+    printf 'public' > "$WORK_DIR/pub.txt"
+    for key in pub/a.txt private.txt; do
+        awss3 s3api put-object --bucket "$b" --key "$key" --body "$WORK_DIR/pub.txt" >/dev/null 2>&1 || return 1
+    done
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/a.txt")" = 403 ] || return 1
+    ! awss3 s3api get-bucket-policy --bucket "$b" >/dev/null 2>&1 || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[
+ {"Sid":"PublicRead","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/pub/*"},
+ {"Effect":"Allow","Principal":{"AWS":"'"$arn"'"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/private.txt"},
+ {"Effect":"Deny","Principal":{"AWS":"'"$account"'"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::'"$b"'/locked/*"}]}' \
+        > "$doc"
+    ! as_role writer writersecret s3api put-bucket-policy --bucket "$b" --policy "file://$doc" >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-policy --bucket "$b" --policy "file://$doc" >/dev/null 2>&1 || return 1
+    awss3 s3api get-bucket-policy --bucket "$b" --query Policy --output text 2>/dev/null \
+        | grep -qF "\"Principal\":{\"AWS\":\"arn:aws:iam::$account:root\"}" || return 1
+    [ "$(awss3 s3api get-bucket-policy-status --bucket "$b" --query PolicyStatus.IsPublic --output text 2>/dev/null)" = True ] \
+        || return 1
+    # Anonymous.
+    [ "$(curl -s "$url/pub/a.txt")" = public ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/private.txt")" = 403 ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/missing.txt")" = 403 ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -T "$WORK_DIR/pub.txt" "$url/pub/new.txt")" = 403 ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$url?list-type=2")" = 403 ] || return 1
+    # The writer: a read its grant doesn't give, and a write the policy takes.
+    as_role writer writersecret s3api get-object --bucket "$b" --key private.txt "$WORK_DIR/pol.out" >/dev/null 2>&1 \
+        || return 1
+    as_role writer writersecret s3api put-object --bucket "$b" --key open/x.txt --body "$WORK_DIR/pub.txt" \
+        >/dev/null 2>&1 || return 1
+    out=$(as_role writer writersecret s3api put-object --bucket "$b" --key locked/x.txt --body "$WORK_DIR/pub.txt" 2>&1) \
+        && return 1
+    echo "$out" | grep -q 'with an explicit deny in a resource-based policy' || return 1
+    # Refused as S3 refuses it.
+    out=$(awss3 s3api put-bucket-policy --bucket "$b" --policy \
+        '{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::'"$account"':user/nobody"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/*"}]}' 2>&1) \
+        && return 1
+    echo "$out" | grep -q 'Invalid principal in policy' || return 1
+    # Everyone denied everything: the admin can't even read or remove it.
+    printf '%s' '{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::'"$b"'","arn:aws:s3:::'"$b"'/*"]}]}' \
+        > "$deny"
+    awss3 s3api put-bucket-policy --bucket "$b" --policy "file://$deny" >/dev/null 2>&1 || return 1
+    ! awss3 s3api delete-bucket-policy --bucket "$b" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-object --bucket "$b" --key pub/a.txt "$WORK_DIR/pol.out" >/dev/null 2>&1 || return 1
+    cairn_bucket_policy delete "$b" >/dev/null 2>&1 || return 1
+    awss3 s3api get-object --bucket "$b" --key pub/a.txt "$WORK_DIR/pol.out" >/dev/null 2>&1 || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/a.txt")" = 403 ] || return 1
+    for key in pub/a.txt private.txt open/x.txt; do
+        awss3 s3api delete-object --bucket "$b" --key "$key" >/dev/null 2>&1
+    done
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
+# A user's access keys: a second one signs as the user until it's
+# deactivated; and an inline policy denies what a grant allows.
+user_keys_and_policies_ok() {
+    local b="keys-$(date +%s)" out id secret
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    cairn_user grant reader "$b" read >/dev/null 2>&1 || return 1
+    out=$(cairn_user key create reader) || return 1
+    id=$(echo "$out" | sed -n 's/^access key: //p')
+    secret=$(echo "$out" | sed -n 's/^secret key: //p')
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    cairn_user key deactivate "$id" >/dev/null 2>&1 || return 1
+    ! as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    cairn_user key delete "$id" >/dev/null 2>&1 || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:ListBucket","Resource":"arn:aws:s3:::'"$b"'"}]}' \
+        > "$WORK_DIR/nolist.json"
+    cairn_user policy put reader nolist "$WORK_DIR/nolist.json" >/dev/null 2>&1 || return 1
+    out=$(as_role reader readersecret s3api list-objects-v2 --bucket "$b" 2>&1) && return 1
+    echo "$out" | grep -q 'with an explicit deny in an identity-based policy' || return 1
+    cairn_user policy delete reader nolist >/dev/null 2>&1 || return 1
+    as_role reader readersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
 admin_scope_ok() {
     local a=(as_role bucketadmin adminsecret) b="adm-$(date +%s)"
     "${a[@]}" s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
-    "${a[@]}" s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api get-bucket-location --bucket "$b" >/dev/null 2>&1 || return 1
+    # HeadBucket is s3:ListBucket, as in S3: listing what's in it.
+    ! "${a[@]}" s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 1
     ! "${a[@]}" s3api put-object --bucket "$b" --key x.txt --body "$SMALL" >/dev/null 2>&1 || return 1
     ! "${a[@]}" s3api get-object --bucket "$BUCKET" --key big.bin "$WORK_DIR/adm.bin" >/dev/null 2>&1 || return 1
     "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1
@@ -2337,6 +2431,8 @@ run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok
 run_test    "Missing bucket 404, no grant 403"      missing_bucket_404_ok
 run_test    "Revoked grant takes effect"            revoke_takes_effect_ok
+run_test    "Bucket policies, anonymous and signed" bucket_policy_ok
+run_test    "Users' access keys and policies"       user_keys_and_policies_ok
 run_test    "Overwrite object, new content wins"    bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&
     s3cmd --config '$S3CFG' put '$WORK_DIR/over.txt' 's3://${BUCKET}/small.txt' >/dev/null &&

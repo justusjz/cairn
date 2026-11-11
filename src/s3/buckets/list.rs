@@ -54,6 +54,7 @@ pub async fn list_buckets(
     app: &App,
     principal: &Principal,
     query: &str,
+    all: bool,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let invalid =
         |message: &str| format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message);
@@ -73,7 +74,7 @@ pub async fn list_buckets(
     let mut listed: Vec<BucketInfo> = buckets(app)
         .await?
         .into_iter()
-        .filter(|b| principal.can_see(&b.name) && b.name.starts_with(&prefix))
+        .filter(|b| (all || principal.can_see(&b.name)) && b.name.starts_with(&prefix))
         .filter(|b| after.as_ref().is_none_or(|after| b.name > *after))
         .take(max + 1)
         .collect();

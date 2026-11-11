@@ -37,6 +37,11 @@ fn context_of(name: &str) -> Context {
     context
 }
 
+/// Whether `identity` and `bucket` allow `request`.
+fn allowed<'p>(identity: impl IntoIterator<Item = &'p Policy>, bucket: Option<&'p Policy>, request: &Request) -> bool {
+    verdict(identity, bucket, request) == Verdict::Allow
+}
+
 fn check(policy: &Policy, principal: Principal, action: &str, resource: &str, context: &Context) -> Decision {
     policy.evaluate(&Request { principal, action, resource, context })
 }
@@ -53,7 +58,7 @@ fn a_public_read_policy_allows_anyone_to_read_objects() {
     assert_eq!(check(&policy, Principal::Anonymous, "s3:PutObject", &object("a"), &none), Decision::NotApplicable);
     let bucket = format!("arn:aws:s3:::{BUCKET}");
     assert_eq!(check(&policy, Principal::Anonymous, "s3:ListBucket", &bucket, &none), Decision::NotApplicable);
-    assert!(policy.allows_everyone());
+    assert!(policy.is_public());
     // `{"AWS": "*"}` is the same.
     let aws = bucket_policy(
         r#"{"Statement":{"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject",
@@ -78,11 +83,11 @@ fn a_deny_wins() {
     tls.set("aws:securetransport", "true");
     let request = |context| Request { principal: user("alice"), action: "s3:GetObject", resource: "", context };
     let resource = object("k");
-    assert!(!decide([&identity], Some(&bucket), &Request { resource: &resource, ..request(&plain) }));
-    assert!(decide([&identity], Some(&bucket), &Request { resource: &resource, ..request(&tls) }));
-    assert!(decide([&identity], None, &Request { resource: &resource, ..request(&plain) }));
+    assert!(!allowed([&identity], Some(&bucket), &Request { resource: &resource, ..request(&plain) }));
+    assert!(allowed([&identity], Some(&bucket), &Request { resource: &resource, ..request(&tls) }));
+    assert!(allowed([&identity], None, &Request { resource: &resource, ..request(&plain) }));
     // Nothing allows: denied.
-    assert!(!decide([], None, &Request { resource: &resource, ..request(&tls) }));
+    assert!(!allowed([], None, &Request { resource: &resource, ..request(&tls) }));
 }
 
 #[test]
@@ -95,13 +100,13 @@ fn a_bucket_policy_naming_a_user_allows_it_alone() {
     let context = Context::default();
     let resource = object("k");
     let request = |name| Request { principal: user(name), action: "s3:PutObject", resource: &resource, context: &context };
-    assert!(decide([], Some(&policy), &request("carlossalazar")));
-    assert!(!decide([], Some(&policy), &request("CarlosSalazar")), "names are case-sensitive");
-    assert!(!decide([], Some(&policy), &request("alice")));
+    assert!(allowed([], Some(&policy), &request("carlossalazar")));
+    assert!(!allowed([], Some(&policy), &request("CarlosSalazar")), "names are case-sensitive");
+    assert!(!allowed([], Some(&policy), &request("alice")));
     let anonymous = Request { principal: Principal::Anonymous, ..request("x") };
-    assert!(!decide([], Some(&policy), &anonymous));
+    assert!(!allowed([], Some(&policy), &anonymous));
     assert_eq!(policy.users().collect::<Vec<_>>(), [(ACCOUNT, "carlossalazar")]);
-    assert!(!policy.allows_everyone());
+    assert!(!policy.is_public());
 }
 
 /// An account as principal allows nothing by itself (it delegates to the

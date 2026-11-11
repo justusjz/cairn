@@ -3,16 +3,16 @@ use std::sync::Arc;
 use http_body_util::BodyExt;
 use hyper::{Method, Request, Response, StatusCode};
 
-use crate::db::Cached;
 use crate::{
     App,
     auth::Rejection,
     body::{ResBody, box_response},
     payload::{self, Payload},
-    roles::{Permission, Principal},
+    roles::Principal,
     s3::{
         buckets::{
             cors::{self, delete_bucket_cors, get_bucket_cors, put_bucket_cors},
+            policy,
             create::create_bucket,
             delete::delete_bucket,
             head::head_bucket,
@@ -31,7 +31,7 @@ use crate::{
             upload_part::put_part,
         },
         objects::{
-            copy::{CopyKeys, copy_object, copy_part, parse_copy_source, replaces_metadata},
+            copy::{CopyKeys, copy_object, copy_part, replaces_metadata},
             delete::{delete_object, delete_objects, missing_checksum},
             get::{get_object, head_object},
             list::{ListVersion, MAX_KEYS_LIMIT, list_objects},
@@ -50,9 +50,8 @@ use crate::{
 
 pub(crate) mod buckets;
 pub(crate) mod checksums;
+pub(crate) mod access;
 pub(crate) mod acl;
-// Not used by requests yet (see `plans/policies.md`, step 3).
-#[allow(dead_code)]
 pub(crate) mod actions;
 pub(crate) mod conditional;
 pub(crate) mod hosting;
@@ -86,6 +85,7 @@ pub async fn handle(
     app: Arc<App>,
     what: &str,
     route: &Route,
+    peer: std::net::IpAddr,
 ) -> Response<ResBody> {
     let mut id = [0u8; 8];
     getrandom::fill(&mut id).expect("the OS random number generator failed");
@@ -95,7 +95,7 @@ pub async fn handle(
     let cross = cors::Cross::of(req.method(), req.headers(), &bucket_of(&route.path));
     let mut response = REQUEST_ID
         .scope(id.clone(), async {
-            handle_request(req, app.clone(), route).await.unwrap_or_else(|e| {
+            handle_request(req, app.clone(), route, peer).await.unwrap_or_else(|e| {
                 eprintln!("{what} failed (request {id}): {e:#}");
                 error_response(&e)
             })
@@ -123,6 +123,7 @@ async fn handle_request(
     req: Request<hyper::body::Incoming>,
     app: Arc<App>,
     route: &Route,
+    peer: std::net::IpAddr,
 ) -> anyhow::Result<Response<ResBody>> {
     // A browser's CORS preflight, which is never signed (see `cors`).
     if req.method() == Method::OPTIONS {
@@ -138,33 +139,59 @@ async fn handle_request(
     // not its headers (see `objects::post`).
     if req.method() == Method::POST && objects::post::is_form(req.headers()) {
         let path = route.path.trim_start_matches('/').to_owned();
-        return Ok(box_response(objects::post::post_object(&app, req, &path, route.virtual_host).await?));
+        return Ok(box_response(objects::post::post_object(&app, req, &path, route.virtual_host, Some(peer)).await?));
     }
-    // Authenticate every other S3 request up front: look up the role the SigV4
-    // credential names and verify the header signature with its secret. Needs
-    // only the method/URI/query/headers, so it runs before any body is read. The
-    // peer endpoint is a separate service and stays open for internal traffic.
-    let Some(access_key) = crate::auth::access_key(req.headers(), req.uri().query().unwrap_or("")) else {
-        return Ok(forbidden("AccessDenied", "request is not signed"));
+    // Authenticate every other S3 request up front: look up the user whose
+    // access key the SigV4 credential names, and verify the header signature
+    // with its secret. Needs only the method/URI/query/headers, so it runs
+    // before any body is read. A request without any signature is anonymous:
+    // only buckets' policies can allow it. The peer endpoint is a separate
+    // service and stays open for internal traffic.
+    let signed = crate::auth::signed(req.headers(), req.uri().query().unwrap_or(""));
+    let principal = match &signed {
+        Some(signed) => {
+            let Some(principal) = Principal::load(&app.pool.get().await?, &signed.access_key).await? else {
+                return Ok(forbidden("InvalidAccessKeyId", "the access key ID does not exist"));
+            };
+            // Against the path the client signed, which isn't the route's if
+            // the bucket was in its host.
+            if let Err(rejection) = crate::auth::verify_sigv4(
+                req.method().as_str(),
+                req.uri().path(),
+                req.uri().query().unwrap_or(""),
+                req.headers(),
+                &principal.secret,
+            ) {
+                return Ok(box_response(util::rejection_response(&rejection)));
+            }
+            Some(principal)
+        }
+        // A signature that isn't one (not SigV4, or malformed).
+        None if req.headers().contains_key(hyper::header::AUTHORIZATION)
+            || query_param(req.uri().query().unwrap_or(""), "X-Amz-Signature").is_some() =>
+        {
+            return Ok(forbidden("AccessDenied", "request is not signed"));
+        }
+        None => None,
     };
-    let principal = Principal::load(&app.pool.get().await?, &access_key).await?;
-    let Some(principal) = principal else {
-        return Ok(forbidden(
-            "InvalidAccessKeyId",
-            "the access key ID does not exist",
-        ));
+    let account = crate::roles::account(&app.pool.get().await?).await?;
+    let origin = access::Origin {
+        peer: Some(peer),
+        trusted_proxies: &app.trusted_proxies,
+        signed: signed.as_ref(),
+        form: false,
     };
-    // Against the path the client signed, which isn't the route's if the
-    // bucket was in its host.
-    if let Err(rejection) = crate::auth::verify_sigv4(
-        req.method().as_str(),
-        req.uri().path(),
-        req.uri().query().unwrap_or(""),
+    let mut access = access::Access::new(
+        principal.as_ref(),
+        &account,
+        req.method(),
         req.headers(),
-        &principal.secret,
-    ) {
-        return Ok(box_response(util::rejection_response(&rejection)));
-    }
+        req.uri().query().unwrap_or(""),
+        &origin,
+    )?;
+    // The secret the request's body (aws-chunked, trailers) is signed with;
+    // none for an anonymous one, whose body can't be signed.
+    let secret = principal.as_ref().map(|p| p.secret.clone()).unwrap_or_default();
     // Every key, prefix, marker and delimiter must be well-formed, so check the
     // whole path and query once, before anything decodes them.
     let mut query_values =
@@ -174,10 +201,14 @@ async fn handle_request(
     }
     let path = route.path.trim_start_matches('/');
     if path.is_empty() {
-        let resp = match req.method() {
-            &hyper::Method::GET => {
-                list_buckets(&app, &principal, req.uri().query().unwrap_or("")).await?
+        let resp = match (req.method(), &principal) {
+            // ListBuckets: every bucket, to whom `s3:ListAllMyBuckets` is
+            // allowed; else those of the user's grants (as MinIO lists them).
+            (&hyper::Method::GET, Some(principal)) => {
+                let all = access.allows(&actions::Check { action: "s3:ListAllMyBuckets", on: actions::On::Account });
+                list_buckets(&app, principal, req.uri().query().unwrap_or(""), all).await?
             }
+            (&hyper::Method::GET, None) => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
         };
         return Ok(box_response(resp));
@@ -186,10 +217,6 @@ async fn handle_request(
         Some((bucket, key)) => (decode_path_param(bucket), decode_path_param(key)),
         None => (decode_path_param(path), "".to_owned()),
     };
-    let copy_source_header = req
-        .headers()
-        .get("x-amz-copy-source")
-        .and_then(|v| v.to_str().ok());
     let query = req.uri().query().unwrap_or("");
     if key.len() > util::MAX_KEY_LENGTH {
         return Ok(box_response(format_s3_error(
@@ -203,27 +230,34 @@ async fn handle_request(
     if let Some(resp) = util::unsupported_subresource(req.method(), key.is_empty(), query) {
         return Ok(box_response(resp));
     }
-    if !authorize(&principal, req.method(), &bucket, &key, query, copy_source_header) {
+    // What the request does, as policies see it, and whether they allow it.
+    let Some(operation) = actions::operation(req.method(), &bucket, &key, query, req.headers()) else {
+        return Ok(box_response(match principal {
+            Some(_) => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
+            None => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
+        }));
+    };
+    let exists = access.load(&app, &bucket).await?;
+    access.load_all(&app, &operation.checks).await?;
+    if let Some((check, verdict)) = access.first_denied(&operation.checks) {
         // As in S3, a bucket that doesn't exist is a 404 to anyone: bucket
         // names aren't secret, only what's in them is. Except to CreateBucket,
         // which is about a bucket that isn't there yet.
-        let creates_bucket = key.is_empty() && *req.method() == Method::PUT && query.is_empty();
-        let exists = app
-            .pool
-            .get()
-            .await?
-            .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
-            .await?
-            .is_some();
-        if !exists && !creates_bucket {
+        if !exists && operation.name != "CreateBucket" {
             return Ok(box_response(format_s3_error(
                 StatusCode::NOT_FOUND,
                 "NoSuchBucket",
                 "the specified bucket does not exist",
             )));
         }
-        return Ok(forbidden("AccessDenied", "Access Denied"));
+        return Ok(box_response(access.denied(check, verdict)));
     }
+    // A key (or version) that isn't there is a 403 to whom may not list the
+    // bucket, as in S3 (probed), so that keys can't be found by guessing.
+    let hides_missing = |status: StatusCode| {
+        let list = actions::Check { action: "s3:ListBucket", on: actions::On::Bucket(bucket.clone()) };
+        status == StatusCode::NOT_FOUND && !access.allows(&list)
+    };
     if key.is_empty() {
         // bucket operations. POST (DeleteObjects) consumes the body, so capture the
         // query up front and match on an owned method — mirroring the object branch
@@ -246,6 +280,12 @@ async fn handle_request(
             }
             if query_param(&query, "cors").is_some() {
                 return Ok(box_response(get_bucket_cors(&app, &bucket).await?));
+            }
+            if query_param(&query, "policyStatus").is_some() {
+                return Ok(box_response(policy::get_bucket_policy_status(&app, &bucket).await?));
+            }
+            if query_param(&query, "policy").is_some() {
+                return Ok(box_response(policy::get_bucket_policy(&app, &bucket).await?));
             }
             if query_param(&query, "tagging").is_some() {
                 return Ok(box_response(get_bucket_tagging(&app, &bucket).await?));
@@ -364,7 +404,7 @@ async fn handle_request(
             // PutBucketVersioning: PUT /{bucket}?versioning with a
             // <VersioningConfiguration> body.
             hyper::Method::PUT if query_param(&query, "versioning").is_some() => {
-                match read_body(req, &principal.secret, true).await? {
+                match read_body(req, &secret, true).await? {
                     Ok(body) => put_bucket_versioning(&app, &bucket, body).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
@@ -372,8 +412,11 @@ async fn handle_request(
             // PutBucketEncryption: PUT /{bucket}?encryption with a
             // <ServerSideEncryptionConfiguration> body.
             hyper::Method::PUT if query_param(&query, "encryption").is_some() => {
-                match read_body(req, &principal.secret, true).await? {
-                    Ok(body) => put_bucket_encryption(&app, &bucket, body, principal.id).await?,
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => {
+                        let role = principal.as_ref().map_or(uuid::Uuid::nil(), |p| p.id);
+                        put_bucket_encryption(&app, &bucket, body, role).await?
+                    }
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
@@ -384,7 +427,7 @@ async fn handle_request(
                 if !payload::has_body_checksum(req.headers()) {
                     return Ok(box_response(missing_checksum()));
                 }
-                match read_body(req, &principal.secret, true).await? {
+                match read_body(req, &secret, true).await? {
                     Ok(body) => put_bucket_lifecycle(&app, &bucket, body).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
@@ -395,7 +438,7 @@ async fn handle_request(
                 if !payload::has_body_checksum(req.headers()) {
                     return Ok(box_response(missing_checksum()));
                 }
-                match read_body(req, &principal.secret, true).await? {
+                match read_body(req, &secret, true).await? {
                     Ok(body) => put_bucket_cors(&app, &bucket, body).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
@@ -406,8 +449,15 @@ async fn handle_request(
                 if !payload::has_body_checksum(req.headers()) {
                     return Ok(box_response(missing_checksum()));
                 }
-                match read_body(req, &principal.secret, true).await? {
+                match read_body(req, &secret, true).await? {
                     Ok(body) => put_bucket_tagging(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
+            // PutBucketPolicy: PUT /{bucket}?policy with the policy (JSON).
+            hyper::Method::PUT if query_param(&query, "policy").is_some() => {
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => policy::put_bucket_policy(&app, &bucket, body).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
@@ -425,11 +475,14 @@ async fn handle_request(
                 if !payload::has_body_checksum(req.headers()) {
                     return Ok(box_response(missing_checksum()));
                 }
-                match read_body(req, &principal.secret, true).await? {
+                match read_body(req, &secret, true).await? {
                     Ok(body) => {
-                        let may_write = principal.can(Permission::Write, &bucket);
-                        let may_delete_versions = principal.can(Permission::DeleteVersion, &bucket);
-                        delete_objects(&app, &bucket, body, may_write, may_delete_versions).await?
+                        // Each key on its own, as in S3.
+                        let allowed = |key: &str, version: bool| {
+                            let on = actions::On::Object(bucket.clone(), key.to_owned());
+                            access.allows(&actions::Check { action: actions::delete(version), on })
+                        };
+                        delete_objects(&app, &bucket, body, &allowed).await?
                     }
                     Err(rejection) => util::rejection_response(&rejection),
                 }
@@ -439,6 +492,9 @@ async fn handle_request(
             }
             hyper::Method::DELETE if query_param(&query, "lifecycle").is_some() => {
                 delete_bucket_lifecycle(&app, &bucket).await?
+            }
+            hyper::Method::DELETE if query_param(&query, "policy").is_some() => {
+                policy::delete_bucket_policy(&app, &bucket).await?
             }
             hyper::Method::DELETE if query_param(&query, "cors").is_some() => {
                 delete_bucket_cors(&app, &bucket).await?
@@ -484,7 +540,7 @@ async fn handle_request(
         let version_id = version_id.as_deref();
         let resp = match req.method().clone() {
             Method::GET => get_object_tagging(&app, &bucket, &key, version_id).await?,
-            Method::PUT => match read_body(req, &principal.secret, true).await? {
+            Method::PUT => match read_body(req, &secret, true).await? {
                 Ok(body) => put_object_tagging(&app, &bucket, &key, version_id, body).await?,
                 Err(rejection) => util::rejection_response(&rejection),
             },
@@ -543,7 +599,7 @@ async fn handle_request(
     // How an object write asks for its object to be encrypted.
     let wanted = sse::Wanted::new(customer_key.as_ref(), server.as_ref());
     // Who the KMS is asked as, for SSE-KMS (see `kms`).
-    let role = Some(principal.id);
+    let role = principal.as_ref().map(|p| p.id);
     // An object write may only ask for the ACL there is (see `acl`).
     if writes_object && let Err(refused) = acl::check_write(req.headers(), acl::On::Object) {
         return Ok(box_response(refused));
@@ -576,7 +632,7 @@ async fn handle_request(
                 list_parts(&app, &bucket, &key, &upload_id, marker, max_parts, customer_key.as_ref(), role).await?;
             return Ok(box_response(resp));
         }
-        return get_object(
+        let response = get_object(
             &app,
             &bucket,
             &key,
@@ -587,8 +643,11 @@ async fn handle_request(
             role,
             checksum_mode,
         )
-        .await
-        .map(|response| overrides.apply(response));
+        .await?;
+        if hides_missing(response.status()) {
+            return Ok(box_response(access.denied(&operation.checks[0], crate::policy::Verdict::ImplicitDeny)));
+        }
+        return Ok(overrides.apply(response));
     }
     let content_type = req
         .headers()
@@ -619,7 +678,7 @@ async fn handle_request(
     // The copy endpoints gate on the *source* via x-amz-copy-source-if-* headers.
     let copy_source_preconditions = Preconditions::from_copy_source_headers(req.headers());
     // What the request claims about an uploaded body, checked as it streams.
-    let payload = Payload::new(req.headers(), &principal.secret, true);
+    let payload = Payload::new(req.headers(), &secret, true);
     // The metadata a write stores with its object, or why it's refused. Only
     // the writes that take the request's metadata look at it.
     let metadata = metadata::from_request(req.headers());
@@ -642,8 +701,8 @@ async fn handle_request(
         Some(_) => Err(format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "Unknown tagging directive.")),
     };
     let resp = match req.method().clone() {
-        hyper::Method::HEAD => overrides.apply(
-            head_object(
+        hyper::Method::HEAD => {
+            let response = head_object(
                 &app,
                 &bucket,
                 &key,
@@ -654,8 +713,12 @@ async fn handle_request(
                 role,
                 checksum_mode,
             )
-            .await?,
-        ),
+            .await?;
+            match hides_missing(response.status()) {
+                true => access.denied(&operation.checks[0], crate::policy::Verdict::ImplicitDeny),
+                false => overrides.apply(response),
+            }
+        }
         // AbortMultipartUpload
         hyper::Method::DELETE if query_param(&query, "uploadId").is_some() => {
             let upload_id = query_param(&query, "uploadId").unwrap_or_default();
@@ -689,7 +752,7 @@ async fn handle_request(
                 Ok(claimed) => claimed,
                 Err(refused) => return Ok(box_response(refused)),
             };
-            match read_body(req, &principal.secret, false).await? {
+            match read_body(req, &secret, false).await? {
                 Ok(body) => {
                     let upload_id = query_param(&query, "uploadId").unwrap_or_default();
                     let customer_key = customer_key.as_ref();
@@ -890,6 +953,7 @@ pub(crate) const BUCKET_CONFIGURATION: &[&str] = &[
     "location",
     "object-lock",
     "policy",
+    "policyStatus",
     "cors",
     "tagging",
     "lifecycle",
@@ -911,6 +975,7 @@ pub(crate) const BUCKET_CONFIGURATION: &[&str] = &[
 /// `write` for the rest. A copy also needs `read` on
 /// its source bucket. DeleteObjects only needs one of `write` / `delete-version`
 /// here; it checks each entry against them itself.
+#[cfg(test)]
 pub(crate) fn authorize(
     principal: &Principal,
     method: &Method,
@@ -919,6 +984,7 @@ pub(crate) fn authorize(
     query: &str,
     copy_source: Option<&str>,
 ) -> bool {
+    use crate::{roles::Permission, s3::objects::copy::parse_copy_source};
     if key.is_empty() {
         return match *method {
             Method::PUT | Method::DELETE => principal.admin,

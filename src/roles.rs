@@ -1,13 +1,18 @@
-//! Roles: the S3 credentials Cairn accepts, and what each may do.
+//! Users (called roles before; still the `roles` table): who may make S3
+//! requests, with which access keys, and what each may do.
 //!
-//! A role is an access key ID (its name) plus a secret. It may be an *admin*,
-//! which allows bucket management (create / delete / list every bucket), and it
-//! holds per-bucket `read` / `write` grants for object access. Admin does not
-//! imply object access; that always needs an explicit grant.
+//! A user has a name (its ARN is `arn:aws:iam::<account>:user/<name>`), up to
+//! two access keys (an ID and a secret; the first is named as the user, as a
+//! role's one key was), and permissions: it may be an *admin*, which allows
+//! bucket management (create / delete / list every bucket), it holds
+//! per-bucket `read` / `write` / `delete-version` grants for object access,
+//! and it may have inline identity policies of its own (see `policy`). Admin
+//! does not imply object access; that always needs a grant (or a policy).
 //!
 //! Everything lives in Postgres, so every node sees a change immediately. The
-//! `cairn role …` subcommands manage it directly against the database, and the
-//! dashboard (see `dashboard`) through the same functions.
+//! `cairn user …` subcommands (`cairn role …`, as before) manage it directly
+//! against the database, and the dashboard (see `dashboard`) through the same
+//! functions.
 
 use std::collections::HashSet;
 
@@ -51,30 +56,40 @@ impl Permission {
     }
 }
 
-/// An authenticated role's secret and permissions, loaded once per request.
+/// An authenticated user's secret (its access key's) and permissions, loaded
+/// once per request.
 pub struct Principal {
-    /// The role's ID, which the KMS knows it by (see `kms`).
+    /// The user's ID, which the KMS knows it by (see `kms`).
     pub id: uuid::Uuid,
+    pub name: String,
+    /// The account the user is of (the cluster's).
+    pub account: String,
+    /// The secret of the access key the request is signed with.
     pub secret: String,
     pub admin: bool,
     read: HashSet<String>,
     write: HashSet<String>,
     delete_version: HashSet<String>,
+    /// The user's inline identity policies, as they were set.
+    pub policies: Vec<String>,
 }
 
 impl Principal {
-    /// Loads the role whose name is `access_key`, or `None` if there is none.
+    /// Loads the user whose active access key `access_key` is, or `None` if
+    /// there's none.
     pub async fn load(client: &Object, access_key: &str) -> anyhow::Result<Option<Self>> {
         let row = client
             .query_opt_cached(
-                "SELECT r.secret, r.admin, r.id,
+                "SELECT k.secret, r.admin, r.id, r.name, (SELECT id FROM accounts),
                         ARRAY(SELECT bucket FROM role_grants
                               WHERE role = r.name AND permission = 'read'),
                         ARRAY(SELECT bucket FROM role_grants
                               WHERE role = r.name AND permission = 'write'),
                         ARRAY(SELECT bucket FROM role_grants
-                              WHERE role = r.name AND permission = 'delete-version')
-                 FROM roles r WHERE r.name = $1",
+                              WHERE role = r.name AND permission = 'delete-version'),
+                        ARRAY(SELECT document FROM role_policies WHERE role_id = r.id ORDER BY name)
+                 FROM access_keys k JOIN roles r ON r.id = k.role_id
+                 WHERE k.access_key_id = $1 AND k.active",
                 &[&access_key],
             )
             .await?;
@@ -82,12 +97,17 @@ impl Principal {
             secret: r.get(0),
             admin: r.get(1),
             id: r.get(2),
-            read: r.get::<_, Vec<String>>(3).into_iter().collect(),
-            write: r.get::<_, Vec<String>>(4).into_iter().collect(),
-            delete_version: r.get::<_, Vec<String>>(5).into_iter().collect(),
+            name: r.get(3),
+            account: r.get(4),
+            read: r.get::<_, Vec<String>>(5).into_iter().collect(),
+            write: r.get::<_, Vec<String>>(6).into_iter().collect(),
+            delete_version: r.get::<_, Vec<String>>(7).into_iter().collect(),
+            policies: r.get(8),
         }))
     }
 
+    /// What a grant allowed before there were policies (see `s3::authorize`).
+    #[cfg(test)]
     pub fn can(&self, permission: Permission, bucket: &str) -> bool {
         match permission {
             Permission::Read => self.read.contains(bucket),
@@ -104,12 +124,23 @@ impl Principal {
         };
         Principal {
             id: uuid::Uuid::nil(),
+            name: "test".to_owned(),
+            account: "123456789012".to_owned(),
             secret: String::new(),
             admin,
             read: on(Permission::Read),
             write: on(Permission::Write),
             delete_version: on(Permission::DeleteVersion),
+            policies: Vec::new(),
         }
+    }
+
+    /// The user's grants, as (permission, bucket).
+    pub fn grants(&self) -> impl Iterator<Item = (Permission, &str)> {
+        let read = self.read.iter().map(|b| (Permission::Read, b.as_str()));
+        let write = self.write.iter().map(|b| (Permission::Write, b.as_str()));
+        let delete_version = self.delete_version.iter().map(|b| (Permission::DeleteVersion, b.as_str()));
+        read.chain(write).chain(delete_version)
     }
 
     /// Whether the role may learn that `bucket` exists: admins see every bucket,
@@ -135,18 +166,20 @@ pub struct RoleArgs {
 
 #[derive(Subcommand, Debug)]
 enum RoleCommand {
-    /// Create a role. Prints its secret; a random one is generated unless given.
+    /// Create a user, with an access key named as it. Prints the key's
+    /// secret; a random one is generated unless given.
     Create {
-        /// Role name, used by clients as the access key ID.
+        /// The user's name, which its first access key's ID is too.
         name: String,
         /// Use this secret instead of generating one (at least 8 characters).
         #[arg(long)]
         secret: Option<String>,
-        /// Allow the role to create, delete, and list all buckets.
+        /// Allow the user to create, delete, and list all buckets.
         #[arg(long)]
         admin: bool,
     },
-    /// Change a role's admin flag and/or secret.
+    /// Change a user's admin flag, and/or the secret of its access key named
+    /// as it.
     Update {
         name: String,
         /// Grant (true) or revoke (false) bucket management.
@@ -159,10 +192,17 @@ enum RoleCommand {
         #[arg(long)]
         secret: Option<String>,
     },
-    /// Delete a role and all its grants.
+    /// Delete a user, and all its access keys, grants and policies.
     Delete { name: String },
-    /// List roles, their admin flag, and their grants (secrets are not shown).
+    /// List users, their admin flag, access keys, grants and policies
+    /// (secrets are not shown).
     List,
+    /// Manage a user's access keys (at most two).
+    #[command(subcommand)]
+    Key(KeyCommand),
+    /// Manage a user's inline identity policies (IAM's policy language).
+    #[command(subcommand)]
+    Policy(PolicyCommand),
     /// Grant permissions on an existing bucket. Grants are removed when their
     /// bucket is deleted.
     Grant {
@@ -180,7 +220,38 @@ enum RoleCommand {
     },
 }
 
-/// `cairn role …`: role management, straight against the database.
+#[derive(Subcommand, Debug)]
+enum KeyCommand {
+    /// Make a new access key for a user. Prints its ID and secret.
+    Create {
+        user: String,
+        /// Use this ID (else a random one of 20 characters).
+        #[arg(long)]
+        id: Option<String>,
+        /// Use this secret (else a random one).
+        #[arg(long)]
+        secret: Option<String>,
+    },
+    /// Delete an access key.
+    Delete { id: String },
+    /// Let an access key sign requests again.
+    Activate { id: String },
+    /// Stop an access key from signing requests, without deleting it.
+    Deactivate { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCommand {
+    /// Set a user's inline policy `name` to the JSON in `file` (`-`: stdin).
+    Put { user: String, name: String, file: String },
+    /// Print a user's inline policy.
+    Get { user: String, name: String },
+    /// Delete a user's inline policy.
+    Delete { user: String, name: String },
+}
+
+/// `cairn user …` (or `cairn role …`): user management, straight against
+/// the database.
 pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
     let pool = crate::db::connect(&args.database).await?;
     let client = pool.get().await?;
@@ -214,18 +285,48 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
         }
         RoleCommand::Delete { name } => delete(&client, &name).await?,
         RoleCommand::List => {
+            let account = account(&client).await?;
             for role in list(&client).await? {
                 let admin = if role.admin { " (admin)" } else { "" };
                 println!("{}{admin}", role.name);
+                println!("  arn:aws:iam::{account}:user/{}", role.name);
                 println!("  id {}", role.id);
                 if let Some(entity) = role.kms_entity_id {
                     println!("  KMS entity {entity}");
                 }
+                for key in role.keys {
+                    let state = if key.active { "" } else { " (inactive)" };
+                    println!("  key {}{state}", key.id);
+                }
                 for (bucket, permission) in role.grants {
                     println!("  {bucket}:{}", permission.as_str());
                 }
+                for policy in role.policies {
+                    println!("  policy {policy}");
+                }
             }
         }
+        RoleCommand::Key(command) => match command {
+            KeyCommand::Create { user, id, secret } => {
+                let (id, secret) = create_key(&client, &user, id, secret).await?;
+                println!("access key: {id}");
+                println!("secret key: {secret}");
+            }
+            KeyCommand::Delete { id } => delete_key(&client, &id).await?,
+            KeyCommand::Activate { id } => set_key_active(&client, &id, true).await?,
+            KeyCommand::Deactivate { id } => set_key_active(&client, &id, false).await?,
+        },
+        RoleCommand::Policy(command) => match command {
+            PolicyCommand::Put { user, name, file } => {
+                let document = match file.as_str() {
+                    "-" => std::io::read_to_string(std::io::stdin())?,
+                    path => std::fs::read_to_string(path)?,
+                };
+                put_policy(&client, &user, &name, &document).await?;
+            }
+            PolicyCommand::Get { user, name } => println!("{}", get_policy(&client, &user, &name).await?),
+            PolicyCommand::Delete { user, name } => delete_policy(&client, &user, &name).await?,
+        },
         RoleCommand::Grant {
             name,
             bucket,
@@ -288,8 +389,8 @@ pub fn generate_secret() -> anyhow::Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// Creates a role, with `secret` or else a generated one, and returns its
-/// secret.
+/// Creates a user, with an access key named as it, of `secret` or else a
+/// generated one, and returns its secret.
 pub async fn create(
     client: &Object,
     name: &str,
@@ -304,17 +405,179 @@ pub async fn create(
         }
         None => generate_secret()?,
     };
+    if key_exists(client, name).await? {
+        return Err(invalid(format!("an access key named {name:?} already exists")));
+    }
+    // One statement: the user and its key, or neither. (`roles.secret` is
+    // what older Cairns authenticate with; the key's trigger keeps it.)
     let inserted = client
         .execute_cached(
-            "INSERT INTO roles (name, secret, admin) VALUES ($1, $2, $3)
-             ON CONFLICT DO NOTHING",
+            "WITH r AS (
+                 INSERT INTO roles (name, secret, admin) VALUES ($1, $2, $3)
+                 ON CONFLICT DO NOTHING RETURNING id
+             )
+             INSERT INTO access_keys (access_key_id, role_id, secret) SELECT $1, id, $2 FROM r",
             &[&name, &secret, &admin],
         )
-        .await?;
-    if inserted == 0 {
-        return Err(invalid(format!("a role named {name:?} already exists")));
+        .await;
+    match inserted {
+        Ok(0) => Err(invalid(format!("a user named {name:?} already exists"))),
+        Ok(_) => Ok(secret),
+        // Another key took the name meanwhile.
+        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
+            Err(invalid(format!("an access key named {name:?} already exists")))
+        }
+        Err(e) => Err(e.into()),
     }
-    Ok(secret)
+}
+
+/// The cluster's account ID (see `accounts`), which never changes (until
+/// there are tenants), so it's read once.
+pub async fn account(client: &Object) -> anyhow::Result<String> {
+    static ACCOUNT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(account) = ACCOUNT.get() {
+        return Ok(account.clone());
+    }
+    let account: String = client.query_one_cached("SELECT id FROM accounts", &[]).await?.get(0);
+    // Each test's database has an account of its own.
+    if !cfg!(test) {
+        let _ = ACCOUNT.set(account.clone());
+    }
+    Ok(account)
+}
+
+async fn key_exists(client: &Object, id: &str) -> anyhow::Result<bool> {
+    Ok(client.query_opt_cached("SELECT 1 FROM access_keys WHERE access_key_id = $1", &[&id]).await?.is_some())
+}
+
+/// The most access keys a user may have, as in IAM.
+const MAX_KEYS: i32 = 2;
+
+/// A random access key ID: 20 characters of base32, as long as AWS's.
+fn generate_key_id() -> anyhow::Result<String> {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let mut bytes = [0u8; 20];
+    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("generating an access key ID: {e}"))?;
+    Ok(bytes.iter().map(|b| ALPHABET[(*b & 31) as usize] as char).collect())
+}
+
+/// Makes a new access key for `user` (with `id` and `secret`, or random
+/// ones), if it has fewer than two. Returns them.
+pub async fn create_key(
+    client: &Object,
+    user: &str,
+    id: Option<String>,
+    secret: Option<String>,
+) -> anyhow::Result<(String, String)> {
+    let id = match id {
+        Some(id) => {
+            validate_name(&id)?;
+            id
+        }
+        None => generate_key_id()?,
+    };
+    let secret = match secret {
+        Some(s) => {
+            validate_secret(&s)?;
+            s
+        }
+        None => generate_secret()?,
+    };
+    // At most two (I10: `cairn_create_key` counts them under the user's
+    // row, held exclusively).
+    let status = client
+        .query_one_cached("SELECT pg_temp.cairn_create_key($1, $2, $3, $4)", &[&user, &id, &secret, &MAX_KEYS])
+        .await?;
+    match status.get::<_, &str>(0) {
+        "created" => Ok((id, secret)),
+        "no_such_user" => Err(invalid(format!("no user named {user:?}"))),
+        "too_many" => Err(invalid(format!("{user:?} has {MAX_KEYS} access keys already; delete one first"))),
+        "taken" => Err(invalid(format!("an access key named {id:?} already exists"))),
+        status => unreachable!("cairn_create_key: unknown status {status}"),
+    }
+}
+
+/// Deletes an access key.
+pub async fn delete_key(client: &Object, id: &str) -> anyhow::Result<()> {
+    let deleted = client.execute_cached("DELETE FROM access_keys WHERE access_key_id = $1", &[&id]).await?;
+    if deleted == 0 {
+        return Err(invalid(format!("no access key {id:?}")));
+    }
+    Ok(())
+}
+
+/// Lets an access key sign requests, or stops it.
+pub async fn set_key_active(client: &Object, id: &str, active: bool) -> anyhow::Result<()> {
+    let updated = client
+        .execute_cached("UPDATE access_keys SET active = $2 WHERE access_key_id = $1", &[&id, &active])
+        .await?;
+    if updated == 0 {
+        return Err(invalid(format!("no access key {id:?}")));
+    }
+    Ok(())
+}
+
+/// The most a user's inline policies may hold together, in characters
+/// other than whitespace, as in IAM.
+const MAX_POLICIES: usize = 2048;
+
+/// Whether `name` may name an inline policy, as in IAM.
+fn validate_policy_name(name: &str) -> anyhow::Result<()> {
+    let valid = (1..=128).contains(&name.len())
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c));
+    if !valid {
+        return Err(invalid("a policy's name must be 1 to 128 of A-Z, a-z, 0-9 and +=,.@_-"));
+    }
+    Ok(())
+}
+
+/// Sets `user`'s inline policy `name` to `document`, if it's a valid
+/// identity policy (see `policy`), and the user's policies stay within
+/// IAM's size.
+pub async fn put_policy(client: &Object, user: &str, name: &str, document: &str) -> anyhow::Result<()> {
+    validate_policy_name(name)?;
+    crate::policy::Policy::parse(document, crate::policy::Kind::Identity)
+        .map_err(|e| invalid(format!("{}: {}", e.code, e.message)))?;
+    // Within IAM's size (I10: `cairn_put_policy` sizes them under the
+    // user's row, held exclusively).
+    let max = MAX_POLICIES as i32;
+    let status = client
+        .query_one_cached("SELECT pg_temp.cairn_put_policy($1, $2, $3, $4)", &[&user, &name, &document, &max])
+        .await?;
+    match status.get::<_, &str>(0) {
+        "set" => Ok(()),
+        "no_such_user" => Err(invalid(format!("no user named {user:?}"))),
+        "too_big" => Err(invalid(format!(
+            "a user's inline policies may hold {MAX_POLICIES} characters (but whitespace) together"
+        ))),
+        status => unreachable!("cairn_put_policy: unknown status {status}"),
+    }
+}
+
+/// `user`'s inline policy `name`, as it was set.
+pub async fn get_policy(client: &Object, user: &str, name: &str) -> anyhow::Result<String> {
+    let row = client
+        .query_opt_cached(
+            "SELECT p.document FROM role_policies p JOIN roles r ON r.id = p.role_id
+             WHERE r.name = $1 AND p.name = $2",
+            &[&user, &name],
+        )
+        .await?;
+    row.map(|r| r.get(0)).ok_or_else(|| invalid(format!("{user:?} has no policy {name:?}")))
+}
+
+/// Deletes `user`'s inline policy `name`.
+pub async fn delete_policy(client: &Object, user: &str, name: &str) -> anyhow::Result<()> {
+    let deleted = client
+        .execute_cached(
+            "DELETE FROM role_policies p USING roles r WHERE r.id = p.role_id AND r.name = $1 AND p.name = $2",
+            &[&user, &name],
+        )
+        .await?;
+    if deleted == 0 {
+        return Err(invalid(format!("{user:?} has no policy {name:?}")));
+    }
+    Ok(())
 }
 
 /// Changes a role's admin flag and/or secret.
@@ -332,15 +595,26 @@ pub async fn update(
     if let Some(s) = &secret {
         validate_secret(s)?;
     }
-    let updated = client
-        .execute_cached(
-            "UPDATE roles SET admin = COALESCE($2, admin), secret = COALESCE($3, secret)
-             WHERE name = $1",
-            &[&name, &admin, &secret],
-        )
-        .await?;
-    if updated == 0 {
-        return Err(invalid(format!("no role named {name:?}")));
+    if let Some(admin) = admin {
+        let updated = client.execute_cached("UPDATE roles SET admin = $2 WHERE name = $1", &[&name, &admin]).await?;
+        if updated == 0 {
+            return Err(invalid(format!("no user named {name:?}")));
+        }
+    }
+    if let Some(secret) = secret {
+        // The key named as the user (its first, a role's only one).
+        let updated = client
+            .execute_cached(
+                "UPDATE access_keys k SET secret = $2 FROM roles r
+                 WHERE r.name = $1 AND k.role_id = r.id AND k.access_key_id = r.name",
+                &[&name, &secret],
+            )
+            .await?;
+        if updated == 0 {
+            return Err(invalid(format!(
+                "no access key named as the user {name:?}; make the user a new key instead"
+            )));
+        }
     }
     Ok(())
 }
@@ -354,7 +628,7 @@ pub async fn delete(client: &Object, name: &str) -> anyhow::Result<()> {
         .await?
         .get(0);
     if !deleted {
-        return Err(invalid(format!("no role named {name:?}")));
+        return Err(invalid(format!("no user named {name:?}")));
     }
     Ok(())
 }
@@ -392,7 +666,15 @@ pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A role as listed: never with its secret.
+/// An access key as listed: never with its secret.
+pub struct KeyInfo {
+    pub id: String,
+    pub active: bool,
+    /// When it was made, in seconds since the Unix epoch.
+    pub created_at: f64,
+}
+
+/// A user as listed: never with its secrets.
 pub struct RoleInfo {
     pub name: String,
     pub admin: bool,
@@ -404,6 +686,10 @@ pub struct RoleInfo {
     pub kms_entity_id: Option<String>,
     /// (bucket, permission), sorted.
     pub grants: Vec<(String, Permission)>,
+    /// Its access keys, oldest first.
+    pub keys: Vec<KeyInfo>,
+    /// The names of its inline policies, sorted.
+    pub policies: Vec<String>,
 }
 
 /// Every role, by name.
@@ -415,7 +701,14 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                           WHERE g.role = r.name ORDER BY g.bucket, g.permission),
                     ARRAY(SELECT g.permission FROM role_grants g
                           WHERE g.role = r.name ORDER BY g.bucket, g.permission),
-                    r.id, r.kms_entity_id
+                    r.id, r.kms_entity_id,
+                    ARRAY(SELECT k.access_key_id FROM access_keys k WHERE k.role_id = r.id
+                          ORDER BY k.created_at, k.access_key_id),
+                    ARRAY(SELECT k.active FROM access_keys k WHERE k.role_id = r.id
+                          ORDER BY k.created_at, k.access_key_id),
+                    ARRAY(SELECT extract(epoch FROM k.created_at)::float8 FROM access_keys k
+                          WHERE k.role_id = r.id ORDER BY k.created_at, k.access_key_id),
+                    ARRAY(SELECT p.name FROM role_policies p WHERE p.role_id = r.id ORDER BY p.name)
              FROM roles r ORDER BY r.name",
             &[],
         )
@@ -430,6 +723,14 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                 created_at: r.get(2),
                 id: r.get(5),
                 kms_entity_id: r.get(6),
+                keys: r
+                    .get::<_, Vec<String>>(7)
+                    .into_iter()
+                    .zip(r.get::<_, Vec<bool>>(8))
+                    .zip(r.get::<_, Vec<f64>>(9))
+                    .map(|((id, active), created_at)| KeyInfo { id, active, created_at })
+                    .collect(),
+                policies: r.get(10),
                 grants: buckets
                     .into_iter()
                     .zip(permissions.iter())
@@ -448,7 +749,7 @@ async fn require_role(client: &Object, name: &str) -> anyhow::Result<()> {
         .await?
         .is_none()
     {
-        return Err(invalid(format!("no role named {name:?}")));
+        return Err(invalid(format!("no user named {name:?}")));
     }
     Ok(())
 }
@@ -467,7 +768,7 @@ pub async fn grant(
         .await?;
     match status.get::<_, &str>(0) {
         "granted" => Ok(()),
-        "no_such_role" => Err(invalid(format!("no role named {name:?}"))),
+        "no_such_role" => Err(invalid(format!("no user named {name:?}"))),
         "no_such_bucket" => Err(invalid(format!("no bucket named {bucket:?}; create it first"))),
         status => unreachable!("cairn_grant: unknown status {status}"),
     }

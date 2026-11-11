@@ -192,6 +192,18 @@ impl Condition {
     pub fn key(&self) -> &str {
         &self.key
     }
+
+    /// Whether the condition limits a statement to fixed values of `key`:
+    /// a positive operator (not over a set), values without wildcards.
+    pub fn fixes(&self, key: &str) -> bool {
+        self.key.eq_ignore_ascii_case(key)
+            && !self.negated
+            && !self.if_exists
+            && self.set.is_none()
+            && self.op != Op::Null
+            && !self.values.is_empty()
+            && self.values.iter().all(|v| !v.contains(['*', '?']))
+    }
 }
 
 fn number(text: &str) -> Option<f64> {
@@ -203,6 +215,24 @@ fn boolean(text: &str) -> Option<bool> {
         t if t.eq_ignore_ascii_case("true") => Some(true),
         t if t.eq_ignore_ascii_case("false") => Some(false),
         _ => None,
+    }
+}
+
+/// A block of addresses: an address and the bits of it that count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Network {
+    address: IpAddr,
+    bits: u8,
+}
+
+impl Network {
+    /// A CIDR block, or one address (all of its bits).
+    pub fn parse(text: &str) -> Option<Network> {
+        cidr(text).map(|(address, bits)| Network { address, bits })
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        in_network(ip.to_canonical(), self.address, self.bits)
     }
 }
 
@@ -387,8 +417,6 @@ const S3_EVALUATED: &[&str] = &[
     "s3:if-none-match",
     "s3:max-keys",
     "s3:prefix",
-    "s3:requestobjecttag/",
-    "s3:requestobjecttagkeys",
     "s3:resourceaccount",
     "s3:signatureage",
     "s3:signatureversion",
@@ -455,7 +483,8 @@ pub fn support(key: &str) -> Option<Support> {
         return Some(Support::Absent);
     }
     // The rest of S3's keys (existing object and bucket tags, object lock,
-    // TLS versions, ...) aren't evaluated yet.
+    // TLS versions, the tags a request sets: PutObjectTagging's are in its
+    // body, which is read after it's authorized, ...) aren't evaluated yet.
     let known = super::s3_actions::CONDITION_KEYS.iter().any(|entry| {
         let entry = entry.to_ascii_lowercase();
         let entry = entry.split_once('/').map_or(entry.clone(), |(prefix, _)| format!("{prefix}/"));
@@ -618,7 +647,7 @@ mod tests {
         assert_eq!(support("aws:SourceIp"), Some(Support::Evaluated));
         assert_eq!(support("AWS:SOURCEVPCE"), Some(Support::Absent));
         assert_eq!(support("s3:prefix"), Some(Support::Evaluated));
-        assert_eq!(support("s3:RequestObjectTag/Project"), Some(Support::Evaluated));
+        assert_eq!(support("s3:RequestObjectTag/Project"), Some(Support::Unsupported));
         assert_eq!(support("s3:RequestObjectTag/"), None);
         assert_eq!(support("s3:ExistingObjectTag/Project"), Some(Support::Unsupported));
         assert_eq!(support("s3:object-lock-mode"), Some(Support::Unsupported));
