@@ -332,6 +332,14 @@ export interface components {
             consolidate_bytes: number;
             /**
              * Format: int64
+             * @description Replicated blobs old and large enough to be erasure-coded, once
+             *     coding is on (see `packer::coding`).
+             */
+            convert: number;
+            /** Format: int64 */
+            convert_bytes: number;
+            /**
+             * Format: int64
              * @description Entries of the garbage log the packer hasn't folded yet: one per blob
              *     that a statement deleted parts from.
              */
@@ -844,7 +852,8 @@ export interface components {
             shards: number;
             /**
              * Format: int32
-             * @description Where the GC's file sweep is, of `shards`.
+             * @description Where the GC's file sweep is, of `shards` (blob directories; the
+             *     names are the dashboard's).
              */
             sweep_shard: number;
         };
@@ -915,7 +924,10 @@ export interface components {
             /** Format: int32 */
             node: number;
         };
-        /** @description The committed blobs a node holds a copy of. */
+        /**
+         * @description The committed blobs a node holds a shard of, and the bytes of those
+         *     shards.
+         */
         NodeHolding: {
             /** Format: int64 */
             blobs: number;
@@ -976,10 +988,23 @@ export interface components {
             op: string;
         };
         PackerSettings: {
+            /** @description Whether it's coded now: also takes as many live nodes as shards. */
+            coding: boolean;
+            /** Format: int64 */
+            cold_age_secs: number;
             /** Format: double */
             compact_threshold: number;
+            /**
+             * Format: int64
+             * @description What cold data is erasure-coded into (the `data-shards` setting, and
+             *     the parity shards that `--replication-factor` gives), and how old it
+             *     must be. One data shard: it isn't.
+             */
+            data_shards: number;
             /** Format: int64 */
             max_sources: number;
+            /** Format: int32 */
+            parity_shards: number;
             /** Format: int64 */
             small_size: number;
             /** Format: int64 */
@@ -1012,13 +1037,19 @@ export interface components {
             crc64nvme?: string | null;
             /** Format: double */
             created_at: number;
+            /**
+             * Format: int32
+             * @description The blob's data shards: 1 if it's replicated, else it's erasure-coded,
+             *     and readable with as many live shards.
+             */
+            data_shards: number;
             etag: string;
             /**
              * @description The byte ranges of the part (as stored) that are intact on no
              *     replica, as [start, stop) from its start (see `scrub`).
              */
             lost: number[][];
-            /** @description The nodes holding a copy of the blob. */
+            /** @description The nodes holding a shard of the blob. */
             nodes: number[];
             /** Format: int32 */
             number: number;
@@ -1030,7 +1061,12 @@ export interface components {
          * @enum {string}
          */
         Permission: "read" | "write" | "delete-version";
-        /** @description The committed blobs with `copies` copies, `live` of them on live nodes. */
+        /**
+         * @description The committed blobs of `data_shards` data shards (1: replicated) with
+         *     `copies` shards in all, `live` of them on live nodes. A blob is readable
+         *     with `data_shards` live shards, and as redundant as the cluster's
+         *     replication factor asks with `data_shards` + replication factor − 1.
+         */
         ReplicaGroup: {
             /** Format: int64 */
             blobs: number;
@@ -1038,6 +1074,8 @@ export interface components {
             bytes: number;
             /** Format: int64 */
             copies: number;
+            /** Format: int64 */
+            data_shards: number;
             /** Format: int64 */
             live: number;
         };

@@ -52,7 +52,7 @@ pub(super) async fn pending_blob(app: &App, age_hours: f64) -> Uuid {
         .await
         .unwrap();
     client
-        .execute("INSERT INTO blob_locations (blob_id, node) VALUES ($1, $2)", &[&blob, &app.node])
+        .execute("INSERT INTO blob_locations (blob_id, node, shard) VALUES ($1, $2, 0)", &[&blob, &app.node])
         .await
         .unwrap();
     blob
@@ -62,7 +62,8 @@ pub(super) async fn pending_blob(app: &App, age_hours: f64) -> Uuid {
 async fn commit_object(tx: &Transaction<'_>, app: &App, blob: Uuid, key: &str) -> String {
     tx.query_one(
         "SELECT status FROM pg_temp.cairn_commit_object(
-             $1, ARRAY[$2::int], 0, 0, 65536, 0, 'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
+             $1, ARRAY[$2::int], ARRAY[0::smallint], 0, 65536, 1::smallint, 0::smallint, 1048576,
+                     ARRAY[0::bigint], 0, 'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
              $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, false,
              NULL, NULL, NULL, false, NULL, $5)",
         &[&blob, &app.node, &BUCKET, &key, &crate::s3::versions::new_version_id()],

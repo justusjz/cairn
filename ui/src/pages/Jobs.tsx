@@ -51,6 +51,16 @@ function View(props: { cluster: Cluster; storage: Storage }) {
           value={num(bl().compact)}
           note={`${bytes(bl().compact_garbage_bytes)} of garbage in blobs ≥ ${pct(pk().compact_threshold, 1)} garbage`}
         />
+        <Card
+          label="To code"
+          value={num(bl().convert)}
+          note={
+            pk().data_shards > 1 && pk().parity_shards > 0
+              ? `${bytes(bl().convert_bytes)} in replicated blobs > ${bytes(pk().small_size)}, ${duration(pk().cold_age_secs)} old; erasure-coded ${pk().data_shards}+${pk().parity_shards}${pk().coding ? ", one job per node and pass" : ", once as many nodes are live"}`
+              : "erasure coding is off: set data-shards with cairn config"
+          }
+          tone={pk().data_shards > 1 && !pk().coding ? "warn" : ""}
+        />
         <Card label="Garbage log" value={num(bl().garbage_log)} note="deleted parts, folded on the next packer pass" />
         <Card
           label="Pending blobs"

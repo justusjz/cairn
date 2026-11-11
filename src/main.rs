@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::db::Cached;
 use crate::auth::Rejection;
+use crate::blob_file::ShardFile;
 use crate::blobs::{Location, ReapTarget, reap_blobs};
 use crate::body::{FrameSender, channel_body};
 use crate::checksum::BlobSummer;
@@ -45,6 +46,7 @@ mod roles;
 mod s3;
 mod scrub;
 mod settings;
+mod shards;
 mod store;
 mod writing;
 
@@ -69,6 +71,15 @@ pub struct App {
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
+}
+
+impl App {
+    /// How many parity shards a new blob gets: as many as there are replicas
+    /// besides the blob's one data shard, so that coded blobs survive losing
+    /// as many nodes as replicated ones (see `shards`).
+    pub(crate) fn parity_shards(&self) -> u32 {
+        self.replication_factor.saturating_sub(1) as u32
+    }
 }
 
 #[derive(Parser, Debug)]
@@ -443,7 +454,9 @@ async fn serve_peer(
     Ok(())
 }
 
-async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<Location>> {
+/// Chooses `count` live nodes for the shards of a new blob, those with the
+/// most free space first: the node for shard i is the i-th.
+async fn choose_nodes(client: &Object, count: usize) -> anyhow::Result<Vec<Location>> {
     let nodes = client
         .query_cached(
             "SELECT id, peer_url FROM nodes WHERE last_seen > NOW() - INTERVAL '10 seconds' ORDER BY free_space DESC",
@@ -452,57 +465,99 @@ async fn choose_replicas(client: &Object, count: usize) -> anyhow::Result<Vec<Lo
         .await?;
     if nodes.len() < count {
         return Err(Unavailable(format!(
-            "need {count} replicas but only {} node(s) are live",
+            "need {count} nodes for a blob's shards but only {} are live",
             nodes.len()
         ))
         .into());
     }
     Ok(nodes[0..count]
         .iter()
-        .map(|n| (n.get("id"), n.get("peer_url")))
+        .zip(0..)
+        .map(|(n, shard)| Location {
+            node: n.get("id"),
+            peer_url: n.get("peer_url"),
+            shard,
+        })
         .collect())
 }
 
-/// Streams a blob body (one side of the writer's fan-out) to a single
-/// replica's peer endpoint, returning the CRC64/NVME the replica reports for
-/// the file it stored.
-async fn upload_to_replica(
+/// What a node is asked to store of a blob being written.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ShardWrite {
+    /// A shard of a replicated blob: the blob's bytes, streamed, its size
+    /// unknown until they end. The node writes the table after them.
+    Replica { blob_id: Uuid, shard: u32 },
+    /// A shard of a coded blob, whose layout is known up front: the shard's
+    /// bytes, followed by the tables of all of the blob's shards, as the
+    /// writer computed them. The node checks its own against them.
+    Coded(ShardFile),
+}
+
+impl ShardWrite {
+    fn blob_id(&self) -> Uuid {
+        match self {
+            ShardWrite::Replica { blob_id, .. } => *blob_id,
+            ShardWrite::Coded(file) => file.blob_id,
+        }
+    }
+
+    fn shard(&self) -> u32 {
+        match self {
+            ShardWrite::Replica { shard, .. } => *shard,
+            ShardWrite::Coded(file) => file.shard,
+        }
+    }
+
+    /// The query of the PUT that asks a peer for it (see `peer::parse_shard`).
+    fn query(&self) -> String {
+        match self {
+            ShardWrite::Replica { shard, .. } => format!("?shard={shard}"),
+            // A coded shard's layout names the shard too.
+            ShardWrite::Coded(file) => format!("?{}", &peer::layout_query(file)[1..]),
+        }
+    }
+}
+
+/// Streams a shard (one side of the writer's fan-out) to the node at
+/// `peer_url`, returning the CRC64/NVME it reports for the file it stored.
+async fn upload_to_peer(
     peers: &peer::PeerClient,
     peer_url: &str,
-    blob_id: Uuid,
+    write: &ShardWrite,
     body: body::ResBody,
 ) -> anyhow::Result<u64> {
     let req = Request::builder()
         .method(Method::PUT)
-        .uri(format!("{peer_url}/blobs/{blob_id}"))
+        .uri(format!("{peer_url}/blobs/{}{}", write.blob_id(), write.query()))
         .body(body)?;
     let res = peers.request(req).await?;
     if res.status() != StatusCode::OK {
-        anyhow::bail!("replica {peer_url} returned status {}", res.status());
+        anyhow::bail!("node {peer_url} returned status {}", res.status());
     }
     let crc = res
         .headers()
         .get(peer::CRC64_HEADER)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| u64::from_str_radix(v, 16).ok());
-    crc.ok_or_else(|| anyhow::anyhow!("replica {peer_url} didn't report a checksum"))
+    crc.ok_or_else(|| anyhow::anyhow!("node {peer_url} didn't report a checksum"))
 }
 
-/// Streams a body to this node's local disk followed by its checksum table (see
-/// `blob_file`), fsyncs it, and records this node as a location for the blob.
-/// Returns the CRC64/NVME of the whole file written. Shared by
-/// the peer PUT endpoint (an `Incoming`) and the local-replica sink in
-/// `upload_part` (a channel-backed body) — hence the generic body.
-async fn write_blob_streaming<B>(app: &App, blob_id: Uuid, body: B) -> anyhow::Result<u64>
+/// Streams a shard of a blob to this node's local disk, followed by its
+/// trailer (see `blob_file`), fsyncs it, and records this node as holding
+/// the shard. Returns the CRC64/NVME of the whole file written. Shared by
+/// the peer PUT endpoint (an `Incoming`) and the local sink of `BlobWriter`
+/// (a channel-backed body) — hence the generic body.
+async fn write_blob_streaming<B>(app: &App, write: &ShardWrite, body: B) -> anyhow::Result<u64>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    let blob_id = write.blob_id();
     // Mark the blob as being written for the whole write→announce window, so the
     // GC's file sweep won't treat this in-flight file (no location yet) as an
     // orphan. The guard drops after the location insert below.
     let _writing = app.writing.begin(blob_id);
-    match write_and_announce(app, blob_id, body).await {
+    match write_and_announce(app, write, body).await {
         Ok(crc) => Ok(crc),
         Err(failure) => {
             // Delete the file right away, unless its location may have been
@@ -517,7 +572,7 @@ where
     }
 }
 
-/// Why a replica failed to store a blob, and whether its location might have
+/// Why a node failed to store a shard, and whether its location might have
 /// been recorded nonetheless.
 struct WriteFailure {
     error: anyhow::Error,
@@ -534,38 +589,78 @@ impl<E: Into<anyhow::Error>> From<E> for WriteFailure {
 }
 
 /// The body of `write_blob_streaming`.
-async fn write_and_announce<B>(app: &App, blob_id: Uuid, mut body: B) -> Result<u64, WriteFailure>
+async fn write_and_announce<B>(app: &App, write: &ShardWrite, mut body: B) -> Result<u64, WriteFailure>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    let blob_id = write.blob_id();
     let mut file = app.store.create_blob(blob_id).await?;
     // The checksums are computed from the bytes as received, before they hit
     // the disk, so the table catches anything that goes wrong on the way down.
     let mut summer = BlobSummer::new(checksum::BLOCK_SIZE);
     let mut file_crc = crc64fast_nvme::Digest::new();
+    // A coded shard's bytes end where its layout says, and the tables follow.
+    let data_len = match write {
+        ShardWrite::Replica { .. } => u64::MAX,
+        ShardWrite::Coded(shard) => shard.data_len(),
+    };
+    let mut size = 0;
+    let mut tables = Vec::new();
     while let Some(frame) = body.frame().await {
-        if let Ok(chunk) = frame?.into_data() {
-            summer.update(&chunk);
-            file_crc.write(&chunk);
-            file.write_all(&chunk).await?;
+        if let Ok(mut chunk) = frame?.into_data() {
+            let data = chunk.split_to(chunk.len().min((data_len - size) as usize));
+            size += data.len() as u64;
+            summer.update(&data);
+            file_crc.write(&data);
+            file.write_all(&data).await?;
+            tables.extend_from_slice(&chunk);
         }
     }
-    let trailer = blob_file::trailer(blob_id, &summer.finish());
+    let trailer = match write {
+        ShardWrite::Replica { .. } => {
+            let shard = ShardFile {
+                blob_id,
+                layout: shards::Layout::new(size, 1, 0),
+                shard: 0,
+            };
+            blob_file::trailer(&shard, &[summer.finish()])
+        }
+        ShardWrite::Coded(shard) => {
+            if size != data_len {
+                return Err(anyhow::anyhow!("blob {blob_id}: got {size} bytes of shard {}, not {data_len}", shard.shard).into());
+            }
+            tables.extend_from_slice(&blob_file::tail(shard));
+            let ours = summer.finish();
+            match blob_file::split_trailer(shard, &tables) {
+                Some((sent, _)) if sent[shard.shard as usize] == ours.0.as_slice() => {}
+                Some(_) => {
+                    return Err(anyhow::anyhow!("blob {blob_id}: shard {} isn't what its table says", shard.shard).into());
+                }
+                None => {
+                    return Err(anyhow::anyhow!("blob {blob_id}: shard {} came with tables of the wrong size", shard.shard).into());
+                }
+            }
+            tables
+        }
+    };
     file_crc.write(&trailer);
     file.write_all(&trailer).await?;
     // fsync before announcing the location, so the bytes survive a crash by the
-    // time the leader's commit can count this replica.
+    // time the leader's commit can count this shard.
     file.sync_all().await?;
     let client = app.pool.get().await?;
+    let shard = write.shard() as i16;
     // The blob may be gone (its upload given up): then this fails its FK check.
     if let Err(e) = client
         .execute_cached(
             // The bytes were checksummed on their way to the disk, and the
             // writer compares the CRC: the copy is known intact as of now.
-            "INSERT INTO blob_locations (blob_id, node, checked_at) VALUES ($1, $2, NOW())
-             ON CONFLICT DO NOTHING",
-            &[&blob_id, &app.node],
+            // A repeated insert is fine; another node's location for the
+            // same shard isn't (`blob_locations_shard`), and fails the write.
+            "INSERT INTO blob_locations (blob_id, node, shard, checked_at) VALUES ($1, $2, $3, NOW())
+             ON CONFLICT (blob_id, node) DO NOTHING",
+            &[&blob_id, &app.node, &shard],
         )
         .await
     {
@@ -578,17 +673,35 @@ where
     Ok(file_crc.sum64())
 }
 
-/// A new blob being written to its replicas: a pending blob row, and a sink per
-/// replica (local or remote) fed through a bounded channel, so the slowest one
+/// How a `BlobWriter` turns the blob's bytes into its shards.
+enum Coding {
+    /// Every shard is the blob, sent on as it comes.
+    Replicated { summer: BlobSummer },
+    /// The blob's rows are encoded as they fill (see `shards`).
+    Coded {
+        layout: shards::Layout,
+        /// The row being filled.
+        row: Vec<u8>,
+        /// Each shard's table, and the CRC of its file, so far.
+        summers: Vec<BlobSummer>,
+        digests: Vec<crc64fast_nvme::Digest>,
+    },
+}
+
+/// A new blob being written to its shards: a pending blob row, and a sink per
+/// shard (local or remote) fed through a bounded channel, so the slowest one
 /// applies backpressure. Computes the blob's checksums as the data passes.
 /// Shared by uploads and the packer.
 pub(crate) struct BlobWriter {
     app: Arc<App>,
     pub blob_id: Uuid,
-    pub replicas: Vec<Location>,
+    /// Where each shard goes, in shard order.
+    pub locations: Vec<Location>,
     senders: Vec<FrameSender>,
-    sinks: JoinSet<anyhow::Result<u64>>,
-    summer: BlobSummer,
+    /// Each sink's shard, and the CRC of the file it stored.
+    sinks: JoinSet<anyhow::Result<(u32, u64)>>,
+    coding: Coding,
+    /// The CRC of the blob's bytes.
     crc: crc64fast_nvme::Digest,
     size: u64,
     /// Whether the blob has been handed on (`finish`) or deleted (`abort`).
@@ -597,9 +710,9 @@ pub(crate) struct BlobWriter {
 }
 
 impl BlobWriter {
-    /// Creates the pending blob and starts a sink on each of its replicas.
+    /// Creates a pending replicated blob, and starts a sink for each shard.
     pub(crate) async fn begin(app: &Arc<App>) -> anyhow::Result<BlobWriter> {
-        let writer = Self::start(app, None).await?;
+        let writer = Self::start(app, None, 1, None).await?;
         Ok(writer.expect("only a bucket can be missing"))
     }
 
@@ -611,10 +724,23 @@ impl BlobWriter {
         app: &Arc<App>,
         bucket: &str,
     ) -> anyhow::Result<Option<BlobWriter>> {
-        Self::start(app, Some(bucket)).await
+        Self::start(app, Some(bucket), 1, None).await
     }
 
-    async fn start(app: &Arc<App>, bucket: Option<&str>) -> anyhow::Result<Option<BlobWriter>> {
+    /// Creates a pending blob of `size` bytes in `data_shards` data shards
+    /// (and the cluster's parity shards), and starts a sink for each shard.
+    /// With one data shard, it's replicated.
+    pub(crate) async fn begin_coded(app: &Arc<App>, data_shards: u32, size: u64) -> anyhow::Result<BlobWriter> {
+        let writer = Self::start(app, None, data_shards, Some(size)).await?;
+        Ok(writer.expect("only a bucket can be missing"))
+    }
+
+    async fn start(
+        app: &Arc<App>,
+        bucket: Option<&str>,
+        data_shards: u32,
+        size: Option<u64>,
+    ) -> anyhow::Result<Option<BlobWriter>> {
         let client = app.pool.get().await?;
         // Time-ordered, so new blobs land at the end of the indexes on blob_id.
         let blob_id = Uuid::now_v7();
@@ -636,16 +762,17 @@ impl BlobWriter {
         // before the insert, since that may have happened by then; if the
         // insert is still underway when the discard runs, the GC has the row.
         let mut pending = blobs::DiscardOnDrop::new(app, blob_id);
+        let shard_count = (data_shards + app.parity_shards()) as usize;
         // Independent of each other, so they're sent together, and take one
         // round trip between them.
-        let (inserted, replicas) = tokio::join!(insert, choose_replicas(&client, app.replication_factor));
+        let (inserted, locations) = tokio::join!(insert, choose_nodes(&client, shard_count));
         if inserted? == 0 {
             pending.disarm();
             return Ok(None);
         }
         drop(client);
-        let replicas = match replicas {
-            Ok(replicas) => replicas,
+        let locations = match locations {
+            Ok(locations) => locations,
             Err(e) => {
                 // No sink has started, so there are only the row's to delete.
                 blobs::discard(app, blob_id).await;
@@ -653,25 +780,53 @@ impl BlobWriter {
                 return Err(e);
             }
         };
+        let coding = match size {
+            Some(size) if data_shards > 1 => {
+                let layout = shards::Layout::new(size, data_shards, app.parity_shards());
+                Coding::Coded {
+                    layout,
+                    row: Vec::new(),
+                    summers: (0..layout.shards()).map(|_| BlobSummer::new(checksum::BLOCK_SIZE)).collect(),
+                    digests: (0..layout.shards()).map(|_| crc64fast_nvme::Digest::new()).collect(),
+                }
+            }
+            _ => Coding::Replicated {
+                summer: BlobSummer::new(checksum::BLOCK_SIZE),
+            },
+        };
         // The pooled connection was dropped above, before the (potentially long)
         // write: the local sink needs one to record its location, and concurrent
         // writes could otherwise exhaust the pool and deadlock.
         let mut senders = Vec::new();
         let mut sinks = JoinSet::new();
-        for (node, peer_url) in replicas.clone() {
+        for location in locations.clone() {
+            let write = match &coding {
+                Coding::Replicated { .. } => ShardWrite::Replica {
+                    blob_id,
+                    shard: location.shard,
+                },
+                Coding::Coded { layout, .. } => ShardWrite::Coded(ShardFile {
+                    blob_id,
+                    layout: *layout,
+                    shard: location.shard,
+                }),
+            };
             let (tx, body) = channel_body();
             senders.push(tx);
-            // A replica that is ourselves writes straight to local disk (no HTTP
-            // hop, and on a single host there's no peer server).
-            if node == app.node {
+            // A shard for ourselves goes straight to local disk (no HTTP hop,
+            // and on a single host there's no peer server).
+            let shard = location.shard;
+            if location.node == app.node {
                 let app = app.clone();
-                sinks.spawn(async move { write_blob_streaming(&app, blob_id, body).await });
+                sinks.spawn(async move { Ok((shard, write_blob_streaming(&app, &write, body).await?)) });
             } else {
                 let peers = app.peers.clone();
                 sinks.spawn(async move {
-                    upload_to_replica(&peers, &peer_url, blob_id, body)
-                        .await
-                        .map_err(|e| Unavailable(format!("replica {peer_url}: {e:#}")).into())
+                    let peer_url = location.peer_url;
+                    match upload_to_peer(&peers, &peer_url, &write, body).await {
+                        Ok(crc) => Ok((shard, crc)),
+                        Err(e) => Err(Unavailable(format!("node {peer_url}: {e:#}")).into()),
+                    }
                 });
             }
         }
@@ -679,73 +834,154 @@ impl BlobWriter {
         Ok(Some(BlobWriter {
             app: app.clone(),
             blob_id,
-            replicas,
+            locations,
             senders,
             sinks,
-            summer: BlobSummer::new(checksum::BLOCK_SIZE),
+            coding,
             crc: crc64fast_nvme::Digest::new(),
             size: 0,
             settled: false,
         }))
     }
 
-    /// Appends `chunk` to the blob on every replica.
+    /// Appends `chunk` to the blob.
     pub(crate) async fn write(&mut self, chunk: Bytes) {
-        self.summer.update(&chunk);
         self.crc.write(&chunk);
         self.size += chunk.len() as u64;
-        for tx in &self.senders {
-            // A dropped receiver means that sink's task failed; its real error
-            // surfaces in `finish`.
-            let _ = tx.send(Ok(Frame::data(chunk.clone()))).await;
+        match &mut self.coding {
+            Coding::Replicated { summer } => {
+                summer.update(&chunk);
+                for tx in &self.senders {
+                    // A dropped receiver means that sink's task failed; its real
+                    // error surfaces in `finish`.
+                    let _ = tx.send(Ok(Frame::data(chunk.clone()))).await;
+                }
+            }
+            Coding::Coded { .. } => {
+                let mut chunk = &chunk[..];
+                while !chunk.is_empty() {
+                    let Coding::Coded { layout, row, .. } = &mut self.coding else { unreachable!() };
+                    let row_len = (layout.data_shards as u64 * layout.stripe_unit) as usize;
+                    let take = chunk.len().min(row_len - row.len());
+                    row.extend_from_slice(&chunk[..take]);
+                    chunk = &chunk[take..];
+                    if row.len() == row_len {
+                        self.send_row().await;
+                    }
+                }
+            }
         }
     }
 
-    /// Gives up on the blob: faults the sinks, so no replica durably stores the
+    /// Encodes the row being filled (the last one may be short), and sends
+    /// each of its cells to its shard.
+    async fn send_row(&mut self) {
+        let Coding::Coded { layout, row, summers, digests } = &mut self.coding else {
+            unreachable!("only a coded blob has rows");
+        };
+        let row = Bytes::from(std::mem::take(row));
+        let su = layout.stripe_unit as usize;
+        let (k, m) = (layout.data_shards as usize, layout.parity_shards);
+        let cells: Vec<Bytes> = (0..k).map(|j| row.slice((j * su).min(row.len())..((j + 1) * su).min(row.len()))).collect();
+        let to_encode = cells.clone();
+        let parity = tokio::task::spawn_blocking(move || {
+            let cells: Vec<&[u8]> = to_encode.iter().map(|c| &c[..]).collect();
+            shards::encode(&cells, m, su)
+        })
+        .await
+        .expect("encoding doesn't panic");
+        let all = cells.into_iter().chain(parity.into_iter().map(Bytes::from));
+        for (shard, cell) in all.enumerate() {
+            if cell.is_empty() {
+                continue;
+            }
+            summers[shard].update(&cell);
+            digests[shard].write(&cell);
+            let _ = self.senders[shard].send(Ok(Frame::data(cell))).await;
+        }
+    }
+
+    /// Gives up on the blob: faults the sinks, so no node durably stores the
     /// truncated data, waits for them, and deletes the pending blob and
-    /// whatever its replicas stored.
+    /// whatever its nodes stored.
     pub(crate) async fn abort(mut self, reason: &str) {
         let (senders, sinks) = (std::mem::take(&mut self.senders), std::mem::take(&mut self.sinks));
         give_up(&self.app, self.blob_id, senders, sinks, reason).await;
         self.settled = true;
     }
 
-    /// Ends the blob and waits for every replica to store it. Fails if one
+    /// Ends the blob and waits for every node to store its shard. Fails if one
     /// couldn't, or if one stored different bytes than were sent, and then
-    /// deletes the pending blob and whatever its replicas stored.
+    /// deletes the pending blob and whatever its nodes stored.
     pub(crate) async fn finish(mut self) -> anyhow::Result<Written> {
+        let blob_id = self.blob_id;
+        // Every shard's file as it must be: the bytes sent, followed by the
+        // trailer they determine. The data's CRC covers just the data; each
+        // file's carries on over its trailer.
+        let expected: Result<(shards::Layout, Vec<u64>), String> = match &mut self.coding {
+            Coding::Replicated { summer } => {
+                let summer = std::mem::replace(summer, BlobSummer::new(checksum::BLOCK_SIZE));
+                let layout = shards::Layout::new(self.size, 1, self.app.parity_shards());
+                let file = ShardFile { blob_id, layout, shard: 0 };
+                let mut crc = self.crc.clone();
+                crc.write(&blob_file::trailer(&file, &[summer.finish()]));
+                Ok((layout, vec![crc.sum64(); layout.shards() as usize]))
+            }
+            Coding::Coded { layout, row, .. } => {
+                let layout = *layout;
+                if !row.is_empty() {
+                    self.send_row().await;
+                }
+                let Coding::Coded { summers, digests, .. } = &mut self.coding else { unreachable!() };
+                if self.size != layout.size {
+                    Err(format!("got {} bytes of a blob of {}", self.size, layout.size))
+                } else {
+                    let tables: Vec<_> = std::mem::take(summers).into_iter().map(BlobSummer::finish).collect();
+                    let sent: Vec<u8> = tables.iter().flat_map(|t| t.0.iter().copied()).collect();
+                    let mut crcs = Vec::new();
+                    for (shard, mut digest) in std::mem::take(digests).into_iter().enumerate() {
+                        let file = ShardFile { blob_id, layout, shard: shard as u32 };
+                        digest.write(&blob_file::trailer(&file, &tables));
+                        crcs.push(digest.sum64());
+                        let _ = self.senders[shard].send(Ok(Frame::data(Bytes::from(sent.clone())))).await;
+                    }
+                    Ok((layout, crcs))
+                }
+            }
+        };
+        let (layout, shard_crcs) = match expected {
+            Ok(expected) => expected,
+            Err(e) => {
+                let (senders, sinks) = (std::mem::take(&mut self.senders), std::mem::take(&mut self.sinks));
+                give_up(&self.app, blob_id, senders, sinks, &e).await;
+                self.settled = true;
+                anyhow::bail!("blob {blob_id}: {e}");
+            }
+        };
         self.senders.clear();
         // Every sink is waited for, also after one failed, so that none is still
         // writing when the blob is deleted.
-        let mut replica_crcs = Vec::new();
+        let mut stored = Vec::new();
         let mut failure = None;
         while let Some(res) = self.sinks.join_next().await {
             match res.map_err(anyhow::Error::from).and_then(|r| r) {
-                Ok(crc) => replica_crcs.push(crc),
+                Ok(crc) => stored.push(crc),
                 Err(e) => failure = failure.or(Some(e)),
             }
         }
         if let Some(e) = failure {
-            blobs::discard(&self.app, self.blob_id).await;
+            blobs::discard(&self.app, blob_id).await;
             self.settled = true;
             return Err(e);
         }
-        // Every replica must have stored exactly the file we expect: the bytes we
-        // sent, followed by the checksum table and blob ID they determine. A
-        // mismatch means a copy was damaged in transit or on its way to disk; the
+        // Every node must have stored exactly the file we expect. A mismatch
+        // means a shard was damaged in transit or on its way to disk; the
         // write can be retried.
-        // The data's CRC covers just the data; the file's carries on over the
-        // trailer.
-        let blob_id = self.blob_id;
-        let data_crc = self.crc.sum64();
-        let summer = std::mem::replace(&mut self.summer, BlobSummer::new(checksum::BLOCK_SIZE));
-        self.crc.write(&blob_file::trailer(blob_id, &summer.finish()));
-        let file_crc = self.crc.sum64();
-        if replica_crcs.iter().any(|&replica_crc| replica_crc != file_crc) {
+        if stored.iter().any(|&(shard, crc)| shard_crcs[shard as usize] != crc) {
             blobs::discard(&self.app, blob_id).await;
             self.settled = true;
             return Err(Unavailable(format!(
-                "blob {blob_id}: a replica stored different bytes than were sent"
+                "blob {blob_id}: a node stored different bytes than were sent"
             ))
             .into());
         }
@@ -753,11 +989,10 @@ impl BlobWriter {
         self.settled = true;
         Ok(Written {
             blob_id,
-            nodes: self.replicas.iter().map(|(node, _)| *node).collect(),
-            replicas: std::mem::take(&mut self.replicas),
-            size: self.size,
-            data_crc,
-            file_crc,
+            layout,
+            locations: std::mem::take(&mut self.locations),
+            data_crc: self.crc.sum64(),
+            shard_crcs,
         })
     }
 }
@@ -781,14 +1016,14 @@ impl Drop for BlobWriter {
 }
 
 /// Gives up on a blob being written: faults the sinks still being fed, so no
-/// replica durably stores the truncated data, waits for every sink (so that
+/// node durably stores the truncated data, waits for every sink (so that
 /// none is still writing when the blob is deleted), and deletes the pending
-/// blob and whatever its replicas stored.
+/// blob and whatever its nodes stored.
 async fn give_up(
     app: &Arc<App>,
     blob_id: Uuid,
     senders: Vec<FrameSender>,
-    mut sinks: JoinSet<anyhow::Result<u64>>,
+    mut sinks: JoinSet<anyhow::Result<(u32, u64)>>,
     reason: &str,
 ) {
     for tx in &senders {
@@ -800,15 +1035,31 @@ async fn give_up(
     blobs::discard(app, blob_id).await;
 }
 
-/// A blob fully written to its replicas, but still pending.
+/// A blob fully written to its shards, but still pending.
 pub(crate) struct Written {
     pub blob_id: Uuid,
-    pub nodes: Vec<i32>,
-    pub replicas: Vec<Location>,
-    pub size: u64,
-    /// CRC64/NVME of the data, and of the whole file as stored.
+    pub layout: shards::Layout,
+    /// Where its shards are, in shard order.
+    pub locations: Vec<Location>,
+    /// CRC64/NVME of its bytes, and of each shard's file as stored.
     pub data_crc: u64,
-    pub file_crc: u64,
+    pub shard_crcs: Vec<u64>,
+}
+
+impl Written {
+    pub fn size(&self) -> u64 {
+        self.layout.size
+    }
+
+    /// Its locations as the catalog's commits take them: nodes, and shards.
+    pub fn location_columns(&self) -> (Vec<i32>, Vec<i16>) {
+        self.locations.iter().map(|l| (l.node, l.shard as i16)).unzip()
+    }
+
+    /// Its shards' file CRCs as stored: their 64 bits, read as signed.
+    pub fn crc_column(&self) -> Vec<i64> {
+        self.shard_crcs.iter().map(|&crc| crc as i64).collect()
+    }
 }
 
 /// Where a freshly-uploaded part should be attached. The part row is inserted
@@ -1161,9 +1412,9 @@ enum CommitResult {
 }
 
 /// Runs the commit transaction once (`cairn_commit_object` or
-/// `cairn_commit_upload_part`): confirms that all of the blob's replicas
+/// `cairn_commit_upload_part`): confirms that all of the blob's shards
 /// recorded their locations, and if so marks the blob committed (recording its
-/// size and the CRC64/NVME of its file) and attaches a part spanning it to
+/// layout and the CRC64/NVME of each shard's file) and attaches a part spanning it to
 /// `attach` (with the CRC64/NVME of its data), all in one statement, and so
 /// one transaction. The raw postgres error is returned unwrapped so the caller can distinguish a
 /// conflict (retry) from a real error (give up).
@@ -1195,10 +1446,14 @@ async fn try_commit_part(
     let checksum = stored.checksum.map(|(_, value)| value);
     // CRCs are stored as their 64 bits, read as a signed BIGINT. The part's
     // covers just its data, and stays valid wherever it's moved later; the
-    // blob's covers its whole file, for a scrub to check against.
-    let size = written.size as i64;
-    let file_crc = written.file_crc as i64;
-    let block_size = checksum::BLOCK_SIZE as i32;
+    // shards' cover their whole files, for a scrub to check against.
+    let size = written.size() as i64;
+    let (nodes, shards) = written.location_columns();
+    let shard_crcs = written.crc_column();
+    let layout = written.layout;
+    let block_size = layout.block_size as i32;
+    let (data_shards, parity_shards) = (layout.data_shards as i16, layout.parity_shards as i16);
+    let stripe_unit = layout.stripe_unit as i32;
     let data_crc = written.data_crc as i64;
     let plain_size = encrypted.map(|e| e.plain_size as i64);
     let enc_salt = encrypted.map(|e| e.salt.to_vec());
@@ -1218,13 +1473,18 @@ async fn try_commit_part(
                     "SELECT status, present, version_id, reap_blob, reap_node, reap_peer, last_modified
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                                                       $11, $12, $13, $14, $15, $16, $17, $18,
-                                                      $19, $20, $21, $22, $23, $24, $25)",
+                                                      $19, $20, $21, $22, $23, $24, $25, $26,
+                                                      $27, $28, $29)",
                     &[
                         &written.blob_id,
-                        &written.nodes,
+                        &nodes,
+                        &shards,
                         &size,
-                        &file_crc,
                         &block_size,
+                        &data_shards,
+                        &parity_shards,
+                        &stripe_unit,
+                        &shard_crcs,
                         &data_crc,
                         &etag,
                         &plain_size,
@@ -1259,13 +1519,17 @@ async fn try_commit_part(
                 .query_one_cached(
                     "SELECT status, present, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_commit_upload_part($1, $2, $3, $4, $5, $6, $7, $8, $9,
-                                                           $10, $11, $12)",
+                                                           $10, $11, $12, $13, $14, $15, $16)",
                     &[
                         &written.blob_id,
-                        &written.nodes,
+                        &nodes,
+                        &shards,
                         &size,
-                        &file_crc,
                         &block_size,
+                        &data_shards,
+                        &parity_shards,
+                        &stripe_unit,
+                        &shard_crcs,
                         &data_crc,
                         &etag,
                         &plain_size,
@@ -1285,7 +1549,7 @@ async fn try_commit_part(
         "missing_locations" => {
             return Ok(CommitResult::MissingLocations {
                 present: row.get(1),
-                required: written.nodes.len(),
+                required: written.locations.len(),
             });
         }
         "stale" => return Ok(CommitResult::Stale),

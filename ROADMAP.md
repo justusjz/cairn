@@ -34,15 +34,20 @@ Done:
 
 ## Next
 
+- **Erasure coding.** Every blob is k data and m parity shards, and
+  replication is k = 1; the packer codes cold data with k > 1, which takes
+  less space for the same tolerance of lost nodes. Implemented; released
+  together with replica repair.
 - **Replication factor in the database.** One setting for the whole cluster,
   instead of a `serve` flag that every node must agree on. Open: how existing
   clusters move over.
 - **Cluster status.** A `cairn status` command that shows which nodes are
   down, and how much data is below the replication factor. (The dashboard's
   Storage page shows this already.)
-- **Replica repair.** Restoring copies lost with a node. Open: when it runs
-  on its own (if ever), and when it waits for the operator to add a node, so
-  that data doesn't move twice.
+- **Replica repair.** Restoring shards lost with a node: copying a replica,
+  or decoding a coded blob's shard from the others. Open: when it runs on its
+  own (if ever), and when it waits for the operator to add a node, so that
+  data doesn't move twice.
 - **Removing a node.** Moving a node's data off before it's taken away, so
   that redundancy never drops.
 - **CI.** Running the test suites (`db-test.sh`, `test.sh`, `ha-test.sh`) on
@@ -59,11 +64,6 @@ Done:
 - **Lifecycle transitions.** Moving objects between storage classes by
   lifecycle rules, once Cairn has more than one (erasure-coded storage, say).
   Expiration rules are done.
-
-## Later
-
-- **Erasure coding.** Converting data to an erasure-coded layout in the
-  background, to store it with less overhead than full replicas.
 
 ## Ideas
 

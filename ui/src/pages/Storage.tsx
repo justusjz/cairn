@@ -1,5 +1,7 @@
 import { For, Show, createMemo } from "solid-js";
 import { type Cluster, type Storage as StorageInfo, api, diskOf } from "../api";
+
+type ReplicaGroup = StorageInfo["replicas"][number];
 import { Badge, Bar, Card, LiveDot, Loading, Panel, Table, poll } from "../components/ui";
 import { bytes, num, pct } from "../format";
 
@@ -16,13 +18,17 @@ export default function Storage() {
 function View(props: { storage: StorageInfo; cluster: Cluster }) {
   const s = () => props.storage;
   const rf = () => s().replication_factor;
+  // A blob is readable with as many live shards as it has data shards (one
+  // for a replicated blob), and as redundant as the replication factor asks
+  // with that many more than one.
+  const wanted = (g: ReplicaGroup) => g.data_shards + rf() - 1;
   const health = createMemo(() => {
     const h = { healthy: 0, healthyBytes: 0, under: 0, underBytes: 0, lost: 0, lostBytes: 0 };
     for (const g of s().replicas) {
-      if (g.live === 0) {
+      if (g.live < g.data_shards) {
         h.lost += g.blobs;
         h.lostBytes += g.bytes;
-      } else if (g.live < rf()) {
+      } else if (g.live < wanted(g)) {
         h.under += g.blobs;
         h.underBytes += g.bytes;
       } else {
@@ -57,40 +63,52 @@ function View(props: { storage: StorageInfo; cluster: Cluster }) {
           tone={b().garbage_bytes / Math.max(1, b().bytes) > 0.3 ? "warn" : ""}
         />
         <Card
-          label="Fully replicated"
+          label="Fully redundant"
           value={pct(health().healthyBytes, health().healthyBytes + health().underBytes + health().lostBytes)}
-          note={`${num(health().healthy)} blobs with ≥ ${rf()} live copies`}
+          note={`${num(health().healthy)} blobs that survive losing ${rf() - 1} more nodes`}
           tone={health().under + health().lost ? "warn" : "ok"}
         />
         <Card
           label="Under-replicated"
           value={num(health().under)}
-          note={`${bytes(health().underBytes)} with fewer live copies than ${rf()}`}
+          note={`${bytes(health().underBytes)} with fewer live shards than that takes`}
           tone={health().under ? "warn" : "ok"}
         />
         <Card
           label="Unavailable"
           value={num(health().lost)}
-          note={`${bytes(health().lostBytes)} with no live copy`}
+          note={`${bytes(health().lostBytes)} with too few live shards to read`}
           tone={health().lost ? "bad" : "ok"}
         />
       </div>
 
       <div class="grid cols-2">
-        <Panel title="Replicas" note={`committed blobs by copies on live nodes · replication factor ${rf()}`}>
+        <Panel
+          title="Shards"
+          note={`committed blobs by layout and shards on live nodes · replication factor ${rf()}`}
+        >
           <Table
             count={s().replicas.length}
             empty="No blobs yet."
-            columns={[{ label: "Live copies", num: true }, { label: "Copies", num: true }, "", { label: "Blobs", num: true }, { label: "Bytes", num: true }, ""]}
+            columns={["Layout", { label: "Live shards", num: true }, { label: "Shards", num: true }, "", { label: "Blobs", num: true }, { label: "Bytes", num: true }, ""]}
           >
             <For each={s().replicas}>
               {(g) => (
                 <tr>
+                  <td>
+                    {g.data_shards === 1 ? "replicated" : `coded ${g.data_shards}+${g.copies - g.data_shards}`}
+                  </td>
                   <td class="num">{num(g.live)}</td>
                   <td class="num">{num(g.copies)}</td>
                   <td>
-                    <Badge tone={g.live === 0 ? "bad" : g.live < rf() ? "warn" : "ok"}>
-                      {g.live === 0 ? "unavailable" : g.live < rf() ? "under-replicated" : g.live > rf() ? "over-replicated" : "healthy"}
+                    <Badge tone={g.live < g.data_shards ? "bad" : g.live < wanted(g) ? "warn" : "ok"}>
+                      {g.live < g.data_shards
+                        ? "unavailable"
+                        : g.live < wanted(g)
+                          ? "under-replicated"
+                          : g.live > wanted(g)
+                            ? "over-replicated"
+                            : "healthy"}
                     </Badge>
                     <Show when={g.copies > g.live}>
                       <div class="subtle small">{g.copies - g.live} on down nodes</div>
@@ -106,7 +124,7 @@ function View(props: { storage: StorageInfo; cluster: Cluster }) {
             </For>
           </Table>
         </Panel>
-        <Panel title="Data per node" note="committed blobs each node holds a copy of">
+        <Panel title="Data per node" note="committed blobs each node holds a shard of">
           <Table
             count={props.cluster.nodes.length}
             columns={["Node", "Peer URL", { label: "Blobs", num: true }, { label: "Bytes", num: true }, { label: "Share", num: true }, "Disk"]}

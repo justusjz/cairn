@@ -1,14 +1,14 @@
 //! The packer: moves parts between blobs, so that the cluster doesn't end up
 //! with a file per small object, or with packed blobs that are mostly garbage.
 //!
-//! Every blob costs a row in the catalog, plus one per replica, and is the unit
+//! Every blob costs a row in the catalog, plus one per shard, and is the unit
 //! that repair and rebalancing move around. So the packer keeps blobs large: it
 //! packs the data of smaller blobs into blobs of 256 MiB.
 //!
 //! A packing job claims a set of source blobs, copies their live parts into
 //! new blobs of about equal size (as few as hold them), verifies the copies, and
 //! then, in one transaction, commits the new blobs, re-points the parts at them,
-//! and drops the sources. There are two kinds of job:
+//! and drops the sources. There are these kinds of job:
 //!
 //! - **Consolidation** packs blobs up to [`SMALL_SIZE`] together, once
 //!   there's enough of them to fill a blob. Packing costs a second write of the
@@ -29,6 +29,20 @@
 //!   per pass. Its bytes can only be verified once copied, by its parts' MD5s,
 //!   so its replicas are tried one at a time; if none matches, its parts are
 //!   lost (`lost_ranges`).
+//! - **Conversion** rewrites replicated blobs larger than [`SMALL_SIZE`] as
+//!   erasure-coded ones (see `shards`), which store the same data with less
+//!   overhead, once they're [`Config::cold_age`] old: a week, so that data
+//!   that's deleted within days, temporary files say, is never coded. One job
+//!   per pass, so that a cluster's replicated data is coded over time, not in
+//!   a burst. Only while coding is on (`coding`): the operator has set the
+//!   `data-shards` setting, and there are nodes enough for the shards.
+//!
+//! Every job writes a new blob coded if coding is on, the blob is larger
+//! than [`SMALL_SIZE`] (coding a small blob would cost more in the padding of
+//! its last row than it saves), and all of its parts are cold. So coded data
+//! that's compacted stays coded, and cold data is coded as it's packed,
+//! rather than written twice. Parts address a blob's bytes whatever its
+//! layout, so nothing above the blob changes with it.
 //!
 //! Within a job, parts are laid out by age band, then bucket, then age. Data
 //! that has lived long is likely to live on (the generational hypothesis), so
@@ -37,9 +51,9 @@
 //! cheaply. Bands double in width, so the ordering matters most among young
 //! data, where lifetimes differ most.
 //!
-//! Packing is coordinated through the catalog, not between replicas: a job
-//! reads the sources from any replica and writes the new blob to replicas of
-//! its own, like an upload. Every node runs a packer, and they claim blobs with
+//! Packing is coordinated through the catalog, not between nodes: a job
+//! reads the sources from any node that can serve them and writes the new
+//! blob to shards of its own, like an upload. Every node runs a packer, and they claim blobs with
 //! a lease (`blobs.pack_lease_until`), so they don't duplicate work. The lease
 //! isn't needed for correctness: a part is only moved if it's still where the
 //! job found it, so a job racing another (or a delete) just leaves some garbage
@@ -62,9 +76,11 @@ use crate::{
     App, BlobWriter, Written,
     db,
     blobs::{
-        BlobSlice, Location, ReapTarget, reap_blobs, reap_columns, stream_blob_range,
+        BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, ReapTarget, layout_at, location_at,
+        reap_blobs, reap_columns, stream_blob_range,
     },
-    checksum::{self, BlockLayout},
+    checksum,
+    shards::Layout,
 };
 
 /// Blobs up to this size are consolidated. Must match the `blobs_small` index
@@ -74,6 +90,12 @@ pub(crate) const SMALL_SIZE: u64 = 64 * 1024 * 1024;
 /// `blobs_compactable` index (migration 10); tests may lower it, at the cost of
 /// the index.
 pub(crate) const COMPACT_THRESHOLD: f64 = 0.25;
+/// How old data must be to be erasure-coded (see `Config::cold_age`).
+const COLD_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
+/// How many conversion jobs a pass runs at most: one, a few hundred MiB,
+/// so that a cluster with much replicated data codes it over time, rather
+/// than in a burst.
+const CONVERSIONS_PER_PASS: usize = 1;
 /// How many new blobs' worth of live data a job takes at most.
 const OUTPUTS_PER_JOB: u64 = 4;
 /// How long a job may hold its source blobs.
@@ -103,6 +125,11 @@ pub(crate) struct Config {
     /// When this many candidates for consolidation wait, they're packed even if
     /// they don't fill a blob.
     pub max_sources: i64,
+    /// How old data must be to be erasure-coded, while coding is on (see
+    /// `coding`): data deleted within days, temporary files say, is better
+    /// never coded. A replicated blob this old is converted, and a new blob
+    /// is written coded if all of its parts are this old.
+    pub cold_age: Duration,
 }
 
 impl Default for Config {
@@ -112,6 +139,7 @@ impl Default for Config {
             small_size: SMALL_SIZE,
             compact_threshold: COMPACT_THRESHOLD,
             max_sources: 10_000,
+            cold_age: COLD_AGE,
         }
     }
 }
@@ -164,6 +192,7 @@ impl std::fmt::Display for JobReport {
             Kind::Compact => "compacted",
             Kind::Consolidate => "consolidated",
             Kind::Upgrade => "upgraded",
+            Kind::Convert => "erasure-coded",
         };
         write!(
             f,
@@ -182,6 +211,8 @@ enum Kind {
     Consolidate,
     /// Rewrites a blob from before checksums into a checksummed one.
     Upgrade,
+    /// Rewrites cold replicated blobs as coded ones.
+    Convert,
 }
 
 /// Runs packing jobs until there's nothing left worth packing (or the pass hits
@@ -189,6 +220,7 @@ enum Kind {
 /// logged, and the pass moves on to other blobs.
 pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
     fold_garbage(app).await?;
+    let coding = coding(app).await?;
     let mut reports = Vec::new();
     for _ in 0..MAX_JOBS_PER_PASS {
         let claimed = match claim(app, Kind::Compact).await? {
@@ -200,12 +232,27 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
         let Some((kind, sources)) = claimed else {
             break;
         };
-        match run_job(app, kind, &sources).await {
+        match run_job(app, kind, &sources, coding).await {
             Ok(report) => reports.push(report),
             Err(e) => {
                 let message = format!("packing {} blobs failed: {e:#}", sources.len());
                 eprintln!("packer: {message}");
                 app.metrics.pack_failed(message);
+            }
+        }
+    }
+    if coding.is_some() {
+        for _ in 0..CONVERSIONS_PER_PASS {
+            let Some(sources) = claim(app, Kind::Convert).await? else {
+                break;
+            };
+            match run_job(app, Kind::Convert, &sources, coding).await {
+                Ok(report) => reports.push(report),
+                Err(e) => {
+                    let message = format!("coding {} blobs failed: {e:#}", sources.len());
+                    eprintln!("packer: {message}");
+                    app.metrics.pack_failed(message);
+                }
             }
         }
     }
@@ -236,7 +283,7 @@ pub(crate) async fn upgrade(app: &Arc<App>, budget: u64) -> anyhow::Result<Vec<J
             .await?
             .get(0);
         spent += size.max(1) as u64;
-        match run_upgrade(app, &sources).await {
+        match run_upgrade(app, &sources, coding(app).await?).await {
             Ok(report) => reports.push(report),
             Err(e) => {
                 let message = format!("upgrading blob {} failed: {e:#}", sources[0]);
@@ -254,7 +301,7 @@ pub(crate) async fn upgrade(app: &Arc<App>, budget: u64) -> anyhow::Result<Vec<J
 /// one gives a copy that verifies. If none does, though every one was read,
 /// its parts are intact nowhere: their bytes go to `lost_ranges` (see
 /// `scrub`), which keeps reads off them, and the blob is left as it is.
-async fn run_upgrade(app: &Arc<App>, sources: &[Uuid]) -> anyhow::Result<JobReport> {
+async fn run_upgrade(app: &Arc<App>, sources: &[Uuid], coding: Option<u32>) -> anyhow::Result<JobReport> {
     let blob_id = sources[0];
     let replicas: Vec<(i32, bool)> = app
         .pool
@@ -278,7 +325,7 @@ async fn run_upgrade(app: &Arc<App>, sources: &[Uuid]) -> anyhow::Result<JobRepo
             continue;
         }
         let mut outputs = Vec::new();
-        let result = pack(app, Kind::Upgrade, sources, &mut outputs, Some(node)).await;
+        let result = pack(app, Kind::Upgrade, sources, &mut outputs, Some(node), coding).await;
         if result.is_err() {
             for output in outputs {
                 crate::blobs::discard(app, output).await;
@@ -322,6 +369,27 @@ async fn run_upgrade(app: &Arc<App>, sources: &[Uuid]) -> anyhow::Result<JobRepo
     Err(last_error)
 }
 
+/// How many data shards cold data is coded into now (see `shards`): `None`
+/// if it isn't, because `data-shards` is 1, or there are no parity shards to
+/// add (a replication factor of 1), or fewer live nodes than shards.
+pub(crate) async fn coding(app: &App) -> anyhow::Result<Option<u32>> {
+    let client = app.pool.get().await?;
+    let data_shards = crate::settings::DATA_SHARDS.get(&client).await? as u32;
+    let parity_shards = app.parity_shards();
+    if data_shards < 2 || parity_shards == 0 {
+        return Ok(None);
+    }
+    // Live as `choose_nodes` counts them.
+    let live: i64 = client
+        .query_one_cached(
+            "SELECT count(*) FROM nodes WHERE last_seen > NOW() - INTERVAL '10 seconds'",
+            &[],
+        )
+        .await?
+        .get(0);
+    Ok((live >= (data_shards + parity_shards) as i64).then_some(data_shards))
+}
+
 /// Takes the garbage log, in batches: the blobs that parts were deleted from
 /// since the last fold. Drops those that no part references anymore, and updates the
 /// `dead_size` of the rest. Folds run one at a time across the cluster: while
@@ -361,6 +429,7 @@ async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
         Kind::Compact => "compact",
         Kind::Consolidate => "consolidate",
         Kind::Upgrade => "upgrade",
+        Kind::Convert => "convert",
     };
     let budget = OUTPUTS_PER_JOB * config.target_size;
     let sources: Vec<Uuid> = app
@@ -368,7 +437,7 @@ async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
         .get()
         .await?
         .query_one_cached(
-            "SELECT pg_temp.cairn_claim($1, $2, $3, $4, $5, $6, $7)",
+            "SELECT pg_temp.cairn_claim($1, $2, $3, $4, $5, $6, $7, $8)",
             &[
                 &kind,
                 &config.compact_threshold,
@@ -377,6 +446,7 @@ async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
                 &(config.target_size as i64),
                 &(budget as i64),
                 &LEASE.as_secs_f64(),
+                &config.cold_age.as_secs_f64(),
             ],
         )
         .await?
@@ -400,6 +470,8 @@ struct Part {
     /// (which is its ETag).
     crc64nvme: Option<u64>,
     etag: String,
+    /// Whether it's old enough to be erasure-coded (`Config::cold_age`).
+    cold: bool,
 }
 
 /// A byte range of a source blob that's copied as a whole: the bytes its parts
@@ -427,9 +499,9 @@ struct Run {
 
 /// Runs a job on the claimed `sources`. On failure, the new blobs are deleted
 /// (left to the GC if that fails too), and the sources stay leased.
-async fn run_job(app: &Arc<App>, kind: Kind, sources: &[Uuid]) -> anyhow::Result<JobReport> {
+async fn run_job(app: &Arc<App>, kind: Kind, sources: &[Uuid], coding: Option<u32>) -> anyhow::Result<JobReport> {
     let mut outputs = Vec::new();
-    let result = pack(app, kind, sources, &mut outputs, None).await;
+    let result = pack(app, kind, sources, &mut outputs, None, coding).await;
     if result.is_err() {
         for blob_id in outputs {
             if let Err(e) = crate::blobs::abandon(app, blob_id).await {
@@ -441,21 +513,23 @@ async fn run_job(app: &Arc<App>, kind: Kind, sources: &[Uuid]) -> anyhow::Result
 }
 
 /// The body of [`run_job`]. Adds each new blob to `outputs` once it exists.
-/// Reads the sources from their replica on node `only`, if given, else from
-/// any.
+/// Reads the sources from their shard on node `only`, if given, else from
+/// any. Writes a new blob coded in `coding` data shards if it's large enough
+/// and all of its parts are cold, else replicated.
 async fn pack(
     app: &Arc<App>,
     kind: Kind,
     sources: &[Uuid],
     outputs: &mut Vec<Uuid>,
     only: Option<i32>,
+    coding: Option<u32>,
 ) -> anyhow::Result<JobReport> {
     let client = app.pool.get().await?;
-    let mut parts = load_parts(&client, sources).await?;
+    let mut parts = load_parts(&client, sources, app.pack.cold_age).await?;
     let mut blobs = load_blobs(&client, app.node, sources).await?;
     if let Some(node) = only {
         for (_, locations) in blobs.values_mut() {
-            locations.retain(|(n, _)| *n == node);
+            locations.retain(|l| l.node == node);
         }
     }
     drop(client);
@@ -480,7 +554,15 @@ async fn pack(
     // deleted), and whose place in a new blob is padding.
     let mut vanished = Vec::new();
     for output in runs.chunk_by(|a, b| a.output == b.output) {
-        let mut writer = BlobWriter::begin(app).await?;
+        // Its size is known: its runs are copied as they are, or padded.
+        let size: u64 = output.iter().map(|r| r.length).sum();
+        let cold = output.iter().all(|r| parts[r.parts.clone()].iter().all(|p| p.cold));
+        let mut writer = match coding {
+            Some(data_shards) if cold && size > app.pack.small_size => {
+                BlobWriter::begin_coded(app, data_shards, size).await?
+            }
+            _ => BlobWriter::begin(app).await?,
+        };
         outputs.push(writer.blob_id);
         for run in output {
             // A source missing here was deleted after its parts were loaded,
@@ -515,20 +597,21 @@ async fn pack(
 
 /// Loads the parts of `sources` in the order they're to be laid out: by age
 /// band (the oldest first), then bucket, then age.
-async fn load_parts(client: &Object, sources: &[Uuid]) -> anyhow::Result<Vec<Part>> {
+async fn load_parts(client: &Object, sources: &[Uuid], cold_age: Duration) -> anyhow::Result<Vec<Part>> {
     // A part's age band is log2 of its age in minutes: the first band holds
     // the parts younger than two minutes, the next those up to four, and so on.
     // The last keys keep a blob's parts together when they're the same age.
     let rows = client
         .query_cached(
-            "SELECT p.id, p.blob_id, p.blob_offset, p.size, p.crc64nvme, p.etag
+            "SELECT p.id, p.blob_id, p.blob_offset, p.size, p.crc64nvme, p.etag,
+                    p.created_at < NOW() - make_interval(secs => $2)
              FROM parts p
              LEFT JOIN objects o ON o.id = p.object_id
              LEFT JOIN multipart_uploads u ON u.upload_id = p.upload_id
              WHERE p.blob_id = ANY($1)
              ORDER BY floor(log(2, greatest(extract(epoch FROM NOW() - p.created_at) / 60, 1))) DESC,
                       coalesce(o.bucket, u.bucket), p.created_at, p.blob_id, p.blob_offset",
-            &[&sources],
+            &[&sources, &cold_age.as_secs_f64()],
         )
         .await?;
     Ok(rows
@@ -543,38 +626,35 @@ async fn load_parts(client: &Object, sources: &[Uuid]) -> anyhow::Result<Vec<Par
             run: 0,
             crc64nvme: r.get::<_, Option<i64>>(4).map(|crc| crc as u64),
             etag: r.get(5),
+            cold: r.get(6),
         })
         .collect())
 }
 
-/// Each source blob's block layout (`None` for a blob from before checksums)
-/// and its replicas, this node first, then the freshest.
+/// Each source blob's layout (`None` for a blob from before checksums) and
+/// the nodes holding its shards, this node first, then the freshest.
 async fn load_blobs(
     client: &Object,
     node: i32,
     sources: &[Uuid],
-) -> anyhow::Result<HashMap<Uuid, (Option<BlockLayout>, Vec<Location>)>> {
+) -> anyhow::Result<HashMap<Uuid, (Option<Layout>, Vec<Location>)>> {
     let rows = client
         .query_cached(
-            "SELECT b.blob_id, b.size, b.block_size, bl.node, n.peer_url
-             FROM blobs b
-             JOIN blob_locations bl ON bl.blob_id = b.blob_id
-             JOIN nodes n ON n.id = bl.node
-             WHERE b.blob_id = ANY($1)
-             ORDER BY bl.node = $2 DESC, n.last_seen DESC",
+            &format!(
+                "SELECT b.blob_id, {LAYOUT_COLUMNS}, {LOCATION_COLUMNS}
+                 FROM blobs b
+                 JOIN blob_locations bl ON bl.blob_id = b.blob_id
+                 JOIN nodes n ON n.id = bl.node
+                 WHERE b.blob_id = ANY($1)
+                 ORDER BY bl.node = $2 DESC, n.last_seen DESC"
+            ),
             &[&sources, &node],
         )
         .await?;
-    let mut blobs: HashMap<Uuid, (Option<BlockLayout>, Vec<Location>)> = HashMap::new();
+    let mut blobs: HashMap<Uuid, (Option<Layout>, Vec<Location>)> = HashMap::new();
     for row in &rows {
-        let (_, locations) = blobs.entry(row.get(0)).or_insert_with(|| {
-            let layout = row.get::<_, Option<i32>>(2).map(|block_size| BlockLayout {
-                block_size: block_size as u64,
-                blob_size: row.get::<_, i64>(1) as u64,
-            });
-            (layout, Vec::new())
-        });
-        locations.push((row.get(3), row.get(4)));
+        let (_, locations) = blobs.entry(row.get(0)).or_insert_with(|| (layout_at(row, 1), Vec::new()));
+        locations.push(location_at(row, 6));
     }
     Ok(blobs)
 }
@@ -677,7 +757,7 @@ fn lay_out(parts: &mut [Part], target: u64) -> Vec<Run> {
 async fn copy_run(
     app: &App,
     run: &Run,
-    layout: Option<BlockLayout>,
+    layout: Option<Layout>,
     locations: &[Location],
     writer: &mut BlobWriter,
 ) -> anyhow::Result<bool> {
@@ -731,17 +811,14 @@ async fn copy_run(
 /// match the part's own checksum. Independent of how the blob was assembled, so
 /// it also catches the packer's own mistakes.
 async fn verify(app: &App, written: &Written, parts: &[Part]) -> anyhow::Result<()> {
-    let mut locations = written.replicas.clone();
-    locations.sort_by_key(|(node, _)| *node != app.node);
+    let mut locations = written.locations.clone();
+    locations.sort_by_key(|l| l.node != app.node);
     let mut slice = BlobSlice {
         blob_id: written.blob_id,
-        layout: Some(BlockLayout {
-            block_size: checksum::BLOCK_SIZE as u64,
-            blob_size: written.size,
-        }),
+        layout: Some(written.layout),
         locations,
         offset: 0,
-        length: written.size,
+        length: written.size(),
         part: None,
     };
     let (tx, mut rx) = mpsc::channel(4);
@@ -917,7 +994,7 @@ async fn commit(
             Err(CommitError::Db(e)) if db::is_conflict(&e) => continue,
             Err(CommitError::Db(e)) => return Err(e.into()),
             Err(CommitError::MissingLocations(present)) => {
-                anyhow::bail!("only {present} replicas of a new blob reported a location");
+                anyhow::bail!("only {present} shards of a new blob reported a location");
             }
         }
     }
@@ -943,12 +1020,22 @@ async fn try_commit(
 ) -> Result<Vec<ReapTarget>, CommitError> {
     // The new blobs. CRCs are stored as their 64 bits, read as a signed BIGINT.
     let out_blobs: Vec<Uuid> = written.iter().map(|w| w.blob_id).collect();
-    let out_sizes: Vec<i64> = written.iter().map(|w| w.size as i64).collect();
-    let out_crcs: Vec<i64> = written.iter().map(|w| w.file_crc as i64).collect();
-    let (loc_blobs, loc_nodes): (Vec<Uuid>, Vec<i32>) = written
-        .iter()
-        .flat_map(|w| w.nodes.iter().map(|&node| (w.blob_id, node)))
-        .unzip();
+    let out_sizes: Vec<i64> = written.iter().map(|w| w.size() as i64).collect();
+    let out_data_shards: Vec<i16> = written.iter().map(|w| w.layout.data_shards as i16).collect();
+    let out_parity_shards: Vec<i16> = written.iter().map(|w| w.layout.parity_shards as i16).collect();
+    // Each shard: its blob, node, number, and the CRC of its file.
+    let mut loc_blobs = Vec::new();
+    let mut loc_nodes = Vec::new();
+    let mut loc_shards = Vec::new();
+    let mut loc_crcs = Vec::new();
+    for w in written {
+        for l in &w.locations {
+            loc_blobs.push(w.blob_id);
+            loc_nodes.push(l.node);
+            loc_shards.push(l.shard as i16);
+            loc_crcs.push(w.shard_crcs[l.shard as usize] as i64);
+        }
+    }
     let ids: Vec<i64> = parts.iter().map(|p| p.id).collect();
     let old_blobs: Vec<Uuid> = parts.iter().map(|p| p.blob_id).collect();
     let old_offsets: Vec<i64> = parts.iter().map(|p| p.offset as i64).collect();
@@ -957,15 +1044,20 @@ async fn try_commit(
     let row = client
         .query_one_cached(
             "SELECT status, present, reap_blob, reap_node, reap_peer
-             FROM pg_temp.cairn_pack_commit($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             FROM pg_temp.cairn_pack_commit($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
+                                            $13, $14, $15, $16)",
             &[
                 &sources,
                 &out_blobs,
                 &out_sizes,
-                &out_crcs,
                 &(checksum::BLOCK_SIZE as i32),
+                &out_data_shards,
+                &out_parity_shards,
+                &(crate::shards::STRIPE_UNIT as i32),
                 &loc_blobs,
                 &loc_nodes,
+                &loc_shards,
+                &loc_crcs,
                 &ids,
                 &old_blobs,
                 &old_offsets,
@@ -1004,6 +1096,7 @@ mod tests {
             run: 0,
             crc64nvme: (!md5).then(|| crc.sum64()),
             etag: Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect(),
+            cold: false,
         }
     }
 
@@ -1024,6 +1117,15 @@ mod tests {
         // `cairn_claim` repeats the bound, for the planner.
         let claim = format!("size <= {SMALL_SIZE} AND");
         assert!(include_str!("catalog.sql").contains(&claim));
+    }
+
+    #[test]
+    fn convert_bound_matches_the_index() {
+        assert!(crate::db::SHARDS.contains(&format!("AND size > {SMALL_SIZE};")));
+        // `cairn_claim` repeats it, for the planner.
+        let catalog = include_str!("catalog.sql");
+        assert!(catalog.contains(&format!("AND size > {SMALL_SIZE}\n")));
+        assert!(catalog.contains(&format!("p_small_size >= {SMALL_SIZE} THEN")));
     }
 
     #[test]

@@ -135,6 +135,17 @@ pub struct Cluster {
 /// A cluster of `n` nodes writing `replication_factor` replicas of every
 /// blob. `None` if there's no database to test against.
 pub async fn cluster(n: usize, replication_factor: usize) -> Option<Cluster> {
+    cluster_with(n, replication_factor, Config::default(), None).await
+}
+
+/// Like `cluster`, with the packer's `pack` config on every node, and the
+/// packer's test `hook` on the first.
+pub async fn cluster_with(
+    n: usize,
+    replication_factor: usize,
+    pack: Config,
+    mut hook: Option<Hook>,
+) -> Option<Cluster> {
     let pool = fresh_database().await?;
     let mut cluster = Cluster {
         nodes: Vec::new(),
@@ -143,7 +154,7 @@ pub async fn cluster(n: usize, replication_factor: usize) -> Option<Cluster> {
     for _ in 0..n {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_url = format!("http://{}", listener.local_addr().unwrap());
-        let app = node_on(&pool, &peer_url, Config::default(), None, replication_factor).await;
+        let app = node_on(&pool, &peer_url, pack.clone(), hook.take(), replication_factor).await;
         let router = crate::peer::router(app.clone());
         let serving = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();

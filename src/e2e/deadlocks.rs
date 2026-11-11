@@ -169,6 +169,7 @@ async fn the_lock_protocol_has_no_deadlocks() {
         small_size: 2_000,
         compact_threshold: 0.1,
         max_sources: 50,
+        ..packer::Config::default()
     };
     let Some(app) = node_with(pack, None).await else { return };
     for i in 0..KEYS {

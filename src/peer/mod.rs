@@ -23,10 +23,11 @@ use hyper_util::{
 use uuid::Uuid;
 
 use crate::{
-    App, blob_file,
+    App,
+    blob_file::{self, ShardFile},
     body::{ResBody, channel_body, send_file},
-    checksum::BlockLayout,
     gc, packer,
+    shards::{Layout, STRIPE_UNIT},
 };
 
 /// Response header of a blob PUT: the hex CRC64/NVME of the file the replica
@@ -98,6 +99,7 @@ pub fn router(app: Arc<App>) -> Router {
             "/blobs/{blob_id}",
             get(get_blob).put(put_blob).delete(delete_blob),
         )
+        .route("/blobs/{blob_id}/table", get(get_table))
         .nest(
             crate::dashboard::PREFIX,
             crate::dashboard::router(app.clone()),
@@ -149,12 +151,13 @@ async fn stats(State(app): State<Arc<App>>) -> axum::Json<crate::dashboard::Node
     axum::Json(crate::dashboard::node_stats(&app).await)
 }
 
-/// Dumb data plane: streams whatever bytes we hold from disk — the whole blob,
-/// or just `?offset=&length=` of it — or 404 so the reader can fall through to
-/// another replica. For a block-aligned range of a checksummed blob, the reader
-/// sends the blob's size and block size from the catalog
-/// (`?blob_size=&block_size=`); we check our file against them and send the
-/// range's block checksums from the file first. The reader verifies the bytes
+/// Dumb data plane: streams whatever bytes we hold of a blob from disk (our
+/// shard of it) — the whole file, or just `?offset=&length=` of its data —
+/// or 404 so the reader can fall through to another shard. For a
+/// block-aligned range of a checksummed blob, the reader sends the blob's
+/// layout from the catalog and which shard it expects us to hold (see
+/// `layout_query`); we check our file against them and send the range's
+/// block checksums from the file first. The reader verifies the bytes
 /// against them, so we don't have to.
 async fn get_blob(
     State(app): State<Arc<App>>,
@@ -166,22 +169,15 @@ async fn get_blob(
     };
     let query = query.unwrap_or_default();
     let range = parse_range(&query);
-    let layout = parse_layout(&query);
+    let expected = parse_layout(&query, blob_id);
     let Some(mut file) = app.store.open_blob(blob_id).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
-    let crcs = match (layout, range) {
-        (Some(layout), Some((offset, length))) => {
-            match blob_file::open_range(&mut file, blob_id, layout, offset, length).await {
+    let crcs = match (expected, range) {
+        (Some(expected), Some((offset, length))) => {
+            match blob_file::open_range(&mut file, &expected, offset, length).await {
                 Ok(crcs) => Some(crcs),
-                Err(e) => {
-                    if e.kind() == std::io::ErrorKind::InvalidData {
-                        eprintln!("CORRUPTION: blob {blob_id}: {e}");
-                        // The reader can't tell this from any other failure.
-                        crate::scrub::suspect(&app, blob_id, app.node);
-                    }
-                    return Err(e.into());
-                }
+                Err(e) => return Err(damaged(&app, blob_id, e)),
             }
         }
         (Some(_), None) => return Ok(StatusCode::BAD_REQUEST.into_response()),
@@ -201,18 +197,63 @@ async fn get_blob(
     Ok(Body::new(body).into_response())
 }
 
+/// The checksums of shard `?of=`'s blocks over its block-aligned range
+/// `?offset=&length=`, from the table our shard's file keeps of it (every
+/// coded shard's file has every shard's table): for a reader that decoded
+/// that shard, to verify what it decoded. Checks our file as `get_blob` does.
+async fn get_table(
+    State(app): State<Arc<App>>,
+    Path(blob_id): Path<String>,
+    RawQuery(query): RawQuery,
+) -> Result<Response, Failed> {
+    let Ok(blob_id) = Uuid::parse_str(&blob_id) else {
+        return Ok(StatusCode::BAD_REQUEST.into_response());
+    };
+    let query = query.unwrap_or_default();
+    let (Some(expected), Some((offset, length)), Some(of)) = (
+        parse_layout(&query, blob_id),
+        parse_range(&query),
+        param(&query, "of").and_then(|v| v.parse().ok()),
+    ) else {
+        return Ok(StatusCode::BAD_REQUEST.into_response());
+    };
+    let Some(mut file) = app.store.open_blob(blob_id).await? else {
+        return Ok(StatusCode::NOT_FOUND.into_response());
+    };
+    match blob_file::read_table(&mut file, &expected, of, offset, length).await {
+        Ok(crcs) => Ok(Body::from(crcs).into_response()),
+        Err(e) => Err(damaged(&app, blob_id, e)),
+    }
+}
+
+/// A failed read of our file: if it's damaged, it's logged, and flagged for
+/// our scrubber, since the reader can't tell this from any other failure.
+fn damaged(app: &App, blob_id: Uuid, e: std::io::Error) -> Failed {
+    if e.kind() == std::io::ErrorKind::InvalidData {
+        eprintln!("CORRUPTION: blob {blob_id}: {e}");
+        crate::scrub::suspect(app, blob_id, app.node);
+    }
+    e.into()
+}
+
 /// Streams the body straight to disk (and announces the location), without
-/// buffering the whole blob in memory. Answers with the CRC of the file we
+/// buffering the whole blob in memory: our shard of the blob, `?shard=`
+/// (see `write_blob_streaming`). Answers with the CRC of the file we
 /// stored, so the writer can check that we got exactly the bytes it sent.
 async fn put_blob(
     State(app): State<Arc<App>>,
     Path(blob_id): Path<String>,
+    RawQuery(query): RawQuery,
     body: Body,
 ) -> Result<Response, Failed> {
     let Ok(blob_id) = Uuid::parse_str(&blob_id) else {
         return Ok(StatusCode::BAD_REQUEST.into_response());
     };
-    let crc = crate::write_blob_streaming(&app, blob_id, body).await?;
+    let query = query.unwrap_or_default();
+    let Some(shard) = parse_shard(&query, blob_id) else {
+        return Ok(StatusCode::BAD_REQUEST.into_response());
+    };
+    let crc = crate::write_blob_streaming(&app, &shard, body).await?;
     let crc = HeaderValue::from_str(&format!("{crc:016x}"))?;
     Ok(([(CRC64_HEADER, crc)], ()).into_response())
 }
@@ -240,15 +281,53 @@ fn param(query: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Parses a checksummed blob's `?blob_size=&block_size=`; both must be present,
-/// else the blob is read without checksums.
-fn parse_layout(query: &str) -> Option<BlockLayout> {
-    let blob_size = param(query, "blob_size")?.parse().ok()?;
-    let block_size = param(query, "block_size")?.parse().ok()?;
-    Some(BlockLayout {
-        block_size,
-        blob_size,
-    })
+/// The query parameters that tell a node which shard file of a blob to
+/// expect (see `parse_layout`). A replicated blob's are the same for every
+/// shard, as they were before blobs had shards, so that nodes of either
+/// version understand each other's reads of them.
+pub fn layout_query(file: &ShardFile) -> String {
+    let l = file.layout;
+    let mut query = format!("&blob_size={}&block_size={}", l.size, l.block_size);
+    if !l.replicated() {
+        query.push_str(&format!(
+            "&data_shards={}&parity_shards={}&stripe_unit={}&shard={}",
+            l.data_shards, l.parity_shards, l.stripe_unit, file.shard
+        ));
+    }
+    query
+}
+
+/// Parses the shard file that `layout_query` describes. Without
+/// `?blob_size=&block_size=`, the blob is from before checksums (or the
+/// request is malformed), and is read without them; without the rest, it's
+/// replicated.
+fn parse_layout(query: &str, blob_id: Uuid) -> Option<ShardFile> {
+    let number = |name: &str| param(query, name)?.parse::<u64>().ok();
+    let layout = Layout {
+        size: number("blob_size")?,
+        block_size: number("block_size")?,
+        data_shards: number("data_shards").unwrap_or(1) as u32,
+        parity_shards: number("parity_shards").unwrap_or(0) as u32,
+        stripe_unit: number("stripe_unit").unwrap_or(STRIPE_UNIT as u64),
+    };
+    if layout.block_size == 0 || layout.data_shards == 0 || layout.stripe_unit == 0 {
+        return None;
+    }
+    let shard = number("shard").unwrap_or(0) as u32;
+    (shard < layout.shards().max(1)).then_some(ShardFile { blob_id, layout, shard })
+}
+
+/// What a writer asks a node to store (see `write_blob_streaming`):
+/// `?shard=`, and for a coded blob its layout too (`layout_query`), whose
+/// size is known up front. A replicated blob's shard is streamed, its size
+/// unknown until it ends.
+fn parse_shard(query: &str, blob_id: Uuid) -> Option<crate::ShardWrite> {
+    let shard: u32 = param(query, "shard")?.parse().ok()?;
+    match parse_layout(query, blob_id) {
+        Some(file) if !file.layout.replicated() && file.shard == shard => Some(crate::ShardWrite::Coded(file)),
+        Some(_) => None,
+        None => Some(crate::ShardWrite::Replica { blob_id, shard }),
+    }
 }
 
 /// Parses an `?offset=&length=` blob range; both must be present, else the whole

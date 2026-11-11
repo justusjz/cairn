@@ -939,6 +939,8 @@
           "consolidate_bytes",
           "compact",
           "compact_garbage_bytes",
+          "convert",
+          "convert_bytes",
           "garbage_log",
           "uploads",
           "upload_bytes"
@@ -959,6 +961,15 @@
             "description": "Blobs small enough to be consolidated."
           },
           "consolidate_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "convert": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Replicated blobs old and large enough to be erasure-coded, once\ncoding is on (see `packer::coding`)."
+          },
+          "convert_bytes": {
             "type": "integer",
             "format": "int64"
           },
@@ -2162,7 +2173,7 @@
           "sweep_shard": {
             "type": "integer",
             "format": "int32",
-            "description": "Where the GC's file sweep is, of `shards`.",
+            "description": "Where the GC's file sweep is, of `shards` (blob directories; the\nnames are the dashboard's).",
             "minimum": 0
           }
         }
@@ -2330,7 +2341,7 @@
       },
       "NodeHolding": {
         "type": "object",
-        "description": "The committed blobs a node holds a copy of.",
+        "description": "The committed blobs a node holds a shard of, and the bytes of those\nshards.",
         "required": [
           "node",
           "blobs",
@@ -2510,16 +2521,39 @@
           "target_size",
           "small_size",
           "compact_threshold",
-          "max_sources"
+          "max_sources",
+          "data_shards",
+          "parity_shards",
+          "cold_age_secs",
+          "coding"
         ],
         "properties": {
+          "coding": {
+            "type": "boolean",
+            "description": "Whether it's coded now: also takes as many live nodes as shards."
+          },
+          "cold_age_secs": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
           "compact_threshold": {
             "type": "number",
             "format": "double"
           },
+          "data_shards": {
+            "type": "integer",
+            "format": "int64",
+            "description": "What cold data is erasure-coded into (the `data-shards` setting, and\nthe parity shards that `--replication-factor` gives), and how old it\nmust be. One data shard: it isn't."
+          },
           "max_sources": {
             "type": "integer",
             "format": "int64"
+          },
+          "parity_shards": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
           },
           "small_size": {
             "type": "integer",
@@ -2581,6 +2615,7 @@
           "blob_offset",
           "blob_size",
           "blob_state",
+          "data_shards",
           "created_at",
           "nodes",
           "lost"
@@ -2612,6 +2647,11 @@
             "type": "number",
             "format": "double"
           },
+          "data_shards": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The blob's data shards: 1 if it's replicated, else it's erasure-coded,\nand readable with as many live shards."
+          },
           "etag": {
             "type": "string"
           },
@@ -2632,7 +2672,7 @@
               "type": "integer",
               "format": "int32"
             },
-            "description": "The nodes holding a copy of the blob."
+            "description": "The nodes holding a shard of the blob."
           },
           "number": {
             "type": "integer",
@@ -2655,8 +2695,9 @@
       },
       "ReplicaGroup": {
         "type": "object",
-        "description": "The committed blobs with `copies` copies, `live` of them on live nodes.",
+        "description": "The committed blobs of `data_shards` data shards (1: replicated) with\n`copies` shards in all, `live` of them on live nodes. A blob is readable\nwith `data_shards` live shards, and as redundant as the cluster's\nreplication factor asks with `data_shards` + replication factor − 1.",
         "required": [
+          "data_shards",
           "live",
           "copies",
           "blobs",
@@ -2672,6 +2713,10 @@
             "format": "int64"
           },
           "copies": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "data_shards": {
             "type": "integer",
             "format": "int64"
           },

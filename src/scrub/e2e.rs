@@ -196,7 +196,7 @@ async fn skips_blobs_from_before_checksums() {
     let client = app.pool.get().await.unwrap();
     client
         .execute(
-            "UPDATE blobs SET block_size = NULL, crc64nvme = NULL WHERE blob_id = $1",
+            "UPDATE blobs SET block_size = NULL, shard_crcs = NULL WHERE blob_id = $1",
             &[&blob_id],
         )
         .await
@@ -365,12 +365,17 @@ async fn repairs_leave_nothing_behind() {
     put(a, "k", vec![1; 1000]).await;
     let blob_id = blob_of(a, "k").await;
     let client = a.pool.get().await.unwrap();
-    let (size, crc): (i64, i64) = {
+    let (size, crc, shard): (i64, i64, i16) = {
         let row = client
-            .query_one("SELECT size, crc64nvme FROM blobs WHERE blob_id = $1", &[&blob_id])
+            .query_one(
+                "SELECT b.size, b.shard_crcs[bl.shard + 1], bl.shard
+                 FROM blobs b JOIN blob_locations bl USING (blob_id)
+                 WHERE b.blob_id = $1 AND bl.node = $2",
+                &[&blob_id, &a.node],
+            )
             .await
             .unwrap();
-        (row.get(0), row.get(1))
+        (row.get(0), row.get(1), row.get(2))
     };
     client
         .batch_execute(&format!(
@@ -382,11 +387,12 @@ async fn repairs_leave_nothing_behind() {
         .await
         .unwrap();
     std::fs::remove_file(a.store.blob_path(blob_id)).unwrap();
-    let layout = crate::checksum::BlockLayout {
-        block_size: crate::checksum::BLOCK_SIZE as u64,
-        blob_size: size as u64,
+    let file = crate::blob_file::ShardFile {
+        blob_id,
+        layout: crate::shards::Layout::new(size as u64, 1, 1),
+        shard: shard as u32,
     };
-    let outcome = super::repair::repair(a, blob_id, layout, crc as u64, None, &Pacer::new(None))
+    let outcome = super::repair::repair(a, &file, crc as u64, None, &Pacer::new(None))
         .await
         .unwrap();
     assert_eq!(outcome, super::repair::Outcome::Repaired);
@@ -551,7 +557,7 @@ async fn make_legacy(nodes: &[Arc<App>], key: &str) -> Uuid {
     client
         .batch_execute(&format!(
             "SET cairn.protocol = '{}';
-             UPDATE blobs SET block_size = NULL, crc64nvme = NULL WHERE blob_id = '{blob_id}';
+             UPDATE blobs SET block_size = NULL, shard_crcs = NULL WHERE blob_id = '{blob_id}';
              UPDATE parts SET crc64nvme = NULL WHERE blob_id = '{blob_id}';",
             crate::db::PROTOCOL
         ))

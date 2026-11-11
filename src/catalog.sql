@@ -112,7 +112,7 @@
 --     serialized by P(u,n), so the part an attach displaces stays put.
 -- I5. A part only references an existing, committed blob; a blob is only
 --     deleted when no part references it; a blob is only committed with all
---     of its replicas' locations present. Guard: X(x).
+--     of its shards' locations present. Guard: X(x).
 --     - Referencing (copies): lock the source parts' blobs shared, then
 --       re-read the source parts, and check they're still the same parts, on
 --       those blobs (`cairn_source_parts`).
@@ -337,10 +337,11 @@ BEGIN
 END
 $$;
 
--- How many of `nodes` hold a location for the blob, if it's still pending;
--- 0 if it isn't (it's gone: deleted by the GC as stale, say). Under X(x)
--- exclusive.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_locations_present(p_blob uuid, p_nodes int[])
+-- How many of the shards that the writer sent to `p_nodes` (shard
+-- `p_shards[i]` to node `p_nodes[i]`) have their location recorded, if the
+-- blob is still pending; 0 if it isn't (it's gone: deleted by the GC as
+-- stale, say). Under X(x) exclusive.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_locations_present(p_blob uuid, p_nodes int[], p_shards smallint[])
 RETURNS bigint LANGUAGE plpgsql AS $$
 DECLARE
     result bigint;
@@ -349,20 +350,25 @@ BEGIN
     IF NOT FOUND THEN
         RETURN 0;
     END IF;
-    SELECT count(*) INTO result FROM blob_locations WHERE blob_id = p_blob AND node = ANY(p_nodes);
+    SELECT count(*) INTO result
+    FROM blob_locations bl JOIN unnest(p_nodes, p_shards) AS w(node, shard)
+        ON w.node = bl.node AND w.shard = bl.shard
+    WHERE bl.blob_id = p_blob;
     RETURN result;
 END
 $$;
 
--- Marks a blob committed, recording its size and the CRC64/NVME of its file
--- (see `Written`). The caller holds X(x) exclusive and has checked its
--- locations.
+-- Marks a blob committed, recording its layout and the CRC64/NVME of each
+-- shard's file (see `Written`). The caller holds X(x) exclusive and has
+-- checked its locations.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_mark_committed(
-    p_blob uuid, p_size bigint, p_file_crc bigint, p_block_size int
+    p_blob uuid, p_size bigint, p_block_size int, p_data_shards smallint,
+    p_parity_shards smallint, p_stripe_unit int, p_shard_crcs bigint[]
 ) RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE blobs SET state = 'committed', size = p_size, crc64nvme = p_file_crc,
-                     block_size = p_block_size
+    UPDATE blobs SET state = 'committed', size = p_size, block_size = p_block_size,
+                     data_shards = p_data_shards, parity_shards = p_parity_shards,
+                     stripe_unit = p_stripe_unit, shard_crcs = p_shard_crcs
     WHERE blob_id = p_blob;
 END
 $$;
@@ -594,17 +600,21 @@ $$;
 -- the version it replaces. Checks that the bucket exists ('no_such_bucket'),
 -- that a conditional write was decided against the version that's current
 -- (`p_expected`, NULL for none; 'stale' otherwise, for the caller to decide
--- again) and that every replica
+-- again) and that every shard's node
 -- recorded its location ('missing_locations', with how many did), then
 -- commits the blob, writes the version and attaches the part ('committed',
 -- with the version's last-modified time in ISO 8601, as CopyObject reports
 -- it).
+-- The blob's shards went to `p_nodes` (shard `p_shards[i]` to node
+-- `p_nodes[i]`), and its layout and shards' file CRCs are as
+-- `cairn_mark_committed` takes them.
 -- `p_size` is the blob's (and the part's); an encrypted part also has its
 -- plaintext's size and its salt (NULL for a plain one), and an encrypted
 -- object its encryption, as `cairn_put_version` takes it, as it does the
 -- object's checksum.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
-    p_blob uuid, p_nodes int[], p_size bigint, p_file_crc bigint, p_block_size int,
+    p_blob uuid, p_nodes int[], p_shards smallint[], p_size bigint, p_block_size int,
+    p_data_shards smallint, p_parity_shards smallint, p_stripe_unit int, p_shard_crcs bigint[],
     p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
     p_bucket text, p_key text, p_content_type text, p_metadata text, p_sse_c_key bytea,
     p_kms_key_id text, p_kms_data_key text, p_kms_sealed bytea, p_kms_context text,
@@ -638,12 +648,13 @@ BEGIN
     SELECT * INTO f FROM pg_temp.cairn_freeable(v_freed);
     v_locked := pg_temp.cairn_lock_blobs(p_blob || f.blobs, true || f.exclusive);
     PERFORM pg_temp.cairn_check_on(v_freed, v_locked);
-    present := pg_temp.cairn_locations_present(p_blob, p_nodes);
+    present := pg_temp.cairn_locations_present(p_blob, p_nodes, p_shards);
     IF present <> cardinality(p_nodes) THEN
         status := 'missing_locations';
         RETURN;
     END IF;
-    PERFORM pg_temp.cairn_mark_committed(p_blob, p_size, p_file_crc, p_block_size);
+    PERFORM pg_temp.cairn_mark_committed(p_blob, p_size, p_block_size, p_data_shards,
+                                         p_parity_shards, p_stripe_unit, p_shard_crcs);
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, coalesce(p_plain_size, p_size), p_etag, p_content_type,
         p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
@@ -664,10 +675,11 @@ $$;
 -- T2: commits an uploaded blob as part `p_part_number` of a multipart upload,
 -- displacing any part uploaded at that number before. Takes U(u) shared,
 -- P(u,n), then X: the blob exclusively, and the displaced part's blob. Or
--- 'no_such_upload', or 'missing_locations'. Sizes and salt as for
+-- 'no_such_upload', or 'missing_locations'. Shards, layout, sizes and salt as for
 -- `cairn_commit_object`; `p_checksum` is the part's (see `s3::checksums`).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_upload_part(
-    p_blob uuid, p_nodes int[], p_size bigint, p_file_crc bigint, p_block_size int,
+    p_blob uuid, p_nodes int[], p_shards smallint[], p_size bigint, p_block_size int,
+    p_data_shards smallint, p_parity_shards smallint, p_stripe_unit int, p_shard_crcs bigint[],
     p_data_crc bigint, p_etag text, p_plain_size bigint, p_enc_salt bytea,
     p_upload uuid, p_part_number int, p_checksum text,
     OUT status text, OUT present bigint,
@@ -691,12 +703,13 @@ BEGIN
     SELECT * INTO f FROM pg_temp.cairn_freeable(v_displaced);
     v_locked := pg_temp.cairn_lock_blobs(p_blob || f.blobs, true || f.exclusive);
     PERFORM pg_temp.cairn_check_on(v_displaced, v_locked);
-    present := pg_temp.cairn_locations_present(p_blob, p_nodes);
+    present := pg_temp.cairn_locations_present(p_blob, p_nodes, p_shards);
     IF present <> cardinality(p_nodes) THEN
         status := 'missing_locations';
         RETURN;
     END IF;
-    PERFORM pg_temp.cairn_mark_committed(p_blob, p_size, p_file_crc, p_block_size);
+    PERFORM pg_temp.cairn_mark_committed(p_blob, p_size, p_block_size, p_data_shards,
+                                         p_parity_shards, p_stripe_unit, p_shard_crcs);
     DELETE FROM parts WHERE id = ANY(v_displaced);
     INSERT INTO parts (blob_id, blob_offset, size, etag, crc64nvme, object_id, upload_id,
                        part_number, plain_size, enc_salt, checksum, created_at)
@@ -1411,8 +1424,10 @@ END
 $$;
 
 -- T14: claims the source blobs for a packing job, if there's one worth
--- running (see `packer::claim`): `p_kind` is 'compact', 'consolidate' or
--- 'upgrade' (a blob from before checksums, one at a time).
+-- running (see `packer::claim`): `p_kind` is 'compact', 'consolidate',
+-- 'upgrade' (a blob from before checksums, one at a time) or 'convert'
+-- (replicated blobs of more than `p_small_size` live bytes, older than
+-- `p_cold_secs`, to be coded).
 -- Takes candidates, skipping those another transaction has locked (it never
 -- waits), until their live bytes would exceed `p_budget`, and leases them.
 -- Returns them, or an empty array if the job isn't worth it. The lease is a
@@ -1432,7 +1447,7 @@ $$;
 -- just fails its job.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_claim(
     p_kind text, p_compact_threshold float8, p_max_sources bigint, p_small_size bigint,
-    p_target_size bigint, p_budget bigint, p_lease_secs float8
+    p_target_size bigint, p_budget bigint, p_lease_secs float8, p_cold_secs float8
 ) RETURNS uuid[] LANGUAGE plpgsql AS $$
 DECLARE
     v_sources uuid[] := '{}';
@@ -1473,6 +1488,53 @@ BEGIN
                               WHERE l.blob_id = blobs.blob_id
                                 AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
             ORDER BY size - dead_size
+            LIMIT p_max_sources FOR UPDATE SKIP LOCKED
+        LOOP
+            EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
+            v_total := v_total + r.live;
+            v_sources := v_sources || r.blob_id;
+        END LOOP;
+        IF cardinality(v_sources) = 0 THEN
+            RETURN '{}';
+        END IF;
+    ELSIF p_kind = 'convert' AND p_small_size >= 67108864 THEN
+        -- The oldest first, off `blobs_replicated`, whose size bound
+        -- (`packer::SMALL_SIZE`, which a test checks against this) is repeated
+        -- as a literal, so that the planner can use the partial index. Those
+        -- mostly garbage are compaction's: it codes what it keeps.
+        FOR r IN
+            SELECT blob_id, size - dead_size AS live FROM blobs
+            WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
+              AND size > 67108864
+              AND size - dead_size > p_small_size AND dead_size < size * p_compact_threshold
+              AND created_at < NOW() - make_interval(secs => p_cold_secs)
+              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
+            ORDER BY created_at
+            LIMIT p_max_sources FOR UPDATE SKIP LOCKED
+        LOOP
+            EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
+            v_total := v_total + r.live;
+            v_sources := v_sources || r.blob_id;
+        END LOOP;
+        IF cardinality(v_sources) = 0 THEN
+            RETURN '{}';
+        END IF;
+    ELSIF p_kind = 'convert' THEN
+        -- A smaller `p_small_size` than the index's (tests): the same,
+        -- without it.
+        FOR r IN
+            SELECT blob_id, size - dead_size AS live FROM blobs
+            WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
+              AND size - dead_size > p_small_size AND dead_size < size * p_compact_threshold
+              AND created_at < NOW() - make_interval(secs => p_cold_secs)
+              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
+            ORDER BY created_at
             LIMIT p_max_sources FOR UPDATE SKIP LOCKED
         LOOP
             EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
@@ -1546,19 +1608,20 @@ $$;
 
 -- T15: the commit that ends a packing job (see `packer::commit`). Takes X
 -- exclusive on its sources and new blobs. Checks that the new blobs are still
--- pending and every replica of each recorded its location
+-- pending and every shard of each recorded its location
 -- ('missing_locations', with how many of one blob's did). Then commits the new
 -- blobs, moves each part that's still where the job found it into its new
 -- blob (I7), drops the sources and new blobs that nothing references anymore,
 -- and releases the leases on the sources that remain ('committed').
 --
--- The new blobs come as parallel arrays (`p_out_*`), and their replicas as
--- (blob, node) pairs (`p_loc_*`); the parts as (id, old blob, old offset, new
--- blob, new offset).
+-- The new blobs come as parallel arrays (`p_out_*`), and their shards as
+-- (blob, node, shard, CRC64/NVME of the shard's file) tuples (`p_loc_*`);
+-- the parts as (id, old blob, old offset, new blob, new offset).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_pack_commit(
     p_sources uuid[],
-    p_out_blobs uuid[], p_out_sizes bigint[], p_out_crcs bigint[], p_block_size int,
-    p_loc_blobs uuid[], p_loc_nodes int[],
+    p_out_blobs uuid[], p_out_sizes bigint[], p_block_size int, p_out_data_shards smallint[],
+    p_out_parity_shards smallint[], p_stripe_unit int,
+    p_loc_blobs uuid[], p_loc_nodes int[], p_loc_shards smallint[], p_loc_crcs bigint[],
     p_part_ids bigint[], p_old_blobs uuid[], p_old_offsets bigint[],
     p_new_blobs uuid[], p_new_offsets bigint[],
     OUT status text, OUT present bigint,
@@ -1566,6 +1629,8 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_pack_commit(
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_nodes int[];
+    v_shards smallint[];
+    v_crcs bigint[];
     v_touched uuid[];
 BEGIN
     reap_blob := '{}';
@@ -1574,18 +1639,23 @@ BEGIN
     v_touched := p_sources || p_out_blobs;
     PERFORM pg_temp.cairn_lock_blobs(v_touched, array_fill(true, ARRAY[cardinality(v_touched)]));
     FOR i IN 1 .. coalesce(cardinality(p_out_blobs), 0) LOOP
-        SELECT coalesce(array_agg(l.node), '{}') INTO v_nodes
-        FROM unnest(p_loc_blobs, p_loc_nodes) AS l(blob_id, node)
+        SELECT coalesce(array_agg(l.node), '{}'), coalesce(array_agg(l.shard), '{}')
+        INTO v_nodes, v_shards
+        FROM unnest(p_loc_blobs, p_loc_nodes, p_loc_shards) AS l(blob_id, node, shard)
         WHERE l.blob_id = p_out_blobs[i];
-        present := pg_temp.cairn_locations_present(p_out_blobs[i], v_nodes);
+        present := pg_temp.cairn_locations_present(p_out_blobs[i], v_nodes, v_shards);
         IF present <> cardinality(v_nodes) THEN
             status := 'missing_locations';
             RETURN;
         END IF;
     END LOOP;
     FOR i IN 1 .. coalesce(cardinality(p_out_blobs), 0) LOOP
-        PERFORM pg_temp.cairn_mark_committed(p_out_blobs[i], p_out_sizes[i], p_out_crcs[i],
-                                             p_block_size);
+        SELECT array_agg(l.crc ORDER BY l.shard) INTO v_crcs
+        FROM unnest(p_loc_blobs, p_loc_shards, p_loc_crcs) AS l(blob_id, shard, crc)
+        WHERE l.blob_id = p_out_blobs[i];
+        PERFORM pg_temp.cairn_mark_committed(p_out_blobs[i], p_out_sizes[i], p_block_size,
+                                             p_out_data_shards[i], p_out_parity_shards[i],
+                                             p_stripe_unit, v_crcs);
     END LOOP;
     -- Only parts on the sources match, and their rows are covered by the
     -- sources' locks (rule B).

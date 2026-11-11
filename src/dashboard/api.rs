@@ -233,7 +233,8 @@ struct NodeCoverage {
     oldest_checked: Option<f64>,
 }
 
-/// The committed blobs a node holds a copy of.
+/// The committed blobs a node holds a shard of, and the bytes of those
+/// shards.
 #[derive(Clone, Serialize, ToSchema)]
 struct NodeHolding {
     node: i32,
@@ -241,9 +242,13 @@ struct NodeHolding {
     bytes: i64,
 }
 
-/// The committed blobs with `copies` copies, `live` of them on live nodes.
+/// The committed blobs of `data_shards` data shards (1: replicated) with
+/// `copies` shards in all, `live` of them on live nodes. A blob is readable
+/// with `data_shards` live shards, and as redundant as the cluster's
+/// replication factor asks with `data_shards` + replication factor − 1.
 #[derive(Clone, Serialize, ToSchema)]
 struct ReplicaGroup {
+    data_shards: i64,
     live: i64,
     copies: i64,
     blobs: i64,
@@ -281,6 +286,10 @@ struct Backlog {
     /// Blobs with enough garbage to be compacted.
     compact: i64,
     compact_garbage_bytes: i64,
+    /// Replicated blobs old and large enough to be erasure-coded, once
+    /// coding is on (see `packer::coding`).
+    convert: i64,
+    convert_bytes: i64,
     /// Entries of the garbage log the packer hasn't folded yet: one per blob
     /// that a statement deleted parts from.
     garbage_log: i64,
@@ -295,6 +304,14 @@ struct PackerSettings {
     small_size: u64,
     compact_threshold: f64,
     max_sources: i64,
+    /// What cold data is erasure-coded into (the `data-shards` setting, and
+    /// the parity shards that `--replication-factor` gives), and how old it
+    /// must be. One data shard: it isn't.
+    data_shards: i64,
+    parity_shards: u32,
+    cold_age_secs: u64,
+    /// Whether it's coded now: also takes as many live nodes as shards.
+    coding: bool,
 }
 
 #[utoipa::path(get, path = "/storage", responses(
@@ -315,14 +332,30 @@ async fn get_storage(State(app): AppState) -> Result<Json<Storage>> {
     Ok(Json(storage))
 }
 
+/// The bytes of a shard file's data (`blob_locations bl` of `blobs b`): the
+/// blob's for a replicated blob, the shard's cut of it for a coded one (see
+/// `shards::Layout::shard_size`).
+const SHARD_BYTES: &str = "CASE
+    WHEN b.data_shards = 1 THEN b.size
+    WHEN bl.shard >= b.data_shards
+        THEN (b.size + b.data_shards::bigint * b.stripe_unit - 1)
+             / (b.data_shards::bigint * b.stripe_unit) * b.stripe_unit
+    ELSE b.size / (b.data_shards::bigint * b.stripe_unit) * b.stripe_unit
+         + least(b.stripe_unit::bigint,
+                 greatest(0, b.size % (b.data_shards::bigint * b.stripe_unit)
+                             - bl.shard::bigint * b.stripe_unit))
+END";
+
 pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
     let client = app.pool.get().await?;
     let nodes = client
         .query_cached(
-            "SELECT l.node, count(*), coalesce(sum(b.size), 0)::bigint
-             FROM blob_locations l JOIN blobs b USING (blob_id)
-             WHERE b.state = 'committed'
-             GROUP BY l.node ORDER BY l.node",
+            &format!(
+                "SELECT bl.node, count(*), coalesce(sum({SHARD_BYTES}), 0)::bigint
+                 FROM blob_locations bl JOIN blobs b USING (blob_id)
+                 WHERE b.state = 'committed'
+                 GROUP BY bl.node ORDER BY bl.node"
+            ),
             &[],
         )
         .await?
@@ -333,34 +366,36 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             bytes: r.get(2),
         })
         .collect();
-    // How many copies each committed blob has, and how many of them are on
+    // How many shards each committed blob has, and how many of them are on
     // live nodes.
     let replicas = client
         .query_cached(
-            "SELECT live, copies, count(*), coalesce(sum(size), 0)::bigint FROM (
-                 SELECT b.size, count(l.node) AS copies,
+            "SELECT data_shards, live, copies, count(*), coalesce(sum(size), 0)::bigint FROM (
+                 SELECT b.size, b.data_shards::bigint, count(l.node) AS copies,
                         count(l.node) FILTER (WHERE n.last_seen > NOW() - INTERVAL '10 seconds')
                             AS live
                  FROM blobs b
                  LEFT JOIN blob_locations l ON l.blob_id = b.blob_id
                  LEFT JOIN nodes n ON n.id = l.node
                  WHERE b.state = 'committed'
-                 GROUP BY b.blob_id, b.size
+                 GROUP BY b.blob_id, b.size, b.data_shards
              ) t
-             GROUP BY live, copies ORDER BY live, copies",
+             GROUP BY data_shards, live, copies ORDER BY data_shards, live, copies",
             &[],
         )
         .await?
         .iter()
         .map(|r| ReplicaGroup {
-            live: r.get(0),
-            copies: r.get(1),
-            blobs: r.get(2),
-            bytes: r.get(3),
+            data_shards: r.get(0),
+            live: r.get(1),
+            copies: r.get(2),
+            blobs: r.get(3),
+            bytes: r.get(4),
         })
         .collect();
     let small_size = app.pack.small_size as i64;
     let threshold = app.pack.compact_threshold;
+    let cold_secs = app.pack.cold_age.as_secs_f64();
     let b = client
         .query_one_cached(
             "SELECT count(*) FILTER (WHERE state = 'committed'),
@@ -378,9 +413,15 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
                     count(*) FILTER (WHERE state = 'committed' AND dead_size > 0
                                      AND dead_size >= size * $2::float8),
                     coalesce(sum(dead_size) FILTER (WHERE state = 'committed' AND dead_size > 0
-                                     AND dead_size >= size * $2::float8), 0)::bigint
+                                     AND dead_size >= size * $2::float8), 0)::bigint,
+                    count(*) FILTER (WHERE state = 'committed' AND data_shards = 1
+                                     AND block_size IS NOT NULL AND size - dead_size > $1
+                                     AND created_at < NOW() - make_interval(secs => $3)),
+                    coalesce(sum(size) FILTER (WHERE state = 'committed' AND data_shards = 1
+                                     AND block_size IS NOT NULL AND size - dead_size > $1
+                                     AND created_at < NOW() - make_interval(secs => $3)), 0)::bigint
              FROM blobs",
-            &[&small_size, &threshold],
+            &[&small_size, &threshold, &cold_secs],
         )
         .await?;
     let o = client
@@ -397,15 +438,17 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
         .await?;
     let coverage = client
         .query_cached(
-            "SELECT bl.node, count(*), coalesce(sum(b.size), 0)::bigint,
-                    count(*) FILTER (WHERE bl.checked_at IS NULL OR bl.checked_at = '-infinity'),
-                    coalesce(sum(b.size) FILTER (WHERE bl.checked_at IS NULL
-                                                 OR bl.checked_at = '-infinity'), 0)::bigint,
-                    extract(epoch FROM min(bl.checked_at)
-                                       FILTER (WHERE bl.checked_at > '-infinity'))::float8
-             FROM blob_locations bl JOIN blobs b ON b.blob_id = bl.blob_id
-             WHERE b.state = 'committed' AND b.block_size IS NOT NULL
-             GROUP BY bl.node ORDER BY bl.node",
+            &format!(
+                "SELECT bl.node, count(*), coalesce(sum({SHARD_BYTES}), 0)::bigint,
+                        count(*) FILTER (WHERE bl.checked_at IS NULL OR bl.checked_at = '-infinity'),
+                        coalesce(sum({SHARD_BYTES}) FILTER (WHERE bl.checked_at IS NULL
+                                                     OR bl.checked_at = '-infinity'), 0)::bigint,
+                        extract(epoch FROM min(bl.checked_at)
+                                           FILTER (WHERE bl.checked_at > '-infinity'))::float8
+                 FROM blob_locations bl JOIN blobs b ON b.blob_id = bl.blob_id
+                 WHERE b.state = 'committed' AND b.block_size IS NOT NULL
+                 GROUP BY bl.node ORDER BY bl.node"
+            ),
             &[],
         )
         .await?
@@ -462,6 +505,8 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             consolidate_bytes: b.get(8),
             compact: b.get(9),
             compact_garbage_bytes: b.get(10),
+            convert: b.get(11),
+            convert_bytes: b.get(12),
             garbage_log: m.get(3),
             uploads: m.get(0),
             oldest_upload: m.get(1),
@@ -472,6 +517,10 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             small_size: app.pack.small_size,
             compact_threshold: app.pack.compact_threshold,
             max_sources: app.pack.max_sources,
+            data_shards: crate::settings::DATA_SHARDS.get(&client).await?,
+            parity_shards: app.parity_shards(),
+            cold_age_secs: app.pack.cold_age.as_secs(),
+            coding: crate::packer::coding(app).await?.is_some(),
         },
         integrity: Coverage {
             nodes: coverage,
@@ -1021,8 +1070,11 @@ struct PartInfo {
     blob_offset: i64,
     blob_size: i64,
     blob_state: String,
+    /// The blob's data shards: 1 if it's replicated, else it's erasure-coded,
+    /// and readable with as many live shards.
+    data_shards: i32,
     created_at: f64,
-    /// The nodes holding a copy of the blob.
+    /// The nodes holding a shard of the blob.
     nodes: Vec<i32>,
     /// The byte ranges of the part (as stored) that are intact on no
     /// replica, as [start, stop) from its start (see `scrub`).
@@ -1061,7 +1113,8 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
             "SELECT p.object_id, p.part_number, p.size, p.etag, p.crc64nvme, p.blob_id,
                     p.blob_offset, b.size, b.state, extract(epoch FROM p.created_at)::float8,
                     ARRAY(SELECT l.node FROM blob_locations l
-                          WHERE l.blob_id = p.blob_id ORDER BY l.node)
+                          WHERE l.blob_id = p.blob_id ORDER BY l.node),
+                    b.data_shards::int
              FROM parts p JOIN blobs b ON b.blob_id = p.blob_id
              WHERE p.object_id = ANY($1)
              ORDER BY p.object_id, p.part_number",
@@ -1082,6 +1135,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
             blob_state: p.get(8),
             created_at: p.get(9),
             nodes: p.get(10),
+            data_shards: p.get(11),
             lost: Vec::new(),
         });
     }
@@ -1528,7 +1582,7 @@ mod e2e {
         assert_eq!(s["blobs"]["committed"], 3);
         assert_eq!(
             s["replicas"],
-            json!([{ "live": 1, "copies": 1, "blobs": 3, "bytes": 60 }])
+            json!([{ "data_shards": 1, "live": 1, "copies": 1, "blobs": 3, "bytes": 60 }])
         );
         assert_eq!(s["nodes"][0]["bytes"], 60);
         assert_eq!(s["backlog"]["consolidate"], 3);

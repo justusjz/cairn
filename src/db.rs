@@ -46,7 +46,7 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "3";
+pub(crate) const PROTOCOL: &str = "4";
 
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
@@ -192,6 +192,7 @@ const MIGRATIONS: &[&str] = &[
     SCRUBBING,
     LOST_RANGES,
     LEGACY_BLOBS,
+    SHARDS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -949,6 +950,65 @@ CREATE TRIGGER lost_ranges_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCAT
 const LEGACY_BLOBS: &str = r#"
 CREATE INDEX blobs_legacy ON blobs (created_at)
     WHERE state = 'committed' AND block_size IS NULL;
+"#;
+
+/// Migration 24: shards (see `shards`). Every blob is k data shards and m
+/// parity shards, each on a node of its own; replication is k = 1. A
+/// location records which shard its node holds, and the catalog keeps the
+/// CRC64/NVME of each shard's file (they differ only once k > 1) instead of
+/// one per blob. Existing blobs are replicated: 1 + (copies - 1), their
+/// copies numbered by node, their file CRC repeated.
+///
+/// Lock protocol 4: the protocol itself doesn't change, but a node of
+/// protocol 3 would read a coded blob's shards as replicas. The gate goes
+/// first, since this session already follows protocol 4.
+pub(crate) const SHARDS: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '4' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE blobs
+    ADD COLUMN data_shards smallint NOT NULL DEFAULT 1 CHECK (data_shards >= 1),
+    ADD COLUMN parity_shards smallint NOT NULL DEFAULT 0 CHECK (parity_shards >= 0),
+    ADD COLUMN stripe_unit int NOT NULL DEFAULT 1048576 CHECK (stripe_unit > 0),
+    ADD COLUMN shard_crcs bigint[];
+
+ALTER TABLE blob_locations ADD COLUMN shard smallint;
+UPDATE blob_locations bl SET shard = n.shard
+FROM (SELECT blob_id, node, row_number() OVER (PARTITION BY blob_id ORDER BY node) - 1 AS shard
+      FROM blob_locations) AS n
+WHERE n.blob_id = bl.blob_id AND n.node = bl.node;
+ALTER TABLE blob_locations
+    ALTER COLUMN shard SET NOT NULL,
+    ADD CHECK (shard >= 0);
+-- At most one location per shard: a commit counts the shards the writer sent
+-- out, and this makes sure no shard is counted for two nodes. (A node holds
+-- at most one shard of a blob: the primary key.)
+CREATE UNIQUE INDEX blob_locations_shard ON blob_locations (blob_id, shard);
+
+UPDATE blobs b SET parity_shards = c.copies - 1
+FROM (SELECT blob_id, count(*)::smallint AS copies FROM blob_locations GROUP BY blob_id) AS c
+WHERE c.blob_id = b.blob_id AND b.state = 'committed';
+UPDATE blobs SET shard_crcs = array_fill(crc64nvme, ARRAY[data_shards + parity_shards])
+WHERE crc64nvme IS NOT NULL;
+ALTER TABLE blobs DROP COLUMN crc64nvme;
+ALTER TABLE blobs
+    ADD CONSTRAINT blobs_checksummed CHECK ((block_size IS NULL) = (shard_crcs IS NULL)),
+    ADD CONSTRAINT blobs_shard_crcs
+        CHECK (cardinality(shard_crcs) = data_shards + parity_shards);
+
+-- Replicated blobs large enough to be coded, which the packer converts once
+-- they're old enough (see `packer`), oldest first. Every node looks for one in
+-- every pass while coding is on. The size bound is `packer::SMALL_SIZE`.
+CREATE INDEX blobs_replicated ON blobs (created_at)
+    WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
+      AND size > 67108864;
 "#;
 
 #[cfg(test)]

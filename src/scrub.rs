@@ -1,13 +1,15 @@
 //! Scrubbing: checking stored data against its checksums in the background,
 //! before a client finds it damaged.
 //!
-//! Every node checks its own copies, the blobs the catalog places on it,
-//! reading its local files only: intact data costs no network traffic, and no
-//! coordination. A copy is checked as a whole: its identity (length and blob
-//! ID, as reads check it), every block against the checksum table, and the
-//! CRC64/NVME of the whole file against the catalog's. The last one is in the
-//! catalog rather than the file, so it also catches a file that's wrong but
-//! consistent with its own table, which only a bug would write.
+//! Every node checks its own copies, the shards of blobs the catalog places
+//! on it, reading its local files only: intact data costs no network
+//! traffic, and no coordination. A copy is checked as a whole: its identity
+//! (length, shard index and blob ID, as reads check it), every block of its
+//! shard against the shard's checksum table, and the CRC64/NVME of the whole
+//! file against the catalog's for its shard. The last one is in the catalog
+//! rather than the file, so it also catches a file that's wrong but
+//! consistent with its own table, which only a bug would write, and damage to
+//! the other shards' tables, which a coded shard's file holds too.
 //!
 //! The scrubber reads at a fixed rate (`--scrub-rate`), copies that have gone
 //! unchecked longest first, as `blob_locations.checked_at` orders them: set
@@ -18,10 +20,10 @@
 //! next.
 //!
 //! A damaged or missing copy is repaired from intact blocks: its own, and the
-//! other replicas' (see `repair`). Bytes that no replica holds intact are lost:
-//! their ranges go to `lost_ranges`, until some copy turns out to hold them
-//! after all (a node that was down comes back, say), and the others are then
-//! repaired from it. What the scrubber finds goes to `scrub_findings`, and to
+//! other shards' (see `repair`). Bytes of the blob that no shard can provide
+//! intact are lost: their ranges go to `lost_ranges`, until some shard turns
+//! out to hold them after all (a node that was down comes back, say), and the
+//! others are then repaired from it. What the scrubber finds goes to `scrub_findings`, and to
 //! the log as `CORRUPTION:`. Blobs from before checksums can't be checked, and
 //! are skipped, until the packer upgrades them (see `packer`).
 
@@ -38,7 +40,12 @@ use crc32c::crc32c;
 use uuid::Uuid;
 
 use crate::db::Cached;
-use crate::{App, checksum::BlockLayout};
+use crate::{
+    App,
+    blob_file::{self, ShardFile},
+    blobs::{LAYOUT_COLUMNS, layout_at},
+    shards::Layout,
+};
 
 /// The least time between two checks of a copy. A node that holds little
 /// would otherwise reread all of it every few hours, for nothing.
@@ -138,11 +145,13 @@ pub enum Scope {
     Everything,
 }
 
-/// A copy of a blob on this node, to check.
+/// A copy of a blob's shard on this node, to check.
 struct Copy {
     blob_id: Uuid,
     /// `None` for a blob from before checksums.
-    layout: Option<BlockLayout>,
+    layout: Option<Layout>,
+    /// Which shard it is.
+    shard: u32,
     /// The catalog's CRC64/NVME of the whole file.
     crc: Option<u64>,
     /// `checked_at` as the pass found it, in seconds since the epoch (NULL,
@@ -178,6 +187,17 @@ pub struct Report {
     pub repaired: u64,
     pub lost: u64,
     pub legacy: u64,
+}
+
+impl Copy {
+    /// Its file, as the catalog describes it.
+    fn file(&self) -> Option<ShardFile> {
+        self.layout.map(|layout| ShardFile {
+            blob_id: self.blob_id,
+            layout,
+            shard: self.shard,
+        })
+    }
 }
 
 impl std::fmt::Display for Report {
@@ -252,13 +272,13 @@ pub async fn pass(app: &Arc<App>, scope: Scope, pacer: &Arc<Mutex<Pacer>>) -> an
         }
         for copy in copies {
             let verdict = check(app, &copy, pacer).await?;
-            let repaired = match (&verdict, copy.layout, copy.crc) {
-                (Verdict::Missing, Some(layout), Some(crc)) => {
-                    Some(repair::repair(app, copy.blob_id, layout, crc, None, pacer).await)
+            let repaired = match (&verdict, copy.file(), copy.crc) {
+                (Verdict::Missing, Some(file), Some(crc)) => {
+                    Some(repair::repair(app, &file, crc, None, pacer).await)
                 }
-                (Verdict::Damaged { bad_blocks, .. }, Some(layout), Some(crc)) => {
+                (Verdict::Damaged { bad_blocks, .. }, Some(file), Some(crc)) => {
                     let bad = bad_blocks.as_deref();
-                    Some(repair::repair(app, copy.blob_id, layout, crc, bad, pacer).await)
+                    Some(repair::repair(app, &file, crc, bad, pacer).await)
                 }
                 _ => None,
             };
@@ -274,10 +294,12 @@ pub async fn pass(app: &Arc<App>, scope: Scope, pacer: &Arc<Mutex<Pacer>>) -> an
 /// record: the copies are known intact as of then (at the latest).
 async fn due(app: &App, until: f64) -> anyhow::Result<(f64, Vec<Copy>)> {
     let client = app.pool.get().await?;
-    let select = "SELECT bl.blob_id, b.size, b.block_size, b.crc64nvme,
-                         extract(epoch FROM bl.checked_at)::float8,
-                         extract(epoch FROM NOW())::float8
-                  FROM blob_locations bl JOIN blobs b ON b.blob_id = bl.blob_id";
+    let select = format!(
+        "SELECT bl.blob_id, bl.shard, b.shard_crcs[bl.shard + 1],
+                extract(epoch FROM bl.checked_at)::float8,
+                extract(epoch FROM NOW())::float8, {LAYOUT_COLUMNS}
+         FROM blob_locations bl JOIN blobs b ON b.blob_id = bl.blob_id"
+    );
     // Two queries, so that each reads the index in order: flagged copies
     // would otherwise wait behind those never checked.
     let mut rows = client
@@ -304,39 +326,36 @@ async fn due(app: &App, until: f64) -> anyhow::Result<(f64, Vec<Copy>)> {
             )
             .await?;
     }
-    let now = rows.first().map_or(0.0, |r| r.get(5));
+    let now = rows.first().map_or(0.0, |r| r.get(4));
     let copies = rows
         .iter()
         .map(|r| Copy {
             blob_id: r.get(0),
-            layout: r.get::<_, Option<i32>>(2).map(|block_size| BlockLayout {
-                block_size: block_size as u64,
-                blob_size: r.get::<_, i64>(1) as u64,
-            }),
-            crc: r.get::<_, Option<i64>>(3).map(|crc| crc as u64),
-            checked_at: r.get(4),
+            shard: r.get::<_, i16>(1) as u32,
+            crc: r.get::<_, Option<i64>>(2).map(|crc| crc as u64),
+            checked_at: r.get(3),
+            layout: layout_at(r, 5),
         })
         .collect();
     Ok((now, copies))
 }
 
-/// Checks this node's copy of a blob.
+/// Checks this node's copy of a blob's shard.
 async fn check(app: &App, copy: &Copy, pacer: &Arc<Mutex<Pacer>>) -> anyhow::Result<Verdict> {
-    let (Some(layout), Some(crc)) = (copy.layout, copy.crc) else {
+    let (Some(file), Some(crc)) = (copy.file(), copy.crc) else {
         return Ok(Verdict::Legacy);
     };
     let path = app.store.blob_path(copy.blob_id);
-    let (blob_id, pacer) = (copy.blob_id, pacer.clone());
-    Ok(tokio::task::spawn_blocking(move || check_file(path, blob_id, layout, crc, &pacer)).await?)
+    let pacer = pacer.clone();
+    Ok(tokio::task::spawn_blocking(move || check_file(path, &file, crc, &pacer)).await?)
 }
 
-/// Checks a blob file against what the catalog says of it: its layout and
+/// Checks a shard file against what the catalog says of it: its layout and
 /// its CRC64/NVME. Reads at the pacer's rate, from the disk rather than the
 /// page cache. Any I/O error is damage too: the copy can't be read.
 pub fn check_file(
     path: PathBuf,
-    blob_id: Uuid,
-    layout: BlockLayout,
+    expected: &ShardFile,
     crc: u64,
     pacer: &Mutex<Pacer>,
 ) -> Verdict {
@@ -351,12 +370,10 @@ pub fn check_file(
     };
     // Whatever of the file is cached would be checked instead of the disk.
     drop_cached(&file, 0, 0);
-    let BlockLayout {
-        block_size,
-        blob_size,
-    } = layout;
+    let layout = expected.blocks_of(expected.shard);
+    let (block_size, blob_size) = (layout.block_size, layout.blob_size);
     let blocks = blob_size.div_ceil(block_size);
-    let expected_len = blob_size + 4 * blocks + 16;
+    let expected_len = expected.len();
     match file.metadata() {
         Ok(m) if m.len() == expected_len => {}
         Ok(m) => {
@@ -367,14 +384,17 @@ pub fn check_file(
         }
         Err(e) => return whole(format!("can't stat the file: {e}")),
     }
-    let mut trailer = vec![0u8; (4 * blocks + 16) as usize];
+    let mut trailer = vec![0u8; (expected_len - blob_size) as usize];
     if let Err(e) = file.read_exact_at(&mut trailer, blob_size) {
-        return whole(format!("can't read the checksum table: {e}"));
+        return whole(format!("can't read the checksum tables: {e}"));
     }
-    let (table, id) = trailer.split_at(4 * blocks as usize);
-    if id != blob_id.as_bytes() {
-        return whole("the file ends in another blob's ID".to_owned());
+    let Some((tables, tail)) = blob_file::split_trailer(expected, &trailer) else {
+        return whole("the checksum tables don't fit the blob".to_owned());
+    };
+    if let Err(reason) = blob_file::check_tail(expected, tail) {
+        return whole(reason.to_owned());
     }
+    let table = tables[if expected.layout.replicated() { 0 } else { expected.shard as usize }];
 
     let mut digest = crc64fast_nvme::Digest::new();
     let mut bad: Vec<i64> = Vec::new();
@@ -429,9 +449,16 @@ pub fn check_file(
     digest.write(&trailer);
     let actual = digest.sum64();
     if actual != crc {
-        return whole(format!(
-            "every block is intact, but the file's CRC64/NVME is {actual:016x}, not {crc:016x}"
-        ));
+        // No block of the shard's data is known bad: the damage is in the
+        // rest of the file (another shard's table, in a coded shard's file),
+        // or the file is wrong but consistent with its own table. The repair
+        // keeps the data, and rebuilds the whole file only if that fails.
+        return Verdict::Damaged {
+            bad_blocks: Some(Vec::new()),
+            detail: format!(
+                "every block is intact, but the file's CRC64/NVME is {actual:016x}, not {crc:016x}"
+            ),
+        };
     }
     Verdict::Intact
 }
@@ -472,7 +499,7 @@ async fn record(
                    WHERE blob_id = $1 AND node = $2
                      AND extract(epoch FROM checked_at)::float8 IS NOT DISTINCT FROM $4::float8
                    RETURNING blob_id, node";
-    let bytes = copy.layout.map_or(0, |l| l.blob_size);
+    let bytes = copy.file().map_or(0, |f| f.data_len());
     let (problem, bad_blocks, detail) = match verdict {
         Verdict::Intact | Verdict::Legacy => {
             // Intact again: whatever was found before has been put right.
@@ -500,7 +527,7 @@ async fn record(
             report.bytes += bytes;
             app.metrics.scrub_checked(bytes, None);
             if !rows.is_empty() {
-                found_intact(app, copy.blob_id).await?;
+                found_intact(app, copy).await?;
             }
             return Ok(());
         }
@@ -520,7 +547,11 @@ async fn record(
             provisional,
         })) => {
             let bytes: i64 = ranges.iter().map(|(start, stop)| stop - start).sum();
-            let mut detail = format!("{detail}; {bytes} bytes are intact on no replica");
+            let mut detail = if ranges.is_empty() {
+                format!("{detail}; some of it can't be rebuilt from the other shards")
+            } else {
+                format!("{detail}; {bytes} bytes of the blob can be read intact from no shard")
+            };
             if *provisional {
                 detail.push_str(" that's up");
             }
@@ -582,11 +613,20 @@ async fn record(
     }
     if resolved {
         report.repaired += 1;
-        found_intact(app, copy.blob_id).await?;
+        found_intact(app, copy).await?;
     }
     if let Some(ranges) = lost {
         report.lost += 1;
-        set_lost(app, copy.blob_id, ranges).await?;
+        match copy.layout {
+            // Each data shard of a coded blob finds the losses in its own
+            // cells, and only those.
+            Some(layout) if !layout.replicated() => {
+                set_lost_in_shard(app, copy.blob_id, layout, copy.shard, ranges).await?
+            }
+            _ => {
+                set_lost(app, copy.blob_id, ranges).await?;
+            }
+        }
     }
     let message = format!("blob {} on node {} (scrub): {detail}", copy.blob_id, app.node);
     eprintln!("CORRUPTION: {message}");
@@ -599,28 +639,130 @@ async fn record(
     Ok(())
 }
 
-/// Records that some copy of a blob is intact: whatever was lost of it isn't.
-/// Its other copies may have been found damaged, but not repaired for want of
-/// intact blocks: they're flagged, so that their nodes repair them next.
-async fn found_intact(app: &App, blob_id: Uuid) -> anyhow::Result<()> {
+/// Records that a shard of a blob is intact: whatever of the blob was lost
+/// in it isn't. That's all of the lost bytes for a replicated blob, and those
+/// in the shard's own cells for a coded one. Its other shards may have been
+/// found damaged, but not repaired for want of intact blocks: they're
+/// flagged, so that their nodes repair them next.
+async fn found_intact(app: &App, copy: &Copy) -> anyhow::Result<()> {
+    let blob_id = copy.blob_id;
     let client = app.pool.get().await?;
     let any = "SELECT EXISTS (SELECT 1 FROM lost_ranges WHERE blob_id = $1)";
     // Almost always nothing is lost: that's one cheap query.
     if !client.query_one_cached(any, &[&blob_id]).await?.get::<_, bool>(0) {
         return Ok(());
     }
+    let Some(layout) = copy.layout.filter(|l| !l.replicated()) else {
+        drop(client);
+        if set_lost(app, blob_id, &[]).await? {
+            app.pool
+                .get()
+                .await?
+                .execute_cached(
+                    "UPDATE blob_locations SET checked_at = '-infinity'
+                     WHERE blob_id = $1 AND node <> $2",
+                    &[&blob_id, &app.node],
+                )
+                .await?;
+        }
+        return Ok(());
+    };
+    // A coded blob's lost ranges each lie in one data cell (see `add_lost`).
+    let rows = client
+        .query_cached(
+            "SELECT start, extract(epoch FROM found_at)::float8 FROM lost_ranges WHERE blob_id = $1",
+            &[&blob_id],
+        )
+        .await?;
     drop(client);
-    if set_lost(app, blob_id, &[]).await? {
-        app.pool
-            .get()
-            .await?
-            .execute_cached(
-                "UPDATE blob_locations SET checked_at = '-infinity'
-                 WHERE blob_id = $1 AND node <> $2",
-                &[&blob_id, &app.node],
-            )
-            .await?;
+    let newest = rows.iter().map(|r| r.get::<_, f64>(1)).fold(f64::MIN, f64::max);
+    let ours: Vec<i64> = rows
+        .iter()
+        .map(|r| r.get::<_, i64>(0))
+        .filter(|&start| layout.cell_at(start as u64).shard == copy.shard)
+        .collect();
+    drop_lost(app, blob_id, &ours).await?;
+    // The others that haven't been checked since the newest loss was found
+    // are checked next: they may be repaired now, or hold their lost cells
+    // after all. Each is flagged once per loss, however often this runs.
+    app.pool
+        .get()
+        .await?
+        .execute_cached(
+            "UPDATE blob_locations SET checked_at = '-infinity'
+             WHERE blob_id = $1 AND node <> $2 AND checked_at IS DISTINCT FROM '-infinity'
+               AND (checked_at IS NULL OR checked_at < to_timestamp($3))",
+            &[&blob_id, &app.node, &newest],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Replaces the lost ranges of a coded blob in shard `shard`'s cells with
+/// `ranges` (byte offsets of the blob, [start, stop), each in one of its
+/// cells), leaving the other shards' alone: what the shard's repair found
+/// lost now, which may be less than before (rows that couldn't be decoded
+/// then can be now). Under the blob's row lock (X shared, see `catalog.sql`),
+/// as `set_lost`.
+async fn set_lost_in_shard(
+    app: &App,
+    blob_id: Uuid,
+    layout: Layout,
+    shard: u32,
+    ranges: &[(i64, i64)],
+) -> anyhow::Result<()> {
+    let mut client = app.pool.get().await?;
+    let tx = client.transaction().await?;
+    let blob = tx
+        .query_opt("SELECT 1 FROM blobs WHERE blob_id = $1 FOR KEY SHARE", &[&blob_id])
+        .await?;
+    if blob.is_none() {
+        return Ok(());
     }
+    let (starts, stops): (Vec<i64>, Vec<i64>) = ranges.iter().copied().unzip();
+    let gone: Vec<i64> = tx
+        .query("SELECT start FROM lost_ranges WHERE blob_id = $1", &[&blob_id])
+        .await?
+        .iter()
+        .map(|r| r.get::<_, i64>(0))
+        .filter(|&start| layout.cell_at(start as u64).shard == shard && !starts.contains(&start))
+        .collect();
+    tx.execute(
+        "DELETE FROM lost_ranges WHERE blob_id = $1 AND start = ANY($2)",
+        &[&blob_id, &gone],
+    )
+    .await?;
+    tx.execute(
+        "INSERT INTO lost_ranges (blob_id, start, stop, found_at)
+         SELECT $1, s, e, NOW() FROM unnest($2::bigint[], $3::bigint[]) AS t(s, e)
+         ON CONFLICT (blob_id, start) DO UPDATE SET stop = EXCLUDED.stop",
+        &[&blob_id, &starts, &stops],
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Drops the lost ranges of a blob that start at `starts`. Under the blob's
+/// row lock, as `set_lost`.
+async fn drop_lost(app: &App, blob_id: Uuid, starts: &[i64]) -> anyhow::Result<()> {
+    if starts.is_empty() {
+        return Ok(());
+    }
+    let mut client = app.pool.get().await?;
+    let tx = client.transaction().await?;
+    let blob = tx
+        .query_opt("SELECT 1 FROM blobs WHERE blob_id = $1 FOR KEY SHARE", &[&blob_id])
+        .await?;
+    if blob.is_none() {
+        return Ok(());
+    }
+    tx.execute(
+        "DELETE FROM lost_ranges WHERE blob_id = $1 AND start = ANY($2)",
+        &[&blob_id, &starts],
+    )
+    .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -742,15 +884,39 @@ mod tests {
         assert_eq!(unpaced.lock().unwrap().delay(u64::MAX), Duration::ZERO);
     }
 
-    fn write(path: &std::path::Path, id: Uuid, data: &[u8], bs: u32) -> u64 {
-        let mut summer = crate::checksum::BlobSummer::new(bs);
-        summer.update(data);
-        let mut bytes = data.to_vec();
-        bytes.extend(crate::blob_file::trailer(id, &summer.finish()));
+    /// Writes the file of shard `shard` of a blob whose shards are `shards`
+    /// (one for a replicated blob); its CRC.
+    fn write(path: &std::path::Path, file: &ShardFile, shards: &[&[u8]]) -> u64 {
+        // A replicated blob's shards share their one table.
+        let tables = if file.layout.replicated() { 1 } else { shards.len() };
+        let tables: Vec<_> = shards[..tables]
+            .iter()
+            .map(|data| {
+                let mut summer = crate::checksum::BlobSummer::new(file.layout.block_size as u32);
+                summer.update(data);
+                summer.finish()
+            })
+            .collect();
+        let mut bytes = shards[(file.shard as usize).min(shards.len() - 1)].to_vec();
+        bytes.extend(blob_file::trailer(file, &tables));
         std::fs::write(path, &bytes).unwrap();
         let mut digest = crc64fast_nvme::Digest::new();
         digest.write(&bytes);
         digest.sum64()
+    }
+
+    fn replicated(id: Uuid, size: u64) -> ShardFile {
+        ShardFile {
+            blob_id: id,
+            layout: Layout {
+                size,
+                block_size: 256,
+                data_shards: 1,
+                parity_shards: 1,
+                stripe_unit: 256,
+            },
+            shard: 1,
+        }
     }
 
     #[test]
@@ -760,17 +926,14 @@ mod tests {
         let path = dir.join("blob");
         let id = Uuid::now_v7();
         let data: Vec<u8> = (0..1000u32).map(|i| (i * 7) as u8).collect();
-        let layout = BlockLayout {
-            block_size: 256,
-            blob_size: 1000,
-        };
-        let crc = write(&path, id, &data, 256);
+        let file = replicated(id, 1000);
+        let crc = write(&path, &ShardFile { shard: 0, ..file }, &[&data]);
         let pacer = Pacer::new(None);
-        let check = |crc| check_file(path.clone(), id, layout, crc, &pacer);
+        let check = |crc| check_file(path.clone(), &file, crc, &pacer);
         assert_eq!(check(crc), Verdict::Intact);
         assert!(matches!(
             check(crc ^ 1),
-            Verdict::Damaged { bad_blocks: None, .. }
+            Verdict::Damaged { bad_blocks: Some(bad), .. } if bad.is_empty()
         ));
 
         // A flipped bit in data, and one in the table: each fails its block.
@@ -786,7 +949,7 @@ mod tests {
         // The wrong length, or another blob's ID: the whole file.
         std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
         assert!(matches!(check(crc), Verdict::Damaged { bad_blocks: None, .. }));
-        write(&path, Uuid::now_v7(), &data, 256);
+        write(&path, &replicated(Uuid::now_v7(), 1000), &[&data, &data]);
         let Verdict::Damaged { bad_blocks, detail } = check(crc) else {
             panic!("not damaged")
         };
@@ -797,12 +960,66 @@ mod tests {
         assert_eq!(check(crc), Verdict::Missing);
 
         // An empty blob is just its ID.
-        let crc = write(&path, id, &[], 256);
-        let empty = BlockLayout {
+        let empty = replicated(id, 0);
+        let crc = write(&path, &empty, &[&[], &[]]);
+        assert_eq!(check_file(path.clone(), &empty, crc, &pacer), Verdict::Intact);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn checks_coded_shards() {
+        let dir = std::env::temp_dir().join(format!("cairn-scrub-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("blob");
+        // 2+1, stripe unit 512, blocks of 256: shard sizes 788, 512, 1024.
+        let layout = Layout {
+            size: 1300,
             block_size: 256,
-            blob_size: 0,
+            data_shards: 2,
+            parity_shards: 1,
+            stripe_unit: 512,
         };
-        assert_eq!(check_file(path.clone(), id, empty, crc, &pacer), Verdict::Intact);
+        let shards: Vec<Vec<u8>> = (0..3).map(|s| vec![s as u8 + 1; layout.shard_size(s) as usize]).collect();
+        let refs: Vec<&[u8]> = shards.iter().map(Vec::as_slice).collect();
+        let file = ShardFile { blob_id: Uuid::now_v7(), layout, shard: 1 };
+        let crc = write(&path, &file, &refs);
+        let pacer = Pacer::new(None);
+        assert_eq!(check_file(path.clone(), &file, crc, &pacer), Verdict::Intact);
+
+        // A block of its own data, and one of another shard's table, which
+        // only the file's CRC catches.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[300] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        let Verdict::Damaged { bad_blocks, .. } = check_file(path.clone(), &file, crc, &pacer) else {
+            panic!("not damaged")
+        };
+        assert_eq!(bad_blocks, Some(vec![1]));
+        bytes[300] ^= 1;
+        bytes[512 + 2] ^= 1;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            check_file(path.clone(), &file, crc, &pacer),
+            Verdict::Damaged { bad_blocks: Some(bad), .. } if bad.is_empty()
+        ));
+
+        // Another shard's file of the same length, read as this one.
+        let other = ShardFile { shard: 0, ..file };
+        let mut bytes = shards[1].clone();
+        let tables: Vec<_> = refs
+            .iter()
+            .map(|data| {
+                let mut summer = crate::checksum::BlobSummer::new(256);
+                summer.update(data);
+                summer.finish()
+            })
+            .collect();
+        bytes.extend(blob_file::trailer(&other, &tables));
+        std::fs::write(&path, &bytes).unwrap();
+        let Verdict::Damaged { detail, .. } = check_file(path.clone(), &file, crc, &pacer) else {
+            panic!("not damaged")
+        };
+        assert!(detail.contains("another shard"), "{detail}");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -12,8 +12,8 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App,
-    blobs::{BlobSlice, Location, stream_blob_range},
-    checksum::BlockLayout,
+    blobs::{BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, layout_at, location_at, stream_blob_range},
+    shards::Layout,
     body::{FrameSender, ResBody, box_response, channel_body},
     encryption::{Key, Opener, Salt, segment_range},
     s3::conditional::{Precondition, Preconditions, not_modified},
@@ -298,7 +298,7 @@ pub async fn get_object(
 pub(crate) struct PartLocation {
     pub id: i64,
     pub blob_id: Uuid,
-    pub layout: Option<BlockLayout>,
+    pub layout: Option<Layout>,
     pub blob_offset: u64,
     /// What it takes in its blob.
     pub size: u64,
@@ -316,7 +316,7 @@ impl PartLocation {
 }
 
 /// Resolves an object version's parts in order, each with its blob and the
-/// blob's candidate replica locations (freshest node first). Runs within the
+/// nodes holding the blob's shards (freshest node first). Runs within the
 /// caller's transaction, so the parts and their locations come from one
 /// consistent snapshot. Shared by GetObject (range streaming) and CopyObject
 /// (whole-object copy).
@@ -326,14 +326,16 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
 ) -> Result<Vec<PartLocation>, tokio_postgres::Error> {
     let rows = client
         .query_cached(
-            "SELECT p.part_number, p.blob_id, p.blob_offset, p.size, b.size, b.block_size,
-                    bl.node, n.peer_url, p.id, p.plain_size, p.enc_salt
-             FROM parts p
-             JOIN blobs b ON b.blob_id = p.blob_id
-             JOIN blob_locations bl ON bl.blob_id = p.blob_id
-             JOIN nodes n ON n.id = bl.node
-             WHERE p.object_id = $1
-             ORDER BY p.part_number, n.last_seen DESC",
+            &format!(
+                "SELECT p.part_number, p.blob_id, p.blob_offset, p.size, p.id, p.plain_size,
+                        p.enc_salt, {LAYOUT_COLUMNS}, {LOCATION_COLUMNS}
+                 FROM parts p
+                 JOIN blobs b ON b.blob_id = p.blob_id
+                 JOIN blob_locations bl ON bl.blob_id = p.blob_id
+                 JOIN nodes n ON n.id = bl.node
+                 WHERE p.object_id = $1
+                 ORDER BY p.part_number, n.last_seen DESC"
+            ),
             &[&object_id],
         )
         .await?;
@@ -344,26 +346,22 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
     for row in &rows {
         let part_number: i32 = row.get(0);
         if current != Some(part_number) {
-            // A blob without a block size predates checksums.
-            let layout = row.get::<_, Option<i32>>(5).map(|block_size| BlockLayout {
-                block_size: block_size as u64,
-                blob_size: row.get::<_, i64>(4) as u64,
-            });
             parts.push(PartLocation {
-                id: row.get(8),
+                id: row.get(4),
                 blob_id: row.get(1),
-                layout,
+                // A blob without a block size predates checksums.
+                layout: layout_at(row, 7),
                 blob_offset: row.get::<_, i64>(2) as u64,
                 size: row.get::<_, i64>(3) as u64,
-                plain_size: row.get::<_, Option<i64>>(9).map(|size| size as u64),
+                plain_size: row.get::<_, Option<i64>>(5).map(|size| size as u64),
                 salt: row
-                    .get::<_, Option<Vec<u8>>>(10)
+                    .get::<_, Option<Vec<u8>>>(6)
                     .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)")),
                 locations: Vec::new(),
             });
             current = Some(part_number);
         }
-        parts.last_mut().unwrap().locations.push((row.get(6), row.get(7)));
+        parts.last_mut().unwrap().locations.push(location_at(row, 12));
     }
     Ok(parts)
 }
@@ -480,7 +478,7 @@ pub(crate) fn lost_data() -> Response<Full<Bytes>> {
     format_s3_error(
         StatusCode::INTERNAL_SERVER_ERROR,
         "InternalError",
-        "some of the requested data is damaged on every replica, and can't be read",
+        "some of the requested data is damaged, and can't be read from any of its shards",
     )
 }
 
@@ -592,13 +590,15 @@ async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSli
     let client = app.pool.get().await?;
     let rows = client
         .query_cached(
-            "SELECT p.blob_id, p.blob_offset, b.size, b.block_size, bl.node, n.peer_url
-             FROM parts p
-             JOIN blobs b ON b.blob_id = p.blob_id
-             JOIN blob_locations bl ON bl.blob_id = p.blob_id
-             JOIN nodes n ON n.id = bl.node
-             WHERE p.id = $1
-             ORDER BY n.last_seen DESC",
+            &format!(
+                "SELECT p.blob_id, p.blob_offset, {LAYOUT_COLUMNS}, {LOCATION_COLUMNS}
+                 FROM parts p
+                 JOIN blobs b ON b.blob_id = p.blob_id
+                 JOIN blob_locations bl ON bl.blob_id = p.blob_id
+                 JOIN nodes n ON n.id = bl.node
+                 WHERE p.id = $1
+                 ORDER BY n.last_seen DESC"
+            ),
             &[&part_id],
         )
         .await?;
@@ -612,11 +612,8 @@ async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSli
     let blob_offset = row.get::<_, i64>(1) as u64;
     Ok(Some(BlobSlice {
         blob_id,
-        layout: row.get::<_, Option<i32>>(3).map(|block_size| BlockLayout {
-            block_size: block_size as u64,
-            blob_size: row.get::<_, i64>(2) as u64,
-        }),
-        locations: rows.iter().map(|r| (r.get(4), r.get(5))).collect(),
+        layout: layout_at(row, 2),
+        locations: rows.iter().map(|r| location_at(r, 7)).collect(),
         // The slice keeps its offset within the part.
         offset: blob_offset + (slice.offset - old_offset),
         length: slice.length,

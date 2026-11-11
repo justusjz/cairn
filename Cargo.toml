@@ -43,6 +43,12 @@ ring = "0.17"
 hkdf = "0.13.0"
 multer = { version = "3.1", default-features = false }
 futures-core = "0.3.34"
+reed-solomon-simd = "3.1"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+
+# The erasure code's arithmetic is slow unoptimized, which tests of coded
+# blobs feel.
+[profile.dev.package.reed-solomon-simd]
+opt-level = 3

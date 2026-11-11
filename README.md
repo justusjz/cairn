@@ -157,6 +157,9 @@ With replication factor `N`, writes succeed as long as at least `N` nodes are
 live; if fewer than `N` are available, uploads are rejected (metadata operations
 still work, since they live in Postgres).
 
+Data that has gone cold can be stored with less overhead than full copies,
+with the same tolerance for lost nodes: see [Erasure coding](#erasure-coding).
+
 ## Roles and permissions
 
 A **role** is a set of S3 credentials: its name is the access key ID, and it has
@@ -719,7 +722,9 @@ A read that runs into a damaged or missing copy has that copy checked next.
 
 A damaged or missing copy is repaired: rebuilt from its own intact blocks and
 the other replicas' (so a bad block costs one block of network traffic), and
-checked against the database's CRC before it replaces the old file. Copies
+checked against the database's CRC before it replaces the old file. A shard of
+an [erasure-coded](#erasure-coding) blob is rebuilt the same way, its damaged
+rows decoded from the other shards. Copies
 damaged in different places repair each other. Bytes that no replica holds
 intact are *lost*: the copies are left as they are, and the lost byte ranges
 are recorded (`lost_ranges`). If a replica's node was down, the scrubber tries
@@ -770,6 +775,37 @@ Data is laid out by age, so data that is likely to be deleted together is
 stored together. Packed data is verified against its checksums before it
 replaces the original, and reads in progress follow the data to its new blob.
 The nodes coordinate through the database, so each blob is packed only once.
+
+## Erasure coding
+
+Every blob is stored as *k* data shards and *m* parity shards, each on a node
+of its own, any *k* of which hold all of its data. Replication is *k* = 1: the
+one data shard is the blob, and each parity shard is a copy of it. Uploads are
+always replicated, with *m* = `--replication-factor` − 1. Once data has gone
+cold, the packer can rewrite it with *k* > 1, which survives losing as many
+nodes, *m*, but stores *(k + m) / k* times the data rather than *m + 1* times:
+with replication factor 3, coding 4+2 stores 1.5× instead of 3×.
+
+Coding is off until you choose *k*, for the whole cluster:
+
+```sh
+cairn config --database "$DB" set data-shards 4
+```
+
+Cairn never picks *k* itself: only you know how many nodes the cluster will
+keep. It needs *k + m* live nodes, one per shard; while fewer are live, data
+stays as it is. A change applies to data coded from then on.
+
+The packer codes replicated blobs over 64 MiB (packed blobs, and large
+uploads) once they're a week old, so that data that's deleted within days is
+never coded, one job of up to 1 GiB per node a minute. Packing and compacting
+cold data writes it coded directly, so coded data stays coded. Each shard holds
+the blob in cells of 1 MiB, so a read of a small object in a coded blob mostly
+reads a single shard, without decoding. A read that can't get a cell from its
+data shard (a node is down, or a block is damaged) decodes it from the other
+shards' cells of its row, and verifies the result against its checksums. The
+dashboard's Storage page shows each layout's health, and the Jobs page how
+much is waiting to be coded.
 
 ## Garbage collection
 

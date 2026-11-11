@@ -13,6 +13,7 @@ pub struct Setting {
     pub name: &'static str,
     pub default: i64,
     pub min: i64,
+    pub max: i64,
     pub help: &'static str,
 }
 
@@ -22,11 +23,29 @@ pub const LIFECYCLE_RATE: Setting = Setting {
     name: "lifecycle-rate",
     default: 1_000_000,
     min: 0,
+    max: i64::MAX,
     help: "object versions lifecycle sweeps read per hour, across the cluster (0 pauses them)",
 };
 
+/// How many data shards the packer codes cold data into (see `shards` and
+/// `packer`); 1 keeps every blob replicated. Its parity shards are the
+/// replicas besides the one (`--replication-factor` − 1), so coded data
+/// survives as many lost nodes as replicated data. Only the operator knows
+/// how many nodes the cluster will keep, so Cairn never picks this itself:
+/// coding needs data + parity shards' worth of live nodes, and with fewer,
+/// the packer leaves data as it is. A change applies to data coded from then
+/// on; blobs keep the layout they were written with.
+pub const DATA_SHARDS: Setting = Setting {
+    name: "data-shards",
+    default: 1,
+    min: 1,
+    max: crate::shards::MAX_DATA_SHARDS as i64,
+    help: "data shards that cold data is erasure-coded into, plus --replication-factor - 1 \
+           parity shards (1 keeps replicas only)",
+};
+
 /// Every setting.
-pub const ALL: &[&Setting] = &[&LIFECYCLE_RATE];
+pub const ALL: &[&Setting] = &[&LIFECYCLE_RATE, &DATA_SHARDS];
 
 /// The setting named `name`, if there's one.
 pub fn named(name: &str) -> Option<&'static Setting> {
@@ -51,6 +70,7 @@ impl Setting {
     /// Sets it, if `value` is one it allows.
     pub async fn set<C: GenericClient>(&self, client: &C, value: i64) -> anyhow::Result<()> {
         anyhow::ensure!(value >= self.min, "{} must be at least {}", self.name, self.min);
+        anyhow::ensure!(value <= self.max, "{} must be at most {}", self.name, self.max);
         client
             .execute_cached(
                 "INSERT INTO settings (name, value) VALUES ($1, $2)

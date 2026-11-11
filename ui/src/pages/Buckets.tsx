@@ -389,9 +389,23 @@ export function ObjectPage() {
                                         )}
                                       </For>
                                     </Show>
-                                    <Show when={liveCopies(p.nodes) < cluster().replication_factor}>
+                                    <Show when={p.data_shards > 1}>
                                       {" "}
-                                      <Badge tone="warn">under-replicated</Badge>
+                                      <Badge>coded {p.data_shards}+{p.nodes.length - p.data_shards}</Badge>
+                                    </Show>
+                                    <Show
+                                      when={liveCopies(p.nodes) >= p.data_shards}
+                                      fallback={
+                                        <>
+                                          {" "}
+                                          <Badge tone="bad">unavailable</Badge>
+                                        </>
+                                      }
+                                    >
+                                      <Show when={liveCopies(p.nodes) < p.data_shards + cluster().replication_factor - 1}>
+                                        {" "}
+                                        <Badge tone="warn">under-replicated</Badge>
+                                      </Show>
                                     </Show>
                                   </td>
                                   <td class="mono small">{p.crc64nvme ?? "–"}</td>

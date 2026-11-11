@@ -47,7 +47,7 @@ async fn leftover_blob(app: &App, state: &str, age: &str) -> Uuid {
         .unwrap();
     client
         .execute(
-            "INSERT INTO blob_locations (blob_id, node) VALUES ($1, $2)",
+            "INSERT INTO blob_locations (blob_id, node, shard) VALUES ($1, $2, 0)",
             &[&blob_id, &app.node],
         )
         .await
