@@ -164,7 +164,7 @@ function View(props: { storage: StorageInfo; cluster: Cluster; refresh: () => vo
 }
 
 /** The cluster's redundancy settings: how many nodes every blob survives
- * losing (parity shards), what cold data is coded into (data shards), and
+ * losing (parity shards), what large blobs are coded into (data shards), and
  * when a node that's down has its shards rebuilt. */
 function Redundancy(props: { storage: StorageInfo; cluster: Cluster; refresh: () => void }) {
   const pk = () => props.storage.packer;
@@ -180,7 +180,7 @@ function Redundancy(props: { storage: StorageInfo; cluster: Cluster; refresh: ()
   return (
     <Panel
       title="Redundancy"
-      note={`for the whole cluster · nodes go by a change within a heartbeat; blobs keep the layout they were written with · ${num(active())} active nodes`}
+      note={`for the whole cluster · new blobs follow a change within a heartbeat, existing ones are rewritten in the background (Jobs) · ${num(active())} active nodes`}
     >
       <Table count={3} columns={["Setting", "Now", "", "Change"]}>
         <SettingRow
@@ -188,14 +188,16 @@ function Redundancy(props: { storage: StorageInfo; cluster: Cluster; refresh: ()
           value={`${num(pk().parity_shards)}`}
           note={
             pk().parity_setting == null
-              ? `from each node's --replication-factor (${num(pk().parity_shards + 1)} copies on this one); set it here for the whole cluster`
-              : `every new blob survives losing ${plural(pk().parity_shards, "node", "nodes")}: ` +
-                `${plural(pk().parity_shards + 1, "copy", "copies")}, or ${plural(pk().parity_shards, "parity shard", "parity shards")} when coded`
+              ? `from each node's --replication-factor (${num(pk().parity_shards + 1)} copies on this one), for new blobs only; set it here for the whole cluster`
+              : `every blob survives losing ${plural(pk().parity_shards, "node", "nodes")}` +
+                (pk().data_shards > 1
+                  ? `: blobs over ${bytes(pk().small_size)} are coded ${pk().data_shards}+${pk().parity_shards}, smaller ones get ${plural(pk().parity_shards + 1, "copy", "copies")} until they're packed`
+                  : `: ${plural(pk().parity_shards + 1, "copy", "copies")} of each`)
           }
           placeholder="parity shards"
           min={0}
           max={pk().max_parity_shards}
-          onSet={(v) => set("parity-shards", v, `Parity shards set to ${num(v)}: ${num(v + 1)} copies of every new blob`)}
+          onSet={(v) => set("parity-shards", v, `Parity shards set to ${num(v)}: every blob survives losing ${plural(v, "node", "nodes")}`)}
           unset={
             pk().parity_setting == null
               ? undefined
@@ -207,15 +209,15 @@ function Redundancy(props: { storage: StorageInfo; cluster: Cluster; refresh: ()
           value={pk().data_shards > 1 ? `coded ${pk().data_shards}+${pk().parity_shards}` : "off"}
           note={
             pk().data_shards > 1
-              ? `cold data (a week old) is erasure-coded into ${num(pk().data_shards)} data shards` +
-                (pk().coding ? "" : `, once ${num(pk().data_shards + pk().parity_shards)} nodes are live`)
-              : "1 keeps every blob replicated; more erasure-codes cold data, which takes as many nodes as data and parity shards"
+              ? `blobs over ${bytes(pk().small_size)} are erasure-coded into ${num(pk().data_shards)} data shards` +
+                (pk().coding ? "" : `, once ${num(pk().data_shards + pk().parity_shards)} nodes are live; until then they're replicated`)
+              : `1 keeps every blob replicated; more erasure-codes blobs over ${bytes(pk().small_size)}, which takes as many nodes as data and parity shards`
           }
           placeholder="data shards"
           min={1}
           max={pk().max_data_shards}
           onSet={(v) =>
-            set("data-shards", v, v > 1 ? `Cold data is coded ${num(v)}+${num(pk().parity_shards)} from now on` : "Erasure coding is off")
+            set("data-shards", v, v > 1 ? `Large blobs are coded ${num(v)}+${num(pk().parity_shards)} from now on` : "Erasure coding is off")
           }
         />
         <SettingRow

@@ -392,12 +392,23 @@ export interface components {
             consolidate_bytes: number;
             /**
              * Format: int64
-             * @description Replicated blobs old and large enough to be erasure-coded, once
-             *     coding is on (see `packer::coding`).
+             * @description Blobs large enough to be coded that aren't in the cluster's layout,
+             *     which the packer converts (see `packer::Layouts`).
              */
             convert: number;
             /** Format: int64 */
             convert_bytes: number;
+            /**
+             * Format: int64
+             * @description Replicated blobs with more or fewer copies than the `parity-shards`
+             *     setting says (none while it isn't set), and how many copies the
+             *     mover is to add and to drop (see `mover`).
+             */
+            copies: number;
+            /** Format: int64 */
+            copies_to_add: number;
+            /** Format: int64 */
+            copies_to_drop: number;
             /**
              * Format: int64
              * @description Entries of the garbage log the packer hasn't folded yet: one per blob
@@ -1088,17 +1099,18 @@ export interface components {
             op: string;
         };
         PackerSettings: {
-            /** @description Whether it's coded now: also takes as many live nodes as shards. */
+            /**
+             * @description Whether blobs are brought to that layout now: it takes as many live
+             *     nodes as shards.
+             */
             coding: boolean;
-            /** Format: int64 */
-            cold_age_secs: number;
             /** Format: double */
             compact_threshold: number;
             /**
              * Format: int64
-             * @description What cold data is erasure-coded into (the `data-shards` setting, and
-             *     the parity shards that `--replication-factor` gives), and how old it
-             *     must be. One data shard: it isn't.
+             * @description What blobs larger than `small_size` are erasure-coded into (the
+             *     `data-shards` setting, and the parity shards). One data shard: they
+             *     aren't.
              */
             data_shards: number;
             /**

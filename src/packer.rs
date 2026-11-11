@@ -29,20 +29,25 @@
 //!   per pass. Its bytes can only be verified once copied, by its parts' MD5s,
 //!   so its replicas are tried one at a time; if none matches, its parts are
 //!   lost (`lost_ranges`).
-//! - **Conversion** rewrites replicated blobs larger than [`SMALL_SIZE`] as
+//! - **Conversion** rewrites blobs larger than [`SMALL_SIZE`] whose layout
+//!   isn't the cluster's (see [`Layouts`]) in it: replicated ones as
 //!   erasure-coded ones (see `shards`), which store the same data with less
-//!   overhead, once they're [`Config::cold_age`] old: a week, so that data
-//!   that's deleted within days, temporary files say, is never coded. One job
-//!   per pass, so that a cluster's replicated data is coded over time, not in
-//!   a burst. Only while coding is on (`coding`): the operator has set the
-//!   `data-shards` setting, and there are nodes enough for the shards.
+//!   overhead, coded ones as replicated ones once coding is turned off, and
+//!   coded ones in as many data and parity shards as the settings say now.
+//!   Uploads whose size is known up front are written in the cluster's layout
+//!   already (see `App::data_shards_for`), so this is for those whose size
+//!   isn't, those written while there were too few nodes for the shards, and
+//!   every blob after a change of the settings. One job per pass, so that a
+//!   cluster's data is converted over time, not in a burst. A replicated
+//!   blob's parity shards are its copies, which the mover adds or drops
+//!   without rewriting it (see `mover`).
 //!
-//! Every job writes a new blob coded if coding is on, the blob is larger
-//! than [`SMALL_SIZE`] (coding a small blob would cost more in the padding of
-//! its last row than it saves), and all of its parts are cold. So coded data
-//! that's compacted stays coded, and cold data is coded as it's packed,
-//! rather than written twice. Parts address a blob's bytes whatever its
-//! layout, so nothing above the blob changes with it.
+//! Every job writes a new blob coded if coding is on (`Layouts`), and the
+//! blob is larger than [`SMALL_SIZE`] (coding a small blob would cost more in
+//! the padding of its last row than it saves). So coded data that's
+//! compacted stays coded, and data is coded as it's packed, rather than
+//! written twice. Parts address a blob's bytes whatever its layout, so
+//! nothing above the blob changes with it.
 //!
 //! Within a job, parts are laid out by age band, then bucket, then age. Data
 //! that has lived long is likely to live on (the generational hypothesis), so
@@ -90,10 +95,8 @@ pub(crate) const SMALL_SIZE: u64 = 64 * 1024 * 1024;
 /// `blobs_compactable` index (migration 10); tests may lower it, at the cost of
 /// the index.
 pub(crate) const COMPACT_THRESHOLD: f64 = 0.25;
-/// How old data must be to be erasure-coded (see `Config::cold_age`).
-const COLD_AGE: Duration = Duration::from_secs(7 * 24 * 3600);
 /// How many conversion jobs a pass runs at most: one, a few hundred MiB,
-/// so that a cluster with much replicated data codes it over time, rather
+/// so that a cluster with much data to convert does so over time, rather
 /// than in a burst.
 const CONVERSIONS_PER_PASS: usize = 1;
 /// How many new blobs' worth of live data a job takes at most.
@@ -125,11 +128,6 @@ pub(crate) struct Config {
     /// When this many candidates for consolidation wait, they're packed even if
     /// they don't fill a blob.
     pub max_sources: i64,
-    /// How old data must be to be erasure-coded, while coding is on (see
-    /// `coding`): data deleted within days, temporary files say, is better
-    /// never coded. A replicated blob this old is converted, and a new blob
-    /// is written coded if all of its parts are this old.
-    pub cold_age: Duration,
 }
 
 impl Default for Config {
@@ -139,7 +137,6 @@ impl Default for Config {
             small_size: SMALL_SIZE,
             compact_threshold: COMPACT_THRESHOLD,
             max_sources: 10_000,
-            cold_age: COLD_AGE,
         }
     }
 }
@@ -192,7 +189,7 @@ impl std::fmt::Display for JobReport {
             Kind::Compact => "compacted",
             Kind::Consolidate => "consolidated",
             Kind::Upgrade => "upgraded",
-            Kind::Convert => "erasure-coded",
+            Kind::Convert => "converted",
         };
         write!(
             f,
@@ -211,7 +208,7 @@ enum Kind {
     Consolidate,
     /// Rewrites a blob from before checksums into a checksummed one.
     Upgrade,
-    /// Rewrites cold replicated blobs as coded ones.
+    /// Rewrites large blobs in the cluster's layout.
     Convert,
 }
 
@@ -220,7 +217,8 @@ enum Kind {
 /// logged, and the pass moves on to other blobs.
 pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
     fold_garbage(app).await?;
-    let coding = coding(app).await?;
+    let layouts = layouts(app).await?;
+    let coding = layouts.and_then(|l| l.coding());
     let mut reports = Vec::new();
     for _ in 0..MAX_JOBS_PER_PASS {
         let claimed = match claim(app, Kind::Compact).await? {
@@ -241,15 +239,15 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
             }
         }
     }
-    if coding.is_some() {
+    if let Some(layouts) = layouts {
         for _ in 0..CONVERSIONS_PER_PASS {
-            let Some(sources) = claim(app, Kind::Convert).await? else {
+            let Some(sources) = claim_conversion(app, layouts).await? else {
                 break;
             };
             match run_job(app, Kind::Convert, &sources, coding).await {
                 Ok(report) => reports.push(report),
                 Err(e) => {
-                    let message = format!("coding {} blobs failed: {e:#}", sources.len());
+                    let message = format!("converting {} blobs failed: {e:#}", sources.len());
                     eprintln!("packer: {message}");
                     app.metrics.pack_failed(message);
                 }
@@ -377,18 +375,53 @@ async fn run_upgrade(app: &Arc<App>, sources: &[Uuid], coding: Option<u32>) -> a
     Err(last_error)
 }
 
-/// How many data shards cold data is coded into now (see `shards`): `None`
-/// if it isn't, because `data-shards` is 1, or there are no parity shards to
-/// add (a replication factor of 1), or fewer live nodes than shards.
-pub(crate) async fn coding(app: &App) -> anyhow::Result<Option<u32>> {
-    let client = app.pool.get().await?;
-    let data_shards = crate::settings::DATA_SHARDS.get(&client).await? as u32;
-    let parity_shards = app.parity_shards();
-    if data_shards < 2 || parity_shards == 0 {
-        return Ok(None);
+/// The layout that every blob larger than [`SMALL_SIZE`] is to have, as the
+/// settings say: coded in `data_shards` data shards and `parity_shards`
+/// parity shards while coding is on (the `data-shards` setting is more than
+/// 1, and there are parity shards to add), else replicated, with
+/// `parity_shards` copies besides the first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Layouts {
+    pub data_shards: u32,
+    pub parity_shards: u32,
+    /// Whether the parity shards are the cluster's, the `parity-shards`
+    /// setting, rather than this node's `--replication-factor`. Only then is a
+    /// blob rewritten (or a replicated blob's copies added or dropped) for its
+    /// parity shards alone: nodes that go by their own flags may disagree.
+    pub parity_settled: bool,
+}
+
+impl Layouts {
+    /// How many data shards a large blob is coded in, if coding is on.
+    pub fn coding(self) -> Option<u32> {
+        (self.data_shards > 1).then_some(self.data_shards)
     }
-    // Live as `choose_nodes` counts them.
-    let live: i64 = client
+}
+
+/// The layout that the settings say large blobs are to have (see
+/// [`Layouts`]), whether or not there are nodes enough for it.
+pub(crate) async fn wanted_layouts(app: &App) -> anyhow::Result<Layouts> {
+    let client = app.pool.get().await?;
+    let setting = crate::settings::DATA_SHARDS.get(&client).await? as u32;
+    let parity_settled = crate::settings::PARITY_SHARDS.get_set(&client).await?.is_some();
+    let parity_shards = app.parity_shards();
+    let data_shards = if parity_shards == 0 { 1 } else { setting.max(1) };
+    Ok(Layouts {
+        data_shards,
+        parity_shards,
+        parity_settled,
+    })
+}
+
+/// The layout that large blobs are to have now (see [`Layouts`]): `None` if
+/// there are fewer live nodes than it takes, and then they keep theirs.
+pub(crate) async fn layouts(app: &App) -> anyhow::Result<Option<Layouts>> {
+    let layouts = wanted_layouts(app).await?;
+    // Live as `live_nodes` counts them.
+    let live: i64 = app
+        .pool
+        .get()
+        .await?
         .query_one_cached(
             "SELECT count(*) FROM nodes
              WHERE state = 'active' AND last_seen > NOW() - INTERVAL '10 seconds'",
@@ -396,7 +429,14 @@ pub(crate) async fn coding(app: &App) -> anyhow::Result<Option<u32>> {
         )
         .await?
         .get(0);
-    Ok((live >= (data_shards + parity_shards) as i64).then_some(data_shards))
+    Ok((live >= (layouts.data_shards + layouts.parity_shards) as i64).then_some(layouts))
+}
+
+/// How many data shards large blobs are coded into now (see `shards`):
+/// `None` if they aren't (see [`Layouts`]), or there are fewer live nodes
+/// than shards.
+pub(crate) async fn coding(app: &App) -> anyhow::Result<Option<u32>> {
+    Ok(layouts(app).await?.and_then(Layouts::coding))
 }
 
 /// Takes the garbage log, in batches: the blobs that parts were deleted from
@@ -433,20 +473,33 @@ async fn fold_garbage(app: &Arc<App>) -> anyhow::Result<()> {
 /// as many candidates as fit into `OUTPUTS_PER_JOB` new blobs, by their live
 /// bytes.
 async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
-    let config = &app.pack;
     let kind = match kind {
         Kind::Compact => "compact",
         Kind::Consolidate => "consolidate",
         Kind::Upgrade => "upgrade",
-        Kind::Convert => "convert",
+        Kind::Convert => unreachable!("conversions are claimed by `claim_conversion`"),
     };
+    claim_with(app, kind, None).await
+}
+
+/// Claims blobs to convert into `layouts`, as `claim` does.
+async fn claim_conversion(app: &App, layouts: Layouts) -> anyhow::Result<Option<Vec<Uuid>>> {
+    claim_with(app, "convert", Some(layouts)).await
+}
+
+async fn claim_with(app: &App, kind: &str, layouts: Option<Layouts>) -> anyhow::Result<Option<Vec<Uuid>>> {
+    let config = &app.pack;
     let budget = OUTPUTS_PER_JOB * config.target_size;
+    let data_shards = layouts.map(|l| l.data_shards as i16);
+    // Blobs aren't rewritten for their parity shards alone unless those
+    // are the cluster's (see `Layouts`).
+    let parity_shards = layouts.filter(|l| l.parity_settled).map(|l| l.parity_shards as i16);
     let sources: Vec<Uuid> = app
         .pool
         .get()
         .await?
         .query_one_cached(
-            "SELECT pg_temp.cairn_claim($1, $2, $3, $4, $5, $6, $7, $8)",
+            "SELECT pg_temp.cairn_claim($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             &[
                 &kind,
                 &config.compact_threshold,
@@ -455,7 +508,8 @@ async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
                 &(config.target_size as i64),
                 &(budget as i64),
                 &LEASE.as_secs_f64(),
-                &config.cold_age.as_secs_f64(),
+                &data_shards,
+                &parity_shards,
             ],
         )
         .await?
@@ -479,8 +533,6 @@ struct Part {
     /// (which is its ETag).
     crc64nvme: Option<u64>,
     etag: String,
-    /// Whether it's old enough to be erasure-coded (`Config::cold_age`).
-    cold: bool,
 }
 
 /// A byte range of a source blob that's copied as a whole: the bytes its parts
@@ -523,8 +575,8 @@ async fn run_job(app: &Arc<App>, kind: Kind, sources: &[Uuid], coding: Option<u3
 
 /// The body of [`run_job`]. Adds each new blob to `outputs` once it exists.
 /// Reads the sources from their shard on node `only`, if given, else from
-/// any. Writes a new blob coded in `coding` data shards if it's large enough
-/// and all of its parts are cold, else replicated.
+/// any. Writes a new blob coded in `coding` data shards if it's large enough,
+/// else replicated.
 async fn pack(
     app: &Arc<App>,
     kind: Kind,
@@ -534,7 +586,7 @@ async fn pack(
     coding: Option<u32>,
 ) -> anyhow::Result<JobReport> {
     let client = app.pool.get().await?;
-    let mut parts = load_parts(&client, sources, app.pack.cold_age).await?;
+    let mut parts = load_parts(&client, sources).await?;
     let mut blobs = load_blobs(&client, app.node, sources).await?;
     if let Some(node) = only {
         for (_, locations) in blobs.values_mut() {
@@ -565,9 +617,8 @@ async fn pack(
     for output in runs.chunk_by(|a, b| a.output == b.output) {
         // Its size is known: its runs are copied as they are, or padded.
         let size: u64 = output.iter().map(|r| r.length).sum();
-        let cold = output.iter().all(|r| parts[r.parts.clone()].iter().all(|p| p.cold));
         let mut writer = match coding {
-            Some(data_shards) if cold && size > app.pack.small_size => {
+            Some(data_shards) if size > app.pack.small_size => {
                 BlobWriter::begin_coded(app, data_shards, size).await?
             }
             _ => BlobWriter::begin(app).await?,
@@ -606,21 +657,20 @@ async fn pack(
 
 /// Loads the parts of `sources` in the order they're to be laid out: by age
 /// band (the oldest first), then bucket, then age.
-async fn load_parts(client: &Object, sources: &[Uuid], cold_age: Duration) -> anyhow::Result<Vec<Part>> {
+async fn load_parts(client: &Object, sources: &[Uuid]) -> anyhow::Result<Vec<Part>> {
     // A part's age band is log2 of its age in minutes: the first band holds
     // the parts younger than two minutes, the next those up to four, and so on.
     // The last keys keep a blob's parts together when they're the same age.
     let rows = client
         .query_cached(
-            "SELECT p.id, p.blob_id, p.blob_offset, p.size, p.crc64nvme, p.etag,
-                    p.created_at < NOW() - make_interval(secs => $2)
+            "SELECT p.id, p.blob_id, p.blob_offset, p.size, p.crc64nvme, p.etag
              FROM parts p
              LEFT JOIN objects o ON o.id = p.object_id
              LEFT JOIN multipart_uploads u ON u.upload_id = p.upload_id
              WHERE p.blob_id = ANY($1)
              ORDER BY floor(log(2, greatest(extract(epoch FROM NOW() - p.created_at) / 60, 1))) DESC,
                       coalesce(o.bucket, u.bucket), p.created_at, p.blob_id, p.blob_offset",
-            &[&sources, &cold_age.as_secs_f64()],
+            &[&sources],
         )
         .await?;
     Ok(rows
@@ -635,7 +685,6 @@ async fn load_parts(client: &Object, sources: &[Uuid], cold_age: Duration) -> an
             run: 0,
             crc64nvme: r.get::<_, Option<i64>>(4).map(|crc| crc as u64),
             etag: r.get(5),
-            cold: r.get(6),
         })
         .collect())
 }
@@ -1105,7 +1154,6 @@ mod tests {
             run: 0,
             crc64nvme: (!md5).then(|| crc.sum64()),
             etag: Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect(),
-            cold: false,
         }
     }
 
@@ -1130,11 +1178,10 @@ mod tests {
 
     #[test]
     fn convert_bound_matches_the_index() {
-        assert!(crate::db::SHARDS.contains(&format!("AND size > {SMALL_SIZE};")));
+        assert!(crate::db::LAYOUTS.contains(&format!("AND size > {SMALL_SIZE};")));
         // `cairn_claim` repeats it, for the planner.
         let catalog = include_str!("catalog.sql");
-        assert!(catalog.contains(&format!("AND size > {SMALL_SIZE}\n")));
-        assert!(catalog.contains(&format!("p_small_size >= {SMALL_SIZE} THEN")));
+        assert!(catalog.contains(&format!("WHEN p_small_size >= {SMALL_SIZE} THEN 'AND size > {SMALL_SIZE}'")));
     }
 
     #[test]

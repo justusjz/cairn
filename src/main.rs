@@ -63,6 +63,8 @@ pub struct App {
     /// The `parity-shards` setting as of the last heartbeat; -1 while it's
     /// not set (see `refresh_settings`).
     parity_setting: std::sync::atomic::AtomicI64,
+    /// The `data-shards` setting as of the last heartbeat.
+    data_setting: std::sync::atomic::AtomicI64,
     /// How many bytes per second the scrubber reads; 0 if it's off.
     scrub_rate: u64,
     writing: WritingSet,
@@ -99,13 +101,31 @@ impl App {
     pub(crate) fn replication_factor(&self) -> usize {
         self.parity_shards() as usize + 1
     }
+
+    /// How many data shards a new blob of `size` bytes (if that's known up
+    /// front) is written in: the `data-shards` setting for one larger than
+    /// [`packer::SMALL_SIZE`] while coding is on (see `shards`), else 1
+    /// (replicated). A smaller blob is consolidated before long, and one
+    /// whose size isn't known is replicated, then converted by the packer.
+    /// Either way, it may still be replicated, when there are fewer live
+    /// nodes than shards (see `BlobWriter::begin`).
+    pub(crate) fn data_shards_for(&self, size: Option<u64>) -> u32 {
+        let data_shards = self.data_setting.load(std::sync::atomic::Ordering::Relaxed).max(1) as u32;
+        match size {
+            Some(size) if size > self.pack.small_size && self.parity_shards() > 0 => data_shards,
+            _ => 1,
+        }
+    }
 }
 
 /// Reads the settings every node keeps a copy of, which it goes by between
-/// heartbeats: `parity-shards`, which uploads would otherwise read every
-/// time. Says so when it overrides `--replication-factor`.
+/// heartbeats: `parity-shards` and `data-shards`, which uploads would
+/// otherwise read every time. Says so when `parity-shards` overrides
+/// `--replication-factor`.
 async fn refresh_settings(app: &App) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
+    let data_shards = settings::DATA_SHARDS.get(&client).await?;
+    app.data_setting.store(data_shards, std::sync::atomic::Ordering::Relaxed);
     let parity = settings::PARITY_SHARDS.get_set(&client).await?.unwrap_or(-1);
     let before = app.parity_setting.swap(parity, std::sync::atomic::Ordering::Relaxed);
     if parity != before && parity >= 0 && parity as usize + 1 != app.replication_flag {
@@ -229,6 +249,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         node,
         replication_flag: args.replication_factor,
         parity_setting: std::sync::atomic::AtomicI64::new(-1),
+        data_setting: std::sync::atomic::AtomicI64::new(1),
         scrub_rate: args.scrub_rate,
         writing: WritingSet::default(),
         pack: packer::Config::default(),
@@ -511,10 +532,10 @@ async fn serve_peer(
     Ok(())
 }
 
-/// Chooses `count` live nodes for the shards of a new blob, those with the
-/// most free space first: the node for shard i is the i-th. Nodes being
-/// removed get none (see `mover`).
-async fn choose_nodes(client: &Object, count: usize) -> anyhow::Result<Vec<Location>> {
+/// The nodes that may take the shards of a new blob: the live ones, those
+/// with the most free space first. Nodes being removed get none (see
+/// `mover`).
+async fn live_nodes(client: &Object) -> anyhow::Result<Vec<(i32, String)>> {
     let nodes = client
         .query_cached(
             "SELECT id, peer_url FROM nodes
@@ -523,19 +544,25 @@ async fn choose_nodes(client: &Object, count: usize) -> anyhow::Result<Vec<Locat
             &[],
         )
         .await?;
-    if nodes.len() < count {
+    Ok(nodes.iter().map(|n| (n.get(0), n.get(1))).collect())
+}
+
+/// Chooses `count` of the `live` nodes for the shards of a new blob, in
+/// their order: the node for shard i is the i-th.
+fn choose_nodes(live: &[(i32, String)], count: usize) -> anyhow::Result<Vec<Location>> {
+    if live.len() < count {
         return Err(Unavailable(format!(
             "need {count} nodes for a blob's shards but only {} are live",
-            nodes.len()
+            live.len()
         ))
         .into());
     }
-    Ok(nodes[0..count]
+    Ok(live[0..count]
         .iter()
         .zip(0..)
-        .map(|(n, shard)| Location {
-            node: n.get("id"),
-            peer_url: n.get("peer_url"),
+        .map(|((node, peer_url), shard)| Location {
+            node: *node,
+            peer_url: peer_url.clone(),
             shard,
         })
         .collect())
@@ -568,34 +595,49 @@ impl ShardWrite {
         }
     }
 
-    /// The query of the PUT that asks a peer for it, moving it from node
-    /// `replaces` if given (see `peer::parse_shard`).
-    fn query(&self, replaces: Option<i32>) -> String {
+    /// The query of the PUT that asks a peer for it, placed there as
+    /// `placement` says (see `peer::parse_shard`).
+    fn query(&self, placement: Placement) -> String {
         let mut query = match self {
             ShardWrite::Replica { shard, .. } => format!("?shard={shard}"),
             // A coded shard's layout names the shard too.
             ShardWrite::Coded(file) => format!("?{}", &peer::layout_query(file)[1..]),
         };
-        if let Some(node) = replaces {
-            query.push_str(&format!("&replaces={node}"));
+        match placement {
+            Placement::New => {}
+            Placement::Move { from } => query.push_str(&format!("&replaces={from}")),
+            Placement::Add { parity_shards } => query.push_str(&format!("&adds_to={parity_shards}")),
         }
         query
     }
 }
 
-/// Streams a shard (one side of the writer's fan-out, or a move from node
-/// `replaces`) to the node at `peer_url`, returning the CRC64/NVME it
-/// reports for the file it stored.
+/// What a shard that a node stores is to the blob (see `mover`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Placement {
+    /// A shard of a new, pending blob, which its commit counts.
+    New,
+    /// A shard of a committed blob, moving here from node `from`.
+    Move { from: i32 },
+    /// A further copy of a committed replicated blob, which has
+    /// `parity_shards` parity shards (copies besides the first) until it's
+    /// added.
+    Add { parity_shards: u32 },
+}
+
+/// Streams a shard (one side of the writer's fan-out, or one the mover
+/// places, as `placement` says) to the node at `peer_url`, returning the
+/// CRC64/NVME it reports for the file it stored.
 pub(crate) async fn upload_to_peer(
     peers: &peer::PeerClient,
     peer_url: &str,
     write: &ShardWrite,
-    replaces: Option<i32>,
+    placement: Placement,
     body: body::ResBody,
 ) -> anyhow::Result<u64> {
     let req = Request::builder()
         .method(Method::PUT)
-        .uri(format!("{peer_url}/blobs/{}{}", write.blob_id(), write.query(replaces)))
+        .uri(format!("{peer_url}/blobs/{}{}", write.blob_id(), write.query(placement)))
         .body(body)?;
     let res = peers.request(req).await?;
     if res.status() != StatusCode::OK {
@@ -615,13 +657,14 @@ pub(crate) async fn upload_to_peer(
 /// the peer PUT endpoint (an `Incoming`) and the local sink of `BlobWriter`
 /// (a channel-backed body) — hence the generic body.
 ///
-/// With `replaces`, the shard of a committed blob moves here from that node
-/// (see `mover`): the location moves, if the file is the one the catalog
-/// describes, and the shard is still there.
+/// A shard of a committed blob moves here from another node, or is a
+/// further copy of it, as `placement` says (see `mover`): the location
+/// moves, or is added, if the file is the one the catalog describes, and
+/// the blob is still as the mover found it.
 async fn write_blob_streaming<B>(
     app: &App,
     write: &ShardWrite,
-    replaces: Option<i32>,
+    placement: Placement,
     body: B,
 ) -> anyhow::Result<u64>
 where
@@ -633,11 +676,11 @@ where
     // GC's file sweep won't treat this in-flight file (no location yet) as an
     // orphan. The guard drops after the location insert below.
     let _writing = app.writing.begin(blob_id);
-    // A shard moving here is written to a file of its own, and only becomes
-    // the blob's file once its location has moved: the node may hold another
-    // shard of the blob already, whose file mustn't be touched.
-    let staged = replaces.map(|_| app.store.move_path(blob_id));
-    match write_and_announce(app, write, replaces, staged.as_deref(), body).await {
+    // A shard placed here by the mover is written to a file of its own, and
+    // only becomes the blob's file once its location is here: the node may
+    // hold another shard of the blob already, whose file mustn't be touched.
+    let staged = (placement != Placement::New).then(|| app.store.move_path(blob_id));
+    match write_and_announce(app, write, placement, staged.as_deref(), body).await {
         Ok(crc) => Ok(crc),
         Err(failure) => {
             // Delete the file right away, unless its location may have been
@@ -716,7 +759,7 @@ impl<E: Into<anyhow::Error>> From<E> for WriteFailure {
 async fn write_and_announce<B>(
     app: &App,
     write: &ShardWrite,
-    replaces: Option<i32>,
+    placement: Placement,
     staged: Option<&std::path::Path>,
     mut body: B,
 ) -> Result<u64, WriteFailure>
@@ -786,10 +829,10 @@ where
     let shard = write.shard() as i16;
     let crc = file_crc.sum64();
     let mut file_lock = None;
-    let announced = match replaces {
+    let announced = match placement {
         // The blob may be gone (its upload given up): then this fails its FK
         // check.
-        None => client
+        Placement::New => client
             .execute_cached(
                 // The bytes were checksummed on their way to the disk, and the
                 // writer compares the CRC: the copy is known intact as of now.
@@ -802,7 +845,7 @@ where
             )
             .await
             .map(|_| None),
-        Some(from) => {
+        Placement::Move { from } => {
             // Held until the file has the blob's name (see `remove_unplaced`).
             file_lock = Some(app.writing.lock_file(blob_id).await);
             client
@@ -813,17 +856,27 @@ where
                 .await
                 .map(|row| Some(row.get::<_, String>(0)))
         }
+        Placement::Add { parity_shards } => {
+            file_lock = Some(app.writing.lock_file(blob_id).await);
+            client
+                .query_one_cached(
+                    "SELECT pg_temp.cairn_add_copy($1, $2, $3, $4, $5)",
+                    &[&blob_id, &shard, &app.node, &(crc as i64), &(parity_shards as i16)],
+                )
+                .await
+                .map(|row| Some(row.get::<_, String>(0)))
+        }
     };
     match announced {
         Ok(None) => {}
-        Ok(Some(status)) if status == "moved" => {
+        Ok(Some(status)) if status == "moved" || status == "added" => {
             // Its location is here now: it's the blob's file. Failing that,
             // the location has no file, which reads fail over from, and the
             // scrubber repairs.
             if let Some(path) = staged
                 && let Err(e) = app.store.install_move(path, blob_id).await
             {
-                eprintln!("CORRUPTION: blob {blob_id}: shard {shard} moved here, but its file couldn't be installed: {e:#}");
+                eprintln!("CORRUPTION: blob {blob_id}: shard {shard} was placed here, but its file couldn't be installed: {e:#}");
                 let _ = app.store.remove_at(path).await;
                 crate::scrub::suspect(app, blob_id, app.node);
                 return Err(e.into());
@@ -832,7 +885,7 @@ where
         }
         // Nothing changed: the file is of no use.
         Ok(Some(status)) => {
-            return Err(anyhow::anyhow!("blob {blob_id}: shard {shard} wasn't moved here: {status}").into());
+            return Err(anyhow::anyhow!("blob {blob_id}: shard {shard} wasn't placed here: {status}").into());
         }
         Err(e) => {
             let maybe_announced = e.code().is_none();
@@ -886,34 +939,43 @@ pub(crate) struct BlobWriter {
 impl BlobWriter {
     /// Creates a pending replicated blob, and starts a sink for each shard.
     pub(crate) async fn begin(app: &Arc<App>) -> anyhow::Result<BlobWriter> {
-        let writer = Self::start(app, None, 1, None).await?;
+        let writer = Self::start(app, None, 1, None, false).await?;
         Ok(writer.expect("only a bucket can be missing"))
     }
 
-    /// Like `begin`, for an upload into `bucket`: `None` if there's no such
-    /// bucket, and then there's no pending blob either. Saves the upload a
-    /// round trip to Postgres for checking the bucket first. (The commit checks
-    /// again, since the bucket may be deleted while the body streams.)
-    pub(crate) async fn begin_in_bucket(
+    /// Creates the pending blob of an upload of `size` bytes, if that's
+    /// known up front, into `bucket`, if it's an object's, and starts a sink
+    /// for each shard. A large one is coded, while coding is on (see
+    /// `App::data_shards_for`); replicated if there are fewer live nodes than
+    /// that takes. `None` if there's no such bucket, and then there's no
+    /// pending blob either: saves the upload a round trip to Postgres for
+    /// checking the bucket first. (The commit checks again, since the bucket
+    /// may be deleted while the body streams.)
+    pub(crate) async fn begin_upload(
         app: &Arc<App>,
-        bucket: &str,
+        bucket: Option<&str>,
+        size: Option<u64>,
     ) -> anyhow::Result<Option<BlobWriter>> {
-        Self::start(app, Some(bucket), 1, None).await
+        Self::start(app, bucket, app.data_shards_for(size), size, true).await
     }
 
     /// Creates a pending blob of `size` bytes in `data_shards` data shards
     /// (and the cluster's parity shards), and starts a sink for each shard.
     /// With one data shard, it's replicated.
     pub(crate) async fn begin_coded(app: &Arc<App>, data_shards: u32, size: u64) -> anyhow::Result<BlobWriter> {
-        let writer = Self::start(app, None, data_shards, Some(size)).await?;
+        let writer = Self::start(app, None, data_shards, Some(size), false).await?;
         Ok(writer.expect("only a bucket can be missing"))
     }
 
+    /// Creates a pending blob in `data_shards` data shards, of `size` bytes
+    /// (which coding needs to know). With `or_replicated`, a blob there
+    /// aren't live nodes enough to code is replicated instead.
     async fn start(
         app: &Arc<App>,
         bucket: Option<&str>,
         data_shards: u32,
         size: Option<u64>,
+        or_replicated: bool,
     ) -> anyhow::Result<Option<BlobWriter>> {
         let client = app.pool.get().await?;
         // Time-ordered, so new blobs land at the end of the indexes on blob_id.
@@ -937,16 +999,20 @@ impl BlobWriter {
         // insert is still underway when the discard runs, the GC has the row.
         let mut pending = blobs::DiscardOnDrop::new(app, blob_id);
         let parity_shards = app.parity_shards();
-        let shard_count = (data_shards + parity_shards) as usize;
         // Independent of each other, so they're sent together, and take one
         // round trip between them.
-        let (inserted, locations) = tokio::join!(insert, choose_nodes(&client, shard_count));
+        let (inserted, live) = tokio::join!(insert, live_nodes(&client));
         if inserted? == 0 {
             pending.disarm();
             return Ok(None);
         }
         drop(client);
-        let locations = match locations {
+        let data_shards = match &live {
+            Ok(live) if or_replicated && live.len() < (data_shards + parity_shards) as usize => 1,
+            _ => data_shards,
+        };
+        let shard_count = (data_shards + parity_shards) as usize;
+        let locations = match live.and_then(|live| choose_nodes(&live, shard_count)) {
             Ok(locations) => locations,
             Err(e) => {
                 // No sink has started, so there are only the row's to delete.
@@ -993,12 +1059,12 @@ impl BlobWriter {
             let shard = location.shard;
             if location.node == app.node {
                 let app = app.clone();
-                sinks.spawn(async move { Ok((shard, write_blob_streaming(&app, &write, None, body).await?)) });
+                sinks.spawn(async move { Ok((shard, write_blob_streaming(&app, &write, Placement::New, body).await?)) });
             } else {
                 let peers = app.peers.clone();
                 sinks.spawn(async move {
                     let peer_url = location.peer_url;
-                    match upload_to_peer(&peers, &peer_url, &write, None, body).await {
+                    match upload_to_peer(&peers, &peer_url, &write, Placement::New, body).await {
                         Ok(crc) => Ok((shard, crc)),
                         Err(e) => Err(Unavailable(format!("node {peer_url}: {e:#}")).into()),
                     }
@@ -1341,12 +1407,18 @@ where
 {
     // 1-2. create the pending blob and start writing it to its replicas. An
     // object's bucket is checked on the way.
-    let mut writer = match attach {
-        AttachTarget::Object { bucket, .. } => match BlobWriter::begin_in_bucket(app, bucket).await? {
-            Some(writer) => writer,
-            None => return Ok(UploadResult::NoSuchBucket),
-        },
-        AttachTarget::MultipartPart { .. } => BlobWriter::begin(app).await?,
+    // Its size, if the body declares it: an encrypted part's is its
+    // ciphertext's.
+    let size = payload.length().map(|plain| match attach.key() {
+        Some(_) => encryption::stored_len(plain),
+        None => plain,
+    });
+    let bucket = match attach {
+        AttachTarget::Object { bucket, .. } => Some(bucket.as_str()),
+        AttachTarget::MultipartPart { .. } => None,
+    };
+    let Some(mut writer) = BlobWriter::begin_upload(app, bucket, size).await? else {
+        return Ok(UploadResult::NoSuchBucket);
     };
     let blob_id = writer.blob_id;
     // An encrypted part is stored as its ciphertext; its ETag is its salt.

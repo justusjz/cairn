@@ -162,7 +162,7 @@ async fn too_few_nodes_leave_nothing() {
 async fn a_replica_of_a_given_up_blob_deletes_its_file() {
     let Some(app) = node().await else { return };
     let body = Full::new(Bytes::from_static(b"data"));
-    let result = crate::write_blob_streaming(&app, &crate::ShardWrite::Replica { blob_id: Uuid::now_v7(), shard: 0 }, None, body).await;
+    let result = crate::write_blob_streaming(&app, &crate::ShardWrite::Replica { blob_id: Uuid::now_v7(), shard: 0 }, crate::Placement::New, body).await;
     assert!(result.is_err(), "there's no such blob to record a location for");
     assert_left(&app, 0).await;
 }

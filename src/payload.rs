@@ -226,16 +226,32 @@ impl Payload {
         }
     }
 
+    /// Like `unchecked`, for data from within Cairn whose length is known
+    /// (a copy's): `length` says how long it is, unchecked.
+    pub fn unchecked_of(length: u64) -> Payload {
+        Payload {
+            content_length: Some(length),
+            ..Payload::unchecked()
+        }
+    }
+
+    /// How much data the body declares it holds, up front: its
+    /// `Content-Length`, or, streaming, its `x-amz-decoded-content-length`.
+    /// `None` for a body in chunked transfer encoding (or a form's file).
+    /// Once `finish` succeeds, it's what it held.
+    pub fn length(&self) -> Option<u64> {
+        match self.decoder {
+            Some(_) => self.decoded_length,
+            None => self.content_length,
+        }
+    }
+
     /// Limits an upload's data to `max` bytes, as S3 does: refused now if it
     /// declares more (in `Content-Length`, or, streaming, in
     /// `x-amz-decoded-content-length`), and as soon as more of it arrives (a
     /// body in chunked transfer encoding, which S3 takes too, declares none).
     pub fn at_most(mut self, max: u64) -> Result<Payload, Rejection> {
-        let declared = match self.decoder {
-            Some(_) => self.decoded_length,
-            None => self.content_length,
-        };
-        if declared.is_some_and(|length| length > max) {
+        if self.length().is_some_and(|length| length > max) {
             return Err(too_large());
         }
         self.max = Some(max);

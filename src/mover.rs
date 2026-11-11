@@ -26,6 +26,15 @@
 //!
 //! Blobs from before checksums can't be verified as they're moved: the
 //! packer's upgrade rewrites them instead, onto active nodes.
+//!
+//! The mover also gives every replicated blob as many copies as the
+//! `parity-shards` setting says, once it's set (nodes that go by their own
+//! `--replication-factor` may disagree): it adds copies, those with the
+//! fewest first, as a move does, and drops those beyond, from nodes being
+//! removed or down first, then from the fullest. A coded blob's parity
+//! shards can't be added or dropped like that (the code's parity shards
+//! differ with their number), so the packer rewrites it instead, and the
+//! replicated blobs it's about to code too (see `packer::Layouts`).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +44,7 @@ use uuid::Uuid;
 
 use crate::db::Cached;
 use crate::{
-    App, ShardWrite,
+    App, Placement, ShardWrite,
     blob_file::{self, ShardFile},
     blobs::{BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, layout_at, location_at},
     body::{FrameSender, channel_body},
@@ -56,9 +65,12 @@ const IDLE: Duration = Duration::from_secs(60);
 /// What a pass did.
 #[derive(Default, Debug)]
 pub struct Report {
-    /// Shards moved, and their bytes.
+    /// Shards moved, and copies added; their bytes.
     pub moved: u64,
+    pub added: u64,
     pub bytes: u64,
+    /// Copies dropped.
+    pub dropped: u64,
     /// Shards left where they are for want of a node to move them to.
     pub waiting: u64,
     /// Moves that failed, which are tried again.
@@ -71,7 +83,7 @@ pub struct Report {
 
 impl Report {
     pub fn is_empty(&self) -> bool {
-        self.moved + self.waiting + self.failed + self.upgraded + self.removed == 0
+        self.moved + self.added + self.dropped + self.waiting + self.failed + self.upgraded + self.removed == 0
     }
 }
 
@@ -79,9 +91,11 @@ impl std::fmt::Display for Report {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "moved {} shards ({} bytes), {} waiting for a node to move to, {} failed; \
+            "moved {} shards and added {} copies ({} bytes), dropped {} copies, \
+             {} waiting for a node, {} failed; \
              upgraded {} blobs from before checksums; {} nodes removed",
-            self.moved, self.bytes, self.waiting, self.failed, self.upgraded, self.removed
+            self.moved, self.added, self.bytes, self.dropped, self.waiting, self.failed, self.upgraded,
+            self.removed
         )
     }
 }
@@ -103,14 +117,16 @@ pub async fn run(app: Arc<App>) {
     }
 }
 
-/// Moves the shards there are to move, until every blob with some has been
-/// claimed (those still with shards to move are claimed again a minute
-/// later, by the next pass).
+/// Moves the shards there are to move, and then adds and drops the copies
+/// there are to add and drop, until every blob with some has been claimed
+/// (those still with some are claimed again a minute later, by the next
+/// pass).
 pub async fn pass(app: &Arc<App>) -> anyhow::Result<Report> {
     let mut report = Report::default();
     report.removed += finish_removals(app).await?;
     let client = app.pool.get().await?;
     let minutes = crate::settings::REPAIR_AFTER.get(&client).await?;
+    let parity_shards = crate::settings::PARITY_SHARDS.get_set(&client).await?.map(|m| m as u32);
     drop(client);
     // NULL: never, for a node that's merely down.
     let after = (minutes > 0).then_some(minutes as f64 * 60.0);
@@ -129,29 +145,209 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Report> {
             break;
         }
         for blob_id in blobs {
-            let done = match move_blob(app, blob_id, after, &mut report).await {
-                Ok(done) => done,
-                Err(e) => {
-                    eprintln!("mover: blob {blob_id}: {e:#}");
-                    report.failed += 1;
-                    false
-                }
-            };
-            // Done: let go of it; else try it again in a while.
-            let retry = (!done).then(|| RETRY.as_secs_f64());
-            app.pool
-                .get()
-                .await?
-                .execute_cached(
-                    "UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => $2)
-                     WHERE blob_id = $1",
-                    &[&blob_id, &retry],
-                )
-                .await?;
+            let done = move_blob(app, blob_id, after, parity_shards, &mut report).await;
+            release(app, blob_id, done, &mut report).await?;
         }
     }
+    copies(app, &mut report).await?;
     report.removed += finish_removals(app).await?;
     Ok(report)
+}
+
+/// Lets go of a blob the mover claimed once it's `done` with it, or else
+/// leases it for a while, to try it again then.
+async fn release(app: &App, blob_id: Uuid, done: anyhow::Result<bool>, report: &mut Report) -> anyhow::Result<()> {
+    let done = match done {
+        Ok(done) => done,
+        Err(e) => {
+            eprintln!("mover: blob {blob_id}: {e:#}");
+            report.failed += 1;
+            false
+        }
+    };
+    let retry = (!done).then(|| RETRY.as_secs_f64());
+    app.pool
+        .get()
+        .await?
+        .execute_cached(
+            "UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => $2)
+             WHERE blob_id = $1",
+            &[&blob_id, &retry],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Adds and drops copies of replicated blobs, until each has as many as the
+/// `parity-shards` setting says, if it's set: but for those the packer is
+/// to code (see `packer::Layouts`), which it rewrites with their parity
+/// shards anyway.
+async fn copies(app: &Arc<App>, report: &mut Report) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
+    let setting = crate::settings::PARITY_SHARDS.get_set(&client).await?;
+    drop(client);
+    let Some(parity_shards) = setting else {
+        return Ok(());
+    };
+    let parity_shards = parity_shards as u32;
+    let layouts = crate::packer::layouts(app).await?;
+    let coded_above = layouts.and_then(|l| l.coding()).map(|_| app.pack.small_size as i64);
+    loop {
+        let blobs: Vec<Uuid> = app
+            .pool
+            .get()
+            .await?
+            .query_one_cached(
+                "SELECT pg_temp.cairn_claim_copies($1, $2, $3, $4)",
+                &[&(parity_shards as i16), &coded_above, &BATCH, &LEASE.as_secs_f64()],
+            )
+            .await?
+            .get(0);
+        if blobs.is_empty() {
+            return Ok(());
+        }
+        for blob_id in blobs {
+            let done = adjust_copies(app, blob_id, parity_shards, report).await;
+            release(app, blob_id, done, report).await?;
+        }
+    }
+}
+
+/// Adds or drops copies of replicated blob `blob_id` until it has
+/// `parity_shards` besides the first. Whether it has.
+async fn adjust_copies(app: &Arc<App>, blob_id: Uuid, parity_shards: u32, report: &mut Report) -> anyhow::Result<bool> {
+    let Some((layout, crcs, mut holders)) = load(app, blob_id, None).await? else {
+        return Ok(true); // deleted meanwhile
+    };
+    let Some(mut layout) = layout.filter(Layout::replicated) else {
+        return Ok(true); // rewritten meanwhile
+    };
+    let crc = crcs[0] as u64;
+    while layout.parity_shards < parity_shards {
+        let taken: Vec<i32> = holders.iter().map(|h| h.location.node).collect();
+        let Some(target) = choose_target(app, &taken, layout.shards()).await? else {
+            report.waiting += 1;
+            return Ok(false);
+        };
+        let Some(source) = holders.iter().position(|h| h.live) else {
+            anyhow::bail!("no copy is on a live node");
+        };
+        let placement = Placement::Add {
+            parity_shards: layout.parity_shards,
+        };
+        if let Err(e) = place_shard(app, blob_id, layout, &holders, source, &target, crc, placement).await {
+            eprintln!("mover: blob {blob_id}: adding a copy: {e:#}");
+            report.failed += 1;
+            return Ok(false);
+        }
+        eprintln!("mover: blob {blob_id}: added copy {} on node {}", target.shard, target.node);
+        report.added += 1;
+        report.bytes += layout.size;
+        layout.parity_shards += 1;
+        holders.push(Holder {
+            location: target,
+            live: true,
+            moving: false,
+        });
+    }
+    while layout.parity_shards > parity_shards {
+        // A copy on a node being removed, or down, first: it would be moved
+        // otherwise. Then the fullest node's.
+        let node: i32 = app
+            .pool
+            .get()
+            .await?
+            .query_one_cached(
+                "SELECT bl.node FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+                 WHERE bl.blob_id = $1
+                 ORDER BY n.state <> 'active' DESC, n.last_seen > NOW() - INTERVAL '10 seconds',
+                          n.free_space, n.id
+                 LIMIT 1",
+                &[&blob_id],
+            )
+            .await?
+            .get(0);
+        if !drop_copy(app, blob_id, node, layout.parity_shards, report).await? {
+            return Ok(false);
+        }
+        layout.parity_shards -= 1;
+    }
+    Ok(true)
+}
+
+/// Drops node `node`'s copy of replicated blob `blob_id`, which has
+/// `parity_shards` parity shards, and reaps its file. Whether it was
+/// dropped: if the blob changed meanwhile, it's read afresh when it's tried
+/// again.
+async fn drop_copy(app: &Arc<App>, blob_id: Uuid, node: i32, parity_shards: u32, report: &mut Report) -> anyhow::Result<bool> {
+    let row = app
+        .pool
+        .get()
+        .await?
+        .query_one_cached(
+            "SELECT status, reap_peer FROM pg_temp.cairn_drop_copy($1, $2, $3)",
+            &[&blob_id, &node, &(parity_shards as i16)],
+        )
+        .await?;
+    let status: String = row.get(0);
+    if status != "dropped" {
+        eprintln!("mover: blob {blob_id}: the copy on node {node} wasn't dropped: {status}");
+        return Ok(false);
+    }
+    eprintln!("mover: blob {blob_id}: dropped the copy on node {node}");
+    report.dropped += 1;
+    crate::blobs::reap_blobs(app, vec![(blob_id, node, row.get(1))]);
+    Ok(true)
+}
+
+/// A blob's layout (`None` from before checksums) and shards' CRCs, and its
+/// shards, in order: `None` if it's gone. Those to move are those on nodes
+/// being removed, or down for longer than `after` seconds, if given.
+async fn load(
+    app: &App,
+    blob_id: Uuid,
+    after: Option<f64>,
+) -> anyhow::Result<Option<(Option<Layout>, Vec<i64>, Vec<Holder>)>> {
+    let client = app.pool.get().await?;
+    // The lease runs from now: the batch's earlier blobs may have taken long.
+    client
+        .execute_cached(
+            "UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => $2) WHERE blob_id = $1",
+            &[&blob_id, &LEASE.as_secs_f64()],
+        )
+        .await?;
+    let Some(blob) = client
+        .query_opt_cached(
+            &format!("SELECT {LAYOUT_COLUMNS}, b.shard_crcs FROM blobs b WHERE b.blob_id = $1"),
+            &[&blob_id],
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    let holders: Vec<Holder> = client
+        .query_cached(
+            &format!(
+                "SELECT {LOCATION_COLUMNS}, n.last_seen > NOW() - INTERVAL '10 seconds',
+                        n.state <> 'active'
+                            OR coalesce(n.last_seen < NOW() - make_interval(secs => $2), false)
+                 FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+                 WHERE bl.blob_id = $1
+                 ORDER BY bl.shard"
+            ),
+            &[&blob_id, &after],
+        )
+        .await?
+        .iter()
+        .map(|r| Holder {
+            location: location_at(r, 0),
+            live: r.get(3),
+            moving: r.get(4),
+        })
+        .collect();
+    // None for a blob from before checksums.
+    let crcs: Option<Vec<i64>> = blob.get(5);
+    Ok(Some((layout_at(&blob, 0), crcs.unwrap_or_default(), holders)))
 }
 
 /// Marks the nodes being removed that hold no shard anymore as removed. How
@@ -181,52 +377,41 @@ struct Holder {
 }
 
 /// Moves the shards of `blob_id` that are to move (on nodes being removed, or
-/// down for longer than `after` seconds). Whether all of them moved.
-async fn move_blob(app: &Arc<App>, blob_id: Uuid, after: Option<f64>, report: &mut Report) -> anyhow::Result<bool> {
-    let client = app.pool.get().await?;
-    // The lease runs from now: the batch's earlier blobs may have taken long.
-    client
-        .execute_cached(
-            "UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => $2) WHERE blob_id = $1",
-            &[&blob_id, &LEASE.as_secs_f64()],
-        )
-        .await?;
-    let Some(blob) = client
-        .query_opt_cached(
-            &format!("SELECT {LAYOUT_COLUMNS}, b.shard_crcs FROM blobs b WHERE b.blob_id = $1"),
-            &[&blob_id],
-        )
-        .await?
-    else {
+/// down for longer than `after` seconds). Whether all of them moved. A
+/// replicated blob with more copies than `parity_shards` (the setting, if
+/// it's set) has those to move dropped instead, as many as it has too many.
+async fn move_blob(
+    app: &Arc<App>,
+    blob_id: Uuid,
+    after: Option<f64>,
+    parity_shards: Option<u32>,
+    report: &mut Report,
+) -> anyhow::Result<bool> {
+    let Some((layout, mut crcs, mut holders)) = load(app, blob_id, after).await? else {
         return Ok(true); // deleted meanwhile
     };
-    let mut holders: Vec<Holder> = client
-        .query_cached(
-            &format!(
-                "SELECT {LOCATION_COLUMNS}, n.last_seen > NOW() - INTERVAL '10 seconds',
-                        n.state <> 'active'
-                            OR coalesce(n.last_seen < NOW() - make_interval(secs => $2), false)
-                 FROM blob_locations bl JOIN nodes n ON n.id = bl.node
-                 WHERE bl.blob_id = $1
-                 ORDER BY bl.shard"
-            ),
-            &[&blob_id, &after],
-        )
-        .await?
-        .iter()
-        .map(|r| Holder {
-            location: location_at(r, 0),
-            live: r.get(3),
-            moving: r.get(4),
-        })
-        .collect();
-    drop(client);
-    let Some(layout) = layout_at(&blob, 0) else {
+    let Some(mut layout) = layout else {
         crate::packer::upgrade_blob(app, blob_id).await?;
         report.upgraded += 1;
         return Ok(true);
     };
-    let crcs: Vec<i64> = blob.get(5);
+    if layout.replicated()
+        && let Some(parity_shards) = parity_shards
+    {
+        let surplus = layout.parity_shards.saturating_sub(parity_shards);
+        let leaving: Vec<i32> = holders.iter().filter(|h| h.moving).map(|h| h.location.node).take(surplus as usize).collect();
+        for node in leaving {
+            if !drop_copy(app, blob_id, node, layout.parity_shards, report).await? {
+                return Ok(false);
+            }
+            layout.parity_shards -= 1;
+        }
+        // The copies have new numbers.
+        let Some((_, now_crcs, now_holders)) = load(app, blob_id, after).await? else {
+            return Ok(true);
+        };
+        (crcs, holders) = (now_crcs, now_holders);
+    }
     let mut done = true;
     // Nodes that shards left in this job: none moves back to one, whose file
     // of the blob may still be on its way to being reaped.
@@ -242,7 +427,10 @@ async fn move_blob(app: &Arc<App>, blob_id: Uuid, after: Option<f64>, report: &m
             continue;
         };
         let crc = crcs[holders[i].location.shard as usize] as u64;
-        match move_shard(app, blob_id, layout, &holders, i, &target, crc).await {
+        let placement = Placement::Move {
+            from: holders[i].location.node,
+        };
+        match place_shard(app, blob_id, layout, &holders, i, &target, crc, placement).await {
             Ok(()) => {
                 let from = holders[i].location.clone();
                 eprintln!(
@@ -292,10 +480,12 @@ async fn choose_target(app: &App, taken: &[i32], shard: u32) -> anyhow::Result<O
     }))
 }
 
-/// Moves the shard of `holders[i]` to `target`: streams its bytes there,
-/// verified, where it's stored and its location moved. `crc` is the
-/// catalog's CRC of the shard's file.
-async fn move_shard(
+/// Places the shard of `holders[i]` on `target`, as `placement` says (it's
+/// moved there, or is a further copy): streams its bytes there, verified,
+/// where it's stored and its location recorded. `crc` is the catalog's CRC
+/// of the shard's file.
+#[allow(clippy::too_many_arguments)]
+async fn place_shard(
     app: &Arc<App>,
     blob_id: Uuid,
     layout: Layout,
@@ -303,21 +493,20 @@ async fn move_shard(
     i: usize,
     target: &Location,
     crc: u64,
+    placement: Placement,
 ) -> anyhow::Result<()> {
-    let from = &holders[i];
-    let shard = from.location.shard;
+    let shard = target.shard;
     let write = if layout.replicated() {
         ShardWrite::Replica { blob_id, shard }
     } else {
         ShardWrite::Coded(ShardFile { blob_id, layout, shard })
     };
     let (tx, body) = channel_body();
-    let replaces = Some(from.location.node);
     let store = async {
         if target.node == app.node {
-            crate::write_blob_streaming(app, &write, replaces, body).await
+            crate::write_blob_streaming(app, &write, placement, body).await
         } else {
-            crate::upload_to_peer(&app.peers, &target.peer_url, &write, replaces, body).await
+            crate::upload_to_peer(&app.peers, &target.peer_url, &write, placement, body).await
         }
     };
     let feed = async {

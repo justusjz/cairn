@@ -196,6 +196,7 @@ const MIGRATIONS: &[&str] = &[
     NODE_STATES,
     BUCKET_CORS,
     TAGGING,
+    LAYOUTS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1040,6 +1041,23 @@ const TAGGING: &str = r#"
 ALTER TABLE objects ADD COLUMN tags text NOT NULL DEFAULT '';
 ALTER TABLE multipart_uploads ADD COLUMN tags text NOT NULL DEFAULT '';
 ALTER TABLE buckets ADD COLUMN tags text;
+"#;
+
+/// Migration 28: blobs are brought to the cluster's layout whatever their
+/// age (see `packer::Layouts`): the packer converts large blobs in any other
+/// layout, off `blobs_large`, rather than replicated ones a week old, and the
+/// mover adds or drops copies of replicated blobs, off `blobs_copies` (see
+/// `mover`). Both claims read their index in order, from the layout on, so
+/// that they read only as far as they take. The size bound is
+/// `packer::SMALL_SIZE`. No new lock protocol: copies are added and dropped
+/// under X(x) exclusive, as shards are moved, and a Cairn that doesn't know
+/// them reads a blob's locations as they are.
+pub(crate) const LAYOUTS: &str = r#"
+DROP INDEX blobs_replicated;
+CREATE INDEX blobs_large ON blobs (data_shards, parity_shards)
+    WHERE state = 'committed' AND block_size IS NOT NULL AND size > 67108864;
+CREATE INDEX blobs_copies ON blobs (parity_shards)
+    WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL;
 "#;
 
 #[cfg(test)]

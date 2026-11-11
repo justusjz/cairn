@@ -31,20 +31,22 @@ pub const LIFECYCLE_RATE: Setting = Setting {
     unset: None,
 };
 
-/// How many data shards the packer codes cold data into (see `shards` and
-/// `packer`); 1 keeps every blob replicated. Its parity shards are
-/// `PARITY_SHARDS`, as a replicated blob's are, so coded data survives as many
-/// lost nodes as replicated data. Only the operator knows
-/// how many nodes the cluster will keep, so Cairn never picks this itself:
-/// coding needs data + parity shards' worth of live nodes, and with fewer,
-/// the packer leaves data as it is. A change applies to data coded from then
-/// on; blobs keep the layout they were written with.
+/// How many data shards blobs larger than `packer::SMALL_SIZE` are coded
+/// into (see `shards` and `packer`); 1 keeps every blob replicated. Smaller
+/// ones are replicated until they're packed. Their parity shards are
+/// `PARITY_SHARDS`, as a replicated blob's are, so coded data survives as
+/// many lost nodes as replicated data. Only the operator knows how many nodes
+/// the cluster will keep, so Cairn never picks this itself: coding needs as
+/// many live nodes as data and parity shards, and with fewer, uploads are
+/// replicated, and the packer leaves data as it is. A change applies to
+/// uploads within a heartbeat, and the packer rewrites the blobs written
+/// before it over time (see `packer::Layouts`).
 pub const DATA_SHARDS: Setting = Setting {
     name: "data-shards",
     default: 1,
     min: 1,
     max: crate::shards::MAX_DATA_SHARDS as i64,
-    help: "data shards that cold data is erasure-coded into, plus the parity shards \
+    help: "data shards that blobs over 64 MiB are erasure-coded into, plus the parity shards \
            (1 keeps replicas only)",
     unset: None,
 };
@@ -54,7 +56,11 @@ pub const DATA_SHARDS: Setting = Setting {
 /// cluster survives losing that many nodes. Unset, each node goes by its
 /// `--replication-factor` (less one), as before there was this setting;
 /// once it's set, the flag is ignored. A change applies to blobs written from
-/// then on (nodes pick it up within a heartbeat); blobs keep theirs.
+/// then on (nodes pick it up within a heartbeat), and, while it's set, the
+/// blobs written before it are brought to it over time: the mover adds or
+/// drops copies of replicated ones, the packer rewrites coded ones (see
+/// `mover`, `packer::Layouts`). Unset, they keep theirs, since nodes may go
+/// by different flags.
 pub const PARITY_SHARDS: Setting = Setting {
     name: "parity-shards",
     default: 0,
@@ -217,7 +223,7 @@ pub async fn placement_warnings<C: GenericClient>(client: &C) -> anyhow::Result<
     } else if data > 1 && parity > 0 && active < data + parity {
         warnings.push(format!(
             "coding {data}+{parity} takes {} nodes, but the cluster has {active} active: \
-             cold data stays replicated until it has",
+             blobs stay replicated until it has",
             data + parity
         ));
     } else if data > 1 && parity == 0 {

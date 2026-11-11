@@ -218,7 +218,7 @@ async fn a_move_racing_a_delete_moves_nothing() {
         async move {
             let write = crate::ShardWrite::Replica { blob_id, shard: 0 };
             let body = http_body_util::Full::new(hyper::body::Bytes::from(body));
-            crate::write_blob_streaming(&target, &write, Some(from), body).await
+            crate::write_blob_streaming(&target, &write, crate::Placement::Move { from }, body).await
         }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -243,7 +243,7 @@ async fn a_move_never_touches_another_shards_file() {
     let shard = std::fs::read(cluster.nodes[holders[1]].store.blob_path(blob_id)).unwrap();
     let body_of_shard = http_body_util::Full::new(hyper::body::Bytes::from(shard));
     let from = cluster.nodes[holders[1]].node;
-    let result = crate::write_blob_streaming(target, &write, Some(from), body_of_shard).await;
+    let result = crate::write_blob_streaming(target, &write, crate::Placement::Move { from }, body_of_shard).await;
     assert!(result.is_err());
     assert_intact(&cluster, blob_id).await;
     assert_reads(target, "k", &body).await;
@@ -282,4 +282,86 @@ async fn a_reap_spares_a_placed_file() {
     let blob_id = blob_of(app, "k").await;
     crate::blobs::remove_unplaced(app, blob_id).await.unwrap();
     assert!(app.store.open_blob(blob_id).await.unwrap().is_some());
+}
+
+/// Once `parity-shards` is set, every replicated blob gets as many copies:
+/// the mover adds them, and drops them again when it's lowered, reaping
+/// their files. Unset, it leaves them be.
+#[tokio::test]
+async fn copies_follow_the_parity_shards_setting() {
+    let Some(cluster) = cluster_with(4, 2, pack(), None).await else { return };
+    let a = &cluster.nodes[0];
+    let body = data(60, 300_000);
+    put(a, "k", body.clone()).await;
+    let blob_id = blob_of(a, "k").await;
+    let client = a.pool.get().await.unwrap();
+    crate::settings::PARITY_SHARDS.unset(&client).await.unwrap();
+    assert!(moves(a).await.is_empty(), "the setting isn't set");
+    crate::settings::PARITY_SHARDS.set(&client, 3).await.unwrap();
+    let report = moves(a).await;
+    assert_eq!((report.added, report.failed), (2, 0), "{report}");
+    let (layout, holders) = shards_of(&cluster, blob_id).await;
+    assert_eq!((layout.parity_shards, holders.len()), (3, 4));
+    assert_intact(&cluster, blob_id).await;
+    assert!(moves(a).await.is_empty());
+
+    crate::settings::PARITY_SHARDS.set(&client, 1).await.unwrap();
+    let report = moves(a).await;
+    assert_eq!((report.dropped, report.failed), (2, 0), "{report}");
+    let (layout, now) = shards_of(&cluster, blob_id).await;
+    assert_eq!((layout.parity_shards, now.len()), (1, 2));
+    assert_intact(&cluster, blob_id).await;
+    for (i, node) in cluster.nodes.iter().enumerate() {
+        if !now.contains(&i) {
+            assert_reaped(node, blob_id).await;
+        }
+        assert_eq!(get(node, "k").await.unwrap(), body);
+    }
+    assert!(moves(a).await.is_empty());
+}
+
+/// A dropped copy is one on a node being removed, rather than one the
+/// mover would keep.
+#[tokio::test]
+async fn a_copy_on_a_node_being_removed_is_dropped_first() {
+    let Some(cluster) = cluster_with(3, 3, pack(), None).await else { return };
+    let a = &cluster.nodes[0];
+    put(a, "k", data(61, 1000)).await;
+    let blob_id = blob_of(a, "k").await;
+    let (_, holders) = shards_of(&cluster, blob_id).await;
+    let leaving = holders[1];
+    set_state(&cluster, leaving, "removing").await;
+    let client = a.pool.get().await.unwrap();
+    crate::settings::PARITY_SHARDS.set(&client, 1).await.unwrap();
+    // A move would wait for a node to move to: there's none spare.
+    let report = moves(a).await;
+    assert_eq!((report.moved, report.dropped), (0, 1), "{report}");
+    let (_, now) = shards_of(&cluster, blob_id).await;
+    assert!(!now.contains(&leaving), "{now:?}");
+    assert_eq!(state(&cluster, leaving).await, "removed");
+}
+
+/// The copies of a replicated blob the packer is about to code are the
+/// packer's to add: it codes it with the parity shards.
+#[tokio::test]
+async fn blobs_to_be_coded_are_left_to_the_packer() {
+    let Some(cluster) = crate::shards::e2e::coding(5, 2, 3, None).await else { return };
+    let a = &cluster.nodes[0];
+    let large = data(62, 2 * 1024 * 1024);
+    put(a, "large", large.clone()).await;
+    put(a, "small", data(63, 1000)).await;
+    let client = a.pool.get().await.unwrap();
+    crate::settings::PARITY_SHARDS.set(&client, 2).await.unwrap();
+    for node in &cluster.nodes {
+        crate::refresh_settings(node).await.unwrap();
+    }
+    let report = moves(a).await;
+    assert_eq!((report.added, report.failed), (1, 0), "the small one's: {report}");
+    let (layout, _) = shards_of(&cluster, blob_of(a, "large").await).await;
+    assert_eq!((layout.data_shards, layout.parity_shards), (1, 1));
+    crate::packer::pass(a).await.unwrap();
+    let (layout, _) = shards_of(&cluster, blob_of(a, "large").await).await;
+    assert_eq!((layout.data_shards, layout.parity_shards), (3, 2));
+    assert_eq!(get(a, "large").await.unwrap(), large);
+    assert!(moves(a).await.is_empty());
 }

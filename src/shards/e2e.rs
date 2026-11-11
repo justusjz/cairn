@@ -1,6 +1,7 @@
-//! End-to-end tests of erasure coding (see `crate::e2e`): blobs that the
-//! packer codes, read with shards missing, damaged or on nodes that are
-//! down, and repaired by the scrubber.
+//! End-to-end tests of erasure coding (see `crate::e2e`): blobs coded as
+//! they're written, or by the packer, read with shards missing, damaged or on
+//! nodes that are down, and repaired by the scrubber; and blobs brought to
+//! the cluster's layout as the settings change.
 
 use std::{sync::Arc, time::Duration};
 
@@ -12,7 +13,7 @@ use crate::{
     App,
     blob_file::{self, ShardFile},
     blobs::{LAYOUT_COLUMNS, layout_at},
-    e2e::{BUCKET, Cluster, assert_reaped, cluster_with, delete, get, put, query_i64},
+    e2e::{BUCKET, Cluster, assert_reaped, cluster_with, delete, get, put, put_sized, query_i64},
     packer::{self, Config, Hook, Stage},
     s3::{conditional::Preconditions, objects},
     scrub::{Pacer, Report, Scope},
@@ -21,20 +22,21 @@ use crate::{
 
 const MIB: usize = 1024 * 1024;
 
-/// Packs into blobs of 8 MiB, and codes blobs over 1 MiB as soon as they're
-/// written.
+/// Packs into blobs of 8 MiB, and codes blobs over 1 MiB.
 pub(crate) fn pack() -> Config {
     Config {
         target_size: 8 * MIB as u64,
         small_size: MIB as u64,
-        cold_age: Duration::ZERO,
         ..Config::default()
     }
 }
 
 /// A cluster of `n` nodes writing blobs with `replication_factor` replicas,
-/// and so `replication_factor` − 1 parity shards, that codes cold data into
-/// `data_shards` data shards. `None` if there's no database to test against.
+/// and so `replication_factor` − 1 parity shards, that codes large blobs into
+/// `data_shards` data shards. (Uploads go by it once the nodes have read it,
+/// in a heartbeat or `refresh`, and only those that declare their size: as
+/// `put`'s don't, they're replicated, for the packer to convert.) `None` if
+/// there's no database to test against.
 pub(crate) async fn coding(n: usize, replication_factor: usize, data_shards: i64, hook: Option<Hook>) -> Option<Cluster> {
     let cluster = cluster_with(n, replication_factor, pack(), hook).await?;
     set_data_shards(&cluster.nodes[0], data_shards).await;
@@ -200,10 +202,10 @@ pub(crate) async fn coded_object_on(n: usize, hook: Option<Hook>) -> Option<(Clu
     Some((cluster, body, blob_id))
 }
 
-/// Cold replicated blobs are coded, one shard per node, and read back as they
-/// were, through any node; the replicas' files go.
+/// Large replicated blobs are coded, one shard per node, and read back as
+/// they were, through any node; the replicas' files go.
 #[tokio::test]
-async fn cold_blobs_are_coded() {
+async fn replicated_blobs_are_converted() {
     let Some(cluster) = coding(4, 2, 3, None).await else { return };
     let a = &cluster.nodes[0];
     let body = data(1, 5 * MIB + 12345);
@@ -215,7 +217,7 @@ async fn cold_blobs_are_coded() {
 
     let reports = packer::pass(a).await.unwrap();
     assert_eq!(reports.len(), 1);
-    assert!(reports[0].to_string().starts_with("erasure-coded 1 blobs"), "{}", reports[0]);
+    assert!(reports[0].to_string().starts_with("converted 1 blobs"), "{}", reports[0]);
     let coded = blob_of(a, "k").await;
     assert_ne!(coded, replicated);
     let (layout, mut holders) = shards_of(&cluster, coded).await;
@@ -232,31 +234,57 @@ async fn cold_blobs_are_coded() {
     assert!(packer::pass(a).await.unwrap().is_empty());
 }
 
-/// Data is coded only once it's cold, and only while coding is on.
+/// An upload that declares its size is coded as it's written if it's
+/// large, while coding is on and there are nodes enough for the shards;
+/// otherwise it's replicated, and a large one is converted by the packer.
 #[tokio::test]
-async fn only_cold_data_is_coded() {
-    let config = Config {
-        cold_age: Duration::from_secs(3600),
-        ..pack()
-    };
-    let Some(cluster) = cluster_with(4, 2, config, None).await else { return };
+async fn uploads_of_known_size_are_coded_as_written() {
+    let Some(cluster) = cluster_with(4, 2, pack(), None).await else { return };
     let a = &cluster.nodes[0];
-    put(a, "k", data(2, 2 * MIB)).await;
-    let client = a.pool.get().await.unwrap();
-    client
-        .batch_execute(
-            "UPDATE blobs SET created_at = created_at - INTERVAL '2 hours';
-             UPDATE parts SET created_at = created_at - INTERVAL '2 hours';",
-        )
-        .await
-        .unwrap();
-    assert!(packer::pass(a).await.unwrap().is_empty(), "coding is off");
+    let large = data(2, 5 * MIB);
+    put_sized(a, "off", large.clone()).await;
+    assert_eq!(layout_of(&cluster, "off").await, (1, 1, 2), "coding is off");
     set_data_shards(a, 3).await;
-    put(a, "young", data(3, 2 * MIB)).await;
+    refresh(&cluster).await;
+    put_sized(a, "large", large.clone()).await;
+    put_sized(a, "small", data(3, 1000)).await;
+    put(a, "unsized", large.clone()).await;
+    assert_eq!(layout_of(&cluster, "large").await, (3, 1, 4));
+    assert_eq!(layout_of(&cluster, "small").await, (1, 1, 2));
+    assert_eq!(layout_of(&cluster, "unsized").await, (1, 1, 2));
+    assert_intact(&cluster, blob_of(a, "large").await).await;
+    assert_reads(&cluster.nodes[3], "large", &large).await;
+    // The packer converts what wasn't coded as it was written, whatever its
+    // age.
     let reports = packer::pass(a).await.unwrap();
-    assert_eq!(reports.len(), 1, "the old blob only");
-    assert_eq!(shards_of(&cluster, blob_of(a, "k").await).await.0.data_shards, 3);
-    assert_eq!(shards_of(&cluster, blob_of(a, "young").await).await.0.data_shards, 1);
+    assert_eq!(reports.len(), 1, "{:?}", reports.iter().map(ToString::to_string).collect::<Vec<_>>());
+    for key in ["off", "large", "unsized"] {
+        assert_eq!(layout_of(&cluster, key).await, (3, 1, 4), "{key}");
+        assert_eq!(get(a, key).await.unwrap(), large, "{key}");
+    }
+    // With a node down, there aren't nodes enough for the shards.
+    cluster.stop(3).await;
+    put_sized(a, "degraded", large.clone()).await;
+    assert_eq!(layout_of(&cluster, "degraded").await, (1, 1, 2));
+    assert_eq!(get(a, "degraded").await.unwrap(), large);
+}
+
+/// An encrypted upload is coded by the size of its ciphertext, which it's
+/// stored as.
+#[tokio::test]
+async fn encrypted_uploads_are_coded_by_their_stored_size() {
+    let Some(cluster) = coding(4, 2, 3, None).await else { return };
+    refresh(&cluster).await;
+    let a = &cluster.nodes[0];
+    let body = data(5, 2 * MIB + 7);
+    let customer = crate::e2e::customer_key(&[7; 32]);
+    crate::e2e::put_sealed_sized(a, "sealed", body.clone(), &customer).await;
+    let (layout, holders) = shards_of(&cluster, blob_of(a, "sealed").await).await;
+    assert_eq!((layout.data_shards, holders.len()), (3, 4));
+    assert_eq!(layout.size, crate::encryption::stored_len(body.len() as u64));
+    let (status, got) = crate::e2e::get_sealed(a, "sealed", None, Some(&customer)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(got == body);
 }
 
 /// Coding needs a node for every shard: with fewer live, data stays as it
@@ -358,10 +386,10 @@ async fn rows_that_cant_be_decoded_are_lost() {
     assert_reads(first, "k", &body).await;
 }
 
-/// Coded data that's compacted stays coded, and cold data that's consolidated
-/// is coded as it's packed.
+/// Coded data that's compacted stays coded, and data that's consolidated is
+/// coded as it's packed.
 #[tokio::test]
-async fn packing_keeps_cold_data_coded() {
+async fn packing_keeps_data_coded() {
     let Some(cluster) = coding(4, 2, 3, None).await else { return };
     let a = &cluster.nodes[0];
     let bodies: Vec<Vec<u8>> = (0..6).map(|i| data(10 + i, 3 * MIB / 2)).collect();
@@ -486,7 +514,7 @@ async fn a_shard_has_one_location() {
     let other = &cluster.nodes[1 - holders[0]];
     let write = crate::ShardWrite::Replica { blob_id, shard: 0 };
     let body = http_body_util::Full::new(hyper::body::Bytes::from(vec![1; 10]));
-    assert!(crate::write_blob_streaming(other, &write, None, body).await.is_err());
+    assert!(crate::write_blob_streaming(other, &write, crate::Placement::New, body).await.is_err());
     assert!(other.store.open_blob(blob_id).await.unwrap().is_none(), "its file is gone");
     let locations = format!("SELECT count(*) FROM blob_locations WHERE blob_id = '{blob_id}'");
     assert_eq!(query_i64(a, &locations).await, 1);
@@ -494,7 +522,7 @@ async fn a_shard_has_one_location() {
 
 /// The `parity-shards` setting overrides every node's `--replication-factor`
 /// once the nodes have read it, for uploads and coding alike; unset, the
-/// flag counts again. Blobs keep the layout they were written with.
+/// flag counts again.
 #[tokio::test]
 async fn parity_shards_overrides_the_flag() {
     let Some(cluster) = cluster_with(4, 1, pack(), None).await else { return };
@@ -507,13 +535,6 @@ async fn parity_shards_overrides_the_flag() {
     assert_eq!(layout_of(&cluster, "flag").await, (1, 0, 1));
     assert_eq!(layout_of(&cluster, "setting").await, (1, 2, 3));
     set_data_shards(a, 2).await;
-    client
-        .batch_execute(
-            "UPDATE blobs SET created_at = created_at - INTERVAL '8 days';
-             UPDATE parts SET created_at = created_at - INTERVAL '8 days';",
-        )
-        .await
-        .unwrap();
     packer::pass(a).await.unwrap();
     assert_eq!(layout_of(&cluster, "setting").await, (2, 2, 4), "coded with the setting's parity shards");
     crate::settings::PARITY_SHARDS.unset(&client).await.unwrap();
@@ -533,4 +554,31 @@ async fn refresh(cluster: &Cluster) {
 async fn layout_of(cluster: &Cluster, key: &str) -> (u32, u32, usize) {
     let (layout, holders) = shards_of(cluster, blob_of(&cluster.nodes[0], key).await).await;
     (layout.data_shards, layout.parity_shards, holders.len())
+}
+
+/// A change of the settings rewrites the coded blobs it concerns: in more
+/// parity shards, once `parity-shards` is set to more, and replicated once
+/// coding is turned off.
+#[tokio::test]
+async fn coded_blobs_follow_the_settings() {
+    let Some((cluster, body, blob_id)) = coded_object_on(5, None).await else { return };
+    let a = &cluster.nodes[0];
+    assert!(packer::pass(a).await.unwrap().is_empty(), "in the cluster's layout");
+    let client = a.pool.get().await.unwrap();
+    crate::settings::PARITY_SHARDS.set(&client, 2).await.unwrap();
+    refresh(&cluster).await;
+    let reports = packer::pass(a).await.unwrap();
+    assert_eq!(reports.len(), 1);
+    let wider = blob_of(a, "k").await;
+    assert_eq!(layout_of(&cluster, "k").await, (3, 2, 5));
+    assert_intact(&cluster, wider).await;
+    for app in &cluster.nodes {
+        assert_reads(app, "k", &body).await;
+        assert_reaped(app, blob_id).await;
+    }
+    set_data_shards(a, 1).await;
+    packer::pass(a).await.unwrap();
+    assert_eq!(layout_of(&cluster, "k").await, (1, 2, 3), "replicated");
+    assert_eq!(get(a, "k").await.unwrap(), body);
+    assert!(packer::pass(a).await.unwrap().is_empty());
 }

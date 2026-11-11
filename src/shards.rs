@@ -5,9 +5,12 @@
 //! any m. Replication is k = 1: the one data shard is the blob, and every
 //! parity shard is a copy of it (a code whose parity rows are all ones, which
 //! is as much an MDS code as any). So a replica is a shard, encoding is a copy,
-//! any shard serves any read, and rebuilding a shard is copying another. Blobs
-//! are written that way, and the packer rewrites data that has gone cold with
-//! k > 1, which stores it with less overhead (see `packer`).
+//! any shard serves any read, and rebuilding a shard is copying another.
+//! Blobs larger than `packer::SMALL_SIZE` are stored with k > 1, which stores
+//! them with less overhead, once the operator sets it (the `data-shards`
+//! setting): coded as they're written, if their size is known up front, else
+//! rewritten by the packer (see `packer`). Smaller blobs are replicated until
+//! they're packed into larger ones.
 //!
 //! With k > 1, the blob is cut into rows of k cells of [`STRIPE_UNIT`] bytes
 //! each, the stripe unit: row r is the blob's bytes [r·k·su, (r+1)·k·su), and

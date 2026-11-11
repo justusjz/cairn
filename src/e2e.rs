@@ -105,6 +105,7 @@ async fn node_on(
         node,
         replication_flag: replication_factor,
         parity_setting: std::sync::atomic::AtomicI64::new(-1),
+        data_setting: std::sync::atomic::AtomicI64::new(1),
         scrub_rate: 0,
         writing: WritingSet::default(),
         pack,
@@ -243,7 +244,20 @@ pub async fn kms_node() -> Option<Arc<App>> {
     Some(Arc::new(app))
 }
 
+/// Writes an object as PutObject does, with a body that doesn't declare its
+/// length (in chunked transfer encoding), so that its blob is replicated.
 pub async fn put(app: &Arc<App>, key: &str, data: Vec<u8>) {
+    put_with(app, key, data, Payload::unchecked()).await
+}
+
+/// Like `put`, with a body that declares its length, as most do: a large one
+/// is coded as it's written, while coding is on.
+pub async fn put_sized(app: &Arc<App>, key: &str, data: Vec<u8>) {
+    let payload = Payload::unchecked_of(data.len() as u64);
+    put_with(app, key, data, payload).await
+}
+
+async fn put_with(app: &Arc<App>, key: &str, data: Vec<u8>, payload: Payload) {
     let attach = AttachTarget::Object {
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
@@ -255,7 +269,7 @@ pub async fn put(app: &Arc<App>, key: &str, data: Vec<u8>) {
         tags: String::new(),
     };
     let body = Full::new(Bytes::from(data));
-    let result = crate::upload_part(app, body, &attach, Payload::unchecked())
+    let result = crate::upload_part(app, body, &attach, payload)
         .await
         .unwrap();
     assert!(matches!(result, UploadResult::Committed { .. }));
@@ -291,6 +305,22 @@ pub fn customer_key(key: &crate::encryption::Key) -> crate::s3::sse_c::CustomerK
 
 /// Writes `data` as `key`, encrypted with the SSE-C `customer` key. Its ETag.
 pub async fn put_sealed(app: &Arc<App>, key: &str, data: Vec<u8>, customer: &crate::s3::sse_c::CustomerKey) -> String {
+    put_sealed_with(app, key, data, customer, Payload::unchecked()).await
+}
+
+/// Like `put_sealed`, with a body that declares its length (see `put_sized`).
+pub async fn put_sealed_sized(app: &Arc<App>, key: &str, data: Vec<u8>, customer: &crate::s3::sse_c::CustomerKey) -> String {
+    let payload = Payload::unchecked_of(data.len() as u64);
+    put_sealed_with(app, key, data, customer, payload).await
+}
+
+async fn put_sealed_with(
+    app: &Arc<App>,
+    key: &str,
+    data: Vec<u8>,
+    customer: &crate::s3::sse_c::CustomerKey,
+    payload: Payload,
+) -> String {
     let attach = AttachTarget::Object {
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
@@ -304,7 +334,7 @@ pub async fn put_sealed(app: &Arc<App>, key: &str, data: Vec<u8>, customer: &cra
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: String::new(),
     };
-    let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
+    let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, payload)
         .await
         .unwrap();
     let UploadResult::Committed { etag, .. } = result else { panic!("not committed") };

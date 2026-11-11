@@ -251,8 +251,10 @@ fn damaged(app: &App, blob_id: Uuid, e: std::io::Error) -> Failed {
 
 /// Streams the body straight to disk (and announces the location), without
 /// buffering the whole blob in memory: our shard of the blob, `?shard=`,
-/// moved here from node `?replaces=` if given (see `write_blob_streaming`). Answers with the CRC of the file we
-/// stored, so the writer can check that we got exactly the bytes it sent.
+/// moved here from node `?replaces=`, or a further copy of a replicated blob
+/// of `?adds_to=` parity shards, if given (see `write_blob_streaming`).
+/// Answers with the CRC of the file we stored, so the writer can check that
+/// we got exactly the bytes it sent.
 async fn put_blob(
     State(app): State<Arc<App>>,
     Path(blob_id): Path<String>,
@@ -266,12 +268,15 @@ async fn put_blob(
     let Some(shard) = parse_shard(&query, blob_id) else {
         return Ok(StatusCode::BAD_REQUEST.into_response());
     };
-    let replaces = match param(&query, "replaces").map(|v| v.parse::<i32>()) {
-        None => None,
-        Some(Ok(node)) => Some(node),
-        Some(Err(_)) => return Ok(StatusCode::BAD_REQUEST.into_response()),
+    let replaces = param(&query, "replaces").map(|v| v.parse::<i32>());
+    let adds_to = param(&query, "adds_to").map(|v| v.parse::<u32>());
+    let placement = match (replaces, adds_to) {
+        (None, None) => crate::Placement::New,
+        (Some(Ok(from)), None) => crate::Placement::Move { from },
+        (None, Some(Ok(parity_shards))) => crate::Placement::Add { parity_shards },
+        _ => return Ok(StatusCode::BAD_REQUEST.into_response()),
     };
-    let crc = crate::write_blob_streaming(&app, &shard, replaces, body).await?;
+    let crc = crate::write_blob_streaming(&app, &shard, placement, body).await?;
     let crc = HeaderValue::from_str(&format!("{crc:016x}"))?;
     Ok(([(CRC64_HEADER, crc)], ()).into_response())
 }

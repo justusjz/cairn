@@ -35,8 +35,10 @@ Done:
 ## Next
 
 - **Erasure coding.** Every blob is k data and m parity shards, and
-  replication is k = 1; the packer codes cold data with k > 1, which takes
-  less space for the same tolerance of lost nodes. Implemented.
+  replication is k = 1; blobs over 64 MiB are coded with k > 1, which takes
+  less space for the same tolerance of lost nodes, as they're written if
+  their size is known, else by the packer. Existing blobs follow changes of
+  the settings. Implemented.
 - **Replica repair and removing nodes.** `cairn node remove` moves a node's
   shards to the others, copied from it while it's up, else rebuilt from the
   other shards; the `repair-after` setting rebuilds a node's shards once it

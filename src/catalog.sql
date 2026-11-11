@@ -120,8 +120,9 @@
 --       parts in a later statement (`cairn_drop_unreferenced_blobs`).
 --     - Committing: lock exclusively, then check it's pending and count its
 --       locations. Locations are only removed together with their blob, or
---       by a move (`cairn_move_shard`), which holds X(x) exclusive, and
---       checks the blob is committed after taking it.
+--       by a move (`cairn_move_shard`) or a dropped copy
+--       (`cairn_drop_copy`), which hold X(x) exclusive, and check the blob
+--       is committed after taking it.
 --     - Deleting a pending blob (GC, and `blobs::abandon` for failed uploads
 --       and packing jobs): the GC locks the stale ones with SKIP LOCKED,
 --       re-checking that they're pending (F2), and so never touches one being
@@ -140,9 +141,11 @@
 -- I8. `dead_size` and the packer's leases (which the mover takes too) are
 --     heuristics: nothing depends on them for correctness.
 -- I9. A blob has at most one location per shard, and a node at most one
---     shard of a blob: the unique indexes on blob_locations. A move checks
---     both under X(x) exclusive, before it swaps the location; the only
---     other inserts are a pending blob's sinks, each with a shard of its own.
+--     shard of a blob: the unique indexes on blob_locations. A move, and an
+--     added or dropped copy, check both under X(x) exclusive, before they
+--     change the locations; the only other inserts are a pending blob's
+--     sinks, each with a shard of its own. A committed blob has a location
+--     for each of its shards: they change together, under X(x) exclusive.
 --
 -- DEADLOCKS
 --
@@ -1506,8 +1509,8 @@ $$;
 -- T14: claims the source blobs for a packing job, if there's one worth
 -- running (see `packer::claim`): `p_kind` is 'compact', 'consolidate',
 -- 'upgrade' (a blob from before checksums, one at a time) or 'convert'
--- (replicated blobs of more than `p_small_size` live bytes, older than
--- `p_cold_secs`, to be coded).
+-- (blobs of more than `p_small_size` live bytes not in `p_data_shards` data
+-- shards and, if it isn't NULL, `p_parity_shards` parity shards).
 -- Takes candidates, skipping those another transaction has locked (it never
 -- waits), until their live bytes would exceed `p_budget`, and leases them.
 -- Returns them, or an empty array if the job isn't worth it. The lease is a
@@ -1527,12 +1530,14 @@ $$;
 -- just fails its job.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_claim(
     p_kind text, p_compact_threshold float8, p_max_sources bigint, p_small_size bigint,
-    p_target_size bigint, p_budget bigint, p_lease_secs float8, p_cold_secs float8
+    p_target_size bigint, p_budget bigint, p_lease_secs float8, p_data_shards smallint,
+    p_parity_shards smallint
 ) RETURNS uuid[] LANGUAGE plpgsql AS $$
 DECLARE
     v_sources uuid[] := '{}';
     v_total bigint := 0;
     v_count bigint;
+    v_dir int;
     r record;
 BEGIN
     IF p_kind = 'compact' AND p_compact_threshold >= 0.25 THEN
@@ -1577,49 +1582,45 @@ BEGIN
         IF cardinality(v_sources) = 0 THEN
             RETURN '{}';
         END IF;
-    ELSIF p_kind = 'convert' AND p_small_size >= 67108864 THEN
-        -- The oldest first, off `blobs_replicated`, whose size bound
-        -- (`packer::SMALL_SIZE`, which a test checks against this) is repeated
-        -- as a literal, so that the planner can use the partial index. Those
-        -- mostly garbage are compaction's: it codes what it keeps.
-        FOR r IN
-            SELECT blob_id, size - dead_size AS live FROM blobs
-            WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
-              AND size > 67108864
-              AND size - dead_size > p_small_size AND dead_size < size * p_compact_threshold
-              AND created_at < NOW() - make_interval(secs => p_cold_secs)
-              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
-              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
-                              WHERE l.blob_id = blobs.blob_id
-                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
-            ORDER BY created_at
-            LIMIT p_max_sources FOR UPDATE SKIP LOCKED
-        LOOP
-            EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
-            v_total := v_total + r.live;
-            v_sources := v_sources || r.blob_id;
-        END LOOP;
-        IF cardinality(v_sources) = 0 THEN
-            RETURN '{}';
-        END IF;
     ELSIF p_kind = 'convert' THEN
-        -- A smaller `p_small_size` than the index's (tests): the same,
-        -- without it.
-        FOR r IN
-            SELECT blob_id, size - dead_size AS live FROM blobs
-            WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
-              AND size - dead_size > p_small_size AND dead_size < size * p_compact_threshold
-              AND created_at < NOW() - make_interval(secs => p_cold_secs)
-              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
-              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
-                              WHERE l.blob_id = blobs.blob_id
-                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
-            ORDER BY created_at
-            LIMIT p_max_sources FOR UPDATE SKIP LOCKED
-        LOOP
-            EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
-            v_total := v_total + r.live;
-            v_sources := v_sources || r.blob_id;
+        -- Blobs whose (data shards, parity shards) is below the layout, then
+        -- those above it, each a range of `blobs_large` (`blobs_layout` in
+        -- `db.rs`), read in its order, so that a claim reads only as far as
+        -- it takes, however many blobs there are to convert. Without parity
+        -- shards to go by, or with one data shard (whose blobs' copies are
+        -- the mover's, see `cairn_claim_copies`), only the data shards
+        -- count: the bounds are past any parity shards. Its size bound
+        -- (`packer::SMALL_SIZE`, which a test checks against this) is in the
+        -- query as a literal, so that the planner can use the partial index,
+        -- unless `p_small_size` is a smaller one (tests): then it goes
+        -- without. Those mostly garbage are compaction's: it converts what it
+        -- keeps.
+        FOR v_dir IN 1..2 LOOP
+            FOR r IN EXECUTE format(
+                'SELECT blob_id, size - dead_size AS live FROM blobs
+                 WHERE state = ''committed'' AND block_size IS NOT NULL %s
+                   AND (data_shards, parity_shards) %s ($1, $2)
+                   AND size - dead_size > $3 AND dead_size < size * $4
+                   AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+                   AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                                   WHERE l.blob_id = blobs.blob_id
+                                     AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
+                 ORDER BY data_shards %s, parity_shards %s
+                 LIMIT $5 FOR UPDATE SKIP LOCKED',
+                CASE WHEN p_small_size >= 67108864 THEN 'AND size > 67108864' ELSE '' END,
+                CASE v_dir WHEN 1 THEN '<' ELSE '>' END,
+                CASE v_dir WHEN 1 THEN 'DESC' ELSE 'ASC' END,
+                CASE v_dir WHEN 1 THEN 'DESC' ELSE 'ASC' END)
+            USING p_data_shards,
+                  CASE WHEN p_parity_shards IS NULL OR p_data_shards = 1 THEN
+                      CASE v_dir WHEN 1 THEN 0 ELSE 32767 END
+                  ELSE p_parity_shards END,
+                  p_small_size, p_compact_threshold, p_max_sources
+            LOOP
+                EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
+                v_total := v_total + r.live;
+                v_sources := v_sources || r.blob_id;
+            END LOOP;
         END LOOP;
         IF cardinality(v_sources) = 0 THEN
             RETURN '{}';
@@ -1838,6 +1839,127 @@ BEGIN
     UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => p_lease_secs)
     WHERE blob_id = ANY(v_claimed);
     RETURN v_claimed;
+END
+$$;
+
+-- T24: claims up to `p_limit` replicated blobs whose copies don't number
+-- `p_parity_shards` + 1 (see `mover`), skipping those another transaction
+-- has locked (it never waits) or a job has leased, and those larger than
+-- `p_coded_above`, if it isn't NULL, which the packer converts (see
+-- `cairn_claim`). Those with too few copies first, the fewest first, off
+-- `blobs_copies`, read in its order, so that a claim reads only as far as it
+-- takes. Leases them, as the packer's claim does (I8).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_claim_copies(
+    p_parity_shards smallint, p_coded_above bigint, p_limit int, p_lease_secs float8
+) RETURNS uuid[] LANGUAGE plpgsql AS $$
+DECLARE
+    v_claimed uuid[] := '{}';
+    r record;
+BEGIN
+    FOR r IN
+        SELECT blob_id FROM blobs
+        WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
+          AND parity_shards < p_parity_shards
+          AND (p_coded_above IS NULL OR size <= p_coded_above)
+          AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+        ORDER BY parity_shards
+        LIMIT p_limit
+        FOR UPDATE SKIP LOCKED
+    LOOP
+        v_claimed := v_claimed || r.blob_id;
+    END LOOP;
+    FOR r IN
+        SELECT blob_id FROM blobs
+        WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
+          AND parity_shards > p_parity_shards
+          AND (p_coded_above IS NULL OR size <= p_coded_above)
+          AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+        ORDER BY parity_shards DESC
+        LIMIT p_limit - cardinality(v_claimed)
+        FOR UPDATE SKIP LOCKED
+    LOOP
+        v_claimed := v_claimed || r.blob_id;
+    END LOOP;
+    UPDATE blobs SET pack_lease_until = NOW() + make_interval(secs => p_lease_secs)
+    WHERE blob_id = ANY(v_claimed);
+    RETURN v_claimed;
+END
+$$;
+
+-- T25: adds node `p_node`'s copy of a replicated blob, as shard `p_shard`,
+-- which it has stored (see `mover`). Takes X(x) exclusive, then checks that
+-- the blob is committed, replicated, and still has `p_parity_shards` parity
+-- shards, of which the new copy is the next ('changed' otherwise: deleted,
+-- or another job got there first), that the file is the blob's (its
+-- CRC64/NVME is every copy's, 'mismatch' otherwise), and that `p_node` holds
+-- no copy yet ('occupied'). Then adds the location and the parity shard
+-- ('added'). Every location is added under X(x) exclusive, or by a pending
+-- blob's sinks (I9).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_add_copy(
+    p_blob uuid, p_shard smallint, p_node int, p_crc bigint, p_parity_shards smallint
+) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM pg_temp.cairn_lock_blobs(ARRAY[p_blob], ARRAY[true]);
+    PERFORM 1 FROM blobs
+    WHERE blob_id = p_blob AND state = 'committed' AND data_shards = 1
+      AND parity_shards = p_parity_shards AND p_shard = 1 + p_parity_shards;
+    IF NOT FOUND THEN
+        RETURN 'changed';
+    END IF;
+    PERFORM 1 FROM blobs WHERE blob_id = p_blob AND shard_crcs[1] = p_crc;
+    IF NOT FOUND THEN
+        RETURN 'mismatch';
+    END IF;
+    PERFORM 1 FROM blob_locations WHERE blob_id = p_blob AND node = p_node;
+    IF FOUND THEN
+        RETURN 'occupied';
+    END IF;
+    -- Checksummed on its way to the disk, and checked against the catalog:
+    -- the copy is known intact as of now.
+    INSERT INTO blob_locations (blob_id, node, shard, checked_at)
+    VALUES (p_blob, p_node, p_shard, NOW());
+    UPDATE blobs SET parity_shards = parity_shards + 1, shard_crcs = shard_crcs || p_crc
+    WHERE blob_id = p_blob;
+    RETURN 'added';
+END
+$$;
+
+-- T26: drops node `p_node`'s copy of a replicated blob (see `mover`). Takes
+-- X(x) exclusive, then checks that the blob is committed, replicated, and
+-- still has `p_parity_shards` parity shards, at least one ('changed'
+-- otherwise), and that `p_node` holds a copy ('gone' otherwise). Then
+-- removes its location and a parity shard: the last copy takes the dropped
+-- one's shard number, which it may, since copies are alike (their files
+-- hold no shard index, see `blob_file`). Resolves the copy's open scrub
+-- findings, and returns the node's peer URL, to reap its file ('dropped').
+CREATE OR REPLACE FUNCTION pg_temp.cairn_drop_copy(
+    p_blob uuid, p_node int, p_parity_shards smallint,
+    OUT status text, OUT reap_peer text
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_shard smallint;
+BEGIN
+    PERFORM pg_temp.cairn_lock_blobs(ARRAY[p_blob], ARRAY[true]);
+    PERFORM 1 FROM blobs
+    WHERE blob_id = p_blob AND state = 'committed' AND data_shards = 1
+      AND parity_shards = p_parity_shards AND p_parity_shards > 0;
+    IF NOT FOUND THEN
+        status := 'changed';
+        RETURN;
+    END IF;
+    SELECT shard INTO v_shard FROM blob_locations WHERE blob_id = p_blob AND node = p_node;
+    IF NOT FOUND THEN
+        status := 'gone';
+        RETURN;
+    END IF;
+    SELECT peer_url INTO reap_peer FROM nodes WHERE id = p_node;
+    DELETE FROM blob_locations WHERE blob_id = p_blob AND node = p_node;
+    UPDATE blob_locations SET shard = v_shard WHERE blob_id = p_blob AND shard = p_parity_shards;
+    UPDATE blobs SET parity_shards = parity_shards - 1, shard_crcs = shard_crcs[1:p_parity_shards]
+    WHERE blob_id = p_blob;
+    UPDATE scrub_findings SET outcome = 'gone', resolved_at = NOW()
+    WHERE blob_id = p_blob AND node = p_node AND resolved_at IS NULL;
+    status := 'dropped';
 END
 $$;
 

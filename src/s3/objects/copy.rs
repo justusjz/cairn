@@ -469,7 +469,7 @@ async fn stream_object_copy(
     };
     // The source stream is data from within Cairn (verified as it's read), so
     // there's nothing to check it against.
-    match crate::upload_part(app, body, &attach, Payload::unchecked()).await? {
+    match crate::upload_part(app, body, &attach, Payload::unchecked_of(size)).await? {
         UploadResult::Committed { etag, checksum, version_id, last_modified, .. } => Ok(Some((
             etag,
             checksum,
@@ -916,7 +916,7 @@ async fn stream_part_copy(
     };
     // The source stream is data from within Cairn (verified against its block
     // checksums as it's read), so there's nothing to check it against.
-    match crate::upload_part(app, source_body, &attach, Payload::unchecked()).await? {
+    match crate::upload_part(app, source_body, &attach, Payload::unchecked_of(end - start)).await? {
         UploadResult::Committed { etag, checksum, .. } => Ok(Some((etag, checksum))),
         UploadResult::NoSuchUpload => Ok(None),
         // Nothing is checked, there are no conditions, and a part has no bucket

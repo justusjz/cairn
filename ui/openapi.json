@@ -1081,6 +1081,9 @@
           "compact_garbage_bytes",
           "convert",
           "convert_bytes",
+          "copies",
+          "copies_to_add",
+          "copies_to_drop",
           "moves",
           "repair_after",
           "garbage_log",
@@ -1109,9 +1112,22 @@
           "convert": {
             "type": "integer",
             "format": "int64",
-            "description": "Replicated blobs old and large enough to be erasure-coded, once\ncoding is on (see `packer::coding`)."
+            "description": "Blobs large enough to be coded that aren't in the cluster's layout,\nwhich the packer converts (see `packer::Layouts`)."
           },
           "convert_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "copies": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Replicated blobs with more or fewer copies than the `parity-shards`\nsetting says (none while it isn't set), and how many copies the\nmover is to add and to drop (see `mover`)."
+          },
+          "copies_to_add": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "copies_to_drop": {
             "type": "integer",
             "format": "int64"
           },
@@ -2739,18 +2755,12 @@
           "parity_shards",
           "max_data_shards",
           "max_parity_shards",
-          "cold_age_secs",
           "coding"
         ],
         "properties": {
           "coding": {
             "type": "boolean",
-            "description": "Whether it's coded now: also takes as many live nodes as shards."
-          },
-          "cold_age_secs": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
+            "description": "Whether blobs are brought to that layout now: it takes as many live\nnodes as shards."
           },
           "compact_threshold": {
             "type": "number",
@@ -2759,7 +2769,7 @@
           "data_shards": {
             "type": "integer",
             "format": "int64",
-            "description": "What cold data is erasure-coded into (the `data-shards` setting, and\nthe parity shards that `--replication-factor` gives), and how old it\nmust be. One data shard: it isn't."
+            "description": "What blobs larger than `small_size` are erasure-coded into (the\n`data-shards` setting, and the parity shards). One data shard: they\naren't."
           },
           "max_data_shards": {
             "type": "integer",

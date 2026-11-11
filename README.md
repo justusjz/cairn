@@ -183,11 +183,13 @@ cairn config --database "$DB" set parity-shards 2     # 3 copies of every new bl
 cairn config --database "$DB" unset parity-shards     # back to each node's flag
 ```
 
-A change applies to blobs written from then on; existing blobs keep their
-copies.
+A change applies to blobs written from then on, and existing blobs are
+brought to it in the background: the mover adds or drops copies, and the
+packer rewrites erasure-coded blobs. While the setting isn't set, existing
+blobs keep their copies, since nodes may go by different flags.
 
-Data that has gone cold can be stored with less overhead than full copies,
-with the same tolerance for lost nodes: see [Erasure coding](#erasure-coding).
+Large blobs can be stored with less overhead than full copies, with the same
+tolerance for lost nodes: see [Erasure coding](#erasure-coding).
 
 ### Removing nodes, and repair
 
@@ -913,34 +915,39 @@ The nodes coordinate through the database, so each blob is packed only once.
 
 Every blob is stored as *k* data shards and *m* parity shards, each on a node
 of its own, any *k* of which hold all of its data. Replication is *k* = 1: the
-one data shard is the blob, and each parity shard is a copy of it. Uploads are
-always replicated, with *m* the `parity-shards` setting (or, while it isn't
-set, each node's `--replication-factor` − 1). Once data has gone
-cold, the packer can rewrite it with *k* > 1, which survives losing as many
-nodes, *m*, but stores *(k + m) / k* times the data rather than *m + 1* times:
-with replication factor 3, coding 4+2 stores 1.5× instead of 3×.
+one data shard is the blob, and each parity shard is a copy of it. *m* is the
+`parity-shards` setting (or, while it isn't set, each node's
+`--replication-factor` − 1). Blobs over 64 MiB can be stored with *k* > 1,
+which survives losing as many nodes, *m*, but stores *(k + m) / k* times the
+data rather than *m + 1* times: with replication factor 3, coding 4+2 stores
+1.5× instead of 3×. Smaller blobs are replicated until the packer packs them
+into larger ones.
 
 Coding is off until you choose *k*, for the whole cluster, next to *m*:
 
 ```sh
 cairn config --database "$DB" set parity-shards 2
-cairn config --database "$DB" set data-shards 4      # cold data is coded 4+2
+cairn config --database "$DB" set data-shards 4      # blobs over 64 MiB are coded 4+2
 ```
 
 Cairn never picks *k* itself: only you know how many nodes the cluster will
-keep. It needs *k + m* live nodes, one per shard; while fewer are live, data
-stays as it is. A change applies to data coded from then on.
+keep. It needs *k + m* live nodes, one per shard; while fewer are live, new
+blobs are replicated, and existing ones stay as they are.
 
-The packer codes replicated blobs over 64 MiB (packed blobs, and large
-uploads) once they're a week old, so that data that's deleted within days is
-never coded, one job of up to 1 GiB per node a minute. Packing and compacting
-cold data writes it coded directly, so coded data stays coded. Each shard holds
+An upload over 64 MiB that declares its size up front (as almost every client
+does) is coded as it's written. The packer converts the other blobs over
+64 MiB, whatever their age: uploads whose size wasn't known, those written
+while too few nodes were live, and every blob in another layout after a
+change of `data-shards` or `parity-shards` (coded blobs are rewritten in the
+new layout, or replicated once coding is turned off), one job of up to 1 GiB
+per node a minute. Packing and compacting write blobs over 64 MiB coded
+directly, so coded data stays coded. Each shard holds
 the blob in cells of 1 MiB, so a read of a small object in a coded blob mostly
 reads a single shard, without decoding. A read that can't get a cell from its
 data shard (a node is down, or a block is damaged) decodes it from the other
 shards' cells of its row, and verifies the result against its checksums. The
 dashboard's Storage page shows each layout's health, and the Jobs page how
-much is waiting to be coded.
+much is waiting to be converted, and how many copies to be added or dropped.
 
 ## Garbage collection
 

@@ -2,7 +2,7 @@ import { A } from "@solidjs/router";
 import { For, Show, createMemo, createSignal } from "solid-js";
 import { type Cluster, type Event, type Lifecycle, type LifecycleBucket, type Storage, api, statsError, statsOf } from "../api";
 import { Badge, Card, LiveDot, Loading, Panel, Table, act, poll } from "../components/ui";
-import { ago, bytes, date, duration, hex, now, num, pct } from "../format";
+import { ago, bytes, date, duration, hex, now, num, pct, plural } from "../format";
 
 export default function Jobs() {
   const cluster = poll(api.cluster, 5000);
@@ -52,14 +52,23 @@ function View(props: { cluster: Cluster; storage: Storage }) {
           note={`${bytes(bl().compact_garbage_bytes)} of garbage in blobs ≥ ${pct(pk().compact_threshold, 1)} garbage`}
         />
         <Card
-          label="To code"
+          label="To convert"
           value={num(bl().convert)}
           note={
-            pk().data_shards > 1 && pk().parity_shards > 0
-              ? `${bytes(bl().convert_bytes)} in replicated blobs > ${bytes(pk().small_size)}, ${duration(pk().cold_age_secs)} old; erasure-coded ${pk().data_shards}+${pk().parity_shards}${pk().coding ? ", one job per node and pass" : ", once as many nodes are live"}`
-              : "erasure coding is off: set data-shards with cairn config"
+            `${bytes(bl().convert_bytes)} in blobs > ${bytes(pk().small_size)} not ` +
+            (pk().data_shards > 1 ? `coded ${pk().data_shards}+${pk().parity_shards}` : "replicated") +
+            (pk().coding ? ", one job per node and pass" : ", once as many nodes are live")
           }
-          tone={pk().data_shards > 1 && !pk().coding ? "warn" : ""}
+          tone={bl().convert && !pk().coding ? "warn" : ""}
+        />
+        <Card
+          label="Copies"
+          value={num(bl().copies)}
+          note={
+            pk().parity_setting == null
+              ? "copies of existing blobs follow the parity-shards setting, once it's set"
+              : `replicated blobs without ${plural(pk().parity_shards + 1, "copy", "copies")}: ${num(bl().copies_to_add)} to add, ${num(bl().copies_to_drop)} to drop`
+          }
         />
         <Card
           label="To move"

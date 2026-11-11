@@ -293,10 +293,16 @@ struct Backlog {
     /// Blobs with enough garbage to be compacted.
     compact: i64,
     compact_garbage_bytes: i64,
-    /// Replicated blobs old and large enough to be erasure-coded, once
-    /// coding is on (see `packer::coding`).
+    /// Blobs large enough to be coded that aren't in the cluster's layout,
+    /// which the packer converts (see `packer::Layouts`).
     convert: i64,
     convert_bytes: i64,
+    /// Replicated blobs with more or fewer copies than the `parity-shards`
+    /// setting says (none while it isn't set), and how many copies the
+    /// mover is to add and to drop (see `mover`).
+    copies: i64,
+    copies_to_add: i64,
+    copies_to_drop: i64,
     /// Shards to move off nodes being removed, or down for longer than the
     /// `repair-after` setting (see `mover`); and that setting, in minutes (0:
     /// off).
@@ -316,9 +322,9 @@ struct PackerSettings {
     small_size: u64,
     compact_threshold: f64,
     max_sources: i64,
-    /// What cold data is erasure-coded into (the `data-shards` setting, and
-    /// the parity shards that `--replication-factor` gives), and how old it
-    /// must be. One data shard: it isn't.
+    /// What blobs larger than `small_size` are erasure-coded into (the
+    /// `data-shards` setting, and the parity shards). One data shard: they
+    /// aren't.
     data_shards: i64,
     parity_shards: u32,
     /// The `parity-shards` setting, if it's set; else every node goes by its
@@ -327,8 +333,8 @@ struct PackerSettings {
     /// The most data and parity shards the settings allow.
     max_data_shards: i64,
     max_parity_shards: i64,
-    cold_age_secs: u64,
-    /// Whether it's coded now: also takes as many live nodes as shards.
+    /// Whether blobs are brought to that layout now: it takes as many live
+    /// nodes as shards.
     coding: bool,
 }
 
@@ -363,6 +369,18 @@ const SHARD_BYTES: &str = "CASE
                  greatest(0, b.size % (b.data_shards::bigint * b.stripe_unit)
                              - bl.shard::bigint * b.stripe_unit))
 END";
+
+/// Of a committed blob of `blobs`, whether the packer is to convert it into
+/// $3 data shards and, unless it's NULL, $4 parity shards (see
+/// `cairn_claim`), if it's large enough.
+const CONVERT: &str = "(data_shards <> $3 OR ($3 > 1 AND $4::smallint IS NOT NULL AND parity_shards <> $4))";
+
+/// Of a blob of `blobs`, whether the mover is to add or drop copies of it,
+/// to $4 parity shards, unless that's NULL: unless the packer is to code it,
+/// as it is any larger than $1 while there are $3 > 1 data shards (see
+/// `cairn_claim_copies`).
+const COPIES: &str = "state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
+    AND $4::smallint IS NOT NULL AND parity_shards <> $4 AND NOT ($3 > 1 AND size > $1)";
 
 pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
     let client = app.pool.get().await?;
@@ -413,10 +431,14 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
         .collect();
     let small_size = app.pack.small_size as i64;
     let threshold = app.pack.compact_threshold;
-    let cold_secs = app.pack.cold_age.as_secs_f64();
+    // The layout blobs are to have: as the packer's and mover's claims see
+    // it (see `cairn_claim`, `cairn_claim_copies`).
+    let wanted = crate::packer::wanted_layouts(app).await?;
+    let data_shards = wanted.data_shards as i16;
+    let parity_shards = wanted.parity_settled.then_some(wanted.parity_shards as i16);
     let b = client
         .query_one_cached(
-            "SELECT count(*) FILTER (WHERE state = 'committed'),
+            &format!("SELECT count(*) FILTER (WHERE state = 'committed'),
                     coalesce(sum(size) FILTER (WHERE state = 'committed'), 0)::bigint,
                     coalesce(sum(dead_size), 0)::bigint,
                     count(*) FILTER (WHERE state = 'pending'),
@@ -432,14 +454,15 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
                                      AND dead_size >= size * $2::float8),
                     coalesce(sum(dead_size) FILTER (WHERE state = 'committed' AND dead_size > 0
                                      AND dead_size >= size * $2::float8), 0)::bigint,
-                    count(*) FILTER (WHERE state = 'committed' AND data_shards = 1
-                                     AND block_size IS NOT NULL AND size - dead_size > $1
-                                     AND created_at < NOW() - make_interval(secs => $3)),
-                    coalesce(sum(size) FILTER (WHERE state = 'committed' AND data_shards = 1
-                                     AND block_size IS NOT NULL AND size - dead_size > $1
-                                     AND created_at < NOW() - make_interval(secs => $3)), 0)::bigint
-             FROM blobs",
-            &[&small_size, &threshold, &cold_secs],
+                    count(*) FILTER (WHERE state = 'committed' AND block_size IS NOT NULL
+                                     AND size - dead_size > $1 AND {CONVERT}),
+                    coalesce(sum(size) FILTER (WHERE state = 'committed' AND block_size IS NOT NULL
+                                     AND size - dead_size > $1 AND {CONVERT}), 0)::bigint,
+                    count(*) FILTER (WHERE {COPIES}),
+                    coalesce(sum(greatest($4 - parity_shards, 0)) FILTER (WHERE {COPIES}), 0)::bigint,
+                    coalesce(sum(greatest(parity_shards - $4, 0)) FILTER (WHERE {COPIES}), 0)::bigint
+             FROM blobs"),
+            &[&small_size, &threshold, &data_shards, &parity_shards],
         )
         .await?;
     let o = client
@@ -535,6 +558,9 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             compact_garbage_bytes: b.get(10),
             convert: b.get(11),
             convert_bytes: b.get(12),
+            copies: b.get(13),
+            copies_to_add: b.get(14),
+            copies_to_drop: b.get(15),
             moves,
             repair_after,
             garbage_log: m.get(3),
@@ -547,13 +573,12 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             small_size: app.pack.small_size,
             compact_threshold: app.pack.compact_threshold,
             max_sources: app.pack.max_sources,
-            data_shards: crate::settings::DATA_SHARDS.get(&client).await?,
+            data_shards: wanted.data_shards as i64,
             parity_shards: app.parity_shards(),
             parity_setting: crate::settings::PARITY_SHARDS.get_set(&client).await?,
             max_data_shards: crate::settings::DATA_SHARDS.max,
             max_parity_shards: crate::settings::PARITY_SHARDS.max,
-            cold_age_secs: app.pack.cold_age.as_secs(),
-            coding: crate::packer::coding(app).await?.is_some(),
+            coding: crate::packer::layouts(app).await?.is_some(),
         },
         integrity: Coverage {
             nodes: coverage,
