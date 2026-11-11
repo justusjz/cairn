@@ -107,6 +107,7 @@ command line wins. `cairn role` reads `CAIRN_DATABASE` as well.
 | `--kms-auth-role <NAME>` | `CAIRN_KMS_AUTH_ROLE` | `s3` | The role of that auth method Cairn's logins use. |
 | `--kms-sse-s3-key <ID>` | `CAIRN_KMS_SSE_S3_KEY` | none | The key for [SSE-S3](#sse-s3) (`<mount>/<key>`), which Cairn uses as itself. Without it, SSE-S3 is refused. |
 | `--kms-ca-cert <PATH>` | `CAIRN_KMS_CA_CERT` | public roots | PEM file of the CA certificates to trust for the KMS's TLS. |
+| `--scrub-rate <RATE>` | `CAIRN_SCRUB_RATE` | `25MiB` | How many bytes per second the [scrubber](#scrubbing) reads, e.g. `100MB`. `0` turns it off. |
 
 On SIGTERM or Ctrl-C, a node stops accepting connections and finishes the
 requests in flight before it exits; a second signal exits right away. Anything
@@ -255,6 +256,13 @@ cluster:
   rates, errors, throughput and latency over the last hour, by S3 operation.
 - **Storage:** how much data there is, how much of it has fewer live copies
   than the replication factor, and what each node holds.
+- **Integrity:** what the [scrubbers](#scrubbing) checked and found: per
+  node, how long a full check takes at its rate and how recently its data was
+  checked; damaged and missing copies, and whether they were repaired; and
+  the objects with data that's intact on no replica. The navigation shows how
+  many of those there are (in red), or else how many findings are still
+  open. The bucket explorer marks objects with lost data, and an object's
+  details name the bytes that are lost.
 - **Jobs:** how the background passes (garbage collection and packing) are
   doing on each node, what they still have to do, and what they did recently;
   and the [lifecycle](#lifecycle-rules) sweeps: each bucket's, how long a
@@ -670,7 +678,8 @@ same block on another replica, so the client only ever gets intact data. If no
 replica has an intact copy of a block, the response is cut off there (its
 `Content-Length` tells the client it's incomplete), and the node logs a
 `CORRUPTION:` line naming the blob and node. Data written by earlier versions
-of Cairn has no checksums and is read unverified.
+of Cairn has no checksums and is read unverified, until the packer
+[rewrites it with checksums](#scrubbing).
 
 Every request body is checked against everything the request claims about it,
 as S3 checks it: the SHA-256 it's signed with (`x-amz-content-sha256`), the
@@ -691,6 +700,54 @@ Listings, ListParts, CompleteMultipartUpload and copies report checksums too.
 The checksums of encrypted objects are stored encrypted, as their data is, so
 they can't be used to test guesses at the content. Objects written by earlier
 versions of Cairn have no checksum, but a copy of one gets one.
+
+### Scrubbing
+
+Every node checks the data it holds in the background, so that damage is
+found before a client runs into it, even in data nobody reads. It reads each
+copy from its own disk (not the page cache), and checks it as a whole: every
+block against its checksum, the file's length and blob ID, and a CRC of the
+whole file that the database keeps. It reads at a fixed rate,
+`--scrub-rate` (25 MiB/s by default), copies that have gone unchecked longest
+first, and checks a copy at most once a week. So a node checks all it holds
+every *held bytes ÷ rate*: at 25 MiB/s, which is about 2 TiB a day, that's
+every 2 days for 4 TiB, and every 8 days for 16 TiB. Set the rate to what the
+disks can spare next to the clients' reads: 25 MiB/s is about a seventh of a
+hard disk, and little for an SSD.
+
+A read that runs into a damaged or missing copy has that copy checked next.
+
+A damaged or missing copy is repaired: rebuilt from its own intact blocks and
+the other replicas' (so a bad block costs one block of network traffic), and
+checked against the database's CRC before it replaces the old file. Copies
+damaged in different places repair each other. Bytes that no replica holds
+intact are *lost*: the copies are left as they are, and the lost byte ranges
+are recorded (`lost_ranges`). If a replica's node was down, the scrubber tries
+again within the hour; once any copy turns out to hold the bytes after all
+(that node came back, or a file was restored from a backup), the lost ranges
+are cleared, and the other copies are repaired from it.
+
+Once bytes are known to be lost, a GET whose range overlaps them fails with
+`500 InternalError` before sending anything (rather than being cut off where
+the damage is), and so does a copy of them (CopyObject, UploadPartCopy), so
+that the damage doesn't spread to new objects unnoticed. A range that misses
+them reads as usual, and HEAD works. Damage the scrubber hasn't found yet still
+cuts a read off. The packer leaves a blob alone while a part of it is on lost
+data; once those objects are deleted, it's compacted as usual.
+
+What the scrubber finds is logged as a `CORRUPTION:` line, recorded in the
+database (`scrub_findings`), and shown on the dashboard's
+[Integrity](#dashboard) page.
+
+Data written by versions of Cairn without checksums can't be checked as it
+is. The packer rewrites it with checksums, the oldest first, reading at the
+scrub rate (and not at all if scrubbing is off), and verifying each object's
+bytes against its MD5 (its ETag). A replica whose copy doesn't match is passed
+over for the next; if none matches, the data is recorded as lost. The
+Integrity page shows how much is still left.
+
+`POST /scrub` on a node's peer endpoint checks what's due right away, at
+full speed (`?all`: every copy), and reports what it found.
 
 ## Packing
 

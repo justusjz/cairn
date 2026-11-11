@@ -27,6 +27,10 @@ Done:
 - **Metadata-only copies.** CopyObject and UploadPartCopy point the new object
   at the existing data instead of copying it. (A part copied from a range that
   spans several parts of its source is still copied as data.)
+- **Scrubbing.** Every node checks its data against its checksums in the
+  background, at a set rate, and repairs damaged copies from the intact
+  blocks of others; data intact on no replica is reported, and reads of it
+  fail up front. Data from before checksums is rewritten with them.
 
 ## Next
 
@@ -41,8 +45,6 @@ Done:
   that data doesn't move twice.
 - **Removing a node.** Moving a node's data off before it's taken away, so
   that redundancy never drops.
-- **Scrubbing.** Checking stored data against its checksums in the
-  background, and repairing damaged copies.
 - **CI.** Running the test suites (`db-test.sh`, `test.sh`, `ha-test.sh`) on
   every change.
 

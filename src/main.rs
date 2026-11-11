@@ -43,6 +43,7 @@ mod packer;
 mod payload;
 mod roles;
 mod s3;
+mod scrub;
 mod settings;
 mod store;
 mod writing;
@@ -53,6 +54,8 @@ pub struct App {
     /// This node's number (`nodes.id`), which locations refer to it by.
     node: i32,
     replication_factor: usize,
+    /// How many bytes per second the scrubber reads; 0 if it's off.
+    scrub_rate: u64,
     writing: WritingSet,
     pack: packer::Config,
     metrics: Arc<metrics::Metrics>,
@@ -117,6 +120,11 @@ struct ServeArgs {
     /// encrypted itself: the key travels in a header.
     #[arg(long, env = "CAIRN_ALLOW_SSE_C_OVER_HTTP")]
     allow_sse_c_over_http: bool,
+    /// How many bytes per second the scrubber reads, checking this node's
+    /// data against its checksums: e.g. 25MiB (the default), 100MB. 0 turns
+    /// it off.
+    #[arg(long, env = "CAIRN_SCRUB_RATE", default_value = "25MiB", value_parser = scrub::parse_rate)]
+    scrub_rate: u64,
     #[command(flatten)]
     kms: kms::KmsArgs,
 }
@@ -161,6 +169,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         store,
         node,
         replication_factor: args.replication_factor,
+        scrub_rate: args.scrub_rate,
         writing: WritingSet::default(),
         pack: packer::Config::default(),
         metrics: Arc::default(),
@@ -174,6 +183,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(heartbeat(app.clone(), peer_url));
     tokio::spawn(maintain(app.clone()));
     tokio::spawn(apply_lifecycles(app.clone()));
+    tokio::spawn(scrub::run(app.clone()));
     // The roles' identities in the KMS, now rather than in a minute.
     let identifying = app.clone();
     tokio::spawn(async move {
@@ -551,7 +561,10 @@ where
     // The blob may be gone (its upload given up): then this fails its FK check.
     if let Err(e) = client
         .execute_cached(
-            "INSERT INTO blob_locations (blob_id, node) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            // The bytes were checksummed on their way to the disk, and the
+            // writer compares the CRC: the copy is known intact as of now.
+            "INSERT INTO blob_locations (blob_id, node, checked_at) VALUES ($1, $2, NOW())
+             ON CONFLICT DO NOTHING",
             &[&blob_id, &app.node],
         )
         .await

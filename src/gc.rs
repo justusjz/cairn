@@ -12,8 +12,9 @@
 //!   exceeds the longest upload. Cheap, through an index of the pending blobs.
 //! - **Orphaned files**: each pass sweeps a slice of this node's shard
 //!   directories, so that a full sweep takes a day, and deletes the files of
-//!   blobs that the catalog doesn't place on this node (and then any shard
-//!   directory left empty).
+//!   blobs that the catalog doesn't place on this node, and the repaired
+//!   copies of blobs that a crashed repair left (see `scrub::repair`), and
+//!   then any shard directory left empty.
 //!
 //! Committed blobs that no part references anymore don't need looking for: a
 //! blob can only become one by its parts being deleted, which the garbage log
@@ -36,6 +37,9 @@ use crate::{
 
 /// How long a blob may stay pending before it's deleted.
 const PENDING_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+/// How old a repaired copy that never replaced its blob's file must be for the
+/// sweep to delete it: a crash left it behind (see `scrub::repair`).
+const STALE_REPAIR: Duration = Duration::from_secs(24 * 3600);
 /// How many shard directories a pass sweeps: all of them in about a day, at a
 /// pass a minute.
 const SHARDS_PER_PASS: u32 = SHARDS.div_ceil(24 * 60);
@@ -217,15 +221,21 @@ async fn sweep_shard(app: &App, shard: u32, report: &mut Report) -> anyhow::Resu
     // A file being written has no location yet. A writer leaves the writing
     // set only after its location is committed, so checking the set before
     // the catalog never mistakes a new blob for an orphan.
-    let files: Vec<Uuid> = app
-        .store
-        .list_shard(shard)
-        .await?
+    let listing = app.store.list_shard(shard).await?;
+    let files: Vec<Uuid> = listing
+        .blobs
         .into_iter()
         .filter(|&blob_id| !app.writing.contains(blob_id))
         .collect();
     if !files.is_empty() {
         delete_orphans(app, files, report).await?;
+    }
+    for (blob_id, modified) in listing.repairs {
+        if modified.elapsed().is_ok_and(|age| age > STALE_REPAIR) {
+            eprintln!("gc: deleting the repaired copy of blob {blob_id} a crash left");
+            app.store.remove_stale_repair(shard, blob_id).await?;
+            report.files += 1;
+        }
     }
     report.dirs += app.store.remove_shard_if_empty(shard).await;
     Ok(())

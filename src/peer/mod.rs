@@ -92,6 +92,7 @@ impl<E: Into<anyhow::Error>> From<E> for Failed {
 pub fn router(app: Arc<App>) -> Router {
     Router::new()
         .route("/maintain", any(maintain))
+        .route("/scrub", any(scrub))
         .route("/stats", get(stats))
         .route(
             "/blobs/{blob_id}",
@@ -122,6 +123,23 @@ async fn maintain(State(app): State<Arc<App>>) -> Result<Response, Failed> {
     Ok((
         [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
         report,
+    )
+        .into_response())
+}
+
+/// Scrubs this node's copies now, unpaced: those due (as the background
+/// scrubber would), or with `?all`, every one. For tests, and for an operator
+/// who wants to know now. Reports what it found once it's done.
+async fn scrub(
+    State(app): State<Arc<App>>,
+    RawQuery(query): RawQuery,
+) -> Result<Response, Failed> {
+    let all = query.unwrap_or_default().split('&').any(|p| p == "all" || p.starts_with("all="));
+    let scope = if all { crate::scrub::Scope::Everything } else { crate::scrub::Scope::Due };
+    let report = crate::scrub::pass(&app, scope, &crate::scrub::Pacer::new(None)).await?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        format!("scrub: {report}\n"),
     )
         .into_response())
 }
@@ -159,6 +177,8 @@ async fn get_blob(
                 Err(e) => {
                     if e.kind() == std::io::ErrorKind::InvalidData {
                         eprintln!("CORRUPTION: blob {blob_id}: {e}");
+                        // The reader can't tell this from any other failure.
+                        crate::scrub::suspect(&app, blob_id, app.node);
                     }
                     return Err(e.into());
                 }

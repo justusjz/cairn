@@ -67,8 +67,9 @@
 --           before they're deleted.
 --   R(r)    The role's row. Shared: granting it a permission. Exclusive (by
 --           deleting it): deleting the role.
---   X(x)    The blob's row. Shared: referencing it, or changing or deleting
---           a part on it. Exclusive: committing it, deleting it, removing a
+--   X(x)    The blob's row. Shared: referencing it, changing or deleting
+--           a part on it, or changing its `lost_ranges` (the scrubber,
+--           which locks the row with nothing else). Exclusive: committing it, deleting it, removing a
 --           location, moving parts off or onto it (the packer). All of a
 --           transaction's blobs are locked by one call of `cairn_lock_blobs`.
 --
@@ -167,9 +168,10 @@
 --    covers the source key): then the copy starts over ('source_changed').
 --
 -- Statements that run on their own (the pending blob and location inserts,
--- CreateMultipartUpload, role creation and updates, the heartbeat) hold
--- nothing that anyone waits for while they wait, so they can't be part of a
--- cycle either. (A location insert's FK checks lock its node's row shared,
+-- CreateMultipartUpload, role creation and updates, the heartbeat, the
+-- scrubber's and reads' updates of a location's `checked_at`, and the
+-- scrubber's changes to `scrub_findings`) hold nothing that anyone waits for
+-- while they wait, so they can't be part of a cycle either. (A location insert's FK checks lock its node's row shared,
 -- but nothing ever locks a node's row exclusively.) An insert whose FK checks
 -- would lock rows out of order (a grant's: the role, then the bucket) is a
 -- function that locks them in order first (`cairn_grant`). The GC
@@ -1409,7 +1411,8 @@ END
 $$;
 
 -- T14: claims the source blobs for a packing job, if there's one worth
--- running (see `packer::claim`): `p_kind` is 'compact' or 'consolidate'.
+-- running (see `packer::claim`): `p_kind` is 'compact', 'consolidate' or
+-- 'upgrade' (a blob from before checksums, one at a time).
 -- Takes candidates, skipping those another transaction has locked (it never
 -- waits), until their live bytes would exceed `p_budget`, and leases them.
 -- Returns them, or an empty array if the job isn't worth it. The lease is a
@@ -1420,6 +1423,13 @@ $$;
 -- index, least live data first, and stops once it has enough; consolidation
 -- first adds its candidates up without locking them, and only locks them once
 -- they're worth a job, since a row lock is a write.
+--
+-- Blobs with parts on lost data (`lost_ranges`, see `scrub`) aren't
+-- candidates: those parts would fail the job's verification, again after every
+-- lease. Lost data that no part uses anymore doesn't keep a blob from being
+-- compacted, which then drops it, and its lost ranges with it. Which blobs
+-- have lost data is a heuristic too: one that loses data after it's claimed
+-- just fails its job.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_claim(
     p_kind text, p_compact_threshold float8, p_max_sources bigint, p_small_size bigint,
     p_target_size bigint, p_budget bigint, p_lease_secs float8
@@ -1440,6 +1450,9 @@ BEGIN
             WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * 0.25
               AND dead_size >= size * p_compact_threshold
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
             ORDER BY size - dead_size
             LIMIT p_max_sources FOR UPDATE SKIP LOCKED
         LOOP
@@ -1456,11 +1469,31 @@ BEGIN
             SELECT blob_id, size - dead_size AS live FROM blobs
             WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * p_compact_threshold
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
             ORDER BY size - dead_size
             LIMIT p_max_sources FOR UPDATE SKIP LOCKED
         LOOP
             EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
             v_total := v_total + r.live;
+            v_sources := v_sources || r.blob_id;
+        END LOOP;
+        IF cardinality(v_sources) = 0 THEN
+            RETURN '{}';
+        END IF;
+    ELSIF p_kind = 'upgrade' THEN
+        -- One blob from before checksums, the oldest, off `blobs_legacy`.
+        FOR r IN
+            SELECT blob_id FROM blobs
+            WHERE state = 'committed' AND block_size IS NULL
+              AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
+            ORDER BY created_at
+            LIMIT 1 FOR UPDATE SKIP LOCKED
+        LOOP
             v_sources := v_sources || r.blob_id;
         END LOOP;
         IF cardinality(v_sources) = 0 THEN
@@ -1474,6 +1507,9 @@ BEGIN
             SELECT size FROM blobs
             WHERE state = 'committed' AND size <= 67108864 AND size <= p_small_size
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
             ORDER BY created_at
             LIMIT p_max_sources
         ) AS c;
@@ -1488,6 +1524,9 @@ BEGIN
             SELECT blob_id, size AS live FROM blobs
             WHERE state = 'committed' AND size <= 67108864 AND size <= p_small_size
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+              AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                              WHERE l.blob_id = blobs.blob_id
+                                AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
             ORDER BY created_at
             LIMIT p_max_sources FOR UPDATE SKIP LOCKED
         LOOP

@@ -24,7 +24,8 @@ use crate::{
         sse_c::CustomerKey,
         objects::get::{
             Missing, ObjectVersion, PartLocation, lookup_version, no_such_version,
-            resolve_object_parts, select_parts_in_range, spawn_range_stream,
+            lost_data, reads_lost, resolve_object_parts, select_parts_in_range,
+            spawn_range_stream,
         },
         util::{
             MAX_UPLOAD, decode_path_param, format_s3_error, is_well_formed, query_param,
@@ -209,6 +210,13 @@ pub async fn copy_object(
         if preconditions.evaluate(&source_etag, version.lm_epoch, true) != Precondition::Proceed {
             return Ok(copy_precondition_failed());
         }
+        // Lost bytes aren't copied, not even by reference: that would make a
+        // new object of them, unnoticed.
+        let client = app.pool.get().await?;
+        if reads_lost(&client, &source.locations, 0, version.size as u64).await? {
+            return Ok(lost_data());
+        }
+        drop(client);
         // As in S3: a larger object is copied part by part (UploadPartCopy).
         if version.size as u64 > MAX_UPLOAD {
             return Ok(format_s3_error(
@@ -634,6 +642,11 @@ pub async fn copy_part(
             Some(Ok(range)) => range,
             Some(Err(refused)) => return Ok(refused),
         };
+        let client = app.pool.get().await?;
+        if reads_lost(&client, &source.locations, start, end).await? {
+            return Ok(lost_data());
+        }
+        drop(client);
         if end - start > MAX_UPLOAD {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,

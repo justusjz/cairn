@@ -66,6 +66,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
     OpenApiRouter::with_openapi(Doc::openapi())
         .routes(routes!(get_cluster))
         .routes(routes!(get_storage))
+        .routes(routes!(get_integrity))
         .routes(routes!(list_buckets, create_bucket))
         .routes(routes!(delete_bucket))
         .routes(routes!(list_objects))
@@ -203,6 +204,33 @@ pub(super) struct Storage {
     objects: ObjectTotals,
     backlog: Backlog,
     packer: PackerSettings,
+    integrity: Coverage,
+}
+
+/// How much of the data the scrubber has checked (see `scrub`).
+#[derive(Clone, Serialize, ToSchema)]
+struct Coverage {
+    /// What each node holds of checksummed data, and how recently it was
+    /// checked.
+    nodes: Vec<NodeCoverage>,
+    /// Committed blobs from before checksums, which can't be checked.
+    legacy_blobs: i64,
+    legacy_bytes: i64,
+}
+
+/// The copies of committed, checksummed blobs a node holds, and how recently
+/// they were known intact.
+#[derive(Clone, Serialize, ToSchema)]
+struct NodeCoverage {
+    node: i32,
+    copies: i64,
+    bytes: i64,
+    /// Copies never checked (from before scrubbing), or flagged by a read:
+    /// checked next.
+    unchecked: i64,
+    unchecked_bytes: i64,
+    /// When the least recently checked of the others was known intact.
+    oldest_checked: Option<f64>,
 }
 
 /// The committed blobs a node holds a copy of.
@@ -367,6 +395,37 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             &[],
         )
         .await?;
+    let coverage = client
+        .query_cached(
+            "SELECT bl.node, count(*), coalesce(sum(b.size), 0)::bigint,
+                    count(*) FILTER (WHERE bl.checked_at IS NULL OR bl.checked_at = '-infinity'),
+                    coalesce(sum(b.size) FILTER (WHERE bl.checked_at IS NULL
+                                                 OR bl.checked_at = '-infinity'), 0)::bigint,
+                    extract(epoch FROM min(bl.checked_at)
+                                       FILTER (WHERE bl.checked_at > '-infinity'))::float8
+             FROM blob_locations bl JOIN blobs b ON b.blob_id = bl.blob_id
+             WHERE b.state = 'committed' AND b.block_size IS NOT NULL
+             GROUP BY bl.node ORDER BY bl.node",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| NodeCoverage {
+            node: r.get(0),
+            copies: r.get(1),
+            bytes: r.get(2),
+            unchecked: r.get(3),
+            unchecked_bytes: r.get(4),
+            oldest_checked: r.get(5),
+        })
+        .collect();
+    let legacy = client
+        .query_one_cached(
+            "SELECT count(*), coalesce(sum(size), 0)::bigint FROM blobs
+             WHERE state = 'committed' AND block_size IS NULL",
+            &[],
+        )
+        .await?;
     let m = client
         .query_one_cached(
             "SELECT (SELECT count(*) FROM multipart_uploads),
@@ -414,6 +473,186 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             compact_threshold: app.pack.compact_threshold,
             max_sources: app.pack.max_sources,
         },
+        integrity: Coverage {
+            nodes: coverage,
+            legacy_blobs: legacy.get(0),
+            legacy_bytes: legacy.get(1),
+        },
+    })
+}
+
+// ─── Integrity ───────────────────────────────────────────────────────────────
+
+/// How many findings `/integrity` lists at most, and how many objects with
+/// lost data.
+const MAX_FINDINGS: i64 = 200;
+const MAX_LOST: i64 = 500;
+/// How long resolved findings are listed for.
+const RESOLVED_DAYS: i32 = 30;
+
+/// What the scrubber found (see `scrub`): damaged and missing copies, and the
+/// objects with data that's intact on no replica.
+#[derive(Serialize, ToSchema)]
+pub(super) struct Integrity {
+    /// The open findings, then those resolved in the last 30 days, newest
+    /// first, up to 200.
+    findings: Vec<FindingInfo>,
+    open_findings: i64,
+    /// Findings of the last day, by node: many of them in a short time are a
+    /// sign of a failing disk.
+    recent: Vec<NodeFindings>,
+    /// The object versions (and uploads' parts) with lost bytes, the most
+    /// recently lost first, up to 500.
+    lost: Vec<LostObject>,
+    /// How many there are, all told.
+    lost_objects: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct FindingInfo {
+    id: i64,
+    blob_id: String,
+    node: i32,
+    found_at: f64,
+    /// `missing`, `damaged`, or `catalog` (every block intact, but not the
+    /// file's CRC).
+    problem: String,
+    /// How many blocks failed; none if the whole file is at fault.
+    bad_blocks: Option<i64>,
+    detail: String,
+    /// `repaired`, `lost` (intact on no replica; still open), or `gone` (the
+    /// blob was deleted); none while open.
+    outcome: Option<String>,
+    resolved_at: Option<f64>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct NodeFindings {
+    node: i32,
+    findings: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct LostObject {
+    bucket: String,
+    key: String,
+    /// The version; none for a part of an upload in progress.
+    version_id: Option<String>,
+    upload_id: Option<String>,
+    latest: bool,
+    delete_marker: bool,
+    size: i64,
+    /// How many of its stored bytes are lost.
+    lost_bytes: i64,
+    /// When the first of them was found lost.
+    since: f64,
+}
+
+#[utoipa::path(get, path = "/integrity", responses(
+    (status = 200, body = Integrity),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn get_integrity(State(app): AppState) -> Result<Json<Integrity>> {
+    Ok(Json(integrity(&app).await?))
+}
+
+pub(super) async fn integrity(app: &App) -> anyhow::Result<Integrity> {
+    let client = app.pool.get().await?;
+    let findings = client
+        .query_cached(
+            "SELECT id, blob_id, node, extract(epoch FROM found_at)::float8, problem,
+                    cardinality(bad_blocks)::bigint, detail, outcome,
+                    extract(epoch FROM resolved_at)::float8
+             FROM scrub_findings
+             WHERE resolved_at IS NULL OR resolved_at > NOW() - make_interval(days => $1)
+             ORDER BY resolved_at IS NULL DESC, found_at DESC
+             LIMIT $2",
+            &[&RESOLVED_DAYS, &MAX_FINDINGS],
+        )
+        .await?
+        .iter()
+        .map(|r| FindingInfo {
+            id: r.get(0),
+            blob_id: r.get::<_, uuid::Uuid>(1).to_string(),
+            node: r.get(2),
+            found_at: r.get(3),
+            problem: r.get(4),
+            bad_blocks: r.get(5),
+            detail: r.get(6),
+            outcome: r.get(7),
+            resolved_at: r.get(8),
+        })
+        .collect();
+    let counts = client
+        .query_one_cached(
+            "SELECT count(*) FROM scrub_findings WHERE resolved_at IS NULL",
+            &[],
+        )
+        .await?;
+    let recent = client
+        .query_cached(
+            "SELECT node, count(*) FROM scrub_findings
+             WHERE found_at > NOW() - INTERVAL '1 day'
+             GROUP BY node ORDER BY node",
+            &[],
+        )
+        .await?
+        .iter()
+        .map(|r| NodeFindings {
+            node: r.get(0),
+            findings: r.get(1),
+        })
+        .collect();
+    // Each part's bytes that are lost, added up per object version or upload.
+    // Lost ranges are disjoint, so their overlaps with a part add up.
+    let lost_rows = client
+        .query_cached(
+            "WITH hit AS (
+                 SELECT p.object_id, p.upload_id,
+                        sum(least(l.stop, p.blob_offset + p.size)
+                            - greatest(l.start, p.blob_offset))::bigint AS lost_bytes,
+                        min(l.found_at) AS since
+                 FROM lost_ranges l
+                 JOIN parts p ON p.blob_id = l.blob_id
+                             AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start
+                 GROUP BY p.object_id, p.upload_id
+             )
+             SELECT coalesce(o.bucket, u.bucket), coalesce(o.key, u.key), o.version_id,
+                    u.upload_id::text, coalesce(o.is_latest, false),
+                    coalesce(o.is_delete_marker, false),
+                    coalesce(o.size, (SELECT coalesce(sum(size), 0) FROM parts
+                                      WHERE upload_id = u.upload_id))::bigint,
+                    hit.lost_bytes, extract(epoch FROM hit.since)::float8,
+                    count(*) OVER ()
+             FROM hit
+             LEFT JOIN objects o ON o.id = hit.object_id
+             LEFT JOIN multipart_uploads u ON u.upload_id = hit.upload_id
+             ORDER BY hit.since DESC
+             LIMIT $1",
+            &[&MAX_LOST],
+        )
+        .await?;
+    let lost_objects = lost_rows.first().map_or(0, |r| r.get(9));
+    let lost = lost_rows
+        .iter()
+        .map(|r| LostObject {
+            bucket: r.get(0),
+            key: r.get(1),
+            version_id: r.get(2),
+            upload_id: r.get(3),
+            latest: r.get(4),
+            delete_marker: r.get(5),
+            size: r.get(6),
+            lost_bytes: r.get(7),
+            since: r.get(8),
+        })
+        .collect();
+    Ok(Integrity {
+        findings,
+        open_findings: counts.get(0),
+        recent,
+        lost,
+        lost_objects,
     })
 }
 
@@ -588,6 +827,8 @@ enum Entry {
         etag: Option<String>,
         last_modified: f64,
         delete_marker: bool,
+        /// Whether some of its bytes are intact on no replica (see `scrub`).
+        lost: bool,
     },
 }
 
@@ -618,7 +859,7 @@ pub(super) async fn listing(app: &App, bucket: &str, query: &ListQuery<'_>) -> R
     let Some(listing) = crate::s3::objects::list::list(app, bucket, query).await? else {
         return Err(ApiError::NotFound(format!("no bucket named {bucket:?}")));
     };
-    let entries = listing
+    let mut entries = listing
         .entries
         .into_iter()
         .map(|e| match e {
@@ -645,13 +886,54 @@ pub(super) async fn listing(app: &App, bucket: &str, query: &ListQuery<'_>) -> R
                 etag,
                 last_modified: last_modified.epoch,
                 delete_marker,
+                lost: false,
             },
         })
-        .collect();
+        .collect::<Vec<_>>();
+    mark_lost(app, bucket, &mut entries).await?;
     Ok(Listing {
         entries,
         next: listing.next_marker,
     })
+}
+
+/// Marks the objects in `entries` whose current version has lost bytes.
+async fn mark_lost(app: &App, bucket: &str, entries: &mut [Entry]) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
+    // Almost always, nothing is lost anywhere: one cheap query.
+    let any: bool = client
+        .query_one_cached("SELECT EXISTS (SELECT 1 FROM lost_ranges)", &[])
+        .await?
+        .get(0);
+    if !any {
+        return Ok(());
+    }
+    let keys: Vec<&str> = entries
+        .iter()
+        .filter_map(|e| match e {
+            Entry::Object { key, .. } => Some(key.as_str()),
+            Entry::Prefix { .. } => None,
+        })
+        .collect();
+    let lost: std::collections::HashSet<String> = client
+        .query_cached(
+            "SELECT DISTINCT o.key FROM objects o
+             JOIN parts p ON p.object_id = o.id
+             JOIN lost_ranges l ON l.blob_id = p.blob_id
+                               AND l.start < p.blob_offset + p.size AND l.stop > p.blob_offset
+             WHERE o.bucket = $1 AND o.key = ANY($2) AND o.is_latest",
+            &[&bucket, &keys],
+        )
+        .await?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    for entry in entries {
+        if let Entry::Object { key, lost: l, .. } = entry {
+            *l = lost.contains(key.as_str());
+        }
+    }
+    Ok(())
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -682,6 +964,8 @@ struct VersionInfo {
     /// How it's encrypted; none if it isn't.
     encryption: Option<EncryptionInfo>,
     parts: Vec<PartInfo>,
+    /// How many of its parts' bytes are intact on no replica.
+    lost_bytes: i64,
 }
 
 /// How an object version is encrypted (see `s3::sse`).
@@ -740,6 +1024,9 @@ struct PartInfo {
     created_at: f64,
     /// The nodes holding a copy of the blob.
     nodes: Vec<i32>,
+    /// The byte ranges of the part (as stored) that are intact on no
+    /// replica, as [start, stop) from its start (see `scrub`).
+    lost: Vec<[i64; 2]>,
 }
 
 #[utoipa::path(get, path = "/buckets/{bucket}/object", params(("bucket" = String, Path), KeyParams),
@@ -795,7 +1082,35 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
             blob_state: p.get(8),
             created_at: p.get(9),
             nodes: p.get(10),
+            lost: Vec::new(),
         });
+    }
+    // Where the parts' blobs have lost data, if anywhere.
+    let blob_ids: Vec<uuid::Uuid> = parts
+        .values()
+        .flatten()
+        .filter_map(|p| p.blob_id.parse().ok())
+        .collect();
+    let lost_ranges = client
+        .query_cached(
+            "SELECT blob_id, start, stop FROM lost_ranges WHERE blob_id = ANY($1) ORDER BY start",
+            &[&blob_ids],
+        )
+        .await?;
+    for part in parts.values_mut().flatten() {
+        for r in &lost_ranges {
+            let (start, stop): (i64, i64) = (r.get(1), r.get(2));
+            let end = part.blob_offset + part.size;
+            if r.get::<_, uuid::Uuid>(0).to_string() == part.blob_id
+                && start < end
+                && stop > part.blob_offset
+            {
+                part.lost.push([
+                    start.max(part.blob_offset) - part.blob_offset,
+                    stop.min(end) - part.blob_offset,
+                ]);
+            }
+        }
     }
     let mut infos = Vec::with_capacity(versions.len());
     for v in &versions {
@@ -819,6 +1134,7 @@ pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result
             content_type: v.get(6),
             last_modified: v.get(7),
             encryption: EncryptionInfo::of(stored),
+            lost_bytes: parts.iter().flat_map(|p| &p.lost).map(|[a, b]| b - a).sum(),
             parts,
         });
     }
@@ -1127,6 +1443,74 @@ mod e2e {
 
     async fn node() -> Option<Arc<App>> {
         node_with(crate::packer::Config::default(), None).await
+    }
+
+    /// What the scrubber found: coverage, findings, lost data, and which
+    /// objects it's in.
+    #[tokio::test]
+    async fn reports_integrity() {
+        let Some(app) = node().await else { return };
+        put(&app, "damaged", vec![1; 300_000]).await;
+        put(&app, "intact", vec![2; 1000]).await;
+        let blob_id: uuid::Uuid = app
+            .pool
+            .get()
+            .await
+            .unwrap()
+            .query_one(
+                "SELECT p.blob_id FROM parts p JOIN objects o ON o.id = p.object_id
+                 WHERE o.key = 'damaged'",
+                &[],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        let path = app.store.blob_path(blob_id);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[70_000] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+        let pacer = crate::scrub::Pacer::new(None);
+        crate::scrub::pass(&app, crate::scrub::Scope::Everything, &pacer).await.unwrap();
+
+        let s = serde_json::to_value(storage(&app).await.unwrap()).unwrap();
+        let coverage = &s["integrity"]["nodes"][0];
+        assert_eq!((coverage["copies"].clone(), coverage["unchecked"].clone()), (json!(2), json!(0)));
+        assert!(coverage["oldest_checked"].is_f64());
+        assert_eq!(s["integrity"]["legacy_blobs"], 0);
+
+        let i = serde_json::to_value(integrity(&app).await.unwrap()).unwrap();
+        assert_eq!(i["open_findings"], 1);
+        assert_eq!(i["findings"][0]["problem"], "damaged");
+        assert_eq!(i["findings"][0]["outcome"], "lost");
+        assert_eq!(i["findings"][0]["bad_blocks"], 1);
+        assert_eq!(i["recent"], json!([{ "node": app.node, "findings": 1 }]));
+        assert_eq!(i["lost_objects"], 1);
+        assert_eq!(i["lost"][0]["key"], "damaged");
+        assert_eq!(i["lost"][0]["latest"], true);
+        assert_eq!(i["lost"][0]["lost_bytes"], 65536);
+
+        let query = ListQuery {
+            prefix: "",
+            delimiter: Some("/"),
+            marker: "",
+            max_keys: PAGE,
+            delete_markers: false,
+            totals: true,
+        };
+        let l = serde_json::to_value(listing(&app, BUCKET, &query).await.unwrap()).unwrap();
+        assert_eq!(l["entries"][0]["key"], "damaged");
+        assert_eq!(l["entries"][0]["lost"], true);
+        assert_eq!(l["entries"][1]["lost"], false);
+
+        let o = serde_json::to_value(object(&app, BUCKET, "damaged").await.unwrap()).unwrap();
+        assert_eq!(o["versions"][0]["lost_bytes"], 65536);
+        assert_eq!(o["versions"][0]["parts"][0]["lost"], json!([[65536, 131072]]));
+
+        // Once the object is deleted, it's not listed, and its finding is gone.
+        delete(&app, "damaged").await;
+        crate::scrub::pass(&app, crate::scrub::Scope::Everything, &pacer).await.unwrap();
+        let i = serde_json::to_value(integrity(&app).await.unwrap()).unwrap();
+        assert_eq!(i["lost_objects"], 0);
     }
 
     #[tokio::test]

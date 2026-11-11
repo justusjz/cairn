@@ -14,6 +14,9 @@ export type Counts = Schemas["Counts"];
 export type OpCounts = Schemas["OpCounts"];
 export type Event = Schemas["EventReport"];
 export type Storage = Schemas["Storage"];
+export type Integrity = Schemas["Integrity"];
+export type Finding = Schemas["FindingInfo"];
+export type LostObject = Schemas["LostObject"];
 export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
@@ -61,6 +64,7 @@ const rolePath = (role: string) => ({ path: { role } });
 export const api = {
   cluster: () => ok(client.GET("/cluster")),
   storage: () => ok(client.GET("/storage")),
+  integrity: () => ok(client.GET("/integrity")),
   buckets: () => ok(client.GET("/buckets")),
   createBucket: (name: string) => ok(client.POST("/buckets", { body: { name } })),
   deleteBucket: (bucket: string) => ok(client.DELETE("/buckets/{bucket}", { params: bucketPath(bucket) })),
