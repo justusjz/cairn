@@ -97,17 +97,17 @@ fn identity_of(row: &tokio_postgres::Row, at: usize) -> Identity {
     Identity { account_id: row.get(at), account: row.get(at + 1), operator: row.get(at + 2), user }
 }
 
-/// Makes an enrollment link's token for user `user`, which replaces any it
-/// had.
-pub async fn create_enrollment(client: &Object, user: &str) -> anyhow::Result<String> {
+/// Makes an enrollment link's token for user `user` of account `account`
+/// (its ID), which replaces any it had.
+pub async fn create_enrollment(client: &Object, account: &str, user: &str) -> anyhow::Result<String> {
     let (token, hash) = token()?;
     let made = client
         .execute_cached(
-            "WITH r AS (SELECT id, account_id FROM roles WHERE name = $1),
+            "WITH r AS (SELECT id, account_id FROM roles WHERE name = $1 AND account_id = $4),
                   d AS (DELETE FROM console_enrollments e USING r WHERE e.role_id = r.id)
              INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
              SELECT $2, r.id, r.account_id, now() + make_interval(secs => $3) FROM r",
-            &[&user, &hash, &secs(ENROLLMENT_TTL)],
+            &[&user, &hash, &secs(ENROLLMENT_TTL), &account],
         )
         .await?;
     if made == 0 {

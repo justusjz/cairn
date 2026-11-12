@@ -29,13 +29,13 @@ async fn a_user_signs_with_any_of_its_active_keys() {
     assert_eq!(principal.account, roles::account(&client).await.unwrap());
     assert_eq!(principal.account.len(), 12);
 
-    let (id, second) = roles::create_key(&client, "alice", None, None).await.unwrap();
+    let (id, second) = roles::create_key(&client, &crate::roles::account(&client).await.unwrap(), "alice", None, None).await.unwrap();
     assert_eq!(id.len(), 20);
     assert_eq!(Principal::load(&client, &id).await.unwrap().unwrap().secret, second);
     // At most two, as in IAM.
-    let third = roles::create_key(&client, "alice", None, None).await.unwrap_err();
+    let third = roles::create_key(&client, &crate::roles::account(&client).await.unwrap(), "alice", None, None).await.unwrap_err();
     assert!(third.to_string().contains("2 access keys"), "{third}");
-    assert!(roles::create_key(&client, "nobody", None, None).await.unwrap_err().to_string().contains("no user"));
+    assert!(roles::create_key(&client, &crate::roles::account(&client).await.unwrap(), "nobody", None, None).await.unwrap_err().to_string().contains("no user"));
 
     roles::set_key_active(&client, None, &id, false).await.unwrap();
     assert!(Principal::load(&client, &id).await.unwrap().is_none());
@@ -43,24 +43,28 @@ async fn a_user_signs_with_any_of_its_active_keys() {
     assert!(Principal::load(&client, &id).await.unwrap().is_some());
     // Only the user's own, when the user is named (as the dashboard does).
     roles::create(&client, "mallory", None, false).await.unwrap();
-    assert!(roles::set_key_active(&client, Some("mallory"), &id, false).await.is_err());
-    assert!(roles::delete_key(&client, Some("mallory"), &id).await.is_err());
+    assert!(roles::set_key_active(&client, Some((&crate::roles::account(&client).await.unwrap(), "mallory")), &id, false).await.is_err());
+    assert!(roles::delete_key(&client, Some((&crate::roles::account(&client).await.unwrap(), "mallory")), &id).await.is_err());
     assert!(Principal::load(&client, &id).await.unwrap().is_some());
-    roles::delete_key(&client, Some("alice"), &id).await.unwrap();
+    roles::delete_key(&client, Some((&crate::roles::account(&client).await.unwrap(), "alice")), &id).await.unwrap();
     assert!(Principal::load(&client, &id).await.unwrap().is_none());
     assert!(roles::delete_key(&client, None, &id).await.is_err());
 
-    // A key's ID can't be another's, nor a new user's name.
-    roles::create_key(&client, "alice", Some("shared".to_owned()), None).await.unwrap();
-    let taken = roles::create(&client, "shared", None, false).await.unwrap_err();
-    assert!(taken.to_string().contains("access key"), "{taken}");
+    // A key's ID can't be another's; a new user whose name is one gets a
+    // first key of another (random) ID.
+    roles::create_key(&client, &crate::roles::account(&client).await.unwrap(), "alice", Some("shared".to_owned()), None).await.unwrap();
+    let account = crate::roles::account(&client).await.unwrap();
+    let (key, _) = roles::create_for(&client, &account, "shared", None, false).await.unwrap();
+    assert_ne!(key, "shared");
+    assert_eq!(key.len(), 20);
+    roles::delete(&client, &account, "shared").await.unwrap();
 
     let listed = roles::list(&client).await.unwrap();
     let alice = listed.iter().find(|u| u.name == "alice").unwrap();
     assert_eq!(alice.keys.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), ["alice", "shared"]);
 
     // Deleting the user deletes its keys.
-    roles::delete(&client, "alice").await.unwrap();
+    roles::delete(&client, &crate::roles::account(&client).await.unwrap(), "alice").await.unwrap();
     assert!(Principal::load(&client, "shared").await.unwrap().is_none());
 }
 
@@ -74,7 +78,7 @@ async fn older_cairns_see_the_first_keys_secret_and_cant_change_users() {
     let secret = roles::create(&client, "bob", None, false).await.unwrap();
     assert_eq!(legacy_secret(&app, "bob").await, secret);
     let rotated = roles::generate_secret().unwrap();
-    roles::update(&client, "bob", None, Some(rotated.clone())).await.unwrap();
+    roles::update(&client, &crate::roles::account(&client).await.unwrap(), "bob", None, Some(rotated.clone())).await.unwrap();
     assert_eq!(legacy_secret(&app, "bob").await, rotated);
     assert_eq!(Principal::load(&client, "bob").await.unwrap().unwrap().secret, rotated);
     roles::set_key_active(&client, None, "bob", false).await.unwrap();
@@ -84,7 +88,7 @@ async fn older_cairns_see_the_first_keys_secret_and_cant_change_users() {
     roles::delete_key(&client, None, "bob").await.unwrap();
     assert!(legacy_secret(&app, "bob").await.starts_with("unusable:"));
     // Without its first key, the user's other keys are rotated as keys.
-    let err = roles::update(&client, "bob", None, Some(rotated)).await.unwrap_err();
+    let err = roles::update(&client, &crate::roles::account(&client).await.unwrap(), "bob", None, Some(rotated)).await.unwrap_err();
     assert!(err.to_string().contains("no access key named as the user"), "{err}");
 
     // A session that doesn't declare `cairn.users` (an older Cairn's).
@@ -112,31 +116,31 @@ async fn inline_policies_are_checked_and_kept_as_given() {
     roles::create(&client, "carol", None, false).await.unwrap();
     let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject",
         "Resource":"arn:aws:s3:::bucket/home/${aws:username}/*"}]}"#;
-    roles::put_policy(&client, "carol", "home", document).await.unwrap();
-    assert_eq!(roles::get_policy(&client, "carol", "home").await.unwrap(), document);
+    roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home", document).await.unwrap();
+    assert_eq!(roles::get_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home").await.unwrap(), document);
     assert_eq!(Principal::load(&client, "carol").await.unwrap().unwrap().policies, [document]);
     let listed = roles::list(&client).await.unwrap();
     assert_eq!(listed.iter().find(|u| u.name == "carol").unwrap().policies, ["home"]);
 
     // Not an identity policy: refused, as IAM refuses it.
     let principal = r#"{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"*"}]}"#;
-    let err = roles::put_policy(&client, "carol", "p", principal).await.unwrap_err();
+    let err = roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "p", principal).await.unwrap_err();
     assert!(err.to_string().contains("principal"), "{err}");
-    assert!(roles::put_policy(&client, "carol", "bad name", document).await.is_err());
-    assert!(roles::put_policy(&client, "nobody", "home", document).await.is_err());
+    assert!(roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "bad name", document).await.is_err());
+    assert!(roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "nobody", "home", document).await.is_err());
     // At most 2048 characters together, whitespace aside.
     let big = format!(
         r#"{{"Statement":[{{"Sid":"{}","Effect":"Allow","Action":"s3:GetObject","Resource":"*"}}]}}"#,
         "x".repeat(1900)
     );
-    let err = roles::put_policy(&client, "carol", "big", &big).await.unwrap_err();
+    let err = roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "big", &big).await.unwrap_err();
     assert!(err.to_string().contains("2048"), "{err}");
     // Replacing a policy counts it once.
-    roles::put_policy(&client, "carol", "home", &big).await.unwrap();
+    roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home", &big).await.unwrap();
 
-    roles::delete_policy(&client, "carol", "home").await.unwrap();
-    assert!(roles::get_policy(&client, "carol", "home").await.is_err());
-    assert!(roles::delete_policy(&client, "carol", "home").await.is_err());
+    roles::delete_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home").await.unwrap();
+    assert!(roles::get_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home").await.is_err());
+    assert!(roles::delete_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home").await.is_err());
 }
 
 /// A bucket policy names a user as the one that had the name when it was
@@ -182,7 +186,7 @@ async fn bucket_policies_name_users_as_they_were() {
     };
     assert!(shown(app.clone()).await.contains(&format!("\"AWS\":\"{arn}\"")));
 
-    roles::delete(&client, &name).await.unwrap();
+    roles::delete(&client, &crate::roles::account(&client).await.unwrap(), &name).await.unwrap();
     roles::create(&client, &name, None, false).await.unwrap();
     let second = Principal::load(&client, &name).await.unwrap().unwrap();
     assert!(!allowed(second).await);
@@ -222,7 +226,10 @@ async fn old_grants_move_into_bucket_policies() {
     let grants = crate::grants::list(&client).await.unwrap();
     assert_eq!(
         grants,
-        [(BUCKET.to_owned(), "olga".to_owned(), roles::Permission::Read), (BUCKET.to_owned(), "olga".to_owned(), roles::Permission::Write)]
+        [
+            (BUCKET.to_owned(), (account.clone(), "olga".to_owned()), roles::Permission::Read),
+            (BUCKET.to_owned(), (account.clone(), "olga".to_owned()), roles::Permission::Write)
+        ]
     );
     let policy: String =
         client.query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
@@ -233,9 +240,9 @@ async fn old_grants_move_into_bucket_policies() {
     assert!(crate::grants::visible(&client, principal.id).await.unwrap().contains(BUCKET));
 
     // Revoked, and gone with the user.
-    roles::revoke(&client, "olga", BUCKET, &[roles::Permission::Write]).await.unwrap();
+    roles::revoke(&client, &crate::roles::account(&client).await.unwrap(), "olga", BUCKET, &[roles::Permission::Write]).await.unwrap();
     assert_eq!(crate::grants::list(&client).await.unwrap().len(), 1);
-    roles::delete(&client, "olga").await.unwrap();
+    roles::delete(&client, &crate::roles::account(&client).await.unwrap(), "olga").await.unwrap();
     assert!(crate::grants::list(&client).await.unwrap().is_empty());
     let policy: String =
         client.query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
@@ -262,4 +269,48 @@ async fn the_operator_account_owns_no_buckets() {
     roles::create_in(&client, Some("operator"), "superadmin", None, false).await.unwrap();
     let principal = Principal::load(&client, "superadmin").await.unwrap().unwrap();
     assert_ne!(principal.account, roles::account(&client).await.unwrap());
+}
+
+/// User names are unique in their account, as in IAM: two accounts each
+/// have an `ada`, with keys of their own; a grant, a policy and a bucket
+/// policy name one of them, never the other.
+#[tokio::test]
+async fn accounts_have_users_of_the_same_name() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let default = roles::account(&client).await.unwrap();
+    let acme = crate::accounts::create(&client, "acme").await.unwrap();
+    let (first, _) = roles::create_for(&client, &default, "ada", None, false).await.unwrap();
+    let (second, _) = roles::create_for(&client, &acme, "ada", None, false).await.unwrap();
+    assert_eq!(first, "ada");
+    assert_ne!(second, "ada");
+    assert_eq!(Principal::load(&client, &first).await.unwrap().unwrap().account, default);
+    assert_eq!(Principal::load(&client, &second).await.unwrap().unwrap().account, acme);
+    // But not twice in one account.
+    assert!(roles::create_for(&client, &acme, "ada", None, false).await.is_err());
+
+    // A grant is the bucket's account's ada's.
+    roles::grant(&client, &default, "ada", BUCKET, &[roles::Permission::Read]).await.unwrap();
+    assert!(roles::grant(&client, &acme, "ada", BUCKET, &[roles::Permission::Read]).await.is_err());
+    let grants = crate::grants::list(&client).await.unwrap();
+    assert_eq!(grants, [(BUCKET.to_owned(), (default.clone(), "ada".to_owned()), roles::Permission::Read)]);
+    let ours = Principal::load(&client, &first).await.unwrap().unwrap();
+    let theirs = Principal::load(&client, &second).await.unwrap().unwrap();
+    assert!(crate::grants::visible(&client, ours.id).await.unwrap().contains(BUCKET));
+    assert!(crate::grants::visible(&client, theirs.id).await.unwrap().is_empty());
+
+    // A bucket policy naming acme's ada binds acme's.
+    let policy = format!(
+        r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{acme}:user/ada"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
+    );
+    let set = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, policy.into()).await.unwrap();
+    assert_eq!(set.status(), hyper::StatusCode::NO_CONTENT);
+    let ids: String =
+        client.query_one("SELECT policy_principals::text FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
+    assert!(ids.contains(&theirs.id.to_string()) && !ids.contains(&ours.id.to_string()), "{ids}");
+
+    // Deleting one leaves the other.
+    roles::delete(&client, &acme, "ada").await.unwrap();
+    assert!(Principal::load(&client, &first).await.unwrap().is_some());
+    assert!(Principal::load(&client, &second).await.unwrap().is_none());
 }

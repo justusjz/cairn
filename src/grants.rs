@@ -123,27 +123,20 @@ pub fn changed(policy: Option<&str>, bucket: &str, changes: &[(String, Permissio
     Ok(Some(policy.normalized().to_owned()))
 }
 
-/// Makes `changes` to `bucket`'s grants: (user, permission, grant or
-/// revoke). Users must be of the bucket's account.
-pub async fn change(client: &Object, bucket: &str, changes: &[(&str, Permission, bool)]) -> anyhow::Result<()> {
+/// Makes `changes` to `bucket`'s grants: (user of `account`, permission,
+/// grant or revoke). The bucket must be of that account (another account's
+/// users are named by its policy itself, for cross-account access).
+pub async fn change(client: &Object, account: &str, bucket: &str, changes: &[(&str, Permission, bool)]) -> anyhow::Result<()> {
     let Some(row) = client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await? else {
         return Err(Invalid(format!("no bucket named {bucket:?}; create it first")).into());
     };
-    let account: String = row.get(0);
+    let owner: String = row.get(0);
+    if owner != account && changes.iter().any(|(_, _, grant)| *grant) {
+        return Err(Invalid(format!("{bucket:?} is another account's bucket")).into());
+    }
     let mut arns = Vec::new();
     for (user, permission, grant) in changes {
-        let user_account: Option<String> = client
-            .query_opt_cached("SELECT account_id FROM roles WHERE name = $1", &[user])
-            .await?
-            .map(|row| row.get(0));
-        match user_account {
-            None if *grant => return Err(Invalid(format!("no user named {user:?}")).into()),
-            Some(other) if *grant && other != account => {
-                return Err(Invalid(format!("{user:?} is a user of another account than {bucket:?}'s")).into());
-            }
-            _ => {}
-        }
-        arns.push((user_arn(&account, user), *permission, *grant));
+        arns.push((user_arn(account, user), *permission, *grant));
     }
     apply(client, bucket, &arns).await?;
     Ok(())
@@ -174,8 +167,11 @@ async fn apply(client: &Object, bucket: &str, changes: &[(String, Permission, bo
     Err(crate::Contended(format!("changing the grants of bucket {bucket:?}")).into())
 }
 
-/// Every grant: (bucket, user, permission), of users who exist.
-pub async fn list(client: &Object) -> anyhow::Result<Vec<(String, String, Permission)>> {
+/// A grant: the bucket, its user (account ID, name), the permission.
+pub type Grant = (String, (String, String), Permission);
+
+/// Every grant, of users who exist.
+pub async fn list(client: &Object) -> anyhow::Result<Vec<Grant>> {
     let rows = client
         .query_cached(
             "SELECT b.name, b.policy, a.id FROM buckets b JOIN accounts a ON a.id = b.account_id
@@ -183,15 +179,17 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<(String, String, Permis
             &[],
         )
         .await?;
-    let users: HashSet<String> =
-        client.query_cached("SELECT name FROM roles", &[]).await?.iter().map(|r| r.get(0)).collect();
+    let users: HashSet<(String, String)> =
+        client.query_cached("SELECT account_id, name FROM roles", &[]).await?.iter().map(|r| (r.get(0), r.get(1))).collect();
     let mut grants = Vec::new();
     for row in rows {
         let (bucket, policy, account): (String, String, String) = (row.get(0), row.get(1), row.get(2));
         let prefix = user_arn(&account, "");
         for (arn, permission) in in_policy(&policy) {
-            if let Some(user) = arn.strip_prefix(&prefix).filter(|u| users.contains(*u)) {
-                grants.push((bucket.clone(), user.to_owned(), permission));
+            if let Some(user) = arn.strip_prefix(&prefix)
+                && users.contains(&(account.clone(), user.to_owned()))
+            {
+                grants.push((bucket.clone(), (account.clone(), user.to_owned()), permission));
             }
         }
     }
@@ -199,15 +197,17 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<(String, String, Permis
     Ok(grants)
 }
 
-/// Revokes everything `user` was granted (as it's deleted).
-pub async fn forget_user(client: &Object, user: &str) -> anyhow::Result<()> {
-    let mine: Vec<_> = list(client).await?.into_iter().filter(|(_, u, _)| u == user).collect();
+/// Revokes everything user `user` of `account` was granted (as it's
+/// deleted).
+pub async fn forget_user(client: &Object, account: &str, user: &str) -> anyhow::Result<()> {
+    let mine: Vec<_> =
+        list(client).await?.into_iter().filter(|(_, (a, u), _)| a == account && u == user).collect();
     let mut buckets: Vec<&String> = mine.iter().map(|(b, _, _)| b).collect();
     buckets.dedup();
     for bucket in buckets {
         let changes: Vec<_> =
-            mine.iter().filter(|(b, _, _)| b == bucket).map(|(_, u, p)| (u.as_str(), *p, false)).collect();
-        change(client, bucket, &changes).await?;
+            mine.iter().filter(|(b, _, _)| b == bucket).map(|(_, (_, u), p)| (u.as_str(), *p, false)).collect();
+        change(client, account, bucket, &changes).await?;
     }
     Ok(())
 }
@@ -234,7 +234,10 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
     let rows = client
         .query_cached(
             "SELECT g.bucket, g.role, g.permission, r.account_id
-             FROM role_grants g JOIN roles r ON r.name = g.role ORDER BY g.bucket",
+             FROM role_grants g JOIN roles r ON r.name = g.role
+             -- From before accounts: the first tenant account's users.
+             WHERE r.account_id = (SELECT id FROM accounts WHERE NOT operator ORDER BY created_at, id LIMIT 1)
+             ORDER BY g.bucket",
             &[],
         )
         .await?;

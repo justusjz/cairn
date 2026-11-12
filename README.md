@@ -229,8 +229,12 @@ shards are waiting to move.
 ## Users and permissions
 
 A **user** (called a role before; `cairn role` still works) is who makes S3
-requests. It has **access keys**: up to two, as in IAM, each an access key ID
-and a secret; its first key's ID is the user's name. Users are stored in
+requests. Its name is unique in its [account](#users-and-permissions), as in
+IAM: two accounts may each have an `ada`. It has **access keys**: up to two,
+as in IAM, each an access key ID and a secret; its first key's ID is the
+user's name, unless another account's user has that one (then it's random:
+`cairn user create` prints it). Access key IDs are unique across the
+cluster. Users are stored in
 Postgres, so every node picks up a change on the very next request; there is
 nothing to restart or sync.
 
@@ -347,7 +351,8 @@ hyphens, starting and ending with a letter or digit, not formatted like an IP
 address, and without the prefixes and suffixes S3 reserves (such as `xn--` or
 `-s3alias`).
 
-Manage users with `cairn user --database <URL> <command>`:
+Manage users with `cairn user --database <URL> [--account <name>] <command>`
+(the `default` account's, without `--account`):
 
 | Command | Description |
 | --- | --- |

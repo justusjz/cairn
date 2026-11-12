@@ -171,6 +171,10 @@ pub struct RoleArgs {
     /// PostgreSQL connection string (the same one the nodes use).
     #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
     database: String,
+    /// The account (by name) whose users these are: user names are unique
+    /// in an account. The first tenant account (`default`) if not given.
+    #[arg(long, global = true)]
+    account: Option<String>,
     #[command(subcommand)]
     command: RoleCommand,
 }
@@ -188,10 +192,6 @@ enum RoleCommand {
         /// Give the user `AdministratorAccess`: everything in its account.
         #[arg(long)]
         admin: bool,
-        /// The account (by name) to make it in; the first tenant account
-        /// (`default`) if not given.
-        #[arg(long)]
-        account: Option<String>,
     },
     /// Change a user's admin flag, and/or the secret of its access key named
     /// as it.
@@ -281,16 +281,25 @@ enum PolicyCommand {
 pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
     let pool = crate::db::connect(&args.database).await?;
     let client = pool.get().await?;
+    // The account's ID.
+    let account_id = match &args.account {
+        Some(name) => client
+            .query_opt_cached("SELECT id FROM accounts WHERE name = $1", &[name])
+            .await?
+            .map(|row| row.get::<_, String>(0))
+            .ok_or_else(|| invalid(format!("no account named {name:?}")))?,
+        None => account(&client).await?,
+    };
+    let account_id = account_id.as_str();
     match args.command {
         RoleCommand::Create {
             name,
             secret,
             admin,
-            account,
         } => {
             let generated = secret.is_none();
-            let secret = create_in(&client, account.as_deref(), &name, secret, admin).await?;
-            println!("access key: {name}");
+            let (key, secret) = create_for(&client, account_id, &name, secret, admin).await?;
+            println!("access key: {key}");
             if generated {
                 println!("secret key: {secret}");
             }
@@ -305,18 +314,17 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
                 (true, _) => Some(generate_secret()?),
                 (false, s) => s,
             };
-            update(&client, &name, admin, secret.clone()).await?;
+            update(&client, account_id, &name, admin, secret.clone()).await?;
             if rotate_secret && let Some(s) = secret {
                 println!("secret key: {s}");
             }
         }
-        RoleCommand::Delete { name } => delete(&client, &name).await?,
+        RoleCommand::Delete { name } => delete(&client, account_id, &name).await?,
         RoleCommand::List => {
-            let account = account(&client).await?;
-            for role in list(&client).await? {
+            for role in list(&client).await?.into_iter().filter(|r| r.account_id == account_id) {
                 let admin = if role.admin { " (admin)" } else { "" };
                 println!("{}{admin}", role.name);
-                println!("  arn:aws:iam::{account}:user/{}", role.name);
+                println!("  arn:aws:iam::{account_id}:user/{}", role.name);
                 println!("  id {}", role.id);
                 if let Some(entity) = role.kms_entity_id {
                     println!("  KMS entity {entity}");
@@ -334,13 +342,13 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
             }
         }
         RoleCommand::Enroll { name, console_url } => {
-            let token = crate::console::store::create_enrollment(&client, &name).await?;
+            let token = crate::console::store::create_enrollment(&client, account_id, &name).await?;
             let origin = console_url.map(|party| party.origin).unwrap_or_default();
             println!("{origin}/enroll#{token}");
         }
         RoleCommand::Key(command) => match command {
             KeyCommand::Create { user, id, secret } => {
-                let (id, secret) = create_key(&client, &user, id, secret).await?;
+                let (id, secret) = create_key(&client, account_id, &user, id, secret).await?;
                 println!("access key: {id}");
                 println!("secret key: {secret}");
             }
@@ -354,21 +362,21 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
                     "-" => std::io::read_to_string(std::io::stdin())?,
                     path => std::fs::read_to_string(path)?,
                 };
-                put_policy(&client, &user, &name, &document).await?;
+                put_policy(&client, account_id, &user, &name, &document).await?;
             }
-            PolicyCommand::Get { user, name } => println!("{}", get_policy(&client, &user, &name).await?),
-            PolicyCommand::Delete { user, name } => delete_policy(&client, &user, &name).await?,
+            PolicyCommand::Get { user, name } => println!("{}", get_policy(&client, account_id, &user, &name).await?),
+            PolicyCommand::Delete { user, name } => delete_policy(&client, account_id, &user, &name).await?,
         },
         RoleCommand::Grant {
             name,
             bucket,
             permissions,
-        } => grant(&client, &name, &bucket, &permissions).await?,
+        } => grant(&client, account_id, &name, &bucket, &permissions).await?,
         RoleCommand::Revoke {
             name,
             bucket,
             permissions,
-        } => revoke(&client, &name, &bucket, &permissions).await?,
+        } => revoke(&client, account_id, &name, &bucket, &permissions).await?,
     }
     Ok(())
 }
@@ -430,9 +438,10 @@ pub async fn create(
     secret: Option<String>,
     admin: bool,
 ) -> anyhow::Result<String> {
-    create_in(client, None, name, secret, admin).await
+    Ok(create_in(client, None, name, secret, admin).await?.1)
 }
 
+#[cfg(test)]
 /// Creates a user of the account named `account` (`None`: the first tenant
 /// account), as `create`.
 pub async fn create_in(
@@ -441,7 +450,7 @@ pub async fn create_in(
     name: &str,
     secret: Option<String>,
     admin: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, String)> {
     let account_id = match account {
         Some(account) => client
             .query_opt_cached("SELECT id FROM accounts WHERE name = $1", &[&account])
@@ -458,9 +467,6 @@ pub async fn create_in(
 /// which older Cairns read, is none that can be guessed.)
 pub async fn create_without_key(client: &Object, account_id: &str, name: &str) -> anyhow::Result<()> {
     validate_name(name)?;
-    if key_exists(client, name).await? {
-        return Err(invalid(format!("an access key named {name:?} already exists")));
-    }
     let inserted = client
         .execute_cached(
             "INSERT INTO roles (name, secret, admin, account_id)
@@ -475,14 +481,15 @@ pub async fn create_without_key(client: &Object, account_id: &str, name: &str) -
     Ok(())
 }
 
-/// Creates a user of the account `account_id`, as `create`.
+/// Creates a user of the account `account_id`, with an access key named as
+/// it (if that's free; else a random one): the key's ID and secret.
 pub async fn create_for(
     client: &Object,
     account_id: &str,
     name: &str,
     secret: Option<String>,
     admin: bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<(String, String)> {
     validate_name(name)?;
     let secret = match secret {
         Some(s) => {
@@ -491,9 +498,12 @@ pub async fn create_for(
         }
         None => generate_secret()?,
     };
-    if key_exists(client, name).await? {
-        return Err(invalid(format!("an access key named {name:?} already exists")));
-    }
+    // Its first key is named as it, unless that's taken (by a user of
+    // another account, of the same name): then a random one.
+    let key = match key_exists(client, name).await? {
+        false => name.to_owned(),
+        true => generate_key_id()?,
+    };
     // One statement: the user and its key, or neither. (`roles.secret` is
     // what older Cairns authenticate with; the key's trigger keeps it.)
     let inserted = client
@@ -502,13 +512,13 @@ pub async fn create_for(
                  INSERT INTO roles (name, secret, admin, account_id) VALUES ($1, $2, $3, $4)
                  ON CONFLICT DO NOTHING RETURNING id
              )
-             INSERT INTO access_keys (access_key_id, role_id, secret) SELECT $1, id, $2 FROM r",
-            &[&name, &secret, &admin, &account_id],
+             INSERT INTO access_keys (access_key_id, role_id, secret) SELECT $5, id, $2 FROM r",
+            &[&name, &secret, &admin, &account_id, &key],
         )
         .await;
     match inserted {
         Ok(0) => Err(invalid(format!("a user named {name:?} already exists"))),
-        Ok(_) => Ok(secret),
+        Ok(_) => Ok((key, secret)),
         // Another key took the name meanwhile.
         Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
             Err(invalid(format!("an access key named {name:?} already exists")))
@@ -566,10 +576,20 @@ fn generate_key_id() -> anyhow::Result<String> {
     Ok(bytes.iter().map(|b| ALPHABET[(*b & 31) as usize] as char).collect())
 }
 
-/// Makes a new access key for `user` (with `id` and `secret`, or random
-/// ones), if it has fewer than two. Returns them.
+/// User `name` of account `account` (its ID): its ID, if there's one.
+pub async fn id_of(client: &Object, account: &str, name: &str) -> anyhow::Result<uuid::Uuid> {
+    client
+        .query_opt_cached("SELECT id FROM roles WHERE account_id = $1 AND name = $2", &[&account, &name])
+        .await?
+        .map(|row| row.get(0))
+        .ok_or_else(|| invalid(format!("no user named {name:?}")))
+}
+
+/// Makes a new access key for `user` of `account` (with `id` and `secret`,
+/// or random ones), if it has fewer than two. Returns them.
 pub async fn create_key(
     client: &Object,
+    account: &str,
     user: &str,
     id: Option<String>,
     secret: Option<String>,
@@ -588,10 +608,11 @@ pub async fn create_key(
         }
         None => generate_secret()?,
     };
+    let role = id_of(client, account, user).await?;
     // At most two (I10: `cairn_create_key` counts them under the user's
     // row, held exclusively).
     let status = client
-        .query_one_cached("SELECT pg_temp.cairn_create_key($1, $2, $3, $4)", &[&user, &id, &secret, &MAX_KEYS])
+        .query_one_cached("SELECT pg_temp.cairn_create_key($1, $2, $3, $4)", &[&role, &id, &secret, &MAX_KEYS])
         .await?;
     match status.get::<_, &str>(0) {
         "created" => Ok((id, secret)),
@@ -603,20 +624,22 @@ pub async fn create_key(
 }
 
 /// That there's no access key `id` (of `user`, if given).
-fn no_such_key(user: Option<&str>, id: &str) -> anyhow::Error {
+fn no_such_key(user: Option<(&str, &str)>, id: &str) -> anyhow::Error {
     match user {
-        Some(user) => invalid(format!("{user:?} has no access key {id:?}")),
+        Some((_, user)) => invalid(format!("{user:?} has no access key {id:?}")),
         None => invalid(format!("no access key {id:?}")),
     }
 }
 
-/// Deletes an access key; only `user`'s, if given.
-pub async fn delete_key(client: &Object, user: Option<&str>, id: &str) -> anyhow::Result<()> {
+/// Deletes an access key; only `user`'s (account ID, name), if given.
+pub async fn delete_key(client: &Object, user: Option<(&str, &str)>, id: &str) -> anyhow::Result<()> {
+    let (account, name) = user.unzip();
     let deleted = client
         .execute_cached(
             "DELETE FROM access_keys k USING roles r
-             WHERE k.access_key_id = $1 AND r.id = k.role_id AND ($2::text IS NULL OR r.name = $2)",
-            &[&id, &user],
+             WHERE k.access_key_id = $1 AND r.id = k.role_id
+               AND ($2::text IS NULL OR (r.account_id = $2 AND r.name = $3))",
+            &[&id, &account, &name],
         )
         .await?;
     if deleted == 0 {
@@ -625,13 +648,16 @@ pub async fn delete_key(client: &Object, user: Option<&str>, id: &str) -> anyhow
     Ok(())
 }
 
-/// Lets an access key sign requests, or stops it; only `user`'s, if given.
-pub async fn set_key_active(client: &Object, user: Option<&str>, id: &str, active: bool) -> anyhow::Result<()> {
+/// Lets an access key sign requests, or stops it; only `user`'s (account
+/// ID, name), if given.
+pub async fn set_key_active(client: &Object, user: Option<(&str, &str)>, id: &str, active: bool) -> anyhow::Result<()> {
+    let (account, name) = user.unzip();
     let updated = client
         .execute_cached(
             "UPDATE access_keys k SET active = $3 FROM roles r
-             WHERE k.access_key_id = $1 AND r.id = k.role_id AND ($2::text IS NULL OR r.name = $2)",
-            &[&id, &user, &active],
+             WHERE k.access_key_id = $1 AND r.id = k.role_id
+               AND ($2::text IS NULL OR (r.account_id = $2 AND r.name = $4))",
+            &[&id, &account, &active, &name],
         )
         .await?;
     if updated == 0 {
@@ -657,15 +683,16 @@ fn validate_policy_name(name: &str) -> anyhow::Result<()> {
 /// Sets `user`'s inline policy `name` to `document`, if it's a valid
 /// identity policy (see `policy`), and the user's policies stay within
 /// IAM's size.
-pub async fn put_policy(client: &Object, user: &str, name: &str, document: &str) -> anyhow::Result<()> {
+pub async fn put_policy(client: &Object, account: &str, user: &str, name: &str, document: &str) -> anyhow::Result<()> {
     validate_policy_name(name)?;
     crate::policy::Policy::parse(document, crate::policy::Kind::Identity)
         .map_err(|e| invalid(format!("{}: {}", e.code, e.message)))?;
     // Within IAM's size (I10: `cairn_put_policy` sizes them under the
     // user's row, held exclusively).
     let max = MAX_POLICIES as i32;
+    let role = id_of(client, account, user).await?;
     let status = client
-        .query_one_cached("SELECT pg_temp.cairn_put_policy($1, $2, $3, $4)", &[&user, &name, &document, &max])
+        .query_one_cached("SELECT pg_temp.cairn_put_policy($1, $2, $3, $4)", &[&role, &name, &document, &max])
         .await?;
     match status.get::<_, &str>(0) {
         "set" => Ok(()),
@@ -678,23 +705,24 @@ pub async fn put_policy(client: &Object, user: &str, name: &str, document: &str)
 }
 
 /// `user`'s inline policy `name`, as it was set.
-pub async fn get_policy(client: &Object, user: &str, name: &str) -> anyhow::Result<String> {
+pub async fn get_policy(client: &Object, account: &str, user: &str, name: &str) -> anyhow::Result<String> {
     let row = client
         .query_opt_cached(
             "SELECT p.document FROM role_policies p JOIN roles r ON r.id = p.role_id
-             WHERE r.name = $1 AND p.name = $2",
-            &[&user, &name],
+             WHERE r.account_id = $3 AND r.name = $1 AND p.name = $2",
+            &[&user, &name, &account],
         )
         .await?;
     row.map(|r| r.get(0)).ok_or_else(|| invalid(format!("{user:?} has no policy {name:?}")))
 }
 
 /// Deletes `user`'s inline policy `name`.
-pub async fn delete_policy(client: &Object, user: &str, name: &str) -> anyhow::Result<()> {
+pub async fn delete_policy(client: &Object, account: &str, user: &str, name: &str) -> anyhow::Result<()> {
     let deleted = client
         .execute_cached(
-            "DELETE FROM role_policies p USING roles r WHERE r.id = p.role_id AND r.name = $1 AND p.name = $2",
-            &[&user, &name],
+            "DELETE FROM role_policies p USING roles r
+             WHERE r.id = p.role_id AND r.account_id = $3 AND r.name = $1 AND p.name = $2",
+            &[&user, &name, &account],
         )
         .await?;
     if deleted == 0 {
@@ -706,6 +734,7 @@ pub async fn delete_policy(client: &Object, user: &str, name: &str) -> anyhow::R
 /// Changes a role's admin flag and/or secret.
 pub async fn update(
     client: &Object,
+    account: &str,
     name: &str,
     admin: Option<bool>,
     secret: Option<String>,
@@ -719,7 +748,9 @@ pub async fn update(
         validate_secret(s)?;
     }
     if let Some(admin) = admin {
-        let updated = client.execute_cached("UPDATE roles SET admin = $2 WHERE name = $1", &[&name, &admin]).await?;
+        let updated = client
+            .execute_cached("UPDATE roles SET admin = $2 WHERE name = $1 AND account_id = $3", &[&name, &admin, &account])
+            .await?;
         if updated == 0 {
             return Err(invalid(format!("no user named {name:?}")));
         }
@@ -729,8 +760,8 @@ pub async fn update(
         let updated = client
             .execute_cached(
                 "UPDATE access_keys k SET secret = $2 FROM roles r
-                 WHERE r.name = $1 AND k.role_id = r.id AND k.access_key_id = r.name",
-                &[&name, &secret],
+                 WHERE r.name = $1 AND r.account_id = $3 AND k.role_id = r.id AND k.access_key_id = r.name",
+                &[&name, &secret, &account],
             )
             .await?;
         if updated == 0 {
@@ -743,13 +774,12 @@ pub async fn update(
 }
 
 /// Deletes a role and all its grants.
-pub async fn delete(client: &Object, name: &str) -> anyhow::Result<()> {
+pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Result<()> {
+    let role = id_of(client, account, name).await?;
     // Its grants first: they're statements of buckets' policies.
-    crate::grants::forget_user(client, name).await?;
-    // Any rows of `role_grants` left are locked in the lock protocol's order first (see
-    // `cairn_delete_role`).
+    crate::grants::forget_user(client, account, name).await?;
     let deleted: bool = client
-        .query_one_cached("SELECT pg_temp.cairn_delete_role($1)", &[&name])
+        .query_one_cached("SELECT pg_temp.cairn_delete_role($1)", &[&role])
         .await?
         .get(0);
     if !deleted {
@@ -843,10 +873,11 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
     rows.iter()
         .map(|r| {
             let name: String = r.get(0);
+            let account_id: String = r.get(11);
             Ok(RoleInfo {
                 grants: grants
                     .iter()
-                    .filter(|(_, user, _)| *user == name)
+                    .filter(|(_, (account, user), _)| *account == account_id && *user == name)
                     .map(|(bucket, _, permission)| (bucket.clone(), *permission))
                     .collect(),
                 name,
@@ -869,42 +900,32 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
         .collect()
 }
 
-/// Fails with a clear message if `name` isn't a role, so a grant/revoke on a
-/// typo'd name doesn't silently do nothing (or trip the FK with a raw error).
-async fn require_role(client: &Object, name: &str) -> anyhow::Result<()> {
-    if client
-        .query_opt_cached("SELECT 1 FROM roles WHERE name = $1", &[&name])
-        .await?
-        .is_none()
-    {
-        return Err(invalid(format!("no user named {name:?}")));
-    }
-    Ok(())
-}
-
-/// Grants `name` permissions on an existing bucket of its account: as
-/// statements of the bucket's policy (see `grants`).
+/// Grants `name` (of `account`) permissions on an existing bucket of its
+/// account: as statements of the bucket's policy (see `grants`).
 pub async fn grant(
     client: &Object,
+    account: &str,
     name: &str,
     bucket: &str,
     permissions: &[Permission],
 ) -> anyhow::Result<()> {
-    require_role(client, name).await?;
+    id_of(client, account, name).await?;
     let changes: Vec<_> = permissions.iter().map(|p| (name, *p, true)).collect();
-    crate::grants::change(client, bucket, &changes).await
+    crate::grants::change(client, account, bucket, &changes).await
 }
 
-/// Revokes `name`'s permissions on a bucket; all of them if none are given.
+/// Revokes `name`'s (of `account`) permissions on a bucket; all of them if
+/// none are given.
 pub async fn revoke(
     client: &Object,
+    account: &str,
     name: &str,
     bucket: &str,
     permissions: &[Permission],
 ) -> anyhow::Result<()> {
-    require_role(client, name).await?;
+    id_of(client, account, name).await?;
     let all = [Permission::Read, Permission::Write, Permission::DeleteVersion];
     let permissions = if permissions.is_empty() { &all[..] } else { permissions };
     let changes: Vec<_> = permissions.iter().map(|p| (name, *p, false)).collect();
-    crate::grants::change(client, bucket, &changes).await
+    crate::grants::change(client, account, bucket, &changes).await
 }

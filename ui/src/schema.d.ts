@@ -1317,6 +1317,11 @@ export interface components {
             rate: number;
         };
         NewRole: {
+            /**
+             * @description The account (its ID) to make it in, on the dashboard; the first
+             *     tenant account if not given. A console session's own, there.
+             */
+            account?: string | null;
             admin?: boolean;
             name: string;
             /** @description At least 8 characters; one is generated if not given. */
@@ -2913,7 +2918,10 @@ export interface operations {
     };
     delete_role: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -2949,7 +2957,10 @@ export interface operations {
     };
     set_admin: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -2989,7 +3000,10 @@ export interface operations {
     };
     create_enrollment: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -3026,7 +3040,10 @@ export interface operations {
     };
     grant: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -3068,6 +3085,8 @@ export interface operations {
         parameters: {
             query: {
                 bucket: string;
+                /** @description The user's account (its ID), on the dashboard (see `InAccount`). */
+                account?: string;
                 /** @description The permission to revoke; all of them on the bucket if not given. */
                 permission?: components["schemas"]["Permission"];
             };
@@ -3106,7 +3125,10 @@ export interface operations {
     };
     create_key: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -3143,7 +3165,10 @@ export interface operations {
     };
     set_key: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -3184,7 +3209,10 @@ export interface operations {
     };
     delete_key: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -3221,7 +3249,10 @@ export interface operations {
     };
     get_policy: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -3259,7 +3290,10 @@ export interface operations {
     };
     put_policy: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -3300,7 +3334,10 @@ export interface operations {
     };
     delete_policy: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;
@@ -3337,7 +3374,10 @@ export interface operations {
     };
     rotate_secret: {
         parameters: {
-            query?: never;
+            query?: {
+                /** @description The account (its ID), on the dashboard. */
+                account?: string;
+            };
             header?: never;
             path: {
                 role: string;

@@ -1387,6 +1387,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1423,6 +1432,15 @@
             "name": "role",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1475,6 +1493,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1517,6 +1544,15 @@
             "name": "role",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1576,6 +1612,15 @@
             }
           },
           {
+            "name": "account",
+            "in": "query",
+            "description": "The user's account (its ID), on the dashboard (see `InAccount`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "name": "permission",
             "in": "query",
             "description": "The permission to revoke; all of them on the bucket if not given.",
@@ -1619,6 +1664,15 @@
             "name": "role",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1672,6 +1726,15 @@
             "name": "key",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1730,6 +1793,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1774,6 +1846,15 @@
             "name": "policy",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1825,6 +1906,15 @@
             "name": "policy",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1883,6 +1973,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -1919,6 +2018,15 @@
             "name": "role",
             "in": "path",
             "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "account",
+            "in": "query",
+            "description": "The account (its ID), on the dashboard.",
+            "required": false,
             "schema": {
               "type": "string"
             }
@@ -3686,6 +3794,13 @@
           "name"
         ],
         "properties": {
+          "account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account (its ID) to make it in, on the dashboard; the first\ntenant account if not given. A console session's own, there."
+          },
           "admin": {
             "type": "boolean"
           },

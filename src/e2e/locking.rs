@@ -253,7 +253,7 @@ async fn cors_waits_only_for_bucket_changes() {
 async fn a_users_keys_are_counted_after_its_row_is_held() {
     let Some(app) = node().await else { return };
     crate::roles::create(&connection(&app).await, "u", None, false).await.unwrap();
-    let make = "SELECT pg_temp.cairn_create_key('u', $1, 'secretsecret', 2)";
+    let make = "SELECT pg_temp.cairn_create_key((SELECT id FROM roles WHERE name = 'u'), $1, 'secretsecret', 2)";
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
     let made: String = tx.query_one(make, &[&"SECOND"]).await.unwrap().get(0);

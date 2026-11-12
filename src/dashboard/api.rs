@@ -887,7 +887,7 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         .collect();
     // Users with a grant on it (see `grants`).
     let mut roles: HashMap<String, i64> = HashMap::new();
-    let mut granted: Vec<(String, String)> =
+    let mut granted: Vec<(String, (String, String))> =
         crate::grants::list(&client).await?.into_iter().map(|(bucket, user, _)| (bucket, user)).collect();
     granted.dedup();
     for (bucket, _) in granted {
@@ -1952,29 +1952,35 @@ async fn delete_oidc_provider(
 
 // ─── Roles ───────────────────────────────────────────────────────────────────
 
-/// The account of user `name`, if the actor may know of it: any user, to the
-/// operator; one of its own account, to a console session (another's is
-/// none, as in IAM).
-async fn account_of(app: &App, actor: &Actor, name: &str) -> Result<String> {
-    let account: Option<String> = app
-        .pool
-        .get()
-        .await?
-        .query_opt_cached("SELECT account_id FROM roles WHERE name = $1", &[&name])
-        .await?
-        .map(|row| row.get(0));
-    match (account, actor.account()) {
-        (Some(account), Some(mine)) if account != mine => Err(ApiError::BadRequest(format!("no user named {name:?}"))),
-        (Some(account), _) => Ok(account),
-        (None, _) => Err(ApiError::BadRequest(format!("no user named {name:?}"))),
-    }
+/// Which account's users a request means: a console session's own; on the
+/// operator's dashboard, the one its `account` (ID) says, or else the first
+/// tenant account.
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct InAccount {
+    /// The account (its ID), on the dashboard.
+    account: Option<String>,
 }
 
-/// Refuses the request unless IAM's `action` on user `name` (of the actor's
-/// account) is allowed.
-async fn check_user(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str) -> Result<()> {
-    let account = account_of(app, actor, name).await?;
-    actor.check(app, action, On::User(account, name.to_owned())).await
+/// The account a request about user `name` means (see `InAccount`), if the
+/// user is there.
+async fn account_of(app: &App, actor: &Actor, at: &InAccount, name: &str) -> Result<String> {
+    let client = app.pool.get().await?;
+    let account = match (actor.account(), &at.account) {
+        (Some(mine), _) => mine.to_owned(),
+        (None, Some(account)) => account.clone(),
+        (None, None) => roles::account(&client).await?,
+    };
+    roles::id_of(&client, &account, name).await?;
+    Ok(account)
+}
+
+/// Refuses the request unless IAM's `action` on user `name` (of the account
+/// it means) is allowed: that account.
+async fn check_user(app: &Arc<App>, actor: &Actor, at: &InAccount, action: &'static str, name: &str) -> Result<String> {
+    let account = account_of(app, actor, at, name).await?;
+    actor.check(app, action, On::User(account.clone(), name.to_owned())).await?;
+    Ok(account)
 }
 
 
@@ -2058,6 +2064,9 @@ struct NewRole {
     secret: Option<String>,
     #[serde(default)]
     admin: bool,
+    /// The account (its ID) to make it in, on the dashboard; the first
+    /// tenant account if not given. A console session's own, there.
+    account: Option<String>,
 }
 
 /// A role's secret, which is shown only this once.
@@ -2080,16 +2089,17 @@ async fn create_role(
     let client = app.pool.get().await?;
     // In the console session's account; on the dashboard, the first
     // tenant's.
-    let account = match actor.account() {
-        Some(account) => account.to_owned(),
-        None => roles::account(&client).await?,
+    let account = match (actor.account(), &body.account) {
+        (Some(account), _) => account.to_owned(),
+        (None, Some(account)) => account.clone(),
+        (None, None) => roles::account(&client).await?,
     };
     actor.check(&app, "iam:CreateUser", On::User(account.clone(), body.name.clone())).await?;
     if body.admin {
         actor.check(&app, "iam:AttachUserPolicy", On::User(account.clone(), body.name.clone())).await?;
     }
     let secret = body.secret.filter(|s| !s.is_empty());
-    let secret = roles::create_for(&client, &account, &body.name, secret, body.admin).await?;
+    let (key, secret) = roles::create_for(&client, &account, &body.name, secret, body.admin).await?;
     // Its identity in the KMS, so that key owners can grant it keys now; if
     // the KMS can't be reached, the next maintenance pass makes it. In the
     // background: a slow KMS mustn't hold up the role.
@@ -2101,21 +2111,19 @@ async fn create_role(
     });
     Ok((
         StatusCode::CREATED,
-        Json(Secret {
-            name: body.name,
-            secret,
-        }),
+        // The key's ID (the user's name, if that was free).
+        Json(Secret { name: key, secret }),
     ))
 }
 
-#[utoipa::path(delete, path = "/roles/{role}", params(("role" = String, Path)), responses(
+#[utoipa::path(delete, path = "/roles/{role}", params(("role" = String, Path), InAccount), responses(
     (status = 204, description = "Deleted, with its grants"),
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_role(State(app): AppState, Extension(actor): Extension<Actor>, Path(role): Path<String>) -> Result<StatusCode> {
-    check_user(&app, &actor, "iam:DeleteUser", &role).await?;
-    roles::delete(&app.pool.get().await?, &role).await?;
+async fn delete_role(State(app): AppState, Extension(actor): Extension<Actor>, Path(role): Path<String>, Query(at): Query<InAccount>) -> Result<StatusCode> {
+    let account = check_user(&app, &actor, &at, "iam:DeleteUser", &role).await?;
+    roles::delete(&app.pool.get().await?, &account, &role).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2143,7 +2151,7 @@ struct NewSecret {
 }
 
 /// Replaces a role's secret.
-#[utoipa::path(post, path = "/roles/{role}/secret", params(("role" = String, Path)),
+#[utoipa::path(post, path = "/roles/{role}/secret", params(("role" = String, Path), InAccount),
     request_body = NewSecret, responses(
         (status = 200, body = Secret),
         (status = "4XX", body = ErrorBody),
@@ -2153,14 +2161,15 @@ async fn rotate_secret(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
+    Query(at): Query<InAccount>,
     Json(body): Json<NewSecret>,
 ) -> Result<Json<Secret>> {
-    check_user(&app, &actor, "iam:UpdateAccessKey", &role).await?;
+    let account = check_user(&app, &actor, &at, "iam:UpdateAccessKey", &role).await?;
     let secret = match body.secret.filter(|s| !s.is_empty()) {
         Some(s) => s,
         None => roles::generate_secret()?,
     };
-    roles::update(&app.pool.get().await?, &role, None, Some(secret.clone())).await?;
+    roles::update(&app.pool.get().await?, &account, &role, None, Some(secret.clone())).await?;
     Ok(Json(Secret { name: role, secret }))
 }
 
@@ -2170,7 +2179,7 @@ struct AdminFlag {
 }
 
 /// Makes a role an admin, or not.
-#[utoipa::path(put, path = "/roles/{role}/admin", params(("role" = String, Path)),
+#[utoipa::path(put, path = "/roles/{role}/admin", params(("role" = String, Path), InAccount),
     request_body = AdminFlag, responses(
         (status = 204, description = "Changed"),
         (status = "4XX", body = ErrorBody),
@@ -2180,12 +2189,13 @@ async fn set_admin(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
+    Query(at): Query<InAccount>,
     Json(body): Json<AdminFlag>,
 ) -> Result<StatusCode> {
     // AdministratorAccess, attached or detached.
     let action = if body.admin { "iam:AttachUserPolicy" } else { "iam:DetachUserPolicy" };
-    check_user(&app, &actor, action, &role).await?;
-    roles::update(&app.pool.get().await?, &role, Some(body.admin), None).await?;
+    let account = check_user(&app, &actor, &at, action, &role).await?;
+    roles::update(&app.pool.get().await?, &account, &role, Some(body.admin), None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2196,7 +2206,7 @@ struct NewGrant {
 }
 
 /// Grants permissions on an existing bucket.
-#[utoipa::path(post, path = "/roles/{role}/grants", params(("role" = String, Path)),
+#[utoipa::path(post, path = "/roles/{role}/grants", params(("role" = String, Path), InAccount),
     request_body = NewGrant, responses(
         (status = 204, description = "Granted"),
         (status = "4XX", body = ErrorBody),
@@ -2206,16 +2216,18 @@ async fn grant(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
+    Query(at): Query<InAccount>,
     Json(body): Json<NewGrant>,
 ) -> Result<StatusCode> {
     if body.permissions.is_empty() {
         return Err(ApiError::BadRequest("pick at least one permission".into()));
     }
     // A grant is a statement of the bucket's policy (see `grants`).
-    account_of(&app, &actor, &role).await?;
+    let account = account_of(&app, &actor, &at, &role).await?;
     actor.check(&app, "s3:PutBucketPolicy", On::Bucket(body.bucket.clone())).await?;
     roles::grant(
         &app.pool.get().await?,
+        &account,
         &role,
         &body.bucket,
         &body.permissions,
@@ -2228,6 +2240,8 @@ async fn grant(
 #[into_params(parameter_in = Query)]
 struct RevokeParams {
     bucket: String,
+    /// The user's account (its ID), on the dashboard (see `InAccount`).
+    account: Option<String>,
     /// The permission to revoke; all of them on the bucket if not given.
     permission: Option<Permission>,
 }
@@ -2244,10 +2258,11 @@ async fn revoke(
     Path(role): Path<String>,
     Query(params): Query<RevokeParams>,
 ) -> Result<StatusCode> {
-    account_of(&app, &actor, &role).await?;
+    let at = InAccount { account: params.account.clone() };
+    let account = account_of(&app, &actor, &at, &role).await?;
     actor.check(&app, "s3:PutBucketPolicy", On::Bucket(params.bucket.clone())).await?;
     let permissions: Vec<Permission> = params.permission.into_iter().collect();
-    roles::revoke(&app.pool.get().await?, &role, &params.bucket, &permissions).await?;
+    roles::revoke(&app.pool.get().await?, &account, &role, &params.bucket, &permissions).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2264,7 +2279,7 @@ struct Enrollment {
 }
 
 /// Makes a role an enrollment link for the console, replacing its last.
-#[utoipa::path(post, path = "/roles/{role}/enrollment", params(("role" = String, Path)), responses(
+#[utoipa::path(post, path = "/roles/{role}/enrollment", params(("role" = String, Path), InAccount), responses(
     (status = 201, body = Enrollment),
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
@@ -2273,10 +2288,11 @@ async fn create_enrollment(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
+    Query(at): Query<InAccount>,
 ) -> Result<(StatusCode, Json<Enrollment>)> {
     // A way into the console: IAM's is a login profile.
-    check_user(&app, &actor, "iam:CreateLoginProfile", &role).await?;
-    let token = crate::console::store::create_enrollment(&app.pool.get().await?, &role).await?;
+    let account = check_user(&app, &actor, &at, "iam:CreateLoginProfile", &role).await?;
+    let token = crate::console::store::create_enrollment(&app.pool.get().await?, &account, &role).await?;
     let path = format!("/enroll#{token}");
     let url = app.dashboard.console_origin.as_ref().map(|origin| format!("{origin}{path}"));
     Ok((StatusCode::CREATED, Json(Enrollment { url, path })))
@@ -2293,7 +2309,7 @@ struct NewKey {
 
 /// Makes a new access key for a role, with a random ID and secret; a role
 /// has at most two.
-#[utoipa::path(post, path = "/roles/{role}/keys", params(("role" = String, Path)), responses(
+#[utoipa::path(post, path = "/roles/{role}/keys", params(("role" = String, Path), InAccount), responses(
     (status = 201, body = NewKey),
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
@@ -2302,9 +2318,10 @@ async fn create_key(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
+    Query(at): Query<InAccount>,
 ) -> Result<(StatusCode, Json<NewKey>)> {
-    check_user(&app, &actor, "iam:CreateAccessKey", &role).await?;
-    let (id, secret) = roles::create_key(&app.pool.get().await?, &role, None, None).await?;
+    let account = check_user(&app, &actor, &at, "iam:CreateAccessKey", &role).await?;
+    let (id, secret) = roles::create_key(&app.pool.get().await?, &account, &role, None, None).await?;
     Ok((StatusCode::CREATED, Json(NewKey { id, secret })))
 }
 
@@ -2314,7 +2331,7 @@ struct KeyState {
 }
 
 /// Lets one of the role's access keys sign requests, or stops it.
-#[utoipa::path(put, path = "/roles/{role}/keys/{key}", params(("role" = String, Path), ("key" = String, Path)),
+#[utoipa::path(put, path = "/roles/{role}/keys/{key}", params(("role" = String, Path), ("key" = String, Path), InAccount),
     request_body = KeyState, responses(
         (status = 204, description = "Changed"),
         (status = "4XX", body = ErrorBody),
@@ -2324,15 +2341,16 @@ async fn set_key(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path((role, key)): Path<(String, String)>,
+    Query(at): Query<InAccount>,
     Json(body): Json<KeyState>,
 ) -> Result<StatusCode> {
-    check_user(&app, &actor, "iam:UpdateAccessKey", &role).await?;
-    roles::set_key_active(&app.pool.get().await?, Some(&role), &key, body.active).await?;
+    let account = check_user(&app, &actor, &at, "iam:UpdateAccessKey", &role).await?;
+    roles::set_key_active(&app.pool.get().await?, Some((&account, &role)), &key, body.active).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Deletes one of the role's access keys.
-#[utoipa::path(delete, path = "/roles/{role}/keys/{key}", params(("role" = String, Path), ("key" = String, Path)),
+#[utoipa::path(delete, path = "/roles/{role}/keys/{key}", params(("role" = String, Path), ("key" = String, Path), InAccount),
     responses(
         (status = 204, description = "Deleted"),
         (status = "4XX", body = ErrorBody),
@@ -2342,9 +2360,10 @@ async fn delete_key(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path((role, key)): Path<(String, String)>,
+    Query(at): Query<InAccount>,
 ) -> Result<StatusCode> {
-    check_user(&app, &actor, "iam:DeleteAccessKey", &role).await?;
-    roles::delete_key(&app.pool.get().await?, Some(&role), &key).await?;
+    let account = check_user(&app, &actor, &at, "iam:DeleteAccessKey", &role).await?;
+    roles::delete_key(&app.pool.get().await?, Some((&account, &role)), &key).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2358,7 +2377,7 @@ struct PolicyDocument {
 
 /// One of the role's inline policies, as it was set.
 #[utoipa::path(get, path = "/roles/{role}/policies/{policy}",
-    params(("role" = String, Path), ("policy" = String, Path)), responses(
+    params(("role" = String, Path), ("policy" = String, Path), InAccount), responses(
         (status = 200, body = PolicyDocument),
         (status = "4XX", body = ErrorBody),
         (status = "5XX", body = ErrorBody),
@@ -2367,15 +2386,16 @@ async fn get_policy(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path((role, policy)): Path<(String, String)>,
+    Query(at): Query<InAccount>,
 ) -> Result<Json<PolicyDocument>> {
-    check_user(&app, &actor, "iam:GetUserPolicy", &role).await?;
-    let document = roles::get_policy(&app.pool.get().await?, &role, &policy).await?;
+    let account = check_user(&app, &actor, &at, "iam:GetUserPolicy", &role).await?;
+    let document = roles::get_policy(&app.pool.get().await?, &account, &role, &policy).await?;
     Ok(Json(PolicyDocument { document }))
 }
 
 /// Sets one of the role's inline policies, if it's a valid identity policy.
 #[utoipa::path(put, path = "/roles/{role}/policies/{policy}",
-    params(("role" = String, Path), ("policy" = String, Path)), request_body = PolicyDocument, responses(
+    params(("role" = String, Path), ("policy" = String, Path), InAccount), request_body = PolicyDocument, responses(
         (status = 204, description = "Set"),
         (status = "4XX", body = ErrorBody),
         (status = "5XX", body = ErrorBody),
@@ -2384,16 +2404,17 @@ async fn put_policy(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path((role, policy)): Path<(String, String)>,
+    Query(at): Query<InAccount>,
     Json(body): Json<PolicyDocument>,
 ) -> Result<StatusCode> {
-    check_user(&app, &actor, "iam:PutUserPolicy", &role).await?;
-    roles::put_policy(&app.pool.get().await?, &role, &policy, &body.document).await?;
+    let account = check_user(&app, &actor, &at, "iam:PutUserPolicy", &role).await?;
+    roles::put_policy(&app.pool.get().await?, &account, &role, &policy, &body.document).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// Deletes one of the role's inline policies.
 #[utoipa::path(delete, path = "/roles/{role}/policies/{policy}",
-    params(("role" = String, Path), ("policy" = String, Path)), responses(
+    params(("role" = String, Path), ("policy" = String, Path), InAccount), responses(
         (status = 204, description = "Deleted"),
         (status = "4XX", body = ErrorBody),
         (status = "5XX", body = ErrorBody),
@@ -2402,9 +2423,10 @@ async fn delete_policy(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path((role, policy)): Path<(String, String)>,
+    Query(at): Query<InAccount>,
 ) -> Result<StatusCode> {
-    check_user(&app, &actor, "iam:DeleteUserPolicy", &role).await?;
-    roles::delete_policy(&app.pool.get().await?, &role, &policy).await?;
+    let account = check_user(&app, &actor, &at, "iam:DeleteUserPolicy", &role).await?;
+    roles::delete_policy(&app.pool.get().await?, &account, &role, &policy).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

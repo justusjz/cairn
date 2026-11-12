@@ -377,7 +377,11 @@ impl Iam<'_> {
             return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn has no permissions boundaries yet"));
         }
         self.check("iam:CreateUser", On::User(self.account().to_owned(), name.clone())).await?;
-        let exists = self.client.query_opt_cached("SELECT 1 FROM roles WHERE name = $1", &[&name]).await?.is_some();
+        let exists = self
+            .client
+            .query_opt_cached("SELECT 1 FROM roles WHERE name = $1 AND account_id = $2", &[&name, &self.account()])
+            .await?
+            .is_some();
         if exists {
             return Err(error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists.")));
         }
@@ -412,13 +416,13 @@ impl Iam<'_> {
         if user.admin {
             return Err(conflict("detach all policies"));
         }
-        roles::delete(self.client, &user.name).await?;
+        roles::delete(self.client, self.account(), &user.name).await?;
         Ok(None)
     }
 
     async fn create_access_key(&mut self, params: &Params) -> Result<Option<String>> {
         let user = self.user(params, "iam:CreateAccessKey").await?;
-        let (id, secret) = roles::create_key(self.client, &user.name, None, None).await.map_err(|e| {
+        let (id, secret) = roles::create_key(self.client, self.account(), &user.name, None, None).await.map_err(|e| {
             match e.downcast::<roles::Invalid>() {
                 Ok(i) if i.0.contains("access keys already") => error(
                     StatusCode::CONFLICT,
@@ -495,14 +499,14 @@ impl Iam<'_> {
             }
         };
         let id = self.key_of(params, &user).await?;
-        roles::set_key_active(self.client, Some(&user.name), &id, active).await?;
+        roles::set_key_active(self.client, Some((self.account(), &user.name)), &id, active).await?;
         Ok(None)
     }
 
     async fn delete_access_key(&mut self, params: &Params) -> Result<Option<String>> {
         let user = self.user(params, "iam:DeleteAccessKey").await?;
         let id = self.key_of(params, &user).await?;
-        roles::delete_key(self.client, Some(&user.name), &id).await?;
+        roles::delete_key(self.client, Some((self.account(), &user.name)), &id).await?;
         Ok(None)
     }
 
@@ -511,7 +515,7 @@ impl Iam<'_> {
         let user = self.user(params, "iam:PutUserPolicy").await?;
         let name = params.required("PolicyName")?;
         let document = params.required("PolicyDocument")?;
-        roles::put_policy(self.client, &user.name, name, document).await.map_err(|e| match e.downcast::<roles::Invalid>() {
+        roles::put_policy(self.client, self.account(), &user.name, name, document).await.map_err(|e| match e.downcast::<roles::Invalid>() {
             Ok(i) if i.0.starts_with("Malformed") || i.0.contains("Policy") && i.0.contains(':') => {
                 let message = i.0.split_once(": ").map_or(i.0.as_str(), |(_, m)| m).to_owned();
                 error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", message)
@@ -531,7 +535,7 @@ impl Iam<'_> {
         params.required("UserName")?;
         let user = self.user(params, "iam:GetUserPolicy").await?;
         let name = params.required("PolicyName")?;
-        let document = roles::get_policy(self.client, &user.name, name).await.map_err(|_| {
+        let document = roles::get_policy(self.client, self.account(), &user.name, name).await.map_err(|_| {
             error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The user policy with name {name} cannot be found."))
         })?;
         // URL-encoded, as IAM gives policy documents (RFC 3986).
@@ -559,7 +563,7 @@ impl Iam<'_> {
         params.required("UserName")?;
         let user = self.user(params, "iam:DeleteUserPolicy").await?;
         let name = params.required("PolicyName")?;
-        roles::delete_policy(self.client, &user.name, name).await.map_err(|_| {
+        roles::delete_policy(self.client, self.account(), &user.name, name).await.map_err(|_| {
             error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The user policy with name {name} cannot be found."))
         })?;
         Ok(None)
@@ -582,7 +586,7 @@ impl Iam<'_> {
         if !attach && !user.admin {
             return Err(error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} was not found.")));
         }
-        roles::update(self.client, &user.name, Some(attach), None).await?;
+        roles::update(self.client, self.account(), &user.name, Some(attach), None).await?;
         Ok(None)
     }
 

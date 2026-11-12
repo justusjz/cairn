@@ -360,7 +360,7 @@ mod e2e {
         assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
 
         // The link.
-        let token = store::create_enrollment(&client, "ada").await.unwrap();
+        let token = store::create_enrollment(&client, &crate::roles::account(&client).await.unwrap(), "ada").await.unwrap();
         let (status, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
         assert_eq!(status, StatusCode::OK, "{ceremony}");
         assert_eq!(ceremony["identity"], "ada @ default");
@@ -439,9 +439,14 @@ mod e2e {
         laptop.counter = 20;
         let (status, _) = sign_in(&mut browser, &mut laptop).await;
         assert_eq!(status, StatusCode::OK);
-        roles::delete(&client, "ada").await.unwrap();
+        roles::delete(&client, &crate::roles::account(&client).await.unwrap(), "ada").await.unwrap();
         assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(store::reap(&client).await.unwrap(), 0);
+    }
+
+    /// The ID of the account named `name`.
+    async fn account_id(client: &deadpool_postgres::Object, name: &str) -> String {
+        client.query_one("SELECT id FROM accounts WHERE name = $1", &[&name]).await.unwrap().get(0)
     }
 
     /// A browser signed in as a new user `name` (with a passkey of its own).
@@ -454,7 +459,11 @@ mod e2e {
     async fn signed_in_to(console: &Arc<Console>, account: Option<&str>, name: &str, admin: bool) -> Browser {
         let client = console.app.pool.get().await.unwrap();
         roles::create_in(&client, account, name, None, admin).await.unwrap();
-        let token = store::create_enrollment(&client, name).await.unwrap();
+        let account = match account {
+            Some(account) => account_id(&client, account).await,
+            None => crate::roles::account(&client).await.unwrap(),
+        };
+        let token = store::create_enrollment(&client, &account, name).await.unwrap();
         let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let (_, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
         let mut body = registration(&mut Authenticator::ed25519(), &ceremony, "Key");
@@ -520,7 +529,7 @@ mod e2e {
 
         // A reader sees only its bucket, lists and downloads, but can't write.
         let mut reader = signed_in(&console, "reader", false).await;
-        roles::grant(&client, "reader", bucket, &[roles::Permission::Read]).await.unwrap();
+        roles::grant(&client, &crate::roles::account(&client).await.unwrap(), "reader", bucket, &[roles::Permission::Read]).await.unwrap();
         let (_, buckets) = reader.send("GET", "/api/buckets", None).await;
         let names: Vec<_> = buckets.as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap()).collect();
         assert_eq!(names, [bucket]);
@@ -529,7 +538,7 @@ mod e2e {
 
         // A writer uploads; the reader then lists and reads it.
         let mut writer = signed_in(&console, "writer", false).await;
-        roles::grant(&client, "writer", bucket, &[roles::Permission::Write]).await.unwrap();
+        roles::grant(&client, &crate::roles::account(&client).await.unwrap(), "writer", bucket, &[roles::Permission::Write]).await.unwrap();
         let path = format!("/api/buckets/{bucket}/object?key=dir%2Fhello.txt");
         assert_eq!(writer.upload(&path, b"hello").await, StatusCode::NO_CONTENT);
         let (status, listing) = reader.send("GET", &format!("/api/buckets/{bucket}/objects?prefix=dir%2F"), None).await;
@@ -565,7 +574,7 @@ mod e2e {
         assert_eq!(admin.send("DELETE", &format!("/api/buckets/{bucket}/policy"), None).await.0, StatusCode::NO_CONTENT);
         // The grants were statements of that policy: the writer has none now.
         assert_eq!(writer.send("DELETE", &delete, None).await.0, StatusCode::FORBIDDEN);
-        roles::grant(&client, "writer", bucket, &[roles::Permission::Write]).await.unwrap();
+        roles::grant(&client, &crate::roles::account(&client).await.unwrap(), "writer", bucket, &[roles::Permission::Write]).await.unwrap();
         assert_eq!(writer.send("DELETE", &delete, None).await.0, StatusCode::NO_CONTENT);
 
         // Versioning, as the admin may set it.
@@ -631,7 +640,7 @@ mod e2e {
         // A new login, through the default account's link.
         let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let mut key = Authenticator::p256();
-        let token = store::create_enrollment(&client, "dora").await.unwrap();
+        let token = store::create_enrollment(&client, &crate::roles::account(&client).await.unwrap(), "dora").await.unwrap();
         let (_, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
         let mut body = registration(&mut key, &ceremony, "Laptop");
         body["token"] = json!(token);
@@ -645,7 +654,7 @@ mod e2e {
         assert_eq!((me["identity"]["account"].as_str(), &me["identity"]["user"]), (Some("acme"), &Value::Null));
         assert!(me["identity"]["arn"].as_str().unwrap().ends_with(":root"));
         // One identity per account: not acme's user as well.
-        let user = store::create_enrollment(&client, "dora-acme").await.unwrap();
+        let user = store::create_enrollment(&client, &account_id(&client, "acme").await, "dora-acme").await.unwrap();
         let (status, err) = browser.send("POST", "/api/enroll/link", Some(json!({ "token": user }))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(err["error"].as_str().unwrap().contains("as someone else"), "{err}");
@@ -695,7 +704,7 @@ mod e2e {
 
         // The operator account: linked, then switched into only with a fresh
         // passkey assertion.
-        let ops = store::create_enrollment(&client, "dora-ops").await.unwrap();
+        let ops = store::create_enrollment(&client, &account_id(&client, "operator").await, "dora-ops").await.unwrap();
         let (status, me) = browser.send("POST", "/api/enroll/link", Some(json!({ "token": ops }))).await;
         assert_eq!(status, StatusCode::OK, "{me}");
         let ops_id = me["identities"].as_array().unwrap().iter().find(|i| i["operator"] == true).unwrap()["account_id"].clone();
@@ -724,7 +733,7 @@ mod e2e {
         assert_eq!(browser.send("POST", "/api/buckets", Some(json!({ "name": "ops-data" }))).await.0, StatusCode::FORBIDDEN);
 
         // Deleting a user unlinks it, and ends the sessions acting as it.
-        roles::delete(&client, "dora-ops").await.unwrap();
+        roles::delete(&client, &account_id(&client, "operator").await, "dora-ops").await.unwrap();
         assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
         let (status, me) = sign_in(&mut browser, &mut key).await;
         assert_eq!(status, StatusCode::OK, "{me}");
@@ -743,7 +752,7 @@ mod e2e {
         crate::e2e::put(&app, "secret.txt", b"tenant data".to_vec()).await;
         let mut tenant = signed_in(&console, "tenant-admin", true).await;
         roles::create_in(&client, Some("operator"), "super", None, true).await.unwrap();
-        let token = store::create_enrollment(&client, "super").await.unwrap();
+        let token = store::create_enrollment(&client, &account_id(&client, "operator").await, "super").await.unwrap();
         let mut ops = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let (_, ceremony) = ops.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
         let mut body = registration(&mut Authenticator::ed25519(), &ceremony, "Key");
@@ -813,7 +822,7 @@ mod e2e {
         assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
         // Her own policy allows it, as well: now she may.
         let own = format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#);
-        roles::put_policy(&client, "eve", "read-shared", &own).await.unwrap();
+        roles::put_policy(&client, &acme, "eve", "read-shared", &own).await.unwrap();
         assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::OK);
         // But only what both allow: not listing it.
         assert_eq!(eve.send("GET", &format!("/api/buckets/{bucket}/objects"), None).await.0, StatusCode::FORBIDDEN);
@@ -824,7 +833,7 @@ mod e2e {
         let (status, err) = owner.send("PUT", &format!("/api/buckets/{bucket}/policy"), Some(json!({ "document": policy }))).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
         assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::OK);
-        roles::delete_policy(&client, "eve", "read-shared").await.unwrap();
+        roles::delete_policy(&client, &acme, "eve", "read-shared").await.unwrap();
         assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
         // An account that doesn't exist is no principal.
         let policy = format!(
@@ -899,7 +908,7 @@ mod e2e {
 
         // Enrolling through a link: a new login, signed in at the provider.
         roles::create(&client, "sam", None, false).await.unwrap();
-        let token = store::create_enrollment(&client, "sam").await.unwrap();
+        let token = store::create_enrollment(&client, &crate::roles::account(&client).await.unwrap(), "sam").await.unwrap();
         let mut sam = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let url = sam.start_oidc(json!({ "purpose": "enroll", "token": token })).await;
         let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
@@ -949,9 +958,9 @@ mod e2e {
         assert_eq!(tenant.send("DELETE", "/api/oidc/mock", None).await.0, StatusCode::NO_CONTENT);
 
         // Signing in again at the provider, to act as the operator.
-        let link = store::create_enrollment(&client, "op").await.unwrap();
+        let link = store::create_enrollment(&client, &account_id(&client, "operator").await, "op").await.unwrap();
         roles::create_in(&client, Some("operator"), "sam-ops", None, true).await.unwrap();
-        let ops_link = store::create_enrollment(&client, "sam-ops").await.unwrap();
+        let ops_link = store::create_enrollment(&client, &account_id(&client, "operator").await, "sam-ops").await.unwrap();
         let _ = link;
         assert_eq!(sam.send("POST", "/api/enroll/link", Some(json!({ "token": ops_link }))).await.0, StatusCode::OK);
         let (_, me) = sam.send("GET", "/api/me", None).await;

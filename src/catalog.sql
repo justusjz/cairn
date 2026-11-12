@@ -1442,12 +1442,12 @@ $$;
 -- row shared, which it holds already; its trigger keeps `roles.secret` (see
 -- migration 29), on the same row. Returns 'created', 'no_such_user',
 -- 'too_many' or 'taken' (another key has the ID).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_create_key(p_user text, p_id text, p_secret text, p_max integer)
+CREATE OR REPLACE FUNCTION pg_temp.cairn_create_key(p_role uuid, p_id text, p_secret text, p_max integer)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
     v_role uuid;
 BEGIN
-    SELECT id INTO v_role FROM roles WHERE name = p_user FOR UPDATE;
+    SELECT id INTO v_role FROM roles WHERE id = p_role FOR UPDATE;
     IF NOT FOUND THEN
         RETURN 'no_such_user';
     END IF;
@@ -1467,12 +1467,12 @@ $$;
 -- more than `p_max` characters (but whitespace) together (I10). Takes R(r)
 -- exclusively, then sizes the others. Returns 'set', 'no_such_user' or
 -- 'too_big'.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_put_policy(p_user text, p_name text, p_document text, p_max integer)
+CREATE OR REPLACE FUNCTION pg_temp.cairn_put_policy(p_role uuid, p_name text, p_document text, p_max integer)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
     v_role uuid;
 BEGIN
-    SELECT id INTO v_role FROM roles WHERE name = p_user FOR UPDATE;
+    SELECT id INTO v_role FROM roles WHERE id = p_role FOR UPDATE;
     IF NOT FOUND THEN
         RETURN 'no_such_user';
     END IF;
@@ -1721,16 +1721,16 @@ BEGIN
 END
 $$;
 
--- Deletes a role. Takes G on the role's grants (in order), which go with it
--- (a cascade), then R (by deleting the row). Returns whether there was one.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_role(p_role text)
+-- Deletes a user (by its ID): takes R (by deleting the row), and its keys,
+-- policies and console identities go with it (cascades). (Its grants are
+-- statements of buckets' policies, which `grants` removes first.) Returns
+-- whether there was one.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_role(p_role uuid)
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
     v_deleted bigint;
 BEGIN
-    PERFORM 1 FROM role_grants WHERE role = p_role
-    ORDER BY role, bucket, permission FOR UPDATE;
-    DELETE FROM roles WHERE name = p_role;
+    DELETE FROM roles WHERE id = p_role;
     GET DIAGNOSTICS v_deleted = ROW_COUNT;
     RETURN v_deleted > 0;
 END

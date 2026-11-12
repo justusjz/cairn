@@ -40,7 +40,7 @@ async fn role(app: &App, write: bool) -> (String, String) {
         true => &[Permission::Write][..],
         false => &[Permission::Read][..],
     };
-    crate::roles::grant(&client, &name, BUCKET, permissions).await.unwrap();
+    crate::roles::grant(&client, &crate::roles::account(&client).await.unwrap(), &name, BUCKET, permissions).await.unwrap();
     (name, secret)
 }
 
@@ -481,7 +481,7 @@ async fn bucket_policies_see_forms_as_posted() {
     // replaces, as any other: so the signer's is made again after it.
     let regrant = || async {
         let client = app.pool.get().await.unwrap();
-        crate::roles::grant(&client, &signer.0, BUCKET, &[Permission::Write]).await.unwrap();
+        crate::roles::grant(&client, &crate::roles::account(&client).await.unwrap(), &signer.0, BUCKET, &[Permission::Write]).await.unwrap();
     };
     let set = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, deny("POST")).await.unwrap();
     assert_eq!(set.status(), StatusCode::NO_CONTENT);

@@ -205,6 +205,7 @@ const MIGRATIONS: &[&str] = &[
     ACCOUNTS,
     LOGINS,
     OIDC,
+    USER_NAMES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1426,6 +1427,37 @@ CREATE TRIGGER login_oidc_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER oidc_flows_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON oidc_flows
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 36: user names are unique per account, as in IAM, not across
+/// the cluster. `role_grants`, which referenced users by name, is only read
+/// now (by older Cairns: grants are bucket policies), so it loses its
+/// reference. A bucket policy's users are bound to the IDs of the users of
+/// the accounts its ARNs name.
+const USER_NAMES: &str = r#"
+ALTER TABLE role_grants DROP CONSTRAINT role_grants_role_fkey;
+-- The ID (unique, `roles_id`) identifies a user now; its name, in its account.
+ALTER TABLE roles DROP CONSTRAINT roles_pkey;
+ALTER TABLE roles ADD CONSTRAINT roles_account_name UNIQUE (account_id, name);
+DROP INDEX roles_account;
+
+CREATE OR REPLACE FUNCTION cairn_policy_principals() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.policy_principals := CASE WHEN NEW.policy IS NOT NULL THEN (
+        SELECT coalesce(jsonb_object_agg(p.arn, r.id::text), '{}'::jsonb)
+        FROM (
+            SELECT DISTINCT a #>> '{}' AS arn
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].Principal.AWS[*]') a
+            UNION
+            SELECT a #>> '{}'
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].NotPrincipal.AWS[*]') a
+        ) p
+        JOIN roles r ON r.account_id = substring(p.arn FROM '^arn:aws:iam::([0-9]{12}):user/')
+                    AND r.name = substring(p.arn FROM '^arn:aws:iam::[0-9]{12}:user/(.+)$')
+    ) END;
+    RETURN NEW;
+END
+$$;
 "#;
 
 #[cfg(test)]
