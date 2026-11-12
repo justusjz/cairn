@@ -4,6 +4,198 @@
  */
 
 export interface paths {
+    "/buckets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_buckets"];
+        put?: never;
+        post: operations["create_bucket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deletes an empty bucket. */
+        delete: operations["delete_bucket"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_bucket_access"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * An object's data, as a file to save. It's always sent as an attachment of
+         *     no particular type, so that a browser never renders it as part of the UI.
+         */
+        get: operations["download"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/lifecycle": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * A bucket's lifecycle rules, as S3's GetBucketLifecycleConfiguration
+         *     gives them, but in the form they're stored in.
+         */
+        get: operations["get_bucket_lifecycle"];
+        /**
+         * Replaces a bucket's lifecycle rules, as S3's
+         *     PutBucketLifecycleConfiguration does, which starts a new sweep of them.
+         *     Rules without an ID get one.
+         */
+        put: operations["put_bucket_lifecycle"];
+        post?: never;
+        /**
+         * Removes a bucket's lifecycle rules, as S3's DeleteBucketLifecycle does:
+         *     nothing expires from then on.
+         */
+        delete: operations["delete_bucket_lifecycle"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/object": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_object"];
+        /**
+         * Writes an object from the request's body, as PutObject does (with the
+         *     bucket's default encryption, and as the user for SSE-KMS); its
+         *     `Content-Type` is the object's. At most 5 GiB, as a single PutObject.
+         */
+        put: operations["upload"];
+        post?: never;
+        /** Deletes a key, or one of its versions, as DeleteObject does. */
+        delete: operations["delete_object"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/objects": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_objects"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a bucket's policy, as PutBucketPolicy does: checked as S3 checks
+         *     it, and refused if it's public while public policies are blocked.
+         */
+        put: operations["put_bucket_policy"];
+        post?: never;
+        /** Removes a bucket's policy. */
+        delete: operations["delete_bucket_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/public-access-block": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a bucket's public access block, as PutPublicAccessBlock does. */
+        put: operations["put_public_access_block"];
+        post?: never;
+        /** Removes a bucket's public access block: only the cluster's applies. */
+        delete: operations["delete_public_access_block"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/versioning": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Enables or suspends a bucket's versioning, as PutBucketVersioning does. */
+        put: operations["set_versioning"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/enroll": {
         parameters: {
             query?: never;
@@ -160,6 +352,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/public-access": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The cluster's public access block: its settings `block-public-policy`
+         *     and `restrict-public-buckets` (set with `PUT /settings/{name}`).
+         */
+        get: operations["get_public_access"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -173,6 +385,70 @@ export interface components {
             /** @description The user the passkey is of, as the authenticator says. */
             user_handle?: string | null;
         };
+        /** @description A public access block's four flags. */
+        Block: {
+            block_public_acls: boolean;
+            block_public_policy: boolean;
+            ignore_public_acls: boolean;
+            restrict_public_buckets: boolean;
+        };
+        /**
+         * @description Who may get at a bucket, besides its users' grants and policies: its
+         *     policy, and its public access block (see `s3::buckets::public_access`).
+         */
+        BucketAccess: {
+            /**
+             * @description The cluster's (only its policy flags count), which applies to every
+             *     bucket as well.
+             */
+            cluster: components["schemas"]["Block"];
+            /** @description Its policy, as GetBucketPolicy shows it; `null` if it has none. */
+            policy?: string | null;
+            /** @description Whether the policy makes the bucket public. */
+            public: boolean;
+            public_access_block?: components["schemas"]["Block"] | null;
+        };
+        /** @description A bucket's lifecycle rules, if it has any. */
+        BucketLifecycle: {
+            configuration?: components["schemas"]["LifecycleConfiguration"] | null;
+        };
+        BucketSummary: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: double */
+            created_at: number;
+            /**
+             * @description The KMS key of its default encryption (SSE-KMS), if it has one: what a
+             *     write that asks for no encryption of its own is encrypted with.
+             */
+            default_kms_key?: string | null;
+            name: string;
+            /**
+             * Format: int64
+             * @description Current versions that aren't delete markers.
+             */
+            objects: number;
+            /** @description Whether its policy makes it public (GetBucketPolicyStatus). */
+            public: boolean;
+            public_access_block?: components["schemas"]["Block"] | null;
+            /**
+             * Format: int64
+             * @description Roles with a grant on the bucket.
+             */
+            roles: number;
+            /** @description Its tags (PutBucketTagging), sorted by key. */
+            tags: components["schemas"]["Tag"][];
+            /** Format: int64 */
+            uploads: number;
+            /** Format: int64 */
+            version_bytes: number;
+            versioning: components["schemas"]["Versioning"];
+            /**
+             * Format: int64
+             * @description Every version, delete markers too.
+             */
+            versions: number;
+        };
         /**
          * @description A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:
          *     `PublicKeyCredentialCreationOptionsJSON` or `…RequestOptionsJSON`), and
@@ -181,6 +457,23 @@ export interface components {
         Ceremony: {
             challenge_id: string;
             options: Record<string, never>;
+        };
+        /** @description How an object version is encrypted (see `s3::sse`). */
+        EncryptionInfo: {
+            /**
+             * @description `SSE-C` (with its client's key, which Cairn doesn't have), `SSE-KMS`
+             *     or `SSE-S3` (with Cairn's own key from the KMS).
+             */
+            kind: string;
+            /** @description SSE-KMS: the encryption context its client gave, as JSON. */
+            kms_context?: string | null;
+            /** @description SSE-KMS and SSE-S3: the name of the KMS key. */
+            kms_key_id?: string | null;
+            /**
+             * Format: int64
+             * @description SSE-KMS and SSE-S3: the version of the KMS key its data key is from.
+             */
+            kms_key_version?: number | null;
         };
         Enroll: components["schemas"]["NewPasskey"] & {
             token: string;
@@ -196,9 +489,97 @@ export interface components {
             /** @description The token of the enrollment link (after its `#`). */
             token: string;
         };
+        Entry: {
+            /** Format: int64 */
+            bytes: number;
+            /** @enum {string} */
+            kind: "prefix";
+            /** Format: double */
+            last_modified: number;
+            /** Format: int64 */
+            objects: number;
+            prefix: string;
+        } | {
+            delete_marker: boolean;
+            etag?: string | null;
+            key: string;
+            /** @enum {string} */
+            kind: "object";
+            /** Format: double */
+            last_modified: number;
+            /** @description Whether some of its bytes are intact on no replica (see `scrub`). */
+            lost: boolean;
+            /** Format: int64 */
+            size: number;
+        };
         ErrorBody: {
             /** @description What went wrong, for a person to read. */
             error: string;
+        };
+        /** @description A bucket's lifecycle configuration. */
+        LifecycleConfiguration: {
+            rules: components["schemas"]["LifecycleRule"][];
+        };
+        /**
+         * Format: int64
+         * @description A day, UTC, as the number of days since 1970-01-01.
+         */
+        LifecycleDay: number;
+        /** @description `Expiration`: one of `days` and `date`, or `expired_object_delete_marker`. */
+        LifecycleExpiration: {
+            date?: components["schemas"]["LifecycleDay"] | null;
+            /** Format: int32 */
+            days?: number | null;
+            expired_object_delete_marker?: boolean;
+        };
+        /**
+         * @description Which objects a rule applies to: those with keys starting with `prefix`,
+         *     sizes strictly between the bounds, and each of `tags` (with that value;
+         *     other tags don't matter). All of them, by default. A delete marker has no
+         *     size, and no tags: a filter on tags never matches one.
+         */
+        LifecycleFilter: {
+            prefix?: string;
+            /** Format: int64 */
+            size_greater_than?: number | null;
+            /** Format: int64 */
+            size_less_than?: number | null;
+            tags?: components["schemas"]["LifecycleFilterTag"][];
+        };
+        /** @description A tag a filter asks for (see `s3::tags`). */
+        LifecycleFilterTag: {
+            key: string;
+            value: string;
+        };
+        /** @description `NoncurrentVersionExpiration`. */
+        LifecycleNoncurrentExpiration: {
+            /** Format: int32 */
+            days: number;
+            /**
+             * Format: int32
+             * @description How many of the newest noncurrent versions are kept regardless.
+             */
+            newer_versions?: number | null;
+        };
+        LifecycleRule: {
+            /**
+             * Format: int32
+             * @description `AbortIncompleteMultipartUpload`'s `DaysAfterInitiation`.
+             */
+            abort_upload_days?: number | null;
+            /** @description `Status`: a disabled rule is kept, but does nothing. */
+            enabled: boolean;
+            expiration?: components["schemas"]["LifecycleExpiration"] | null;
+            filter: components["schemas"]["LifecycleFilter"];
+            /** @description Its name, unique among the bucket's rules; one is made up if empty. */
+            id?: string;
+            noncurrent_expiration?: components["schemas"]["LifecycleNoncurrentExpiration"] | null;
+        };
+        /** @description A page of a bucket's keys, rolled up at `/` like a directory listing. */
+        Listing: {
+            entries: components["schemas"]["Entry"][];
+            /** @description What to pass as `after` for the next page, if there is one. */
+            next?: string | null;
         };
         Login: {
             challenge_id: string;
@@ -212,11 +593,61 @@ export interface components {
             name: string;
             passkeys: components["schemas"]["PasskeySummary"][];
         };
+        NewBucket: {
+            name: string;
+        };
         NewPasskey: {
             challenge_id: string;
             credential: components["schemas"]["Registration"];
             /** @description What to call it, e.g. "Laptop". */
             name: string;
+        };
+        NewVersioning: {
+            /** @description `Enabled` or `Suspended`. */
+            status: string;
+        };
+        /**
+         * @description Every version of a key (the newest 200), each with its parts and where their
+         *     blobs are stored.
+         */
+        ObjectInfo: {
+            bucket: string;
+            key: string;
+            /** @description Newest first; empty if there's no such key. */
+            versions: components["schemas"]["VersionInfo"][];
+        };
+        PartInfo: {
+            blob_id: string;
+            /**
+             * Format: int64
+             * @description Where in the blob the part's bytes start.
+             */
+            blob_offset: number;
+            /** Format: int64 */
+            blob_size: number;
+            blob_state: string;
+            /** @description The CRC64/NVME of the part's bytes, in hex; none for old data. */
+            crc64nvme?: string | null;
+            /** Format: double */
+            created_at: number;
+            /**
+             * Format: int32
+             * @description The blob's data shards: 1 if it's replicated, else it's erasure-coded,
+             *     and readable with as many live shards.
+             */
+            data_shards: number;
+            etag: string;
+            /**
+             * @description The byte ranges of the part (as stored) that are intact on no
+             *     replica, as [start, stop) from its start (see `scrub`).
+             */
+            lost: number[][];
+            /** @description The nodes holding a shard of the blob. */
+            nodes: number[];
+            /** Format: int32 */
+            number: number;
+            /** Format: int64 */
+            size: number;
         };
         PasskeyName: {
             name: string;
@@ -234,6 +665,10 @@ export interface components {
             last_used_at?: number | null;
             name: string;
         };
+        /** @description An inline policy: a JSON document in IAM's policy language. */
+        PolicyDocument: {
+            document: string;
+        };
         /**
          * @description What `navigator.credentials.create()` gave the page (its parts, in
          *     base64url).
@@ -243,6 +678,37 @@ export interface components {
             client_data_json: string;
             id: string;
         };
+        /** @description A tag of a bucket or an object version (see `s3::tags`). */
+        Tag: {
+            key: string;
+            value: string;
+        };
+        VersionInfo: {
+            content_type?: string | null;
+            delete_marker: boolean;
+            encryption?: components["schemas"]["EncryptionInfo"] | null;
+            etag?: string | null;
+            /** Format: double */
+            last_modified: number;
+            latest: boolean;
+            /**
+             * Format: int64
+             * @description How many of its parts' bytes are intact on no replica.
+             */
+            lost_bytes: number;
+            parts: components["schemas"]["PartInfo"][];
+            /** Format: int64 */
+            size: number;
+            /** @description Its tags, sorted by key. */
+            tags: components["schemas"]["Tag"][];
+            version_id: string;
+        };
+        /**
+         * @description A bucket's versioning state. A bucket starts out unversioned; once enabled,
+         *     it only moves between enabled and suspended. Serialized as it's stored.
+         * @enum {string}
+         */
+        Versioning: "unversioned" | "enabled" | "suspended";
     };
     responses: never;
     parameters: never;
@@ -252,6 +718,651 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_buckets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketSummary"][];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_bucket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewBucket"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_bucket: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_bucket_access: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketAccess"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    download: {
+        parameters: {
+            query: {
+                key: string;
+                /** @description The version to download; the current one if not given. */
+                version?: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The object's data */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": unknown;
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_bucket_lifecycle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketLifecycle"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_bucket_lifecycle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LifecycleConfiguration"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_bucket_lifecycle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_object: {
+        parameters: {
+            query: {
+                key: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ObjectInfo"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    upload: {
+        parameters: {
+            query: {
+                key: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": number[];
+            };
+        };
+        responses: {
+            /** @description Written */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_object: {
+        parameters: {
+            query: {
+                key: string;
+                /**
+                 * @description The version to remove for good; without it, the key is deleted as
+                 *     DeleteObject does (a delete marker, in a versioned bucket).
+                 */
+                version?: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_objects: {
+        parameters: {
+            query?: {
+                /** @description List what's under this prefix. */
+                prefix?: string;
+                /** @description Resume after this key (a page's `next`). */
+                after?: string;
+                /** @description Also list keys whose current version is a delete marker. */
+                deleted?: boolean;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Listing"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_bucket_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyDocument"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_bucket_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_public_access_block: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Block"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_public_access_block: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_versioning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewVersioning"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     enroll: {
         parameters: {
             query?: never;
@@ -604,6 +1715,33 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_public_access: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Block"];
                 };
             };
             "5XX": {

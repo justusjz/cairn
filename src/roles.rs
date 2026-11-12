@@ -78,9 +78,25 @@ impl Principal {
     /// Loads the user whose active access key `access_key` is, or `None` if
     /// there's none.
     pub async fn load(client: &Object, access_key: &str) -> anyhow::Result<Option<Self>> {
+        Self::load_where(client, "FROM access_keys k JOIN roles r ON r.id = k.role_id
+             WHERE k.access_key_id = $1 AND k.active", "k.secret", &access_key).await
+    }
+
+    /// Loads user `id` itself, as the console acts as it (no secret: it
+    /// signs nothing), or `None` if there's none.
+    pub async fn load_user(client: &Object, id: uuid::Uuid) -> anyhow::Result<Option<Self>> {
+        Self::load_where(client, "FROM roles r WHERE r.id = $1", "''::text", &id).await
+    }
+
+    async fn load_where(
+        client: &Object,
+        from: &str,
+        secret: &str,
+        param: &(dyn tokio_postgres::types::ToSql + Sync),
+    ) -> anyhow::Result<Option<Self>> {
         let row = client
             .query_opt_cached(
-                "SELECT k.secret, r.admin, r.id, r.name, (SELECT id FROM accounts),
+                &format!("SELECT {secret}, r.admin, r.id, r.name, (SELECT id FROM accounts),
                         ARRAY(SELECT bucket FROM role_grants
                               WHERE role = r.name AND permission = 'read'),
                         ARRAY(SELECT bucket FROM role_grants
@@ -88,9 +104,8 @@ impl Principal {
                         ARRAY(SELECT bucket FROM role_grants
                               WHERE role = r.name AND permission = 'delete-version'),
                         ARRAY(SELECT document FROM role_policies WHERE role_id = r.id ORDER BY name)
-                 FROM access_keys k JOIN roles r ON r.id = k.role_id
-                 WHERE k.access_key_id = $1 AND k.active",
-                &[&access_key],
+                 {from}"),
+                &[param],
             )
             .await?;
         Ok(row.map(|r| Principal {

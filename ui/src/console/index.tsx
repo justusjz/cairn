@@ -1,15 +1,22 @@
 // The console: where an account's people sign in with passkeys (see
-// `src/console/`). For now: signing in, a first passkey through an
-// enrollment link, and one's own passkeys.
+// `src/console/`): signing in, a first passkey through an enrollment link,
+// one's own passkeys, and the buckets and objects, as the user. Those are
+// the dashboard's pages, talking to the same API, which the console serves
+// as its user (`useConsoleApi`).
 
 import { A, Navigate, Route, Router, type RouteSectionProps, useNavigate } from "@solidjs/router";
 import { For, Show, createResource, createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import { Badge, Loading, Panel, Table, Toasts, act, toast } from "../components/ui";
 import { ago, date } from "../format";
+import { useConsoleApi } from "../api";
+import { BucketBrowser, BucketList, ObjectPage } from "../pages/Buckets";
+import Lifecycle from "../pages/Lifecycle";
 import "../styles.css";
 import { ApiError, type Me, type Passkey, api } from "./api";
 import { authenticate, deviceName, explain, register, supported } from "./webauthn";
+
+useConsoleApi();
 
 /** Who's signed in: `null` if no one, undefined while asking. */
 const [me, { refetch: refreshMe, mutate: setMe }] = createResource<Me | null>(async () => {
@@ -47,7 +54,16 @@ function Layout(props: RouteSectionProps) {
     <>
       <header class="topbar">
         <Brand />
-        <nav />
+        <nav>
+          <Show when={me()}>
+            <A href="/buckets" activeClass="active">
+              Buckets
+            </A>
+            <A href="/account" activeClass="active">
+              Account
+            </A>
+          </Show>
+        </nav>
         <Show when={me()}>
           {(m) => (
             <div class="whoami">
@@ -97,7 +113,7 @@ function Login() {
       const ceremony = await api.loginOptions();
       const credential = await authenticate(ceremony.options);
       setMe(await api.login(ceremony.challenge_id, credential));
-      navigate("/");
+      navigate("/buckets");
     } catch (e) {
       setError(explain(e));
     }
@@ -140,7 +156,7 @@ function Enroll() {
       const credential = await register(c.options);
       setMe(await api.enroll(token, c.challenge_id, name(), credential));
       toast("Your passkey is set up");
-      navigate("/");
+      navigate("/account");
     } catch (e) {
       setError(explain(e));
       setBusy(false);
@@ -175,6 +191,11 @@ function Enroll() {
   );
 }
 
+/** A page for the signed-in only. */
+function Guarded(page: () => import("solid-js").JSX.Element) {
+  return () => <SignedIn>{() => page()}</SignedIn>;
+}
+
 function Home() {
   return (
     <SignedIn>
@@ -190,7 +211,10 @@ function Home() {
                 <Badge tone="accent">admin</Badge>
               </Show>
             </p>
-            <p class="subtle small">Policies name you by this ARN. Buckets and users come to the console next.</p>
+            <p class="subtle small">
+              Policies name you by this ARN. What you may do here is what your access keys may do over S3: your grants,
+              admin rights and policies, and the buckets' policies, decide both.
+            </p>
           </Panel>
           <Passkeys passkeys={m.passkeys} />
         </>
@@ -276,7 +300,12 @@ function NotFound() {
 render(
   () => (
     <Router root={Layout} explicitLinks>
-      <Route path="/" component={Home} />
+      <Route path="/" component={() => <Navigate href="/buckets" />} />
+      <Route path="/account" component={Home} />
+      <Route path="/buckets" component={Guarded(BucketList)} />
+      <Route path="/buckets/:bucket" component={Guarded(BucketBrowser)} />
+      <Route path="/buckets/:bucket/object" component={Guarded(ObjectPage)} />
+      <Route path="/buckets/:bucket/lifecycle" component={Guarded(Lifecycle)} />
       <Route path="/login" component={Login} />
       <Route path="/enroll" component={Enroll} />
       <Route path="*" component={NotFound} />

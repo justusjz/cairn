@@ -53,7 +53,9 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
 
 /// The API's OpenAPI spec, as committed in `ui/console-openapi.json`.
 pub fn openapi() -> utoipa::openapi::OpenApi {
-    router().split_for_parts().1
+    let mut spec = router().split_for_parts().1;
+    spec.merge(crate::dashboard::shared_router().split_for_parts().1);
+    spec
 }
 
 fn b64(bytes: &[u8]) -> String {

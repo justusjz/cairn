@@ -30,15 +30,35 @@ export type LifecycleRule = Schemas["LifecycleRule"];
 export type BucketAccess = Schemas["BucketAccess"];
 export type PublicAccessBlock = Schemas["Block"];
 
-/** Where the API is; also in the spec's `servers`. */
-const BASE = "/_dashboard/api";
+/** Where the API is: the dashboard's (also in the spec's `servers`), or the
+ * console's, which serves the bucket and object part of it as its user. */
+let BASE = "/_dashboard/api";
+let consoleMode = false;
 
-const client = createClient<paths>({
-  baseUrl: BASE,
-  // Marks requests as the dashboard's own: the API refuses changes without
-  // it, so that other sites can't make them.
-  headers: { "x-cairn-ui": "1" },
-});
+function makeClient() {
+  return createClient<paths>({
+    baseUrl: BASE,
+    // Marks requests as the UI's own: the API refuses changes without it,
+    // so that other sites can't make them.
+    headers: { "x-cairn-ui": "1" },
+  });
+}
+
+let client = makeClient();
+
+/** Has the pages talk to the console's API (as the signed-in user) rather
+ * than the dashboard's; called by the console before it renders. */
+export function useConsoleApi() {
+  BASE = "/api";
+  consoleMode = true;
+  client = makeClient();
+}
+
+/** Whether the pages are the console's: then what's the operator's (the
+ * cluster, its settings) isn't theirs to show. */
+export function isConsole(): boolean {
+  return consoleMode;
+}
 
 export class ApiError extends Error {
   constructor(
@@ -126,6 +146,23 @@ export const api = {
     ok(client.PUT("/settings/{name}", { params: { path: { name } }, body: { value } })),
   removeNode: (id: number) => ok(client.POST("/nodes/{id}/remove", { params: { path: { id } } })),
   keepNode: (id: number) => ok(client.POST("/nodes/{id}/keep", { params: { path: { id } } })),
+  /** Writes an object from a file, as PutObject does. */
+  upload: async (bucket: string, key: string, file: Blob) => {
+    const url = `${BASE}/buckets/${encodeURIComponent(bucket)}/object?key=${encodeURIComponent(key)}`;
+    const response = await fetch(url, {
+      method: "PUT",
+      headers: { "x-cairn-ui": "1", "content-type": file.type || "application/octet-stream" },
+      body: file,
+    });
+    if (!response.ok) {
+      const body = (await response.json().catch(() => ({}))) as { error?: string };
+      throw new ApiError(response.status, body.error ?? `upload failed (${response.status})`);
+    }
+  },
+  deleteObject: (bucket: string, key: string, version?: string) =>
+    ok(client.DELETE("/buckets/{bucket}/object", { params: { ...bucketPath(bucket), query: { key, version } } })),
+  setVersioning: (bucket: string, status: "Enabled" | "Suspended") =>
+    ok(client.PUT("/buckets/{bucket}/versioning", { params: bucketPath(bucket), body: { status } })),
   revoke: (role: string, bucket: string, permission: Permission) =>
     ok(client.DELETE("/roles/{role}/grants", { params: { ...rolePath(role), query: { bucket, permission } } })),
 };

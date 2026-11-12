@@ -214,7 +214,7 @@ button, .button {
   white-space: nowrap;
 }
 button:hover, .button:hover { background: var(--panel-2); text-decoration: none; }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
+button.primary, .button.primary { background: var(--accent); border-color: var(--accent); color: var(--panel); font-weight: 600; }
 button.primary:hover { filter: brightness(1.08); background: var(--accent); }
 button.danger { color: var(--bad); }
 button.danger:hover { background: var(--bad-soft); }
@@ -354,3 +354,5 @@ button.chip.policy:hover { border-color: var(--accent); }
 .whoami { margin-left: auto; display: flex; align-items: center; gap: 10px; }
 label.field { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; font-size: 13px; color: var(--muted); }
 label.field input { font-size: 14px; }
+label.file-button { position: relative; overflow: hidden; cursor: pointer; }
+label.file-button input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }

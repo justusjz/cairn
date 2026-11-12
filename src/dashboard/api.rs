@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use axum::{
     Json,
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Extension, Path, Query, State},
     http::{HeaderValue, StatusCode, header},
     response::Response,
 };
@@ -26,7 +26,9 @@ use tokio::task::JoinSet;
 use utoipa::{IntoParams, OpenApi as _, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 
+use super::actor::Actor;
 use super::{ApiError, ErrorBody, NodeStats, node_stats};
+use crate::s3::actions::{Check, On};
 use crate::db::Cached;
 use crate::{
     App,
@@ -67,11 +69,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(get_cluster))
         .routes(routes!(get_storage))
         .routes(routes!(get_integrity))
-        .routes(routes!(list_buckets, create_bucket))
-        .routes(routes!(delete_bucket))
-        .routes(routes!(list_objects))
-        .routes(routes!(get_object))
-        .routes(routes!(download))
         .routes(routes!(list_roles, create_role))
         .routes(routes!(delete_role))
         .routes(routes!(rotate_secret))
@@ -83,15 +80,30 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_key, delete_key))
         .routes(routes!(get_policy, put_policy, delete_policy))
         .routes(routes!(get_lifecycle))
-        .routes(routes!(get_bucket_lifecycle, put_bucket_lifecycle, delete_bucket_lifecycle))
         .routes(routes!(set_lifecycle_rate))
         .routes(routes!(set_setting))
+        .routes(routes!(remove_node))
+        .routes(routes!(keep_node))
+        .merge(shared_router())
+}
+
+/// The buckets and objects, which the console serves too, as its user (see
+/// `actor`): every handler here checks what it does as its S3 operation's
+/// actions.
+pub(crate) fn shared_router() -> OpenApiRouter<Arc<App>> {
+    OpenApiRouter::new()
+        .routes(routes!(list_buckets, create_bucket))
+        .routes(routes!(delete_bucket))
+        .routes(routes!(list_objects))
+        .routes(routes!(get_object))
+        .routes(routes!(download))
+        .routes(routes!(get_bucket_lifecycle, put_bucket_lifecycle, delete_bucket_lifecycle))
         .routes(routes!(get_bucket_access))
         .routes(routes!(put_bucket_policy, delete_bucket_policy))
         .routes(routes!(put_public_access_block, delete_public_access_block))
         .routes(routes!(get_public_access))
-        .routes(routes!(remove_node))
-        .routes(routes!(keep_node))
+        .routes(routes!(upload, delete_object))
+        .routes(routes!(set_versioning))
 }
 
 /// The API's OpenAPI spec, as committed in `ui/openapi.json`.
@@ -817,8 +829,11 @@ fn tag_list(stored: &str) -> Vec<Tag> {
     (status = 200, body = Vec<BucketSummary>),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_buckets(State(app): AppState) -> Result<Json<Vec<BucketSummary>>> {
-    Ok(Json(buckets(&app).await?))
+async fn list_buckets(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<BucketSummary>>> {
+    let all = actor.allows(&app, "s3:ListAllMyBuckets", On::Account).await?;
+    let mut buckets = buckets(&app).await?;
+    buckets.retain(|b| actor.lists(all, &b.name));
+    Ok(Json(buckets))
 }
 
 /// Every bucket (as ListBuckets lists them), with what's in it.
@@ -914,7 +929,8 @@ struct NewBucket {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_bucket(State(app): AppState, Json(body): Json<NewBucket>) -> Result<StatusCode> {
+async fn create_bucket(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewBucket>) -> Result<StatusCode> {
+    actor.check(&app, "s3:CreateBucket", On::Bucket(body.name.clone())).await?;
     match create::create(&app, &body.name).await? {
         create::Creation::Created => Ok(StatusCode::CREATED),
         create::Creation::Exists => Err(ApiError::Conflict(format!(
@@ -935,7 +951,8 @@ async fn create_bucket(State(app): AppState, Json(body): Json<NewBucket>) -> Res
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_bucket(State(app): AppState, Path(bucket): Path<String>) -> Result<StatusCode> {
+async fn delete_bucket(State(app): AppState, Extension(actor): Extension<Actor>, Path(bucket): Path<String>) -> Result<StatusCode> {
+    actor.check(&app, "s3:DeleteBucket", On::Bucket(bucket.clone())).await?;
     let resp = crate::s3::buckets::delete::delete_bucket(&app, &bucket).await?;
     match resp.status() {
         StatusCode::NO_CONTENT => Ok(StatusCode::NO_CONTENT),
@@ -969,8 +986,18 @@ struct BucketAccess {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_bucket_access(State(app): AppState, Path(bucket): Path<String>) -> Result<Json<BucketAccess>> {
+async fn get_bucket_access(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<Json<BucketAccess>> {
     use crate::s3::buckets::{policy, public_access};
+    let on = || On::Bucket(bucket.clone());
+    let checks = [
+        Check { action: "s3:GetBucketPolicy", on: on() },
+        Check { action: "s3:GetBucketPublicAccessBlock", on: on() },
+    ];
+    actor.check_all(&app, &checks).await?;
     let client = app.pool.get().await?;
     let no_bucket = || ApiError::NotFound(format!("no bucket named {bucket:?}"));
     let policy = policy::shown(&client, &bucket).await?.ok_or_else(no_bucket)?;
@@ -999,9 +1026,11 @@ async fn get_bucket_access(State(app): AppState, Path(bucket): Path<String>) -> 
     ))]
 async fn put_bucket_policy(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
     Json(body): Json<PolicyDocument>,
 ) -> Result<StatusCode> {
+    actor.check(&app, "s3:PutBucketPolicy", On::Bucket(bucket.clone())).await?;
     use crate::s3::buckets::policy;
     let client = app.pool.get().await?;
     let checked = match policy::check(&client, &bucket, &body.document).await? {
@@ -1024,7 +1053,12 @@ async fn put_bucket_policy(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_bucket_policy(State(app): AppState, Path(bucket): Path<String>) -> Result<StatusCode> {
+async fn delete_bucket_policy(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<StatusCode> {
+    actor.check(&app, "s3:DeleteBucketPolicy", On::Bucket(bucket.clone())).await?;
     use crate::s3::buckets::policy;
     match policy::set(&app.pool.get().await?, &bucket, None).await? {
         policy::Set::NoSuchBucket => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
@@ -1041,9 +1075,11 @@ async fn delete_bucket_policy(State(app): AppState, Path(bucket): Path<String>) 
     ))]
 async fn put_public_access_block(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
     Json(body): Json<crate::s3::buckets::public_access::Block>,
 ) -> Result<StatusCode> {
+    actor.check(&app, "s3:PutBucketPublicAccessBlock", On::Bucket(bucket.clone())).await?;
     match crate::s3::buckets::public_access::set(&app, &bucket, Some(body)).await? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
@@ -1056,7 +1092,13 @@ async fn put_public_access_block(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_public_access_block(State(app): AppState, Path(bucket): Path<String>) -> Result<StatusCode> {
+async fn delete_public_access_block(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<StatusCode> {
+    // DeletePublicAccessBlock is authorized as its put, in S3.
+    actor.check(&app, "s3:PutBucketPublicAccessBlock", On::Bucket(bucket.clone())).await?;
     match crate::s3::buckets::public_access::set(&app, &bucket, None).await? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
@@ -1124,9 +1166,13 @@ enum Entry {
     ))]
 async fn list_objects(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
     Query(params): Query<ListParams>,
 ) -> Result<Json<Listing>> {
+    // Delete markers are versions: listing them is ListObjectVersions.
+    let action = if params.deleted.unwrap_or(false) { "s3:ListBucketVersions" } else { "s3:ListBucket" };
+    actor.check(&app, action, On::Bucket(bucket.clone())).await?;
     let query = ListQuery {
         prefix: params.prefix.as_deref().unwrap_or(""),
         delimiter: Some("/"),
@@ -1328,10 +1374,21 @@ struct PartInfo {
     ))]
 async fn get_object(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
     Query(params): Query<KeyParams>,
 ) -> Result<Json<ObjectInfo>> {
-    Ok(Json(object(&app, &bucket, &params.key).await?))
+    // As HeadObject, and its older versions as ListObjectVersions.
+    actor.check(&app, "s3:GetObject", On::Object(bucket.clone(), params.key.clone())).await?;
+    let mut info = object(&app, &bucket, &params.key).await?;
+    if !actor.allows(&app, "s3:ListBucketVersions", On::Bucket(bucket.clone())).await? {
+        info.versions.truncate(1);
+    }
+    // Where the parts are stored (blobs, nodes) is the operator's to know.
+    if let Actor::User(_) = actor {
+        info.versions.iter_mut().for_each(|v| v.parts.clear());
+    }
+    Ok(Json(info))
 }
 
 pub(super) async fn object(app: &App, bucket: &str, key: &str) -> anyhow::Result<ObjectInfo> {
@@ -1464,9 +1521,12 @@ struct DownloadParams {
     ))]
 async fn download(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
     Query(params): Query<DownloadParams>,
 ) -> Result<Response> {
+    let action = if params.version.is_some() { "s3:GetObjectVersion" } else { "s3:GetObject" };
+    actor.check(&app, action, On::Object(bucket.clone(), params.key.clone())).await?;
     let resp = crate::s3::objects::get::get_object(
         &app,
         &bucket,
@@ -1476,8 +1536,10 @@ async fn download(
         None,
         &Preconditions::default(),
         None,
-        // No role: the dashboard can't open SSE-KMS objects (see `s3::sse`).
-        None,
+        // As the user, whom the KMS lets open SSE-KMS objects with keys
+        // it may use; the operator has no identity there, so it can't (see
+        // `s3::sse`).
+        actor.kms_role(),
         false,
     )
     .await?;
@@ -1509,6 +1571,148 @@ async fn download(
         HeaderValue::from_static("sandbox"),
     );
     Ok(Response::from_parts(parts, Body::new(body)))
+}
+
+/// An S3 handler's error response as the API's: its status, and its
+/// message (or code).
+async fn s3_error(resp: hyper::Response<http_body_util::Full<hyper::body::Bytes>>) -> ApiError {
+    let status = resp.status();
+    let body = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let text = String::from_utf8_lossy(&body);
+    let element = |name: &str| {
+        let open = format!("<{name}>");
+        let start = text.find(&open)? + open.len();
+        let end = text[start..].find(&format!("</{name}>"))?;
+        Some(text[start..start + end].to_owned())
+    };
+    let message = element("Message").filter(|m| !m.is_empty()).or_else(|| element("Code")).unwrap_or_default();
+    match status {
+        StatusCode::NOT_FOUND => ApiError::NotFound(message),
+        StatusCode::FORBIDDEN => ApiError::Forbidden(message),
+        StatusCode::CONFLICT => ApiError::Conflict(message),
+        s if s.is_client_error() => ApiError::BadRequest(message),
+        _ => ApiError::Failed(anyhow::anyhow!("S3 handler answered {status}: {message}")),
+    }
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct UploadParams {
+    key: String,
+}
+
+/// Writes an object from the request's body, as PutObject does (with the
+/// bucket's default encryption, and as the user for SSE-KMS); its
+/// `Content-Type` is the object's. At most 5 GiB, as a single PutObject.
+#[utoipa::path(put, path = "/buckets/{bucket}/object", params(("bucket" = String, Path), UploadParams),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    responses(
+        (status = 204, description = "Written"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn upload(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+    Query(params): Query<UploadParams>,
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> Result<StatusCode> {
+    actor.check(&app, "s3:PutObject", On::Object(bucket.clone(), params.key.clone())).await?;
+    if !crate::s3::util::is_well_formed(&params.key) || params.key.is_empty() || params.key.len() > 1024 {
+        return Err(ApiError::BadRequest("a key is 1 to 1024 bytes of UTF-8, without control characters".into()));
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("application/octet-stream");
+    let length = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse().ok());
+    let payload = length.map_or_else(crate::payload::Payload::unchecked, crate::payload::Payload::unchecked_of);
+    let payload = payload
+        .at_most(crate::s3::util::MAX_UPLOAD)
+        .map_err(|_| ApiError::BadRequest("an upload is at most 5 GiB".into()))?;
+    let resp = crate::s3::objects::put::put_object(
+        &app,
+        &bucket,
+        &params.key,
+        content_type,
+        "",
+        "",
+        body,
+        payload,
+        &Preconditions::default(),
+        crate::s3::sse::Wanted::Plain,
+        actor.kms_role(),
+    )
+    .await?;
+    match resp.status() {
+        StatusCode::OK => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct DeleteParams {
+    key: String,
+    /// The version to remove for good; without it, the key is deleted as
+    /// DeleteObject does (a delete marker, in a versioned bucket).
+    version: Option<String>,
+}
+
+/// Deletes a key, or one of its versions, as DeleteObject does.
+#[utoipa::path(delete, path = "/buckets/{bucket}/object", params(("bucket" = String, Path), DeleteParams),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn delete_object(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+    Query(params): Query<DeleteParams>,
+) -> Result<StatusCode> {
+    let action = crate::s3::actions::delete(params.version.is_some());
+    actor.check(&app, action, On::Object(bucket.clone(), params.key.clone())).await?;
+    let resp = crate::s3::objects::delete::delete_object(&app, &bucket, &params.key, params.version.as_deref()).await?;
+    match resp.status() {
+        StatusCode::NO_CONTENT | StatusCode::OK => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+struct NewVersioning {
+    /// `Enabled` or `Suspended`.
+    status: String,
+}
+
+/// Enables or suspends a bucket's versioning, as PutBucketVersioning does.
+#[utoipa::path(put, path = "/buckets/{bucket}/versioning", params(("bucket" = String, Path)),
+    request_body = NewVersioning, responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn set_versioning(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+    Json(body): Json<NewVersioning>,
+) -> Result<StatusCode> {
+    if !matches!(body.status.as_str(), "Enabled" | "Suspended") {
+        return Err(ApiError::BadRequest("versioning is Enabled or Suspended".into()));
+    }
+    actor.check(&app, "s3:PutBucketVersioning", On::Bucket(bucket.clone())).await?;
+    let xml = format!("<VersioningConfiguration><Status>{}</Status></VersioningConfiguration>", body.status);
+    let resp = crate::s3::buckets::versioning::put_bucket_versioning(&app, &bucket, xml.into()).await?;
+    match resp.status() {
+        StatusCode::OK => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
 }
 
 // ─── Roles ───────────────────────────────────────────────────────────────────
@@ -2741,7 +2945,12 @@ struct BucketLifecycle {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_bucket_lifecycle(State(app): AppState, Path(bucket): Path<String>) -> Result<Json<BucketLifecycle>> {
+async fn get_bucket_lifecycle(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<Json<BucketLifecycle>> {
+    actor.check(&app, "s3:GetLifecycleConfiguration", On::Bucket(bucket.clone())).await?;
     let row = app
         .pool
         .get()
@@ -2770,9 +2979,11 @@ async fn get_bucket_lifecycle(State(app): AppState, Path(bucket): Path<String>) 
     ))]
 async fn put_bucket_lifecycle(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(bucket): Path<String>,
     Json(body): Json<crate::lifecycle::rules::Configuration>,
 ) -> Result<StatusCode> {
+    actor.check(&app, "s3:PutLifecycleConfiguration", On::Bucket(bucket.clone())).await?;
     let configuration = body.check().map_err(ApiError::BadRequest)?;
     match crate::s3::buckets::lifecycle::set(&app, &bucket, Some(&configuration.to_json())).await? {
         true => Ok(StatusCode::NO_CONTENT),
@@ -2787,7 +2998,13 @@ async fn put_bucket_lifecycle(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_bucket_lifecycle(State(app): AppState, Path(bucket): Path<String>) -> Result<StatusCode> {
+async fn delete_bucket_lifecycle(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<StatusCode> {
+    // DeleteBucketLifecycle is authorized as its put, in S3.
+    actor.check(&app, "s3:PutLifecycleConfiguration", On::Bucket(bucket.clone())).await?;
     match crate::s3::buckets::lifecycle::set(&app, &bucket, None).await? {
         true => Ok(StatusCode::NO_CONTENT),
         false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),

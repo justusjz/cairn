@@ -28,7 +28,18 @@ use axum::{
     routing::get,
 };
 
-use crate::{App, dashboard::ApiError};
+use std::net::SocketAddr;
+
+use axum::extract::ConnectInfo;
+
+use crate::{
+    App,
+    dashboard::{
+        ApiError,
+        actor::{self, Actor},
+    },
+    roles::Principal,
+};
 
 mod api;
 pub mod cbor;
@@ -85,7 +96,13 @@ pub fn parse_url(text: &str) -> Result<Party, String> {
 /// The console.
 pub fn router(console: Arc<Console>) -> Router {
     let (api, _) = api::router().split_for_parts();
+    // The buckets and objects: the dashboard's handlers, as the user.
+    let (shared, _) = crate::dashboard::shared_router().split_for_parts();
+    let shared = shared
+        .layer(middleware::from_fn_with_state(console.clone(), as_user))
+        .with_state(console.app.clone());
     let api = api
+        .merge(shared)
         .fallback(|| async { ApiError::NotFound("no such API route".into()) })
         .layer(middleware::from_fn_with_state(console.clone(), require_same_origin))
         .layer(middleware::map_response(|mut resp: Response| async {
@@ -113,6 +130,36 @@ async fn require_same_origin(State(console): State<Arc<Console>>, req: Request, 
         }
     }
     next.run(req).await
+}
+
+/// Has the request act as its session's user (see `dashboard::actor`), or
+/// answers 401 without one.
+async fn as_user(State(console): State<Arc<Console>>, mut req: Request, next: Next) -> Response {
+    let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+    let (method, headers) = (req.method().clone(), req.headers().clone());
+    let query = req.uri().query().unwrap_or("").to_owned();
+    match user_of(&console, method, headers, query, peer).await {
+        Ok(user) => {
+            req.extensions_mut().insert(Actor::User(Arc::new(user)));
+            next.run(req).await
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn user_of(
+    console: &Console,
+    method: Method,
+    headers: HeaderMap,
+    query: String,
+    peer: Option<std::net::IpAddr>,
+) -> Result<actor::User, ApiError> {
+    let unauthorized = || ApiError::Unauthorized("sign in first".into());
+    let token = session_token(&headers).ok_or_else(unauthorized)?;
+    let client = console.app.pool.get().await?;
+    let session = store::session(&client, &token).await?.ok_or_else(unauthorized)?;
+    let principal = Principal::load_user(&client, session.user.id).await?.ok_or_else(unauthorized)?;
+    Ok(actor::User { account: principal.account.clone(), principal, method, headers, query, peer })
 }
 
 /// A file of the console's UI, or else its page.
@@ -388,6 +435,128 @@ mod e2e {
         roles::delete(&client, "ada").await.unwrap();
         assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(store::reap(&client).await.unwrap(), 0);
+    }
+
+    /// A browser signed in as a new user `name` (with a passkey of its own).
+    async fn signed_in(console: &Arc<Console>, name: &str, admin: bool) -> Browser {
+        let client = console.app.pool.get().await.unwrap();
+        roles::create(&client, name, None, admin).await.unwrap();
+        let token = store::create_enrollment(&client, name).await.unwrap();
+        let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let (_, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
+        let mut body = registration(&mut Authenticator::ed25519(), &ceremony, "Key");
+        body["token"] = json!(token);
+        assert_eq!(browser.send("POST", "/api/enroll", Some(body)).await.0, StatusCode::OK);
+        browser
+    }
+
+    impl Browser {
+        /// A request with a raw body (an upload).
+        async fn upload(&mut self, path: &str, body: &'static [u8]) -> StatusCode {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header("origin", &self.origin)
+                .header("x-cairn-ui", "1")
+                .header("content-type", "text/plain")
+                .header("content-length", body.len())
+                .header("cookie", format!("{COOKIE}={}", self.cookie.as_deref().unwrap_or("")))
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            router(self.console.clone()).oneshot(req).await.unwrap().status()
+        }
+    }
+
+    /// The console's buckets and objects are the dashboard's API, as the
+    /// signed-in user: what its grants, admin flag and policies allow, and
+    /// what a bucket's policy denies it, as over S3.
+    #[tokio::test]
+    async fn acts_as_the_user_under_its_policies() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = Arc::new(Console { app: app.clone(), party: party() });
+        let client = app.pool.get().await.unwrap();
+        let bucket = crate::e2e::BUCKET;
+
+        // Not signed in: nothing.
+        let mut nobody = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        assert_eq!(nobody.send("GET", "/api/buckets", None).await.0, StatusCode::UNAUTHORIZED);
+
+        // An admin creates buckets, and sees them all, but can't read
+        // objects without a grant (as over S3).
+        let mut admin = signed_in(&console, "boss", true).await;
+        assert_eq!(admin.send("POST", "/api/buckets", Some(json!({ "name": "made-here" }))).await.0, StatusCode::CREATED);
+        let (status, buckets) = admin.send("GET", "/api/buckets", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let names: Vec<_> = buckets.as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&bucket) && names.contains(&"made-here"), "{names:?}");
+        let (status, err) = admin.send("GET", &format!("/api/buckets/{bucket}/objects"), None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(
+            err["error"].as_str().unwrap(),
+            format!(
+                "User: arn:aws:iam::{}:user/boss is not authorized to perform: s3:ListBucket on resource: \"arn:aws:s3:::{bucket}\" because no identity-based policy allows the s3:ListBucket action",
+                roles::account(&client).await.unwrap()
+            )
+        );
+
+        // A reader sees only its bucket, lists and downloads, but can't write.
+        let mut reader = signed_in(&console, "reader", false).await;
+        roles::grant(&client, "reader", bucket, &[roles::Permission::Read]).await.unwrap();
+        let (_, buckets) = reader.send("GET", "/api/buckets", None).await;
+        let names: Vec<_> = buckets.as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap()).collect();
+        assert_eq!(names, [bucket]);
+        assert_eq!(reader.upload(&format!("/api/buckets/{bucket}/object?key=r.txt"), b"no").await, StatusCode::FORBIDDEN);
+        assert_eq!(reader.send("POST", "/api/buckets", Some(json!({ "name": "nope-here" }))).await.0, StatusCode::FORBIDDEN);
+
+        // A writer uploads; the reader then lists and reads it.
+        let mut writer = signed_in(&console, "writer", false).await;
+        roles::grant(&client, "writer", bucket, &[roles::Permission::Write]).await.unwrap();
+        let path = format!("/api/buckets/{bucket}/object?key=dir%2Fhello.txt");
+        assert_eq!(writer.upload(&path, b"hello").await, StatusCode::NO_CONTENT);
+        let (status, listing) = reader.send("GET", &format!("/api/buckets/{bucket}/objects?prefix=dir%2F"), None).await;
+        assert_eq!(status, StatusCode::OK, "{listing}");
+        assert_eq!(listing["entries"][0]["key"], "dir/hello.txt");
+        assert_eq!(listing["entries"][0]["size"], 5);
+        let (status, info) = reader.send("GET", &format!("/api/buckets/{bucket}/object?key=dir%2Fhello.txt"), None).await;
+        assert_eq!(status, StatusCode::OK, "{info}");
+        // Not where it's stored: that's the operator's.
+        assert_eq!(info["versions"][0]["parts"], json!([]));
+        let req = Request::builder()
+            .uri(format!("/api/buckets/{bucket}/download?key=dir%2Fhello.txt"))
+            .header("cookie", format!("{COOKIE}={}", reader.cookie.as_deref().unwrap()))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let resp = router(console.clone()).oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["content-security-policy"], "sandbox");
+        assert!(resp.headers()["content-disposition"].to_str().unwrap().starts_with("attachment"));
+        assert_eq!(&resp.into_body().collect().await.unwrap().to_bytes()[..], b"hello");
+
+        // A bucket policy's Deny wins over the writer's grant.
+        let account = roles::account(&client).await.unwrap();
+        let deny = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":{{"AWS":"arn:aws:iam::{account}:user/writer"}},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
+        );
+        let (status, err) = admin.send("PUT", &format!("/api/buckets/{bucket}/policy"), Some(json!({ "document": deny }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        let delete = format!("/api/buckets/{bucket}/object?key=dir%2Fhello.txt");
+        let (status, err) = writer.send("DELETE", &delete, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(err["error"].as_str().unwrap().ends_with("with an explicit deny in a resource-based policy"), "{err}");
+        assert_eq!(admin.send("DELETE", &format!("/api/buckets/{bucket}/policy"), None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(writer.send("DELETE", &delete, None).await.0, StatusCode::NO_CONTENT);
+
+        // Versioning, as the admin may set it.
+        let path = format!("/api/buckets/{bucket}/versioning");
+        assert_eq!(writer.send("PUT", &path, Some(json!({ "status": "Enabled" }))).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("PUT", &path, Some(json!({ "status": "Enabled" }))).await.0, StatusCode::NO_CONTENT);
+        let (_, buckets) = admin.send("GET", "/api/buckets", None).await;
+        let ours = buckets.as_array().unwrap().iter().find(|b| b["name"] == bucket).unwrap();
+        assert_eq!(ours["versioning"], "enabled");
+
+        // The operator's routes aren't the console's.
+        assert_eq!(admin.send("GET", "/api/cluster", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(admin.send("GET", "/api/roles", None).await.0, StatusCode::NOT_FOUND);
     }
 
     /// Only the console's own page may sign in: other origins, and requests

@@ -1,6 +1,6 @@
 import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { For, Match, Show, Switch, createEffect, createSignal, on, onMount } from "solid-js";
-import { type Bucket, type BucketAccess, type Entry, type PublicAccessBlock, api, downloadUrl } from "../api";
+import { type Bucket, type BucketAccess, type Entry, type PublicAccessBlock, api, downloadUrl, isConsole } from "../api";
 import { Badge, LiveDot, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { bytes, date, num, pretty } from "../format";
 
@@ -121,7 +121,7 @@ export function BucketList() {
           </button>
         </form>
       </div>
-      <Show when={cluster()}>{(c) => <ClusterBlock block={c()} changed={data.refresh} />}</Show>
+      <Show when={!isConsole() && cluster()}>{(c) => <ClusterBlock block={c()} changed={data.refresh} />}</Show>
       <Show when={buckets.data()} fallback={<Loading error={buckets.error()} />}>
         {(list) => (
           <Panel>
@@ -237,6 +237,38 @@ export function BucketBrowser() {
   const [error, setError] = createSignal<string>();
   const [goto, setGoto] = createSignal("");
   const [access, setAccess] = createSignal(false);
+  const [uploading, setUploading] = createSignal<string>();
+  // The bucket's versioning state, for its switch.
+  const [versioning, setVersioning] = createSignal<string>();
+  const loadVersioning = async () => {
+    try {
+      setVersioning((await api.buckets()).find((b) => b.name === bucket())?.versioning);
+    } catch {
+      setVersioning(undefined);
+    }
+  };
+  createEffect(on(bucket, loadVersioning));
+  const toggleVersioning = async () => {
+    const on = versioning() !== "enabled";
+    if (!on && !confirm("Suspend versioning? Existing versions stay; new writes replace the null version.")) return;
+    const msg = on ? "Versioning enabled" : "Versioning suspended";
+    if (await act(() => api.setVersioning(bucket(), on ? "Enabled" : "Suspended"), msg)) loadVersioning();
+  };
+  /** Uploads the chosen files under the current prefix, one by one. */
+  const upload = async (files: FileList | null) => {
+    if (!files) return;
+    for (const file of Array.from(files)) {
+      const key = prefix() + file.name;
+      setUploading(`Uploading ${file.name} (${bytes(file.size)})…`);
+      if (!(await act(() => api.upload(bucket(), key, file), `Uploaded ${key}`))) break;
+    }
+    setUploading(undefined);
+    restart();
+  };
+  const remove = async (key: string) => {
+    if (!confirm(`Delete "${key}"? In a versioned bucket, its versions stay, under a delete marker.`)) return;
+    if (await act(() => api.deleteObject(bucket(), key), `Deleted ${key}`)) restart();
+  };
 
   // Counts the listings started, so that a page of an old one is dropped.
   let listing = 0;
@@ -252,17 +284,16 @@ export function BucketBrowser() {
       if (current === listing) setError((e as Error).message);
     }
   };
+  const restart = () => {
+    listing++;
+    setEntries([]);
+    setNext(null);
+    setLoaded(false);
+    setError(undefined);
+    load("");
+  };
   // Start over whenever the listing's bucket, prefix or filter changes.
-  createEffect(
-    on([bucket, prefix, deleted], () => {
-      listing++;
-      setEntries([]);
-      setNext(null);
-      setLoaded(false);
-      setError(undefined);
-      load("");
-    }),
-  );
+  createEffect(on([bucket, prefix, deleted], restart));
 
   return (
     <>
@@ -279,6 +310,18 @@ export function BucketBrowser() {
           Lifecycle rules
         </A>
         <button onClick={() => setAccess(true)}>Policy and public access</button>
+        <Show when={versioning()}>
+          {(v) => (
+            <button onClick={toggleVersioning} title={`Versioning is ${v()}`}>
+              {v() === "enabled" ? "Suspend versioning" : "Enable versioning"}
+            </button>
+          )}
+        </Show>
+        <label class="button primary file-button">
+          Upload files
+          <input type="file" multiple onChange={(e) => upload(e.currentTarget.files).then(() => (e.currentTarget.value = ""))} />
+        </label>
+        <Show when={uploading()}>{(u) => <span class="subtle">{u()}</span>}</Show>
         <span class="spacer" />
         <form
           class="form-row"
@@ -335,6 +378,9 @@ export function BucketBrowser() {
                         <a class="button small" href={downloadUrl(bucket(), e.key)}>
                           Download
                         </a>
+                        <button class="small danger" onClick={() => remove(e.key)}>
+                          Delete
+                        </button>
                       </Show>
                     </td>
                   </tr>
@@ -515,7 +561,12 @@ export function ObjectPage() {
   const [search] = useSearchParams();
   const bucket = () => params.bucket ?? "";
   const key = () => (typeof search.key === "string" ? search.key : "");
-  const data = poll(() => Promise.all([api.object(bucket(), key()), api.cluster()]));
+  // The cluster (where parts are stored) is the operator's to see.
+  const data = poll(() => Promise.all([api.object(bucket(), key()), isConsole() ? null : api.cluster()]));
+  const removeVersion = async (version: string) => {
+    if (!confirm(`Delete version ${version} of "${key()}" for good?`)) return;
+    if (await act(() => api.deleteObject(bucket(), key(), version), `Deleted version ${version}`)) data.refresh();
+  };
   createEffect(on([bucket, key], () => data.refresh(), { defer: true }));
   const prefix = () => key().slice(0, key().lastIndexOf("/") + 1);
 
@@ -527,7 +578,7 @@ export function ObjectPage() {
         {(d) => {
           const obj = () => d()[0];
           const cluster = () => d()[1];
-          const node = (id: number) => cluster().nodes.find((n) => n.id === id);
+          const node = (id: number) => cluster()?.nodes.find((n) => n.id === id);
           const liveCopies = (ids: number[]) => ids.filter((id) => node(id)?.live).length;
           return (
             <>
@@ -566,6 +617,9 @@ export function ObjectPage() {
                             Download
                           </a>
                         </Show>
+                        <button class="small danger" onClick={() => removeVersion(v.version_id)}>
+                          Delete version
+                        </button>
                       </div>
                       <Show when={!v.delete_marker}>
                         <dl class="kv">
@@ -604,6 +658,7 @@ export function ObjectPage() {
                             <TagList tags={v.tags} />
                           </dd>
                         </dl>
+                        <Show when={cluster()}>
                         <div class="parts">
                           <Table
                             count={v.parts.length}
@@ -651,7 +706,7 @@ export function ObjectPage() {
                                         </>
                                       }
                                     >
-                                      <Show when={liveCopies(p.nodes) < p.data_shards + cluster().replication_factor - 1}>
+                                      <Show when={liveCopies(p.nodes) < p.data_shards + (cluster()?.replication_factor ?? 1) - 1}>
                                         {" "}
                                         <Badge tone="warn">under-replicated</Badge>
                                       </Show>
@@ -663,6 +718,7 @@ export function ObjectPage() {
                             </For>
                           </Table>
                         </div>
+                        </Show>
                       </Show>
                     </div>
                   )}

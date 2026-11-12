@@ -18,6 +18,790 @@
     }
   ],
   "paths": {
+    "/buckets": {
+      "get": {
+        "operationId": "list_buckets",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/BucketSummary"
+                  }
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_bucket",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewBucket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}": {
+      "delete": {
+        "summary": "Deletes an empty bucket.",
+        "operationId": "delete_bucket",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/access": {
+      "get": {
+        "operationId": "get_bucket_access",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketAccess"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/download": {
+      "get": {
+        "summary": "An object's data, as a file to save. It's always sent as an attachment of\nno particular type, so that a browser never renders it as part of the UI.",
+        "operationId": "download",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "description": "The version to download; the current one if not given.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The object's data",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/lifecycle": {
+      "get": {
+        "summary": "A bucket's lifecycle rules, as S3's GetBucketLifecycleConfiguration\ngives them, but in the form they're stored in.",
+        "operationId": "get_bucket_lifecycle",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketLifecycle"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Replaces a bucket's lifecycle rules, as S3's\nPutBucketLifecycleConfiguration does, which starts a new sweep of them.\nRules without an ID get one.",
+        "operationId": "put_bucket_lifecycle",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LifecycleConfiguration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's lifecycle rules, as S3's DeleteBucketLifecycle does:\nnothing expires from then on.",
+        "operationId": "delete_bucket_lifecycle",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/object": {
+      "get": {
+        "operationId": "get_object",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObjectInfo"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Writes an object from the request's body, as PutObject does (with the\nbucket's default encryption, and as the user for SSE-KMS); its\n`Content-Type` is the object's. At most 5 GiB, as a single PutObject.",
+        "operationId": "upload",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Written"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a key, or one of its versions, as DeleteObject does.",
+        "operationId": "delete_object",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "description": "The version to remove for good; without it, the key is deleted as\nDeleteObject does (a delete marker, in a versioned bucket).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/objects": {
+      "get": {
+        "operationId": "list_objects",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "prefix",
+            "in": "query",
+            "description": "List what's under this prefix.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Resume after this key (a page's `next`).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "deleted",
+            "in": "query",
+            "description": "Also list keys whose current version is a delete marker.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Listing"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/policy": {
+      "put": {
+        "summary": "Sets a bucket's policy, as PutBucketPolicy does: checked as S3 checks\nit, and refused if it's public while public policies are blocked.",
+        "operationId": "put_bucket_policy",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyDocument"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's policy.",
+        "operationId": "delete_bucket_policy",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/public-access-block": {
+      "put": {
+        "summary": "Sets a bucket's public access block, as PutPublicAccessBlock does.",
+        "operationId": "put_public_access_block",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Block"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's public access block: only the cluster's applies.",
+        "operationId": "delete_public_access_block",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/versioning": {
+      "put": {
+        "summary": "Enables or suspends a bucket's versioning, as PutBucketVersioning does.",
+        "operationId": "set_versioning",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewVersioning"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/enroll": {
       "post": {
         "summary": "Registers a user's first passkey through its enrollment link (which it\nuses up), and signs in with it.",
@@ -400,6 +1184,32 @@
           }
         }
       }
+    },
+    "/public-access": {
+      "get": {
+        "summary": "The cluster's public access block: its settings `block-public-policy`\nand `restrict-public-buckets` (set with `PUT /settings/{name}`).",
+        "operationId": "get_public_access",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Block"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -435,6 +1245,166 @@
           }
         }
       },
+      "Block": {
+        "type": "object",
+        "description": "A public access block's four flags.",
+        "required": [
+          "block_public_acls",
+          "ignore_public_acls",
+          "block_public_policy",
+          "restrict_public_buckets"
+        ],
+        "properties": {
+          "block_public_acls": {
+            "type": "boolean"
+          },
+          "block_public_policy": {
+            "type": "boolean"
+          },
+          "ignore_public_acls": {
+            "type": "boolean"
+          },
+          "restrict_public_buckets": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BucketAccess": {
+        "type": "object",
+        "description": "Who may get at a bucket, besides its users' grants and policies: its\npolicy, and its public access block (see `s3::buckets::public_access`).",
+        "required": [
+          "public",
+          "cluster"
+        ],
+        "properties": {
+          "cluster": {
+            "$ref": "#/components/schemas/Block",
+            "description": "The cluster's (only its policy flags count), which applies to every\nbucket as well."
+          },
+          "policy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its policy, as GetBucketPolicy shows it; `null` if it has none."
+          },
+          "public": {
+            "type": "boolean",
+            "description": "Whether the policy makes the bucket public."
+          },
+          "public_access_block": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Block",
+                "description": "Its public access block; `null` if it has none."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "BucketLifecycle": {
+        "type": "object",
+        "description": "A bucket's lifecycle rules, if it has any.",
+        "properties": {
+          "configuration": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LifecycleConfiguration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "BucketSummary": {
+        "type": "object",
+        "required": [
+          "name",
+          "created_at",
+          "versioning",
+          "objects",
+          "bytes",
+          "versions",
+          "version_bytes",
+          "uploads",
+          "roles",
+          "tags",
+          "public"
+        ],
+        "properties": {
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "default_kms_key": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The KMS key of its default encryption (SSE-KMS), if it has one: what a\nwrite that asks for no encryption of its own is encrypted with."
+          },
+          "name": {
+            "type": "string"
+          },
+          "objects": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Current versions that aren't delete markers."
+          },
+          "public": {
+            "type": "boolean",
+            "description": "Whether its policy makes it public (GetBucketPolicyStatus)."
+          },
+          "public_access_block": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Block",
+                "description": "Its public access block, if it has one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "roles": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Roles with a grant on the bucket."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags (PutBucketTagging), sorted by key."
+          },
+          "uploads": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "version_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "versioning": {
+            "$ref": "#/components/schemas/Versioning"
+          },
+          "versions": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Every version, delete markers too."
+          }
+        }
+      },
       "Ceremony": {
         "type": "object",
         "description": "A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:\n`PublicKeyCredentialCreationOptionsJSON` or `…RequestOptionsJSON`), and\nthe ID of its challenge, to send back with the response.",
@@ -448,6 +1418,41 @@
           },
           "options": {
             "type": "object"
+          }
+        }
+      },
+      "EncryptionInfo": {
+        "type": "object",
+        "description": "How an object version is encrypted (see `s3::sse`).",
+        "required": [
+          "kind"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "`SSE-C` (with its client's key, which Cairn doesn't have), `SSE-KMS`\nor `SSE-S3` (with Cairn's own key from the KMS)."
+          },
+          "kms_context": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SSE-KMS: the encryption context its client gave, as JSON."
+          },
+          "kms_key_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "SSE-KMS and SSE-S3: the name of the KMS key."
+          },
+          "kms_key_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "SSE-KMS and SSE-S3: the version of the KMS key its data key is from."
           }
         }
       },
@@ -500,6 +1505,88 @@
           }
         }
       },
+      "Entry": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "A \"directory\": the keys whose names continue past the prefix with `/`.",
+            "required": [
+              "prefix",
+              "objects",
+              "bytes",
+              "last_modified",
+              "kind"
+            ],
+            "properties": {
+              "bytes": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "prefix"
+                ]
+              },
+              "last_modified": {
+                "type": "number",
+                "format": "double"
+              },
+              "objects": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "prefix": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A key's current version.",
+            "required": [
+              "key",
+              "size",
+              "last_modified",
+              "delete_marker",
+              "lost",
+              "kind"
+            ],
+            "properties": {
+              "delete_marker": {
+                "type": "boolean"
+              },
+              "etag": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "key": {
+                "type": "string"
+              },
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "object"
+                ]
+              },
+              "last_modified": {
+                "type": "number",
+                "format": "double"
+              },
+              "lost": {
+                "type": "boolean",
+                "description": "Whether some of its bytes are intact on no replica (see `scrub`)."
+              },
+              "size": {
+                "type": "integer",
+                "format": "int64"
+              }
+            }
+          }
+        ]
+      },
       "ErrorBody": {
         "type": "object",
         "required": [
@@ -509,6 +1596,198 @@
           "error": {
             "type": "string",
             "description": "What went wrong, for a person to read."
+          }
+        }
+      },
+      "LifecycleConfiguration": {
+        "type": "object",
+        "description": "A bucket's lifecycle configuration.",
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LifecycleRule"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "LifecycleDay": {
+        "type": "integer",
+        "format": "int64",
+        "description": "A day, UTC, as the number of days since 1970-01-01."
+      },
+      "LifecycleExpiration": {
+        "type": "object",
+        "description": "`Expiration`: one of `days` and `date`, or `expired_object_delete_marker`.",
+        "properties": {
+          "date": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LifecycleDay"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "expired_object_delete_marker": {
+            "type": "boolean"
+          }
+        },
+        "additionalProperties": false
+      },
+      "LifecycleFilter": {
+        "type": "object",
+        "description": "Which objects a rule applies to: those with keys starting with `prefix`,\nsizes strictly between the bounds, and each of `tags` (with that value;\nother tags don't matter). All of them, by default. A delete marker has no\nsize, and no tags: a filter on tags never matches one.",
+        "properties": {
+          "prefix": {
+            "type": "string"
+          },
+          "size_greater_than": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "size_less_than": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LifecycleFilterTag"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "LifecycleFilterTag": {
+        "type": "object",
+        "description": "A tag a filter asks for (see `s3::tags`).",
+        "required": [
+          "key",
+          "value"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "LifecycleNoncurrentExpiration": {
+        "type": "object",
+        "description": "`NoncurrentVersionExpiration`.",
+        "required": [
+          "days"
+        ],
+        "properties": {
+          "days": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "newer_versions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many of the newest noncurrent versions are kept regardless.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "LifecycleRule": {
+        "type": "object",
+        "required": [
+          "enabled",
+          "filter"
+        ],
+        "properties": {
+          "abort_upload_days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`AbortIncompleteMultipartUpload`'s `DaysAfterInitiation`.",
+            "minimum": 0
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "`Status`: a disabled rule is kept, but does nothing."
+          },
+          "expiration": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LifecycleExpiration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "filter": {
+            "$ref": "#/components/schemas/LifecycleFilter"
+          },
+          "id": {
+            "type": "string",
+            "description": "Its name, unique among the bucket's rules; one is made up if empty."
+          },
+          "noncurrent_expiration": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LifecycleNoncurrentExpiration"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "Listing": {
+        "type": "object",
+        "description": "A page of a bucket's keys, rolled up at `/` like a directory listing.",
+        "required": [
+          "entries"
+        ],
+        "properties": {
+          "entries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Entry"
+            }
+          },
+          "next": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to pass as `after` for the next page, if there is one."
           }
         }
       },
@@ -555,6 +1834,17 @@
           }
         }
       },
+      "NewBucket": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "NewPasskey": {
         "type": "object",
         "required": [
@@ -572,6 +1862,121 @@
           "name": {
             "type": "string",
             "description": "What to call it, e.g. \"Laptop\"."
+          }
+        }
+      },
+      "NewVersioning": {
+        "type": "object",
+        "required": [
+          "status"
+        ],
+        "properties": {
+          "status": {
+            "type": "string",
+            "description": "`Enabled` or `Suspended`."
+          }
+        }
+      },
+      "ObjectInfo": {
+        "type": "object",
+        "description": "Every version of a key (the newest 200), each with its parts and where their\nblobs are stored.",
+        "required": [
+          "bucket",
+          "key",
+          "versions"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "versions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/VersionInfo"
+            },
+            "description": "Newest first; empty if there's no such key."
+          }
+        }
+      },
+      "PartInfo": {
+        "type": "object",
+        "required": [
+          "number",
+          "size",
+          "etag",
+          "blob_id",
+          "blob_offset",
+          "blob_size",
+          "blob_state",
+          "data_shards",
+          "created_at",
+          "nodes",
+          "lost"
+        ],
+        "properties": {
+          "blob_id": {
+            "type": "string"
+          },
+          "blob_offset": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Where in the blob the part's bytes start."
+          },
+          "blob_size": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "blob_state": {
+            "type": "string"
+          },
+          "crc64nvme": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The CRC64/NVME of the part's bytes, in hex; none for old data."
+          },
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "data_shards": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The blob's data shards: 1 if it's replicated, else it's erasure-coded,\nand readable with as many live shards."
+          },
+          "etag": {
+            "type": "string"
+          },
+          "lost": {
+            "type": "array",
+            "items": {
+              "type": "array",
+              "items": {
+                "type": "integer",
+                "format": "int64"
+              }
+            },
+            "description": "The byte ranges of the part (as stored) that are intact on no\nreplica, as [start, stop) from its start (see `scrub`)."
+          },
+          "nodes": {
+            "type": "array",
+            "items": {
+              "type": "integer",
+              "format": "int32"
+            },
+            "description": "The nodes holding a shard of the blob."
+          },
+          "number": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -624,6 +2029,18 @@
           }
         }
       },
+      "PolicyDocument": {
+        "type": "object",
+        "description": "An inline policy: a JSON document in IAM's policy language.",
+        "required": [
+          "document"
+        ],
+        "properties": {
+          "document": {
+            "type": "string"
+          }
+        }
+      },
       "Registration": {
         "type": "object",
         "description": "What `navigator.credentials.create()` gave the page (its parts, in\nbase64url).",
@@ -643,6 +2060,104 @@
             "type": "string"
           }
         }
+      },
+      "Tag": {
+        "type": "object",
+        "description": "A tag of a bucket or an object version (see `s3::tags`).",
+        "required": [
+          "key",
+          "value"
+        ],
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        }
+      },
+      "VersionInfo": {
+        "type": "object",
+        "required": [
+          "version_id",
+          "latest",
+          "delete_marker",
+          "size",
+          "last_modified",
+          "tags",
+          "parts",
+          "lost_bytes"
+        ],
+        "properties": {
+          "content_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "delete_marker": {
+            "type": "boolean"
+          },
+          "encryption": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EncryptionInfo",
+                "description": "How it's encrypted; none if it isn't."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "etag": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_modified": {
+            "type": "number",
+            "format": "double"
+          },
+          "latest": {
+            "type": "boolean"
+          },
+          "lost_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many of its parts' bytes are intact on no replica."
+          },
+          "parts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PartInfo"
+            }
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags, sorted by key."
+          },
+          "version_id": {
+            "type": "string"
+          }
+        }
+      },
+      "Versioning": {
+        "type": "string",
+        "description": "A bucket's versioning state. A bucket starts out unversioned; once enabled,\nit only moves between enabled and suspended. Serialized as it's stored.",
+        "enum": [
+          "unversioned",
+          "enabled",
+          "suspended"
+        ]
       }
     }
   }

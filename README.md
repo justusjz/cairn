@@ -492,9 +492,22 @@ The console is a web UI for the account's people, apart from the dashboard
 (which is the operator's, on the private network, without a sign-in). It's
 off unless a node is started with `--listen-console` and `--console-url`.
 People sign in with **passkeys** only: there are no passwords, and access
-keys are for S3, never for the console. For now, the console shows who's
-signed in and manages their passkeys; buckets, objects and users come next
-(see `plans/console.md`).
+keys are for S3, never for the console. Signed in, people manage their
+passkeys, and the buckets and objects: create and delete buckets, browse,
+upload (up to 5 GiB a file), download and delete objects and versions,
+versioning, lifecycle rules, bucket policies and public access blocks. Users
+come next (see `plans/console.md`).
+
+The console acts as its user: it allows exactly what that user's S3 requests
+would be allowed, by the same policies (the user's grants, admin flag and
+inline policies, and the bucket's policy; an explicit Deny wins), and denies
+with S3's messages. An admin creates buckets, but reads and writes objects
+only with a grant or a policy that allows it, as over S3. The bucket and
+object pages are the dashboard's, and so is their API: the dashboard serves
+it to the operator (everything is allowed), the console to the signed-in
+user. Downloads are always attachments, sandboxed, so that nothing of an
+object is shown in the console's origin; SSE-KMS objects open with the keys
+the user may use.
 
 - **Its own origin.** Serve it at a host name of its own, never the S3 API's:
   objects are served from that origin with whatever `Content-Type` they were

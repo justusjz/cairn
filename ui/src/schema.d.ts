@@ -110,9 +110,15 @@ export interface paths {
             cookie?: never;
         };
         get: operations["get_object"];
-        put?: never;
+        /**
+         * Writes an object from the request's body, as PutObject does (with the
+         *     bucket's default encryption, and as the user for SSE-KMS); its
+         *     `Content-Type` is the object's. At most 5 GiB, as a single PutObject.
+         */
+        put: operations["upload"];
         post?: never;
-        delete?: never;
+        /** Deletes a key, or one of its versions, as DeleteObject does. */
+        delete: operations["delete_object"];
         options?: never;
         head?: never;
         patch?: never;
@@ -168,6 +174,23 @@ export interface paths {
         post?: never;
         /** Removes a bucket's public access block: only the cluster's applies. */
         delete: operations["delete_public_access_block"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/versioning": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Enables or suspends a bucket's versioning, as PutBucketVersioning does. */
+        put: operations["set_versioning"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1198,6 +1221,10 @@ export interface components {
             /** Format: int64 */
             value?: number | null;
         };
+        NewVersioning: {
+            /** @description `Enabled` or `Suspended`. */
+            status: string;
+        };
         /**
          * @description The copies of committed, checksummed blobs a node holds, and how recently
          *     they were known intact.
@@ -1874,6 +1901,91 @@ export interface operations {
             };
         };
     };
+    upload: {
+        parameters: {
+            query: {
+                key: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": number[];
+            };
+        };
+        responses: {
+            /** @description Written */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_object: {
+        parameters: {
+            query: {
+                key: string;
+                /**
+                 * @description The version to remove for good; without it, the key is deleted as
+                 *     DeleteObject does (a delete marker, in a versioned bucket).
+                 */
+                version?: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_objects: {
         parameters: {
             query?: {
@@ -2046,6 +2158,46 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_versioning: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewVersioning"];
+            };
+        };
+        responses: {
+            /** @description Set */
             204: {
                 headers: {
                     [name: string]: unknown;

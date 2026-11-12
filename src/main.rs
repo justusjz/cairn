@@ -338,7 +338,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         let console = Arc::new(console::Console { app: app.clone(), party: party.clone() });
         let listener = TcpListener::bind(addr).await?;
         eprintln!("console at {} (listening on {addr})", party.origin);
-        axum::serve(listener, console::router(console))
+        axum::serve(listener, console::router(console).into_make_service_with_connect_info::<SocketAddr>())
             .with_graceful_shutdown(async {
                 let _ = console_stopped.await;
             })

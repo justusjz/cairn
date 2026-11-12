@@ -44,8 +44,10 @@ use utoipa::ToSchema;
 
 use crate::{App, metrics::MetricsReport, metrics::now_secs};
 
+pub(crate) mod actor;
 mod api;
 
+pub(crate) use api::shared_router;
 use api::{Storage, openapi};
 
 /// Where the dashboard lives.
@@ -96,6 +98,8 @@ pub fn router(app: Arc<App>) -> Router<Arc<App>> {
     let api = api
         .route("/openapi.json", get(|| async { Json(openapi()) }))
         .fallback(|| async { ApiError::NotFound("no such API route".into()) })
+        // The dashboard is the operator's (see `actor`).
+        .layer(axum::Extension(actor::Actor::Operator))
         .layer(middleware::from_fn(require_ui_header))
         .layer(middleware::map_response(|mut resp: Response| async {
             set_default(resp.headers_mut(), header::CACHE_CONTROL, "no-store");
