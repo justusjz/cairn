@@ -1429,6 +1429,294 @@
         }
       }
     },
+    "/oidc-providers": {
+      "get": {
+        "operationId": "list_oidc_providers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OidcProviders"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/oidc-providers/{name}": {
+      "put": {
+        "summary": "Sets an OIDC provider, after checking its discovery document and keys.",
+        "operationId": "set_oidc_provider",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewOidcProvider"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes an OIDC provider: the identities at it no longer sign anyone in.",
+        "operationId": "delete_oidc_provider",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/oidc/callback": {
+      "get": {
+        "summary": "Where providers send the browser back to (register it with them): ends\nthe sign-in, and goes on to the console.",
+        "operationId": "oidc_callback",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error_description",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "On to the console, signed in (or to the sign-in page, with what went wrong)"
+          }
+        }
+      }
+    },
+    "/oidc/providers": {
+      "get": {
+        "summary": "The OIDC providers people may sign in at (for the sign-in page).",
+        "operationId": "oidc_providers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderButton"
+                  }
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/oidc/{provider}": {
+      "delete": {
+        "summary": "Unlinks the signed-in login's identity at a provider (not its last way\nin).",
+        "operationId": "oidc_unlink",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unlinked"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/oidc/{provider}/start": {
+      "post": {
+        "summary": "Starts a sign-in at a provider.",
+        "operationId": "oidc_start",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OidcStart"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OidcRedirect"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/passkeys": {
       "post": {
         "summary": "Adds a passkey to the signed-in login.",
@@ -3867,6 +4155,27 @@
         },
         "additionalProperties": false
       },
+      "LinkedProvider": {
+        "type": "object",
+        "required": [
+          "provider",
+          "label"
+        ],
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        }
+      },
       "Listing": {
         "type": "object",
         "description": "A page of a bucket's keys, rolled up at `/` like a directory listing.",
@@ -4040,12 +4349,13 @@
           "identity",
           "identities",
           "fresh",
-          "passkeys"
+          "passkeys",
+          "oidc"
         ],
         "properties": {
           "fresh": {
             "type": "boolean",
-            "description": "Whether its passkey was used within five minutes: acting as the\noperator takes that."
+            "description": "Whether its passkey was used (or it signed in at its provider)\nwithin five minutes: acting as the operator takes that."
           },
           "identities": {
             "type": "array",
@@ -4062,11 +4372,25 @@
             "type": "string",
             "description": "The login's name."
           },
+          "oidc": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LinkedProvider"
+            },
+            "description": "Its identities at OIDC providers, which sign it in too."
+          },
           "passkeys": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PasskeySummary"
             }
+          },
+          "signed_in_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The OIDC provider this session was signed in at, if it was."
           }
         }
       },
@@ -4150,6 +4474,41 @@
           },
           "secret": {
             "type": "string"
+          }
+        }
+      },
+      "NewOidcProvider": {
+        "type": "object",
+        "required": [
+          "label",
+          "issuer",
+          "client_id"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string"
+          },
+          "client_secret": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's secret; none for a public client. Left out when\nchanging a provider: it keeps its secret."
+          },
+          "issuer": {
+            "type": "string",
+            "description": "The issuer's URL: its discovery document is at\n`<issuer>/.well-known/openid-configuration`."
+          },
+          "label": {
+            "type": "string",
+            "description": "What the sign-in button says, e.g. \"Company SSO\"."
+          },
+          "scopes": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`openid email profile` if not given."
           }
         }
       },
@@ -4474,6 +4833,103 @@
           }
         }
       },
+      "OidcProvider": {
+        "type": "object",
+        "description": "An OpenID Connect provider people may sign in to the console at (see\n`console::oidc`); never its client secret.",
+        "required": [
+          "name",
+          "label",
+          "issuer",
+          "client_id",
+          "has_secret",
+          "scopes",
+          "logins"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string"
+          },
+          "has_secret": {
+            "type": "boolean",
+            "description": "Whether it has a client secret (else it's a public client)."
+          },
+          "issuer": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "logins": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Logins it signs in."
+          },
+          "name": {
+            "type": "string"
+          },
+          "scopes": {
+            "type": "string"
+          }
+        }
+      },
+      "OidcProviders": {
+        "type": "object",
+        "description": "The providers, and the redirect URI to register with them.",
+        "required": [
+          "providers"
+        ],
+        "properties": {
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/OidcProvider"
+            }
+          },
+          "redirect_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`<console URL>/api/oidc/callback`, if this node serves the console."
+          }
+        }
+      },
+      "OidcRedirect": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Where to send the browser: the provider's sign-in."
+          }
+        }
+      },
+      "OidcStart": {
+        "type": "object",
+        "required": [
+          "purpose"
+        ],
+        "properties": {
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "purpose": {
+            "type": "string",
+            "description": "`login`, `enroll` (with `token`), `link` or `reauth` (with\n`account_id`), the latter two signed in."
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "OpCounts": {
         "allOf": [
           {
@@ -4740,6 +5196,22 @@
         ],
         "properties": {
           "document": {
+            "type": "string"
+          }
+        }
+      },
+      "ProviderButton": {
+        "type": "object",
+        "description": "A provider to sign in at.",
+        "required": [
+          "name",
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "name": {
             "type": "string"
           }
         }

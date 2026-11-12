@@ -43,6 +43,7 @@ use crate::{
 
 mod api;
 pub mod cbor;
+pub mod oidc;
 pub mod store;
 pub mod webauthn;
 
@@ -427,7 +428,7 @@ mod e2e {
         let laptop_id = URL_SAFE_NO_PAD.encode(&laptop.credential_id);
         let (status, err) = browser.send("DELETE", &format!("/api/passkeys/{laptop_id}"), None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(err["error"].as_str().unwrap().contains("last passkey"), "{err}");
+        assert!(err["error"].as_str().unwrap().contains("last way"), "{err}");
 
         // Signing out ends the session.
         assert_eq!(browser.send("POST", "/api/logout", None).await.0, StatusCode::NO_CONTENT);
@@ -831,6 +832,142 @@ mod e2e {
         );
         let (status, err) = owner.send("PUT", &format!("/api/buckets/{bucket}/policy"), Some(json!({ "document": policy }))).await;
         assert_eq!((status, err["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Invalid principal in policy")));
+    }
+
+    impl Browser {
+        /// The provider sending the browser back (a cross-site navigation:
+        /// no SameSite=Strict cookie goes with it): where it's sent on.
+        async fn come_back(&mut self, state: &str, code: &str) -> (StatusCode, String) {
+            let req = Request::builder()
+                .uri(format!("/api/oidc/callback?state={state}&code={code}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = router(self.console.clone()).oneshot(req).await.unwrap();
+            if let Some(set) = resp.headers().get(header::SET_COOKIE) {
+                let value = set.to_str().unwrap().split(';').next().unwrap().split_once('=').unwrap().1;
+                self.cookie = (!value.is_empty()).then(|| value.to_owned());
+            }
+            let location = resp.headers().get(header::LOCATION).map(|l| l.to_str().unwrap().to_owned()).unwrap_or_default();
+            (resp.status(), location)
+        }
+
+        /// Starts a sign-in at the mock provider: its authorization URL.
+        async fn start_oidc(&mut self, body: Value) -> String {
+            let (status, answer) = self.send("POST", "/api/oidc/mock/start", Some(body)).await;
+            assert_eq!(status, StatusCode::OK, "{answer}");
+            answer["url"].as_str().unwrap().to_owned()
+        }
+    }
+
+    /// Signing in at an OIDC provider: configured by a superadmin, used to
+    /// enroll through a link (a new login), to sign in, linked to a login
+    /// that has a passkey, unlinked but not as the last way in, and to sign
+    /// in again before acting as the operator. Tokens that aren't right are
+    /// refused, and an identity linked to no login signs no one in.
+    #[tokio::test]
+    async fn signs_in_at_any_oidc_provider() {
+        use super::oidc::mock::{CLIENT_ID, CLIENT_SECRET, Mock};
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = Arc::new(Console { app: app.clone(), party: party() });
+        let client = app.pool.get().await.unwrap();
+        let mock = Mock::start().await;
+
+        // A superadmin configures it (checked against its discovery).
+        let mut ops = signed_in_to(&console, Some("operator"), "op", true).await;
+        let config = json!({ "label": "Company SSO", "issuer": mock.issuer, "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET });
+        let (status, err) = ops.send("PUT", "/api/oidc-providers/mock", Some(config)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        let bad = json!({ "label": "x", "issuer": "https://127.0.0.1:1", "client_id": "c" });
+        assert_eq!(ops.send("PUT", "/api/oidc-providers/broken", Some(bad)).await.0, StatusCode::BAD_REQUEST);
+        let mut tenant = signed_in(&console, "tenant", true).await;
+        let config = json!({ "label": "x", "issuer": mock.issuer, "client_id": "c" });
+        assert_eq!(tenant.send("PUT", "/api/oidc-providers/sneaky", Some(config)).await.0, StatusCode::FORBIDDEN);
+        let (_, buttons) = Browser { console: console.clone(), cookie: None, origin: party().origin }
+            .send("GET", "/api/oidc/providers", None)
+            .await;
+        assert_eq!(buttons, json!([{ "name": "mock", "label": "Company SSO" }]));
+
+        // An identity no login has: signs in no one.
+        let mut stranger = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let url = stranger.start_oidc(json!({ "purpose": "login" })).await;
+        assert!(url.starts_with(&format!("{}/authorize?", mock.issuer)), "{url}");
+        let (state, code) = mock.code_for(&url, "sub-unknown", "x@example.com");
+        let (status, location) = stranger.come_back(&state, &code).await;
+        assert_eq!(status, StatusCode::SEE_OTHER);
+        assert!(location.starts_with("/login?error="), "{location}");
+        assert!(stranger.cookie.is_none());
+
+        // Enrolling through a link: a new login, signed in at the provider.
+        roles::create(&client, "sam", None, false).await.unwrap();
+        let token = store::create_enrollment(&client, "sam").await.unwrap();
+        let mut sam = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let url = sam.start_oidc(json!({ "purpose": "enroll", "token": token })).await;
+        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
+        let (status, location) = sam.come_back(&state, &code).await;
+        assert_eq!((status, location.as_str()), (StatusCode::SEE_OTHER, "/account"));
+        let (status, me) = sam.send("GET", "/api/me", None).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["identity"]["user"], "sam");
+        assert_eq!(me["signed_in_at"], "mock");
+        assert_eq!(me["oidc"], json!([{ "provider": "mock", "label": "Company SSO", "email": "sam@example.com" }]));
+        // A state is used once.
+        assert!(sam.come_back(&state, &code).await.1.starts_with("/login?error="));
+
+        // Signing in again, in another browser.
+        let mut again = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let url = again.start_oidc(json!({ "purpose": "login" })).await;
+        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
+        assert_eq!(again.come_back(&state, &code).await.1, "/");
+        assert_eq!(again.send("GET", "/api/me", None).await.1["identity"]["user"], "sam");
+        // Its last way in can't be unlinked.
+        let (status, err) = again.send("DELETE", "/api/oidc/mock", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("last way"), "{err}");
+
+        // A token for another client is refused.
+        *mock.audience.lock().unwrap() = "someone-else".into();
+        let mut tricked = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let url = tricked.start_oidc(json!({ "purpose": "login" })).await;
+        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
+        let (_, location) = tricked.come_back(&state, &code).await;
+        assert!(location.contains("another%20client"), "{location}");
+        assert!(tricked.cookie.is_none());
+        *mock.audience.lock().unwrap() = CLIENT_ID.into();
+
+        // A login with a passkey links the identity, and may then unlink it.
+        let url = tenant.start_oidc(json!({ "purpose": "link" })).await;
+        let (state, code) = mock.code_for(&url, "sub-tenant", "t@example.com");
+        let saved = tenant.cookie.clone();
+        assert_eq!(tenant.come_back(&state, &code).await.1, "/account");
+        tenant.cookie = saved;
+        let (_, me) = tenant.send("GET", "/api/me", None).await;
+        assert_eq!(me["oidc"][0]["provider"], "mock");
+        // Not to another login, though.
+        let url = tenant.start_oidc(json!({ "purpose": "link" })).await;
+        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
+        assert!(tenant.come_back(&state, &code).await.1.starts_with("/account?error="));
+        assert_eq!(tenant.send("DELETE", "/api/oidc/mock", None).await.0, StatusCode::NO_CONTENT);
+
+        // Signing in again at the provider, to act as the operator.
+        let link = store::create_enrollment(&client, "op").await.unwrap();
+        roles::create_in(&client, Some("operator"), "sam-ops", None, true).await.unwrap();
+        let ops_link = store::create_enrollment(&client, "sam-ops").await.unwrap();
+        let _ = link;
+        assert_eq!(sam.send("POST", "/api/enroll/link", Some(json!({ "token": ops_link }))).await.0, StatusCode::OK);
+        let (_, me) = sam.send("GET", "/api/me", None).await;
+        let ops_id = me["identities"].as_array().unwrap().iter().find(|i| i["operator"] == true).unwrap()["account_id"].clone();
+        let default_id = me["identities"].as_array().unwrap().iter().find(|i| i["operator"] == false).unwrap()["account_id"].clone();
+        assert_eq!(sam.send("POST", "/api/switch", Some(json!({ "account_id": default_id }))).await.0, StatusCode::OK);
+        client.execute("UPDATE console_sessions SET verified_at = now() - interval '1 hour'", &[]).await.unwrap();
+        assert_eq!(sam.send("POST", "/api/switch", Some(json!({ "account_id": ops_id }))).await.0, StatusCode::UNAUTHORIZED);
+        let url = sam.start_oidc(json!({ "purpose": "reauth", "account_id": ops_id })).await;
+        assert!(url.contains("prompt=login"), "{url}");
+        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
+        let saved = sam.cookie.clone();
+        assert_eq!(sam.come_back(&state, &code).await.1, "/");
+        sam.cookie = saved;
+        let (_, me) = sam.send("GET", "/api/me", None).await;
+        assert_eq!(me["identity"]["operator"], true, "{me}");
     }
 
     /// Only the console's own page may sign in: other origins, and requests

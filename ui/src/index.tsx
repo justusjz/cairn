@@ -10,6 +10,7 @@ import Lifecycle from "./pages/Lifecycle";
 import Overview from "./pages/Overview";
 import Users from "./pages/Users";
 import Accounts from "./pages/Accounts";
+import SignIn from "./pages/SignIn";
 import Storage from "./pages/Storage";
 import "./styles.css";
 
@@ -21,6 +22,7 @@ const NAV: [string, string][] = [
   ["/buckets", "Buckets"],
   ["/users", "Users"],
   ["/accounts", "Accounts"],
+  ["/sign-in", "Sign-in"],
 ];
 
 /** A count next to the Integrity link, on every page: objects with lost data
@@ -94,6 +96,7 @@ render(
       <Route path="/buckets/:bucket/lifecycle" component={Lifecycle} />
       <Route path="/users" component={Users} />
       <Route path="/accounts" component={Accounts} />
+      <Route path="/sign-in" component={SignIn} />
       <Route path="/roles" component={() => <Navigate href="/users" />} />
       <Route path="*" component={NotFound} />
     </Router>

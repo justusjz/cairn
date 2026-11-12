@@ -330,15 +330,28 @@ pub async fn identities(client: &Object, login: Uuid) -> anyhow::Result<Vec<Iden
     Ok(rows.iter().map(|r| identity_of(r, 0)).collect())
 }
 
-/// A session's token, for `login`, signed in with `credential_id`, acting as
-/// its identity in `account` (by ID).
-pub async fn create_session(client: &Object, login: Uuid, account: &str, credential_id: &[u8]) -> anyhow::Result<String> {
+/// How a session was signed in.
+#[derive(Clone, Copy, Debug)]
+pub enum Way<'a> {
+    /// With this passkey (its credential ID).
+    Passkey(&'a [u8]),
+    /// At this OIDC provider (its name).
+    Oidc(&'a str),
+}
+
+/// A session's token, for `login`, signed in `way`, acting as its identity
+/// in `account` (by ID).
+pub async fn create_session(client: &Object, login: Uuid, account: &str, way: Way<'_>) -> anyhow::Result<String> {
     let (token, hash) = token()?;
+    let (credential, provider) = match way {
+        Way::Passkey(credential) => (Some(credential), None),
+        Way::Oidc(provider) => (None, Some(provider)),
+    };
     client
         .execute_cached(
-            "INSERT INTO console_sessions (token_hash, login_id, account_id, credential_id, expires_at)
-             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
-            &[&hash, &login, &account, &credential_id, &secs(SESSION_TTL)],
+            "INSERT INTO console_sessions (token_hash, login_id, account_id, credential_id, oidc_provider, expires_at)
+             VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
+            &[&hash, &login, &account, &credential, &provider, &secs(SESSION_TTL)],
         )
         .await?;
     Ok(token)
@@ -352,8 +365,10 @@ pub struct Session {
     pub login_name: String,
     /// Who it acts as.
     pub identity: Identity,
-    /// The passkey it was signed in with.
-    pub credential_id: Vec<u8>,
+    /// The passkey it was signed in with, if it was.
+    pub credential_id: Option<Vec<u8>>,
+    /// The OIDC provider it was signed in at, if it was.
+    pub oidc_provider: Option<String>,
     /// Whether its passkey was used within `OPERATOR_FRESHNESS`.
     pub fresh: bool,
 }
@@ -366,7 +381,7 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
             &format!(
                 "SELECT {IDENTITY}, s.login_id, l.name, s.credential_id,
                         s.verified_at > now() - make_interval(secs => $3),
-                        s.last_seen_at < now() - interval '1 minute'
+                        s.last_seen_at < now() - interval '1 minute', s.oidc_provider
                  FROM console_sessions s
                  JOIN logins l ON l.id = s.login_id
                  JOIN login_identities i ON i.login_id = s.login_id AND i.account_id = s.account_id
@@ -389,20 +404,27 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
         login_name: row.get(7),
         credential_id: row.get(8),
         fresh: row.get(9),
+        oidc_provider: row.get(11),
     }))
 }
 
 /// Has session `token` act as its login's identity in account `account` (by
-/// ID); `verified`: its passkey was just used (an assertion), which acting
-/// as the operator account needs. Whether the login has an identity there.
+/// ID); `verified`: its login just signed in again (a passkey's assertion,
+/// or at its provider), which acting as the operator account needs. Whether
+/// the login has an identity there.
 pub async fn switch(client: &Object, token: &str, account: &str, verified: bool) -> anyhow::Result<bool> {
+    switch_hashed(client, &hash(token), account, verified).await
+}
+
+/// As `switch`, for the session whose token hashes to `token_hash`.
+pub async fn switch_hashed(client: &Object, token_hash: &[u8], account: &str, verified: bool) -> anyhow::Result<bool> {
     let updated = client
         .execute_cached(
             "UPDATE console_sessions s
              SET account_id = $2, verified_at = CASE WHEN $3 THEN now() ELSE s.verified_at END
              WHERE s.token_hash = $1
                AND EXISTS (SELECT 1 FROM login_identities i WHERE i.login_id = s.login_id AND i.account_id = $2)",
-            &[&hash(token), &account, &verified],
+            &[&token_hash, &account, &verified],
         )
         .await?;
     Ok(updated == 1)
@@ -474,7 +496,7 @@ pub async fn delete_passkey(client: &Object, login: Uuid, credential_id: &[u8]) 
     match status.get::<_, &str>(0) {
         "deleted" => Ok(()),
         "no_such_passkey" => Err(Invalid("no such passkey".into()).into()),
-        "last" => Err(Invalid("this is your last passkey: add another before removing it".into()).into()),
+        "last" => Err(Invalid("it's your last way to sign in: add another passkey or a provider first".into()).into()),
         status => unreachable!("cairn_delete_passkey: unknown status {status}"),
     }
 }

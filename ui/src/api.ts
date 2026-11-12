@@ -22,6 +22,7 @@ export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
 export type User = Schemas["RoleSummary"];
 export type Account = Schemas["AccountSummary"];
+export type OidcProvider = Schemas["OidcProvider"];
 export type AccessKey = Schemas["AccessKey"];
 export type Permission = Schemas["Permission"];
 export type Lifecycle = Schemas["Lifecycle"];
@@ -121,6 +122,12 @@ export const api = {
     ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
   grant: (role: string, bucket: string, permissions: Permission[]) =>
     ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
+  oidcConfig: () => ok(client.GET("/oidc-providers")),
+  setOidcProvider: (
+    name: string,
+    body: { label: string; issuer: string; client_id: string; client_secret: string | null; scopes: string | null },
+  ) => ok(client.PUT("/oidc-providers/{name}", { params: { path: { name } }, body })),
+  deleteOidcProvider: (name: string) => ok(client.DELETE("/oidc-providers/{name}", { params: { path: { name } } })),
   accounts: () => ok(client.GET("/accounts")),
   createAccount: (name: string) => ok(client.POST("/accounts", { body: { name } })),
   rootEnrollment: (account: string) =>

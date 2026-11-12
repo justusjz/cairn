@@ -163,6 +163,9 @@ enum Command {
     User(roles::RoleArgs),
     /// List or make accounts, and their roots' console enrollment links.
     Account(accounts::AccountArgs),
+    /// Configure the OpenID Connect providers people may sign in to the
+    /// console at.
+    Oidc(console::oidc::OidcArgs),
     /// Show, set or delete a bucket's policy, whatever it allows.
     BucketPolicy(s3::buckets::policy::BucketPolicyArgs),
     /// Show or change the cluster's settings.
@@ -248,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve(args) => serve_main(args).await,
         Command::User(args) => roles::role_main(args).await,
         Command::Account(args) => accounts::account_main(args).await,
+        Command::Oidc(args) => console::oidc::oidc_main(args).await,
         Command::BucketPolicy(args) => s3::buckets::policy::bucket_policy_main(args).await,
         Command::Config(args) => settings::config_main(args).await,
         Command::Node(args) => nodes::node_main(args).await,
@@ -402,6 +406,9 @@ async fn maintain(app: Arc<App>) {
                 Ok(client) => {
                     if let Err(e) = console::store::reap(&client).await {
                         eprintln!("console: reaping expired sessions: {e:#}");
+                    }
+                    if let Err(e) = console::oidc::reap(&client).await {
+                        eprintln!("console: reaping expired sign-ins: {e:#}");
                     }
                 }
                 Err(e) => eprintln!("console: reaping expired sessions: {e:#}"),

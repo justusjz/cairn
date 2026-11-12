@@ -356,3 +356,5 @@ label.field { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; f
 label.field input { font-size: 14px; }
 label.file-button { position: relative; overflow: hidden; cursor: pointer; }
 label.file-button input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+form.stacked { max-width: 560px; }
+.provider-buttons { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }

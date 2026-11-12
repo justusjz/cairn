@@ -17,6 +17,7 @@ import Jobs from "../pages/Jobs";
 import Lifecycle from "../pages/Lifecycle";
 import Overview from "../pages/Overview";
 import Storage from "../pages/Storage";
+import SignIn from "../pages/SignIn";
 import Users from "../pages/Users";
 import "../styles.css";
 import { ApiError, type Identity, type Me, type Passkey, api } from "./api";
@@ -108,6 +109,7 @@ const OPERATOR_NAV: [string, string][] = [
   ["/integrity", "Integrity"],
   ["/jobs", "Jobs"],
   ["/accounts", "Accounts"],
+  ["/sign-in", "Sign-in"],
   ["/users", "Superadmins"],
   ["/account", "Account"],
 ];
@@ -127,6 +129,13 @@ async function switchTo(target: Identity) {
       next = await api.switchTo(target.account_id);
     } catch (e) {
       if (!(e instanceof ApiError && e.status === 401 && target.operator)) throw e;
+      // Without passkeys, signing in again at the login's provider.
+      const m = me();
+      if (m && !m.passkeys.length && m.oidc.length) {
+        const { url } = await api.oidcStart(m.oidc[0].provider, "reauth", { account_id: target.account_id });
+        location.assign(url);
+        return;
+      }
       const ceremony = await api.loginOptions();
       const credential = await authenticate(ceremony.options);
       next = await api.switchTo(target.account_id, ceremony.challenge_id, credential);
@@ -184,6 +193,39 @@ function SignedIn(props: { children: (me: Me) => import("solid-js").JSX.Element 
   );
 }
 
+/** The OIDC providers to continue with, for `purpose`. */
+function ProviderButtons(props: { purpose: "login" | "enroll"; token?: string; onError: (e: string) => void }) {
+  const [providers] = createResource(() => api.oidcProviders().catch(() => []));
+  const go = async (name: string) => {
+    try {
+      const { url } = await api.oidcStart(name, props.purpose, { token: props.token });
+      location.assign(url);
+    } catch (e) {
+      props.onError(explain(e));
+    }
+  };
+  return (
+    <Show when={providers()?.length}>
+      <div class="provider-buttons">
+        <For each={providers()}>
+          {(p) => (
+            <button type="button" onClick={() => go(p.name)}>
+              Continue with {p.label}
+            </button>
+          )}
+        </For>
+      </div>
+    </Show>
+  );
+}
+
+/** What a provider's sign-in sent back as wrong (`?error=`), once. */
+function takeError(): string | undefined {
+  const error = new URLSearchParams(location.search).get("error") ?? undefined;
+  if (error) history.replaceState(null, "", location.pathname + location.hash);
+  return error;
+}
+
 function NoPasskeys() {
   return (
     <p class="error-text">
@@ -195,7 +237,7 @@ function NoPasskeys() {
 function Login() {
   const navigate = useNavigate();
   const [busy, setBusy] = createSignal(false);
-  const [error, setError] = createSignal<string>();
+  const [error, setError] = createSignal<string | undefined>(takeError());
   const signIn = async () => {
     setBusy(true);
     setError(undefined);
@@ -217,9 +259,10 @@ function Login() {
           <button class="primary" disabled={busy()} onClick={signIn}>
             Sign in with a passkey
           </button>
+          <ProviderButtons purpose="login" onError={setError} />
           <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
           <p class="subtle small">
-            No passkey yet? Ask an administrator for an enrollment link.
+            New here? Ask an administrator for an enrollment link.
           </p>
         </Show>
       </Panel>
@@ -267,7 +310,7 @@ function Enroll() {
   };
   return (
     <div class="signin">
-      <Panel title="Set up your passkey">
+      <Panel title="Set up your sign-in">
         <Show when={supported()} fallback={<NoPasskeys />}>
           <Show when={ceremony()} fallback={<Loading error={ceremony.error && (ceremony.error as Error).message} />}>
             {(c) => (
@@ -297,6 +340,7 @@ function Enroll() {
                 <button class="primary" type="submit" disabled={busy()}>
                   Make a passkey
                 </button>
+                <ProviderButtons purpose="enroll" token={token} onError={setError} />
                 <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
                 <p class="subtle small">This link works once. If it doesn't anymore, ask for a new one.</p>
               </form>
@@ -366,14 +410,74 @@ function Home() {
               but what its buckets' policies deny. Switching to the operator account asks for your passkey again.
             </p>
           </Panel>
-          <Passkeys passkeys={m.passkeys} />
+          <Passkeys passkeys={m.passkeys} others={m.oidc.length} />
+          <Providers me={m} />
         </>
       )}
     </SignedIn>
   );
 }
 
-function Passkeys(props: { passkeys: Passkey[] }) {
+/** The login's identities at OIDC providers, which sign it in too: linking
+ * one (at the provider), and unlinking (not the last way in). */
+function Providers(props: { me: Me }) {
+  const [providers] = createResource(() => api.oidcProviders().catch(() => []));
+  const [error, setError] = createSignal<string | undefined>(takeError());
+  const unlinked = () => (providers() ?? []).filter((p) => !props.me.oidc.some((o) => o.provider === p.name));
+  const link = async (name: string) => {
+    try {
+      const { url } = await api.oidcStart(name, "link");
+      location.assign(url);
+    } catch (e) {
+      setError(explain(e));
+    }
+  };
+  const unlink = async (provider: string, label: string) => {
+    if (!confirm(`Stop signing in with ${label}?`)) return;
+    if (await act(() => api.oidcUnlink(provider), `Unlinked ${label}`)) refreshMe();
+  };
+  return (
+    <Show when={providers()?.length || props.me.oidc.length}>
+      <Panel title="Sign-in providers">
+        <Table count={props.me.oidc.length} empty="None linked." columns={["Provider", "As", ""]}>
+          <For each={props.me.oidc}>
+            {(o) => (
+              <tr>
+                <td>
+                  {o.label}{" "}
+                  <Show when={props.me.signed_in_at === o.provider}>
+                    <Badge tone="ok">this session</Badge>
+                  </Show>
+                </td>
+                <td>{o.email ?? <span class="subtle">no e-mail given</span>}</td>
+                <td class="actions">
+                  <button
+                    class="small danger"
+                    disabled={props.me.passkeys.length + props.me.oidc.length <= 1}
+                    title={props.me.passkeys.length + props.me.oidc.length <= 1 ? "Your last way to sign in" : ""}
+                    onClick={() => unlink(o.provider, o.label)}
+                  >
+                    Unlink
+                  </button>
+                </td>
+              </tr>
+            )}
+          </For>
+        </Table>
+        <For each={unlinked()}>
+          {(p) => (
+            <button class="small" onClick={() => link(p.name)}>
+              Link {p.label}
+            </button>
+          )}
+        </For>
+        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+      </Panel>
+    </Show>
+  );
+}
+
+function Passkeys(props: { passkeys: Passkey[]; others: number }) {
   const add = async () => {
     try {
       const ceremony = await api.passkeyOptions();
@@ -417,7 +521,12 @@ function Passkeys(props: { passkeys: Passkey[] }) {
                 <button class="small" onClick={() => rename(p)}>
                   Rename
                 </button>
-                <button class="small danger" disabled={props.passkeys.length <= 1} title={props.passkeys.length <= 1 ? "Your last passkey" : ""} onClick={() => remove(p)}>
+                <button
+                  class="small danger"
+                  disabled={props.passkeys.length + props.others <= 1}
+                  title={props.passkeys.length + props.others <= 1 ? "Your last way to sign in" : ""}
+                  onClick={() => remove(p)}
+                >
                   Remove
                 </button>
               </td>
@@ -455,6 +564,7 @@ render(
       <Route path="/integrity" component={Guarded(Integrity)} />
       <Route path="/jobs" component={Guarded(Jobs)} />
       <Route path="/accounts" component={Guarded(Accounts)} />
+      <Route path="/sign-in" component={Guarded(SignIn)} />
       <Route path="/users" component={Guarded(Users)} />
       <Route path="/account" component={Home} />
       <Route path="/buckets" component={Guarded(BucketList)} />

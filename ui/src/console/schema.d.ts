@@ -490,6 +490,114 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/oidc-providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_oidc_providers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oidc-providers/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets an OIDC provider, after checking its discovery document and keys. */
+        put: operations["set_oidc_provider"];
+        post?: never;
+        /** Removes an OIDC provider: the identities at it no longer sign anyone in. */
+        delete: operations["delete_oidc_provider"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oidc/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Where providers send the browser back to (register it with them): ends
+         *     the sign-in, and goes on to the console.
+         */
+        get: operations["oidc_callback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oidc/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The OIDC providers people may sign in at (for the sign-in page). */
+        get: operations["oidc_providers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oidc/{provider}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unlinks the signed-in login's identity at a provider (not its last way
+         *     in).
+         */
+        delete: operations["oidc_unlink"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oidc/{provider}/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Starts a sign-in at a provider. */
+        post: operations["oidc_start"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/passkeys": {
         parameters: {
             query?: never;
@@ -1410,6 +1518,11 @@ export interface components {
             id?: string;
             noncurrent_expiration?: components["schemas"]["LifecycleNoncurrentExpiration"] | null;
         };
+        LinkedProvider: {
+            email?: string | null;
+            label: string;
+            provider: string;
+        };
         /** @description A page of a bucket's keys, rolled up at `/` like a directory listing. */
         Listing: {
             entries: components["schemas"]["Entry"][];
@@ -1475,8 +1588,8 @@ export interface components {
         /** @description The signed-in login: who it acts as now, its identities, its passkeys. */
         Me: {
             /**
-             * @description Whether its passkey was used within five minutes: acting as the
-             *     operator takes that.
+             * @description Whether its passkey was used (or it signed in at its provider)
+             *     within five minutes: acting as the operator takes that.
              */
             fresh: boolean;
             /** @description Every identity of the login, the operator account's last. */
@@ -1485,7 +1598,11 @@ export interface components {
             identity: components["schemas"]["IdentitySummary"];
             /** @description The login's name. */
             name: string;
+            /** @description Its identities at OIDC providers, which sign it in too. */
+            oidc: components["schemas"]["LinkedProvider"][];
             passkeys: components["schemas"]["PasskeySummary"][];
+            /** @description The OIDC provider this session was signed in at, if it was. */
+            signed_in_at?: string | null;
         };
         /** @description A node's metrics. Times are seconds since the Unix epoch. */
         MetricsReport: {
@@ -1513,6 +1630,23 @@ export interface components {
         NewKey: {
             id: string;
             secret: string;
+        };
+        NewOidcProvider: {
+            client_id: string;
+            /**
+             * @description The client's secret; none for a public client. Left out when
+             *     changing a provider: it keeps its secret.
+             */
+            client_secret?: string | null;
+            /**
+             * @description The issuer's URL: its discovery document is at
+             *     `<issuer>/.well-known/openid-configuration`.
+             */
+            issuer: string;
+            /** @description What the sign-in button says, e.g. "Company SSO". */
+            label: string;
+            /** @description `openid email profile` if not given. */
+            scopes?: string | null;
         };
         NewPasskey: {
             challenge_id: string;
@@ -1648,6 +1782,43 @@ export interface components {
             /** Format: int64 */
             noncurrent_bytes: number;
         };
+        /**
+         * @description An OpenID Connect provider people may sign in to the console at (see
+         *     `console::oidc`); never its client secret.
+         */
+        OidcProvider: {
+            client_id: string;
+            /** @description Whether it has a client secret (else it's a public client). */
+            has_secret: boolean;
+            issuer: string;
+            label: string;
+            /**
+             * Format: int64
+             * @description Logins it signs in.
+             */
+            logins: number;
+            name: string;
+            scopes: string;
+        };
+        /** @description The providers, and the redirect URI to register with them. */
+        OidcProviders: {
+            providers: components["schemas"]["OidcProvider"][];
+            /** @description `<console URL>/api/oidc/callback`, if this node serves the console. */
+            redirect_uri?: string | null;
+        };
+        OidcRedirect: {
+            /** @description Where to send the browser: the provider's sign-in. */
+            url: string;
+        };
+        OidcStart: {
+            account_id?: string | null;
+            /**
+             * @description `login`, `enroll` (with `token`), `link` or `reauth` (with
+             *     `account_id`), the latter two signed in.
+             */
+            purpose: string;
+            token?: string | null;
+        };
         OpCounts: components["schemas"]["Counts"] & {
             op: string;
         };
@@ -1758,6 +1929,11 @@ export interface components {
         /** @description An inline policy: a JSON document in IAM's policy language. */
         PolicyDocument: {
             document: string;
+        };
+        /** @description A provider to sign in at. */
+        ProviderButton: {
+            label: string;
+            name: string;
         };
         /**
          * @description What `navigator.credentials.create()` gave the page (its parts, in
@@ -3164,6 +3340,244 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["NodeRemoved"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_oidc_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OidcProviders"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_oidc_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewOidcProvider"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_oidc_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    oidc_callback: {
+        parameters: {
+            query?: {
+                state?: string;
+                code?: string;
+                error?: string;
+                error_description?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description On to the console, signed in (or to the sign-in page, with what went wrong) */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    oidc_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderButton"][];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    oidc_unlink: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Unlinked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    oidc_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OidcStart"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OidcRedirect"];
                 };
             };
             "4XX": {

@@ -579,6 +579,21 @@ the user may use.
   as a hash, so every node serves them. Removing a passkey or the user ends
   the sessions signed in with it. Changes must come from the console's own
   page (its `Origin`).
+- **OpenID Connect**: besides passkeys, people may sign in at any OIDC
+  provider that follows the standard (Keycloak, Authentik, Dex, Entra ID,
+  Google, Okta, ...). A superadmin adds one on the console's Sign-in page
+  (or with `cairn oidc set <name> --issuer <URL> --client-id <ID>
+  [--client-secret <S>]`): Cairn reads the rest from the issuer's discovery
+  document. Register `<console URL>/api/oidc/callback` with the provider as
+  the client's redirect URI. Cairn uses the authorization code flow with
+  PKCE, and checks the ID token's signature by the provider's keys (RS*,
+  PS*, ES256, ES384, EdDSA), issuer, audience, expiry and nonce. An identity
+  at a provider signs in only a login it's linked to: through an enrollment
+  link ("Continue with ..."), or from the account page, signed in. No
+  account is ever entered for a matching e-mail address. Switching into the
+  operator account without a passkey signs in at the provider again
+  (`prompt=login`). A login keeps at least one way in: its last passkey or
+  provider can't be removed.
 - **Passkeys** are checked by Cairn itself (WebAuthn, with EdDSA, ES256 or
   RS256 keys), with user verification (a PIN or biometrics) every time, and
   without attestation: any authenticator works. A passkey whose signature

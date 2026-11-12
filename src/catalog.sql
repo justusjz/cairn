@@ -156,9 +156,10 @@
 --     most 2048 characters (but whitespace) together, as in IAM: making a
 --     key, or setting a policy, holds R(r) exclusively, and counts what the
 --     user has in a later statement (T28, T29). Likewise a console login
---     has at most 8 passkeys, as IAM's MFA devices, and at least one, but
---     by being deleted, under L(l) (T30, T31); and at most one identity per
---     account (T33, T34; the login_identities indexes are a backstop). Deleting a key or a
+--     has at most 8 passkeys, as IAM's MFA devices, and at least one way in
+--     (a passkey, or an identity at an OIDC provider), but by being
+--     deleted, under L(l) (T30, T31, T35, T37); and at most one identity per
+--     account (T33, T34, T36; the login_identities indexes are a backstop). Deleting a key or a
 --     policy only takes from them. The console's enrollments, challenges and
 --     sessions are each used up or ended by a single DELETE, whose condition
 --     is on its own row (F2), so each is used once.
@@ -1513,9 +1514,10 @@ END
 $$;
 
 -- T31: removes one of a login's passkeys (and so the sessions signed in with
--- it), unless it's the login's last, so that no one locks themselves out of
--- the console. Takes L(l) exclusively, then counts. Returns 'deleted',
--- 'no_such_passkey' or 'last'.
+-- it), unless it's the login's last way in (passkeys, and identities at OIDC
+-- providers), so that no one locks themselves out of the console. Takes
+-- L(l) exclusively, then counts. Returns 'deleted', 'no_such_passkey' or
+-- 'last'.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_passkey(p_login uuid, p_credential bytea)
 RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
@@ -1523,7 +1525,8 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM passkeys WHERE login_id = p_login AND credential_id = p_credential) THEN
         RETURN 'no_such_passkey';
     END IF;
-    IF (SELECT count(*) FROM passkeys WHERE login_id = p_login) <= 1 THEN
+    IF (SELECT count(*) FROM passkeys WHERE login_id = p_login)
+       + (SELECT count(*) FROM login_oidc WHERE login_id = p_login) <= 1 THEN
         RETURN 'last';
     END IF;
     DELETE FROM passkeys WHERE login_id = p_login AND credential_id = p_credential;
@@ -1615,6 +1618,77 @@ BEGIN
     INSERT INTO passkeys (credential_id, login_id, public_key, sign_count, name, backup_eligible, backed_up)
     VALUES (p_credential, login, p_public_key, p_sign_count, p_passkey, p_backup_eligible, p_backed_up);
     status := 'created';
+END
+$$;
+
+-- T35: links an identity at an OIDC provider (`p_provider`, `p_subject`) to a
+-- signed-in login, as a way in. Takes L(l) exclusively. Returns 'linked',
+-- 'no_such_login' or 'taken' (it's another login's).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_link_oidc(p_login uuid, p_provider text, p_subject text, p_email text)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM logins WHERE id = p_login FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_login';
+    END IF;
+    INSERT INTO login_oidc (provider, subject, login_id, email) VALUES (p_provider, p_subject, p_login, p_email)
+    ON CONFLICT DO NOTHING;
+    IF NOT FOUND THEN
+        IF EXISTS (SELECT 1 FROM login_oidc WHERE provider = p_provider AND subject = p_subject AND login_id = p_login) THEN
+            RETURN 'linked';
+        END IF;
+        RETURN 'taken';
+    END IF;
+    RETURN 'linked';
+END
+$$;
+
+-- T36: a new login `p_login`, named `p_name`, signing in with an identity at
+-- an OIDC provider, for the identity of enrollment `p_enrollment` (see
+-- `cairn_link_identity`): all of it, or nothing, as T34. Returns 'created',
+-- 'no_enrollment' or 'taken' (the provider's identity is another login's),
+-- and the identity's account.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_new_oidc_login(
+    p_login uuid, p_name text, p_enrollment bytea, p_provider text, p_subject text, p_email text,
+    OUT status text, OUT account text)
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM console_enrollments e WHERE e.token_hash = p_enrollment AND e.expires_at > now()) THEN
+        status := 'no_enrollment';
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM login_oidc WHERE provider = p_provider AND subject = p_subject)
+       OR EXISTS (SELECT 1 FROM logins WHERE id = p_login) THEN
+        status := 'taken';
+        RETURN;
+    END IF;
+    INSERT INTO logins (id, name) VALUES (p_login, p_name);
+    SELECT l.status, l.account INTO status, account FROM pg_temp.cairn_link_identity(p_login, p_enrollment) l;
+    IF status <> 'linked' THEN
+        DELETE FROM logins WHERE id = p_login;
+        RETURN;
+    END IF;
+    INSERT INTO login_oidc (provider, subject, login_id, email) VALUES (p_provider, p_subject, p_login, p_email);
+    status := 'created';
+END
+$$;
+
+-- T37: unlinks a login's identity at an OIDC provider, unless it's the
+-- login's last way in (as T31). Takes L(l) exclusively. Returns
+-- 'unlinked', 'none' or 'last'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_unlink_oidc(p_login uuid, p_provider text)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM logins WHERE id = p_login FOR UPDATE;
+    IF NOT EXISTS (SELECT 1 FROM login_oidc WHERE login_id = p_login AND provider = p_provider) THEN
+        RETURN 'none';
+    END IF;
+    IF (SELECT count(*) FROM passkeys WHERE login_id = p_login)
+       + (SELECT count(*) FROM login_oidc WHERE login_id = p_login) <= 1 THEN
+        RETURN 'last';
+    END IF;
+    DELETE FROM login_oidc WHERE login_id = p_login AND provider = p_provider;
+    RETURN 'unlinked';
 END
 $$;
 

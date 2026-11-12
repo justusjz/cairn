@@ -86,6 +86,8 @@ pub(crate) fn shared_router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(keep_node))
         .routes(routes!(list_accounts, create_account))
         .routes(routes!(create_root_enrollment))
+        .routes(routes!(list_oidc_providers))
+        .routes(routes!(set_oidc_provider, delete_oidc_provider))
         // Accounts' buckets and objects (`s3:`), and users (`iam:`).
         .routes(routes!(list_buckets, create_bucket))
         .routes(routes!(delete_bucket))
@@ -1829,6 +1831,123 @@ async fn create_root_enrollment(
     let path = format!("/enroll#{token}");
     let url = app.dashboard.console_origin.as_ref().map(|origin| format!("{origin}{path}"));
     Ok((StatusCode::CREATED, Json(Enrollment { url, path })))
+}
+
+// ─── OIDC providers ──────────────────────────────────────────────────────────
+
+/// An OpenID Connect provider people may sign in to the console at (see
+/// `console::oidc`); never its client secret.
+#[derive(Serialize, ToSchema)]
+struct OidcProvider {
+    name: String,
+    label: String,
+    issuer: String,
+    client_id: String,
+    /// Whether it has a client secret (else it's a public client).
+    has_secret: bool,
+    scopes: String,
+    /// Logins it signs in.
+    logins: i64,
+}
+
+/// The providers, and the redirect URI to register with them.
+#[derive(Serialize, ToSchema)]
+struct OidcProviders {
+    providers: Vec<OidcProvider>,
+    /// `<console URL>/api/oidc/callback`, if this node serves the console.
+    redirect_uri: Option<String>,
+}
+
+#[utoipa::path(get, path = "/oidc-providers", responses(
+    (status = 200, body = OidcProviders),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn list_oidc_providers(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<OidcProviders>> {
+    actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
+    let client = app.pool.get().await?;
+    let counts: HashMap<String, i64> = client
+        .query_cached("SELECT provider, count(*) FROM login_oidc GROUP BY provider", &[])
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    let providers = crate::console::oidc::providers(&client)
+        .await?
+        .into_iter()
+        .map(|p| OidcProvider {
+            logins: counts.get(&p.name).copied().unwrap_or(0),
+            has_secret: p.client_secret.is_some(),
+            name: p.name,
+            label: p.label,
+            issuer: p.issuer,
+            client_id: p.client_id,
+            scopes: p.scopes,
+        })
+        .collect();
+    let redirect_uri = app.dashboard.console_origin.as_ref().map(|origin| format!("{origin}/api/oidc/callback"));
+    Ok(Json(OidcProviders { providers, redirect_uri }))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct NewOidcProvider {
+    /// What the sign-in button says, e.g. "Company SSO".
+    label: String,
+    /// The issuer's URL: its discovery document is at
+    /// `<issuer>/.well-known/openid-configuration`.
+    issuer: String,
+    client_id: String,
+    /// The client's secret; none for a public client. Left out when
+    /// changing a provider: it keeps its secret.
+    client_secret: Option<String>,
+    /// `openid email profile` if not given.
+    scopes: Option<String>,
+}
+
+/// Sets an OIDC provider, after checking its discovery document and keys.
+#[utoipa::path(put, path = "/oidc-providers/{name}", params(("name" = String, Path)), request_body = NewOidcProvider, responses(
+    (status = 204, description = "Set"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn set_oidc_provider(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+    Json(body): Json<NewOidcProvider>,
+) -> Result<StatusCode> {
+    actor.check(&app, "cairn:PutSetting", On::Cluster).await?;
+    let client = app.pool.get().await?;
+    let secret = match body.client_secret.filter(|s| !s.is_empty()) {
+        Some(secret) => Some(secret),
+        None => crate::console::oidc::provider(&client, &name).await?.and_then(|p| p.client_secret),
+    };
+    let provider = crate::console::oidc::Provider {
+        name,
+        label: body.label,
+        issuer: body.issuer,
+        client_id: body.client_id,
+        client_secret: secret,
+        scopes: body.scopes.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "openid email profile".to_owned()),
+    };
+    crate::console::oidc::set_provider(&client, &provider).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes an OIDC provider: the identities at it no longer sign anyone in.
+#[utoipa::path(delete, path = "/oidc-providers/{name}", params(("name" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_oidc_provider(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<StatusCode> {
+    actor.check(&app, "cairn:PutSetting", On::Cluster).await?;
+    crate::console::oidc::remove_provider(&app.pool.get().await?, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─── Roles ───────────────────────────────────────────────────────────────────

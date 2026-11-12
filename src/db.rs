@@ -204,6 +204,7 @@ const MIGRATIONS: &[&str] = &[
     PUBLIC_ACCESS_BLOCK,
     ACCOUNTS,
     LOGINS,
+    OIDC,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1373,6 +1374,57 @@ CREATE INDEX console_sessions_identity ON console_sessions (login_id, account_id
 CREATE TRIGGER logins_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON logins
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER login_identities_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON login_identities
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 35: OpenID Connect sign-in to the console (see
+/// `console::oidc`): the providers superadmins configure (by their issuer,
+/// whose discovery document says the rest), the identities at them (issuer
+/// and subject) that sign in a login, and sign-ins in progress (their
+/// state, used once). A session signed in that way has no passkey.
+const OIDC: &str = r#"
+CREATE TABLE oidc_providers (
+    name          text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9-]{0,31}$'),
+    label         text NOT NULL,
+    issuer        text NOT NULL,
+    client_id     text NOT NULL,
+    client_secret text,
+    scopes        text NOT NULL DEFAULT 'openid email profile',
+    created_at    timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE login_oidc (
+    provider     text NOT NULL REFERENCES oidc_providers (name) ON DELETE CASCADE,
+    subject      text NOT NULL,
+    login_id     uuid NOT NULL REFERENCES logins (id) ON DELETE CASCADE,
+    email        text,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    last_used_at timestamptz,
+    PRIMARY KEY (provider, subject)
+);
+CREATE INDEX login_oidc_login ON login_oidc (login_id);
+
+CREATE TABLE oidc_flows (
+    state_hash bytea PRIMARY KEY,
+    provider   text NOT NULL REFERENCES oidc_providers (name) ON DELETE CASCADE,
+    nonce      text NOT NULL,
+    verifier   text NOT NULL,
+    purpose    text NOT NULL CHECK (purpose IN ('login', 'enroll', 'link', 'reauth')),
+    login_id   uuid REFERENCES logins (id) ON DELETE CASCADE,
+    enrollment bytea,
+    account_id text,
+    session    bytea,
+    expires_at timestamptz NOT NULL
+);
+
+ALTER TABLE console_sessions ALTER COLUMN credential_id DROP NOT NULL;
+ALTER TABLE console_sessions ADD COLUMN oidc_provider text;
+
+CREATE TRIGGER oidc_providers_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON oidc_providers
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER login_oidc_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON login_oidc
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER oidc_flows_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON oidc_flows
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
