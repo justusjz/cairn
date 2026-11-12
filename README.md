@@ -968,7 +968,10 @@ sent.
 Objects keep their S3 checksums, as S3 does: the one the client uploaded
 (CRC32, CRC32C, CRC64NVME, SHA-1 or SHA-256), or else a CRC64NVME that Cairn
 computes. A multipart upload gets the algorithm and type (`COMPOSITE` or
-`FULL_OBJECT`) it was created with, or else a full-object CRC64NVME. An
+`FULL_OBJECT`) it was created with, or else a full-object CRC64NVME. As in
+S3, a `COMPOSITE` upload's parts must each carry their checksum, and be
+listed with it on completion; a `FULL_OBJECT` upload's needn't, Cairn works
+them out itself (and checks any that are sent or listed). An
 SSE-C upload created without an algorithm gets no checksum, so it can be
 completed without the key, as in S3. A read with `x-amz-checksum-mode:
 ENABLED` returns the checksum, so clients can verify what they download.

@@ -40,6 +40,9 @@ enum CompleteOutcome {
     },
     NoSuchUpload,
     InvalidPart,
+    /// A part of a COMPOSITE upload is listed without its checksum: its
+    /// number, as listed.
+    MissingChecksum(Algorithm, i32),
     /// Its parts make an object larger than S3 stores.
     TooLarge,
     /// A part, not the last, is smaller than S3 takes.
@@ -258,7 +261,18 @@ pub async fn complete_multipart_upload(
                 return Ok(format_s3_error(
                     StatusCode::BAD_REQUEST,
                     "InvalidPart",
-                    "one or more listed parts could not be found or its ETag did not match",
+                    "One or more of the specified parts could not be found.  The part may not have been uploaded, or the specified entity tag may not match the part's entity tag.",
+                ));
+            }
+            Ok(CompleteOutcome::MissingChecksum(algorithm, number)) => {
+                return Ok(format_s3_error(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidRequest",
+                    &format!(
+                        "The upload was created using a {} checksum. The complete request must include the \
+                         checksum for each part. It was missing for part {number} in the request.",
+                        algorithm.name().to_lowercase()
+                    ),
                 ));
             }
             Ok(CompleteOutcome::TooLarge) => {
@@ -557,8 +571,9 @@ async fn try_complete(
         staged.insert(row.get::<_, i32>(0), Staged { id: row.get(1), etag, checksum, size });
     }
     // Each listed part must be staged, with its ETag; and with its checksum
-    // if the upload has an algorithm, which S3 requires to be listed (one
-    // listed of the default, CRC64NVME, is checked too).
+    // if the upload is COMPOSITE, which S3 requires to be listed. A FULL_OBJECT
+    // upload's needn't be (probed), but one listed is checked, as one of the
+    // default, CRC64NVME, is.
     let algorithm = upload.object_checksum().map(|(algorithm, _)| algorithm);
     let mut parts = Vec::with_capacity(requested.len());
     for ((number, etag), listed) in requested.iter().zip(&request.listed.checksums) {
@@ -569,8 +584,10 @@ async fn try_complete(
         match (listed, &part.checksum) {
             (Some(listed), Some(checksum)) if listed == checksum => {}
             (Some(_), _) => return Ok(CompleteOutcome::InvalidPart),
-            (None, _) if upload.checksum.is_some() => return Ok(CompleteOutcome::InvalidPart),
-            (None, _) => {}
+            (None, _) => match upload.checksum {
+                Some((algorithm, Type::Composite)) => return Ok(CompleteOutcome::MissingChecksum(algorithm, *number)),
+                _ => {}
+            },
         }
         parts.push(part);
     }

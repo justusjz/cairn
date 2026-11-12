@@ -36,6 +36,22 @@ impl Upload {
         }
     }
 
+    /// Why a part declaring a checksum of `declared` (if any) can't be one
+    /// of this upload, if it can't: an upload of an algorithm takes parts
+    /// with checksums of it only, but a FULL_OBJECT one's parts may come
+    /// without, their checksums worked out here, as S3 does (probed).
+    pub fn mismatch(&self, declared: Option<Algorithm>) -> Option<String> {
+        let (algorithm, kind) = self.checksum?;
+        if declared == Some(algorithm) || (declared.is_none() && kind == Type::FullObject) {
+            return None;
+        }
+        Some(format!(
+            "Checksum Type mismatch occurred, expected checksum Type: {}, actual checksum Type: {}",
+            algorithm.name().to_lowercase(),
+            declared.map_or("null".to_owned(), |a| a.name().to_lowercase())
+        ))
+    }
+
     /// The algorithm and type of the object's checksum, if it gets one.
     pub fn object_checksum(&self) -> Option<(Algorithm, Type)> {
         match self.part_checksum() {

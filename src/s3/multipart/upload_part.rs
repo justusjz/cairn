@@ -61,20 +61,8 @@ pub async fn put_part(
             "the specified multipart upload does not exist",
         ));
     };
-    // An upload of an algorithm takes parts with checksums of it only (S3
-    // requires them; MinIO's 400).
-    if let Some((algorithm, _)) = upload.checksum
-        && payload.declared_algorithm() != Some(algorithm)
-    {
-        let got = payload.declared_algorithm().map_or("", |a| a.name());
-        return Ok(format_s3_error(
-            StatusCode::BAD_REQUEST,
-            "InvalidArgument",
-            &format!(
-                "Invalid arguments provided for {bucket}/{key}: (checksum missing, want \"{}\", got \"{got}\")",
-                algorithm.name()
-            ),
-        ));
+    if let Some(mismatch) = upload.mismatch(payload.declared_algorithm()) {
+        return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", &mismatch));
     }
     let encryption = upload.encryption.clone();
     if let Err(refused) = sse::check(&encryption, customer_key) {
@@ -101,12 +89,17 @@ pub async fn put_part(
     )
     .await?
     {
-        UploadResult::Committed { etag, sent, .. } => {
+        UploadResult::Committed { etag, checksum, sent, .. } => {
             let builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, format!("\"{etag}\""));
-            // The checksum the client sent, as S3 echoes it.
-            let builder = match &sent {
+            // The part's checksum, if the upload has an algorithm, sent or
+            // not; else the one the client sent, as S3 echoes them (probed).
+            let echoed = match upload.checksum {
+                Some(_) => checksum.as_ref(),
+                None => sent.as_ref(),
+            };
+            let builder = match echoed {
                 Some(sent) => builder.header(sent.algorithm.header(), &sent.value),
                 None => builder,
             };

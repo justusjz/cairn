@@ -666,10 +666,10 @@ sse_c_ok() {
 
 # S3's checksums: a PUT's, the client's, told by a HEAD with checksum mode
 # and checked by the client as it downloads; a multipart upload's of an
-# algorithm, COMPOSITE, of its parts; a copy's of the algorithm it asks for,
-# FULL_OBJECT.
+# algorithm, COMPOSITE, of its parts, and a FULL_OBJECT one's, whose parts
+# needn't carry theirs; a copy's of the algorithm it asks for, FULL_OBJECT.
 checksums_ok() {
-    local out="$WORK_DIR/ck-out" sha crc told
+    local out="$WORK_DIR/ck-out" url="http://${SERVER_HOST}:${SERVER_PORT}/${BUCKET}" sha crc told id etag
     crc32() { python3 -I -c 'import sys, zlib, base64
 print(base64.b64encode(zlib.crc32(open(sys.argv[1], "rb").read()).to_bytes(4, "big")).decode())' "$1"; }
     sha=$(openssl dgst -sha256 -binary "$BIG" | base64)
@@ -696,7 +696,21 @@ print(base64.b64encode(zlib.crc32(open(sys.argv[1], "rb").read()).to_bytes(4, "b
     told=$(awss3 s3api head-object --bucket "$BUCKET" --key ck/copy.bin --checksum-mode ENABLED \
         --query '[ChecksumType, ChecksumCRC32]' --output text 2>/dev/null)
     [ "$told" = "FULL_OBJECT	$(crc32 "$MULTIPART")" ] || return 1
-    for key in sha.bin crc.bin multi.bin copy.bin; do
+    # A FULL_OBJECT upload's part may come without its checksum, which it's
+    # then told, and be listed without it.
+    id=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key ck/full.bin --checksum-algorithm CRC32 \
+        --checksum-type FULL_OBJECT --query UploadId --output text 2>/dev/null) || return 1
+    told=$(curl -s -D - -o /dev/null -X PUT -T "$BIG" --aws-sigv4 "aws:amz:us-east-1:s3" \
+        --user "$ACCESS_KEY:$SECRET_KEY" "$url/ck/full.bin?partNumber=1&uploadId=$id" | tr -d '\r')
+    echo "$told" | grep -qx "x-amz-checksum-crc32: $crc" || return 1
+    etag=$(echo "$told" | sed -n 's/^etag: //Ip')
+    awss3 s3api complete-multipart-upload --bucket "$BUCKET" --key ck/full.bin --upload-id "$id" \
+        --multipart-upload "{\"Parts\": [{\"PartNumber\": 1, \"ETag\": $(printf '%s' "$etag" | python3 -I -c 'import json, sys; print(json.dumps(sys.stdin.read()))')}]}" \
+        >/dev/null 2>&1 || return 1
+    told=$(awss3 s3api head-object --bucket "$BUCKET" --key ck/full.bin --checksum-mode ENABLED \
+        --query '[ChecksumType, ChecksumCRC32]' --output text 2>/dev/null)
+    [ "$told" = "FULL_OBJECT	$crc" ] || return 1
+    for key in sha.bin crc.bin multi.bin copy.bin full.bin; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "ck/$key" >/dev/null 2>&1 || return 1
     done
 }

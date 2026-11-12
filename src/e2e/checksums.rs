@@ -173,10 +173,8 @@ async fn upload_part(
     let id: Uuid = upload_id.parse().unwrap();
     let upload = upload(app, &id, BUCKET, key).await.unwrap().unwrap();
     // As `put_part` checks it.
-    if let Some((algorithm, _)) = upload.checksum
-        && sent != Some(algorithm)
-    {
-        return Err("InvalidArgument".into());
+    if upload.mismatch(sent).is_some() {
+        return Err("InvalidRequest".into());
     }
     let upload_key = sse::open(app, &upload.encryption, customer, None, BUCKET, key).await.unwrap().ok().unwrap();
     let attach = AttachTarget::MultipartPart {
@@ -247,8 +245,8 @@ async fn composite_uploads() {
     let (one, two) = (data(MIN), data(1000));
     let id = create(&app, "m", Some((Algorithm::Sha256, Type::Composite)), None).await;
     // A part without its checksum, or of another algorithm, is refused.
-    assert_eq!(upload_part(&app, "m", &id, 1, &one, None, None).await, Err("InvalidArgument".into()));
-    assert_eq!(upload_part(&app, "m", &id, 1, &one, Some(Algorithm::Crc32), None).await, Err("InvalidArgument".into()));
+    assert_eq!(upload_part(&app, "m", &id, 1, &one, None, None).await, Err("InvalidRequest".into()));
+    assert_eq!(upload_part(&app, "m", &id, 1, &one, Some(Algorithm::Crc32), None).await, Err("InvalidRequest".into()));
     let e1 = upload_part(&app, "m", &id, 1, &one, Some(Algorithm::Sha256), None).await.unwrap();
     let e2 = upload_part(&app, "m", &id, 2, &two, Some(Algorithm::Sha256), None).await.unwrap();
     let (c1, c2) = (b64(Algorithm::Sha256, &one), b64(Algorithm::Sha256, &two));
@@ -258,14 +256,16 @@ async fn composite_uploads() {
     assert!(listed.contains("<ChecksumAlgorithm>SHA256</ChecksumAlgorithm><ChecksumType>COMPOSITE</ChecksumType>"));
     assert!(listed.contains(&format!("<ChecksumSHA256>{c2}</ChecksumSHA256>")), "{listed}");
 
-    // A part listed without its checksum, or a wrong one, isn't the part.
+    // A part listed without its checksum is refused; one with a wrong one
+    // isn't the part.
     let sha = |v: &str| vec![(Algorithm::Sha256, v.to_owned())];
     let (good1, good2, wrong) = (sha(&c1), sha(&c2), sha(&c1));
     let (status, _, body) = complete(&app, "m", &id, &[(1, &e1, &good1), (2, &e2, &[])], &[], None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(body.contains("InvalidPart"));
-    let (status, _, _) = complete(&app, "m", &id, &[(1, &e1, &good1), (2, &e2, &wrong)], &[], None).await;
+    assert!(body.contains("InvalidRequest") && body.contains("missing for part 2"), "{body}");
+    let (status, _, body) = complete(&app, "m", &id, &[(1, &e1, &good1), (2, &e2, &wrong)], &[], None).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("InvalidPart"), "{body}");
 
     // A wrong object checksum claimed: BadDigest, and nothing's published.
     let parts = [(1, e1.as_str(), good1.as_slice()), (2, e2.as_str(), good2.as_slice())];
@@ -288,24 +288,39 @@ async fn composite_uploads() {
 }
 
 /// A FULL_OBJECT upload's object checksum is its parts' combined: of the
-/// algorithm asked for, or, without one, S3's default, CRC64NVME.
+/// algorithm asked for, or, without one, S3's default, CRC64NVME. Its parts
+/// may come without their checksums, and be listed without them, as in S3.
 #[tokio::test]
 async fn full_object_uploads() {
     let Some(app) = node().await else { return };
     let (one, two) = (data(MIN), data(70_001));
     let whole = [one.clone(), two.clone()].concat();
-    for (key, checksum) in [
-        ("crc32c", Some((Algorithm::Crc32c, Type::FullObject))),
-        ("crc64", Some((Algorithm::Crc64Nvme, Type::FullObject))),
-        ("default", None),
+    for (key, checksum, sent) in [
+        ("crc32c", Some((Algorithm::Crc32c, Type::FullObject)), true),
+        ("crc64", Some((Algorithm::Crc64Nvme, Type::FullObject)), true),
+        ("default", None, false),
+        ("crc32-unsent", Some((Algorithm::Crc32, Type::FullObject)), false),
+        ("crc64-unsent", Some((Algorithm::Crc64Nvme, Type::FullObject)), false),
     ] {
         let algorithm = checksum.map_or(Algorithm::Crc64Nvme, |(a, _)| a);
         let id = create(&app, key, checksum, None).await;
-        let sent = checksum.map(|(a, _)| a);
+        // Another algorithm's is refused, though.
+        if let Some((a, _)) = checksum {
+            let other = if a == Algorithm::Crc32 { Algorithm::Crc32c } else { Algorithm::Crc32 };
+            assert_eq!(upload_part(&app, key, &id, 1, &one, Some(other), None).await, Err("InvalidRequest".into()));
+        }
+        let sent = checksum.filter(|_| sent).map(|(a, _)| a);
         let e1 = upload_part(&app, key, &id, 1, &one, sent, None).await.unwrap();
         let e2 = upload_part(&app, key, &id, 2, &two, sent, None).await.unwrap();
-        let listed = |data: &[u8]| match checksum {
-            Some((a, _)) => vec![(a, b64(a, data))],
+        // Listed, the parts' checksums are checked.
+        if let Some((a, _)) = checksum {
+            let wrong = [(a, b64(a, &two))];
+            let (status, _, body) = complete(&app, key, &id, &[(1, &e1, &wrong), (2, &e2, &[])], &[], None).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body.contains("InvalidPart"), "{body}");
+        }
+        let listed = |data: &[u8]| match sent {
+            Some(a) => vec![(a, b64(a, data))],
             None => vec![],
         };
         let (l1, l2) = (listed(&one), listed(&two));
