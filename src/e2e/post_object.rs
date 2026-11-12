@@ -464,3 +464,26 @@ async fn refuses_malformed_forms() {
     assert_eq!(outcome(response).await, (StatusCode::BAD_REQUEST, "InvalidArgument".to_owned()));
     assert_eq!(post_to(&app, BUCKET, &[], ok()).await.status(), StatusCode::NO_CONTENT);
 }
+
+/// A form is signed as `POST` (`s3:authType`), which a bucket policy may
+/// deny uploads by.
+#[tokio::test]
+async fn bucket_policies_see_forms_as_posted() {
+    let Some(app) = node().await else { return };
+    let signer = role(&app, true).await;
+    let deny = |auth_type: &str| {
+        Bytes::from(format!(
+            r#"{{"Statement":[{{"Effect":"Deny","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::{BUCKET}/*",
+                "Condition":{{"StringEquals":{{"s3:authType":"{auth_type}","s3:signatureversion":"AWS4-HMAC-SHA256"}}}}}}]}}"#
+        ))
+    };
+    let set = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, deny("POST")).await.unwrap();
+    assert_eq!(set.status(), StatusCode::NO_CONTENT);
+    let (status, code) = outcome(post(&app, form(&keyed(&signer, "denied.txt", "", &[]), "f", b"x", &[])).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::FORBIDDEN, "AccessDenied"));
+    assert!(get(&app, "denied.txt").await.is_none());
+
+    crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, deny("REST-HEADER")).await.unwrap();
+    let response = post(&app, form(&keyed(&signer, "allowed.txt", "", &[]), "f", b"x", &[])).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}

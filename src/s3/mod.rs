@@ -263,34 +263,36 @@ async fn handle_request(
         // query up front and match on an owned method — mirroring the object branch
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
-        // Bucket sub-resource GETs: versioning, encryption, lifecycle, CORS
-        // and tagging are real; the rest (acl, location, policy,
+        // Bucket sub-resource GETs: versioning, encryption, lifecycle, CORS,
+        // policy and tagging are real; the rest (acl, location,
         // object-lock, website, ...) are stubbed — Cairn implements none of
         // them, so answer as S3 does for an unconfigured bucket before
-        // falling through to a listing.
+        // falling through to a listing. Each goes where `operation` says,
+        // which is what was authorized: a request naming two subresources
+        // must not be checked as one and handled as the other.
         if *req.method() == hyper::Method::GET {
-            if query_param(&query, "versioning").is_some() {
+            if operation.name == "GetBucketVersioning" {
                 return Ok(box_response(get_bucket_versioning(&app, &bucket).await?));
             }
-            if query_param(&query, "encryption").is_some() {
+            if operation.name == "GetBucketEncryption" {
                 return Ok(box_response(get_bucket_encryption(&app, &bucket).await?));
             }
-            if query_param(&query, "lifecycle").is_some() {
+            if operation.name == "GetBucketLifecycleConfiguration" {
                 return Ok(box_response(get_bucket_lifecycle(&app, &bucket).await?));
             }
-            if query_param(&query, "cors").is_some() {
+            if operation.name == "GetBucketCors" {
                 return Ok(box_response(get_bucket_cors(&app, &bucket).await?));
             }
-            if query_param(&query, "policyStatus").is_some() {
+            if operation.name == "GetBucketPolicyStatus" {
                 return Ok(box_response(policy::get_bucket_policy_status(&app, &bucket).await?));
             }
-            if query_param(&query, "policy").is_some() {
+            if operation.name == "GetBucketPolicy" {
                 return Ok(box_response(policy::get_bucket_policy(&app, &bucket).await?));
             }
-            if query_param(&query, "tagging").is_some() {
+            if operation.name == "GetBucketTagging" {
                 return Ok(box_response(get_bucket_tagging(&app, &bucket).await?));
             }
-            if query_param(&query, "ownershipControls").is_some() {
+            if operation.name == "GetBucketOwnershipControls" {
                 return Ok(box_response(acl::ownership_controls()));
             }
             if let Some(resp) = bucket_subresource_stub(&query) {
@@ -403,7 +405,7 @@ async fn handle_request(
             hyper::Method::HEAD => head_bucket(&app, &bucket).await?,
             // PutBucketVersioning: PUT /{bucket}?versioning with a
             // <VersioningConfiguration> body.
-            hyper::Method::PUT if query_param(&query, "versioning").is_some() => {
+            hyper::Method::PUT if operation.name == "PutBucketVersioning" => {
                 match read_body(req, &secret, true).await? {
                     Ok(body) => put_bucket_versioning(&app, &bucket, body).await?,
                     Err(rejection) => util::rejection_response(&rejection),
@@ -411,7 +413,7 @@ async fn handle_request(
             }
             // PutBucketEncryption: PUT /{bucket}?encryption with a
             // <ServerSideEncryptionConfiguration> body.
-            hyper::Method::PUT if query_param(&query, "encryption").is_some() => {
+            hyper::Method::PUT if operation.name == "PutBucketEncryption" => {
                 match read_body(req, &secret, true).await? {
                     Ok(body) => {
                         let role = principal.as_ref().map_or(uuid::Uuid::nil(), |p| p.id);
@@ -423,7 +425,7 @@ async fn handle_request(
             // PutBucketLifecycleConfiguration: PUT /{bucket}?lifecycle with a
             // <LifecycleConfiguration> body, which must declare a checksum, as
             // in S3: it says what to delete.
-            hyper::Method::PUT if query_param(&query, "lifecycle").is_some() => {
+            hyper::Method::PUT if operation.name == "PutBucketLifecycleConfiguration" => {
                 if !payload::has_body_checksum(req.headers()) {
                     return Ok(box_response(missing_checksum()));
                 }
@@ -434,7 +436,7 @@ async fn handle_request(
             }
             // PutBucketCors: PUT /{bucket}?cors with a <CORSConfiguration>
             // body, which must declare a checksum, as in S3.
-            hyper::Method::PUT if query_param(&query, "cors").is_some() => {
+            hyper::Method::PUT if operation.name == "PutBucketCors" => {
                 if !payload::has_body_checksum(req.headers()) {
                     return Ok(box_response(missing_checksum()));
                 }
@@ -445,7 +447,7 @@ async fn handle_request(
             }
             // PutBucketTagging: PUT /{bucket}?tagging with a <Tagging> body,
             // which must declare a checksum, as in S3.
-            hyper::Method::PUT if query_param(&query, "tagging").is_some() => {
+            hyper::Method::PUT if operation.name == "PutBucketTagging" => {
                 if !payload::has_body_checksum(req.headers()) {
                     return Ok(box_response(missing_checksum()));
                 }
@@ -455,17 +457,17 @@ async fn handle_request(
                 }
             }
             // PutBucketPolicy: PUT /{bucket}?policy with the policy (JSON).
-            hyper::Method::PUT if query_param(&query, "policy").is_some() => {
+            hyper::Method::PUT if operation.name == "PutBucketPolicy" => {
                 match read_body(req, &secret, true).await? {
                     Ok(body) => policy::put_bucket_policy(&app, &bucket, body).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
             // PutBucketAcl: there are no ACLs (`acl`).
-            hyper::Method::PUT if query_param(&query, "acl").is_some() => {
+            hyper::Method::PUT if operation.name == "PutBucketAcl" => {
                 acl::put_bucket_acl(&app, &bucket, req.headers()).await?
             }
-            hyper::Method::PUT => match acl::check_write(req.headers(), acl::On::Bucket) {
+            hyper::Method::PUT if operation.name == "CreateBucket" => match acl::check_write(req.headers(), acl::On::Bucket) {
                 Ok(()) => create_bucket(&app, &bucket).await?,
                 Err(refused) => refused,
             },
@@ -487,22 +489,22 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
-            hyper::Method::DELETE if query_param(&query, "encryption").is_some() => {
+            hyper::Method::DELETE if operation.name == "DeleteBucketEncryption" => {
                 delete_bucket_encryption(&app, &bucket).await?
             }
-            hyper::Method::DELETE if query_param(&query, "lifecycle").is_some() => {
+            hyper::Method::DELETE if operation.name == "DeleteBucketLifecycle" => {
                 delete_bucket_lifecycle(&app, &bucket).await?
             }
-            hyper::Method::DELETE if query_param(&query, "policy").is_some() => {
+            hyper::Method::DELETE if operation.name == "DeleteBucketPolicy" => {
                 policy::delete_bucket_policy(&app, &bucket).await?
             }
-            hyper::Method::DELETE if query_param(&query, "cors").is_some() => {
+            hyper::Method::DELETE if operation.name == "DeleteBucketCors" => {
                 delete_bucket_cors(&app, &bucket).await?
             }
-            hyper::Method::DELETE if query_param(&query, "tagging").is_some() => {
+            hyper::Method::DELETE if operation.name == "DeleteBucketTagging" => {
                 delete_bucket_tagging(&app, &bucket).await?
             }
-            hyper::Method::DELETE => delete_bucket(&app, &bucket).await?,
+            hyper::Method::DELETE if operation.name == "DeleteBucket" => delete_bucket(&app, &bucket).await?,
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
         };
         return Ok(box_response(resp));
@@ -528,8 +530,7 @@ async fn handle_request(
     // GET, HEAD and DELETE may address one specific version of the object,
     // as may the tagging requests.
     let version_id = query_param(&query, "versionId");
-    let tagging = query_param(&query, "tagging").is_some()
-        && matches!(*req.method(), Method::GET | Method::PUT | Method::DELETE);
+    let tagging = matches!(operation.name, "GetObjectTagging" | "PutObjectTagging" | "DeleteObjectTagging");
     let addresses_version = tagging || matches!(*req.method(), Method::GET | Method::HEAD | Method::DELETE);
     if let Some(v) = version_id.as_deref().filter(|v| addresses_version && !is_version_id(v)) {
         return Ok(box_response(invalid_version_id("versionId", v)));

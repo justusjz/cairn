@@ -333,7 +333,8 @@ where
         tagged.insert("x-amz-tagging", HeaderValue::from_static("form"));
     }
     let operation = actions::operation(&Method::PUT, &bucket, &key, "", &tagged).expect("a PUT is an operation");
-    let origin = access::Origin { peer, trusted_proxies: &app.trusted_proxies, signed: None, form: true };
+    let signed = signature.signed();
+    let origin = access::Origin { peer, trusted_proxies: &app.trusted_proxies, signed: Some(&signed), form: true };
     let mut access = access::Access::new(Some(&principal), &account, &Method::POST, &headers, "", &origin)?;
     let exists = access.load(app, &bucket).await?;
     if let Some((check, verdict)) = access.first_denied(&operation.checks) {

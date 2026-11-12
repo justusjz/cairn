@@ -618,6 +618,13 @@ pub struct PostSignature {
 }
 
 impl PostSignature {
+    /// How the form is signed, as a request's signature is: for its
+    /// condition keys (`s3:authType` `POST`, `s3:signatureversion`,
+    /// `aws:RequestedRegion`), which a policy may deny forms by.
+    pub fn signed(&self) -> Signed {
+        Signed { access_key: self.access_key.clone(), region: self.region.clone(), presigned: false, date: None }
+    }
+
     /// The signature a form's fields (`field` by lowercase name) carry, or
     /// why they don't carry one. Its time has to be its credential's day; the
     /// policy's expiration bounds how long it's valid, not the clock skew.

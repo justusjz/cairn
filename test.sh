@@ -2196,6 +2196,14 @@ bucket_policy_ok() {
     out=$(as_role writer writersecret s3api put-object --bucket "$b" --key locked/x.txt --body "$WORK_DIR/pub.txt" 2>&1) \
         && return 1
     echo "$out" | grep -q 'with an explicit deny in a resource-based policy' || return 1
+    # A request naming two subresources is handled as what it was authorized
+    # as: the writer reads the tags it may read, not the policy; the admin's
+    # DeleteBucketCors deletes no policy.
+    out=$(curl -s --aws-sigv4 "aws:amz:us-east-1:s3" --user "writer:writersecret" "$url?tagging&policy")
+    echo "$out" | grep -q NoSuchTagSet || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -X DELETE --aws-sigv4 "aws:amz:us-east-1:s3" \
+        --user "$ACCESS_KEY:$SECRET_KEY" "$url?cors&policy")" = 204 ] || return 1
+    awss3 s3api get-bucket-policy --bucket "$b" >/dev/null 2>&1 || return 1
     # Refused as S3 refuses it.
     out=$(awss3 s3api put-bucket-policy --bucket "$b" --policy \
         '{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::'"$account"':user/nobody"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/*"}]}' 2>&1) \
