@@ -18,6 +18,125 @@
     }
   ],
   "paths": {
+    "/accounts": {
+      "get": {
+        "operationId": "list_accounts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccountSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a tenant account. Its root signs in through an enrollment link.",
+        "operationId": "create_account",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewAccount"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/accounts/{account}/enrollment": {
+      "post": {
+        "summary": "Makes an account's root a one-time link to the console (24 hours): a new\naccount's first, or one to recover it, if its root lost its passkeys.\nIt replaces the root's last.",
+        "operationId": "create_root_enrollment",
+        "parameters": [
+          {
+            "name": "account",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Enrollment"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/buckets": {
       "get": {
         "operationId": "list_buckets",
@@ -1829,6 +1948,53 @@
           }
         }
       },
+      "AccountSummary": {
+        "type": "object",
+        "description": "An account (see `accounts`).",
+        "required": [
+          "id",
+          "name",
+          "operator",
+          "users",
+          "buckets",
+          "bytes",
+          "root_enrolled",
+          "created_at"
+        ],
+        "properties": {
+          "buckets": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Bytes in its buckets' current versions."
+          },
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "operator": {
+            "type": "boolean",
+            "description": "Whether it's the operator account (the superadmins')."
+          },
+          "root_enrolled": {
+            "type": "boolean",
+            "description": "Whether its root has signed in to the console (has a login)."
+          },
+          "users": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
       "AdminFlag": {
         "type": "object",
         "required": [
@@ -3290,6 +3456,17 @@
           }
         }
       },
+      "NewAccount": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "NewBucket": {
         "type": "object",
         "required": [
@@ -3925,6 +4102,8 @@
         "description": "A role, never with its secret.",
         "required": [
           "name",
+          "account_id",
+          "account",
           "id",
           "admin",
           "created_at",
@@ -3933,6 +4112,13 @@
           "policies"
         ],
         "properties": {
+          "account": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string",
+            "description": "Its account's ID and name."
+          },
           "admin": {
             "type": "boolean"
           },

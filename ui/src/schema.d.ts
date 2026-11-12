@@ -4,6 +4,44 @@
  */
 
 export interface paths {
+    "/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_accounts"];
+        put?: never;
+        /** Makes a tenant account. Its root signs in through an enrollment link. */
+        post: operations["create_account"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/accounts/{account}/enrollment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Makes an account's root a one-time link to the console (24 hours): a new
+         *     account's first, or one to recover it, if its root lost its passkeys.
+         *     It replaces the root's last.
+         */
+        post: operations["create_root_enrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets": {
         parameters: {
             query?: never;
@@ -551,6 +589,26 @@ export interface components {
             /** Format: double */
             created_at: number;
             id: string;
+        };
+        /** @description An account (see `accounts`). */
+        AccountSummary: {
+            /** Format: int64 */
+            buckets: number;
+            /**
+             * Format: int64
+             * @description Bytes in its buckets' current versions.
+             */
+            bytes: number;
+            /** Format: double */
+            created_at: number;
+            id: string;
+            name: string;
+            /** @description Whether it's the operator account (the superadmins'). */
+            operator: boolean;
+            /** @description Whether its root has signed in to the console (has a login). */
+            root_enrolled: boolean;
+            /** Format: int64 */
+            users: number;
         };
         AdminFlag: {
             admin: boolean;
@@ -1185,6 +1243,9 @@ export interface components {
             /** Format: double */
             started_at: number;
         };
+        NewAccount: {
+            name: string;
+        };
         NewBucket: {
             name: string;
         };
@@ -1451,6 +1512,9 @@ export interface components {
         };
         /** @description A role, never with its secret. */
         RoleSummary: {
+            account: string;
+            /** @description Its account's ID and name. */
+            account_id: string;
             admin: boolean;
             /** Format: double */
             created_at: number;
@@ -1579,6 +1643,116 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_accounts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewAccount"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_root_enrollment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Enrollment"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_buckets: {
         parameters: {
             query?: never;

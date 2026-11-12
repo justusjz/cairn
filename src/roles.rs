@@ -423,6 +423,7 @@ pub fn generate_secret() -> anyhow::Result<String> {
 
 /// Creates a user of the first tenant account, with an access key named as
 /// it, of `secret` or else a generated one, and returns its secret.
+#[cfg(test)]
 pub async fn create(
     client: &Object,
     name: &str,
@@ -449,6 +450,17 @@ pub async fn create_in(
             .ok_or_else(|| invalid(format!("no account named {account:?}")))?,
         None => self::account(client).await?,
     };
+    create_for(client, &account_id, name, secret, admin).await
+}
+
+/// Creates a user of the account `account_id`, as `create`.
+pub async fn create_for(
+    client: &Object,
+    account_id: &str,
+    name: &str,
+    secret: Option<String>,
+    admin: bool,
+) -> anyhow::Result<String> {
     validate_name(name)?;
     let secret = match secret {
         Some(s) => {
@@ -495,6 +507,21 @@ pub async fn account(client: &Object) -> anyhow::Result<String> {
         .query_one_cached("SELECT id FROM accounts WHERE NOT operator ORDER BY created_at, id LIMIT 1", &[])
         .await?
         .get(0);
+    // Each test's database has an account of its own.
+    if !cfg!(test) {
+        let _ = ACCOUNT.set(account.clone());
+    }
+    Ok(account)
+}
+
+/// The operator account's ID (see `accounts`), which never changes, so it's
+/// read once.
+pub async fn operator_account(client: &Object) -> anyhow::Result<String> {
+    static ACCOUNT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    if let Some(account) = ACCOUNT.get() {
+        return Ok(account.clone());
+    }
+    let account: String = client.query_one_cached("SELECT id FROM accounts WHERE operator", &[]).await?.get(0);
     // Each test's database has an account of its own.
     if !cfg!(test) {
         let _ = ACCOUNT.set(account.clone());
@@ -753,6 +780,9 @@ pub struct KeyInfo {
 /// A user as listed: never with its secrets.
 pub struct RoleInfo {
     pub name: String,
+    /// Its account's ID and name.
+    pub account_id: String,
+    pub account: String,
     pub admin: bool,
     /// When it was created, in seconds since the Unix epoch.
     pub created_at: f64,
@@ -781,8 +811,9 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                           ORDER BY k.created_at, k.access_key_id),
                     ARRAY(SELECT extract(epoch FROM k.created_at)::float8 FROM access_keys k
                           WHERE k.role_id = r.id ORDER BY k.created_at, k.access_key_id),
-                    ARRAY(SELECT p.name FROM role_policies p WHERE p.role_id = r.id ORDER BY p.name)
-             FROM roles r ORDER BY r.name",
+                    ARRAY(SELECT p.name FROM role_policies p WHERE p.role_id = r.id ORDER BY p.name),
+                    a.id, a.name
+             FROM roles r JOIN accounts a ON a.id = r.account_id ORDER BY a.operator, a.name, r.name",
             &[],
         )
         .await?;
@@ -809,6 +840,8 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                     .map(|((id, active), created_at)| KeyInfo { id, active, created_at })
                     .collect(),
                 policies: r.get(10),
+                account_id: r.get(11),
+                account: r.get(12),
             })
         })
         .collect()

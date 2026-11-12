@@ -65,33 +65,28 @@ type AppState = State<Arc<App>>;
 struct Doc;
 
 pub(super) fn router() -> OpenApiRouter<Arc<App>> {
-    OpenApiRouter::with_openapi(Doc::openapi())
+    OpenApiRouter::with_openapi(Doc::openapi()).merge(shared_router())
+}
+
+/// The whole API, which the console serves too, as its session's identity
+/// (see `actor`): every handler checks what it does as its S3 operation's
+/// actions, IAM's, or the operator's (`cairn:`, on the cluster, which only
+/// the operator account's identities may be allowed).
+pub(crate) fn shared_router() -> OpenApiRouter<Arc<App>> {
+    OpenApiRouter::new()
+        // The cluster's: the operator account's (`cairn:` actions).
         .routes(routes!(get_cluster))
         .routes(routes!(get_storage))
         .routes(routes!(get_integrity))
-        .routes(routes!(list_roles, create_role))
-        .routes(routes!(delete_role))
-        .routes(routes!(rotate_secret))
-        .routes(routes!(set_admin))
         .routes(routes!(identify_roles))
-        .routes(routes!(grant, revoke))
-        .routes(routes!(create_enrollment))
-        .routes(routes!(create_key))
-        .routes(routes!(set_key, delete_key))
-        .routes(routes!(get_policy, put_policy, delete_policy))
         .routes(routes!(get_lifecycle))
         .routes(routes!(set_lifecycle_rate))
         .routes(routes!(set_setting))
         .routes(routes!(remove_node))
         .routes(routes!(keep_node))
-        .merge(shared_router())
-}
-
-/// The buckets and objects, which the console serves too, as its user (see
-/// `actor`): every handler here checks what it does as its S3 operation's
-/// actions.
-pub(crate) fn shared_router() -> OpenApiRouter<Arc<App>> {
-    OpenApiRouter::new()
+        .routes(routes!(list_accounts, create_account))
+        .routes(routes!(create_root_enrollment))
+        // Accounts' buckets and objects (`s3:`), and users (`iam:`).
         .routes(routes!(list_buckets, create_bucket))
         .routes(routes!(delete_bucket))
         .routes(routes!(list_objects))
@@ -104,6 +99,15 @@ pub(crate) fn shared_router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(get_public_access))
         .routes(routes!(upload, delete_object))
         .routes(routes!(set_versioning))
+        .routes(routes!(list_roles, create_role))
+        .routes(routes!(delete_role))
+        .routes(routes!(rotate_secret))
+        .routes(routes!(set_admin))
+        .routes(routes!(grant, revoke))
+        .routes(routes!(create_enrollment))
+        .routes(routes!(create_key))
+        .routes(routes!(set_key, delete_key))
+        .routes(routes!(get_policy, put_policy, delete_policy))
 }
 
 /// The API's OpenAPI spec, as committed in `ui/openapi.json`.
@@ -146,7 +150,8 @@ pub(super) struct ClusterNode {
     (status = 200, body = Cluster),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_cluster(State(app): AppState) -> Result<Json<Cluster>> {
+async fn get_cluster(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Cluster>> {
+    actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     Ok(Json(cluster(&app).await?))
 }
 
@@ -362,7 +367,8 @@ struct PackerSettings {
     (status = 200, body = Storage),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_storage(State(app): AppState) -> Result<Json<Storage>> {
+async fn get_storage(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Storage>> {
+    actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     // Requests that come in while a report is being made wait for it, rather
     // than make their own.
     let mut cached = app.dashboard.storage.lock().await;
@@ -679,7 +685,8 @@ struct LostObject {
     (status = 200, body = Integrity),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_integrity(State(app): AppState) -> Result<Json<Integrity>> {
+async fn get_integrity(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Integrity>> {
+    actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     Ok(Json(integrity(&app).await?))
 }
 
@@ -1726,12 +1733,139 @@ async fn set_versioning(
     }
 }
 
+// ─── Accounts ────────────────────────────────────────────────────────────────
+
+/// An account (see `accounts`).
+#[derive(Serialize, ToSchema)]
+struct AccountSummary {
+    id: String,
+    name: String,
+    /// Whether it's the operator account (the superadmins').
+    operator: bool,
+    users: i64,
+    buckets: i64,
+    /// Bytes in its buckets' current versions.
+    bytes: i64,
+    /// Whether its root has signed in to the console (has a login).
+    root_enrolled: bool,
+    created_at: f64,
+}
+
+#[utoipa::path(get, path = "/accounts", responses(
+    (status = 200, body = Vec<AccountSummary>),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn list_accounts(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<AccountSummary>>> {
+    actor.check(&app, "cairn:ListAccounts", On::Cluster).await?;
+    let rows = app
+        .pool
+        .get()
+        .await?
+        .query_cached(
+            "SELECT a.id, a.name, a.operator,
+                    (SELECT count(*) FROM roles r WHERE r.account_id = a.id),
+                    (SELECT count(*) FROM buckets b WHERE b.account_id = a.id),
+                    (SELECT coalesce(sum(o.size), 0)::bigint FROM objects o JOIN buckets b ON b.name = o.bucket
+                     WHERE b.account_id = a.id AND o.is_latest AND NOT o.is_delete_marker),
+                    EXISTS (SELECT 1 FROM login_identities i WHERE i.account_id = a.id AND i.role_id IS NULL),
+                    extract(epoch FROM a.created_at)::float8
+             FROM accounts a ORDER BY a.operator, a.name",
+            &[],
+        )
+        .await?;
+    Ok(Json(
+        rows.iter()
+            .map(|r| AccountSummary {
+                id: r.get(0),
+                name: r.get(1),
+                operator: r.get(2),
+                users: r.get(3),
+                buckets: r.get(4),
+                bytes: r.get(5),
+                root_enrolled: r.get(6),
+                created_at: r.get(7),
+            })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct NewAccount {
+    name: String,
+}
+
+/// Makes a tenant account. Its root signs in through an enrollment link.
+#[utoipa::path(post, path = "/accounts", request_body = NewAccount, responses(
+    (status = 201, description = "Created"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_account(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<NewAccount>,
+) -> Result<StatusCode> {
+    actor.check(&app, "cairn:CreateAccount", On::Cluster).await?;
+    crate::accounts::create(&app.pool.get().await?, &body.name).await?;
+    Ok(StatusCode::CREATED)
+}
+
+/// Makes an account's root a one-time link to the console (24 hours): a new
+/// account's first, or one to recover it, if its root lost its passkeys.
+/// It replaces the root's last.
+#[utoipa::path(post, path = "/accounts/{account}/enrollment", params(("account" = String, Path)), responses(
+    (status = 201, body = Enrollment),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_root_enrollment(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(account): Path<String>,
+) -> Result<(StatusCode, Json<Enrollment>)> {
+    actor.check(&app, "cairn:RecoverAccount", On::Cluster).await?;
+    let token = crate::console::store::create_root_enrollment(&app.pool.get().await?, &account).await?;
+    let path = format!("/enroll#{token}");
+    let url = app.dashboard.console_origin.as_ref().map(|origin| format!("{origin}{path}"));
+    Ok((StatusCode::CREATED, Json(Enrollment { url, path })))
+}
+
 // ─── Roles ───────────────────────────────────────────────────────────────────
+
+/// The account of user `name`, if the actor may know of it: any user, to the
+/// operator; one of its own account, to a console session (another's is
+/// none, as in IAM).
+async fn account_of(app: &App, actor: &Actor, name: &str) -> Result<String> {
+    let account: Option<String> = app
+        .pool
+        .get()
+        .await?
+        .query_opt_cached("SELECT account_id FROM roles WHERE name = $1", &[&name])
+        .await?
+        .map(|row| row.get(0));
+    match (account, actor.account()) {
+        (Some(account), Some(mine)) if account != mine => Err(ApiError::BadRequest(format!("no user named {name:?}"))),
+        (Some(account), _) => Ok(account),
+        (None, _) => Err(ApiError::BadRequest(format!("no user named {name:?}"))),
+    }
+}
+
+/// Refuses the request unless IAM's `action` on user `name` (of the actor's
+/// account) is allowed.
+async fn check_user(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str) -> Result<()> {
+    let account = account_of(app, actor, name).await?;
+    actor.check(app, action, On::User(account, name.to_owned())).await
+}
+
 
 /// A role, never with its secret.
 #[derive(Serialize, ToSchema)]
 pub(super) struct RoleSummary {
     name: String,
+    /// Its account's ID and name.
+    account_id: String,
+    account: String,
     /// Its ID, which never changes or comes back: its name (alias) in the
     /// KMS's auth mount for Cairn.
     id: String,
@@ -1764,12 +1898,20 @@ struct Grant {
     (status = 200, body = Vec<RoleSummary>),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn list_roles(State(app): AppState) -> Result<Json<Vec<RoleSummary>>> {
+async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<RoleSummary>>> {
+    // A console session's account's users, as ListUsers lists them; the
+    // operator's dashboard, everyone's.
+    if let Some(account) = actor.account() {
+        actor.check(&app, "iam:ListUsers", On::Users(account.to_owned())).await?;
+    }
     let roles = roles::list(&app.pool.get().await?)
         .await?
         .into_iter()
+        .filter(|r| actor.account().is_none_or(|account| r.account_id == account))
         .map(|r| RoleSummary {
             name: r.name,
+            account_id: r.account_id,
+            account: r.account,
             id: r.id.to_string(),
             kms_entity_id: r.kms_entity_id,
             admin: r.admin,
@@ -1813,11 +1955,22 @@ struct Secret {
 ))]
 async fn create_role(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Json(body): Json<NewRole>,
 ) -> Result<(StatusCode, Json<Secret>)> {
     let client = app.pool.get().await?;
+    // In the console session's account; on the dashboard, the first
+    // tenant's.
+    let account = match actor.account() {
+        Some(account) => account.to_owned(),
+        None => roles::account(&client).await?,
+    };
+    actor.check(&app, "iam:CreateUser", On::User(account.clone(), body.name.clone())).await?;
+    if body.admin {
+        actor.check(&app, "iam:AttachUserPolicy", On::User(account.clone(), body.name.clone())).await?;
+    }
     let secret = body.secret.filter(|s| !s.is_empty());
-    let secret = roles::create(&client, &body.name, secret, body.admin).await?;
+    let secret = roles::create_for(&client, &account, &body.name, secret, body.admin).await?;
     // Its identity in the KMS, so that key owners can grant it keys now; if
     // the KMS can't be reached, the next maintenance pass makes it. In the
     // background: a slow KMS mustn't hold up the role.
@@ -1841,7 +1994,8 @@ async fn create_role(
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_role(State(app): AppState, Path(role): Path<String>) -> Result<StatusCode> {
+async fn delete_role(State(app): AppState, Extension(actor): Extension<Actor>, Path(role): Path<String>) -> Result<StatusCode> {
+    check_user(&app, &actor, "iam:DeleteUser", &role).await?;
     roles::delete(&app.pool.get().await?, &role).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1854,7 +2008,8 @@ async fn delete_role(State(app): AppState, Path(role): Path<String>) -> Result<S
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn identify_roles(State(app): AppState) -> Result<StatusCode> {
+async fn identify_roles(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<StatusCode> {
+    actor.check(&app, "cairn:IdentifyUsers", On::Cluster).await?;
     if app.kms.is_none() {
         return Err(ApiError::BadRequest("this node has no KMS".into()));
     }
@@ -1877,9 +2032,11 @@ struct NewSecret {
     ))]
 async fn rotate_secret(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
     Json(body): Json<NewSecret>,
 ) -> Result<Json<Secret>> {
+    check_user(&app, &actor, "iam:UpdateAccessKey", &role).await?;
     let secret = match body.secret.filter(|s| !s.is_empty()) {
         Some(s) => s,
         None => roles::generate_secret()?,
@@ -1902,9 +2059,13 @@ struct AdminFlag {
     ))]
 async fn set_admin(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
     Json(body): Json<AdminFlag>,
 ) -> Result<StatusCode> {
+    // AdministratorAccess, attached or detached.
+    let action = if body.admin { "iam:AttachUserPolicy" } else { "iam:DetachUserPolicy" };
+    check_user(&app, &actor, action, &role).await?;
     roles::update(&app.pool.get().await?, &role, Some(body.admin), None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -1924,12 +2085,16 @@ struct NewGrant {
     ))]
 async fn grant(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
     Json(body): Json<NewGrant>,
 ) -> Result<StatusCode> {
     if body.permissions.is_empty() {
         return Err(ApiError::BadRequest("pick at least one permission".into()));
     }
+    // A grant is a statement of the bucket's policy (see `grants`).
+    account_of(&app, &actor, &role).await?;
+    actor.check(&app, "s3:PutBucketPolicy", On::Bucket(body.bucket.clone())).await?;
     roles::grant(
         &app.pool.get().await?,
         &role,
@@ -1956,9 +2121,12 @@ struct RevokeParams {
     ))]
 async fn revoke(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
     Query(params): Query<RevokeParams>,
 ) -> Result<StatusCode> {
+    account_of(&app, &actor, &role).await?;
+    actor.check(&app, "s3:PutBucketPolicy", On::Bucket(params.bucket.clone())).await?;
     let permissions: Vec<Permission> = params.permission.into_iter().collect();
     roles::revoke(&app.pool.get().await?, &role, &params.bucket, &permissions).await?;
     Ok(StatusCode::NO_CONTENT)
@@ -1982,7 +2150,13 @@ struct Enrollment {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_enrollment(State(app): AppState, Path(role): Path<String>) -> Result<(StatusCode, Json<Enrollment>)> {
+async fn create_enrollment(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(role): Path<String>,
+) -> Result<(StatusCode, Json<Enrollment>)> {
+    // A way into the console: IAM's is a login profile.
+    check_user(&app, &actor, "iam:CreateLoginProfile", &role).await?;
     let token = crate::console::store::create_enrollment(&app.pool.get().await?, &role).await?;
     let path = format!("/enroll#{token}");
     let url = app.dashboard.console_origin.as_ref().map(|origin| format!("{origin}{path}"));
@@ -2005,7 +2179,12 @@ struct NewKey {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_key(State(app): AppState, Path(role): Path<String>) -> Result<(StatusCode, Json<NewKey>)> {
+async fn create_key(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(role): Path<String>,
+) -> Result<(StatusCode, Json<NewKey>)> {
+    check_user(&app, &actor, "iam:CreateAccessKey", &role).await?;
     let (id, secret) = roles::create_key(&app.pool.get().await?, &role, None, None).await?;
     Ok((StatusCode::CREATED, Json(NewKey { id, secret })))
 }
@@ -2024,9 +2203,11 @@ struct KeyState {
     ))]
 async fn set_key(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path((role, key)): Path<(String, String)>,
     Json(body): Json<KeyState>,
 ) -> Result<StatusCode> {
+    check_user(&app, &actor, "iam:UpdateAccessKey", &role).await?;
     roles::set_key_active(&app.pool.get().await?, Some(&role), &key, body.active).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2038,7 +2219,12 @@ async fn set_key(
         (status = "4XX", body = ErrorBody),
         (status = "5XX", body = ErrorBody),
     ))]
-async fn delete_key(State(app): AppState, Path((role, key)): Path<(String, String)>) -> Result<StatusCode> {
+async fn delete_key(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path((role, key)): Path<(String, String)>,
+) -> Result<StatusCode> {
+    check_user(&app, &actor, "iam:DeleteAccessKey", &role).await?;
     roles::delete_key(&app.pool.get().await?, Some(&role), &key).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2058,7 +2244,12 @@ struct PolicyDocument {
         (status = "4XX", body = ErrorBody),
         (status = "5XX", body = ErrorBody),
     ))]
-async fn get_policy(State(app): AppState, Path((role, policy)): Path<(String, String)>) -> Result<Json<PolicyDocument>> {
+async fn get_policy(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path((role, policy)): Path<(String, String)>,
+) -> Result<Json<PolicyDocument>> {
+    check_user(&app, &actor, "iam:GetUserPolicy", &role).await?;
     let document = roles::get_policy(&app.pool.get().await?, &role, &policy).await?;
     Ok(Json(PolicyDocument { document }))
 }
@@ -2072,9 +2263,11 @@ async fn get_policy(State(app): AppState, Path((role, policy)): Path<(String, St
     ))]
 async fn put_policy(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path((role, policy)): Path<(String, String)>,
     Json(body): Json<PolicyDocument>,
 ) -> Result<StatusCode> {
+    check_user(&app, &actor, "iam:PutUserPolicy", &role).await?;
     roles::put_policy(&app.pool.get().await?, &role, &policy, &body.document).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2086,7 +2279,12 @@ async fn put_policy(
         (status = "4XX", body = ErrorBody),
         (status = "5XX", body = ErrorBody),
     ))]
-async fn delete_policy(State(app): AppState, Path((role, policy)): Path<(String, String)>) -> Result<StatusCode> {
+async fn delete_policy(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path((role, policy)): Path<(String, String)>,
+) -> Result<StatusCode> {
+    check_user(&app, &actor, "iam:DeleteUserPolicy", &role).await?;
     roles::delete_policy(&app.pool.get().await?, &role, &policy).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2750,7 +2948,8 @@ struct SweepProgress {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_lifecycle(State(app): AppState) -> Result<Json<Lifecycle>> {
+async fn get_lifecycle(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Lifecycle>> {
+    actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     let client = app.pool.get().await?;
     let rate = crate::settings::LIFECYCLE_RATE.get(&client).await?;
     let runs = client
@@ -2861,9 +3060,11 @@ const REDUNDANCY: &[&crate::settings::Setting] = &[
     ))]
 async fn set_setting(
     State(app): AppState,
+    Extension(actor): Extension<Actor>,
     Path(name): Path<String>,
     Json(body): Json<NewSetting>,
 ) -> Result<Json<SettingChanged>> {
+    actor.check(&app, "cairn:PutSetting", On::Cluster).await?;
     let Some(setting) = REDUNDANCY.iter().find(|s| s.name == name) else {
         return Err(ApiError::NotFound(format!("no setting {name:?} to set here")));
     };
@@ -2901,7 +3102,8 @@ struct NodeRemoved {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn remove_node(State(app): AppState, Path(id): Path<i32>) -> Result<Json<NodeRemoved>> {
+async fn remove_node(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<i32>) -> Result<Json<NodeRemoved>> {
+    actor.check(&app, "cairn:RemoveNode", On::Cluster).await?;
     match crate::nodes::remove(&app.pool.get().await?, id).await? {
         Ok(shards) => Ok(Json(NodeRemoved { shards })),
         Err(why) => Err(node_unchanged(id, why)),
@@ -2915,7 +3117,8 @@ async fn remove_node(State(app): AppState, Path(id): Path<i32>) -> Result<Json<N
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn keep_node(State(app): AppState, Path(id): Path<i32>) -> Result<StatusCode> {
+async fn keep_node(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<i32>) -> Result<StatusCode> {
+    actor.check(&app, "cairn:RemoveNode", On::Cluster).await?;
     match crate::nodes::keep(&app.pool.get().await?, id).await? {
         Ok(()) => Ok(StatusCode::NO_CONTENT),
         Err(why) => Err(node_unchanged(id, why)),
@@ -2936,7 +3139,8 @@ fn node_unchanged(id: i32, why: String) -> ApiError {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn set_lifecycle_rate(State(app): AppState, Json(body): Json<NewRate>) -> Result<StatusCode> {
+async fn set_lifecycle_rate(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewRate>) -> Result<StatusCode> {
+    actor.check(&app, "cairn:PutSetting", On::Cluster).await?;
     if body.rate < 0 {
         return Err(ApiError::BadRequest("the rate can't be negative".into()));
     }

@@ -1,5 +1,5 @@
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type AccessKey, type Bucket, type Cluster, type Permission, type User, api } from "../api";
+import { type AccessKey, type Bucket, type Cluster, type Permission, type User, api, isConsole } from "../api";
 import { Badge, Loading, Panel, SecretDialog, Table, act, poll, toast } from "../components/ui";
 import { ago, date, pretty } from "../format";
 
@@ -25,8 +25,9 @@ const TEMPLATE = `{
 export default function Users() {
   // Every few seconds: a new user's identity in the KMS comes a moment later.
   const data = poll(() => Promise.all([api.roles(), api.buckets()]), 5000);
-  const cluster = poll(() => api.cluster(), 10000);
-  const kms = () => cluster.data()?.nodes.some((n) => n.stats?.kms) ?? false;
+  // The KMS is the cluster's: the operator's to set up, not a tenant's.
+  const cluster = isConsole() ? undefined : poll(() => api.cluster(), 10000);
+  const kms = () => cluster?.data()?.nodes.some((n) => n.stats?.kms) ?? false;
   const [secret, setSecret] = createSignal<NewSecret>();
   const [editing, setEditing] = createSignal<{ user: string; policy?: string }>();
   const [enrollment, setEnrollment] = createSignal<{ user: string; url?: string | null; path: string }>();
@@ -79,8 +80,9 @@ export default function Users() {
         </form>
         <p class="subtle small">
           A new user's first access key has the user's name as its ID; a user may have {MAX_KEYS} keys, to rotate
-          them. Admins may create and delete buckets over S3; object access takes a grant, or an inline policy (IAM's
-          policy language) that allows it. A policy's Deny wins over any grant.
+          them. Admins have AdministratorAccess: everything in their account. Others may do what their grants (statements
+          of the buckets' policies) and inline policies (IAM's policy language) allow; a Deny wins over any Allow. A user
+          of the account signs in to the console through its console link.
         </p>
       </Panel>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
@@ -108,14 +110,14 @@ export default function Users() {
           </Panel>
         )}
       </Show>
-      <Show when={cluster.data()}>
+      <Show when={cluster?.data()}>
         {(c) => (
           <KmsPanel
             cluster={c()}
             pending={(data.data()?.[0] ?? []).filter((r) => !r.kms_entity_id).length}
             refresh={() => {
               data.refresh();
-              cluster.refresh();
+              cluster?.refresh();
             }}
           />
         )}
@@ -307,6 +309,9 @@ function UserRow(props: {
         <div class="subtle small" title="The user's name (alias) in the KMS's auth mount for Cairn">
           id {r().id}
         </div>
+        <Show when={!isConsole()}>
+          <div class="subtle small">account {r().account}</div>
+        </Show>
         <Show
           when={r().kms_entity_id}
           fallback={
@@ -557,7 +562,7 @@ function PolicyDialog(props: { user: string; policy?: string; onClose: () => voi
 
 
 /** A user's enrollment link for the console, shown once. */
-function EnrollmentDialog(props: { user: string; url?: string | null; path: string; onClose: () => void }) {
+export function EnrollmentDialog(props: { user: string; url?: string | null; path: string; onClose: () => void }) {
   let dialog!: HTMLDialogElement;
   let input!: HTMLInputElement;
   onMount(() => {

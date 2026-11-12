@@ -4,6 +4,44 @@
  */
 
 export interface paths {
+    "/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_accounts"];
+        put?: never;
+        /** Makes a tenant account. Its root signs in through an enrollment link. */
+        post: operations["create_account"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/accounts/{account}/enrollment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Makes an account's root a one-time link to the console (24 hours): a new
+         *     account's first, or one to recover it, if its root lost its passkeys.
+         *     It replaces the root's last.
+         */
+        post: operations["create_root_enrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets": {
         parameters: {
             query?: never;
@@ -196,6 +234,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/cluster": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The nodes, each with the metrics it reports, if it's live. */
+        get: operations["get_cluster"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/enroll": {
         parameters: {
             query?: never;
@@ -247,6 +302,79 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["enroll_options"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/integrity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_integrity"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/kms/identify": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Logs in to the KMS as each role without an identity there yet, from this
+         *     node, now rather than at its next maintenance pass. Fails with what went
+         *     wrong.
+         */
+        post: operations["identify_roles"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/lifecycle": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * How lifecycle sweeps are going: the rate, how long a round takes at it,
+         *     and each bucket's sweep.
+         */
+        get: operations["get_lifecycle"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/lifecycle/rate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_lifecycle_rate"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -316,6 +444,46 @@ export interface paths {
         get: operations["me"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{id}/keep": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Keeps a node that's being removed, or was, as `cairn node keep` does: it
+         *     gets shards again; those that moved stay where they are.
+         */
+        post: operations["keep_node"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/nodes/{id}/remove": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Starts removing a node, as `cairn node remove` does: it gets no new
+         *     shards, and its shards move to the other nodes (see `mover`).
+         */
+        post: operations["remove_node"];
         delete?: never;
         options?: never;
         head?: never;
@@ -396,6 +564,202 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_roles"];
+        put?: never;
+        post: operations["create_role"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["delete_role"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/admin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Makes a role an admin, or not. */
+        put: operations["set_admin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/enrollment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Makes a role an enrollment link for the console, replacing its last. */
+        post: operations["create_enrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Grants permissions on an existing bucket. */
+        post: operations["grant"];
+        delete: operations["revoke"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Makes a new access key for a role, with a random ID and secret; a role
+         *     has at most two.
+         */
+        post: operations["create_key"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/keys/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Lets one of the role's access keys sign requests, or stops it. */
+        put: operations["set_key"];
+        post?: never;
+        /** Deletes one of the role's access keys. */
+        delete: operations["delete_key"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/policies/{policy}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One of the role's inline policies, as it was set. */
+        get: operations["get_policy"];
+        /** Sets one of the role's inline policies, if it's a valid identity policy. */
+        put: operations["put_policy"];
+        post?: never;
+        /** Deletes one of the role's inline policies. */
+        delete: operations["delete_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replaces a role's secret. */
+        post: operations["rotate_secret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/settings/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets one of the redundancy settings (`data-shards`, `parity-shards`,
+         *     `repair-after`), or of the cluster's public access block
+         *     (`block-public-policy`, `restrict-public-buckets`: 0 or 1), for the whole
+         *     cluster, as `cairn config set` does. The node answering goes by it right
+         *     away, the others within a heartbeat (the public access block's, at once).
+         */
+        put: operations["set_setting"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/storage": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_storage"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/switch": {
         parameters: {
             query?: never;
@@ -417,6 +781,35 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AccessKey: {
+            active: boolean;
+            /** Format: double */
+            created_at: number;
+            id: string;
+        };
+        /** @description An account (see `accounts`). */
+        AccountSummary: {
+            /** Format: int64 */
+            buckets: number;
+            /**
+             * Format: int64
+             * @description Bytes in its buckets' current versions.
+             */
+            bytes: number;
+            /** Format: double */
+            created_at: number;
+            id: string;
+            name: string;
+            /** @description Whether it's the operator account (the superadmins'). */
+            operator: boolean;
+            /** @description Whether its root has signed in to the console (has a login). */
+            root_enrolled: boolean;
+            /** Format: int64 */
+            users: number;
+        };
+        AdminFlag: {
+            admin: boolean;
+        };
         /** @description What `navigator.credentials.get()` gave the page. */
         Assertion: {
             authenticator_data: string;
@@ -425,6 +818,84 @@ export interface components {
             signature: string;
             /** @description The login the passkey is of, as the authenticator says. */
             user_handle?: string | null;
+        };
+        Backlog: {
+            /**
+             * Format: int64
+             * @description Blobs with enough garbage to be compacted.
+             */
+            compact: number;
+            /** Format: int64 */
+            compact_garbage_bytes: number;
+            /**
+             * Format: int64
+             * @description Blobs small enough to be consolidated.
+             */
+            consolidate: number;
+            /** Format: int64 */
+            consolidate_bytes: number;
+            /**
+             * Format: int64
+             * @description Blobs large enough to be coded that aren't in the cluster's layout,
+             *     which the packer converts (see `packer::Layouts`).
+             */
+            convert: number;
+            /** Format: int64 */
+            convert_bytes: number;
+            /**
+             * Format: int64
+             * @description Replicated blobs with more or fewer copies than the `parity-shards`
+             *     setting says (none while it isn't set), and how many copies the
+             *     mover is to add and to drop (see `mover`).
+             */
+            copies: number;
+            /** Format: int64 */
+            copies_to_add: number;
+            /** Format: int64 */
+            copies_to_drop: number;
+            /**
+             * Format: int64
+             * @description Entries of the garbage log the packer hasn't folded yet: one per blob
+             *     that a statement deleted parts from.
+             */
+            garbage_log: number;
+            /**
+             * Format: int64
+             * @description Shards to move off nodes being removed, or down for longer than the
+             *     `repair-after` setting (see `mover`); and that setting, in minutes (0:
+             *     off).
+             */
+            moves: number;
+            /** Format: double */
+            oldest_upload?: number | null;
+            /**
+             * Format: int64
+             * @description Blobs leased by packing jobs, right now.
+             */
+            packing: number;
+            /** Format: int64 */
+            packing_bytes: number;
+            /** Format: int64 */
+            repair_after: number;
+            /** Format: int64 */
+            upload_bytes: number;
+            /** Format: int64 */
+            uploads: number;
+        };
+        BlobTotals: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            committed: number;
+            /**
+             * Format: int64
+             * @description Bytes of packed blobs that no part references anymore.
+             */
+            garbage_bytes: number;
+            /** Format: double */
+            oldest_pending?: number | null;
+            /** Format: int64 */
+            pending: number;
         };
         /** @description A public access block's four flags. */
         Block: {
@@ -501,6 +972,91 @@ export interface components {
             challenge_id: string;
             options: Record<string, never>;
         };
+        Cluster: {
+            nodes: components["schemas"]["ClusterNode"][];
+            /** Format: double */
+            now: number;
+            replication_factor: number;
+            /**
+             * Format: int32
+             * @description The node answering.
+             */
+            this_node: number;
+        };
+        ClusterNode: {
+            /**
+             * Format: int64
+             * @description As of its last heartbeat.
+             */
+            free_space: number;
+            /** Format: int32 */
+            id: number;
+            /** Format: double */
+            last_seen: number;
+            /** @description Seen within the last 10 seconds. */
+            live: boolean;
+            node_id: string;
+            peer_url: string;
+            /**
+             * @description `active`, `removing` (its shards are moving to other nodes, see
+             *     `mover`) or `removed`.
+             */
+            state: string;
+            stats?: components["schemas"]["NodeStats"] | null;
+            /** @description Why a live node's stats are missing. */
+            stats_error?: string | null;
+        };
+        /** @description Counts of requests, by how they ended, and of what they moved. */
+        Counts: {
+            /** Format: int64 */
+            bytes_in: number;
+            /** Format: int64 */
+            bytes_out: number;
+            /**
+             * Format: int64
+             * @description Answered with a 4xx: the client's fault (including denied requests).
+             */
+            client_errors: number;
+            /**
+             * Format: int64
+             * @description The sum of the times until the response's head was ready.
+             */
+            latency_us: number;
+            /** Format: int64 */
+            requests: number;
+            /**
+             * Format: int64
+             * @description Answered with a 5xx: a fault, or too few nodes.
+             */
+            server_errors: number;
+        };
+        /** @description How much of the data the scrubber has checked (see `scrub`). */
+        Coverage: {
+            /**
+             * Format: int64
+             * @description Committed blobs from before checksums, which can't be checked.
+             */
+            legacy_blobs: number;
+            /** Format: int64 */
+            legacy_bytes: number;
+            /**
+             * @description What each node holds of checksummed data, and how recently it was
+             *     checked.
+             */
+            nodes: components["schemas"]["NodeCoverage"][];
+        };
+        Disk: {
+            /**
+             * Format: int64
+             * @description Bytes Cairn may still write.
+             */
+            available: number;
+            /**
+             * Format: int64
+             * @description Bytes in all.
+             */
+            total: number;
+        };
         /** @description How an object version is encrypted (see `s3::sse`). */
         EncryptionInfo: {
             /**
@@ -561,6 +1117,56 @@ export interface components {
             /** @description What went wrong, for a person to read. */
             error: string;
         };
+        EventReport: {
+            error: boolean;
+            message: string;
+            /** @description `gc`, `packer`, `lifecycle`, `scrub` or `maintenance`. */
+            source: string;
+            /** Format: double */
+            time: number;
+        };
+        FindingInfo: {
+            /**
+             * Format: int64
+             * @description How many blocks failed; none if the whole file is at fault.
+             */
+            bad_blocks?: number | null;
+            blob_id: string;
+            detail: string;
+            /** Format: double */
+            found_at: number;
+            /** Format: int64 */
+            id: number;
+            /** Format: int32 */
+            node: number;
+            /**
+             * @description `repaired`, `lost` (intact on no replica; still open), or `gone` (the
+             *     blob was deleted); none while open.
+             */
+            outcome?: string | null;
+            /**
+             * @description `missing`, `damaged`, or `catalog` (every block intact, but not the
+             *     file's CRC).
+             */
+            problem: string;
+            /** Format: double */
+            resolved_at?: number | null;
+        };
+        /** @description What garbage collection deleted since the node started. */
+        GcTotals: {
+            /** Format: int64 */
+            dirs: number;
+            /** Format: int64 */
+            errors: number;
+            /** Format: int64 */
+            files: number;
+            /** Format: int64 */
+            pending: number;
+        };
+        Grant: {
+            bucket: string;
+            permission: components["schemas"]["Permission"];
+        };
         /** @description An identity of the login. */
         IdentitySummary: {
             account: string;
@@ -576,6 +1182,174 @@ export interface components {
             operator: boolean;
             /** @description The user's name; `null`: the account's root. */
             user?: string | null;
+        };
+        /**
+         * @description What the scrubber found (see `scrub`): damaged and missing copies, and the
+         *     objects with data that's intact on no replica.
+         */
+        Integrity: {
+            /**
+             * @description The open findings, then those resolved in the last 30 days, newest
+             *     first, up to 200.
+             */
+            findings: components["schemas"]["FindingInfo"][];
+            /**
+             * @description The object versions (and uploads' parts) with lost bytes, the most
+             *     recently lost first, up to 500.
+             */
+            lost: components["schemas"]["LostObject"][];
+            /**
+             * Format: int64
+             * @description How many there are, all told.
+             */
+            lost_objects: number;
+            /** Format: int64 */
+            open_findings: number;
+            /**
+             * @description Findings of the last day, by node: many of them in a short time are a
+             *     sign of a failing disk.
+             */
+            recent: components["schemas"]["NodeFindings"][];
+        };
+        KeyState: {
+            active: boolean;
+        };
+        /** @description A login to the KMS as a role. */
+        KmsLogin: {
+            /**
+             * Format: double
+             * @description When, in seconds since the Unix epoch.
+             */
+            at: number;
+            /** @description Why it failed, if it did: what's likely wrong with the KMS's setup. */
+            error?: string | null;
+            /** @description The role's ID, or `cairn` for Cairn itself (for SSE-S3). */
+            role: string;
+        };
+        /** @description A node's KMS, as it sees it. */
+        KmsStatus: {
+            /** @description The KMS's URL. */
+            address: string;
+            /**
+             * @description Where the KMS's JWT auth method for Cairn is mounted (under `auth/`),
+             *     and the role of it that Cairn's logins use.
+             */
+            auth_mount: string;
+            auth_role: string;
+            /**
+             * @description Cairn's own identity (entity) in the KMS, which is to be granted that
+             *     key, once the node has logged in as itself.
+             */
+            cairn_entity?: string | null;
+            /** @description Why it couldn't reach it. */
+            error?: string | null;
+            initialized?: boolean | null;
+            last_login?: components["schemas"]["KmsLogin"] | null;
+            /**
+             * Format: double
+             * @description When its last login that worked was, in seconds since the Unix epoch.
+             */
+            last_success?: number | null;
+            /**
+             * @description The public key of the key the node signs its logins with (PEM): what
+             *     that auth method is to trust (`jwt_validation_pubkeys`). The same on
+             *     every node.
+             */
+            public_key: string;
+            /** @description Whether the node could reach the KMS just now, and how it is. */
+            reachable: boolean;
+            sealed?: boolean | null;
+            /** @description SSE-S3's key, if Cairn has one: it uses it as itself. */
+            sse_s3_key?: string | null;
+            standby?: boolean | null;
+            version?: string | null;
+        };
+        /**
+         * @description A bucket's last whole sweep, as `lifecycle_sweeps.last` keeps it. Times
+         *     are seconds since the Unix epoch.
+         */
+        LastSweep: {
+            /** Format: int64 */
+            aborted: number;
+            /** Format: int64 */
+            expired: number;
+            /** Format: double */
+            finished: number;
+            /**
+             * Format: int64
+             * @description Versions (and uploads) read.
+             */
+            read: number;
+            /** Format: int64 */
+            removed: number;
+            /** Format: double */
+            started: number;
+        };
+        /** @description How lifecycle sweeps are going (see `lifecycle`). */
+        Lifecycle: {
+            buckets: components["schemas"]["LifecycleBucket"][];
+            /**
+             * Format: int64
+             * @description The rate's default.
+             */
+            default_rate: number;
+            /**
+             * Format: double
+             * @description When the last step began, and whether one is running now.
+             */
+            last_step?: number | null;
+            /**
+             * Format: int64
+             * @description Object versions sweeps may read per hour, across the cluster; 0 if
+             *     they're paused.
+             */
+            rate: number;
+            /**
+             * Format: double
+             * @description When that was last measured.
+             */
+            reached_at?: number | null;
+            /**
+             * Format: double
+             * @description The rate steps have actually reached when they had more to do than
+             *     their share (an average over about the last hour), if they have.
+             *     Below `rate` if a step at a time can't go faster.
+             */
+            reached_rate?: number | null;
+            /**
+             * @description Whether some bucket has had no whole sweep yet, so that a round reads
+             *     more than `round_versions`.
+             */
+            round_partial: boolean;
+            /**
+             * Format: double
+             * @description How long a round takes at the rate reached, or set if it's lower (or
+             *     none was measured yet), in seconds; none if paused. Over a day, sweeps
+             *     fall behind, and expirations come that much later.
+             */
+            round_secs?: number | null;
+            /**
+             * Format: int64
+             * @description Versions a round of every bucket's sweep reads: the last whole sweep
+             *     of each, or what its first has read so far.
+             */
+            round_versions: number;
+            stepping: boolean;
+        };
+        /** @description A bucket's rules, and its sweep of them. */
+        LifecycleBucket: {
+            bucket: string;
+            /**
+             * Format: double
+             * @description When it gets its next turn: its next sweep, or, during one, its next
+             *     step (it's due if that's past).
+             */
+            due?: number | null;
+            enabled: number;
+            last?: components["schemas"]["LastSweep"] | null;
+            /** @description How many rules it has, and how many of them are enabled. */
+            rules: number;
+            sweep?: components["schemas"]["SweepProgress"] | null;
         };
         /** @description A bucket's lifecycle configuration. */
         LifecycleConfiguration: {
@@ -646,6 +1420,58 @@ export interface components {
             challenge_id: string;
             credential: components["schemas"]["Assertion"];
         };
+        LostObject: {
+            bucket: string;
+            delete_marker: boolean;
+            key: string;
+            latest: boolean;
+            /**
+             * Format: int64
+             * @description How many of its stored bytes are lost.
+             */
+            lost_bytes: number;
+            /**
+             * Format: double
+             * @description When the first of them was found lost.
+             */
+            since: number;
+            /** Format: int64 */
+            size: number;
+            upload_id?: string | null;
+            /** @description The version; none for a part of an upload in progress. */
+            version_id?: string | null;
+        };
+        MaintenanceReport: {
+            /** @description The most recent things a pass did or failed at, oldest first. */
+            events: components["schemas"]["EventReport"][];
+            gc: components["schemas"]["GcTotals"];
+            /** Format: int64 */
+            interval_secs: number;
+            /**
+             * Format: double
+             * @description How many seconds the last pass took.
+             */
+            last_duration?: number | null;
+            /** Format: double */
+            last_started?: number | null;
+            packer: components["schemas"]["PackerTotals"];
+            /** Format: int64 */
+            passes: number;
+            /**
+             * Format: double
+             * @description When the pass that's running started.
+             */
+            running_since?: number | null;
+            scrub: components["schemas"]["ScrubTotals"];
+            /** Format: int32 */
+            shards: number;
+            /**
+             * Format: int32
+             * @description Where the GC's file sweep is, of `shards` (blob directories; the
+             *     names are the dashboard's).
+             */
+            sweep_shard: number;
+        };
         /** @description The signed-in login: who it acts as now, its identities, its passkeys. */
         Me: {
             /**
@@ -661,8 +1487,32 @@ export interface components {
             name: string;
             passkeys: components["schemas"]["PasskeySummary"][];
         };
+        /** @description A node's metrics. Times are seconds since the Unix epoch. */
+        MetricsReport: {
+            /**
+             * Format: int64
+             * @description Requests whose response hasn't been sent in full yet.
+             */
+            in_flight: number;
+            maintenance: components["schemas"]["MaintenanceReport"];
+            requests: components["schemas"]["RequestsReport"];
+            /** Format: double */
+            started_at: number;
+        };
+        NewAccount: {
+            name: string;
+        };
         NewBucket: {
             name: string;
+        };
+        NewGrant: {
+            bucket: string;
+            permissions: components["schemas"]["Permission"][];
+        };
+        /** @description A new access key, whose secret is shown only this once. */
+        NewKey: {
+            id: string;
+            secret: string;
         };
         NewPasskey: {
             challenge_id: string;
@@ -670,9 +1520,109 @@ export interface components {
             /** @description What to call it, e.g. "Laptop". */
             name: string;
         };
+        NewRate: {
+            /**
+             * Format: int64
+             * @description Object versions per hour, across the cluster; 0 pauses sweeps.
+             */
+            rate: number;
+        };
+        NewRole: {
+            admin?: boolean;
+            name: string;
+            /** @description At least 8 characters; one is generated if not given. */
+            secret?: string | null;
+        };
+        NewSecret: {
+            /** @description At least 8 characters; one is generated if not given. */
+            secret?: string | null;
+        };
+        /**
+         * @description Sets the rate lifecycle sweeps go at, for the whole cluster.
+         *     A cluster setting's new value; `null` unsets it (it's back to its
+         *     default, or for `parity-shards`, every node goes by its flag again).
+         */
+        NewSetting: {
+            /** Format: int64 */
+            value?: number | null;
+        };
         NewVersioning: {
             /** @description `Enabled` or `Suspended`. */
             status: string;
+        };
+        /**
+         * @description The copies of committed, checksummed blobs a node holds, and how recently
+         *     they were known intact.
+         */
+        NodeCoverage: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            copies: number;
+            /** Format: int32 */
+            node: number;
+            /**
+             * Format: double
+             * @description When the least recently checked of the others was known intact.
+             */
+            oldest_checked?: number | null;
+            /**
+             * Format: int64
+             * @description Copies never checked (from before scrubbing), or flagged by a read:
+             *     checked next.
+             */
+            unchecked: number;
+            /** Format: int64 */
+            unchecked_bytes: number;
+        };
+        NodeFindings: {
+            /** Format: int64 */
+            findings: number;
+            /** Format: int32 */
+            node: number;
+        };
+        /**
+         * @description The committed blobs a node holds a shard of, and the bytes of those
+         *     shards.
+         */
+        NodeHolding: {
+            /** Format: int64 */
+            blobs: number;
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int32 */
+            node: number;
+        };
+        NodeRemoved: {
+            /**
+             * Format: int64
+             * @description The shards it holds, which move to other nodes.
+             */
+            shards: number;
+        };
+        /**
+         * @description What a node reports about itself, for the dashboard of any node (see
+         *     `peer`'s `/stats`).
+         */
+        NodeStats: components["schemas"]["MetricsReport"] & {
+            disk?: components["schemas"]["Disk"] | null;
+            disk_error?: string | null;
+            kms?: components["schemas"]["KmsStatus"] | null;
+            /** Format: int32 */
+            node: number;
+            node_id: string;
+            /**
+             * Format: double
+             * @description The node's clock, in seconds since the Unix epoch.
+             */
+            now: number;
+            replication_factor: number;
+            /**
+             * Format: int64
+             * @description How many bytes per second its scrubber reads; 0 if it's off.
+             */
+            scrub_rate: number;
+            version: string;
         };
         /**
          * @description Every version of a key (the newest 200), each with its parts and where their
@@ -683,6 +1633,73 @@ export interface components {
             key: string;
             /** @description Newest first; empty if there's no such key. */
             versions: components["schemas"]["VersionInfo"][];
+        };
+        ObjectTotals: {
+            /** Format: int64 */
+            buckets: number;
+            /** Format: int64 */
+            current: number;
+            /** Format: int64 */
+            current_bytes: number;
+            /** Format: int64 */
+            delete_markers: number;
+            /** Format: int64 */
+            noncurrent: number;
+            /** Format: int64 */
+            noncurrent_bytes: number;
+        };
+        OpCounts: components["schemas"]["Counts"] & {
+            op: string;
+        };
+        PackerSettings: {
+            /**
+             * @description Whether blobs are brought to that layout now: it takes as many live
+             *     nodes as shards.
+             */
+            coding: boolean;
+            /** Format: double */
+            compact_threshold: number;
+            /**
+             * Format: int64
+             * @description What blobs larger than `small_size` are erasure-coded into (the
+             *     `data-shards` setting, and the parity shards). One data shard: they
+             *     aren't.
+             */
+            data_shards: number;
+            /**
+             * Format: int64
+             * @description The most data and parity shards the settings allow.
+             */
+            max_data_shards: number;
+            /** Format: int64 */
+            max_parity_shards: number;
+            /** Format: int64 */
+            max_sources: number;
+            /**
+             * Format: int64
+             * @description The `parity-shards` setting, if it's set; else every node goes by its
+             *     `--replication-factor`.
+             */
+            parity_setting?: number | null;
+            /** Format: int32 */
+            parity_shards: number;
+            /** Format: int64 */
+            small_size: number;
+            /** Format: int64 */
+            target_size: number;
+        };
+        /** @description What the packer did since the node started. */
+        PackerTotals: {
+            /** Format: int64 */
+            blobs: number;
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            failed: number;
+            /** Format: int64 */
+            jobs: number;
+            /** Format: int64 */
+            parts: number;
         };
         PartInfo: {
             blob_id: string;
@@ -733,6 +1750,11 @@ export interface components {
             last_used_at?: number | null;
             name: string;
         };
+        /**
+         * @description A bucket-level permission a role can be granted.
+         * @enum {string}
+         */
+        Permission: "read" | "write" | "delete-version";
         /** @description An inline policy: a JSON document in IAM's policy language. */
         PolicyDocument: {
             document: string;
@@ -745,6 +1767,128 @@ export interface components {
             attestation_object: string;
             client_data_json: string;
             id: string;
+        };
+        /**
+         * @description The committed blobs of `data_shards` data shards (1: replicated) with
+         *     `copies` shards in all, `live` of them on live nodes. A blob is readable
+         *     with `data_shards` live shards, and as redundant as the cluster's
+         *     replication factor asks with `data_shards` + replication factor − 1.
+         */
+        ReplicaGroup: {
+            /** Format: int64 */
+            blobs: number;
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            copies: number;
+            /** Format: int64 */
+            data_shards: number;
+            /** Format: int64 */
+            live: number;
+        };
+        RequestsReport: {
+            /** @description The last hour's slots that had requests, oldest first. */
+            history: components["schemas"]["SlotCounts"][];
+            /** @description Since the node started, by operation. */
+            ops: components["schemas"]["OpCounts"][];
+            /**
+             * Format: int64
+             * @description How many seconds a slot of `history` covers.
+             */
+            slot_secs: number;
+        };
+        /** @description A role, never with its secret. */
+        RoleSummary: {
+            account: string;
+            /** @description Its account's ID and name. */
+            account_id: string;
+            admin: boolean;
+            /** Format: double */
+            created_at: number;
+            grants: components["schemas"]["Grant"][];
+            /**
+             * @description Its ID, which never changes or comes back: its name (alias) in the
+             *     KMS's auth mount for Cairn.
+             */
+            id: string;
+            /** @description Its access keys, oldest first (never their secrets). */
+            keys: components["schemas"]["AccessKey"][];
+            /**
+             * @description Its identity (entity) in the KMS, which key owners grant keys to;
+             *     none until Cairn has logged in as it, or without a KMS.
+             */
+            kms_entity_id?: string | null;
+            name: string;
+            /** @description The names of its inline policies. */
+            policies: string[];
+        };
+        /**
+         * @description What the scrubber did since the node started: the copies it checked (and
+         *     their bytes), how many of them it found damaged or missing, how many of
+         *     those it repaired, and how many have data that's intact nowhere, and how
+         *     many of its passes failed.
+         */
+        ScrubTotals: {
+            /** Format: int64 */
+            bytes: number;
+            /** Format: int64 */
+            copies: number;
+            /** Format: int64 */
+            damaged: number;
+            /** Format: int64 */
+            failed: number;
+            /** Format: int64 */
+            lost: number;
+            /** Format: int64 */
+            repaired: number;
+        };
+        /** @description A role's secret, which is shown only this once. */
+        Secret: {
+            name: string;
+            secret: string;
+        };
+        SettingChanged: {
+            /**
+             * @description What's wrong with the cluster's layouts now, if anything: too few
+             *     nodes for them, say.
+             */
+            warnings: string[];
+        };
+        SlotCounts: components["schemas"]["Counts"] & {
+            /**
+             * Format: int64
+             * @description When the slot starts. The same on every node, so slots add up.
+             */
+            t: number;
+        };
+        /**
+         * @description What's stored where, how well it's replicated, and what the background jobs
+         *     still have to do.
+         */
+        Storage: {
+            backlog: components["schemas"]["Backlog"];
+            blobs: components["schemas"]["BlobTotals"];
+            integrity: components["schemas"]["Coverage"];
+            nodes: components["schemas"]["NodeHolding"][];
+            objects: components["schemas"]["ObjectTotals"];
+            packer: components["schemas"]["PackerSettings"];
+            replicas: components["schemas"]["ReplicaGroup"][];
+            replication_factor: number;
+        };
+        /** @description A sweep in progress. */
+        SweepProgress: {
+            /** Format: int64 */
+            aborted: number;
+            /** Format: int64 */
+            expired: number;
+            /** @description The key it has got to. */
+            key: string;
+            /** Format: int64 */
+            read: number;
+            /** Format: int64 */
+            removed: number;
+            /** Format: double */
+            started: number;
         };
         Switch: {
             /** @description The account (its ID) to act in. */
@@ -797,6 +1941,116 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    list_accounts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewAccount"];
+            };
+        };
+        responses: {
+            /** @description Created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_root_enrollment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                account: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Enrollment"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_buckets: {
         parameters: {
             query?: never;
@@ -1442,6 +2696,33 @@ export interface operations {
             };
         };
     };
+    get_cluster: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Cluster"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     enroll: {
         parameters: {
             query?: never;
@@ -1541,6 +2822,140 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["EnrollCeremony"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_integrity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Integrity"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    identify_roles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Every role has its identity in the KMS */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_lifecycle: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Lifecycle"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_lifecycle_rate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewRate"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {
@@ -1676,6 +3091,79 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    keep_node: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Kept */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    remove_node: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NodeRemoved"];
                 };
             };
             "4XX": {
@@ -1860,6 +3348,605 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Block"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_roles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoleSummary"][];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewRole"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Secret"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted, with its grants */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_admin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminFlag"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_enrollment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Enrollment"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewGrant"];
+            };
+        };
+        responses: {
+            /** @description Granted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    revoke: {
+        parameters: {
+            query: {
+                bucket: string;
+                /** @description The permission to revoke; all of them on the bucket if not given. */
+                permission?: components["schemas"]["Permission"];
+            };
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewKey"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KeyState"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+                policy: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDocument"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+                policy: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyDocument"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+                policy: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    rotate_secret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSecret"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Secret"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_setting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSetting"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SettingChanged"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_storage: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Storage"];
                 };
             };
             "5XX": {

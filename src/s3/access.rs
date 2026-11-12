@@ -101,6 +101,8 @@ pub struct Access {
     user: Option<(String, String, String)>,
     /// An account's root (by its account) acts, rather than a user.
     root: Option<String>,
+    /// The operator account, whose the cluster is (loaded for checks on it).
+    operator: Option<String>,
     identity: Vec<Arc<Policy>>,
     pub context: Context,
     /// Each bucket loaded: whether it exists, and its policy (see `Loaded`).
@@ -129,6 +131,7 @@ impl Access {
         }
         Ok(Access {
             root: None,
+            operator: None,
             user: principal.map(|p| (p.account.clone(), p.name.clone(), p.id.to_string())),
             identity,
             context: context(principal, account, method, headers, query, origin),
@@ -145,7 +148,14 @@ impl Access {
         context.set("aws:PrincipalAccount", account);
         context.set("aws:PrincipalType", "Account");
         context.set("aws:PrincipalIsAWSService", "false");
-        Access { user: None, root: Some(account.to_owned()), identity: Vec::new(), context, buckets: HashMap::new() }
+        Access {
+            user: None,
+            root: Some(account.to_owned()),
+            operator: None,
+            identity: Vec::new(),
+            context,
+            buckets: HashMap::new(),
+        }
     }
 
     /// Loads `bucket`'s policy, for the checks on it; whether it exists.
@@ -186,6 +196,9 @@ impl Access {
         for bucket in checks.iter().filter_map(|c| c.on.bucket()) {
             self.load(app, bucket).await?;
         }
+        if self.operator.is_none() && checks.iter().any(|c| c.on == On::Cluster) {
+            self.operator = Some(crate::roles::operator_account(&app.pool.get().await?).await?);
+        }
         Ok(())
     }
 
@@ -207,7 +220,13 @@ impl Access {
         // Whose the resource is: a bucket's owner; else (no bucket, or none
         // by its name) the principal's own account's. A bucket to create is
         // the principal's, whoever has its name (that's BucketAlreadyExists).
-        let owner = loaded.and_then(|loaded| loaded.account.as_deref()).filter(|_| check.action != "s3:CreateBucket");
+        let owner = match &check.on {
+            On::User(account, _) | On::Users(account) => Some(account.as_str()),
+            // The operator account's (an unknown one, if it wasn't loaded:
+            // no one's).
+            On::Cluster => Some(self.operator.as_deref().unwrap_or("")),
+            _ => loaded.and_then(|loaded| loaded.account.as_deref()).filter(|_| check.action != "s3:CreateBucket"),
+        };
         if let Some(account) = &self.root {
             return crate::policy::root_verdict(bucket, &request, owner.is_none_or(|owner| owner == account));
         }

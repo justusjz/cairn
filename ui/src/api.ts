@@ -21,6 +21,7 @@ export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
 export type User = Schemas["RoleSummary"];
+export type Account = Schemas["AccountSummary"];
 export type AccessKey = Schemas["AccessKey"];
 export type Permission = Schemas["Permission"];
 export type Lifecycle = Schemas["Lifecycle"];
@@ -108,6 +109,10 @@ export const api = {
     ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
   grant: (role: string, bucket: string, permissions: Permission[]) =>
     ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
+  accounts: () => ok(client.GET("/accounts")),
+  createAccount: (name: string) => ok(client.POST("/accounts", { body: { name } })),
+  rootEnrollment: (account: string) =>
+    ok(client.POST("/accounts/{account}/enrollment", { params: { path: { account } } })),
   createEnrollment: (role: string) => ok(client.POST("/roles/{role}/enrollment", { params: rolePath(role) })),
   createKey: (role: string) => ok(client.POST("/roles/{role}/keys", { params: rolePath(role) })),
   setKeyActive: (role: string, key: string, active: boolean) =>

@@ -569,9 +569,40 @@ mod e2e {
         let ours = buckets.as_array().unwrap().iter().find(|b| b["name"] == bucket).unwrap();
         assert_eq!(ours["versioning"], "enabled");
 
-        // The operator's routes aren't the console's.
-        assert_eq!(admin.send("GET", "/api/cluster", None).await.0, StatusCode::NOT_FOUND);
-        assert_eq!(admin.send("GET", "/api/roles", None).await.0, StatusCode::NOT_FOUND);
+        // The cluster is the operator account's, not a tenant admin's.
+        assert_eq!(admin.send("GET", "/api/cluster", None).await.0, StatusCode::FORBIDDEN);
+
+        // Users, as IAM's actions: the admin (AdministratorAccess) manages
+        // its account's; a user without IAM permissions may do none of it.
+        let (status, err) = writer.send("GET", "/api/roles", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(err["error"].as_str().unwrap().contains("iam:ListUsers"), "{err}");
+        let new_user = json!({ "name": "made-in-console", "admin": false });
+        assert_eq!(writer.send("POST", "/api/roles", Some(new_user.clone())).await.0, StatusCode::FORBIDDEN);
+        let (status, made) = admin.send("POST", "/api/roles", Some(new_user)).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        let (_, users) = admin.send("GET", "/api/roles", None).await;
+        let names: Vec<_> = users.as_array().unwrap().iter().map(|u| u["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"made-in-console") && names.contains(&"writer"), "{names:?}");
+        assert!(users.as_array().unwrap().iter().all(|u| u["account"] == "default"));
+        let (status, _) = admin.send("POST", "/api/roles/made-in-console/keys", None).await;
+        assert_eq!(status, StatusCode::CREATED);
+        // An inline policy may give a user IAM permissions on itself only,
+        // as AWS's self-service policies do.
+        let own = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:CreateAccessKey","iam:ListUsers"],"Resource":"arn:aws:iam::*:user/${aws:username}"}]}"#;
+        let (status, err) = admin.send("PUT", "/api/roles/writer/policies/self", Some(json!({ "document": own }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        assert_eq!(writer.send("POST", "/api/roles/writer/keys", None).await.0, StatusCode::CREATED);
+        assert_eq!(writer.send("POST", "/api/roles/reader/keys", None).await.0, StatusCode::FORBIDDEN);
+        // Another account's users are none of its business.
+        let client = app.pool.get().await.unwrap();
+        crate::accounts::create(&client, "other").await.unwrap();
+        roles::create_in(&client, Some("other"), "stranger", None, false).await.unwrap();
+        let (status, err) = admin.send("DELETE", "/api/roles/stranger", None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(err["error"], "no user named \"stranger\"");
+        let (_, users) = admin.send("GET", "/api/roles", None).await;
+        assert!(!users.as_array().unwrap().iter().any(|u| u["name"] == "stranger"));
     }
 
     /// One login (one passkey) acts in several accounts: as a user of one,
@@ -691,6 +722,64 @@ mod e2e {
         let (status, me) = sign_in(&mut browser, &mut key).await;
         assert_eq!(status, StatusCode::OK, "{me}");
         assert_eq!(me["identities"].as_array().unwrap().len(), 2);
+    }
+
+    /// The cluster is the operator account's: its admins (superadmins) see
+    /// and run it, make accounts, and manage each other, but see no
+    /// tenant's objects; a tenant's admin may do none of it.
+    #[tokio::test]
+    async fn superadmins_run_the_cluster_and_nothing_else() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = Arc::new(Console { app: app.clone(), party: party() });
+        let client = app.pool.get().await.unwrap();
+        let bucket = crate::e2e::BUCKET;
+        crate::e2e::put(&app, "secret.txt", b"tenant data".to_vec()).await;
+        let mut tenant = signed_in(&console, "tenant-admin", true).await;
+        roles::create_in(&client, Some("operator"), "super", None, true).await.unwrap();
+        let token = store::create_enrollment(&client, "super").await.unwrap();
+        let mut ops = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let (_, ceremony) = ops.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
+        let mut body = registration(&mut Authenticator::ed25519(), &ceremony, "Key");
+        body["token"] = json!(token);
+        let (status, me) = ops.send("POST", "/api/enroll", Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["identity"]["operator"], true);
+
+        // The cluster.
+        for path in ["/api/cluster", "/api/storage", "/api/integrity", "/api/lifecycle", "/api/accounts"] {
+            assert_eq!(ops.send("GET", path, None).await.0, StatusCode::OK, "{path}");
+            let (status, err) = tenant.send("GET", path, None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {err}");
+        }
+        let (status, err) = tenant.send("PUT", "/api/lifecycle/rate", Some(json!({ "rate": 5 }))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+        assert_eq!(ops.send("PUT", "/api/lifecycle/rate", Some(json!({ "rate": 5 }))).await.0, StatusCode::NO_CONTENT);
+
+        // Accounts: made, and their roots' links.
+        assert_eq!(ops.send("POST", "/api/accounts", Some(json!({ "name": "newco" }))).await.0, StatusCode::CREATED);
+        assert_eq!(tenant.send("POST", "/api/accounts", Some(json!({ "name": "evilco" }))).await.0, StatusCode::FORBIDDEN);
+        let (status, link) = ops.send("POST", "/api/accounts/newco/enrollment", None).await;
+        assert_eq!(status, StatusCode::CREATED, "{link}");
+        assert!(link["path"].as_str().unwrap().starts_with("/enroll#"));
+        let (_, accounts) = ops.send("GET", "/api/accounts", None).await;
+        let names: Vec<_> = accounts.as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["default", "newco", "operator"]);
+
+        // Superadmins manage superadmins, and only them.
+        let (_, users) = ops.send("GET", "/api/roles", None).await;
+        let names: Vec<_> = users.as_array().unwrap().iter().map(|u| u["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["super"]);
+        let new = json!({ "name": "super-2", "admin": true });
+        assert_eq!(ops.send("POST", "/api/roles", Some(new)).await.0, StatusCode::CREATED);
+        assert_eq!(ops.send("DELETE", "/api/roles/tenant-admin", None).await.0, StatusCode::BAD_REQUEST);
+
+        // No tenant's buckets, nor their objects.
+        let (_, buckets) = ops.send("GET", "/api/buckets", None).await;
+        assert_eq!(buckets, json!([]));
+        let path = format!("/api/buckets/{bucket}/objects");
+        assert_eq!(ops.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
+        let path = format!("/api/buckets/{bucket}/object?key=secret.txt");
+        assert_eq!(ops.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
     }
 
     /// Only the console's own page may sign in: other origins, and requests

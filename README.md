@@ -518,10 +518,18 @@ account's root, and switches between them; switching into the operator
 account takes the passkey again, unless it was used in the last five
 minutes. An enrollment link is for an identity: opened signed out, it makes
 a new login; signed in, it adds the identity to that login. Signed in,
-people manage their passkeys, and the buckets and objects: create and delete buckets, browse,
+people manage their passkeys, their account's users (as IAM's actions
+allow them: an admin may do all of it; others what their policies say, as
+`iam:CreateAccessKey` on their own user, say), and the buckets and objects: create and delete buckets, browse,
 upload (up to 5 GiB a file), download and delete objects and versions,
-versioning, lifecycle rules, bucket policies and public access blocks. Users
-come next (see `plans/console.md`).
+versioning, lifecycle rules, bucket policies and public access blocks.
+Superadmins (the operator account's users) see the cluster instead: the
+dashboard's Overview, Storage, Integrity and Jobs pages, the accounts (making
+one, and its root's enrollment link), and each other, but no tenant's
+buckets. Their actions are `cairn:` ones (`cairn:GetCluster`,
+`cairn:PutSetting`, `cairn:RemoveNode`, `cairn:CreateAccount`, …) on the
+cluster, which is the operator account's, so a tenant's policies can't allow
+them.
 
 The console acts as its user: it allows exactly what that user's S3 requests
 would be allowed, by the same policies (the user's grants, admin flag and

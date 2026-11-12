@@ -10,8 +10,14 @@ import { render } from "solid-js/web";
 import { Badge, Loading, Panel, Table, Toasts, act, toast } from "../components/ui";
 import { ago, date } from "../format";
 import { useConsoleApi } from "../api";
+import Accounts from "../pages/Accounts";
 import { BucketBrowser, BucketList, ObjectPage } from "../pages/Buckets";
+import Integrity from "../pages/Integrity";
+import Jobs from "../pages/Jobs";
 import Lifecycle from "../pages/Lifecycle";
+import Overview from "../pages/Overview";
+import Storage from "../pages/Storage";
+import Users from "../pages/Users";
 import "../styles.css";
 import { ApiError, type Identity, type Me, type Passkey, api } from "./api";
 import { authenticate, deviceName, explain, register, supported } from "./webauthn";
@@ -56,12 +62,15 @@ function Layout(props: RouteSectionProps) {
         <Brand />
         <nav>
           <Show when={me()}>
-            <A href="/buckets" activeClass="active">
-              Buckets
-            </A>
-            <A href="/account" activeClass="active">
-              Account
-            </A>
+            {(m) => (
+              <For each={m().identity.operator ? OPERATOR_NAV : TENANT_NAV}>
+                {([href, label]) => (
+                  <A href={href} end={href === "/"} activeClass="active">
+                    {label}
+                  </A>
+                )}
+              </For>
+            )}
           </Show>
         </nav>
         <Show when={me()}>
@@ -80,6 +89,25 @@ function Layout(props: RouteSectionProps) {
     </>
   );
 }
+
+/** What a tenant's identity sees: its account's buckets and users. */
+const TENANT_NAV: [string, string][] = [
+  ["/buckets", "Buckets"],
+  ["/users", "Users"],
+  ["/account", "Account"],
+];
+
+/** What the operator account's sees: the cluster, the accounts, and the
+ * superadmins; no buckets, which are tenants'. */
+const OPERATOR_NAV: [string, string][] = [
+  ["/", "Overview"],
+  ["/storage", "Storage"],
+  ["/integrity", "Integrity"],
+  ["/jobs", "Jobs"],
+  ["/accounts", "Accounts"],
+  ["/users", "Superadmins"],
+  ["/account", "Account"],
+];
 
 /** `user @ account`, or `root @ account`. */
 function label(i: Identity): string {
@@ -114,7 +142,7 @@ function AccountPicker(props: { me: Me }) {
     const target = props.me.identities.find((i) => i.account_id === accountId);
     if (!target || accountId === props.me.identity.account_id) return;
     await switchTo(target);
-    navigate("/buckets");
+    navigate("/");
   };
   return (
     <Show
@@ -172,7 +200,7 @@ function Login() {
       const ceremony = await api.loginOptions();
       const credential = await authenticate(ceremony.options);
       setMe(await api.login(ceremony.challenge_id, credential));
-      navigate("/buckets");
+      navigate("/");
     } catch (e) {
       setError(explain(e));
     }
@@ -280,6 +308,16 @@ function Enroll() {
 /** A page for the signed-in only. */
 function Guarded(page: () => import("solid-js").JSX.Element) {
   return () => <SignedIn>{() => page()}</SignedIn>;
+}
+
+/** The start: the cluster's overview to the operator account, a tenant's
+ * buckets to anyone else. */
+function Start() {
+  return (
+    <Show when={me()?.identity.operator} fallback={<Navigate href="/buckets" />}>
+      <Overview />
+    </Show>
+  );
 }
 
 function Home() {
@@ -409,7 +447,12 @@ function NotFound() {
 render(
   () => (
     <Router root={Layout} explicitLinks>
-      <Route path="/" component={() => <Navigate href="/buckets" />} />
+      <Route path="/" component={Guarded(Start)} />
+      <Route path="/storage" component={Guarded(Storage)} />
+      <Route path="/integrity" component={Guarded(Integrity)} />
+      <Route path="/jobs" component={Guarded(Jobs)} />
+      <Route path="/accounts" component={Guarded(Accounts)} />
+      <Route path="/users" component={Guarded(Users)} />
       <Route path="/account" component={Home} />
       <Route path="/buckets" component={Guarded(BucketList)} />
       <Route path="/buckets/:bucket" component={Guarded(BucketBrowser)} />

@@ -27,6 +27,13 @@ pub enum On {
     Account,
     Bucket(String),
     Object(String, String),
+    /// A user of an account (by its ID), for IAM's actions on it.
+    User(String, String),
+    /// An account's users (by its ID), for `iam:ListUsers`.
+    Users(String),
+    /// The cluster, for the operator's actions (`cairn:`): the operator
+    /// account's.
+    Cluster,
 }
 
 impl On {
@@ -36,14 +43,17 @@ impl On {
             On::Account => "*".to_owned(),
             On::Bucket(bucket) => format!("arn:aws:s3:::{bucket}"),
             On::Object(bucket, key) => format!("arn:aws:s3:::{bucket}/{key}"),
+            On::User(account, name) => format!("arn:aws:iam::{account}:user/{name}"),
+            On::Users(account) => format!("arn:aws:iam::{account}:user/*"),
+            On::Cluster => "arn:cairn:::cluster".to_owned(),
         }
     }
 
     /// The bucket whose policy applies, if any.
     pub fn bucket(&self) -> Option<&str> {
         match self {
-            On::Account => None,
             On::Bucket(bucket) | On::Object(bucket, _) => Some(bucket),
+            _ => None,
         }
     }
 }
@@ -398,6 +408,7 @@ mod tests {
                     On::Account => Applies::Account,
                     On::Bucket(_) => Applies::Bucket,
                     On::Object(..) => Applies::Object,
+                    on => panic!("S3's operations are on S3's resources, not {on:?}"),
                 };
                 assert_eq!(*applies, wanted, "{action}");
             }
