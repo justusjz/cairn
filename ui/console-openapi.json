@@ -1,0 +1,649 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "Cairn console API",
+    "description": "The API of Cairn's console.",
+    "contact": {
+      "name": "Justus Zorn"
+    },
+    "license": {
+      "name": "AGPL-3.0-or-later",
+      "identifier": "AGPL-3.0-or-later"
+    },
+    "version": "0.5.1"
+  },
+  "servers": [
+    {
+      "url": "/api"
+    }
+  ],
+  "paths": {
+    "/enroll": {
+      "post": {
+        "summary": "Registers a user's first passkey through its enrollment link (which it\nuses up), and signs in with it.",
+        "operationId": "enroll",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Enroll"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in; the session's cookie is set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/enroll/options": {
+      "post": {
+        "operationId": "enroll_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Enrollment"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnrollCeremony"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/login": {
+      "post": {
+        "summary": "Signs in with a passkey.",
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Login"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in; the session's cookie is set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/login/options": {
+      "post": {
+        "operationId": "login_options",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ceremony"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/logout": {
+      "post": {
+        "summary": "Signs out: ends the session.",
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "Signed out; the cookie is cleared"
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/me": {
+      "get": {
+        "operationId": "me",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/passkeys": {
+      "post": {
+        "summary": "Adds a passkey to the signed-in user.",
+        "operationId": "add_passkey",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewPasskey"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Added"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/passkeys/options": {
+      "post": {
+        "operationId": "passkey_options",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ceremony"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/passkeys/{id}": {
+      "put": {
+        "summary": "Renames one of the signed-in user's passkeys.",
+        "operationId": "rename_passkey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyName"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Renamed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes one of the signed-in user's passkeys (not its last), and ends the\nsessions signed in with it.",
+        "operationId": "delete_passkey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Assertion": {
+        "type": "object",
+        "description": "What `navigator.credentials.get()` gave the page.",
+        "required": [
+          "id",
+          "client_data_json",
+          "authenticator_data",
+          "signature"
+        ],
+        "properties": {
+          "authenticator_data": {
+            "type": "string"
+          },
+          "client_data_json": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "signature": {
+            "type": "string"
+          },
+          "user_handle": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user the passkey is of, as the authenticator says."
+          }
+        }
+      },
+      "Ceremony": {
+        "type": "object",
+        "description": "A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:\n`PublicKeyCredentialCreationOptionsJSON` or `…RequestOptionsJSON`), and\nthe ID of its challenge, to send back with the response.",
+        "required": [
+          "challenge_id",
+          "options"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "options": {
+            "type": "object"
+          }
+        }
+      },
+      "Enroll": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/NewPasskey"
+          },
+          {
+            "type": "object",
+            "required": [
+              "token"
+            ],
+            "properties": {
+              "token": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "EnrollCeremony": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Ceremony"
+          },
+          {
+            "type": "object",
+            "required": [
+              "user"
+            ],
+            "properties": {
+              "user": {
+                "type": "string"
+              }
+            }
+          }
+        ],
+        "description": "The options to register a user's first passkey, through an enrollment\nlink, and whose it'll be."
+      },
+      "Enrollment": {
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The token of the enrollment link (after its `#`)."
+          }
+        }
+      },
+      "ErrorBody": {
+        "type": "object",
+        "required": [
+          "error"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "What went wrong, for a person to read."
+          }
+        }
+      },
+      "Login": {
+        "type": "object",
+        "required": [
+          "challenge_id",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "$ref": "#/components/schemas/Assertion"
+          }
+        }
+      },
+      "Me": {
+        "type": "object",
+        "description": "The signed-in user.",
+        "required": [
+          "name",
+          "arn",
+          "admin",
+          "passkeys"
+        ],
+        "properties": {
+          "admin": {
+            "type": "boolean"
+          },
+          "arn": {
+            "type": "string",
+            "description": "The user's ARN, which policies name it by."
+          },
+          "name": {
+            "type": "string"
+          },
+          "passkeys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PasskeySummary"
+            }
+          }
+        }
+      },
+      "NewPasskey": {
+        "type": "object",
+        "required": [
+          "challenge_id",
+          "name",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "$ref": "#/components/schemas/Registration"
+          },
+          "name": {
+            "type": "string",
+            "description": "What to call it, e.g. \"Laptop\"."
+          }
+        }
+      },
+      "PasskeyName": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "PasskeySummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "backed_up",
+          "created_at",
+          "current"
+        ],
+        "properties": {
+          "backed_up": {
+            "type": "boolean",
+            "description": "Whether it's synced (backed up) by its provider, as it last said."
+          },
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "current": {
+            "type": "boolean",
+            "description": "Whether this session was signed in with it."
+          },
+          "id": {
+            "type": "string",
+            "description": "Its credential ID (base64url)."
+          },
+          "last_used_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "Registration": {
+        "type": "object",
+        "description": "What `navigator.credentials.create()` gave the page (its parts, in\nbase64url).",
+        "required": [
+          "id",
+          "client_data_json",
+          "attestation_object"
+        ],
+        "properties": {
+          "attestation_object": {
+            "type": "string"
+          },
+          "client_data_json": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

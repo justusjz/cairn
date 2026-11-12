@@ -197,6 +197,17 @@ enum RoleCommand {
     /// List users, their admin flag, access keys, grants and policies
     /// (secrets are not shown).
     List,
+    /// Print a one-time link (valid 24 hours) for a user to register its
+    /// first passkey for the console, and sign in. A new link replaces the
+    /// user's last; one for a user with passkeys adds another (when it lost
+    /// them, say).
+    Enroll {
+        name: String,
+        /// The console's URL (as `cairn serve` has it), to make the link
+        /// from; without it, the link's path and token are printed.
+        #[arg(long, env = "CAIRN_CONSOLE_URL", value_parser = crate::console::parse_url)]
+        console_url: Option<crate::console::webauthn::Party>,
+    },
     /// Manage a user's access keys (at most two).
     #[command(subcommand)]
     Key(KeyCommand),
@@ -305,6 +316,11 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
                     println!("  policy {policy}");
                 }
             }
+        }
+        RoleCommand::Enroll { name, console_url } => {
+            let token = crate::console::store::create_enrollment(&client, &name).await?;
+            let origin = console_url.map(|party| party.origin).unwrap_or_default();
+            println!("{origin}/enroll#{token}");
         }
         RoleCommand::Key(command) => match command {
             KeyCommand::Create { user, id, secret } => {

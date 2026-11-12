@@ -32,6 +32,7 @@ mod blob_file;
 mod blobs;
 mod body;
 mod checksum;
+mod console;
 mod dashboard;
 mod db;
 #[cfg(test)]
@@ -217,6 +218,16 @@ struct ServeArgs {
     /// it off.
     #[arg(long, env = "CAIRN_SCRUB_RATE", default_value = "25MiB", value_parser = scrub::parse_rate)]
     scrub_rate: u64,
+    /// Bind address for the console: the web UI people of the account sign
+    /// in to with passkeys. Off unless set; requires --console-url.
+    #[arg(long, env = "CAIRN_LISTEN_CONSOLE", requires = "console_url")]
+    listen_console: Option<String>,
+    /// The URL the console is reached at, as the browser sees it, e.g.
+    /// https://console.example.com: an origin of its own (not the S3 API's),
+    /// over HTTPS (a proxy in front terminates TLS), or on localhost.
+    /// Passkeys are bound to its host.
+    #[arg(long, env = "CAIRN_CONSOLE_URL", value_parser = console::parse_url)]
+    console_url: Option<console::webauthn::Party>,
     #[command(flatten)]
     kms: kms::KmsArgs,
 }
@@ -274,7 +285,10 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         writing: WritingSet::default(),
         pack: packer::Config::default(),
         metrics: Arc::default(),
-        dashboard: dashboard::Dashboard::new(&peer_url),
+        dashboard: dashboard::Dashboard::new(
+            &peer_url,
+            args.listen_console.as_ref().and(args.console_url.as_ref()).map(|party| party.origin.clone()),
+        ),
         peers: peer::PeerClient::new(),
         allow_sse_c_over_http: args.allow_sse_c_over_http,
         trusted_proxies: args.trusted_proxies.clone(),
@@ -304,16 +318,34 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     // flight, and only after that does the peer endpoint, since those requests
     // may still be reading and writing replicas through it, ours included.
     // Whatever is cut off anyway is left for GC, as after a crash.
+    // The console, if any, stops with the S3 API.
     let (stop_peer, peer_stopped) = tokio::sync::oneshot::channel::<()>();
+    let (stop_console, console_stopped) = tokio::sync::oneshot::channel::<()>();
     let client = async {
         let result = serve_client(listen_client_addr, app.clone(), shutdown_signal()).await;
         let _ = stop_peer.send(());
+        let _ = stop_console.send(());
         result
     };
     let peer = serve_peer(listen_peer_addr, app.clone(), async {
         let _ = peer_stopped.await;
     });
-    tokio::try_join!(client, peer)?;
+    let console = async {
+        let (Some(addr), Some(party)) = (&args.listen_console, &args.console_url) else {
+            return Ok(());
+        };
+        let addr = SocketAddr::from_str(addr)?;
+        let console = Arc::new(console::Console { app: app.clone(), party: party.clone() });
+        let listener = TcpListener::bind(addr).await?;
+        eprintln!("console at {} (listening on {addr})", party.origin);
+        axum::serve(listener, console::router(console))
+            .with_graceful_shutdown(async {
+                let _ = console_stopped.await;
+            })
+            .await?;
+        anyhow::Ok(())
+    };
+    tokio::try_join!(client, peer, console)?;
     eprintln!("shut down");
     Ok(())
 }
@@ -354,6 +386,14 @@ async fn maintain(app: Arc<App>) {
             let app = task_app;
             if let Err(e) = roles::identify(&app).await {
                 eprintln!("kms: identifying roles: {e:#}");
+            }
+            match app.pool.get().await {
+                Ok(client) => {
+                    if let Err(e) = console::store::reap(&client).await {
+                        eprintln!("console: reaping expired sessions: {e:#}");
+                    }
+                }
+                Err(e) => eprintln!("console: reaping expired sessions: {e:#}"),
             }
             let report = gc::pass(&app, scope).await;
             if !report.is_empty() {

@@ -17,6 +17,8 @@ const SOURCES: &[&str] = &[
     "ui/package.json",
     "ui/package-lock.json",
     "ui/vite.config.ts",
+    "ui/vite.console.config.ts",
+    "ui/console.html",
     "ui/tsconfig.json",
 ];
 
@@ -28,9 +30,12 @@ fn main() {
     for source in SOURCES {
         println!("cargo:rerun-if-changed={source}");
     }
-    let Ok(built) = dist.join("index.html").metadata().and_then(|m| m.modified()) else {
+    // Both pages: the dashboard's, and the console's.
+    let pages = [dist.join("index.html"), dist.join("console/console.html")];
+    let built = pages.iter().map(|page| page.metadata().and_then(|m| m.modified()).ok()).collect::<Option<Vec<_>>>();
+    let Some(built) = built.and_then(|b| b.into_iter().min()) else {
         eprintln!(
-            "error: the dashboard's UI isn't built (no ui/dist/index.html).\n\
+            "error: the UI isn't built (no ui/dist/index.html or ui/dist/console/console.html).\n\
              Build it first, with Node.js 26 or later: cd ui && npm ci && npm run build"
         );
         std::process::exit(1);

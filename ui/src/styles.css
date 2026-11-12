@@ -347,3 +347,10 @@ button.chip.policy { cursor: pointer; font-family: var(--mono); padding: 1px 8px
 button.chip.policy:hover { border-color: var(--accent); }
 .key-line { margin-bottom: 6px; }
 .key-actions { display: flex; gap: 4px; margin-top: 2px; }
+
+/* The console. */
+.signin { max-width: 520px; margin: 48px auto; }
+.signin .primary { margin: 8px 0; }
+.whoami { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+label.field { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; font-size: 13px; color: var(--muted); }
+label.field input { font-size: 14px; }

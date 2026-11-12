@@ -111,7 +111,7 @@ async fn node_on(
         writing: WritingSet::default(),
         pack,
         metrics: Arc::default(),
-        dashboard: crate::dashboard::Dashboard::new(peer_url),
+        dashboard: crate::dashboard::Dashboard::new(peer_url, None),
         peers: crate::peer::PeerClient::new(),
         allow_sse_c_over_http: false,
         trusted_proxies: Vec::new(),

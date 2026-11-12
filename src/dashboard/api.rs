@@ -78,6 +78,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_admin))
         .routes(routes!(identify_roles))
         .routes(routes!(grant, revoke))
+        .routes(routes!(create_enrollment))
         .routes(routes!(create_key))
         .routes(routes!(set_key, delete_key))
         .routes(routes!(get_policy, put_policy, delete_policy))
@@ -1598,6 +1599,31 @@ async fn revoke(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── Console enrollment ──────────────────────────────────────────────────────
+
+/// A one-time link for a role to register its first passkey for the
+/// console, valid 24 hours.
+#[derive(Serialize, ToSchema)]
+struct Enrollment {
+    /// The link, if this node serves the console (and so knows its URL).
+    url: Option<String>,
+    /// The link's path, for the console's URL.
+    path: String,
+}
+
+/// Makes a role an enrollment link for the console, replacing its last.
+#[utoipa::path(post, path = "/roles/{role}/enrollment", params(("role" = String, Path)), responses(
+    (status = 201, body = Enrollment),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_enrollment(State(app): AppState, Path(role): Path<String>) -> Result<(StatusCode, Json<Enrollment>)> {
+    let token = crate::console::store::create_enrollment(&app.pool.get().await?, &role).await?;
+    let path = format!("/enroll#{token}");
+    let url = app.dashboard.console_origin.as_ref().map(|origin| format!("{origin}{path}"));
+    Ok((StatusCode::CREATED, Json(Enrollment { url, path })))
+}
+
 // ─── Access keys ─────────────────────────────────────────────────────────────
 
 /// A new access key, whose secret is shown only this once.
@@ -2136,6 +2162,12 @@ mod e2e {
                 { "bucket": BUCKET, "permission": "read" },
             ])
         );
+        // A link to enroll a passkey for the console (this node serves none).
+        let (status, _, body) = send(&app, request("POST", &format!("{api}/roles/ui-role/enrollment"), None)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let enrollment: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(enrollment["url"], Value::Null);
+        assert!(enrollment["path"].as_str().unwrap().starts_with("/enroll#"));
         // Its access keys and inline policies.
         let (status, _, body) = send(&app, request("POST", &format!("{api}/roles/ui-role/keys"), None)).await;
         assert_eq!(status, StatusCode::CREATED);

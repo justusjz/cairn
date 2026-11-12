@@ -86,6 +86,7 @@ export const api = {
     ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
   grant: (role: string, bucket: string, permissions: Permission[]) =>
     ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
+  createEnrollment: (role: string) => ok(client.POST("/roles/{role}/enrollment", { params: rolePath(role) })),
   createKey: (role: string) => ok(client.POST("/roles/{role}/keys", { params: rolePath(role) })),
   setKeyActive: (role: string, key: string, active: boolean) =>
     ok(client.PUT("/roles/{role}/keys/{key}", { params: { path: { role, key } }, body: { active } })),

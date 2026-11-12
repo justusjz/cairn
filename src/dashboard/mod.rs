@@ -61,10 +61,13 @@ pub struct Dashboard {
     /// The last `/storage` report, and when it was made. It takes scans of
     /// whole tables, so every page polling it shares one report a while.
     storage: tokio::sync::Mutex<Option<(Instant, Storage)>>,
+    /// The console's origin, if this node serves it: enrollment links are
+    /// made from it.
+    console_origin: Option<String>,
 }
 
 impl Dashboard {
-    pub fn new(peer_url: &str) -> Dashboard {
+    pub fn new(peer_url: &str, console_origin: Option<String>) -> Dashboard {
         let peer_host = peer_url
             .parse::<Uri>()
             .ok()
@@ -72,6 +75,7 @@ impl Dashboard {
         Dashboard {
             peer_host,
             storage: tokio::sync::Mutex::default(),
+            console_origin,
         }
     }
 }
@@ -155,7 +159,7 @@ async fn require_ui_header(req: Request, next: Next) -> Response {
 
 /// Keeps the page from being framed, or from running anything but its own
 /// script. A response that sets its own policy (a download) keeps it.
-async fn security_headers(mut resp: Response) -> Response {
+pub(crate) async fn security_headers(mut resp: Response) -> Response {
     let headers = resp.headers_mut();
     set_default(
         headers,
@@ -174,23 +178,33 @@ fn set_default(headers: &mut HeaderMap, name: header::HeaderName, value: &'stati
         .or_insert(HeaderValue::from_static(value));
 }
 
-/// A file of the UI, or else its `index.html`.
+/// A file of the UI, or else its `index.html`. The console's files
+/// (`console/`) are the console's to serve.
 async fn static_file(method: Method, uri: Uri) -> Response {
     if !matches!(method, Method::GET | Method::HEAD) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    let path = uri.path();
+    if uri.path().starts_with("/console/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    serve_asset(uri.path(), "/index.html")
+}
+
+/// The built UI's file at `path`, or else the page at `index` (for the app's
+/// own routes).
+pub(crate) fn serve_asset(path: &str, index: &str) -> Response {
     let asset = ASSETS.iter().find(|a| a.path == path);
-    // Vite names the files under /assets/ after their content, so they can be
+    // Vite names the files under assets/ after their content, so they can be
     // cached for good. A missing one is a stale page asking for an old build.
+    let is_asset = path.starts_with("/assets/") || path.starts_with("/console/assets/");
     let cache = match asset {
-        Some(_) if path.starts_with("/assets/") => "public, max-age=31536000, immutable",
-        None if path.starts_with("/assets/") => return StatusCode::NOT_FOUND.into_response(),
+        Some(_) if is_asset => "public, max-age=31536000, immutable",
+        None if is_asset => return StatusCode::NOT_FOUND.into_response(),
         _ => "no-cache",
     };
     let asset = asset
-        .or_else(|| ASSETS.iter().find(|a| a.path == "/index.html"))
-        .expect("the UI has an index.html");
+        .or_else(|| ASSETS.iter().find(|a| a.path == index))
+        .expect("the UI has its pages");
     (
         [
             (header::CONTENT_TYPE, asset.content_type),
@@ -206,6 +220,8 @@ async fn static_file(method: Method, uri: Uri) -> Response {
 pub(crate) enum ApiError {
     /// The request can't be carried out as asked.
     BadRequest(String),
+    /// Not signed in (the console).
+    Unauthorized(String),
     Forbidden(String),
     NotFound(String),
     /// It conflicts with how things are, e.g. a name that's taken.
@@ -234,11 +250,12 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
+            ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Failed(e) => {
-                eprintln!("dashboard request failed: {e:#}");
+                eprintln!("dashboard or console request failed: {e:#}");
                 if e.downcast_ref::<crate::Unavailable>().is_some() {
                     (
                         StatusCode::SERVICE_UNAVAILABLE,

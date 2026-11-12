@@ -29,6 +29,7 @@ export default function Users() {
   const kms = () => cluster.data()?.nodes.some((n) => n.stats?.kms) ?? false;
   const [secret, setSecret] = createSignal<NewSecret>();
   const [editing, setEditing] = createSignal<{ user: string; policy?: string }>();
+  const [enrollment, setEnrollment] = createSignal<{ user: string; url?: string | null; path: string }>();
   const [name, setName] = createSignal("");
   const [newSecret, setNewSecret] = createSignal("");
   const [admin, setAdmin] = createSignal(false);
@@ -99,6 +100,7 @@ export default function Users() {
                     changed={data.refresh}
                     showSecret={setSecret}
                     editPolicy={(policy) => setEditing({ user: user.name, policy })}
+                    showEnrollment={(e) => setEnrollment({ user: user.name, ...e })}
                   />
                 )}
               </For>
@@ -120,6 +122,9 @@ export default function Users() {
       </Show>
       <Show when={secret()}>
         {(s) => <SecretDialog id={s().id} secret={s().secret} onClose={() => setSecret(undefined)} />}
+      </Show>
+      <Show when={enrollment()}>
+        {(e) => <EnrollmentDialog {...e()} onClose={() => setEnrollment(undefined)} />}
       </Show>
       <Show when={editing()}>
         {(e) => (
@@ -258,6 +263,7 @@ function UserRow(props: {
   changed: () => void;
   showSecret: (s: NewSecret) => void;
   editPolicy: (policy?: string) => void;
+  showEnrollment: (e: { url?: string | null; path: string }) => void;
 }) {
   const r = () => props.user;
   const [granting, setGranting] = createSignal(false);
@@ -283,6 +289,10 @@ function UserRow(props: {
     if (!res) return;
     props.showSecret(res.value);
     props.changed();
+  };
+  const enroll = async () => {
+    const res = await act(() => api.createEnrollment(r().name));
+    if (res) props.showEnrollment(res.value);
   };
   const remove = async () => {
     if (!confirm(`Delete user "${r().name}", with its access keys, grants and policies? Clients using it stop working.`))
@@ -392,6 +402,9 @@ function UserRow(props: {
         </button>
         <button class="small" onClick={toggleAdmin}>
           {r().admin ? "Revoke admin" : "Make admin"}
+        </button>
+        <button class="small" title="A one-time link to set up a passkey for the console" onClick={enroll}>
+          Console link
         </button>
         <button class="small danger" onClick={remove}>
           Delete
@@ -549,4 +562,49 @@ function pretty(text: string): string {
   } catch {
     return text;
   }
+}
+
+/** A user's enrollment link for the console, shown once. */
+function EnrollmentDialog(props: { user: string; url?: string | null; path: string; onClose: () => void }) {
+  let dialog!: HTMLDialogElement;
+  let input!: HTMLInputElement;
+  onMount(() => {
+    dialog.showModal();
+    input.select();
+  });
+  const link = () => props.url ?? props.path;
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(link());
+      toast("Copied");
+    } catch {
+      input.select();
+    }
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <h2>
+        Console link for <span class="mono">{props.user}</span>
+      </h2>
+      <p class="subtle">
+        Send it to <span class="mono">{props.user}</span>: it sets up a passkey for the console, and works once, for 24
+        hours. A new link replaces this one.
+      </p>
+      <Show when={!props.url}>
+        <p class="subtle small">
+          This node doesn't serve the console, so put the console's URL in front (as with{" "}
+          <span class="mono">cairn user enroll --console-url</span>).
+        </p>
+      </Show>
+      <div class="secret">
+        <input ref={input} type="text" readOnly value={link()} />
+        <button onClick={copy}>Copy</button>
+      </div>
+      <div class="buttons">
+        <button class="primary" onClick={() => dialog.close()}>
+          Done
+        </button>
+      </div>
+    </dialog>
+  );
 }

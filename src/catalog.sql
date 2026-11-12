@@ -66,8 +66,8 @@
 --   G(g)    The role_grants rows. Locked (exclusively, in primary-key order)
 --           before they're deleted.
 --   R(r)    The role's (user's) row. Shared: granting it a permission.
---           Exclusive: giving it an access key, or setting an inline
---           policy (I10); deleting the user (by deleting the row).
+--           Exclusive: giving it an access key, a passkey, or setting an
+--           inline policy (I10); deleting the user (by deleting the row).
 --   X(x)    The blob's row. Shared: referencing it, changing or deleting
 --           a part on it, or changing its `lost_ranges` (the scrubber,
 --           which locks the row with nothing else). Exclusive: committing it, deleting it, removing a
@@ -150,8 +150,12 @@
 -- I10. A user has at most two access keys, and its inline policies hold at
 --     most 2048 characters (but whitespace) together, as in IAM: making a
 --     key, or setting a policy, holds R(r) exclusively, and counts what the
---     user has in a later statement (T23, T24). Deleting a key or a policy
---     only takes from either.
+--     user has in a later statement (T28, T29). Likewise at most 8
+--     passkeys, as IAM's MFA devices (T30), and at least one, once it has
+--     any, but by deleting the user (T31, likewise). Deleting a key or a
+--     policy only takes from them. The console's enrollments, challenges and
+--     sessions are each used up or ended by a single DELETE, whose condition
+--     is on its own row (F2), so each is used once.
 --
 -- DEADLOCKS
 --
@@ -1389,7 +1393,7 @@ BEGIN
 END
 $$;
 
--- T22: PutBucketPolicy and DeleteBucketPolicy: sets (or, with NULL, removes)
+-- T27: PutBucketPolicy and DeleteBucketPolicy: sets (or, with NULL, removes)
 -- the bucket's policy. A plain UPDATE of the bucket's row, as T16's: no
 -- invariant involves the policy, which requests read as they begin, not
 -- under B. Returns whether the bucket exists.
@@ -1401,7 +1405,7 @@ BEGIN
 END
 $$;
 
--- T23: gives a user an access key, unless it has `p_max` already (I10).
+-- T28: gives a user an access key, unless it has `p_max` already (I10).
 -- Takes R(r) exclusively, then counts its keys. The key's FK check locks the
 -- row shared, which it holds already; its trigger keeps `roles.secret` (see
 -- migration 29), on the same row. Returns 'created', 'no_such_user',
@@ -1427,7 +1431,7 @@ BEGIN
 END
 $$;
 
--- T24: sets a user's inline policy `p_name`, unless its policies would hold
+-- T29: sets a user's inline policy `p_name`, unless its policies would hold
 -- more than `p_max` characters (but whitespace) together (I10). Takes R(r)
 -- exclusively, then sizes the others. Returns 'set', 'no_such_user' or
 -- 'too_big'.
@@ -1448,6 +1452,60 @@ BEGIN
     INSERT INTO role_policies (role_id, name, document) VALUES (v_role, p_name, p_document)
     ON CONFLICT (role_id, name) DO UPDATE SET document = EXCLUDED.document;
     RETURN 'set';
+END
+$$;
+
+-- T30: gives a user a passkey, unless it has `p_max` already (I10): through
+-- the enrollment link whose token hashes to `p_enrollment`, which it uses up,
+-- or (NULL) signed in. Takes R(r) exclusively, then uses up the link, and
+-- counts the user's passkeys. Returns 'added', 'no_such_user',
+-- 'no_enrollment' (used, expired, or another user's), 'too_many' or 'taken'
+-- (the credential is registered already).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_add_passkey(
+    p_role uuid, p_enrollment bytea, p_credential bytea, p_public_key bytea, p_sign_count bigint,
+    p_name text, p_backup_eligible boolean, p_backed_up boolean, p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM roles WHERE id = p_role FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_user';
+    END IF;
+    IF p_enrollment IS NOT NULL THEN
+        DELETE FROM console_enrollments
+        WHERE token_hash = p_enrollment AND role_id = p_role AND expires_at > now();
+        IF NOT FOUND THEN
+            RETURN 'no_enrollment';
+        END IF;
+    END IF;
+    IF (SELECT count(*) FROM passkeys WHERE role_id = p_role) >= p_max THEN
+        RETURN 'too_many';
+    END IF;
+    INSERT INTO passkeys (credential_id, role_id, public_key, sign_count, name, backup_eligible, backed_up)
+    VALUES (p_credential, p_role, p_public_key, p_sign_count, p_name, p_backup_eligible, p_backed_up)
+    ON CONFLICT DO NOTHING;
+    IF NOT FOUND THEN
+        RETURN 'taken';
+    END IF;
+    RETURN 'added';
+END
+$$;
+
+-- T31: removes one of a user's passkeys (and so the sessions signed in with
+-- it), unless it's the user's last, so that no one locks themselves out of
+-- the console. Takes R(r) exclusively, then counts. Returns 'deleted',
+-- 'no_such_passkey' or 'last'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_passkey(p_role uuid, p_credential bytea)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM roles WHERE id = p_role FOR UPDATE;
+    IF NOT EXISTS (SELECT 1 FROM passkeys WHERE role_id = p_role AND credential_id = p_credential) THEN
+        RETURN 'no_such_passkey';
+    END IF;
+    IF (SELECT count(*) FROM passkeys WHERE role_id = p_role) <= 1 THEN
+        RETURN 'last';
+    END IF;
+    DELETE FROM passkeys WHERE role_id = p_role AND credential_id = p_credential;
+    RETURN 'deleted';
 END
 $$;
 

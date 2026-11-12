@@ -297,6 +297,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/roles/{role}/enrollment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Makes a role an enrollment link for the console, replacing its last. */
+        post: operations["create_enrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/roles/{role}/grants": {
         parameters: {
             query?: never;
@@ -655,6 +672,16 @@ export interface components {
              * @description SSE-KMS and SSE-S3: the version of the KMS key its data key is from.
              */
             kms_key_version?: number | null;
+        };
+        /**
+         * @description A one-time link for a role to register its first passkey for the
+         *     console, valid 24 hours.
+         */
+        Enrollment: {
+            /** @description The link's path, for the console's URL. */
+            path: string;
+            /** @description The link, if this node serves the console (and so knows its URL). */
+            url?: string | null;
         };
         Entry: {
             /** Format: int64 */
@@ -2108,6 +2135,43 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_enrollment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Enrollment"];
+                };
             };
             "4XX": {
                 headers: {

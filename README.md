@@ -103,6 +103,8 @@ command line wins. `cairn user` reads `CAIRN_DATABASE` as well.
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
 | `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. |
+| `--listen-console <ADDR>` | `CAIRN_LISTEN_CONSOLE` | off | Bind address for the [console](#console), the web UI people sign in to with passkeys. Requires `--console-url`. |
+| `--console-url <URL>` | `CAIRN_CONSOLE_URL` | none | The URL the console is reached at, as browsers see it, e.g. `https://console.example.com`: an origin of its own (not the S3 API's), over HTTPS, or on `localhost`. Passkeys are bound to its host. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
 | `--kms-jwt-key <PATH>` | `CAIRN_KMS_JWT_KEY` | *required with a KMS* | PEM file of the Ed25519 private key Cairn signs its roles' logins to the KMS with. The same on every node. |
 | `--kms-auth-mount <PATH>` | `CAIRN_KMS_AUTH_MOUNT` | `cairn` | Where the KMS's JWT auth method for Cairn is mounted. |
@@ -315,6 +317,7 @@ Manage users with `cairn user --database <URL> <command>`:
 | `policy put <name> <policy> <file>` | Set an inline policy (JSON; `-` reads stdin). A user's policies hold at most 2048 characters together, as in IAM. |
 | `policy get\|delete <name> <policy>` | Show or delete an inline policy. |
 | `list` | List users, their ARNs, admin flags, keys, grants and policies (secrets are not shown). |
+| `enroll <name> [--console-url <URL>]` | Print a one-time link (24 hours) for the user to set up a passkey for the [console](#console). A new link replaces the last. |
 
 A bucket policy can deny everyone everything, its admins too, as in S3. The
 superadmin, with access to the database, can always remove it, as an AWS
@@ -395,8 +398,9 @@ cluster:
   [lifecycle rules](#lifecycle-rules) edited.
 - **Users:** everything `cairn user` does: create and delete users, grant and
   revoke permissions, toggle admin, make, deactivate and delete access keys
-  (replacing the secret of the one named as the user in place), and write
-  inline policies, which the server checks as IAM does. Each user's ID and
+  (replacing the secret of the one named as the user in place), write
+  inline policies, which the server checks as IAM does, and make
+  [console](#console) enrollment links. Each user's ID and
   its identity in the KMS are shown, for granting it [KMS keys](#sse-kms).
 
 To keep other websites from reaching it through DNS rebinding, the dashboard
@@ -430,13 +434,17 @@ cargo build --release
 
 `./build-release.sh` does both. While working on the UI, `npm run dev` in
 `ui/` serves it with hot reloading, passing API requests on to the node at
-`CAIRN_URL` (default `http://127.0.0.1:9431`).
+`CAIRN_URL` (default `http://127.0.0.1:9431`). The [console](#console) is a
+second page of the same UI (`ui/console.html`, built into `ui/dist/console/`);
+`npm run dev:console` serves it, passing its API on to `CAIRN_CONSOLE`
+(default `http://localhost:9480`).
 
 The UI's types come from the API's OpenAPI spec, which is generated from the
-Rust code (with [utoipa](https://github.com/juhaku/utoipa)). Both the spec
-(`ui/openapi.json`) and the TypeScript types made from it for
-[openapi-fetch](https://openapi-ts.dev/openapi-fetch/) (`ui/src/schema.d.ts`)
-are committed, so building needs neither generator. A test fails when the
+Rust code (with [utoipa](https://github.com/juhaku/utoipa)). Both the specs
+(`ui/openapi.json`, and the console's `ui/console-openapi.json`) and the
+TypeScript types made from them for
+[openapi-fetch](https://openapi-ts.dev/openapi-fetch/) (`ui/src/schema.d.ts`,
+`ui/src/console/schema.d.ts`) are committed, so building needs neither generator. A test fails when the
 committed spec no longer matches the API; after changing the API, regenerate
 both:
 
@@ -448,6 +456,43 @@ CAIRN_UPDATE_OPENAPI=1 cargo test openapi
 `npm run gen` runs [openapi-typescript](https://openapi-ts.dev/) through `npx`,
 with pinned versions and the TypeScript 5 it needs (the UI itself uses
 TypeScript 7), so it needs network access.
+
+## Console
+
+The console is a web UI for the account's people, apart from the dashboard
+(which is the operator's, on the private network, without a sign-in). It's
+off unless a node is started with `--listen-console` and `--console-url`.
+People sign in with **passkeys** only: there are no passwords, and access
+keys are for S3, never for the console. For now, the console shows who's
+signed in and manages their passkeys; buckets, objects and users come next
+(see `plans/console.md`).
+
+- **Its own origin.** Serve it at a host name of its own, never the S3 API's:
+  objects are served from that origin with whatever `Content-Type` they were
+  uploaded with, so an HTML object there could act in the console as whoever
+  opens it. Cairn speaks plain HTTP: put a TLS-terminating proxy in front
+  (`http://localhost` works for trying it out, as browsers treat it as
+  secure). Passkeys are bound to the console URL's host, so changing it
+  makes everyone enroll again.
+- **Enrollment.** A user gets a first passkey through a one-time link, valid
+  24 hours: `cairn user enroll <name> --console-url <URL>`, or the Users page
+  of the dashboard. Once signed in, people add more passkeys (at most 8; a
+  second one, on another device, keeps them from being locked out) and remove
+  them, but never their last. A lost passkey takes a new link.
+- **Sessions** last 12 hours at most, and end after an hour unused. They're a
+  cookie (`__Host-`, Secure, HttpOnly, SameSite=Strict), kept in the database
+  as a hash, so every node serves them. Removing a passkey or the user ends
+  the sessions signed in with it. Changes must come from the console's own
+  page (its `Origin`).
+- **Passkeys** are checked by Cairn itself (WebAuthn, with EdDSA, ES256 or
+  RS256 keys), with user verification (a PIN or biometrics) every time, and
+  without attestation: any authenticator works. A passkey whose signature
+  counter goes backwards (a cloned security key) is refused.
+
+```sh
+cairn serve ... --listen-console 0.0.0.0:9480 --console-url https://console.example.com
+cairn user enroll ada --console-url https://console.example.com
+```
 
 ## Versioning
 

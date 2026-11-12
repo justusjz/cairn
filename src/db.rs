@@ -199,6 +199,7 @@ const MIGRATIONS: &[&str] = &[
     TAGGING,
     LAYOUTS,
     USERS,
+    CONSOLE,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1139,6 +1140,64 @@ END
 $$;
 CREATE TRIGGER access_keys_legacy AFTER INSERT OR UPDATE OR DELETE ON access_keys
     FOR EACH ROW EXECUTE FUNCTION cairn_legacy_secret();
+"#;
+
+/// Migration 30: the console's sign-ins (see `console`): users' passkeys,
+/// the one-time links that enroll their first, the challenges of ceremonies
+/// in progress, and sessions. All of them rows of their user (R(r)); tokens
+/// are kept as their SHA-256 only.
+const CONSOLE: &str = r#"
+CREATE TABLE passkeys (
+    credential_id   bytea PRIMARY KEY,
+    role_id         uuid NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+    public_key      bytea NOT NULL,
+    sign_count      bigint NOT NULL,
+    name            text NOT NULL,
+    backup_eligible boolean NOT NULL,
+    backed_up       boolean NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    last_used_at    timestamptz
+);
+CREATE INDEX passkeys_role ON passkeys (role_id);
+
+CREATE TABLE console_enrollments (
+    token_hash bytea PRIMARY KEY,
+    role_id    uuid NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL
+);
+CREATE INDEX console_enrollments_role ON console_enrollments (role_id);
+
+-- `purpose`: 'enroll', 'add' (a passkey, signed in) or 'login'; `role_id`
+-- is whose, but for a login, which finds out.
+CREATE TABLE console_challenges (
+    id         uuid PRIMARY KEY,
+    challenge  bytea NOT NULL,
+    purpose    text NOT NULL CHECK (purpose IN ('enroll', 'add', 'login')),
+    role_id    uuid REFERENCES roles (id) ON DELETE CASCADE,
+    expires_at timestamptz NOT NULL
+);
+CREATE INDEX console_challenges_role ON console_challenges (role_id);
+
+CREATE TABLE console_sessions (
+    token_hash    bytea PRIMARY KEY,
+    role_id       uuid NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+    credential_id bytea NOT NULL REFERENCES passkeys (credential_id) ON DELETE CASCADE,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    last_seen_at  timestamptz NOT NULL DEFAULT now(),
+    expires_at    timestamptz NOT NULL
+);
+CREATE INDEX console_sessions_role ON console_sessions (role_id);
+CREATE INDEX console_sessions_credential ON console_sessions (credential_id);
+
+CREATE TRIGGER passkeys_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON passkeys
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER console_enrollments_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_enrollments
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER console_challenges_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_challenges
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER console_sessions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_sessions
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

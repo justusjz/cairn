@@ -819,6 +819,51 @@
         }
       }
     },
+    "/roles/{role}/enrollment": {
+      "post": {
+        "summary": "Makes a role an enrollment link for the console, replacing its last.",
+        "operationId": "create_enrollment",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Enrollment"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/roles/{role}/grants": {
       "post": {
         "summary": "Grants permissions on an existing bucket.",
@@ -1826,6 +1871,26 @@
             ],
             "format": "int64",
             "description": "SSE-KMS and SSE-S3: the version of the KMS key its data key is from."
+          }
+        }
+      },
+      "Enrollment": {
+        "type": "object",
+        "description": "A one-time link for a role to register its first passkey for the\nconsole, valid 24 hours.",
+        "required": [
+          "path"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "The link's path, for the console's URL."
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The link, if this node serves the console (and so knows its URL)."
           }
         }
       },
