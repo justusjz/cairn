@@ -200,6 +200,7 @@ const MIGRATIONS: &[&str] = &[
     LAYOUTS,
     USERS,
     CONSOLE,
+    PRINCIPAL_IDS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1198,6 +1199,39 @@ CREATE TRIGGER console_challenges_protocol BEFORE INSERT OR UPDATE OR DELETE OR 
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER console_sessions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_sessions
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 31: the users a bucket's policy names, by the IDs they had when
+/// it was set (`buckets.policy_principals`: ARN → ID), as S3 keeps a user's
+/// unique ID: a user deleted and made again with its name is another user,
+/// which the policy doesn't name (see `policy::Policy::with_ids`). A trigger
+/// keeps them with every policy written, an older Cairn's too, from the
+/// users there are as it's written; the policies there are get theirs now.
+/// A user that's gone is no one's: a user deleted before this migration is
+/// named by no one's ID.
+const PRINCIPAL_IDS: &str = r#"
+ALTER TABLE buckets ADD COLUMN policy_principals jsonb;
+
+CREATE FUNCTION cairn_policy_principals() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.policy_principals := CASE WHEN NEW.policy IS NOT NULL THEN (
+        SELECT coalesce(jsonb_object_agg(p.arn, r.id::text), '{}'::jsonb)
+        FROM (
+            SELECT DISTINCT a #>> '{}' AS arn
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].Principal.AWS[*]') a
+            UNION
+            SELECT a #>> '{}'
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].NotPrincipal.AWS[*]') a
+        ) p
+        JOIN roles r ON r.name = substring(p.arn FROM '^arn:aws:iam::[0-9]{12}:user/(.+)$')
+    ) END;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER buckets_policy_principals BEFORE INSERT OR UPDATE OF policy ON buckets
+    FOR EACH ROW EXECUTE FUNCTION cairn_policy_principals();
+
+UPDATE buckets SET policy = policy WHERE policy IS NOT NULL;
 "#;
 
 #[cfg(test)]

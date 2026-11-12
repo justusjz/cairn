@@ -5,6 +5,8 @@
 //! an AWS account's root user can, so that one that denies everyone can't
 //! lock its bucket for good.
 
+use std::collections::HashMap;
+
 use clap::{Args, Subcommand};
 use deadpool_postgres::Object;
 use http_body_util::Full;
@@ -65,6 +67,34 @@ async fn stored(client: &Object, bucket: &str) -> anyhow::Result<Option<Option<S
     Ok(row.map(|row| row.get(0)))
 }
 
+/// The bucket's policy as GetBucketPolicy shows it: as it's kept, but each
+/// user it names that's gone since it was set named by its ID, as S3 shows
+/// one (a user made with the name since isn't the one it names: see
+/// `db::PRINCIPAL_IDS`). `None` if there's no such bucket, `Some(None)` if
+/// it has none.
+async fn shown(client: &Object, bucket: &str) -> anyhow::Result<Option<Option<String>>> {
+    let row = client
+        .query_opt_cached(
+            "SELECT b.policy,
+                    (SELECT coalesce(jsonb_object_agg(p.key, p.value), '{}'::jsonb)
+                     FROM jsonb_each_text(b.policy_principals) p
+                     WHERE NOT EXISTS (SELECT 1 FROM roles r WHERE r.id::text = p.value))::text
+             FROM buckets b WHERE b.name = $1",
+            &[&bucket],
+        )
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    let Some(text) = row.get::<_, Option<String>>(0) else { return Ok(Some(None)) };
+    let gone: HashMap<String, String> = serde_json::from_str(row.get(1))?;
+    if gone.is_empty() {
+        return Ok(Some(Some(text)));
+    }
+    let kind = Kind::Bucket(bucket);
+    let policy = Policy::parse(&text, kind)
+        .map_err(|e| anyhow::anyhow!("bucket {bucket}'s policy doesn't parse: {}", e.message))?;
+    Ok(Some(Some(policy.shown(kind, &gone))))
+}
+
 /// Sets (`None`: deletes) the bucket's policy (`cairn_set_policy`). Whether
 /// the bucket exists.
 async fn set(client: &Object, bucket: &str, policy: Option<&str>) -> anyhow::Result<bool> {
@@ -85,7 +115,7 @@ fn empty(status: StatusCode) -> Response<Full<Bytes>> {
 
 /// GetBucketPolicy: `GET /{bucket}?policy`: the policy, as S3 keeps it.
 pub async fn get_bucket_policy(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
-    Ok(match stored(&app.pool.get().await?, bucket).await? {
+    Ok(match shown(&app.pool.get().await?, bucket).await? {
         None => no_such_bucket(),
         Some(None) => no_such_policy(),
         Some(Some(policy)) => Response::builder()
@@ -171,7 +201,7 @@ pub async fn bucket_policy_main(args: BucketPolicyArgs) -> anyhow::Result<()> {
     let pool = crate::db::connect(&args.database).await?;
     let client = pool.get().await?;
     match args.command {
-        BucketPolicyCommand::Get { bucket } => match stored(&client, &bucket).await? {
+        BucketPolicyCommand::Get { bucket } => match shown(&client, &bucket).await? {
             None => anyhow::bail!("no bucket named {bucket:?}"),
             Some(None) => anyhow::bail!("{bucket:?} has no policy"),
             Some(Some(policy)) => println!("{policy}"),

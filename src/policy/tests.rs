@@ -6,8 +6,12 @@ use super::*;
 const ACCOUNT: &str = "123456789012";
 const BUCKET: &str = "examplebucket";
 
+/// A bucket policy, as it was set: each user it names by the ID the user
+/// had then, which (for these tests) is its name.
 fn bucket_policy(json: &str) -> Policy {
-    Policy::parse(json, Kind::Bucket(BUCKET)).unwrap_or_else(|e| panic!("{json}: {e:?}"))
+    let policy = Policy::parse(json, Kind::Bucket(BUCKET)).unwrap_or_else(|e| panic!("{json}: {e:?}"));
+    let ids = policy.users().map(|(account, name)| (user_arn(account, name), name.to_owned())).collect();
+    policy.with_ids(ids)
 }
 
 fn identity_policy(json: &str) -> Policy {
@@ -22,7 +26,7 @@ fn refused(json: &str, kind: Kind) -> Invalid {
 }
 
 fn user(name: &str) -> Principal<'_> {
-    Principal::User { account: ACCOUNT, name }
+    Principal::User { account: ACCOUNT, name, id: name }
 }
 
 fn object(key: &str) -> String {
@@ -464,4 +468,40 @@ fn absent_keys_are_missing() {
             "Condition":{"StringNotEquals":{"aws:SourceVpce":"vpce-1a2b3c4d"}}}]}"#,
     );
     assert_eq!(check(&policy, user("a"), "s3:GetObject", &object("k"), &Context::default()), Decision::Deny);
+}
+
+/// A user a bucket policy names is the one that had the name when it was
+/// set: not one made with the name since (S3 keeps the user's unique ID).
+/// One that's gone is shown by its ID.
+#[test]
+fn names_users_as_they_were() {
+    let json = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":["arn:aws:iam::{ACCOUNT}:user/bob","arn:aws:iam::{ACCOUNT}:user/carol"]}},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*","Condition":{{"StringEquals":{{"aws:PrincipalArn":"arn:aws:iam::{ACCOUNT}:user/bob"}}}}}}]}}"#
+    );
+    let policy = Policy::parse(&json, Kind::Bucket(BUCKET)).unwrap();
+    let bob = user_arn(ACCOUNT, "bob");
+    let policy = policy.with_ids([(bob.clone(), "id-1".to_owned())].into());
+    let mut context = context_of("bob");
+    context.set("aws:PrincipalArn", &bob);
+    let resource = object("k");
+    let request = |id| Request {
+        principal: Principal::User { account: ACCOUNT, name: "bob", id },
+        action: "s3:GetObject",
+        resource: &resource,
+        context: &context,
+    };
+    assert_eq!(policy.evaluate(&request("id-1")), Decision::Allow);
+    assert_eq!(policy.evaluate(&request("id-2")), Decision::NotApplicable);
+    // Carol wasn't there when it was set: it names no one (its condition
+    // holding, as the context is bob's).
+    let carol = Request { principal: Principal::User { account: ACCOUNT, name: "carol", id: "carol" }, ..request("id-1") };
+    assert_eq!(policy.evaluate(&carol), Decision::NotApplicable);
+
+    // Shown with bob's ID once bob is gone; the condition's ARN is a value,
+    // which stays.
+    assert_eq!(policy.shown(Kind::Bucket(BUCKET), &HashMap::new()), policy.normalized());
+    let shown = policy.shown(Kind::Bucket(BUCKET), &[(bob.clone(), "id-1".to_owned())].into());
+    assert_eq!(shown, policy.normalized().replacen(&format!("\"{bob}\""), "\"id-1\"", 1));
+    assert!(shown.contains(&format!("\"aws:PrincipalArn\":\"{bob}\"")), "{shown}");
 }

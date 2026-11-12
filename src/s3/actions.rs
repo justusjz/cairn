@@ -439,7 +439,7 @@ mod tests {
         operation.checks.iter().all(|check| {
             let resource = check.on.arn();
             let request = Request {
-                principal: Principal::User { account: "123456789012", name: "r" },
+                principal: Principal::User { account: "123456789012", name: "r", id: "r" },
                 action: check.action,
                 resource: &resource,
                 context: &context,

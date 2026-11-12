@@ -30,21 +30,24 @@ use crate::{
 /// otherwise parse its user's and buckets' policies again.
 static PARSED: Mutex<Option<HashMap<Parsed, Arc<Policy>>>> = Mutex::new(None);
 
-/// A parsed policy's key: its bucket (none for an identity policy), and its
-/// text.
-type Parsed = (Option<String>, String);
+/// A parsed policy's key: its bucket (none for an identity policy), its
+/// text, and (a bucket policy's) its users' IDs.
+type Parsed = (Option<String>, String, Option<String>);
 
 /// The most policies kept parsed; past it, they're parsed again.
 const MAX_PARSED: usize = 10_000;
 
-/// `text` parsed as a policy of `kind`, from `PARSED` if it's been parsed.
-fn parsed(text: &str, kind: Kind) -> anyhow::Result<Arc<Policy>> {
+/// `text` parsed as a policy of `kind`, naming its users by `ids` (a bucket
+/// policy's `policy_principals`: ARN → ID), from `PARSED` if it's been
+/// parsed.
+fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Result<Arc<Policy>> {
     let key = (
         match kind {
             Kind::Identity => None,
             Kind::Bucket(bucket) => Some(bucket.to_owned()),
         },
         text.to_owned(),
+        ids.map(str::to_owned),
     );
     if let Some(policy) = PARSED.lock().unwrap().as_ref().and_then(|p| p.get(&key)) {
         return Ok(policy.clone());
@@ -52,9 +55,13 @@ fn parsed(text: &str, kind: Kind) -> anyhow::Result<Arc<Policy>> {
     // A policy that was taken when it was set, but isn't now (a Cairn that
     // checks more), decides nothing: it fails the request, rather than
     // allowing what it might deny.
-    let policy = Arc::new(Policy::parse(text, kind).map_err(|e| {
+    let policy = Policy::parse(text, kind).map_err(|e| {
         anyhow::anyhow!("a stored policy doesn't parse ({}: {}): {text}", e.code, e.message)
-    })?);
+    })?;
+    let policy = Arc::new(match ids {
+        Some(ids) => policy.with_ids(serde_json::from_str(ids)?),
+        None => policy,
+    });
     let mut cache = PARSED.lock().unwrap();
     let cache = cache.get_or_insert_with(HashMap::new);
     if cache.len() >= MAX_PARSED {
@@ -78,8 +85,8 @@ pub struct Origin<'a> {
 /// What a request may do: the policies that decide it, and its condition
 /// keys. Buckets' policies are loaded as checks need them.
 pub struct Access {
-    /// The user, by its account and name; `None` if anonymous.
-    user: Option<(String, String)>,
+    /// The user, by its account, name and ID; `None` if anonymous.
+    user: Option<(String, String, String)>,
     identity: Vec<Arc<Policy>>,
     pub context: Context,
     /// Each bucket loaded: whether it exists, and its policy.
@@ -100,17 +107,17 @@ impl Access {
         let mut identity = Vec::new();
         if let Some(principal) = principal {
             for (permission, bucket) in principal.grants() {
-                identity.push(parsed(&actions::grant_policy(permission, bucket), Kind::Identity)?);
+                identity.push(parsed(&actions::grant_policy(permission, bucket), Kind::Identity, None)?);
             }
             if principal.admin {
-                identity.push(parsed(&actions::admin_policy(), Kind::Identity)?);
+                identity.push(parsed(&actions::admin_policy(), Kind::Identity, None)?);
             }
             for document in &principal.policies {
-                identity.push(parsed(document, Kind::Identity)?);
+                identity.push(parsed(document, Kind::Identity, None)?);
             }
         }
         Ok(Access {
-            user: principal.map(|p| (p.account.clone(), p.name.clone())),
+            user: principal.map(|p| (p.account.clone(), p.name.clone(), p.id.to_string())),
             identity,
             context: context(principal, account, method, headers, query, origin),
             buckets: HashMap::new(),
@@ -126,10 +133,15 @@ impl Access {
             .pool
             .get()
             .await?
-            .query_opt_cached("SELECT policy FROM buckets WHERE name = $1", &[&bucket])
+            .query_opt_cached("SELECT policy, policy_principals::text FROM buckets WHERE name = $1", &[&bucket])
             .await?;
         let policy = match row.as_ref().and_then(|row| row.get::<_, Option<String>>(0)) {
-            Some(text) => Some(parsed(&text, Kind::Bucket(bucket))?),
+            Some(text) => {
+                // Its users, by the IDs they had when it was set (see
+                // `db::PRINCIPAL_IDS`).
+                let ids = row.as_ref().and_then(|row| row.get::<_, Option<String>>(1));
+                Some(parsed(&text, Kind::Bucket(bucket), Some(ids.as_deref().unwrap_or("{}")))?)
+            }
             None => None,
         };
         self.buckets.insert(bucket.to_owned(), (row.is_some(), policy));
@@ -149,7 +161,7 @@ impl Access {
     pub fn verdict(&self, check: &Check) -> Verdict {
         let resource = check.on.arn();
         let principal = match &self.user {
-            Some((account, name)) => Who::User { account, name },
+            Some((account, name, id)) => Who::User { account, name, id },
             None => Who::Anonymous,
         };
         let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &self.context };
@@ -170,7 +182,7 @@ impl Access {
     /// S3's 403 for `check`, denied by `verdict`: to a user, it says what
     /// was denied and why (probed); anonymously, just that it was.
     pub fn denied(&self, check: &Check, verdict: Verdict) -> Response<Full<Bytes>> {
-        let Some((account, name)) = &self.user else {
+        let Some((account, name, _)) = &self.user else {
             return format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied");
         };
         let on = match &check.on {

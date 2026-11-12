@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use super::node_with;
+use super::{BUCKET, node_with};
 use crate::{
     App, packer,
     roles::{self, Principal},
@@ -137,4 +137,60 @@ async fn inline_policies_are_checked_and_kept_as_given() {
     roles::delete_policy(&client, "carol", "home").await.unwrap();
     assert!(roles::get_policy(&client, "carol", "home").await.is_err());
     assert!(roles::delete_policy(&client, "carol", "home").await.is_err());
+}
+
+/// A bucket policy names a user as the one that had the name when it was
+/// set, as S3 does: one deleted and made again with the name isn't allowed
+/// what the first was, and the policy shows the first by its ID. Older
+/// Cairns' policies (written as they write them) are kept so too.
+#[tokio::test]
+async fn bucket_policies_name_users_as_they_were() {
+    use crate::s3::{access, actions, buckets::policy};
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let name = format!("bob-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    roles::create(&client, &name, None, false).await.unwrap();
+    let account = roles::account(&client).await.unwrap();
+    let arn = format!("arn:aws:iam::{account}:user/{name}");
+    let document = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{arn}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
+    );
+    let set = policy::put_bucket_policy(&app, BUCKET, document.clone().into()).await.unwrap();
+    assert_eq!(set.status(), hyper::StatusCode::NO_CONTENT);
+
+    let read = actions::Check { action: "s3:GetObject", on: actions::On::Object(BUCKET.to_owned(), "k".to_owned()) };
+    let allowed = |principal: Principal| {
+        let app = app.clone();
+        let read = read.clone();
+        let account = account.clone();
+        async move {
+            let origin = access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+            let headers = hyper::HeaderMap::new();
+            let mut access =
+                access::Access::new(Some(&principal), &account, &hyper::Method::GET, &headers, "", &origin).unwrap();
+            access.load(&app, BUCKET).await.unwrap();
+            access.allows(&read)
+        }
+    };
+    let first = Principal::load(&client, &name).await.unwrap().unwrap();
+    let first_id = first.id.to_string();
+    assert!(allowed(first).await);
+    let shown = |app: Arc<App>| async move {
+        let response = policy::get_bucket_policy(&app, BUCKET).await.unwrap();
+        let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+        String::from_utf8(body.to_vec()).unwrap()
+    };
+    assert!(shown(app.clone()).await.contains(&format!("\"AWS\":\"{arn}\"")));
+
+    roles::delete(&client, &name).await.unwrap();
+    roles::create(&client, &name, None, false).await.unwrap();
+    let second = Principal::load(&client, &name).await.unwrap().unwrap();
+    assert!(!allowed(second).await);
+    assert!(shown(app.clone()).await.contains(&format!("\"AWS\":\"{first_id}\"")));
+
+    // As an older Cairn writes it: the IDs are kept all the same.
+    client.execute("UPDATE buckets SET policy = $2 WHERE name = $1", &[&BUCKET, &document]).await.unwrap();
+    let second = Principal::load(&client, &name).await.unwrap().unwrap();
+    assert!(allowed(second).await);
+    client.execute("UPDATE buckets SET policy = NULL WHERE name = $1", &[&BUCKET]).await.unwrap();
 }

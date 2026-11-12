@@ -260,7 +260,10 @@ allows; else it's denied. They are:
   are **anonymous**, and only a bucket policy with `"Principal": "*"` can
   allow them (a public bucket, say). Users are named in policies as
   `arn:aws:iam::<account>:user/<name>`; the cluster is one account, whose ID
-  `cairn user list` shows.
+  `cairn user list` shows. As in S3, a bucket policy names the user that
+  had the name when the policy was set: a user deleted and created again
+  under the same name isn't allowed what the first was, and the policy then
+  shows the first by its ID.
 
 ```sh
 aws s3api put-bucket-policy --bucket my-bucket --policy '{"Version": "2012-10-17", "Statement": [

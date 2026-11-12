@@ -70,8 +70,9 @@ impl Context {
 pub enum Principal<'a> {
     /// An unsigned request.
     Anonymous,
-    /// A user of `account` (its 12-digit ID).
-    User { account: &'a str, name: &'a str },
+    /// A user of `account` (its 12-digit ID), by its name and its ID
+    /// (which a bucket policy names it by: see `Policy::with_ids`).
+    User { account: &'a str, name: &'a str, id: &'a str },
 }
 
 /// One check of a request: whether `principal` may do `action` (`s3:...`) to
@@ -148,6 +149,9 @@ pub struct Policy {
     statements: Vec<Statement>,
     /// The policy as S3 keeps it, and gives it back (see `normalized`).
     normalized: String,
+    /// The IDs of the users a bucket policy names, by their ARNs, as they
+    /// were when it was set (see `with_ids`).
+    ids: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -179,12 +183,16 @@ struct Principals {
 }
 
 impl Principals {
-    /// Whether the statement is about `principal`.
-    fn about(&self, principal: Principal, allow: bool) -> bool {
+    /// Whether the statement is about `principal`. A user it names is the
+    /// one that had the name when the policy was set (`ids`), as in S3: not
+    /// one made with the name later.
+    fn about(&self, principal: Principal, allow: bool, ids: &HashMap<String, String>) -> bool {
         match principal {
             Principal::Anonymous => self.everyone != self.not,
-            Principal::User { account, name } => {
-                let user = self.users.iter().any(|(a, n)| a == account && n == name);
+            Principal::User { account, name, id } => {
+                let user = self.users.iter().any(|(a, n)| {
+                    a == account && n == name && ids.get(&user_arn(a, n)).is_some_and(|named| named == id)
+                });
                 let whole = self.accounts.iter().any(|a| a == account);
                 if self.not {
                     // NotPrincipal leaves out the users it names (as S3 does,
@@ -208,9 +216,9 @@ impl Matches {
 }
 
 impl Statement {
-    fn applies(&self, request: &Request, variables: bool) -> bool {
+    fn applies(&self, request: &Request, variables: bool, ids: &HashMap<String, String>) -> bool {
         if let Some(principals) = &self.principals
-            && !principals.about(request.principal, self.allow)
+            && !principals.about(request.principal, self.allow, ids)
         {
             return false;
         }
@@ -226,7 +234,7 @@ impl Statement {
 impl Policy {
     /// What the policy says about `request`.
     pub fn evaluate(&self, request: &Request) -> Decision {
-        let applying = self.statements.iter().filter(|s| s.applies(request, self.variables));
+        let applying = self.statements.iter().filter(|s| s.applies(request, self.variables, &self.ids));
         let mut decision = Decision::NotApplicable;
         for statement in applying {
             if !statement.allow {
@@ -235,6 +243,25 @@ impl Policy {
             decision = Decision::Allow;
         }
         decision
+    }
+
+    /// The policy, naming by `ids` (ARN → ID) the users it names: as they
+    /// were when it was set (`buckets.policy_principals`). A user it names
+    /// that isn't in `ids` is none.
+    pub fn with_ids(mut self, ids: HashMap<String, String>) -> Policy {
+        self.ids = ids;
+        self
+    }
+
+    /// The policy as GetBucketPolicy shows it: as `normalized`, but each
+    /// user that `gone` gives an ID for (by its ARN) named by that ID, as S3
+    /// shows a user that was deleted.
+    pub fn shown(&self, kind: Kind, gone: &HashMap<String, String>) -> String {
+        if gone.is_empty() {
+            return self.normalized.clone();
+        }
+        let rename = |arn: &str| gone.get(arn).cloned();
+        Policy::parse_as(&self.normalized, kind, &rename).map_or_else(|_| self.normalized.clone(), |p| p.normalized)
     }
 
     /// The users it names as principals, (account, name): they must exist.
@@ -292,6 +319,12 @@ impl Policy {
     /// (probed). What S3 would take but Cairn can't decide (see `Support`)
     /// is refused once the policy is otherwise valid.
     pub fn parse(text: &str, kind: Kind) -> Result<Policy, Invalid> {
+        Policy::parse_as(text, kind, &|_| None)
+    }
+
+    /// `parse`, with each user principal that `rename` gives a name for (by
+    /// its ARN) written as that in the normalized policy.
+    fn parse_as(text: &str, kind: Kind, rename: &dyn Fn(&str) -> Option<String>) -> Result<Policy, Invalid> {
         let first_byte = || Invalid::malformed("Policies must be valid JSON and the first byte must be '{'");
         if !text.trim_start().starts_with('{') {
             return Err(first_byte());
@@ -347,7 +380,7 @@ impl Policy {
                 }
                 sids.push(sid.clone());
             }
-            let (statement, text) = Statement::parse(fields, kind, &mut unsupported)?;
+            let (statement, text) = Statement::parse(fields, kind, &mut unsupported, rename)?;
             parsed.push(statement);
             normalized.push(text);
         }
@@ -367,7 +400,7 @@ impl Policy {
         if let Some(key) = unsupported {
             return Err(Invalid::unsupported(format!("Cairn doesn't evaluate the condition key {key} yet")));
         }
-        Ok(Policy { variables: version == "2012-10-17", statements: parsed, normalized: out })
+        Ok(Policy { variables: version == "2012-10-17", statements: parsed, normalized: out, ids: HashMap::new() })
     }
 }
 
@@ -439,6 +472,7 @@ impl Statement {
         fields: &[(String, Json)],
         kind: Kind,
         unsupported: &mut Option<String>,
+        rename: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(Statement, String), Invalid> {
         let field = |name: &str| fields.iter().find(|(n, _)| n == name).map(|(_, v)| v);
         const FIELDS: &[&str] =
@@ -479,7 +513,7 @@ impl Statement {
                 if not && allow {
                     return Err(Invalid::malformed("Allow with NotPrincipal is not allowed."));
                 }
-                let (principals, text) = parse_principals(not, value)?;
+                let (principals, text) = parse_principals(not, value, rename)?;
                 out.push(format!("\"{}Principal\":{text}", if not { "Not" } else { "" }));
                 Some(principals)
             }
@@ -597,13 +631,22 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
 }
 
 /// Whether `id` is an account's: 12 digits.
+/// A user's ARN.
+pub fn user_arn(account: &str, name: &str) -> String {
+    format!("arn:aws:iam::{account}:user/{name}")
+}
+
 fn is_account(id: &str) -> bool {
     id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A bucket policy statement's `Principal` (or, `not`, `NotPrincipal`), and
 /// its normalized text.
-fn parse_principals(not: bool, value: &Json) -> Result<(Principals, String), Invalid> {
+fn parse_principals(
+    not: bool,
+    value: &Json,
+    rename: &dyn Fn(&str) -> Option<String>,
+) -> Result<(Principals, String), Invalid> {
     let invalid = || Invalid::malformed("Invalid principal in policy");
     let mut principals = Principals { not, everyone: false, users: Vec::new(), accounts: Vec::new() };
     let entries = match value {
@@ -641,6 +684,9 @@ fn parse_principals(not: bool, value: &Json) -> Result<(Principals, String), Inv
                         // a user there isn't).
                         Some(user) if !user.is_empty() && !user.contains(['*', '?']) => {
                             principals.users.push((account.to_owned(), user.to_owned()));
+                            if let Some(name) = rename(id) {
+                                *id = name;
+                            }
                         }
                         // Roles and the rest: Cairn has none.
                         _ => return Err(invalid()),
