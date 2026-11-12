@@ -64,7 +64,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=111
+TOTAL=112
 STEP=0
 PASS=0
 FAIL=0
@@ -1301,12 +1301,15 @@ tagging_roles_ok() {
 
 # Bucket sub-resource stubs: location/versioning/accelerate/request payment/
 # logging/notification succeed (200, empty or default config);
-# policy/website/replication are "not configured" (the client errors on 404),
-# and so are CORS, tags and lifecycle, until they're set.
+# website/replication are "not configured" (the client errors on 404),
+# and so are CORS, tags and lifecycle, until they're set. The policy holds
+# the bucket's grants (see `grants`), and nothing else.
 subresource_stubs_ok() {
     awss3 s3api get-bucket-location --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     awss3 s3api get-bucket-versioning --bucket "$BUCKET" >/dev/null 2>&1 || return 1
-    ! awss3 s3api get-bucket-policy --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-policy --bucket "$BUCKET" --query Policy --output text 2>/dev/null \
+        | python3 -c 'import json,sys; print(all(s["Sid"].startswith("CairnGrant") for s in json.load(sys.stdin)["Statement"]))')" \
+        = True ] || return 1
     ! awss3 s3api get-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
@@ -2213,7 +2216,9 @@ bucket_policy_ok() {
         awss3 s3api put-object --bucket "$b" --key "$key" --body "$WORK_DIR/pub.txt" >/dev/null 2>&1 || return 1
     done
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/a.txt")" = 403 ] || return 1
-    ! awss3 s3api get-bucket-policy --bucket "$b" >/dev/null 2>&1 || return 1
+    # The grants are the bucket's policy, so far.
+    awss3 s3api get-bucket-policy --bucket "$b" --query Policy --output text 2>/dev/null \
+        | grep -q '"Sid":"CairnGrantWrite"' || return 1
     printf '%s' '{"Version":"2012-10-17","Statement":[
  {"Sid":"PublicRead","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/pub/*"},
  {"Sid":"Drop","Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::'"$b"'/drop/*"},
@@ -2328,6 +2333,37 @@ admin_scope_ok() {
     "${a[@]}" s3api list-objects-v2 --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     "${a[@]}" s3api delete-object --bucket "$b" --key x.txt >/dev/null 2>&1 || return 1
     "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
+# The IAM API, on the same endpoint (requests signed for `iam`), as the AWS
+# CLI calls it: an admin makes a user, its access key and an inline policy,
+# which the new key then signs S3 requests under; reader may do none of it;
+# a user with something attached can't be deleted until it's gone, as in IAM.
+iam_api_ok() {
+    local u="iam-$(date +%s)" b="iamb-$(date +%s)" doc="$WORK_DIR/iam-policy.json" key id secret out
+    awss3 iam create-user --user-name "$u" >/dev/null 2>&1 || return 1
+    key=$(awss3 iam create-access-key --user-name "$u" \
+        --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>/dev/null) || return 1
+    id=$(echo "$key" | cut -f1); secret=$(echo "$key" | cut -f2)
+    [ "$(as_role "$id" "$secret" sts get-caller-identity --query Arn --output text 2>/dev/null)" \
+        = "$(awss3 iam get-user --user-name "$u" --query User.Arn --output text 2>/dev/null)" ] || return 1
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    ! as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::'"$b"'"}]}' \
+        > "$doc"
+    awss3 iam put-user-policy --user-name "$u" --policy-name list --policy-document "file://$doc" >/dev/null 2>&1 || return 1
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    awss3 iam get-user-policy --user-name "$u" --policy-name list --query PolicyDocument.Statement[0].Action \
+        --output text 2>/dev/null | grep -qx s3:ListBucket || return 1
+    out=$(as_role reader readersecret iam list-users 2>&1) && return 1
+    echo "$out" | grep -q 'not authorized to perform: iam:ListUsers' || return 1
+    out=$(awss3 iam delete-user --user-name "$u" 2>&1) && return 1
+    echo "$out" | grep -q DeleteConflict || return 1
+    awss3 iam delete-access-key --user-name "$u" --access-key-id "$id" >/dev/null 2>&1 || return 1
+    awss3 iam delete-user-policy --user-name "$u" --policy-name list >/dev/null 2>&1 || return 1
+    awss3 iam delete-user --user-name "$u" >/dev/null 2>&1 || return 1
+    ! awss3 iam get-user --user-name "$u" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
 # writer holds read/write on $OBUCKET only. It can use its own bucket, but can't
@@ -2507,6 +2543,7 @@ run_test    "Read-only role can read, not write"    reader_permissions_ok
 run_test    "Tags: read with read, changed with write" tagging_roles_ok
 run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
 run_test    "Admin has AdministratorAccess"          admin_scope_ok
+run_test    "IAM API: users, keys, inline policies"  iam_api_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok

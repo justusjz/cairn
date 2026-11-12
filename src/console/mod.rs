@@ -445,8 +445,14 @@ mod e2e {
 
     /// A browser signed in as a new user `name` (with a passkey of its own).
     async fn signed_in(console: &Arc<Console>, name: &str, admin: bool) -> Browser {
+        signed_in_to(console, None, name, admin).await
+    }
+
+    /// A browser signed in as a new user `name` of `account` (by name;
+    /// `None`: the first tenant account).
+    async fn signed_in_to(console: &Arc<Console>, account: Option<&str>, name: &str, admin: bool) -> Browser {
         let client = console.app.pool.get().await.unwrap();
-        roles::create(&client, name, None, admin).await.unwrap();
+        roles::create_in(&client, account, name, None, admin).await.unwrap();
         let token = store::create_enrollment(&client, name).await.unwrap();
         let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let (_, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
@@ -780,6 +786,51 @@ mod e2e {
         assert_eq!(ops.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
         let path = format!("/api/buckets/{bucket}/object?key=secret.txt");
         assert_eq!(ops.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
+    }
+
+    /// Cross-account access, as in AWS: a bucket's policy may name another
+    /// account's users (or the account), who then may do what both that
+    /// policy and their own policies allow, and nothing that only one does.
+    #[tokio::test]
+    async fn another_accounts_users_need_both_sides_to_allow() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = Arc::new(Console { app: app.clone(), party: party() });
+        let client = app.pool.get().await.unwrap();
+        let bucket = crate::e2e::BUCKET;
+        crate::e2e::put(&app, "shared.txt", b"shared".to_vec()).await;
+        let acme = crate::accounts::create(&client, "acme").await.unwrap();
+        let mut eve = signed_in_to(&console, Some("acme"), "eve", false).await;
+        let mut owner = signed_in(&console, "owner", true).await;
+        let path = format!("/api/buckets/{bucket}/object?key=shared.txt");
+
+        // The bucket's policy names eve; her own policies don't allow it.
+        let policy = format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{acme}:user/eve"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
+        );
+        let (status, err) = owner.send("PUT", &format!("/api/buckets/{bucket}/policy"), Some(json!({ "document": policy }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
+        // Her own policy allows it, as well: now she may.
+        let own = format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#);
+        roles::put_policy(&client, "eve", "read-shared", &own).await.unwrap();
+        assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::OK);
+        // But only what both allow: not listing it.
+        assert_eq!(eve.send("GET", &format!("/api/buckets/{bucket}/objects"), None).await.0, StatusCode::FORBIDDEN);
+        // Naming the account leaves it to the account's own policies, too.
+        let policy = format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{acme}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
+        );
+        let (status, err) = owner.send("PUT", &format!("/api/buckets/{bucket}/policy"), Some(json!({ "document": policy }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::OK);
+        roles::delete_policy(&client, "eve", "read-shared").await.unwrap();
+        assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
+        // An account that doesn't exist is no principal.
+        let policy = format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"999999999999"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
+        );
+        let (status, err) = owner.send("PUT", &format!("/api/buckets/{bucket}/policy"), Some(json!({ "document": policy }))).await;
+        assert_eq!((status, err["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Invalid principal in policy")));
     }
 
     /// Only the console's own page may sign in: other origins, and requests

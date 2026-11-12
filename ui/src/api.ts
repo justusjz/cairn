@@ -56,9 +56,21 @@ export function useConsoleApi() {
 }
 
 /** Whether the pages are the console's: then what's the operator's (the
- * cluster, its settings) isn't theirs to show. */
+ * cluster, its settings) isn't theirs to show, but to a superadmin. */
 export function isConsole(): boolean {
   return consoleMode;
+}
+
+let operatorMode = false;
+
+/** Whether the pages act for the operator: the dashboard's, or a console
+ * session's as the operator account; the console sets it as it switches. */
+export function setOperatorMode(operator: boolean) {
+  operatorMode = operator;
+}
+
+export function isOperator(): boolean {
+  return !consoleMode || operatorMode;
 }
 
 export class ApiError extends Error {

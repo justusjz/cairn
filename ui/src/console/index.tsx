@@ -5,11 +5,11 @@
 // as its user (`useConsoleApi`).
 
 import { A, Navigate, Route, Router, type RouteSectionProps, useNavigate } from "@solidjs/router";
-import { For, Show, createResource, createSignal } from "solid-js";
+import { For, Show, createEffect, createResource, createRoot, createSignal } from "solid-js";
 import { render } from "solid-js/web";
 import { Badge, Loading, Panel, Table, Toasts, act, toast } from "../components/ui";
 import { ago, date } from "../format";
-import { useConsoleApi } from "../api";
+import { setOperatorMode, useConsoleApi } from "../api";
 import Accounts from "../pages/Accounts";
 import { BucketBrowser, BucketList, ObjectPage } from "../pages/Buckets";
 import Integrity from "../pages/Integrity";
@@ -33,6 +33,9 @@ const [me, { refetch: refreshMe, mutate: setMe }] = createResource<Me | null>(as
     throw e;
   }
 });
+
+// The shared pages show the operator's parts (the KMS) to a superadmin.
+createRoot(() => createEffect(() => setOperatorMode(me()?.identity.operator ?? false)));
 
 function Brand() {
   return (

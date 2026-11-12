@@ -149,6 +149,10 @@ async fn handle_request(
     // only buckets' policies can allow it. The peer endpoint is a separate
     // service and stays open for internal traffic.
     let signed = crate::auth::signed(req.headers(), req.uri().query().unwrap_or(""));
+    // IAM's and STS's (signed for their service), on the same port.
+    if let Some(signed) = signed.as_ref().filter(|s| crate::iam::wants(s)) {
+        return Ok(box_response(crate::iam::handle(&app, req, signed.clone(), peer).await));
+    }
     let principal = match &signed {
         Some(signed) => {
             let Some(principal) = Principal::load(&app.pool.get().await?, &signed.access_key).await? else {

@@ -363,6 +363,26 @@ Manage users with `cairn user --database <URL> <command>`:
 | `list` | List users, their ARNs, admin flags, keys, grants and policies (secrets are not shown). |
 | `enroll <name> [--console-url <URL>]` | Print a one-time link (24 hours) for the user to sign in to the [console](#console): a new login with a passkey, or (opened signed in) added to the login. A new link replaces the last. |
 
+**The IAM API** is on the S3 endpoint too: requests signed for the `iam`
+service (SigV4's credential scope) are IAM's, whatever their path, so the AWS
+CLI, SDKs and Terraform manage users with Cairn as their IAM endpoint (the
+same URL as for S3: `aws iam --endpoint-url ...`, or Terraform's
+`endpoints { iam = ... }`). Each request acts as its signer, in its account,
+checked as IAM's actions on the user's ARN (`iam:CreateUser`,
+`iam:CreateAccessKey`, `iam:PutUserPolicy`, ...): an admin may do all of it,
+another user what its policies allow (its own keys, with a policy on
+`arn:aws:iam::*:user/${aws:username}`, say). There are users (CreateUser,
+GetUser, ListUsers, DeleteUser, which refuses while keys or policies are
+left, as IAM does), access keys (Create, List, Update, Delete), inline
+policies (Put, Get, List, Delete), and the one managed policy,
+`arn:aws:iam::aws:policy/AdministratorAccess` (Attach, Detach,
+ListAttached: the admin flag). Groups, roles, managed policies of one's own,
+paths, tags and permissions boundaries are NotImplemented. STS's
+`GetCallerIdentity` answers too (signed for `sts`), which Terraform's AWS
+provider calls as it starts. The AWS CLI refuses access key IDs shorter than
+16 characters as parameters (`--access-key-id`): the keys IAM makes are 20,
+but a user's first key is named as the user.
+
 A bucket policy can deny everyone everything, its admins too, as in S3. The
 superadmin, with access to the database, can always remove it, as an AWS
 account's root user can: `cairn bucket-policy --database <URL> delete

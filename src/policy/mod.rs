@@ -138,7 +138,7 @@ pub fn verdict_across<'p>(
             Decision::NotApplicable => {}
         }
     }
-    let bucket_allows = match bucket.map(|policy| policy.evaluate(request)) {
+    let bucket_allows = match bucket.map(|policy| policy.evaluate_across(request, cross)) {
         Some(Decision::Deny) => return Verdict::ExplicitDeny { identity: false },
         Some(Decision::Allow) => true,
         _ => false,
@@ -225,7 +225,7 @@ impl Principals {
     /// Whether the statement is about `principal`. A user it names is the
     /// one that had the name when the policy was set (`ids`), as in S3: not
     /// one made with the name later.
-    fn about(&self, principal: Principal, allow: bool, ids: &HashMap<String, String>) -> bool {
+    fn about(&self, principal: Principal, allow: bool, ids: &HashMap<String, String>, cross: bool) -> bool {
         match principal {
             Principal::Anonymous => self.everyone != self.not,
             // The account itself: named by the account (its ID or root ARN).
@@ -245,8 +245,10 @@ impl Principals {
                 } else {
                     // An account allows nothing by itself: it leaves it to the
                     // account's identity policies. It does deny all of the
-                    // account's users (probed).
-                    self.everyone || user || (whole && !allow)
+                    // account's users (probed). For a request from another
+                    // account than the bucket's (`cross`), naming the account
+                    // is the bucket's side of what both sides must allow.
+                    self.everyone || user || (whole && (!allow || cross))
                 }
             }
         }
@@ -260,9 +262,9 @@ impl Matches {
 }
 
 impl Statement {
-    fn applies(&self, request: &Request, variables: bool, ids: &HashMap<String, String>) -> bool {
+    fn applies(&self, request: &Request, variables: bool, ids: &HashMap<String, String>, cross: bool) -> bool {
         if let Some(principals) = &self.principals
-            && !principals.about(request.principal, self.allow, ids)
+            && !principals.about(request.principal, self.allow, ids, cross)
         {
             return false;
         }
@@ -278,7 +280,13 @@ impl Statement {
 impl Policy {
     /// What the policy says about `request`.
     pub fn evaluate(&self, request: &Request) -> Decision {
-        let applying = self.statements.iter().filter(|s| s.applies(request, self.variables, &self.ids));
+        self.evaluate_across(request, false)
+    }
+
+    /// As `evaluate`, for a request from another account than the
+    /// resource's (`cross`), when it's so.
+    pub fn evaluate_across(&self, request: &Request, cross: bool) -> Decision {
+        let applying = self.statements.iter().filter(|s| s.applies(request, self.variables, &self.ids, cross));
         let mut decision = Decision::NotApplicable;
         for statement in applying {
             if !statement.allow {

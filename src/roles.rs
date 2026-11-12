@@ -453,6 +453,28 @@ pub async fn create_in(
     create_for(client, &account_id, name, secret, admin).await
 }
 
+/// Creates a user of the account `account_id` without access keys, as
+/// IAM's CreateUser does: it gets them with `create_key`. (`roles.secret`,
+/// which older Cairns read, is none that can be guessed.)
+pub async fn create_without_key(client: &Object, account_id: &str, name: &str) -> anyhow::Result<()> {
+    validate_name(name)?;
+    if key_exists(client, name).await? {
+        return Err(invalid(format!("an access key named {name:?} already exists")));
+    }
+    let inserted = client
+        .execute_cached(
+            "INSERT INTO roles (name, secret, admin, account_id)
+             VALUES ($1, 'unusable:' || gen_random_uuid() || gen_random_uuid(), false, $2)
+             ON CONFLICT DO NOTHING",
+            &[&name, &account_id],
+        )
+        .await?;
+    if inserted == 0 {
+        return Err(invalid(format!("a user named {name:?} already exists")));
+    }
+    Ok(())
+}
+
 /// Creates a user of the account `account_id`, as `create`.
 pub async fn create_for(
     client: &Object,

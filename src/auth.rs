@@ -255,8 +255,11 @@ fn presigned(query: &str) -> bool {
 
 /// What a signed request says about its signature, as policies' condition
 /// keys see it (see `s3::access`).
+#[derive(Clone, Debug)]
 pub struct Signed {
     pub access_key: String,
+    /// The service it's signed for (`s3`; `iam`, `sts`).
+    pub service: String,
     /// The credential's region.
     pub region: String,
     /// Signed in its query (a presigned URL), rather than its headers.
@@ -277,7 +280,13 @@ pub fn signed(headers: &HeaderMap, query: &str) -> Option<Signed> {
         false => headers.get("x-amz-date").and_then(|v| v.to_str().ok()).map(str::to_owned),
         true => query_value(query, "X-Amz-Date"),
     };
-    Some(Signed { access_key: authorization.access_key, region: authorization.region, presigned, date })
+    Some(Signed {
+        access_key: authorization.access_key,
+        service: authorization.service,
+        region: authorization.region,
+        presigned,
+        date,
+    })
 }
 
 fn sha256_hex(data: &[u8]) -> String {
@@ -442,7 +451,23 @@ pub fn verify_sigv4(
         .duration_since(UNIX_EPOCH)
         .expect("clock after 1970")
         .as_secs() as i64;
-    verify_sigv4_at(method, path, query, headers, secret, now)
+    verify_sigv4_at(method, path, query, headers, secret, now, None)
+}
+
+/// As `verify_sigv4`, for a request of another service than S3 (IAM, STS),
+/// whose signature covers its `body` by its SHA-256, which the client needn't
+/// send in `x-amz-content-sha256` (if it does, it must be the body's).
+pub fn verify_sigv4_with_body(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &HeaderMap,
+    secret: &str,
+    body: &[u8],
+) -> Result<(), Rejection> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs() as i64;
+    let hash = sha256_hex(body);
+    verify_sigv4_at(method, path, query, headers, secret, now, Some(&hash))
 }
 
 /// The longest a presigned URL may be valid: a week, as in S3.
@@ -456,6 +481,7 @@ fn verify_sigv4_at(
     headers: &HeaderMap,
     secret: &str,
     now: i64,
+    body_hash: Option<&str>,
 ) -> Result<(), Rejection> {
     if !headers.contains_key("authorization") {
         return verify_presigned_at(method, path, query, headers, secret, now);
@@ -476,6 +502,16 @@ fn verify_sigv4_at(
         .and_then(|v| v.to_str().ok())
         .ok_or_else(|| access_denied("the request has no valid x-amz-date header"))?;
     let payload_hash = match headers.get("x-amz-content-sha256").map(|v| v.to_str()) {
+        // The body's, as the service signs it.
+        Some(Ok(value)) if body_hash.is_some_and(|hash| hash == value) => value,
+        Some(_) if body_hash.is_some() => {
+            return Err(Rejection::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "x-amz-content-sha256 isn't the body's SHA-256",
+            ));
+        }
+        None if body_hash.is_some() => body_hash.unwrap(),
         None => {
             return Err(Rejection::new(
                 StatusCode::BAD_REQUEST,
@@ -627,7 +663,13 @@ impl PostSignature {
     /// condition keys (`s3:authType` `POST`, `s3:signatureversion`,
     /// `aws:RequestedRegion`), which a policy may deny forms by.
     pub fn signed(&self) -> Signed {
-        Signed { access_key: self.access_key.clone(), region: self.region.clone(), presigned: false, date: None }
+        Signed {
+            access_key: self.access_key.clone(),
+            service: "s3".to_owned(),
+            region: self.region.clone(),
+            presigned: false,
+            date: None,
+        }
     }
 
     /// The signature a form's fields (`field` by lowercase name) carry, or
@@ -784,7 +826,7 @@ pub(crate) mod tests {
     }
 
     fn verify(headers: &HeaderMap) -> Result<(), Rejection> {
-        verify_sigv4_at("PUT", "/b/k", "", headers, SECRET, parse_amz_date(DATE).unwrap())
+        verify_sigv4_at("PUT", "/b/k", "", headers, SECRET, parse_amz_date(DATE).unwrap(), None)
     }
 
     const BASE: [(&str, &str); 3] = [
@@ -859,7 +901,7 @@ pub(crate) mod tests {
     const AWS_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 
     fn verify_aws_presigned(query: &str, headers: &HeaderMap, now: i64) -> Result<(), Rejection> {
-        verify_sigv4_at("GET", "/test.txt", query, headers, AWS_SECRET, now)
+        verify_sigv4_at("GET", "/test.txt", query, headers, AWS_SECRET, now, None)
     }
 
     fn aws_host() -> HeaderMap {
@@ -914,6 +956,7 @@ pub(crate) mod tests {
             &aws_host(),
             AWS_SECRET,
             signed_at,
+            None,
         );
         assert_eq!(other_path.unwrap_err().code, "SignatureDoesNotMatch");
         // An x-amz-* header it doesn't cover.
@@ -944,6 +987,7 @@ pub(crate) mod tests {
             &both,
             SECRET,
             parse_amz_date(DATE).unwrap(),
+            None,
         )
         .unwrap_err();
         assert_eq!(

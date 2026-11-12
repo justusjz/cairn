@@ -46,12 +46,6 @@ pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<
             return Ok(Err(Refused { status, code: invalid.code, message: invalid.message }));
         }
     };
-    // The bucket's own account: its users are the ones a policy may name
-    // (until there are cross-account principals).
-    let account: String = match client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await? {
-        Some(row) => row.get(0),
-        None => crate::roles::account(client).await?,
-    };
     let invalid_principal = || {
         Ok(Err(Refused {
             status: StatusCode::BAD_REQUEST,
@@ -59,16 +53,20 @@ pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<
             message: "Invalid principal in policy".to_owned(),
         }))
     };
-    // The bucket's account, and its users.
-    if policy.accounts().any(|a| a != account) {
-        return invalid_principal();
+    // Any account's users and accounts, as in S3, if they exist: another
+    // account's, for cross-account access (which that account's own
+    // policies must allow too; see `policy::verdict_across`).
+    for account in policy.accounts() {
+        if client.query_opt_cached("SELECT 1 FROM accounts WHERE id = $1", &[&account]).await?.is_none() {
+            return invalid_principal();
+        }
     }
-    for (user_account, user) in policy.users() {
+    for (account, user) in policy.users() {
         let exists = client
             .query_opt_cached("SELECT 1 FROM roles WHERE name = $1 AND account_id = $2", &[&user, &account])
             .await?
             .is_some();
-        if user_account != account || !exists {
+        if !exists {
             return invalid_principal();
         }
     }

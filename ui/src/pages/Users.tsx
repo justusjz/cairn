@@ -1,5 +1,5 @@
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type AccessKey, type Bucket, type Cluster, type Permission, type User, api, isConsole } from "../api";
+import { type AccessKey, type Bucket, type Cluster, type Permission, type User, api, isConsole, isOperator } from "../api";
 import { Badge, Loading, Panel, SecretDialog, Table, act, poll, toast } from "../components/ui";
 import { ago, date, pretty } from "../format";
 
@@ -26,7 +26,7 @@ export default function Users() {
   // Every few seconds: a new user's identity in the KMS comes a moment later.
   const data = poll(() => Promise.all([api.roles(), api.buckets()]), 5000);
   // The KMS is the cluster's: the operator's to set up, not a tenant's.
-  const cluster = isConsole() ? undefined : poll(() => api.cluster(), 10000);
+  const cluster = isOperator() ? poll(() => api.cluster(), 10000) : undefined;
   const kms = () => cluster?.data()?.nodes.some((n) => n.stats?.kms) ?? false;
   const [secret, setSecret] = createSignal<NewSecret>();
   const [editing, setEditing] = createSignal<{ user: string; policy?: string }>();

@@ -41,6 +41,7 @@ mod e2e;
 mod encryption;
 mod gc;
 mod grants;
+mod iam;
 mod kms;
 mod lifecycle;
 mod metrics;
