@@ -393,8 +393,10 @@ cluster:
   an SSE-C object's key, and the KMS opens an SSE-KMS one only for a role).
   Buckets can be created and (when empty) deleted, and their
   [lifecycle rules](#lifecycle-rules) edited.
-- **Roles:** everything `cairn role` does: create and delete roles, grant and
-  revoke permissions, rotate secrets, and toggle admin. Each role's ID and
+- **Users:** everything `cairn user` does: create and delete users, grant and
+  revoke permissions, toggle admin, make, deactivate and delete access keys
+  (replacing the secret of the one named as the user in place), and write
+  inline policies, which the server checks as IAM does. Each user's ID and
   its identity in the KMS are shown, for granting it [KMS keys](#sse-kms).
 
 To keep other websites from reaching it through DNS rebinding, the dashboard
@@ -716,7 +718,7 @@ deleting a key makes its objects unreadable for good (crypto-shredding).
   naming the role by its ID, which is never reused. Cairn logs in once for
   each new role (when the dashboard creates it, or within a minute), so that
   OpenBao makes its entity right away. `cairn role list` and the dashboard
-  show each role's ID and entity; the dashboard's Roles page also shows
+  show each role's ID and entity; the dashboard's Users page also shows
   Cairn's public key, whether each node reaches OpenBao, and how its logins
   went, with what's wrong in OpenBao's setup if they fail. A deleted role's
   entity stays in OpenBao,
@@ -808,7 +810,7 @@ roles.
 
 - Cairn logs in to OpenBao through its JWT mount as itself, with the subject
   `cairn` (roles' are their IDs), and its entity must be allowed
-  `datakey/plaintext` and `decrypt` on the key. The dashboard's Roles page
+  `datakey/plaintext` and `decrypt` on the key. The dashboard's Users page
   shows that entity.
 - As S3's bucket keys do, a node uses one data key from OpenBao for an hour of
   writes, and keeps the data keys it opened for an hour after their last use.

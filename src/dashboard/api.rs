@@ -78,6 +78,9 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_admin))
         .routes(routes!(identify_roles))
         .routes(routes!(grant, revoke))
+        .routes(routes!(create_key))
+        .routes(routes!(set_key, delete_key))
+        .routes(routes!(get_policy, put_policy, delete_policy))
         .routes(routes!(get_lifecycle))
         .routes(routes!(get_bucket_lifecycle, put_bucket_lifecycle, delete_bucket_lifecycle))
         .routes(routes!(set_lifecycle_rate))
@@ -1595,6 +1598,108 @@ async fn revoke(
     Ok(StatusCode::NO_CONTENT)
 }
 
+// ─── Access keys ─────────────────────────────────────────────────────────────
+
+/// A new access key, whose secret is shown only this once.
+#[derive(Serialize, ToSchema)]
+struct NewKey {
+    id: String,
+    secret: String,
+}
+
+/// Makes a new access key for a role, with a random ID and secret; a role
+/// has at most two.
+#[utoipa::path(post, path = "/roles/{role}/keys", params(("role" = String, Path)), responses(
+    (status = 201, body = NewKey),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_key(State(app): AppState, Path(role): Path<String>) -> Result<(StatusCode, Json<NewKey>)> {
+    let (id, secret) = roles::create_key(&app.pool.get().await?, &role, None, None).await?;
+    Ok((StatusCode::CREATED, Json(NewKey { id, secret })))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct KeyState {
+    active: bool,
+}
+
+/// Lets one of the role's access keys sign requests, or stops it.
+#[utoipa::path(put, path = "/roles/{role}/keys/{key}", params(("role" = String, Path), ("key" = String, Path)),
+    request_body = KeyState, responses(
+        (status = 204, description = "Changed"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn set_key(
+    State(app): AppState,
+    Path((role, key)): Path<(String, String)>,
+    Json(body): Json<KeyState>,
+) -> Result<StatusCode> {
+    roles::set_key_active(&app.pool.get().await?, Some(&role), &key, body.active).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes one of the role's access keys.
+#[utoipa::path(delete, path = "/roles/{role}/keys/{key}", params(("role" = String, Path), ("key" = String, Path)),
+    responses(
+        (status = 204, description = "Deleted"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn delete_key(State(app): AppState, Path((role, key)): Path<(String, String)>) -> Result<StatusCode> {
+    roles::delete_key(&app.pool.get().await?, Some(&role), &key).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Inline policies ─────────────────────────────────────────────────────────
+
+/// An inline policy: a JSON document in IAM's policy language.
+#[derive(Serialize, Deserialize, ToSchema)]
+struct PolicyDocument {
+    document: String,
+}
+
+/// One of the role's inline policies, as it was set.
+#[utoipa::path(get, path = "/roles/{role}/policies/{policy}",
+    params(("role" = String, Path), ("policy" = String, Path)), responses(
+        (status = 200, body = PolicyDocument),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn get_policy(State(app): AppState, Path((role, policy)): Path<(String, String)>) -> Result<Json<PolicyDocument>> {
+    let document = roles::get_policy(&app.pool.get().await?, &role, &policy).await?;
+    Ok(Json(PolicyDocument { document }))
+}
+
+/// Sets one of the role's inline policies, if it's a valid identity policy.
+#[utoipa::path(put, path = "/roles/{role}/policies/{policy}",
+    params(("role" = String, Path), ("policy" = String, Path)), request_body = PolicyDocument, responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn put_policy(
+    State(app): AppState,
+    Path((role, policy)): Path<(String, String)>,
+    Json(body): Json<PolicyDocument>,
+) -> Result<StatusCode> {
+    roles::put_policy(&app.pool.get().await?, &role, &policy, &body.document).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes one of the role's inline policies.
+#[utoipa::path(delete, path = "/roles/{role}/policies/{policy}",
+    params(("role" = String, Path), ("policy" = String, Path)), responses(
+        (status = 204, description = "Deleted"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn delete_policy(State(app): AppState, Path((role, policy)): Path<(String, String)>) -> Result<StatusCode> {
+    roles::delete_policy(&app.pool.get().await?, &role, &policy).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[cfg(test)]
 mod e2e {
     use axum::http::Request;
@@ -2031,6 +2136,38 @@ mod e2e {
                 { "bucket": BUCKET, "permission": "read" },
             ])
         );
+        // Its access keys and inline policies.
+        let (status, _, body) = send(&app, request("POST", &format!("{api}/roles/ui-role/keys"), None)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        let key: Value = serde_json::from_slice(&body).unwrap();
+        let key = key["id"].as_str().unwrap().to_owned();
+        let uri = format!("{api}/roles/ui-role/keys/{key}");
+        let inactive = json!({ "active": false });
+        assert_eq!(send(&app, request("PUT", &uri, Some(inactive))).await.0, StatusCode::NO_CONTENT);
+        let (_, _, body) = send(&app, request("GET", &format!("{api}/roles"), None)).await;
+        let roles: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(roles[0]["keys"][1]["id"], key.as_str());
+        assert_eq!(roles[0]["keys"][1]["active"], false);
+        // Only its own keys.
+        let uri_other = format!("{api}/roles/ui-role/keys/nobody");
+        assert_eq!(send(&app, request("DELETE", &uri_other, None)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(send(&app, request("DELETE", &uri, None)).await.0, StatusCode::NO_CONTENT);
+        let uri = format!("{api}/roles/ui-role/policies/nolist");
+        let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:ListBucket","Resource":"*"}]}"#;
+        let body = json!({ "document": document });
+        assert_eq!(send(&app, request("PUT", &uri, Some(body))).await.0, StatusCode::NO_CONTENT);
+        let (status, _, body) = send(&app, request("GET", &uri, None)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["document"], document);
+        let bad = json!({ "document": r#"{"Statement":[{"Effect":"Allow"}]}"# });
+        let (status, _, body) = send(&app, request("PUT", &uri, Some(bad))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_of(&body), "MalformedPolicy: Missing required field Action");
+        let (_, _, body) = send(&app, request("GET", &format!("{api}/roles"), None)).await;
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()[0]["policies"], json!(["nolist"]));
+        assert_eq!(send(&app, request("DELETE", &uri, None)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(send(&app, request("GET", &uri, None)).await.0, StatusCode::BAD_REQUEST);
+
         let uri = format!("{api}/roles/nobody");
         let (status, _, body) = send(&app, request("DELETE", &uri, None)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);

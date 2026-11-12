@@ -20,7 +20,8 @@ export type LostObject = Schemas["LostObject"];
 export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
-export type Role = Schemas["RoleSummary"];
+export type User = Schemas["RoleSummary"];
+export type AccessKey = Schemas["AccessKey"];
 export type Permission = Schemas["Permission"];
 export type Lifecycle = Schemas["Lifecycle"];
 export type LifecycleBucket = Schemas["LifecycleBucket"];
@@ -85,6 +86,17 @@ export const api = {
     ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
   grant: (role: string, bucket: string, permissions: Permission[]) =>
     ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
+  createKey: (role: string) => ok(client.POST("/roles/{role}/keys", { params: rolePath(role) })),
+  setKeyActive: (role: string, key: string, active: boolean) =>
+    ok(client.PUT("/roles/{role}/keys/{key}", { params: { path: { role, key } }, body: { active } })),
+  deleteKey: (role: string, key: string) =>
+    ok(client.DELETE("/roles/{role}/keys/{key}", { params: { path: { role, key } } })),
+  policy: (role: string, policy: string) =>
+    ok(client.GET("/roles/{role}/policies/{policy}", { params: { path: { role, policy } } })),
+  putPolicy: (role: string, policy: string, document: string) =>
+    ok(client.PUT("/roles/{role}/policies/{policy}", { params: { path: { role, policy } }, body: { document } })),
+  deletePolicy: (role: string, policy: string) =>
+    ok(client.DELETE("/roles/{role}/policies/{policy}", { params: { path: { role, policy } } })),
   identifyRoles: () => ok(client.POST("/kms/identify")),
   lifecycle: () => ok(client.GET("/lifecycle")),
   bucketLifecycle: (bucket: string) => ok(client.GET("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),

@@ -325,3 +325,25 @@ dialog .buttons { display: flex; justify-content: flex-end; gap: 8px; margin-top
 .rule { display: grid; gap: 10px; }
 .rule .label { flex: 0 0 150px; color: var(--muted); }
 .rule label.check.label { color: var(--text); }
+
+dialog.wide { width: min(760px, calc(100vw - 32px)); }
+textarea.policy {
+  display: block;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 320px;
+  margin-top: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  resize: vertical;
+}
+.error-text { color: var(--bad); white-space: pre-wrap; }
+button.chip.policy { cursor: pointer; font-family: var(--mono); padding: 1px 8px; color: var(--text); }
+button.chip.policy:hover { border-color: var(--accent); }
+.key-line { margin-bottom: 6px; }
+.key-actions { display: flex; gap: 4px; margin-top: 2px; }

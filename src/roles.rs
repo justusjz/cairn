@@ -312,9 +312,9 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
                 println!("access key: {id}");
                 println!("secret key: {secret}");
             }
-            KeyCommand::Delete { id } => delete_key(&client, &id).await?,
-            KeyCommand::Activate { id } => set_key_active(&client, &id, true).await?,
-            KeyCommand::Deactivate { id } => set_key_active(&client, &id, false).await?,
+            KeyCommand::Delete { id } => delete_key(&client, None, &id).await?,
+            KeyCommand::Activate { id } => set_key_active(&client, None, &id, true).await?,
+            KeyCommand::Deactivate { id } => set_key_active(&client, None, &id, false).await?,
         },
         RoleCommand::Policy(command) => match command {
             PolicyCommand::Put { user, name, file } => {
@@ -497,22 +497,40 @@ pub async fn create_key(
     }
 }
 
-/// Deletes an access key.
-pub async fn delete_key(client: &Object, id: &str) -> anyhow::Result<()> {
-    let deleted = client.execute_cached("DELETE FROM access_keys WHERE access_key_id = $1", &[&id]).await?;
+/// That there's no access key `id` (of `user`, if given).
+fn no_such_key(user: Option<&str>, id: &str) -> anyhow::Error {
+    match user {
+        Some(user) => invalid(format!("{user:?} has no access key {id:?}")),
+        None => invalid(format!("no access key {id:?}")),
+    }
+}
+
+/// Deletes an access key; only `user`'s, if given.
+pub async fn delete_key(client: &Object, user: Option<&str>, id: &str) -> anyhow::Result<()> {
+    let deleted = client
+        .execute_cached(
+            "DELETE FROM access_keys k USING roles r
+             WHERE k.access_key_id = $1 AND r.id = k.role_id AND ($2::text IS NULL OR r.name = $2)",
+            &[&id, &user],
+        )
+        .await?;
     if deleted == 0 {
-        return Err(invalid(format!("no access key {id:?}")));
+        return Err(no_such_key(user, id));
     }
     Ok(())
 }
 
-/// Lets an access key sign requests, or stops it.
-pub async fn set_key_active(client: &Object, id: &str, active: bool) -> anyhow::Result<()> {
+/// Lets an access key sign requests, or stops it; only `user`'s, if given.
+pub async fn set_key_active(client: &Object, user: Option<&str>, id: &str, active: bool) -> anyhow::Result<()> {
     let updated = client
-        .execute_cached("UPDATE access_keys SET active = $2 WHERE access_key_id = $1", &[&id, &active])
+        .execute_cached(
+            "UPDATE access_keys k SET active = $3 FROM roles r
+             WHERE k.access_key_id = $1 AND r.id = k.role_id AND ($2::text IS NULL OR r.name = $2)",
+            &[&id, &user, &active],
+        )
         .await?;
     if updated == 0 {
-        return Err(invalid(format!("no access key {id:?}")));
+        return Err(no_such_key(user, id));
     }
     Ok(())
 }

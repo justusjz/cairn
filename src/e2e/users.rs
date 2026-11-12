@@ -37,13 +37,18 @@ async fn a_user_signs_with_any_of_its_active_keys() {
     assert!(third.to_string().contains("2 access keys"), "{third}");
     assert!(roles::create_key(&client, "nobody", None, None).await.unwrap_err().to_string().contains("no user"));
 
-    roles::set_key_active(&client, &id, false).await.unwrap();
+    roles::set_key_active(&client, None, &id, false).await.unwrap();
     assert!(Principal::load(&client, &id).await.unwrap().is_none());
-    roles::set_key_active(&client, &id, true).await.unwrap();
+    roles::set_key_active(&client, None, &id, true).await.unwrap();
     assert!(Principal::load(&client, &id).await.unwrap().is_some());
-    roles::delete_key(&client, &id).await.unwrap();
+    // Only the user's own, when the user is named (as the dashboard does).
+    roles::create(&client, "mallory", None, false).await.unwrap();
+    assert!(roles::set_key_active(&client, Some("mallory"), &id, false).await.is_err());
+    assert!(roles::delete_key(&client, Some("mallory"), &id).await.is_err());
+    assert!(Principal::load(&client, &id).await.unwrap().is_some());
+    roles::delete_key(&client, Some("alice"), &id).await.unwrap();
     assert!(Principal::load(&client, &id).await.unwrap().is_none());
-    assert!(roles::delete_key(&client, &id).await.is_err());
+    assert!(roles::delete_key(&client, None, &id).await.is_err());
 
     // A key's ID can't be another's, nor a new user's name.
     roles::create_key(&client, "alice", Some("shared".to_owned()), None).await.unwrap();
@@ -72,11 +77,11 @@ async fn older_cairns_see_the_first_keys_secret_and_cant_change_users() {
     roles::update(&client, "bob", None, Some(rotated.clone())).await.unwrap();
     assert_eq!(legacy_secret(&app, "bob").await, rotated);
     assert_eq!(Principal::load(&client, "bob").await.unwrap().unwrap().secret, rotated);
-    roles::set_key_active(&client, "bob", false).await.unwrap();
+    roles::set_key_active(&client, None, "bob", false).await.unwrap();
     assert!(legacy_secret(&app, "bob").await.starts_with("unusable:"));
-    roles::set_key_active(&client, "bob", true).await.unwrap();
+    roles::set_key_active(&client, None, "bob", true).await.unwrap();
     assert_eq!(legacy_secret(&app, "bob").await, rotated);
-    roles::delete_key(&client, "bob").await.unwrap();
+    roles::delete_key(&client, None, "bob").await.unwrap();
     assert!(legacy_secret(&app, "bob").await.starts_with("unusable:"));
     // Without its first key, the user's other keys are rotated as keys.
     let err = roles::update(&client, "bob", None, Some(rotated)).await.unwrap_err();

@@ -1,4 +1,4 @@
-import { A, Route, Router, type RouteSectionProps } from "@solidjs/router";
+import { A, Navigate, Route, Router, type RouteSectionProps } from "@solidjs/router";
 import { render } from "solid-js/web";
 import { Show } from "solid-js";
 import { api } from "./api";
@@ -8,7 +8,7 @@ import Integrity from "./pages/Integrity";
 import Jobs from "./pages/Jobs";
 import Lifecycle from "./pages/Lifecycle";
 import Overview from "./pages/Overview";
-import Roles from "./pages/Roles";
+import Users from "./pages/Users";
 import Storage from "./pages/Storage";
 import "./styles.css";
 
@@ -18,7 +18,7 @@ const NAV: [string, string][] = [
   ["/integrity", "Integrity"],
   ["/jobs", "Jobs"],
   ["/buckets", "Buckets"],
-  ["/roles", "Roles"],
+  ["/users", "Users"],
 ];
 
 /** A count next to the Integrity link, on every page: objects with lost data
@@ -90,7 +90,8 @@ render(
       <Route path="/buckets/:bucket" component={BucketBrowser} />
       <Route path="/buckets/:bucket/object" component={ObjectPage} />
       <Route path="/buckets/:bucket/lifecycle" component={Lifecycle} />
-      <Route path="/roles" component={Roles} />
+      <Route path="/users" component={Users} />
+      <Route path="/roles" component={() => <Navigate href="/users" />} />
       <Route path="*" component={NotFound} />
     </Router>
   ),

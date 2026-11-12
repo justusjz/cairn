@@ -78,7 +78,7 @@ export function BucketList() {
                 { label: "Size", num: true },
                 { label: "Older versions", num: true },
                 { label: "Uploads", num: true },
-                { label: "Roles", num: true },
+                { label: "Users", num: true },
                 "Tags",
                 "Created",
                 "",

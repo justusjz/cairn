@@ -165,7 +165,8 @@ export function Loading(props: { error?: string }) {
 }
 
 /** A modal showing a role's new secret, which is shown only this once. */
-export function SecretDialog(props: { name: string; secret: string; onClose: () => void }) {
+/** A new secret access key, with the ID clients sign as (`id`), shown once. */
+export function SecretDialog(props: { id: string; secret: string; onClose: () => void }) {
   let dialog!: HTMLDialogElement;
   let input!: HTMLInputElement;
   onMount(() => {
@@ -183,10 +184,11 @@ export function SecretDialog(props: { name: string; secret: string; onClose: () 
   return (
     <dialog ref={dialog} onClose={() => props.onClose()}>
       <h2>
-        Secret for <span class="mono">{props.name}</span>
+        Secret for <span class="mono">{props.id}</span>
       </h2>
       <p class="subtle">
-        Store it now: it isn't shown again. Clients use the role's name as access key ID and this as secret access key.
+        Store it now: it isn't shown again. Clients use <span class="mono">{props.id}</span> as access key ID and this
+        as secret access key.
       </p>
       <div class="secret">
         <input ref={input} type="text" readOnly value={props.secret} />
