@@ -284,6 +284,134 @@
         }
       }
     },
+    "/buckets/{bucket}/cors": {
+      "get": {
+        "operationId": "get_bucket_cors",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketCors"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets a bucket's CORS configuration, checked as PutBucketCors checks it.",
+        "operationId": "put_bucket_cors",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Configuration"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's CORS configuration: no other site's page may use it.",
+        "operationId": "delete_bucket_cors",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/buckets/{bucket}/download": {
       "get": {
         "summary": "An object's data, as a file to save. It's always sent as an attachment of\nno particular type, so that a browser never renders it as part of the UI.",
@@ -629,6 +757,72 @@
         }
       }
     },
+    "/buckets/{bucket}/object/tags": {
+      "put": {
+        "summary": "Replaces a version's tags, as PutObjectTagging does (or, with none,\nDeleteObjectTagging).",
+        "operationId": "set_object_tags",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "query",
+            "description": "The version whose tags to set; the current one if not given.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTags"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/buckets/{bucket}/objects": {
       "get": {
         "operationId": "list_objects",
@@ -850,6 +1044,316 @@
         "responses": {
           "204": {
             "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/tags": {
+      "put": {
+        "summary": "Replaces a bucket's tags, as PutBucketTagging does (or, with none,\nDeleteBucketTagging).",
+        "operationId": "set_bucket_tags",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTags"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/uploads": {
+      "post": {
+        "summary": "Starts a multipart upload, as CreateMultipartUpload does: for a file\nlarger than one upload may be (5 GiB), in parts.",
+        "operationId": "create_upload",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewUpload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadStarted"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/uploads/{upload}": {
+      "delete": {
+        "summary": "Aborts a multipart upload, as AbortMultipartUpload does: its parts go.",
+        "operationId": "abort_upload",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Aborted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/uploads/{upload}/complete": {
+      "post": {
+        "summary": "Completes a multipart upload with its parts, in order, as\nCompleteMultipartUpload does: the object is written then.",
+        "operationId": "complete_upload",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CompleteUpload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Written"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/uploads/{upload}/parts/{part}": {
+      "put": {
+        "summary": "Uploads one part (1 to 10000) of a multipart upload, from the request's\nbody: at least 5 MiB but for the last, at most 5 GiB.",
+        "operationId": "upload_part",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "upload",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "part",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PartUploaded"
+                }
+              }
+            }
           },
           "4XX": {
             "content": {
@@ -3102,6 +3606,23 @@
           }
         }
       },
+      "BucketCors": {
+        "type": "object",
+        "description": "A bucket's CORS configuration.",
+        "properties": {
+          "configuration": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Configuration",
+                "description": "`null` if it has none."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "BucketLifecycle": {
         "type": "object",
         "description": "A bucket's lifecycle rules, if it has any.",
@@ -3311,6 +3832,53 @@
             "description": "Why a live node's stats are missing."
           }
         }
+      },
+      "CompleteUpload": {
+        "type": "object",
+        "required": [
+          "parts"
+        ],
+        "properties": {
+          "parts": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CompletedPart"
+            }
+          }
+        }
+      },
+      "CompletedPart": {
+        "type": "object",
+        "required": [
+          "number",
+          "etag"
+        ],
+        "properties": {
+          "etag": {
+            "type": "string"
+          },
+          "number": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
+      "Configuration": {
+        "type": "object",
+        "description": "A bucket's CORS configuration.",
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Rule"
+            }
+          }
+        },
+        "additionalProperties": false
       },
       "Counts": {
         "type": "object",
@@ -4706,6 +5274,38 @@
           }
         }
       },
+      "NewTags": {
+        "type": "object",
+        "required": [
+          "tags"
+        ],
+        "properties": {
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "The whole tag set (none: no tags)."
+          }
+        }
+      },
+      "NewUpload": {
+        "type": "object",
+        "required": [
+          "key"
+        ],
+        "properties": {
+          "content_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "key": {
+            "type": "string"
+          }
+        }
+      },
       "NewVersioning": {
         "type": "object",
         "required": [
@@ -5245,6 +5845,18 @@
           }
         }
       },
+      "PartUploaded": {
+        "type": "object",
+        "required": [
+          "etag"
+        ],
+        "properties": {
+          "etag": {
+            "type": "string",
+            "description": "What to complete the upload with."
+          }
+        }
+      },
       "PasskeyName": {
         "type": "object",
         "required": [
@@ -5479,6 +6091,58 @@
           }
         }
       },
+      "Rule": {
+        "type": "object",
+        "required": [
+          "origins",
+          "methods"
+        ],
+        "properties": {
+          "expose": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`ExposeHeader`s: the response headers a page may read."
+          },
+          "headers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`AllowedHeader`s: what a preflight may ask to send."
+          },
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_age": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`MaxAgeSeconds`: how long a browser may keep a preflight's answer."
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`AllowedMethod`s."
+          },
+          "origins": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "`AllowedOrigin`s."
+          }
+        },
+        "additionalProperties": false
+      },
       "ScrubTotals": {
         "type": "object",
         "description": "What the scrubber did since the node started: the copies it checked (and\ntheir bytes), how many of them it found damaged or missing, how many of\nthose it repaired, and how many have data that's intact nowhere, and how\nmany of its passes failed.",
@@ -5701,6 +6365,17 @@
             "type": "string"
           },
           "value": {
+            "type": "string"
+          }
+        }
+      },
+      "UploadStarted": {
+        "type": "object",
+        "required": [
+          "upload_id"
+        ],
+        "properties": {
+          "upload_id": {
             "type": "string"
           }
         }

@@ -546,8 +546,9 @@ a new login; signed in, it adds the identity to that login. Signed in,
 people manage their passkeys, their account's users (as IAM's actions
 allow them: an admin may do all of it; others what their policies say, as
 `iam:CreateAccessKey` on their own user, say), and the buckets and objects: create and delete buckets, browse,
-upload (up to 5 GiB a file), download and delete objects and versions,
-versioning, lifecycle rules, bucket policies and public access blocks.
+upload (a file over 64 MiB in parts, so of any size S3 takes), download and
+delete objects and versions, versioning, tags (buckets' and versions'), CORS,
+lifecycle rules, bucket policies and public access blocks.
 Superadmins (the operator account's users) see the cluster instead: the
 dashboard's Overview, Storage, Integrity and Jobs pages, the accounts (making
 one, and its root's enrollment link), and each other, but no tenant's

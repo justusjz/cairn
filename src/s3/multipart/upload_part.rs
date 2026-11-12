@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes, body::Incoming, header};
+use hyper::{Response, StatusCode, body::Body, body::Bytes, header};
 use uuid::Uuid;
 
 use crate::{
@@ -19,17 +19,21 @@ use crate::{
 /// with it; that of an SSE-KMS upload is encrypted with the upload's key,
 /// which the KMS opens.
 #[allow(clippy::too_many_arguments)]
-pub async fn put_part(
+pub async fn put_part<B>(
     app: &Arc<App>,
     bucket: &str,
     key: &str,
     upload_id: &str,
     part_number: &str,
-    body: Incoming,
+    body: B,
     payload: Payload,
     customer_key: Option<&CustomerKey>,
     role: Option<Uuid>,
-) -> anyhow::Result<Response<Full<Bytes>>> {
+) -> anyhow::Result<Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin + Send,
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
         Err(_) => {

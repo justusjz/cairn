@@ -38,13 +38,13 @@ const MAX_ID_LENGTH: usize = 255;
 const METHODS: &[&str] = &["GET", "PUT", "HEAD", "POST", "DELETE"];
 
 /// A bucket's CORS configuration.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Configuration {
     pub rules: Vec<Rule>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     #[serde(default, skip_serializing_if = "Option::is_none")]

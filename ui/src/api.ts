@@ -23,6 +23,7 @@ export type ObjectInfo = Schemas["ObjectInfo"];
 export type User = Schemas["RoleSummary"];
 export type Account = Schemas["AccountSummary"];
 export type OidcProvider = Schemas["OidcProvider"];
+export type CorsConfiguration = Schemas["Configuration"];
 export type AccessKey = Schemas["AccessKey"];
 export type Permission = Schemas["Permission"];
 export type Lifecycle = Schemas["Lifecycle"];
@@ -174,8 +175,10 @@ export const api = {
     ok(client.PUT("/settings/{name}", { params: { path: { name } }, body: { value } })),
   removeNode: (id: number) => ok(client.POST("/nodes/{id}/remove", { params: { path: { id } } })),
   keepNode: (id: number) => ok(client.POST("/nodes/{id}/keep", { params: { path: { id } } })),
-  /** Writes an object from a file, as PutObject does. */
-  upload: async (bucket: string, key: string, file: Blob) => {
+  /** Writes an object from a file: in one PutObject, or, a large one, in
+   * parts (a multipart upload), four at a time, saying how far it got. */
+  upload: async (bucket: string, key: string, file: Blob, progress?: (sent: number) => void) => {
+    if (file.size > MULTIPART_ABOVE) return uploadInParts(bucket, key, file, progress);
     const url = `${BASE}/buckets/${encodeURIComponent(bucket)}/object?key=${encodeURIComponent(key)}`;
     const response = await fetch(url, {
       method: "PUT",
@@ -189,11 +192,76 @@ export const api = {
   },
   deleteObject: (bucket: string, key: string, version?: string) =>
     ok(client.DELETE("/buckets/{bucket}/object", { params: { ...bucketPath(bucket), query: { key, version } } })),
+  setBucketTags: (bucket: string, tags: { key: string; value: string }[]) =>
+    ok(client.PUT("/buckets/{bucket}/tags", { params: bucketPath(bucket), body: { tags } })),
+  setObjectTags: (bucket: string, key: string, version: string | undefined, tags: { key: string; value: string }[]) =>
+    ok(client.PUT("/buckets/{bucket}/object/tags", { params: { ...bucketPath(bucket), query: { key, version } }, body: { tags } })),
+  bucketCors: (bucket: string) => ok(client.GET("/buckets/{bucket}/cors", { params: bucketPath(bucket) })),
+  putBucketCors: (bucket: string, configuration: CorsConfiguration) =>
+    ok(client.PUT("/buckets/{bucket}/cors", { params: bucketPath(bucket), body: configuration })),
+  deleteBucketCors: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/cors", { params: bucketPath(bucket) })),
   setVersioning: (bucket: string, status: "Enabled" | "Suspended") =>
     ok(client.PUT("/buckets/{bucket}/versioning", { params: bucketPath(bucket), body: { status } })),
   revoke: (role: string, bucket: string, permission: Permission, account?: string) =>
     ok(client.DELETE("/roles/{role}/grants", { params: { path: { role }, query: { bucket, permission, account } } })),
 };
+
+/** Files larger than this are uploaded in parts. */
+const MULTIPART_ABOVE = 64 << 20;
+
+/** A large file, as a multipart upload: parts of 64 MiB at least (more for
+ * a file that would need more than 10000), four at a time. Aborted if a
+ * part fails. */
+async function uploadInParts(bucket: string, key: string, file: Blob, progress?: (sent: number) => void) {
+  const b = encodeURIComponent(bucket);
+  const k = encodeURIComponent(key);
+  const fail = async (response: Response) => {
+    const body = (await response.json().catch(() => ({}))) as { error?: string };
+    return new ApiError(response.status, body.error ?? `upload failed (${response.status})`);
+  };
+  const headers = { "x-cairn-ui": "1", "content-type": "application/json" };
+  const started = await fetch(`${BASE}/buckets/${b}/uploads`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ key, content_type: file.type || "application/octet-stream" }),
+  });
+  if (!started.ok) throw await fail(started);
+  const { upload_id: id } = (await started.json()) as { upload_id: string };
+  const mib = 1 << 20;
+  const size = Math.max(MULTIPART_ABOVE, Math.ceil(file.size / 10000 / mib) * mib);
+  const count = Math.ceil(file.size / size);
+  const etags: string[] = new Array(count);
+  let next = 0;
+  let sent = 0;
+  try {
+    const worker = async () => {
+      while (next < count) {
+        const i = next++;
+        const part = file.slice(i * size, Math.min(file.size, (i + 1) * size));
+        const response = await fetch(`${BASE}/buckets/${b}/uploads/${id}/parts/${i + 1}?key=${k}`, {
+          method: "PUT",
+          headers: { "x-cairn-ui": "1", "content-type": "application/octet-stream" },
+          body: part,
+        });
+        if (!response.ok) throw await fail(response);
+        etags[i] = ((await response.json()) as { etag: string }).etag;
+        sent += part.size;
+        progress?.(sent);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(4, count) }, worker));
+    const parts = etags.map((etag, i) => ({ number: i + 1, etag }));
+    const done = await fetch(`${BASE}/buckets/${b}/uploads/${id}/complete?key=${k}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ parts }),
+    });
+    if (!done.ok) throw await fail(done);
+  } catch (e) {
+    await fetch(`${BASE}/buckets/${b}/uploads/${id}?key=${k}`, { method: "DELETE", headers }).catch(() => {});
+    throw e;
+  }
+}
 
 /** Where to download a version of an object from. It's a plain link, so the
  * browser saves the file itself. */

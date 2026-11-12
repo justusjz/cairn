@@ -979,6 +979,119 @@ mod e2e {
         assert_eq!(me["identity"]["operator"], true, "{me}");
     }
 
+    /// Bucket and object tags and CORS, set as S3 sets them (and checked as
+    /// it checks them), by whom S3's actions allow.
+    #[tokio::test]
+    async fn edits_tags_and_cors() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = Arc::new(Console { app: app.clone(), party: party() });
+        let client = app.pool.get().await.unwrap();
+        let bucket = crate::e2e::BUCKET;
+        crate::e2e::put(&app, "t.txt", b"t".to_vec()).await;
+        let mut admin = signed_in(&console, "admin", true).await;
+        let mut reader = signed_in(&console, "reader", false).await;
+        roles::grant(&client, &crate::roles::account(&client).await.unwrap(), "reader", bucket, &[roles::Permission::Read]).await.unwrap();
+
+        let tags = json!({ "tags": [{ "key": "team", "value": "a" }, { "key": "cost", "value": "1" }] });
+        let path = format!("/api/buckets/{bucket}/tags");
+        assert_eq!(reader.send("PUT", &path, Some(tags.clone())).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("PUT", &path, Some(tags)).await.0, StatusCode::NO_CONTENT);
+        let (_, buckets) = admin.send("GET", "/api/buckets", None).await;
+        let ours = buckets.as_array().unwrap().iter().find(|b| b["name"] == bucket).unwrap();
+        assert_eq!(ours["tags"], json!([{ "key": "cost", "value": "1" }, { "key": "team", "value": "a" }]));
+        // Checked as S3 checks them.
+        let bad = json!({ "tags": [{ "key": "aws:reserved", "value": "x" }] });
+        let (status, err) = admin.send("PUT", &path, Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(admin.send("PUT", &path, Some(json!({ "tags": [] }))).await.0, StatusCode::NO_CONTENT);
+
+        let path = format!("/api/buckets/{bucket}/object/tags?key=t.txt");
+        let tags = json!({ "tags": [{ "key": "k", "value": "v" }] });
+        assert_eq!(reader.send("PUT", &path, Some(tags.clone())).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("PUT", &path, Some(tags)).await.0, StatusCode::NO_CONTENT);
+        let (_, info) = admin.send("GET", &format!("/api/buckets/{bucket}/object?key=t.txt"), None).await;
+        assert_eq!(info["versions"][0]["tags"], json!([{ "key": "k", "value": "v" }]));
+
+        let path = format!("/api/buckets/{bucket}/cors");
+        let (_, cors) = admin.send("GET", &path, None).await;
+        assert_eq!(cors["configuration"], Value::Null);
+        let rules = json!({ "rules": [{ "origins": ["https://app.example.com"], "methods": ["GET", "PUT"], "headers": ["*"], "max_age": 600 }] });
+        assert_eq!(admin.send("PUT", &path, Some(rules.clone())).await.0, StatusCode::NO_CONTENT);
+        let (_, cors) = reader.send("GET", &path, None).await;
+        assert_eq!(cors["configuration"]["rules"][0]["origins"], json!(["https://app.example.com"]));
+        let bad = json!({ "rules": [{ "origins": ["*"], "methods": ["PATCH"] }] });
+        let (status, err) = admin.send("PUT", &path, Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(reader.send("DELETE", &path, None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
+    }
+
+    impl Browser {
+        /// A part's upload (a raw body): its status and answer.
+        async fn put_part(&mut self, path: &str, body: Vec<u8>) -> (StatusCode, Value) {
+            let req = Request::builder()
+                .method("PUT")
+                .uri(path)
+                .header("origin", &self.origin)
+                .header("x-cairn-ui", "1")
+                .header("content-length", body.len())
+                .header("cookie", format!("{COOKIE}={}", self.cookie.as_deref().unwrap_or("")))
+                .body(axum::body::Body::from(body))
+                .unwrap();
+            let resp = router(self.console.clone()).oneshot(req).await.unwrap();
+            let status = resp.status();
+            let body = resp.into_body().collect().await.unwrap().to_bytes();
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        }
+    }
+
+    /// Uploads in parts, as the console's page does for large files: made,
+    /// parts put, completed (and the object is the parts'), or aborted;
+    /// parts too small are refused at completion, as S3 refuses them.
+    #[tokio::test]
+    async fn uploads_in_parts() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = Arc::new(Console { app: app.clone(), party: party() });
+        let client = app.pool.get().await.unwrap();
+        let bucket = crate::e2e::BUCKET;
+        let mut writer = signed_in(&console, "w", false).await;
+        let account = crate::roles::account(&client).await.unwrap();
+        roles::grant(&client, &account, "w", bucket, &[roles::Permission::Write, roles::Permission::Read]).await.unwrap();
+
+        let start = |key: &str| json!({ "key": key, "content_type": "application/x-test" });
+        let (status, started) = writer.send("POST", &format!("/api/buckets/{bucket}/uploads"), Some(start("big.bin"))).await;
+        assert_eq!(status, StatusCode::CREATED, "{started}");
+        let id = started["upload_id"].as_str().unwrap().to_owned();
+        let first = vec![1u8; 5 << 20];
+        let (status, one) = writer.put_part(&format!("/api/buckets/{bucket}/uploads/{id}/parts/1?key=big.bin"), first).await;
+        assert_eq!(status, StatusCode::OK, "{one}");
+        let (_, two) = writer.put_part(&format!("/api/buckets/{bucket}/uploads/{id}/parts/2?key=big.bin"), vec![2u8; 10]).await;
+        let parts = json!({ "parts": [{ "number": 1, "etag": one["etag"] }, { "number": 2, "etag": two["etag"] }] });
+        let (status, err) = writer.send("POST", &format!("/api/buckets/{bucket}/uploads/{id}/complete?key=big.bin"), Some(parts)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        let (_, info) = writer.send("GET", &format!("/api/buckets/{bucket}/object?key=big.bin"), None).await;
+        assert_eq!(info["versions"][0]["size"], (5 << 20) + 10);
+        assert_eq!(info["versions"][0]["content_type"], "application/x-test");
+
+        // A first part under 5 MiB: refused at completion.
+        let (_, started) = writer.send("POST", &format!("/api/buckets/{bucket}/uploads"), Some(start("small.bin"))).await;
+        let id = started["upload_id"].as_str().unwrap().to_owned();
+        let (_, one) = writer.put_part(&format!("/api/buckets/{bucket}/uploads/{id}/parts/1?key=small.bin"), vec![1; 100]).await;
+        let (_, two) = writer.put_part(&format!("/api/buckets/{bucket}/uploads/{id}/parts/2?key=small.bin"), vec![2; 100]).await;
+        let parts = json!({ "parts": [{ "number": 1, "etag": one["etag"] }, { "number": 2, "etag": two["etag"] }] });
+        let (status, err) = writer.send("POST", &format!("/api/buckets/{bucket}/uploads/{id}/complete?key=small.bin"), Some(parts)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().to_lowercase().contains("small"), "{err}");
+        // Aborted, it's gone.
+        let path = format!("/api/buckets/{bucket}/uploads/{id}?key=small.bin");
+        assert_eq!(writer.send("DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
+        let uploads: i64 = client.query_one("SELECT count(*) FROM multipart_uploads", &[]).await.unwrap().get(0);
+        assert_eq!(uploads, 0);
+        // Not by someone who may not write there.
+        let mut reader = signed_in(&console, "r", false).await;
+        assert_eq!(reader.send("POST", &format!("/api/buckets/{bucket}/uploads"), Some(start("x"))).await.0, StatusCode::FORBIDDEN);
+    }
+
     /// Only the console's own page may sign in: other origins, and requests
     /// without the header, are refused.
     #[tokio::test]

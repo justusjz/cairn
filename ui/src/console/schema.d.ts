@@ -91,6 +91,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/buckets/{bucket}/cors": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_bucket_cors"];
+        /** Sets a bucket's CORS configuration, checked as PutBucketCors checks it. */
+        put: operations["put_bucket_cors"];
+        post?: never;
+        /** Removes a bucket's CORS configuration: no other site's page may use it. */
+        delete: operations["delete_bucket_cors"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets/{bucket}/download": {
         parameters: {
             query?: never;
@@ -162,6 +180,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/buckets/{bucket}/object/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replaces a version's tags, as PutObjectTagging does (or, with none,
+         *     DeleteObjectTagging).
+         */
+        put: operations["set_object_tags"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets/{bucket}/objects": {
         parameters: {
             query?: never;
@@ -212,6 +250,103 @@ export interface paths {
         post?: never;
         /** Removes a bucket's public access block: only the cluster's applies. */
         delete: operations["delete_public_access_block"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Replaces a bucket's tags, as PutBucketTagging does (or, with none,
+         *     DeleteBucketTagging).
+         */
+        put: operations["set_bucket_tags"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/uploads": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Starts a multipart upload, as CreateMultipartUpload does: for a file
+         *     larger than one upload may be (5 GiB), in parts.
+         */
+        post: operations["create_upload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/uploads/{upload}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Aborts a multipart upload, as AbortMultipartUpload does: its parts go. */
+        delete: operations["abort_upload"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/uploads/{upload}/complete": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Completes a multipart upload with its parts, in order, as
+         *     CompleteMultipartUpload does: the object is written then.
+         */
+        post: operations["complete_upload"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/uploads/{upload}/parts/{part}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Uploads one part (1 to 10000) of a multipart upload, from the request's
+         *     body: at least 5 MiB but for the last, at most 5 GiB.
+         */
+        put: operations["upload_part"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1028,6 +1163,10 @@ export interface components {
             public: boolean;
             public_access_block?: components["schemas"]["Block"] | null;
         };
+        /** @description A bucket's CORS configuration. */
+        BucketCors: {
+            configuration?: components["schemas"]["Configuration"] | null;
+        };
         /** @description A bucket's lifecycle rules, if it has any. */
         BucketLifecycle: {
             configuration?: components["schemas"]["LifecycleConfiguration"] | null;
@@ -1113,6 +1252,18 @@ export interface components {
             stats?: components["schemas"]["NodeStats"] | null;
             /** @description Why a live node's stats are missing. */
             stats_error?: string | null;
+        };
+        CompleteUpload: {
+            parts: components["schemas"]["CompletedPart"][];
+        };
+        CompletedPart: {
+            etag: string;
+            /** Format: int32 */
+            number: number;
+        };
+        /** @description A bucket's CORS configuration. */
+        Configuration: {
+            rules: components["schemas"]["Rule"][];
         };
         /** @description Counts of requests, by how they ended, and of what they moved. */
         Counts: {
@@ -1685,6 +1836,14 @@ export interface components {
             /** Format: int64 */
             value?: number | null;
         };
+        NewTags: {
+            /** @description The whole tag set (none: no tags). */
+            tags: components["schemas"]["Tag"][];
+        };
+        NewUpload: {
+            content_type?: string | null;
+            key: string;
+        };
         NewVersioning: {
             /** @description `Enabled` or `Suspended`. */
             status: string;
@@ -1910,6 +2069,10 @@ export interface components {
             /** Format: int64 */
             size: number;
         };
+        PartUploaded: {
+            /** @description What to complete the upload with. */
+            etag: string;
+        };
         PasskeyName: {
             name: string;
         };
@@ -2003,6 +2166,22 @@ export interface components {
             /** @description The names of its inline policies. */
             policies: string[];
         };
+        Rule: {
+            /** @description `ExposeHeader`s: the response headers a page may read. */
+            expose?: string[];
+            /** @description `AllowedHeader`s: what a preflight may ask to send. */
+            headers?: string[];
+            id?: string | null;
+            /**
+             * Format: int32
+             * @description `MaxAgeSeconds`: how long a browser may keep a preflight's answer.
+             */
+            max_age?: number | null;
+            /** @description `AllowedMethod`s. */
+            methods: string[];
+            /** @description `AllowedOrigin`s. */
+            origins: string[];
+        };
         /**
          * @description What the scrubber did since the node started: the copies it checked (and
          *     their bytes), how many of them it found damaged or missing, how many of
@@ -2086,6 +2265,9 @@ export interface components {
         Tag: {
             key: string;
             value: string;
+        };
+        UploadStarted: {
+            upload_id: string;
         };
         VersionInfo: {
             content_type?: string | null;
@@ -2351,6 +2533,119 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["BucketAccess"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_bucket_cors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketCors"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_bucket_cors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Configuration"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_bucket_cors: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {
@@ -2641,6 +2936,50 @@ export interface operations {
             };
         };
     };
+    set_object_tags: {
+        parameters: {
+            query: {
+                key: string;
+                /** @description The version whose tags to set; the current one if not given. */
+                version?: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewTags"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_objects: {
         parameters: {
             query?: {
@@ -2818,6 +3157,214 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_bucket_tags: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewTags"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_upload: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewUpload"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadStarted"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    abort_upload: {
+        parameters: {
+            query: {
+                key: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+                upload: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Aborted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    complete_upload: {
+        parameters: {
+            query: {
+                key: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+                upload: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CompleteUpload"];
+            };
+        };
+        responses: {
+            /** @description Written */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    upload_part: {
+        parameters: {
+            query: {
+                key: string;
+            };
+            header?: never;
+            path: {
+                bucket: string;
+                upload: string;
+                part: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/octet-stream": number[];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PartUploaded"];
+                };
             };
             "4XX": {
                 headers: {

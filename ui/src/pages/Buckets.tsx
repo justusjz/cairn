@@ -1,6 +1,7 @@
 import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { For, Match, Show, Switch, createEffect, createSignal, on, onMount } from "solid-js";
 import { type Bucket, type BucketAccess, type Entry, type PublicAccessBlock, api, downloadUrl, isConsole } from "../api";
+import { CorsDialog, TagsDialog } from "../components/Editors";
 import { Badge, LiveDot, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { bytes, date, num, pretty } from "../format";
 
@@ -240,9 +241,13 @@ export function BucketBrowser() {
   const [uploading, setUploading] = createSignal<string>();
   // The bucket's versioning state, for its switch.
   const [versioning, setVersioning] = createSignal<string>();
+  const [bucketTags, setBucketTags] = createSignal<{ key: string; value: string }[]>([]);
+  const [editing, setEditing] = createSignal<"tags" | "cors">();
   const loadVersioning = async () => {
     try {
-      setVersioning((await api.buckets()).find((b) => b.name === bucket())?.versioning);
+      const b = (await api.buckets()).find((b) => b.name === bucket());
+      setVersioning(b?.versioning);
+      setBucketTags(b?.tags ?? []);
     } catch {
       setVersioning(undefined);
     }
@@ -260,7 +265,9 @@ export function BucketBrowser() {
     for (const file of Array.from(files)) {
       const key = prefix() + file.name;
       setUploading(`Uploading ${file.name} (${bytes(file.size)})…`);
-      if (!(await act(() => api.upload(bucket(), key, file), `Uploaded ${key}`))) break;
+      const progress = (sent: number) =>
+        setUploading(`Uploading ${file.name}: ${bytes(sent)} of ${bytes(file.size)} (${Math.floor((sent / file.size) * 100)}%)`);
+      if (!(await act(() => api.upload(bucket(), key, file, progress), `Uploaded ${key}`))) break;
     }
     setUploading(undefined);
     restart();
@@ -310,6 +317,8 @@ export function BucketBrowser() {
           Lifecycle rules
         </A>
         <button onClick={() => setAccess(true)}>Policy and public access</button>
+        <button onClick={() => setEditing("tags")}>Tags{bucketTags().length ? ` (${bucketTags().length})` : ""}</button>
+        <button onClick={() => setEditing("cors")}>CORS</button>
         <Show when={versioning()}>
           {(v) => (
             <button onClick={toggleVersioning} title={`Versioning is ${v()}`}>
@@ -336,6 +345,18 @@ export function BucketBrowser() {
       </div>
       <Show when={access()}>
         <AccessDialog bucket={bucket()} onClose={() => setAccess(false)} />
+      </Show>
+      <Show when={editing() === "tags"}>
+        <TagsDialog
+          title={`Tags of ${bucket()}`}
+          tags={bucketTags()}
+          save={(tags) => api.setBucketTags(bucket(), tags)}
+          changed={loadVersioning}
+          onClose={() => setEditing(undefined)}
+        />
+      </Show>
+      <Show when={editing() === "cors"}>
+        <CorsDialog bucket={bucket()} onClose={() => setEditing(undefined)} />
       </Show>
       <Show when={loaded()} fallback={<Loading error={error()} />}>
         <Panel>
@@ -563,6 +584,7 @@ export function ObjectPage() {
   const key = () => (typeof search.key === "string" ? search.key : "");
   // The cluster (where parts are stored) is the operator's to see.
   const data = poll(() => Promise.all([api.object(bucket(), key()), isConsole() ? null : api.cluster()]));
+  const [tagging, setTagging] = createSignal<{ version: string; tags: { key: string; value: string }[] }>();
   const removeVersion = async (version: string) => {
     if (!confirm(`Delete version ${version} of "${key()}" for good?`)) return;
     if (await act(() => api.deleteObject(bucket(), key(), version), `Deleted version ${version}`)) data.refresh();
@@ -572,6 +594,17 @@ export function ObjectPage() {
 
   return (
     <>
+      <Show when={tagging()}>
+        {(t) => (
+          <TagsDialog
+            title={`Tags of ${key()} (version ${t().version})`}
+            tags={t().tags}
+            save={(tags) => api.setObjectTags(bucket(), key(), t().version, tags)}
+            changed={data.refresh}
+            onClose={() => setTagging(undefined)}
+          />
+        )}
+      </Show>
       <h1>Object</h1>
       <Crumbs bucket={bucket()} prefix={prefix()} />
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
@@ -616,6 +649,11 @@ export function ObjectPage() {
                           <a class="button small" href={downloadUrl(obj().bucket, obj().key, v.version_id)}>
                             Download
                           </a>
+                        </Show>
+                        <Show when={!v.delete_marker}>
+                          <button class="small" onClick={() => setTagging({ version: v.version_id, tags: v.tags })}>
+                            Edit tags
+                          </button>
                         </Show>
                         <button class="small danger" onClick={() => removeVersion(v.version_id)}>
                           Delete version

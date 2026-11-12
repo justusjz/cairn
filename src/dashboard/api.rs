@@ -29,6 +29,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use super::actor::Actor;
 use super::{ApiError, ErrorBody, NodeStats, node_stats};
 use crate::s3::actions::{Check, On};
+use crate::s3::util::xml_escape;
 use crate::db::Cached;
 use crate::{
     App,
@@ -101,6 +102,13 @@ pub(crate) fn shared_router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(get_public_access))
         .routes(routes!(upload, delete_object))
         .routes(routes!(set_versioning))
+        .routes(routes!(set_bucket_tags))
+        .routes(routes!(create_upload))
+        .routes(routes!(upload_part))
+        .routes(routes!(complete_upload))
+        .routes(routes!(abort_upload))
+        .routes(routes!(set_object_tags))
+        .routes(routes!(get_bucket_cors, put_bucket_cors, delete_bucket_cors))
         .routes(routes!(list_roles, create_role))
         .routes(routes!(delete_role))
         .routes(routes!(rotate_secret))
@@ -822,7 +830,7 @@ pub(super) struct BucketSummary {
 }
 
 /// A tag of a bucket or an object version (see `s3::tags`).
-#[derive(Serialize, ToSchema)]
+#[derive(Serialize, Deserialize, ToSchema)]
 pub(super) struct Tag {
     key: String,
     value: String,
@@ -1948,6 +1956,365 @@ async fn delete_oidc_provider(
     actor.check(&app, "cairn:PutSetting", On::Cluster).await?;
     crate::console::oidc::remove_provider(&app.pool.get().await?, &name).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ─── Multipart uploads ───────────────────────────────────────────────────────
+
+#[derive(Deserialize, ToSchema)]
+struct NewUpload {
+    key: String,
+    content_type: Option<String>,
+}
+
+#[derive(Serialize, ToSchema)]
+struct UploadStarted {
+    upload_id: String,
+}
+
+/// The value of element `name` in an S3 handler's XML answer.
+fn element(xml: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&format!("</{name}>"))?;
+    Some(xml[start..start + end].to_owned())
+}
+
+/// Starts a multipart upload, as CreateMultipartUpload does: for a file
+/// larger than one upload may be (5 GiB), in parts.
+#[utoipa::path(post, path = "/buckets/{bucket}/uploads", params(("bucket" = String, Path)), request_body = NewUpload,
+    responses(
+        (status = 201, body = UploadStarted),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn create_upload(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+    Json(body): Json<NewUpload>,
+) -> Result<(StatusCode, Json<UploadStarted>)> {
+    actor.check(&app, "s3:PutObject", On::Object(bucket.clone(), body.key.clone())).await?;
+    if !crate::s3::util::is_well_formed(&body.key) || body.key.is_empty() || body.key.len() > 1024 {
+        return Err(ApiError::BadRequest("a key is 1 to 1024 bytes of UTF-8, without control characters".into()));
+    }
+    let content_type = body.content_type.as_deref().filter(|t| !t.is_empty()).unwrap_or("application/octet-stream");
+    let resp = crate::s3::multipart::create::create_multipart_upload(
+        &app,
+        &bucket,
+        &body.key,
+        content_type,
+        "",
+        "",
+        crate::s3::sse::Wanted::Plain,
+        actor.kms_role(),
+        None,
+    )
+    .await?;
+    if resp.status() != StatusCode::OK {
+        return Err(s3_error(resp).await);
+    }
+    let xml = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let upload_id = element(&String::from_utf8_lossy(&xml), "UploadId")
+        .ok_or_else(|| anyhow::anyhow!("CreateMultipartUpload answered no upload ID"))?;
+    Ok((StatusCode::CREATED, Json(UploadStarted { upload_id })))
+}
+
+#[derive(Serialize, ToSchema)]
+struct PartUploaded {
+    /// What to complete the upload with.
+    etag: String,
+}
+
+/// Uploads one part (1 to 10000) of a multipart upload, from the request's
+/// body: at least 5 MiB but for the last, at most 5 GiB.
+#[utoipa::path(put, path = "/buckets/{bucket}/uploads/{upload}/parts/{part}",
+    params(("bucket" = String, Path), ("upload" = String, Path), ("part" = u32, Path), UploadParams),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream"),
+    responses(
+        (status = 200, body = PartUploaded),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn upload_part(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path((bucket, upload, part)): Path<(String, String, u32)>,
+    Query(params): Query<UploadParams>,
+    headers: axum::http::HeaderMap,
+    body: Body,
+) -> Result<Json<PartUploaded>> {
+    actor.check(&app, "s3:PutObject", On::Object(bucket.clone(), params.key.clone())).await?;
+    let length = headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse().ok());
+    let payload = length.map_or_else(crate::payload::Payload::unchecked, crate::payload::Payload::unchecked_of);
+    let payload = payload
+        .at_most(crate::s3::util::MAX_UPLOAD)
+        .map_err(|_| ApiError::BadRequest("a part is at most 5 GiB".into()))?;
+    let resp = crate::s3::multipart::upload_part::put_part(
+        &app,
+        &bucket,
+        &params.key,
+        &upload,
+        &part.to_string(),
+        body,
+        payload,
+        None,
+        actor.kms_role(),
+    )
+    .await?;
+    if resp.status() != StatusCode::OK {
+        return Err(s3_error(resp).await);
+    }
+    let etag = resp
+        .headers()
+        .get(header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| anyhow::anyhow!("UploadPart answered no ETag"))?
+        .to_owned();
+    Ok(Json(PartUploaded { etag }))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct CompletedPart {
+    number: u32,
+    etag: String,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct CompleteUpload {
+    parts: Vec<CompletedPart>,
+}
+
+/// Completes a multipart upload with its parts, in order, as
+/// CompleteMultipartUpload does: the object is written then.
+#[utoipa::path(post, path = "/buckets/{bucket}/uploads/{upload}/complete",
+    params(("bucket" = String, Path), ("upload" = String, Path), UploadParams), request_body = CompleteUpload,
+    responses(
+        (status = 204, description = "Written"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn complete_upload(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path((bucket, upload)): Path<(String, String)>,
+    Query(params): Query<UploadParams>,
+    Json(body): Json<CompleteUpload>,
+) -> Result<StatusCode> {
+    actor.check(&app, "s3:PutObject", On::Object(bucket.clone(), params.key.clone())).await?;
+    let parts: String = body
+        .parts
+        .iter()
+        .map(|p| format!("<Part><PartNumber>{}</PartNumber><ETag>{}</ETag></Part>", p.number, xml_escape(&p.etag)))
+        .collect();
+    let xml = format!("<CompleteMultipartUpload>{parts}</CompleteMultipartUpload>");
+    let resp = crate::s3::multipart::complete::complete_multipart_upload(
+        &app,
+        &bucket,
+        &params.key,
+        &upload,
+        xml.into(),
+        &Preconditions::default(),
+        None,
+        actor.kms_role(),
+        None,
+        None,
+    )
+    .await?;
+    let status = resp.status();
+    let answer = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
+    let answer = String::from_utf8_lossy(&answer);
+    // An error may come with a 200, once the answer has started (as S3's).
+    if status != StatusCode::OK || answer.contains("<Error>") {
+        let message = element(&answer, "Message").or_else(|| element(&answer, "Code")).unwrap_or_default();
+        return Err(match status {
+            s if s.is_server_error() => ApiError::Failed(anyhow::anyhow!("completing an upload: {message}")),
+            _ => ApiError::BadRequest(message),
+        });
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Aborts a multipart upload, as AbortMultipartUpload does: its parts go.
+#[utoipa::path(delete, path = "/buckets/{bucket}/uploads/{upload}",
+    params(("bucket" = String, Path), ("upload" = String, Path), UploadParams), responses(
+        (status = 204, description = "Aborted"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn abort_upload(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path((bucket, upload)): Path<(String, String)>,
+    Query(params): Query<UploadParams>,
+) -> Result<StatusCode> {
+    actor.check(&app, "s3:AbortMultipartUpload", On::Object(bucket.clone(), params.key.clone())).await?;
+    let resp = crate::s3::multipart::abort::abort_multipart_upload(&app, &bucket, &params.key, &upload).await?;
+    match resp.status() {
+        s if s.is_success() => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
+}
+
+// ─── Tags and CORS ───────────────────────────────────────────────────────────
+
+#[derive(Deserialize, ToSchema)]
+struct NewTags {
+    /// The whole tag set (none: no tags).
+    tags: Vec<Tag>,
+}
+
+/// A tag set as S3's `<Tagging>` document.
+fn tagging_xml(tags: &[Tag]) -> String {
+    let tags: String = tags
+        .iter()
+        .map(|t| format!("<Tag><Key>{}</Key><Value>{}</Value></Tag>", xml_escape(&t.key), xml_escape(&t.value)))
+        .collect();
+    format!("<Tagging><TagSet>{tags}</TagSet></Tagging>")
+}
+
+/// Replaces a bucket's tags, as PutBucketTagging does (or, with none,
+/// DeleteBucketTagging).
+#[utoipa::path(put, path = "/buckets/{bucket}/tags", params(("bucket" = String, Path)), request_body = NewTags,
+    responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn set_bucket_tags(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+    Json(body): Json<NewTags>,
+) -> Result<StatusCode> {
+    // DeleteBucketTagging is authorized as its put, in S3.
+    actor.check(&app, "s3:PutBucketTagging", On::Bucket(bucket.clone())).await?;
+    use crate::s3::buckets::tagging;
+    let resp = match body.tags.is_empty() {
+        true => tagging::delete_bucket_tagging(&app, &bucket).await?,
+        false => tagging::put_bucket_tagging(&app, &bucket, tagging_xml(&body.tags).into()).await?,
+    };
+    match resp.status() {
+        s if s.is_success() => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
+}
+
+#[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct ObjectTagParams {
+    key: String,
+    /// The version whose tags to set; the current one if not given.
+    version: Option<String>,
+}
+
+/// Replaces a version's tags, as PutObjectTagging does (or, with none,
+/// DeleteObjectTagging).
+#[utoipa::path(put, path = "/buckets/{bucket}/object/tags", params(("bucket" = String, Path), ObjectTagParams),
+    request_body = NewTags, responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn set_object_tags(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+    Query(params): Query<ObjectTagParams>,
+    Json(body): Json<NewTags>,
+) -> Result<StatusCode> {
+    use crate::s3::objects::tagging;
+    let version = params.version.as_deref();
+    let action = match (body.tags.is_empty(), version.is_some()) {
+        (false, false) => "s3:PutObjectTagging",
+        (false, true) => "s3:PutObjectVersionTagging",
+        (true, false) => "s3:DeleteObjectTagging",
+        (true, true) => "s3:DeleteObjectVersionTagging",
+    };
+    actor.check(&app, action, On::Object(bucket.clone(), params.key.clone())).await?;
+    let resp = match body.tags.is_empty() {
+        true => tagging::delete_object_tagging(&app, &bucket, &params.key, version).await?,
+        false => tagging::put_object_tagging(&app, &bucket, &params.key, version, tagging_xml(&body.tags).into()).await?,
+    };
+    match resp.status() {
+        s if s.is_success() => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
+}
+
+/// A bucket's CORS configuration.
+#[derive(Serialize, ToSchema)]
+struct BucketCors {
+    /// `null` if it has none.
+    configuration: Option<crate::s3::buckets::cors::Configuration>,
+}
+
+#[utoipa::path(get, path = "/buckets/{bucket}/cors", params(("bucket" = String, Path)), responses(
+    (status = 200, body = BucketCors),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn get_bucket_cors(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<Json<BucketCors>> {
+    actor.check(&app, "s3:GetBucketCORS", On::Bucket(bucket.clone())).await?;
+    let row = app
+        .pool
+        .get()
+        .await?
+        .query_opt_cached("SELECT cors FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no bucket named {bucket:?}")))?;
+    let configuration = match row.get::<_, Option<String>>(0) {
+        None => None,
+        Some(json) => Some(
+            crate::s3::buckets::cors::Configuration::from_json(&json)
+                .map_err(|e| anyhow::anyhow!("bucket {bucket}'s CORS configuration doesn't parse: {e}"))?,
+        ),
+    };
+    Ok(Json(BucketCors { configuration }))
+}
+
+/// Sets a bucket's CORS configuration, checked as PutBucketCors checks it.
+#[utoipa::path(put, path = "/buckets/{bucket}/cors", params(("bucket" = String, Path)),
+    request_body = crate::s3::buckets::cors::Configuration, responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn put_bucket_cors(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+    Json(body): Json<crate::s3::buckets::cors::Configuration>,
+) -> Result<StatusCode> {
+    actor.check(&app, "s3:PutBucketCORS", On::Bucket(bucket.clone())).await?;
+    let resp = crate::s3::buckets::cors::put_bucket_cors(&app, &bucket, body.to_xml().into()).await?;
+    match resp.status() {
+        s if s.is_success() => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
+}
+
+/// Removes a bucket's CORS configuration: no other site's page may use it.
+#[utoipa::path(delete, path = "/buckets/{bucket}/cors", params(("bucket" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_bucket_cors(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<StatusCode> {
+    // DeleteBucketCors is authorized as its put, in S3.
+    actor.check(&app, "s3:PutBucketCORS", On::Bucket(bucket.clone())).await?;
+    let resp = crate::s3::buckets::cors::delete_bucket_cors(&app, &bucket).await?;
+    match resp.status() {
+        s if s.is_success() => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
 }
 
 // ─── Roles ───────────────────────────────────────────────────────────────────
