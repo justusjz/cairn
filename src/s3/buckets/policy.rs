@@ -26,9 +26,16 @@ pub struct Refused {
     pub message: String,
 }
 
-/// `text` as `bucket`'s policy would be kept (normalized), if S3 would take
-/// it: a valid bucket policy, whose users and accounts exist.
-pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<Result<String, Refused>> {
+/// A policy as it's to be kept: normalized, and whether it's public (which
+/// a public access block may refuse: see `public_access`).
+pub struct Checked {
+    pub normalized: String,
+    pub public: bool,
+}
+
+/// `text` as `bucket`'s policy would be kept, if S3 would take it: a valid
+/// bucket policy, whose users and accounts exist.
+pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<Result<Checked, Refused>> {
     let policy = match Policy::parse(text, Kind::Bucket(bucket)) {
         Ok(policy) => policy,
         Err(invalid) => {
@@ -57,7 +64,7 @@ pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<
             return invalid_principal();
         }
     }
-    Ok(Ok(policy.normalized().to_owned()))
+    Ok(Ok(Checked { normalized: policy.normalized().to_owned(), public: policy.is_public() }))
 }
 
 /// The bucket's policy, normalized: `None` if there's no such bucket,
@@ -72,7 +79,7 @@ async fn stored(client: &Object, bucket: &str) -> anyhow::Result<Option<Option<S
 /// one (a user made with the name since isn't the one it names: see
 /// `db::PRINCIPAL_IDS`). `None` if there's no such bucket, `Some(None)` if
 /// it has none.
-async fn shown(client: &Object, bucket: &str) -> anyhow::Result<Option<Option<String>>> {
+pub async fn shown(client: &Object, bucket: &str) -> anyhow::Result<Option<Option<String>>> {
     let row = client
         .query_opt_cached(
             "SELECT b.policy,
@@ -95,11 +102,34 @@ async fn shown(client: &Object, bucket: &str) -> anyhow::Result<Option<Option<St
     Ok(Some(Some(policy.shown(kind, &gone))))
 }
 
-/// Sets (`None`: deletes) the bucket's policy (`cairn_set_policy`). Whether
-/// the bucket exists.
-async fn set(client: &Object, bucket: &str, policy: Option<&str>) -> anyhow::Result<bool> {
-    Ok(client.query_one_cached("SELECT pg_temp.cairn_set_policy($1, $2)", &[&bucket, &policy]).await?.get(0))
+/// What setting a bucket's policy did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Set {
+    Set,
+    /// It's public, and public policies are blocked (see `public_access`).
+    Blocked,
+    NoSuchBucket,
 }
+
+/// Sets (`None`: deletes) the bucket's policy (`cairn_set_policy`), unless
+/// it's public and that's blocked.
+pub async fn set(client: &Object, bucket: &str, policy: Option<&Checked>) -> anyhow::Result<Set> {
+    let (text, public) = policy.map_or((None, false), |p| (Some(p.normalized.as_str()), p.public));
+    let status: String = client
+        .query_one_cached("SELECT pg_temp.cairn_set_policy($1, $2, $3)", &[&bucket, &text, &public])
+        .await?
+        .get(0);
+    Ok(match status.as_str() {
+        "set" => Set::Set,
+        "blocked" => Set::Blocked,
+        "no_such_bucket" => Set::NoSuchBucket,
+        other => anyhow::bail!("cairn_set_policy: unexpected status {other}"),
+    })
+}
+
+/// Why a public policy was refused.
+pub const BLOCKED: &str = "public policies are blocked by the BlockPublicPolicy block public access setting \
+                           (the bucket's, or the cluster's block-public-policy)";
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
     format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
@@ -142,8 +172,9 @@ pub async fn put_bucket_policy(app: &App, bucket: &str, body: Bytes) -> anyhow::
         Err(refused) => return Ok(format_s3_error(refused.status, refused.code, &refused.message)),
     };
     Ok(match set(&client, bucket, Some(&policy)).await? {
-        true => empty(StatusCode::NO_CONTENT),
-        false => no_such_bucket(),
+        Set::Set => empty(StatusCode::NO_CONTENT),
+        Set::Blocked => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", BLOCKED),
+        Set::NoSuchBucket => no_such_bucket(),
     })
 }
 
@@ -151,8 +182,8 @@ pub async fn put_bucket_policy(app: &App, bucket: &str, body: Bytes) -> anyhow::
 /// without (probed).
 pub async fn delete_bucket_policy(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(match set(&app.pool.get().await?, bucket, None).await? {
-        true => empty(StatusCode::NO_CONTENT),
-        false => no_such_bucket(),
+        Set::NoSuchBucket => no_such_bucket(),
+        _ => empty(StatusCode::NO_CONTENT),
     })
 }
 
@@ -215,12 +246,17 @@ pub async fn bucket_policy_main(args: BucketPolicyArgs) -> anyhow::Result<()> {
                 Ok(policy) => policy,
                 Err(refused) => anyhow::bail!("{}: {}", refused.code, refused.message),
             };
-            if !set(&client, &bucket, Some(&policy)).await? {
-                anyhow::bail!("no bucket named {bucket:?}");
+            match set(&client, &bucket, Some(&policy)).await? {
+                Set::Set => {}
+                Set::Blocked => anyhow::bail!(
+                    "{BLOCKED}: turn the bucket's off first (DeletePublicAccessBlock, or on the dashboard), \
+                     or the cluster's (cairn config set block-public-policy 0)"
+                ),
+                Set::NoSuchBucket => anyhow::bail!("no bucket named {bucket:?}"),
             }
         }
         BucketPolicyCommand::Delete { bucket } => {
-            if !set(&client, &bucket, None).await? {
+            if set(&client, &bucket, None).await? == Set::NoSuchBucket {
                 anyhow::bail!("no bucket named {bucket:?}");
             }
         }

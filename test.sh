@@ -2209,6 +2209,15 @@ bucket_policy_ok() {
  {"Effect":"Deny","Principal":{"AWS":"'"$account"'"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::'"$b"'/locked/*"}]}' \
         > "$doc"
     ! as_role writer writersecret s3api put-bucket-policy --bucket "$b" --policy "file://$doc" >/dev/null 2>&1 || return 1
+    # A new bucket blocks public access, as in S3: the public policy is
+    # refused until its block is off.
+    [ "$(awss3 s3api get-public-access-block --bucket "$b" \
+        --query 'PublicAccessBlockConfiguration.[BlockPublicAcls,IgnorePublicAcls,BlockPublicPolicy,RestrictPublicBuckets]' \
+        --output text 2>/dev/null)" = "$(printf 'True\tTrue\tTrue\tTrue')" ] || return 1
+    out=$(awss3 s3api put-bucket-policy --bucket "$b" --policy "file://$doc" 2>&1) && return 1
+    echo "$out" | grep -q BlockPublicPolicy || return 1
+    awss3 s3api delete-public-access-block --bucket "$b" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-public-access-block --bucket "$b" >/dev/null 2>&1 || return 1
     awss3 s3api put-bucket-policy --bucket "$b" --policy "file://$doc" >/dev/null 2>&1 || return 1
     awss3 s3api get-bucket-policy --bucket "$b" --query Policy --output text 2>/dev/null \
         | grep -qF "\"Principal\":{\"AWS\":\"arn:aws:iam::$account:root\"}" || return 1
@@ -2220,6 +2229,13 @@ bucket_policy_ok() {
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/missing.txt")" = 403 ] || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' -T "$WORK_DIR/pub.txt" "$url/pub/new.txt")" = 403 ] || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url?list-type=2")" = 403 ] || return 1
+    # RestrictPublicBuckets: the public policy allows anonymous requests
+    # nothing, while it's on.
+    awss3 s3api put-public-access-block --bucket "$b" \
+        --public-access-block-configuration RestrictPublicBuckets=true >/dev/null 2>&1 || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/a.txt")" = 403 ] || return 1
+    awss3 s3api delete-public-access-block --bucket "$b" >/dev/null 2>&1 || return 1
+    [ "$(curl -s "$url/pub/a.txt")" = public ] || return 1
     # An unsigned form, where the policy allows anyone to upload, and not
     # elsewhere.
     [ "$(curl -s -o /dev/null -w '%{http_code}' -F key=drop/form.txt -F "file=@$WORK_DIR/pub.txt" "$url")" = 204 ] \

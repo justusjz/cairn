@@ -27,6 +27,8 @@ export type Lifecycle = Schemas["Lifecycle"];
 export type LifecycleBucket = Schemas["LifecycleBucket"];
 export type LifecycleConfiguration = Schemas["LifecycleConfiguration"];
 export type LifecycleRule = Schemas["LifecycleRule"];
+export type BucketAccess = Schemas["BucketAccess"];
+export type PublicAccessBlock = Schemas["Block"];
 
 /** Where the API is; also in the spec's `servers`. */
 const BASE = "/_dashboard/api";
@@ -104,10 +106,22 @@ export const api = {
   setBucketLifecycle: (bucket: string, configuration: LifecycleConfiguration) =>
     ok(client.PUT("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket), body: configuration })),
   deleteBucketLifecycle: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),
+  bucketAccess: (bucket: string) => ok(client.GET("/buckets/{bucket}/access", { params: bucketPath(bucket) })),
+  putBucketPolicy: (bucket: string, document: string) =>
+    ok(client.PUT("/buckets/{bucket}/policy", { params: bucketPath(bucket), body: { document } })),
+  deleteBucketPolicy: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/policy", { params: bucketPath(bucket) })),
+  putPublicAccessBlock: (bucket: string, block: PublicAccessBlock) =>
+    ok(client.PUT("/buckets/{bucket}/public-access-block", { params: bucketPath(bucket), body: block })),
+  deletePublicAccessBlock: (bucket: string) =>
+    ok(client.DELETE("/buckets/{bucket}/public-access-block", { params: bucketPath(bucket) })),
+  /** The cluster's public access block (`block-public-policy`,
+   * `restrict-public-buckets`), set with `setSetting`. */
+  publicAccess: () => ok(client.GET("/public-access")),
   setLifecycleRate: (rate: number) => ok(client.PUT("/lifecycle/rate", { body: { rate } })),
   /** Sets a redundancy setting (`data-shards`, `parity-shards`,
-   * `repair-after`); `null` unsets it. Resolves to what's wrong with the
-   * cluster's layouts now, if anything. */
+   * `repair-after`) or a public access one (`block-public-policy`,
+   * `restrict-public-buckets`); `null` unsets it. Resolves to what's wrong
+   * with the cluster's layouts now, if anything. */
   setSetting: (name: string, value: number | null) =>
     ok(client.PUT("/settings/{name}", { params: { path: { name } }, body: { value } })),
   removeNode: (id: number) => ok(client.POST("/nodes/{id}/remove", { params: { path: { id } } })),

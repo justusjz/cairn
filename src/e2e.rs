@@ -36,6 +36,7 @@ mod locking;
 mod metadata;
 mod multipart;
 mod post_object;
+mod public_access;
 mod users;
 mod tagging;
 

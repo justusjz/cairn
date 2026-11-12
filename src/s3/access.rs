@@ -71,6 +71,16 @@ fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Result<Arc<Polic
     Ok(policy)
 }
 
+/// A bucket, as a request's checks see it.
+struct Loaded {
+    exists: bool,
+    policy: Option<Arc<Policy>>,
+    /// Whether its policy is public, and RestrictPublicBuckets is on (the
+    /// bucket's or the cluster's; see `public_access`): then it allows
+    /// anonymous requests nothing.
+    restricted: bool,
+}
+
 /// Where a request comes from, as condition keys say it.
 pub struct Origin<'a> {
     /// The connection's peer.
@@ -89,8 +99,8 @@ pub struct Access {
     user: Option<(String, String, String)>,
     identity: Vec<Arc<Policy>>,
     pub context: Context,
-    /// Each bucket loaded: whether it exists, and its policy.
-    buckets: HashMap<String, (bool, Option<Arc<Policy>>)>,
+    /// Each bucket loaded: whether it exists, and its policy (see `Loaded`).
+    buckets: HashMap<String, Loaded>,
 }
 
 impl Access {
@@ -126,14 +136,20 @@ impl Access {
 
     /// Loads `bucket`'s policy, for the checks on it; whether it exists.
     pub async fn load(&mut self, app: &App, bucket: &str) -> anyhow::Result<bool> {
-        if let Some((exists, _)) = self.buckets.get(bucket) {
-            return Ok(*exists);
+        if let Some(loaded) = self.buckets.get(bucket) {
+            return Ok(loaded.exists);
         }
         let row = app
             .pool
             .get()
             .await?
-            .query_opt_cached("SELECT policy, policy_principals::text FROM buckets WHERE name = $1", &[&bucket])
+            .query_opt_cached(
+                "SELECT policy, policy_principals::text,
+                        public_access_block & 8 <> 0
+                        OR coalesce((SELECT value FROM settings WHERE name = 'restrict-public-buckets'), '0') <> '0'
+                 FROM buckets WHERE name = $1",
+                &[&bucket],
+            )
             .await?;
         let policy = match row.as_ref().and_then(|row| row.get::<_, Option<String>>(0)) {
             Some(text) => {
@@ -144,7 +160,9 @@ impl Access {
             }
             None => None,
         };
-        self.buckets.insert(bucket.to_owned(), (row.is_some(), policy));
+        let restrict = row.as_ref().and_then(|row| row.get::<_, Option<bool>>(2)).unwrap_or(false);
+        let restricted = restrict && policy.as_ref().is_some_and(|policy| policy.is_public());
+        self.buckets.insert(bucket.to_owned(), Loaded { exists: row.is_some(), policy, restricted });
         Ok(row.is_some())
     }
 
@@ -165,7 +183,11 @@ impl Access {
             None => Who::Anonymous,
         };
         let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &self.context };
-        let bucket = check.on.bucket().and_then(|b| self.buckets.get(b)).and_then(|(_, p)| p.as_deref());
+        let loaded = check.on.bucket().and_then(|b| self.buckets.get(b));
+        // A restricted bucket's public policy is none to anonymous requests.
+        let bucket = loaded
+            .filter(|loaded| !(loaded.restricted && self.user.is_none()))
+            .and_then(|loaded| loaded.policy.as_deref());
         crate::policy::verdict(self.identity.iter().map(|p| &**p), bucket, &request)
     }
 

@@ -201,6 +201,7 @@ const MIGRATIONS: &[&str] = &[
     USERS,
     CONSOLE,
     PRINCIPAL_IDS,
+    PUBLIC_ACCESS_BLOCK,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1232,6 +1233,18 @@ CREATE TRIGGER buckets_policy_principals BEFORE INSERT OR UPDATE OF policy ON bu
     FOR EACH ROW EXECUTE FUNCTION cairn_policy_principals();
 
 UPDATE buckets SET policy = policy WHERE policy IS NOT NULL;
+"#;
+
+/// Migration 32: a bucket's public access block (see
+/// `s3::buckets::public_access`), its four flags as bits: 1
+/// BlockPublicAcls, 2 IgnorePublicAcls, 4 BlockPublicPolicy, 8
+/// RestrictPublicBuckets. NULL: it has none. The buckets there are have none;
+/// new ones get all four, as S3's do, older Cairns' too (the column's
+/// default).
+const PUBLIC_ACCESS_BLOCK: &str = r#"
+ALTER TABLE buckets ADD COLUMN public_access_block smallint
+    CHECK (public_access_block BETWEEN 0 AND 15);
+ALTER TABLE buckets ALTER COLUMN public_access_block SET DEFAULT 15;
 "#;
 
 #[cfg(test)]

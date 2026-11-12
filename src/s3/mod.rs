@@ -12,7 +12,7 @@ use crate::{
     s3::{
         buckets::{
             cors::{self, delete_bucket_cors, get_bucket_cors, put_bucket_cors},
-            policy,
+            policy, public_access,
             create::create_bucket,
             delete::delete_bucket,
             head::head_bucket,
@@ -300,6 +300,9 @@ async fn handle_request(
             if operation.name == "GetBucketPolicy" {
                 return Ok(box_response(policy::get_bucket_policy(&app, &bucket).await?));
             }
+            if operation.name == "GetPublicAccessBlock" {
+                return Ok(box_response(public_access::get_public_access_block(&app, &bucket).await?));
+            }
             if operation.name == "GetBucketTagging" {
                 return Ok(box_response(get_bucket_tagging(&app, &bucket).await?));
             }
@@ -474,6 +477,18 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
+            // PutPublicAccessBlock: PUT /{bucket}?publicAccessBlock with a
+            // <PublicAccessBlockConfiguration> body, which must declare a
+            // checksum, as in S3.
+            hyper::Method::PUT if operation.name == "PutPublicAccessBlock" => {
+                if !payload::has_body_checksum(req.headers()) {
+                    return Ok(box_response(missing_checksum()));
+                }
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => public_access::put_public_access_block(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
             // PutBucketAcl: there are no ACLs (`acl`).
             hyper::Method::PUT if operation.name == "PutBucketAcl" => {
                 acl::put_bucket_acl(&app, &bucket, req.headers()).await?
@@ -511,6 +526,9 @@ async fn handle_request(
             }
             hyper::Method::DELETE if operation.name == "DeleteBucketCors" => {
                 delete_bucket_cors(&app, &bucket).await?
+            }
+            hyper::Method::DELETE if operation.name == "DeletePublicAccessBlock" => {
+                public_access::delete_public_access_block(&app, &bucket).await?
             }
             hyper::Method::DELETE if operation.name == "DeleteBucketTagging" => {
                 delete_bucket_tagging(&app, &bucket).await?
@@ -1015,6 +1033,7 @@ pub(crate) const BUCKET_CONFIGURATION: &[&str] = &[
     "object-lock",
     "policy",
     "policyStatus",
+    "publicAccessBlock",
     "cors",
     "tagging",
     "lifecycle",

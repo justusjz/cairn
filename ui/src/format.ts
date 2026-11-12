@@ -1,5 +1,14 @@
 // How numbers, sizes and times are shown.
 
+/** `text` indented, if it's JSON; else as it is. */
+export function pretty(text: string): string {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    return text;
+  }
+}
+
 export function bytes(n: number | null | undefined): string {
   if (n == null) return "–";
   const units = ["B", "KiB", "MiB", "GiB", "TiB", "PiB"];

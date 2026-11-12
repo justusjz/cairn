@@ -311,17 +311,20 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "requestPayment",
             "logging",
             "notification",
+            "publicAccessBlock",
             // Ignored, as S3 ignores it on a bucket (probed): a listing.
             "attributes",
         ],
         // PutBucketVersioning, PutBucketEncryption,
         // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketTagging,
         // PutBucketPolicy, PutBucketAcl (`acl`).
-        (true, &Method::PUT) => &["versioning", "encryption", "lifecycle", "cors", "tagging", "policy", "acl"],
+        (true, &Method::PUT) => {
+            &["versioning", "encryption", "lifecycle", "cors", "tagging", "policy", "acl", "publicAccessBlock"]
+        }
         (true, &Method::POST) => &["delete"],
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
         // DeleteBucketTagging, DeleteBucketPolicy.
-        (true, &Method::DELETE) => &["encryption", "lifecycle", "cors", "tagging", "policy"],
+        (true, &Method::DELETE) => &["encryption", "lifecycle", "cors", "tagging", "policy", "publicAccessBlock"],
         // GetObjectAcl (stubbed), ListParts, GetObjectTagging, a part of
         // the object, GetObjectAttributes.
         (false, &Method::GET) => &["acl", "uploadId", "tagging", "partNumber", "attributes"],

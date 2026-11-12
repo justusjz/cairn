@@ -1394,13 +1394,38 @@ END
 $$;
 
 -- T27: PutBucketPolicy and DeleteBucketPolicy: sets (or, with NULL, removes)
--- the bucket's policy. A plain UPDATE of the bucket's row, as T16's: no
--- invariant involves the policy, which requests read as they begin, not
--- under B. Returns whether the bucket exists.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_set_policy(p_bucket text, p_policy text)
+-- the bucket's policy, unless it's public (`p_public`) and the bucket's
+-- public access block, or the cluster's `block-public-policy`, blocks public
+-- policies ('blocked'). Takes the bucket's row as a plain UPDATE does (no
+-- key update), and checks the block under it, so that a PutPublicAccessBlock
+-- (T32) lands entirely before or after. No invariant involves the policy,
+-- which requests read as they begin, not under B. 'set', 'blocked' or
+-- 'no_such_bucket'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_policy(p_bucket text, p_policy text, p_public boolean)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_block smallint;
+BEGIN
+    SELECT public_access_block INTO v_block FROM buckets WHERE name = p_bucket FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_bucket';
+    END IF;
+    IF p_public AND (coalesce(v_block, 0) & 4 <> 0
+                     OR coalesce((SELECT value FROM settings WHERE name = 'block-public-policy'), '0') <> '0') THEN
+        RETURN 'blocked';
+    END IF;
+    UPDATE buckets SET policy = p_policy WHERE name = p_bucket;
+    RETURN 'set';
+END
+$$;
+
+-- T32: PutPublicAccessBlock and DeletePublicAccessBlock: sets (or, with
+-- NULL, removes) the bucket's public access block. A plain UPDATE of the
+-- bucket's row, as T16's. Returns whether the bucket exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_public_access_block(p_bucket text, p_block smallint)
 RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE buckets SET policy = p_policy WHERE name = p_bucket;
+    UPDATE buckets SET public_access_block = p_block WHERE name = p_bucket;
     RETURN FOUND;
 END
 $$;

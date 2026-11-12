@@ -6,5 +6,6 @@ pub mod head;
 pub mod lifecycle;
 pub mod list;
 pub mod policy;
+pub mod public_access;
 pub mod tagging;
 pub mod versioning;

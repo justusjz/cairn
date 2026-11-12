@@ -1,7 +1,7 @@
 import { For, Show, createSignal, onMount } from "solid-js";
 import { type AccessKey, type Bucket, type Cluster, type Permission, type User, api } from "../api";
 import { Badge, Loading, Panel, SecretDialog, Table, act, poll, toast } from "../components/ui";
-import { ago, date } from "../format";
+import { ago, date, pretty } from "../format";
 
 const PERMISSIONS: Permission[] = ["read", "write", "delete-version"];
 
@@ -555,14 +555,6 @@ function PolicyDialog(props: { user: string; policy?: string; onClose: () => voi
   );
 }
 
-/** `text` indented, if it's JSON; else as it is. */
-function pretty(text: string): string {
-  try {
-    return JSON.stringify(JSON.parse(text), null, 2);
-  } catch {
-    return text;
-  }
-}
 
 /** A user's enrollment link for the console, shown once. */
 function EnrollmentDialog(props: { user: string; url?: string | null; path: string; onClose: () => void }) {

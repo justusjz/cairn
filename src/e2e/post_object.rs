@@ -501,6 +501,10 @@ async fn takes_unsigned_forms_where_a_bucket_policy_allows_them() {
     let policy = format!(
         r#"{{"Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::{BUCKET}/drop/*"}}]}}"#
     );
+    // A new bucket blocks public policies, as in S3.
+    let blocked = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, Bytes::from(policy.clone())).await.unwrap();
+    assert_eq!(blocked.status(), StatusCode::FORBIDDEN);
+    assert!(crate::s3::buckets::public_access::set(&app, BUCKET, None).await.unwrap());
     let set = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, Bytes::from(policy)).await.unwrap();
     assert_eq!(set.status(), StatusCode::NO_CONTENT);
     let response = post(&app, unsigned("drop/a.txt")).await;

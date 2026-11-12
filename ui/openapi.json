@@ -121,6 +121,50 @@
         }
       }
     },
+    "/buckets/{bucket}/access": {
+      "get": {
+        "operationId": "get_bucket_access",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketAccess"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/buckets/{bucket}/download": {
       "get": {
         "summary": "An object's data, as a file to save. It's always sent as an attachment of\nno particular type, so that a browser never renders it as part of the UI.",
@@ -423,6 +467,178 @@
         }
       }
     },
+    "/buckets/{bucket}/policy": {
+      "put": {
+        "summary": "Sets a bucket's policy, as PutBucketPolicy does: checked as S3 checks\nit, and refused if it's public while public policies are blocked.",
+        "operationId": "put_bucket_policy",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyDocument"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's policy.",
+        "operationId": "delete_bucket_policy",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/public-access-block": {
+      "put": {
+        "summary": "Sets a bucket's public access block, as PutPublicAccessBlock does.",
+        "operationId": "put_public_access_block",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Block"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's public access block: only the cluster's applies.",
+        "operationId": "delete_public_access_block",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/cluster": {
       "get": {
         "summary": "The nodes, each with the metrics it reports, if it's live.",
@@ -646,6 +862,32 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/public-access": {
+      "get": {
+        "summary": "The cluster's public access block: its settings `block-public-policy`\nand `restrict-public-buckets` (set with `PUT /settings/{name}`).",
+        "operationId": "get_public_access",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Block"
                 }
               }
             }
@@ -1323,7 +1565,7 @@
     },
     "/settings/{name}": {
       "put": {
-        "summary": "Sets one of the redundancy settings (`data-shards`, `parity-shards`,\n`repair-after`), for the whole cluster, as `cairn config set` does. The\nnode answering goes by it right away, the others within a heartbeat.",
+        "summary": "Sets one of the redundancy settings (`data-shards`, `parity-shards`,\n`repair-after`), or of the cluster's public access block\n(`block-public-policy`, `restrict-public-buckets`: 0 or 1), for the whole\ncluster, as `cairn config set` does. The node answering goes by it right\naway, the others within a heartbeat (the public access block's, at once).",
         "operationId": "set_setting",
         "parameters": [
           {
@@ -1571,6 +1813,66 @@
           }
         }
       },
+      "Block": {
+        "type": "object",
+        "description": "A public access block's four flags.",
+        "required": [
+          "block_public_acls",
+          "ignore_public_acls",
+          "block_public_policy",
+          "restrict_public_buckets"
+        ],
+        "properties": {
+          "block_public_acls": {
+            "type": "boolean"
+          },
+          "block_public_policy": {
+            "type": "boolean"
+          },
+          "ignore_public_acls": {
+            "type": "boolean"
+          },
+          "restrict_public_buckets": {
+            "type": "boolean"
+          }
+        }
+      },
+      "BucketAccess": {
+        "type": "object",
+        "description": "Who may get at a bucket, besides its users' grants and policies: its\npolicy, and its public access block (see `s3::buckets::public_access`).",
+        "required": [
+          "public",
+          "cluster"
+        ],
+        "properties": {
+          "cluster": {
+            "$ref": "#/components/schemas/Block",
+            "description": "The cluster's (only its policy flags count), which applies to every\nbucket as well."
+          },
+          "policy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its policy, as GetBucketPolicy shows it; `null` if it has none."
+          },
+          "public": {
+            "type": "boolean",
+            "description": "Whether the policy makes the bucket public."
+          },
+          "public_access_block": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Block",
+                "description": "Its public access block; `null` if it has none."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "BucketLifecycle": {
         "type": "object",
         "description": "A bucket's lifecycle rules, if it has any.",
@@ -1599,7 +1901,8 @@
           "version_bytes",
           "uploads",
           "roles",
-          "tags"
+          "tags",
+          "public"
         ],
         "properties": {
           "bytes": {
@@ -1624,6 +1927,21 @@
             "type": "integer",
             "format": "int64",
             "description": "Current versions that aren't delete markers."
+          },
+          "public": {
+            "type": "boolean",
+            "description": "Whether its policy makes it public (GetBucketPolicyStatus)."
+          },
+          "public_access_block": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Block",
+                "description": "Its public access block, if it has one."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "roles": {
             "type": "integer",

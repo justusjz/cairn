@@ -86,6 +86,10 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(get_bucket_lifecycle, put_bucket_lifecycle, delete_bucket_lifecycle))
         .routes(routes!(set_lifecycle_rate))
         .routes(routes!(set_setting))
+        .routes(routes!(get_bucket_access))
+        .routes(routes!(put_bucket_policy, delete_bucket_policy))
+        .routes(routes!(put_public_access_block, delete_public_access_block))
+        .routes(routes!(get_public_access))
         .routes(routes!(remove_node))
         .routes(routes!(keep_node))
 }
@@ -788,6 +792,10 @@ pub(super) struct BucketSummary {
     roles: i64,
     /// Its tags (PutBucketTagging), sorted by key.
     tags: Vec<Tag>,
+    /// Whether its policy makes it public (GetBucketPolicyStatus).
+    public: bool,
+    /// Its public access block, if it has one.
+    public_access_block: Option<crate::s3::buckets::public_access::Block>,
 }
 
 /// A tag of a bucket or an object version (see `s3::tags`).
@@ -859,6 +867,19 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
+    // Each bucket's policy (whether it's public), and its block.
+    let mut access: HashMap<String, (bool, Option<crate::s3::buckets::public_access::Block>)> = HashMap::new();
+    for row in client.query_cached("SELECT name, policy, public_access_block FROM buckets", &[]).await? {
+        let name: String = row.get(0);
+        let public = match row.get::<_, Option<&str>>(1) {
+            Some(text) => crate::policy::Policy::parse(text, crate::policy::Kind::Bucket(&name))
+                .map_err(|e| anyhow::anyhow!("bucket {name}'s policy doesn't parse: {}", e.message))?
+                .is_public(),
+            None => false,
+        };
+        let block = row.get::<_, Option<i16>>(2).map(crate::s3::buckets::public_access::Block::from_bits);
+        access.insert(name, (public, block));
+    }
     Ok(buckets
         .into_iter()
         .map(|b| {
@@ -869,6 +890,8 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
                 roles: roles.get(&b.name).copied().unwrap_or(0),
                 default_kms_key: defaults.remove(&b.name),
                 tags: tags.remove(&b.name).as_deref().map(tag_list).unwrap_or_default(),
+                public: access.get(&b.name).is_some_and(|(public, _)| *public),
+                public_access_block: access.remove(&b.name).and_then(|(_, block)| block),
                 name: b.name,
                 created_at: b.created_at.epoch,
                 versioning: b.versioning,
@@ -922,6 +945,132 @@ async fn delete_bucket(State(app): AppState, Path(bucket): Path<String>) -> Resu
         ))),
         _ => Err(crate::Contended(format!("deleting bucket {bucket:?}")).into()),
     }
+}
+
+// ─── Bucket access ───────────────────────────────────────────────────────────
+
+/// Who may get at a bucket, besides its users' grants and policies: its
+/// policy, and its public access block (see `s3::buckets::public_access`).
+#[derive(Serialize, ToSchema)]
+struct BucketAccess {
+    /// Its policy, as GetBucketPolicy shows it; `null` if it has none.
+    policy: Option<String>,
+    /// Whether the policy makes the bucket public.
+    public: bool,
+    /// Its public access block; `null` if it has none.
+    public_access_block: Option<crate::s3::buckets::public_access::Block>,
+    /// The cluster's (only its policy flags count), which applies to every
+    /// bucket as well.
+    cluster: crate::s3::buckets::public_access::Block,
+}
+
+#[utoipa::path(get, path = "/buckets/{bucket}/access", params(("bucket" = String, Path)), responses(
+    (status = 200, body = BucketAccess),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn get_bucket_access(State(app): AppState, Path(bucket): Path<String>) -> Result<Json<BucketAccess>> {
+    use crate::s3::buckets::{policy, public_access};
+    let client = app.pool.get().await?;
+    let no_bucket = || ApiError::NotFound(format!("no bucket named {bucket:?}"));
+    let policy = policy::shown(&client, &bucket).await?.ok_or_else(no_bucket)?;
+    let stored: Option<String> = client
+        .query_opt_cached("SELECT policy FROM buckets WHERE name = $1", &[&bucket])
+        .await?
+        .ok_or_else(no_bucket)?
+        .get(0);
+    let public = match &stored {
+        Some(text) => crate::policy::Policy::parse(text, crate::policy::Kind::Bucket(&bucket))
+            .map_err(|e| anyhow::anyhow!("bucket {bucket}'s policy doesn't parse: {}", e.message))?
+            .is_public(),
+        None => false,
+    };
+    let public_access_block = public_access::get(&app, &bucket).await?.ok_or_else(no_bucket)?;
+    Ok(Json(BucketAccess { policy, public, public_access_block, cluster: public_access::cluster(&client).await? }))
+}
+
+/// Sets a bucket's policy, as PutBucketPolicy does: checked as S3 checks
+/// it, and refused if it's public while public policies are blocked.
+#[utoipa::path(put, path = "/buckets/{bucket}/policy", params(("bucket" = String, Path)),
+    request_body = PolicyDocument, responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn put_bucket_policy(
+    State(app): AppState,
+    Path(bucket): Path<String>,
+    Json(body): Json<PolicyDocument>,
+) -> Result<StatusCode> {
+    use crate::s3::buckets::policy;
+    let client = app.pool.get().await?;
+    let checked = match policy::check(&client, &bucket, &body.document).await? {
+        Ok(checked) => checked,
+        Err(refused) => return Err(ApiError::BadRequest(refused.message)),
+    };
+    match policy::set(&client, &bucket, Some(&checked)).await? {
+        policy::Set::Set => Ok(StatusCode::NO_CONTENT),
+        policy::Set::Blocked => Err(ApiError::Forbidden(format!(
+            "the policy makes the bucket public, and {}",
+            policy::BLOCKED
+        ))),
+        policy::Set::NoSuchBucket => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+    }
+}
+
+/// Removes a bucket's policy.
+#[utoipa::path(delete, path = "/buckets/{bucket}/policy", params(("bucket" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_bucket_policy(State(app): AppState, Path(bucket): Path<String>) -> Result<StatusCode> {
+    use crate::s3::buckets::policy;
+    match policy::set(&app.pool.get().await?, &bucket, None).await? {
+        policy::Set::NoSuchBucket => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+        _ => Ok(StatusCode::NO_CONTENT),
+    }
+}
+
+/// Sets a bucket's public access block, as PutPublicAccessBlock does.
+#[utoipa::path(put, path = "/buckets/{bucket}/public-access-block", params(("bucket" = String, Path)),
+    request_body = crate::s3::buckets::public_access::Block, responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn put_public_access_block(
+    State(app): AppState,
+    Path(bucket): Path<String>,
+    Json(body): Json<crate::s3::buckets::public_access::Block>,
+) -> Result<StatusCode> {
+    match crate::s3::buckets::public_access::set(&app, &bucket, Some(body)).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+    }
+}
+
+/// Removes a bucket's public access block: only the cluster's applies.
+#[utoipa::path(delete, path = "/buckets/{bucket}/public-access-block", params(("bucket" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_public_access_block(State(app): AppState, Path(bucket): Path<String>) -> Result<StatusCode> {
+    match crate::s3::buckets::public_access::set(&app, &bucket, None).await? {
+        true => Ok(StatusCode::NO_CONTENT),
+        false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+    }
+}
+
+/// The cluster's public access block: its settings `block-public-policy`
+/// and `restrict-public-buckets` (set with `PUT /settings/{name}`).
+#[utoipa::path(get, path = "/public-access", responses(
+    (status = 200, body = crate::s3::buckets::public_access::Block),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn get_public_access(State(app): AppState) -> Result<Json<crate::s3::buckets::public_access::Block>> {
+    Ok(Json(crate::s3::buckets::public_access::cluster(&app.pool.get().await?).await?))
 }
 
 // ─── Objects ─────────────────────────────────────────────────────────────────
@@ -2037,6 +2186,62 @@ mod e2e {
         assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["configuration"], Value::Null);
     }
 
+    /// A bucket's policy and public access block, and the cluster's block.
+    #[tokio::test]
+    async fn edits_bucket_access() {
+        let Some(app) = node().await else { return };
+        let bucket = crate::e2e::BUCKET;
+        let access = format!("/_dashboard/api/buckets/{bucket}/access");
+        let get = || async { serde_json::from_slice::<Value>(&send(&app, request("GET", &access, None)).await.2).unwrap() };
+        let all = serde_json::json!({
+            "block_public_acls": true, "ignore_public_acls": true,
+            "block_public_policy": true, "restrict_public_buckets": true,
+        });
+        let first = get().await;
+        assert_eq!((&first["policy"], &first["public"]), (&Value::Null, &Value::Bool(false)));
+        assert_eq!(first["public_access_block"], all);
+        assert_eq!(first["cluster"]["block_public_policy"], false);
+
+        let document = format!(
+            r#"{{"Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
+        );
+        let policy = format!("/_dashboard/api/buckets/{bucket}/policy");
+        let put = || request("PUT", &policy, Some(serde_json::json!({ "document": document })));
+        let (status, _, body) = send(&app, put()).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(error_of(&body).contains("BlockPublicPolicy"), "{}", error_of(&body));
+        let block = format!("/_dashboard/api/buckets/{bucket}/public-access-block");
+        let none = serde_json::json!({
+            "block_public_acls": false, "ignore_public_acls": false,
+            "block_public_policy": false, "restrict_public_buckets": true,
+        });
+        assert_eq!(send(&app, request("PUT", &block, Some(none.clone()))).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(send(&app, put()).await.0, StatusCode::NO_CONTENT);
+        let after = get().await;
+        assert_eq!((&after["public"], &after["public_access_block"]), (&Value::Bool(true), &none));
+        assert!(after["policy"].as_str().unwrap().contains(r#""Principal":"*""#));
+        let bad = request("PUT", &policy, Some(serde_json::json!({ "document": "{}" })));
+        assert_eq!(send(&app, bad).await.0, StatusCode::BAD_REQUEST);
+        // The bucket list tells too.
+        let (_, _, body) = send(&app, request("GET", "/_dashboard/api/buckets", None)).await;
+        let listed: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listed[0]["public"], true);
+
+        // The cluster's block.
+        let setting = |value| request("PUT", "/_dashboard/api/settings/block-public-policy", Some(serde_json::json!({ "value": value })));
+        assert_eq!(send(&app, setting(1)).await.0, StatusCode::OK);
+        assert_eq!(get().await["cluster"]["block_public_policy"], true);
+        assert_eq!(send(&app, request("DELETE", &policy, None)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(send(&app, put()).await.0, StatusCode::FORBIDDEN);
+        let (_, _, body) = send(&app, request("GET", "/_dashboard/api/public-access", None)).await;
+        assert_eq!(serde_json::from_slice::<Value>(&body).unwrap()["block_public_policy"], true);
+        assert_eq!(send(&app, setting(2)).await.0, StatusCode::BAD_REQUEST);
+
+        assert_eq!(send(&app, request("DELETE", &block, None)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(get().await["public_access_block"], Value::Null);
+        assert_eq!(send(&app, request("GET", "/_dashboard/api/buckets/nope/access", None)).await.0, StatusCode::NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn serves_the_dashboard() {
         let Some(app) = node().await else { return };
@@ -2418,16 +2623,20 @@ struct SettingChanged {
 }
 
 /// The settings that the dashboard changes this way: those of how blobs are
-/// stored, and repaired.
+/// stored, and repaired, and the cluster's public access block.
 const REDUNDANCY: &[&crate::settings::Setting] = &[
     &crate::settings::DATA_SHARDS,
     &crate::settings::PARITY_SHARDS,
     &crate::settings::REPAIR_AFTER,
+    &crate::settings::BLOCK_PUBLIC_POLICY,
+    &crate::settings::RESTRICT_PUBLIC_BUCKETS,
 ];
 
 /// Sets one of the redundancy settings (`data-shards`, `parity-shards`,
-/// `repair-after`), for the whole cluster, as `cairn config set` does. The
-/// node answering goes by it right away, the others within a heartbeat.
+/// `repair-after`), or of the cluster's public access block
+/// (`block-public-policy`, `restrict-public-buckets`: 0 or 1), for the whole
+/// cluster, as `cairn config set` does. The node answering goes by it right
+/// away, the others within a heartbeat (the public access block's, at once).
 #[utoipa::path(put, path = "/settings/{name}", params(("name" = String, Path)),
     request_body = NewSetting, responses(
         (status = 200, body = SettingChanged),
@@ -2454,7 +2663,8 @@ async fn set_setting(
         None => setting.unset(&client).await?,
     }
     crate::refresh_settings(&app).await?;
-    let warnings = if setting.name == crate::settings::REPAIR_AFTER.name {
+    let redundancy = [crate::settings::DATA_SHARDS.name, crate::settings::PARITY_SHARDS.name];
+    let warnings = if !redundancy.contains(&setting.name) {
         Vec::new()
     } else {
         crate::settings::placement_warnings(&client).await?

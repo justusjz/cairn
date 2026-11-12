@@ -101,6 +101,11 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
         Some(("PutBucketPolicy", "s3:PutBucketPolicy", "DeleteBucketPolicy", "s3:DeleteBucketPolicy")),
     ),
     ("policyStatus", ("GetBucketPolicyStatus", "s3:GetBucketPolicyStatus"), None),
+    (
+        "publicAccessBlock",
+        ("GetPublicAccessBlock", "s3:GetBucketPublicAccessBlock"),
+        Some(("PutPublicAccessBlock", "s3:PutBucketPublicAccessBlock", "DeletePublicAccessBlock", "s3:PutBucketPublicAccessBlock")),
+    ),
     ("acl", ("GetBucketAcl", "s3:GetBucketAcl"), Some(("PutBucketAcl", "s3:PutBucketAcl", "", ""))),
     ("ownershipControls", ("GetBucketOwnershipControls", "s3:GetBucketOwnershipControls"), None),
     ("location", ("GetBucketLocation", "s3:GetBucketLocation"), None),

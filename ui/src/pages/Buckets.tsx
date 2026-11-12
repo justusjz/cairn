@@ -1,8 +1,8 @@
 import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
-import { For, Match, Show, Switch, createEffect, createSignal, on } from "solid-js";
-import { type Entry, api, downloadUrl } from "../api";
-import { Badge, LiveDot, Loading, Panel, Table, act, poll } from "../components/ui";
-import { bytes, date, num } from "../format";
+import { For, Match, Show, Switch, createEffect, createSignal, on, onMount } from "solid-js";
+import { type Bucket, type BucketAccess, type Entry, type PublicAccessBlock, api, downloadUrl } from "../api";
+import { Badge, LiveDot, Loading, Panel, Table, act, poll, toast } from "../components/ui";
+import { bytes, date, num, pretty } from "../format";
 
 const enc = encodeURIComponent;
 
@@ -38,8 +38,65 @@ export function objectUrl(bucket: string, key: string) {
   return `/buckets/${enc(bucket)}/object?key=${enc(key)}`;
 }
 
+/** Whether a bucket is open to anyone, as its policy, its public access
+ * block and the cluster's say. */
+function PublicAccess(props: { bucket: Bucket; cluster: PublicAccessBlock }) {
+  const restricted = () => !!props.bucket.public_access_block?.restrict_public_buckets || props.cluster.restrict_public_buckets;
+  const blocked = () => !!props.bucket.public_access_block?.block_public_policy || props.cluster.block_public_policy;
+  return (
+    <Switch fallback={<span class="subtle">not blocked</span>}>
+      <Match when={props.bucket.public && !restricted()}>
+        <span title="Its policy lets anyone, unsigned requests too, do what it allows">
+          <Badge tone="bad">public</Badge>
+        </span>
+      </Match>
+      <Match when={props.bucket.public}>
+        <span title="Its policy is public, but RestrictPublicBuckets lets it allow unsigned requests nothing">
+          <Badge tone="warn">public policy, restricted</Badge>
+        </span>
+      </Match>
+      <Match when={blocked() && restricted()}>
+        <Badge tone="ok">blocked</Badge>
+      </Match>
+      <Match when={blocked() || restricted()}>
+        <Badge>partly blocked</Badge>
+      </Match>
+    </Switch>
+  );
+}
+
+/** The cluster's public access block, which every bucket gets too. */
+function ClusterBlock(props: { block: PublicAccessBlock; changed: () => void }) {
+  const set = async (name: string, on: boolean) => {
+    if (await act(() => api.setSetting(name, on ? 1 : 0), `${name} ${on ? "on" : "off"}`)) props.changed();
+  };
+  return (
+    <div class="toolbar">
+      <span class="subtle">For every bucket:</span>
+      <label class="check" title="Refuse bucket policies that make a bucket public, whatever its own block says">
+        <input
+          type="checkbox"
+          checked={props.block.block_public_policy}
+          onChange={(e) => set("block-public-policy", e.currentTarget.checked)}
+        />
+        Block public policies
+      </label>
+      <label class="check" title="Let no public bucket policy allow unsigned requests anything">
+        <input
+          type="checkbox"
+          checked={props.block.restrict_public_buckets}
+          onChange={(e) => set("restrict-public-buckets", e.currentTarget.checked)}
+        />
+        Restrict public buckets
+      </label>
+    </div>
+  );
+}
+
 export function BucketList() {
-  const buckets = poll(api.buckets);
+  const data = poll(() => Promise.all([api.buckets(), api.publicAccess()]));
+  const buckets = { data: () => data.data()?.[0], error: data.error, refresh: data.refresh };
+  const cluster = () => data.data()?.[1];
   const [name, setName] = createSignal("");
   const create = async (e: SubmitEvent) => {
     e.preventDefault();
@@ -64,6 +121,7 @@ export function BucketList() {
           </button>
         </form>
       </div>
+      <Show when={cluster()}>{(c) => <ClusterBlock block={c()} changed={data.refresh} />}</Show>
       <Show when={buckets.data()} fallback={<Loading error={buckets.error()} />}>
         {(list) => (
           <Panel>
@@ -74,6 +132,7 @@ export function BucketList() {
                 "Name",
                 "Versioning",
                 "Default encryption",
+                "Public access",
                 { label: "Objects", num: true },
                 { label: "Size", num: true },
                 { label: "Older versions", num: true },
@@ -107,6 +166,9 @@ export function BucketList() {
                           </span>
                         )}
                       </Show>
+                    </td>
+                    <td>
+                      <PublicAccess bucket={b} cluster={cluster()!} />
                     </td>
                     <td class="num">{num(b.objects)}</td>
                     <td class="num">{bytes(b.bytes)}</td>
@@ -174,6 +236,7 @@ export function BucketBrowser() {
   const [loaded, setLoaded] = createSignal(false);
   const [error, setError] = createSignal<string>();
   const [goto, setGoto] = createSignal("");
+  const [access, setAccess] = createSignal(false);
 
   // Counts the listings started, so that a page of an old one is dropped.
   let listing = 0;
@@ -215,6 +278,7 @@ export function BucketBrowser() {
         <A class="button" href={`/buckets/${enc(bucket())}/lifecycle`}>
           Lifecycle rules
         </A>
+        <button onClick={() => setAccess(true)}>Policy and public access</button>
         <span class="spacer" />
         <form
           class="form-row"
@@ -227,6 +291,9 @@ export function BucketBrowser() {
           <button type="submit">Open</button>
         </form>
       </div>
+      <Show when={access()}>
+        <AccessDialog bucket={bucket()} onClose={() => setAccess(false)} />
+      </Show>
       <Show when={loaded()} fallback={<Loading error={error()} />}>
         <Panel>
           <Table
@@ -283,6 +350,160 @@ export function BucketBrowser() {
         </Panel>
       </Show>
     </>
+  );
+}
+
+/** A starting point for a bucket's policy: anyone may read what's under
+ * `public/`. */
+const POLICY_TEMPLATE = (bucket: string) => `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": "*",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::${bucket}/public/*"
+    }
+  ]
+}`;
+
+/** The public access block's flags, as the dialog shows them. */
+const FLAGS: { key: keyof PublicAccessBlock; label: string; note: string }[] = [
+  { key: "block_public_policy", label: "Block public policies", note: "A policy that makes the bucket public is refused." },
+  {
+    key: "restrict_public_buckets",
+    label: "Restrict public buckets",
+    note: "A public policy allows unsigned requests nothing; the cluster's users keep what it allows them.",
+  },
+  { key: "block_public_acls", label: "Block public ACLs", note: "Kept for S3 clients: Cairn refuses every ACL but private anyway." },
+  { key: "ignore_public_acls", label: "Ignore public ACLs", note: "Likewise." },
+];
+
+/** A bucket's policy and public access block, to view and change. The
+ * server checks the policy as S3 does, and says what's wrong. */
+function AccessDialog(props: { bucket: string; onClose: () => void }) {
+  let dialog!: HTMLDialogElement;
+  const [access, setAccess] = createSignal<BucketAccess>();
+  const [block, setBlock] = createSignal<PublicAccessBlock>({
+    block_public_acls: false,
+    ignore_public_acls: false,
+    block_public_policy: false,
+    restrict_public_buckets: false,
+  });
+  const [document, setDocument] = createSignal("");
+  const [error, setError] = createSignal<string>();
+  const load = async () => {
+    try {
+      const a = await api.bucketAccess(props.bucket);
+      setAccess(a);
+      if (a.public_access_block) setBlock({ ...a.public_access_block });
+      setDocument(a.policy ? pretty(a.policy) : POLICY_TEMPLATE(props.bucket));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  onMount(() => {
+    dialog.showModal();
+    load();
+  });
+  const run = async (fn: () => Promise<unknown>, done: string) => {
+    setError(undefined);
+    try {
+      await fn();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    toast(done);
+    await load();
+  };
+  const saveBlock = () => run(() => api.putPublicAccessBlock(props.bucket, block()), `Saved the public access block of ${props.bucket}`);
+  const removeBlock = () => {
+    if (!confirm(`Remove the public access block of "${props.bucket}"? Only the cluster's will apply.`)) return;
+    run(() => api.deletePublicAccessBlock(props.bucket), `Removed the public access block of ${props.bucket}`);
+  };
+  const savePolicy = () => run(() => api.putBucketPolicy(props.bucket, document()), `Saved the policy of ${props.bucket}`);
+  const removePolicy = () => {
+    if (!confirm(`Delete the policy of "${props.bucket}"?`)) return;
+    run(() => api.deleteBucketPolicy(props.bucket), `Deleted the policy of ${props.bucket}`);
+  };
+  return (
+    <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
+      <h2>
+        Policy and public access of <span class="mono">{props.bucket}</span>
+      </h2>
+      <Show when={access()} fallback={<Loading error={error()} />}>
+        {(a) => (
+          <>
+            <h3>Public access block</h3>
+            <p class="subtle small">
+              <Show when={a().public_access_block} fallback="The bucket has no block of its own: only the cluster's applies.">
+                The bucket's own block. The cluster's applies as well
+                {a().cluster.block_public_policy || a().cluster.restrict_public_buckets ? " (it has some on)" : " (it has none on)"}.
+              </Show>
+            </p>
+            <For each={FLAGS}>
+              {(f) => (
+                <div>
+                  <label class="check" title={f.note}>
+                    <input
+                      type="checkbox"
+                      checked={block()[f.key]}
+                      onChange={(e) => setBlock({ ...block(), [f.key]: e.currentTarget.checked })}
+                    />
+                    {f.label}
+                  </label>{" "}
+                  <span class="subtle small">{f.note}</span>
+                </div>
+              )}
+            </For>
+            <div class="buttons">
+              <Show when={a().public_access_block}>
+                <button type="button" class="danger" onClick={removeBlock}>
+                  Remove block
+                </button>
+              </Show>
+              <button type="button" class="primary" onClick={saveBlock}>
+                Save block
+              </button>
+            </div>
+            <h3>
+              Bucket policy{" "}
+              <Show when={a().public}>
+                <Badge tone="bad">public</Badge>
+              </Show>
+            </h3>
+            <p class="subtle small">
+              IAM's policy language, as a bucket policy: each statement names its Principal (
+              <span class="mono">"*"</span> is anyone, unsigned requests too; a user is{" "}
+              <span class="mono">arn:aws:iam::ACCOUNT:user/NAME</span>); Resource is the bucket or its objects.
+              <Show when={!a().policy}> It has none; this is an example.</Show>
+            </p>
+            <textarea
+              class="policy"
+              aria-label="Bucket policy"
+              spellcheck={false}
+              value={document()}
+              onInput={(e) => setDocument(e.currentTarget.value)}
+            />
+            <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+            <div class="buttons">
+              <Show when={a().policy}>
+                <button type="button" class="danger" onClick={removePolicy}>
+                  Delete policy
+                </button>
+              </Show>
+              <button type="button" onClick={() => dialog.close()}>
+                Close
+              </button>
+              <button type="button" class="primary" onClick={savePolicy}>
+                Save policy
+              </button>
+            </div>
+          </>
+        )}
+      </Show>
+    </dialog>
   );
 }
 

@@ -281,6 +281,26 @@ why (`... with an explicit deny in a resource-based policy`); a key that
 doesn't exist is a 403 too, to whom may not list the bucket, so that keys
 can't be found by guessing.
 
+**Block Public Access** guards against making a bucket public by accident,
+as in S3. A bucket's public access block (PutPublicAccessBlock, or the
+bucket's *Policy and public access* on the dashboard) has S3's four flags:
+`BlockPublicPolicy` refuses a bucket policy that makes the bucket public
+(one that allows everyone something, with no condition that limits it to
+fixed addresses, accounts or the like), and `RestrictPublicBuckets` makes a
+public policy allow anonymous requests nothing (the cluster's users keep what
+it allows them). `BlockPublicAcls` and `IgnorePublicAcls` are kept for S3
+clients; Cairn refuses every ACL but `private` anyway. **New buckets have all
+four on**, as S3's do, so making one public takes turning its block off first
+(`aws s3api delete-public-access-block`); buckets made before Cairn had
+blocks have none. The cluster has a block of its own, which every bucket gets
+too, whatever its own says: `cairn config set block-public-policy 1` and
+`cairn config set restrict-public-buckets 1` (or the switches on the
+dashboard's Buckets page).
+
+```sh
+aws s3api delete-public-access-block --bucket my-bucket   # then put the public policy above
+```
+
 `aws:SourceIp` and `aws:SecureTransport` (and so policies that ask for an
 address, or for HTTPS) take the client's address and protocol from
 `X-Forwarded-For` and `X-Forwarded-Proto` only if the request came from a
@@ -402,7 +422,9 @@ cluster:
   them, and download any version (but an encrypted one: Cairn doesn't have
   an SSE-C object's key, and the KMS opens an SSE-KMS one only for a role).
   Buckets can be created and (when empty) deleted, and their
-  [lifecycle rules](#lifecycle-rules) edited.
+  [lifecycle rules](#lifecycle-rules), bucket policies and public access
+  blocks edited; the list shows which buckets are public, and has the
+  cluster's own public access block.
 - **Users:** everything `cairn user` does: create and delete users, grant and
   revoke permissions, toggle admin, make, deactivate and delete access keys
   (replacing the secret of the one named as the user in place), write
