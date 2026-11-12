@@ -48,11 +48,11 @@ async fn anyone_reads(app: &App, bucket: &str) -> bool {
 async fn blocks_public_policies_and_restricts_public_buckets() {
     let Some(app) = node().await else { return };
     let bucket = format!("pab-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    assert!(matches!(create::create(&app, &bucket, None).await.unwrap(), create::Creation::Created));
+    let account = crate::roles::account(&app.pool.get().await.unwrap()).await.unwrap();
+    assert!(matches!(create::create(&app, &bucket, &account).await.unwrap(), create::Creation::Created));
     assert_eq!(public_access::get(&app, &bucket).await.unwrap(), Some(Some(Block::from_bits(15))));
     assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::FORBIDDEN);
     // A policy that isn't public is no matter.
-    let account = crate::roles::account(&app.pool.get().await.unwrap()).await.unwrap();
     let private = format!(
         r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{account}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
     );

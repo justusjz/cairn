@@ -16,8 +16,7 @@ The schema is created automatically; just point Cairn at an empty database.
 
 > [!WARNING]
 > The peer endpoint (`--listen-peer`, default `127.0.0.1:9431`) is
-> unauthenticated: it can read and delete blobs, and it serves the
-> [dashboard](#dashboard), which manages roles. Only bind it to a
+> unauthenticated: it can read and delete blobs. Only bind it to a
 > trusted/private network — never expose it to the public internet.
 
 ## Installing
@@ -103,7 +102,7 @@ command line wins. `cairn user` reads `CAIRN_DATABASE` as well.
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
 | `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. |
-| `--listen-console <ADDR>` | `CAIRN_LISTEN_CONSOLE` | off | Bind address for the [console](#console), the web UI people sign in to with passkeys. Requires `--console-url`. |
+| `--listen-console <ADDR>` | `CAIRN_LISTEN_CONSOLE` | off | Bind address for the [console](#console), Cairn's web UI, which people sign in to with passkeys or OIDC. Requires `--console-url`. |
 | `--console-url <URL>` | `CAIRN_CONSOLE_URL` | none | The URL the console is reached at, as browsers see it, e.g. `https://console.example.com`: an origin of its own (not the S3 API's), over HTTPS, or on `localhost`. Passkeys are bound to its host. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
 | `--kms-jwt-key <PATH>` | `CAIRN_KMS_JWT_KEY` | *required with a KMS* | PEM file of the Ed25519 private key Cairn signs its roles' logins to the KMS with. The same on every node. |
@@ -223,7 +222,7 @@ once it has been down for long enough, without removing it, set:
 cairn config --database "$DB" set repair-after 60   # minutes; 0, the default, is off
 ```
 
-The dashboard's Overview shows each node's state, and its Jobs page how many
+The console's Overview shows each node's state, and its Jobs page how many
 shards are waiting to move.
 
 ## Users and permissions
@@ -249,8 +248,8 @@ allows; else it's denied. They are:
   policy (`CairnGrantRead`, `CairnGrantWrite`, `CairnGrantDeleteVersion`,
   each naming the users granted it), so they go with the bucket, and show
   in GetBucketPolicy as what they are. Setting a bucket's policy over S3
-  replaces its grants too, as it replaces any statement; the dashboard and
-  console show them as grants, and leave the policy's other statements
+  replaces its grants too, as it replaces any statement; the console shows
+  them as grants, and leave the policy's other statements
   alone:
   - **`read`** on a bucket: GetObject, HeadObject, GetObjectAttributes,
     HeadBucket, ListObjects, reading an object's [tags](#tags), and being the
@@ -307,7 +306,7 @@ can't be found by guessing.
 
 **Block Public Access** guards against making a bucket public by accident,
 as in S3. A bucket's public access block (PutPublicAccessBlock, or the
-bucket's *Policy and public access* on the dashboard) has S3's four flags:
+bucket's *Policy and public access* in the console) has S3's four flags:
 `BlockPublicPolicy` refuses a bucket policy that makes the bucket public
 (one that allows everyone something, with no condition that limits it to
 fixed addresses, accounts or the like), and `RestrictPublicBuckets` makes a
@@ -319,7 +318,7 @@ four on**, as S3's do, so making one public takes turning its block off first
 blocks have none. The cluster has a block of its own, which every bucket gets
 too, whatever its own says: `cairn config set block-public-policy 1` and
 `cairn config set restrict-public-buckets 1` (or the switches on the
-dashboard's Buckets page).
+console's Accounts page).
 
 ```sh
 aws s3api delete-public-access-block --bucket my-bucket   # then put the public policy above
@@ -435,13 +434,71 @@ on its key takes it.
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,
 > since it is part of the signature.
 
-## Dashboard
+## Console
 
-Every node serves a web dashboard for watching and managing the cluster, on its
-peer endpoint, under `/_dashboard`: open the peer URL in a browser, e.g.
-`http://10.0.0.1:9431/` (or `http://127.0.0.1:9431/` with the default
-`--listen-peer`), which leads there. Any node's dashboard shows the whole
-cluster:
+The console is Cairn's web UI: an account's people manage its buckets,
+objects and users there, and the operator's (superadmins) watch and run the
+cluster. It's off unless a node is started with `--listen-console` and
+`--console-url`; any number of nodes may serve it, behind one URL. People
+sign in with **passkeys**, or at an **OpenID Connect** provider: there are no
+passwords, and access keys are for S3, never for the console.
+
+```sh
+cairn serve ... --listen-console 0.0.0.0:9480 --console-url https://console.example.com
+```
+
+The first superadmin comes from the command line: a user of the `operator`
+account, and a link for it to enroll its passkey with. Everyone after that
+can be made in the console.
+
+```sh
+cairn user create ada --account operator --admin
+cairn user enroll ada --account operator --console-url https://console.example.com
+```
+
+A **login** (a person, with passkeys) acts in each account it's in as one
+identity there, a user or the account's root, and switches between them;
+switching into the operator account takes the passkey again, unless it was
+used in the last five minutes. An enrollment link is for an identity: opened
+signed out, it makes a new login; signed in, it adds the identity to that
+login.
+
+The console acts as its identity: it allows exactly what that identity's S3
+and IAM requests would be allowed, by the same policies (the user's grants,
+admin flag and inline policies, and the bucket's policy; an explicit Deny
+wins), and denies with S3's messages. An account's root may do anything in
+its account, as in AWS.
+
+### An account's pages
+
+- **Buckets:** create and (when empty) delete buckets, browse them by prefix,
+  upload (a file over 64 MiB in parts, so of any size S3 takes), download
+  and delete objects and versions; see every version of a key, with how
+  it's encrypted, its tags, and whether any of its data is lost. A bucket's
+  versioning, tags, CORS, [lifecycle rules](#lifecycle-rules), bucket policy
+  and public access block are edited there; the list shows which buckets
+  are public. An admin creates buckets, but reads and writes objects only
+  with a grant or a policy that allows it, as over S3. Downloads are always
+  attachments, sandboxed, so that nothing of an object is shown in the
+  console's origin; SSE-KMS objects open with the keys the user may use (an
+  SSE-C object, whose key Cairn doesn't have, can't be downloaded).
+- **Users:** everything `cairn user` does, as IAM's actions allow (an admin
+  may do all of it; others what their policies say, as `iam:CreateAccessKey`
+  on their own user, say): create and delete users, grant and revoke
+  permissions, toggle admin, make, deactivate and delete access keys
+  (replacing the secret of the one named as the user in place), write
+  inline policies, which the server checks as IAM does, and make enrollment
+  links.
+- **Account:** the login's passkeys, its identities at OIDC providers, and
+  the accounts it's in.
+
+### The operator's pages
+
+Superadmins (the operator account's users) see the cluster instead, and no
+tenant's buckets. Their actions are `cairn:` ones (`cairn:GetCluster`,
+`cairn:PutSetting`, `cairn:RemoveNode`, `cairn:CreateAccount`, …) on the
+cluster, which is the operator account's, so a tenant's policies can't allow
+them. Whichever node answers shows the whole cluster:
 
 - **Overview:** which nodes are live, how full their disks are, and request
   rates, errors, throughput and latency over the last hour, by S3 operation.
@@ -456,117 +513,23 @@ cluster:
   checked; damaged and missing copies, and whether they were repaired; and
   the objects with data that's intact on no replica. The navigation shows how
   many of those there are (in red), or else how many findings are still
-  open. The bucket explorer marks objects with lost data, and an object's
-  details name the bytes that are lost.
+  open.
 - **Jobs:** how the background passes (garbage collection and packing) are
   doing on each node, what they still have to do, and what they did recently;
   and the [lifecycle](#lifecycle-rules) sweeps: each bucket's, how long a
   round of them takes, and the rate they go at, which can be changed there.
-- **Buckets:** browse buckets by prefix, see every version of a key with how
-  it's encrypted, the blobs its parts are stored in and the nodes holding
-  them, and download any version (but an encrypted one: Cairn doesn't have
-  an SSE-C object's key, and the KMS opens an SSE-KMS one only for a role).
-  Buckets can be created and (when empty) deleted, and their
-  [lifecycle rules](#lifecycle-rules), bucket policies and public access
-  blocks edited; the list shows which buckets are public, and has the
-  cluster's own public access block.
-- **Users:** everything `cairn user` does: create and delete users, grant and
-  revoke permissions, toggle admin, make, deactivate and delete access keys
-  (replacing the secret of the one named as the user in place), write
-  inline policies, which the server checks as IAM does, and make
-  [console](#console) enrollment links. Each user's ID and
-  its identity in the KMS are shown, for granting it [KMS keys](#sse-kms).
-
-To keep other websites from reaching it through DNS rebinding, the dashboard
-only answers when it's opened by IP address, as `localhost`, or by the host of
-the node's `--peer-url`.
+- **Accounts:** each account's users, buckets and size; making one, and its
+  root's enrollment link (a new account's first, or to recover it); and the
+  cluster's public access block, which every bucket gets.
+- **Sign-in:** the OIDC providers people may sign in at.
+- **Superadmins:** the operator account's users, as an account's Users page,
+  and the [KMS](#sse-kms) setup: each user's ID and its identity in the KMS,
+  for granting it keys.
 
 Request metrics are kept in memory by each node, so they start over when it
 restarts; everything else is read from the database.
 
-The dashboard's JSON API is under `/_dashboard/api/`, described by an OpenAPI
-spec at `/_dashboard/api/openapi.json` (also committed as `ui/openapi.json`).
-
-> [!WARNING]
-> Like the rest of the peer endpoint, the dashboard has no authentication:
-> anyone who can reach it can read every unencrypted object and manage every
-> role, and so act as any role, with the KMS keys it may use. Keep the peer
-> endpoint on a trusted network.
-
-### Building the dashboard
-
-The dashboard's UI lives in `ui/` (SolidJS and TypeScript, built with Vite)
-and is embedded into the binary when Cairn is built, so build it first (with
-Node.js 26 or later). Cargo doesn't run npm itself: without a build of the UI,
-building Cairn (or running its tests) fails and says how to build it, and it
-warns when the build is older than the UI's sources.
-
-```sh
-(cd ui && npm ci && npm run build)
-cargo build --release
-```
-
-`./build-release.sh` does both. While working on the UI, `npm run dev` in
-`ui/` serves it with hot reloading, passing API requests on to the node at
-`CAIRN_URL` (default `http://127.0.0.1:9431`). The [console](#console) is a
-second page of the same UI (`ui/console.html`, built into `ui/dist/console/`);
-`npm run dev:console` serves it, passing its API on to `CAIRN_CONSOLE`
-(default `http://localhost:9480`).
-
-The UI's types come from the API's OpenAPI spec, which is generated from the
-Rust code (with [utoipa](https://github.com/juhaku/utoipa)). Both the specs
-(`ui/openapi.json`, and the console's `ui/console-openapi.json`) and the
-TypeScript types made from them for
-[openapi-fetch](https://openapi-ts.dev/openapi-fetch/) (`ui/src/schema.d.ts`,
-`ui/src/console/schema.d.ts`) are committed, so building needs neither generator. A test fails when the
-committed spec no longer matches the API; after changing the API, regenerate
-both:
-
-```sh
-CAIRN_UPDATE_OPENAPI=1 cargo test openapi
-(cd ui && npm run gen)
-```
-
-`npm run gen` runs [openapi-typescript](https://openapi-ts.dev/) through `npx`,
-with pinned versions and the TypeScript 5 it needs (the UI itself uses
-TypeScript 7), so it needs network access.
-
-## Console
-
-The console is a web UI for the account's people, apart from the dashboard
-(which is the operator's, on the private network, without a sign-in). It's
-off unless a node is started with `--listen-console` and `--console-url`.
-People sign in with **passkeys** only: there are no passwords, and access
-keys are for S3, never for the console. A **login** (a person, with
-passkeys) acts in each account it's in as one identity there, a user or the
-account's root, and switches between them; switching into the operator
-account takes the passkey again, unless it was used in the last five
-minutes. An enrollment link is for an identity: opened signed out, it makes
-a new login; signed in, it adds the identity to that login. Signed in,
-people manage their passkeys, their account's users (as IAM's actions
-allow them: an admin may do all of it; others what their policies say, as
-`iam:CreateAccessKey` on their own user, say), and the buckets and objects: create and delete buckets, browse,
-upload (a file over 64 MiB in parts, so of any size S3 takes), download and
-delete objects and versions, versioning, tags (buckets' and versions'), CORS,
-lifecycle rules, bucket policies and public access blocks.
-Superadmins (the operator account's users) see the cluster instead: the
-dashboard's Overview, Storage, Integrity and Jobs pages, the accounts (making
-one, and its root's enrollment link), and each other, but no tenant's
-buckets. Their actions are `cairn:` ones (`cairn:GetCluster`,
-`cairn:PutSetting`, `cairn:RemoveNode`, `cairn:CreateAccount`, …) on the
-cluster, which is the operator account's, so a tenant's policies can't allow
-them.
-
-The console acts as its user: it allows exactly what that user's S3 requests
-would be allowed, by the same policies (the user's grants, admin flag and
-inline policies, and the bucket's policy; an explicit Deny wins), and denies
-with S3's messages. An admin creates buckets, but reads and writes objects
-only with a grant or a policy that allows it, as over S3. The bucket and
-object pages are the dashboard's, and so is their API: the dashboard serves
-it to the operator (everything is allowed), the console to the signed-in
-user. Downloads are always attachments, sandboxed, so that nothing of an
-object is shown in the console's origin; SSE-KMS objects open with the keys
-the user may use.
+### Signing in
 
 - **Its own origin.** Serve it at a host name of its own, never the S3 API's:
   objects are served from that origin with whatever `Content-Type` they were
@@ -575,11 +538,12 @@ the user may use.
   (`http://localhost` works for trying it out, as browsers treat it as
   secure). Passkeys are bound to the console URL's host, so changing it
   makes everyone enroll again.
-- **Enrollment.** A user gets a first passkey through a one-time link, valid
-  24 hours: `cairn user enroll <name> --console-url <URL>`, or the Users page
-  of the dashboard. Once signed in, people add more passkeys (at most 8; a
-  second one, on another device, keeps them from being locked out) and remove
-  them, but never their last. A lost passkey takes a new link.
+- **Enrollment.** An identity gets a first passkey through a one-time link,
+  valid 24 hours: `cairn user enroll <name> --console-url <URL>` (`cairn
+  account enroll <account>` for an account's root), or the Users (Accounts)
+  page. Once signed in, people add more passkeys (at most 8; a second one,
+  on another device, keeps them from being locked out) and remove them, but
+  never their last. A lost passkey takes a new link.
 - **Sessions** last 12 hours at most, and end after an hour unused. They're a
   cookie (`__Host-`, Secure, HttpOnly, SameSite=Strict), kept in the database
   as a hash, so every node serves them. Removing a passkey or the user ends
@@ -605,10 +569,42 @@ the user may use.
   without attestation: any authenticator works. A passkey whose signature
   counter goes backwards (a cloned security key) is refused.
 
+The console's JSON API is under `/api/`, described by an OpenAPI spec at
+`/api/openapi.json` (also committed as `ui/openapi.json`).
+
+### Building the console
+
+The console's UI lives in `ui/` (SolidJS and TypeScript, built with Vite)
+and is embedded into the binary when Cairn is built, so build it first (with
+Node.js 26 or later). Cargo doesn't run npm itself: without a build of the UI,
+building Cairn (or running its tests) fails and says how to build it, and it
+warns when the build is older than the UI's sources.
+
 ```sh
-cairn serve ... --listen-console 0.0.0.0:9480 --console-url https://console.example.com
-cairn user enroll ada --console-url https://console.example.com
+(cd ui && npm ci && npm run build)
+cargo build --release
 ```
+
+`./build-release.sh` does both. While working on the UI, `npm run dev` in
+`ui/` serves it with hot reloading, passing API requests on to the console
+at `CAIRN_CONSOLE` (default `http://localhost:9480`).
+
+The UI's types come from the API's OpenAPI spec, which is generated from the
+Rust code (with [utoipa](https://github.com/juhaku/utoipa)). Both the spec
+(`ui/openapi.json`) and the TypeScript types made from it for
+[openapi-fetch](https://openapi-ts.dev/openapi-fetch/) (`ui/src/schema.d.ts`)
+are committed, so building needs neither generator. A test fails when the
+committed spec no longer matches the API; after changing the API, regenerate
+both:
+
+```sh
+CAIRN_UPDATE_OPENAPI=1 cargo test openapi
+(cd ui && npm run gen)
+```
+
+`npm run gen` runs [openapi-typescript](https://openapi-ts.dev/) through `npx`,
+with pinned versions and the TypeScript 5 it needs (the UI itself uses
+TypeScript 7), so it needs network access.
 
 ## Versioning
 
@@ -672,8 +668,8 @@ aws s3api get-bucket-lifecycle-configuration --bucket my-bucket
 aws s3api delete-bucket-lifecycle --bucket my-bucket
 ```
 
-Or on the dashboard: a bucket's page links to an editor of its rules, which
-the dashboard checks as S3's requests are checked, and writes back in the same
+Or in the console: a bucket's page links to an editor of its rules, which
+the console checks as S3's requests are checked, and writes back in the same
 form, so S3 clients see the same rules.
 
 What a rule can do:
@@ -713,7 +709,7 @@ cairn config --database "$DB" set lifecycle-rate 2000000
 cairn config --database "$DB" get              # every setting, with its default
 ```
 
-Or on the dashboard's Jobs page, which also shows each bucket's sweep, the rate
+Or on the console's Jobs page, which also shows each bucket's sweep, the rate
 sweeps actually reach when they're busy, and how long a round of every
 bucket's sweep takes at it. If that's more than a day, sweeps fall behind, and
 expirations come that much later: raise the rate, or, if sweeps don't reach
@@ -768,7 +764,7 @@ digits, spaces and `+ - = . _ : / @`, and keys can't start with `aws:`, as in
 S3. Tags are stored in plaintext, whatever an object's
 [encryption](#encryption), as S3 keeps them: an SSE-C object's are read and
 changed without its key, and lifecycle sweeps, which have no keys, read them.
-Don't put secrets in them. The dashboard shows both.
+Don't put secrets in them. The console shows both.
 
 ## CORS
 
@@ -877,9 +873,9 @@ deleting a key makes its objects unreadable for good (crypto-shredding).
 - **Roles in OpenBao.** Every Cairn role is an identity (an *entity*) in
   OpenBao, which Cairn logs in as through a JWT auth mount of its own,
   naming the role by its ID, which is never reused. Cairn logs in once for
-  each new role (when the dashboard creates it, or within a minute), so that
-  OpenBao makes its entity right away. `cairn role list` and the dashboard
-  show each role's ID and entity; the dashboard's Users page also shows
+  each new role (when the console creates it, or within a minute), so that
+  OpenBao makes its entity right away. `cairn user list` and the console
+  show each role's ID and entity; the console's Superadmins page also shows
   Cairn's public key, whether each node reaches OpenBao, and how its logins
   went, with what's wrong in OpenBao's setup if they fail. A deleted role's
   entity stays in OpenBao,
@@ -965,14 +961,14 @@ encrypt, so a mistyped key name would make a new key. Cairn never calls it.
 With an SSE-S3 key configured (`--kms-sse-s3-key`), a write may ask for SSE-S3,
 as with S3: `aws s3api put-object --server-side-encryption AES256`. Reads need
 nothing. Cairn uses that key as itself, not as the role that asks, so any role
-that may read an object reads it, and the dashboard can download it: it
+that may read an object reads it, and so can the console's downloads: it
 protects the data at rest (disks, the database, backups), not from Cairn's
 roles.
 
 - Cairn logs in to OpenBao through its JWT mount as itself, with the subject
   `cairn` (roles' are their IDs), and its entity must be allowed
-  `datakey/plaintext` and `decrypt` on the key. The dashboard's Users page
-  shows that entity.
+  `datakey/plaintext` and `decrypt` on the key. The console's Superadmins
+  page shows that entity.
 - As S3's bucket keys do, a node uses one data key from OpenBao for an hour of
   writes, and keeps the data keys it opened for an hour after their last use.
   So OpenBao sees a few calls an hour, not one a request. Every object still
@@ -1017,7 +1013,7 @@ aws s3api put-bucket-encryption --bucket demo --server-side-encryption-configura
   nothing.
 - Changing or removing the default leaves what's written as it is. A write
   under way keeps the default it began with.
-- The dashboard's Buckets page shows each bucket's default.
+- The console's Buckets page shows each bucket's default.
 
 ## Data integrity
 
@@ -1102,8 +1098,8 @@ cuts a read off. The packer leaves a blob alone while a part of it is on lost
 data; once those objects are deleted, it's compacted as usual.
 
 What the scrubber finds is logged as a `CORRUPTION:` line, recorded in the
-database (`scrub_findings`), and shown on the dashboard's
-[Integrity](#dashboard) page.
+database (`scrub_findings`), and shown on the console's
+[Integrity](#the-operators-pages) page.
 
 Data written by versions of Cairn without checksums can't be checked as it
 is. The packer rewrites it with checksums, the oldest first, reading at the
@@ -1172,7 +1168,7 @@ the blob in cells of 1 MiB, so a read of a small object in a coded blob mostly
 reads a single shard, without decoding. A read that can't get a cell from its
 data shard (a node is down, or a block is damaged) decodes it from the other
 shards' cells of its row, and verifies the result against its checksums. The
-dashboard's Storage page shows each layout's health, and the Jobs page how
+console's Storage page shows each layout's health, and the Jobs page how
 much is waiting to be converted, and how many copies to be added or dropped.
 
 ## Garbage collection

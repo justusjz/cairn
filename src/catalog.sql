@@ -1695,7 +1695,7 @@ $$;
 -- T18: PutBucketLifecycleConfiguration and DeleteBucketLifecycle: sets (or,
 -- with NULL, removes) the bucket's lifecycle configuration, with a new
 -- generation, and starts a new sweep of it, due now (the last whole sweep
--- stays, for the dashboard), or drops its sweep. Plain UPDATEs of the
+-- stays, for the console), or drops its sweep. Plain UPDATEs of the
 -- bucket's row, as T16's: no invariant involves the configuration, which a
 -- sweep checks itself (T17). The sweep's row's FK check locks the bucket's
 -- row shared, which it updated already. Returns whether the bucket exists.

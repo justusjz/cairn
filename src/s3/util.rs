@@ -500,7 +500,7 @@ mod tests {
                 .await
                 .ends_with("<RequestId>0123456789ABCDEF</RequestId></Error>")
         );
-        // Outside of a request (the dashboard's, say), none.
+        // Outside of a request (the console's, say), none.
         let unnamed = format_s3_error(StatusCode::NOT_FOUND, "NoSuchKey", "no");
         assert!(!body(unnamed).await.contains("RequestId"));
     }

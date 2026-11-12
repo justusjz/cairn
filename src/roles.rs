@@ -11,7 +11,7 @@
 //!
 //! Everything lives in Postgres, so every node sees a change immediately. The
 //! `cairn user …` subcommands (`cairn role …`, as before) manage it directly
-//! against the database, and the dashboard (see `dashboard`) through the same
+//! against the database, and the console (see `console::manage`) through the same
 //! functions.
 
 #[cfg(test)]
@@ -832,9 +832,8 @@ pub struct KeyInfo {
 /// A user as listed: never with its secrets.
 pub struct RoleInfo {
     pub name: String,
-    /// Its account's ID and name.
+    /// Its account's ID.
     pub account_id: String,
-    pub account: String,
     pub admin: bool,
     /// When it was created, in seconds since the Unix epoch.
     pub created_at: f64,
@@ -864,7 +863,7 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                     ARRAY(SELECT extract(epoch FROM k.created_at)::float8 FROM access_keys k
                           WHERE k.role_id = r.id ORDER BY k.created_at, k.access_key_id),
                     ARRAY(SELECT p.name FROM role_policies p WHERE p.role_id = r.id ORDER BY p.name),
-                    a.id, a.name
+                    a.id
              FROM roles r JOIN accounts a ON a.id = r.account_id ORDER BY a.operator, a.name, r.name",
             &[],
         )
@@ -894,7 +893,6 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                     .collect(),
                 policies: r.get(10),
                 account_id: r.get(11),
-                account: r.get(12),
             })
         })
         .collect()

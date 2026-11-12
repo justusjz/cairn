@@ -477,7 +477,7 @@ async fn allow(app: &App, role: Uuid, keys: &[&str]) {
 
 /// Each role gets an identity of its own in OpenBao before it uses a key,
 /// and may use only the keys OpenBao lets it; grants and revocations take
-/// effect at once. A request of no role (the dashboard's) can't open an
+/// effect at once. A request of no role (an account's root's, in the console) can't open an
 /// SSE-KMS object.
 #[tokio::test]
 async fn roles_use_the_keys_openbao_lets_them() {
@@ -517,7 +517,7 @@ async fn roles_use_the_keys_openbao_lets_them() {
     allow(&app, bob, &[]).await;
     assert_eq!(get(&app, Some(bob), "k", None).await.0, StatusCode::FORBIDDEN);
 
-    // No role: the dashboard's download.
+    // No role: a root's download, in the console.
     assert_eq!(get(&app, None, "k", None).await.0, StatusCode::FORBIDDEN);
     // Copies ask as their role, for the source as for the destination.
     let request = kms(None, &[]);
@@ -525,7 +525,7 @@ async fn roles_use_the_keys_openbao_lets_them() {
     assert_eq!(copy(&app, alice, "k", "k4", None, Wanted::Kms(&request)).await.0, StatusCode::OK);
 }
 
-/// What the dashboard tells about the KMS: Cairn's public key, as OpenBao is
+/// What the console tells about the KMS: Cairn's public key, as OpenBao is
 /// to trust it (the one openssl made for `db-test.sh`), OpenBao's health,
 /// and how logins went, with what's wrong if they failed.
 #[tokio::test]
@@ -688,7 +688,7 @@ async fn put_s3(app: &Arc<App>, role: Uuid, key: &str, data: Vec<u8>) {
 }
 
 /// SSE-S3: under Cairn's own key, as Cairn, so any role that may read an
-/// object (or the dashboard, which is none) reads it. A node reuses its data
+/// object (or a root, which is none) reads it. A node reuses its data
 /// key for many objects, and asks the KMS for none it already has; each
 /// object's key is bound to its name. Copies to and from SSE-KMS share their
 /// parts, multipart uploads and bucket defaults work. Revoking Cairn's access

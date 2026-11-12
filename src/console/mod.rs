@@ -1,6 +1,8 @@
-//! The console: a web UI for an account's people, with a sign-in of its own
-//! (passkeys), on its own listener (`--listen-console`) and origin
-//! (`--console-url`). See `plans/console.md`.
+//! The console: Cairn's web UI, with a sign-in of its own (passkeys, or an
+//! OIDC provider), on its own listener (`--listen-console`) and origin
+//! (`--console-url`). An account's people manage its buckets, objects and
+//! users there; the operator account's (superadmins) watch and run the
+//! cluster. See `plans/console.md`.
 //!
 //! Not on the S3 port: objects are served from the S3 origin with whatever
 //! `Content-Type` they were given, so an HTML object there could run script
@@ -14,8 +16,10 @@
 //! something must come from the console's own origin (`Origin`), with the
 //! `x-cairn-ui` header, which a cross-site form can't send.
 //!
-//! The UI is a page of the same app as the dashboard's (`ui/console.html`),
-//! built into `ui/dist/console/`, and served from the root here.
+//! The UI (`ui/`) is built into `ui/dist`, embedded in the binary, and
+//! served from the root here (see `web`). Its API is under `/api`: signing
+//! in and the login's own passkeys and identities (`api`), and what the
+//! session's identity manages (`manage`), as that identity (`actor`).
 
 use std::sync::Arc;
 
@@ -32,20 +36,19 @@ use std::net::SocketAddr;
 
 use axum::extract::ConnectInfo;
 
-use crate::{
-    App,
-    dashboard::{
-        ApiError,
-        actor::{self, Actor},
-    },
-    roles::Principal,
-};
+use crate::{App, roles::Principal};
 
+pub(crate) mod actor;
 mod api;
 pub mod cbor;
+mod manage;
 pub mod oidc;
 pub mod store;
+pub(crate) mod web;
 pub mod webauthn;
+
+use actor::Actor;
+use web::ApiError;
 
 pub use api::openapi;
 use webauthn::Party;
@@ -55,6 +58,23 @@ use webauthn::Party;
 const COOKIE: &str = "__Host-cairn-session";
 /// The header every request that changes something must carry.
 const CSRF_HEADER: &str = "x-cairn-ui";
+
+/// What the console's API keeps on every node, whether or not it serves the
+/// console itself (part of [`App`]).
+pub struct Shared {
+    /// The last `/storage` report, and when it was made. It takes scans of
+    /// whole tables, so every page polling it shares one report a while.
+    storage: tokio::sync::Mutex<Option<(std::time::Instant, manage::Storage)>>,
+    /// The console's origin, if this node serves it: enrollment links are
+    /// made from it.
+    origin: Option<String>,
+}
+
+impl Shared {
+    pub fn new(origin: Option<String>) -> Shared {
+        Shared { storage: tokio::sync::Mutex::default(), origin }
+    }
+}
 
 /// What the console's handlers have.
 pub struct Console {
@@ -97,13 +117,13 @@ pub fn parse_url(text: &str) -> Result<Party, String> {
 /// The console.
 pub fn router(console: Arc<Console>) -> Router {
     let (api, _) = api::router().split_for_parts();
-    // The buckets and objects: the dashboard's handlers, as the user.
-    let (shared, _) = crate::dashboard::shared_router().split_for_parts();
-    let shared = shared
+    // What the session's identity manages, as that identity.
+    let (managed, _) = manage::router().split_for_parts();
+    let managed = managed
         .layer(middleware::from_fn_with_state(console.clone(), as_user))
         .with_state(console.app.clone());
     let api = api
-        .merge(shared)
+        .merge(managed)
         .fallback(|| async { ApiError::NotFound("no such API route".into()) })
         .layer(middleware::from_fn_with_state(console.clone(), require_same_origin))
         .layer(middleware::map_response(|mut resp: Response| async {
@@ -114,7 +134,7 @@ pub fn router(console: Arc<Console>) -> Router {
         .nest("/api", api)
         .route("/api/openapi.json", get(|| async { Json(openapi()) }))
         .fallback(static_file)
-        .layer(middleware::map_response(crate::dashboard::security_headers))
+        .layer(middleware::map_response(web::security_headers))
         .with_state(console)
 }
 
@@ -133,7 +153,7 @@ async fn require_same_origin(State(console): State<Arc<Console>>, req: Request, 
     next.run(req).await
 }
 
-/// Has the request act as its session's user (see `dashboard::actor`), or
+/// Has the request act as its session's user (see `actor`), or
 /// answers 401 without one.
 async fn as_user(State(console): State<Arc<Console>>, mut req: Request, next: Next) -> Response {
     let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
@@ -141,7 +161,7 @@ async fn as_user(State(console): State<Arc<Console>>, mut req: Request, next: Ne
     let query = req.uri().query().unwrap_or("").to_owned();
     match user_of(&console, method, headers, query, peer).await {
         Ok(user) => {
-            req.extensions_mut().insert(Actor::User(Arc::new(user)));
+            req.extensions_mut().insert(Actor(Arc::new(user)));
             next.run(req).await
         }
         Err(e) => e.into_response(),
@@ -171,8 +191,7 @@ async fn static_file(method: Method, uri: Uri) -> Response {
     if !matches!(method, Method::GET | Method::HEAD) {
         return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
-    let path = format!("/console{}", uri.path());
-    crate::dashboard::serve_asset(&path, "/console/console.html")
+    web::serve_asset(uri.path())
 }
 
 /// The session token in a request's cookies.
@@ -267,9 +286,10 @@ mod e2e {
     use crate::roles;
 
     /// The console's spec, as the UI's types are generated from it.
+    /// `CAIRN_UPDATE_OPENAPI=1 cargo test openapi` updates it.
     #[test]
-    fn console_openapi_json_is_up_to_date() {
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/ui/console-openapi.json");
+    fn openapi_json_is_up_to_date() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/ui/openapi.json");
         let spec = openapi().to_pretty_json().unwrap() + "\n";
         if std::env::var_os("CAIRN_UPDATE_OPENAPI").is_some() {
             std::fs::write(path, &spec).unwrap();
@@ -278,19 +298,44 @@ mod e2e {
         let committed = std::fs::read_to_string(path).unwrap_or_default();
         assert!(
             committed == spec,
-            "ui/console-openapi.json is out of date: run `CAIRN_UPDATE_OPENAPI=1 cargo test openapi`, \
+            "ui/openapi.json is out of date: run `CAIRN_UPDATE_OPENAPI=1 cargo test openapi`, \
              then `npm run gen` in ui/"
         );
     }
 
-    struct Browser {
+    /// The spec is the sign-in API's and `manage`'s, merged: a schema of one
+    /// may share a name with one of the other only if it's the same (as
+    /// `ErrorBody` is), as it would replace it.
+    #[test]
+    fn the_apis_schemas_have_names_of_their_own() {
+        let schemas = |spec: utoipa::openapi::OpenApi| spec.components.map(|c| c.schemas).unwrap_or_default();
+        let sign_in = schemas(api::router().split_for_parts().1);
+        let managed = schemas(manage::router().split_for_parts().1);
+        for (name, schema) in &sign_in {
+            if let Some(other) = managed.get(name) {
+                let json = |s| serde_json::to_value(s).unwrap();
+                assert_eq!(json(schema), json(other), "two schemas named {name}");
+            }
+        }
+    }
+
+    /// A browser on the console's page, signed in once `cookie` is set.
+    pub(super) struct Browser {
         console: Arc<Console>,
         cookie: Option<String>,
         origin: String,
     }
 
     impl Browser {
-        async fn send(&mut self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+        /// Sends a request with a JSON body, as the page does: its status,
+        /// and its body as JSON (`null` if it isn't).
+        pub(super) async fn send(&mut self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, Value) {
+            let (status, _, body) = self.request(method, path, body).await;
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        }
+
+        /// Sends a request with a JSON body: its status, headers and body.
+        pub(super) async fn request(&mut self, method: &str, path: &str, body: Option<Value>) -> (StatusCode, HeaderMap, Vec<u8>) {
             let mut req = Request::builder()
                 .method(method)
                 .uri(path)
@@ -308,9 +353,9 @@ mod e2e {
                 let value = set.split(';').next().unwrap().split_once('=').unwrap().1;
                 self.cookie = (!value.is_empty()).then(|| value.to_owned());
             }
-            let status = resp.status();
-            let body = resp.into_body().collect().await.unwrap().to_bytes();
-            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+            let (parts, body) = resp.into_parts();
+            let body = body.collect().await.unwrap().to_bytes().to_vec();
+            (parts.status, parts.headers, body)
         }
     }
 
@@ -449,8 +494,19 @@ mod e2e {
         client.query_one("SELECT id FROM accounts WHERE name = $1", &[&name]).await.unwrap().get(0)
     }
 
+    /// The console of node `app`.
+    pub(super) fn console_of(app: &Arc<App>) -> Arc<Console> {
+        Arc::new(Console { app: app.clone(), party: party() })
+    }
+
+    /// A browser signed in as a new superadmin `name` (a user of the
+    /// operator account).
+    pub(super) async fn superadmin(console: &Arc<Console>, name: &str) -> Browser {
+        signed_in_to(console, Some("operator"), name, true).await
+    }
+
     /// A browser signed in as a new user `name` (with a passkey of its own).
-    async fn signed_in(console: &Arc<Console>, name: &str, admin: bool) -> Browser {
+    pub(super) async fn signed_in(console: &Arc<Console>, name: &str, admin: bool) -> Browser {
         signed_in_to(console, None, name, admin).await
     }
 
@@ -489,7 +545,7 @@ mod e2e {
         }
     }
 
-    /// The console's buckets and objects are the dashboard's API, as the
+    /// The console's buckets and objects are `manage`'s API, as the
     /// signed-in user: what its grants, admin flag and policies allow, and
     /// what a bucket's policy denies it, as over S3.
     #[tokio::test]
@@ -548,7 +604,7 @@ mod e2e {
         let (status, info) = reader.send("GET", &format!("/api/buckets/{bucket}/object?key=dir%2Fhello.txt"), None).await;
         assert_eq!(status, StatusCode::OK, "{info}");
         // Not where it's stored: that's the operator's.
-        assert_eq!(info["versions"][0]["parts"], json!([]));
+        assert_eq!(info["versions"][0]["parts"], Value::Null);
         let req = Request::builder()
             .uri(format!("/api/buckets/{bucket}/download?key=dir%2Fhello.txt"))
             .header("cookie", format!("{COOKIE}={}", reader.cookie.as_deref().unwrap()))
@@ -600,7 +656,6 @@ mod e2e {
         let (_, users) = admin.send("GET", "/api/roles", None).await;
         let names: Vec<_> = users.as_array().unwrap().iter().map(|u| u["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"made-in-console") && names.contains(&"writer"), "{names:?}");
-        assert!(users.as_array().unwrap().iter().all(|u| u["account"] == "default"));
         let (status, _) = admin.send("POST", "/api/roles/made-in-console/keys", None).await;
         assert_eq!(status, StatusCode::CREATED);
         // An inline policy may give a user IAM permissions on itself only,

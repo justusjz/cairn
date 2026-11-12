@@ -1,7 +1,8 @@
-// The dashboard's JSON API (`src/dashboard/api.rs`), through openapi-fetch.
-// Its types are generated from `openapi.json`, the spec the API itself is
-// built from (`npm run gen` writes `schema.d.ts`), so paths, parameters and
-// responses are all checked against it. Times are seconds since the Unix epoch.
+// The console's API for what the signed-in identity manages
+// (`src/console/manage.rs`), through openapi-fetch. Its types are generated
+// from `openapi.json`, the spec the API itself is built from (`npm run gen`
+// writes `schema.d.ts`), so paths, parameters and responses are all checked
+// against it. Times are seconds since the Unix epoch.
 
 import createClient from "openapi-fetch";
 import type { components, paths } from "./schema";
@@ -33,46 +34,27 @@ export type LifecycleRule = Schemas["LifecycleRule"];
 export type BucketAccess = Schemas["BucketAccess"];
 export type PublicAccessBlock = Schemas["Block"];
 
-/** Where the API is: the dashboard's (also in the spec's `servers`), or the
- * console's, which serves the bucket and object part of it as its user. */
-let BASE = "/_dashboard/api";
-let consoleMode = false;
+/** Where the API is (also in the spec's `servers`). */
+const BASE = "/api";
 
-function makeClient() {
-  return createClient<paths>({
-    baseUrl: BASE,
-    // Marks requests as the UI's own: the API refuses changes without it,
-    // so that other sites can't make them.
-    headers: { "x-cairn-ui": "1" },
-  });
-}
-
-let client = makeClient();
-
-/** Has the pages talk to the console's API (as the signed-in user) rather
- * than the dashboard's; called by the console before it renders. */
-export function useConsoleApi() {
-  BASE = "/api";
-  consoleMode = true;
-  client = makeClient();
-}
-
-/** Whether the pages are the console's: then what's the operator's (the
- * cluster, its settings) isn't theirs to show, but to a superadmin. */
-export function isConsole(): boolean {
-  return consoleMode;
-}
+const client = createClient<paths>({
+  baseUrl: BASE,
+  // Marks requests as the UI's own: the API refuses changes without it, so
+  // that other sites can't make them.
+  headers: { "x-cairn-ui": "1" },
+});
 
 let operatorMode = false;
 
-/** Whether the pages act for the operator: the dashboard's, or a console
- * session's as the operator account; the console sets it as it switches. */
+/** Whether the session acts as the operator account (a superadmin): then
+ * the pages show what's the operator's (the cluster, its KMS); the console
+ * sets it as it switches. */
 export function setOperatorMode(operator: boolean) {
   operatorMode = operator;
 }
 
 export function isOperator(): boolean {
-  return !consoleMode || operatorMode;
+  return operatorMode;
 }
 
 export class ApiError extends Error {
@@ -97,9 +79,8 @@ async function ok<T>(
 }
 
 const bucketPath = (bucket: string) => ({ path: { bucket } });
-/** A user's path, and which account's (its ID): on the dashboard, which
- * lists every account's users, it says which `role` is meant. */
-const rolePath = (role: string, account?: string) => ({ path: { role }, query: { account } });
+/** A user's path. */
+const rolePath = (role: string) => ({ path: { role } });
 
 export const api = {
   cluster: () => ok(client.GET("/cluster")),
@@ -117,15 +98,15 @@ export const api = {
   object: (bucket: string, key: string) =>
     ok(client.GET("/buckets/{bucket}/object", { params: { ...bucketPath(bucket), query: { key } } })),
   roles: () => ok(client.GET("/roles")),
-  createRole: (name: string, secret: string, admin: boolean, account?: string) =>
-    ok(client.POST("/roles", { body: { name, secret: secret || null, admin, account: account ?? null } })),
-  deleteRole: (role: string, account?: string) => ok(client.DELETE("/roles/{role}", { params: rolePath(role, account) })),
-  rotateSecret: (role: string, account?: string) =>
-    ok(client.POST("/roles/{role}/secret", { params: rolePath(role, account), body: {} })),
-  setAdmin: (role: string, admin: boolean, account?: string) =>
-    ok(client.PUT("/roles/{role}/admin", { params: rolePath(role, account), body: { admin } })),
-  grant: (role: string, bucket: string, permissions: Permission[], account?: string) =>
-    ok(client.POST("/roles/{role}/grants", { params: rolePath(role, account), body: { bucket, permissions } })),
+  createRole: (name: string, secret: string, admin: boolean) =>
+    ok(client.POST("/roles", { body: { name, secret: secret || null, admin } })),
+  deleteRole: (role: string) => ok(client.DELETE("/roles/{role}", { params: rolePath(role) })),
+  rotateSecret: (role: string) =>
+    ok(client.POST("/roles/{role}/secret", { params: rolePath(role), body: {} })),
+  setAdmin: (role: string, admin: boolean) =>
+    ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
+  grant: (role: string, bucket: string, permissions: Permission[]) =>
+    ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
   oidcConfig: () => ok(client.GET("/oidc-providers")),
   setOidcProvider: (
     name: string,
@@ -136,19 +117,19 @@ export const api = {
   createAccount: (name: string) => ok(client.POST("/accounts", { body: { name } })),
   rootEnrollment: (account: string) =>
     ok(client.POST("/accounts/{account}/enrollment", { params: { path: { account } } })),
-  createEnrollment: (role: string, account?: string) =>
-    ok(client.POST("/roles/{role}/enrollment", { params: rolePath(role, account) })),
-  createKey: (role: string, account?: string) => ok(client.POST("/roles/{role}/keys", { params: rolePath(role, account) })),
-  setKeyActive: (role: string, key: string, active: boolean, account?: string) =>
-    ok(client.PUT("/roles/{role}/keys/{key}", { params: { path: { role, key }, query: { account } }, body: { active } })),
-  deleteKey: (role: string, key: string, account?: string) =>
-    ok(client.DELETE("/roles/{role}/keys/{key}", { params: { path: { role, key }, query: { account } } })),
-  policy: (role: string, policy: string, account?: string) =>
-    ok(client.GET("/roles/{role}/policies/{policy}", { params: { path: { role, policy }, query: { account } } })),
-  putPolicy: (role: string, policy: string, document: string, account?: string) =>
-    ok(client.PUT("/roles/{role}/policies/{policy}", { params: { path: { role, policy }, query: { account } }, body: { document } })),
-  deletePolicy: (role: string, policy: string, account?: string) =>
-    ok(client.DELETE("/roles/{role}/policies/{policy}", { params: { path: { role, policy }, query: { account } } })),
+  createEnrollment: (role: string) =>
+    ok(client.POST("/roles/{role}/enrollment", { params: rolePath(role) })),
+  createKey: (role: string) => ok(client.POST("/roles/{role}/keys", { params: rolePath(role) })),
+  setKeyActive: (role: string, key: string, active: boolean) =>
+    ok(client.PUT("/roles/{role}/keys/{key}", { params: { path: { role, key } }, body: { active } })),
+  deleteKey: (role: string, key: string) =>
+    ok(client.DELETE("/roles/{role}/keys/{key}", { params: { path: { role, key } } })),
+  policy: (role: string, policy: string) =>
+    ok(client.GET("/roles/{role}/policies/{policy}", { params: { path: { role, policy } } })),
+  putPolicy: (role: string, policy: string, document: string) =>
+    ok(client.PUT("/roles/{role}/policies/{policy}", { params: { path: { role, policy } }, body: { document } })),
+  deletePolicy: (role: string, policy: string) =>
+    ok(client.DELETE("/roles/{role}/policies/{policy}", { params: { path: { role, policy } } })),
   identifyRoles: () => ok(client.POST("/kms/identify")),
   lifecycle: () => ok(client.GET("/lifecycle")),
   bucketLifecycle: (bucket: string) => ok(client.GET("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),
@@ -202,8 +183,8 @@ export const api = {
   deleteBucketCors: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/cors", { params: bucketPath(bucket) })),
   setVersioning: (bucket: string, status: "Enabled" | "Suspended") =>
     ok(client.PUT("/buckets/{bucket}/versioning", { params: bucketPath(bucket), body: { status } })),
-  revoke: (role: string, bucket: string, permission: Permission, account?: string) =>
-    ok(client.DELETE("/roles/{role}/grants", { params: { path: { role }, query: { bucket, permission, account } } })),
+  revoke: (role: string, bucket: string, permission: Permission) =>
+    ok(client.DELETE("/roles/{role}/grants", { params: { path: { role }, query: { bucket, permission } } })),
 };
 
 /** Files larger than this are uploaded in parts. */

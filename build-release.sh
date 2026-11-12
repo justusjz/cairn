@@ -17,7 +17,7 @@
 # Requires the musl target, e.g.:  rustup target add x86_64-unknown-linux-musl,
 # and musl's C compiler wrapper, musl-gcc (Debian/Ubuntu: musl-tools; Arch:
 # musl), since ring compiles C,
-# and Node.js 26 or later (with npm), to build the dashboard's UI.
+# and Node.js 26 or later (with npm), to build the console's UI.
 
 set -euo pipefail
 
@@ -36,9 +36,9 @@ VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 PKG="cairn-v${VERSION}-${TARGET}"
 BIN="target/${TARGET}/release/cairn"
 
-# The dashboard's UI is embedded in the binary, which doesn't build without it.
+# The console's UI is embedded in the binary, which doesn't build without it.
 # A fresh build, so that the release never ships a stale one.
-echo "Building the dashboard UI..."
+echo "Building the console UI..."
 (cd ui && npm ci && npm run build)
 
 # ring's build script compiles C for the target. cc-rs looks for

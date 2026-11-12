@@ -4,7 +4,7 @@
 
 import { A, useParams } from "@solidjs/router";
 import { For, Show, createEffect, createSignal, on } from "solid-js";
-import { type LifecycleRule, api, isConsole } from "../api";
+import { type LifecycleRule, api } from "../api";
 import { Loading, Panel, act } from "../components/ui";
 import { bucketUrl } from "./Buckets";
 
@@ -183,9 +183,7 @@ export default function Lifecycle() {
       </div>
       <p class="subtle">
         What expires in the bucket, and when, as S3's lifecycle rules say it. Rules apply in background sweeps, once a day
-        <Show when={!isConsole()} fallback=", at the rate the operator set. ">
-          , at the rate set on the <A href="/jobs">Jobs</A> page, which also shows how they're going.{" "}
-        </Show>
+        , at the rate the operator set.{" "}
         Days count to the next midnight UTC.
       </p>
       <Show when={loaded()} fallback={<Loading error={error()} />}>

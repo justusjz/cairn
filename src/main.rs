@@ -34,7 +34,6 @@ mod blobs;
 mod body;
 mod checksum;
 mod console;
-mod dashboard;
 mod db;
 #[cfg(test)]
 mod e2e;
@@ -75,7 +74,8 @@ pub struct App {
     writing: WritingSet,
     pack: packer::Config,
     metrics: Arc<metrics::Metrics>,
-    dashboard: dashboard::Dashboard,
+    /// What the console's API keeps on this node.
+    console: console::Shared,
     /// Every request to another node goes through this.
     peers: peer::PeerClient,
     /// Whether SSE-C keys are accepted over plain HTTP (see `s3::sse_c`).
@@ -226,8 +226,8 @@ struct ServeArgs {
     /// it off.
     #[arg(long, env = "CAIRN_SCRUB_RATE", default_value = "25MiB", value_parser = scrub::parse_rate)]
     scrub_rate: u64,
-    /// Bind address for the console: the web UI people of the account sign
-    /// in to with passkeys. Off unless set; requires --console-url.
+    /// Bind address for the console: Cairn's web UI, which people sign in to
+    /// with passkeys or OIDC. Off unless set; requires --console-url.
     #[arg(long, env = "CAIRN_LISTEN_CONSOLE", requires = "console_url")]
     listen_console: Option<String>,
     /// The URL the console is reached at, as the browser sees it, e.g.
@@ -300,8 +300,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         writing: WritingSet::default(),
         pack: packer::Config::default(),
         metrics: Arc::default(),
-        dashboard: dashboard::Dashboard::new(
-            &peer_url,
+        console: console::Shared::new(
             args.listen_console.as_ref().and(args.console_url.as_ref()).map(|party| party.origin.clone()),
         ),
         peers: peer::PeerClient::new(),

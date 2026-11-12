@@ -221,7 +221,7 @@ pub struct Kms {
     /// Each role's token, by role ID, each behind a lock of its own, so that
     /// one role's login doesn't hold up another's calls.
     tokens: std::sync::Mutex<HashMap<Identity, Arc<Mutex<Option<Token>>>>>,
-    /// How this node's logins went, for the dashboard.
+    /// How this node's logins went, for the console.
     logins: std::sync::Mutex<Logins>,
     /// SSE-S3's key, and its data keys, if it's configured.
     sse_s3: Option<SseS3>,

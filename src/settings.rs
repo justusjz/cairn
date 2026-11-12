@@ -1,6 +1,6 @@
 //! The cluster's settings: values every node goes by, kept in the database
 //! (`settings`), so that they're the same everywhere, and a change reaches
-//! every node at once. Set with `cairn config set`, or on the dashboard. A
+//! every node at once. Set with `cairn config set`, or in the console. A
 //! setting that was never set has its default.
 
 use clap::{Args, Subcommand};

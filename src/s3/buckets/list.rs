@@ -20,7 +20,7 @@ pub struct BucketInfo {
     pub versioning: Versioning,
 }
 
-/// Every bucket, by name. Shared by ListBuckets and the dashboard.
+/// Every bucket, by name. Shared by ListBuckets and the console.
 pub async fn buckets(app: &App) -> anyhow::Result<Vec<BucketInfo>> {
     let client = app.pool.get().await?;
     let rows = client

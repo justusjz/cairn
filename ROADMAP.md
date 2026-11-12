@@ -23,7 +23,7 @@ Done:
   answered with 503 SlowDown if they still can't complete, instead of 500.
 - **Dashboard.** A web UI on the peer endpoint showing nodes, disks, request
   rates, replica health and background jobs, with a bucket explorer and role
-  management.
+  management. Since replaced by the console.
 - **Metadata-only copies.** CopyObject and UploadPartCopy point the new object
   at the existing data instead of copying it. (A part copied from a range that
   spans several parts of its source is still copied as data.)
@@ -48,15 +48,16 @@ Done:
   before; once set, it overrides the flags. Implemented; the flag can go in
   a later release.
 - **Cluster status.** A `cairn status` command that shows which nodes are
-  down, and how much data is below the replication factor. (The dashboard's
+  down, and how much data is below the replication factor. (The console's
   Storage page shows this already.)
 - **CI.** Running the test suites (`db-test.sh`, `test.sh`, `ha-test.sh`) on
   every change.
 
-- **Dashboard users and isolation.** Logins for the dashboard, so that it can
-  leave the private network, and a way to divide a cluster between tenants
-  (projects, say), since a single kind of admin role isn't enough. Open: how
-  dashboard users relate to S3 roles.
+- **Console, accounts and IAM.** Implemented: a web UI with passkey and
+  OIDC sign-in on a listener of its own, which replaced the dashboard;
+  accounts as tenants, with an operator account of superadmins; IAM
+  policies, bucket policies across accounts, and the IAM API. Open:
+  permissions boundaries, groups, and quotas per account.
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes

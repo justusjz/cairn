@@ -1,8 +1,8 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "Cairn dashboard",
-    "description": "The API of Cairn's dashboard.",
+    "title": "Cairn console",
+    "description": "The API of Cairn's console.",
     "contact": {
       "name": "Justus Zorn"
     },
@@ -14,7 +14,7 @@
   },
   "servers": [
     {
-      "url": "/_dashboard/api"
+      "url": "/api"
     }
   ],
   "paths": {
@@ -111,7 +111,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Enrollment"
+                  "$ref": "#/components/schemas/EnrollmentLink"
                 }
               }
             }
@@ -1451,6 +1451,141 @@
         }
       }
     },
+    "/enroll": {
+      "post": {
+        "summary": "Makes a new login, with a first passkey, for an enrollment link's\nidentity (using the link up), and signs in with it.",
+        "operationId": "enroll",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Enroll"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in; the session's cookie is set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/enroll/link": {
+      "post": {
+        "summary": "Adds an enrollment link's identity to the signed-in login (using the\nlink up), and acts as it, unless it's the operator account's, which\ntakes a fresh passkey assertion first (`/switch`).",
+        "operationId": "enroll_link",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Enrollment"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/enroll/options": {
+      "post": {
+        "operationId": "enroll_options",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Enrollment"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnrollCeremony"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/integrity": {
       "get": {
         "operationId": "get_integrity",
@@ -1556,6 +1691,140 @@
         "responses": {
           "204": {
             "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/login": {
+      "post": {
+        "summary": "Signs in with a passkey, as the login's identity in its first account\n(by name; the operator account last).",
+        "operationId": "login",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Login"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in; the session's cookie is set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/login/options": {
+      "post": {
+        "operationId": "login_options",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ceremony"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/logout": {
+      "post": {
+        "summary": "Signs out: ends the session.",
+        "operationId": "logout",
+        "responses": {
+          "204": {
+            "description": "Signed out; the cookie is cleared"
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/me": {
+      "get": {
+        "operationId": "me",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
           },
           "4XX": {
             "content": {
@@ -1784,6 +2053,333 @@
         }
       }
     },
+    "/oidc/callback": {
+      "get": {
+        "summary": "Where providers send the browser back to (register it with them): ends\nthe sign-in, and goes on to the console.",
+        "operationId": "oidc_callback",
+        "parameters": [
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error_description",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "303": {
+            "description": "On to the console, signed in (or to the sign-in page, with what went wrong)"
+          }
+        }
+      }
+    },
+    "/oidc/providers": {
+      "get": {
+        "summary": "The OIDC providers people may sign in at (for the sign-in page).",
+        "operationId": "oidc_providers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ProviderButton"
+                  }
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/oidc/{provider}": {
+      "delete": {
+        "summary": "Unlinks the signed-in login's identity at a provider (not its last way\nin).",
+        "operationId": "oidc_unlink",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unlinked"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/oidc/{provider}/start": {
+      "post": {
+        "summary": "Starts a sign-in at a provider.",
+        "operationId": "oidc_start",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OidcStart"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OidcRedirect"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/passkeys": {
+      "post": {
+        "summary": "Adds a passkey to the signed-in login.",
+        "operationId": "add_passkey",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewPasskey"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Added"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/passkeys/options": {
+      "post": {
+        "operationId": "passkey_options",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Ceremony"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/passkeys/{id}": {
+      "put": {
+        "summary": "Renames one of the signed-in login's passkeys.",
+        "operationId": "rename_passkey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PasskeyName"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Renamed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes one of the signed-in login's passkeys (not its last), and ends\nthe sessions signed in with it.",
+        "operationId": "delete_passkey",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/public-access": {
       "get": {
         "summary": "The cluster's public access block: its settings `block-public-policy`\nand `restrict-public-buckets` (set with `PUT /settings/{name}`).",
@@ -1891,15 +2487,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
           }
         ],
         "responses": {
@@ -1936,15 +2523,6 @@
             "name": "role",
             "in": "path",
             "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -1997,15 +2575,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
           }
         ],
         "responses": {
@@ -2013,7 +2582,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Enrollment"
+                  "$ref": "#/components/schemas/EnrollmentLink"
                 }
               }
             }
@@ -2048,15 +2617,6 @@
             "name": "role",
             "in": "path",
             "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2116,15 +2676,6 @@
             }
           },
           {
-            "name": "account",
-            "in": "query",
-            "description": "The user's account (its ID), on the dashboard (see `InAccount`).",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
             "name": "permission",
             "in": "query",
             "description": "The permission to revoke; all of them on the bucket if not given.",
@@ -2168,15 +2719,6 @@
             "name": "role",
             "in": "path",
             "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2230,15 +2772,6 @@
             "name": "key",
             "in": "path",
             "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2297,15 +2830,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
           }
         ],
         "responses": {
@@ -2350,15 +2874,6 @@
             "name": "policy",
             "in": "path",
             "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2410,15 +2925,6 @@
             "name": "policy",
             "in": "path",
             "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2477,15 +2983,6 @@
             "schema": {
               "type": "string"
             }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
           }
         ],
         "responses": {
@@ -2522,15 +3019,6 @@
             "name": "role",
             "in": "path",
             "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "account",
-            "in": "query",
-            "description": "The account (its ID), on the dashboard.",
-            "required": false,
             "schema": {
               "type": "string"
             }
@@ -2656,6 +3144,51 @@
           }
         }
       }
+    },
+    "/switch": {
+      "post": {
+        "summary": "Acts as the login's identity in another account.",
+        "operationId": "switch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Switch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -2735,6 +3268,37 @@
         "properties": {
           "admin": {
             "type": "boolean"
+          }
+        }
+      },
+      "Assertion": {
+        "type": "object",
+        "description": "What `navigator.credentials.get()` gave the page.",
+        "required": [
+          "id",
+          "client_data_json",
+          "authenticator_data",
+          "signature"
+        ],
+        "properties": {
+          "authenticator_data": {
+            "type": "string"
+          },
+          "client_data_json": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "signature": {
+            "type": "string"
+          },
+          "user_handle": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The login the passkey is of, as the authenticator says."
           }
         }
       },
@@ -3056,6 +3620,22 @@
           }
         }
       },
+      "Ceremony": {
+        "type": "object",
+        "description": "A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:\n`PublicKeyCredentialCreationOptionsJSON` or `…RequestOptionsJSON`), and\nthe ID of its challenge, to send back with the response.",
+        "required": [
+          "challenge_id",
+          "options"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "options": {
+            "type": "object"
+          }
+        }
+      },
       "Cluster": {
         "type": "object",
         "required": [
@@ -3322,7 +3902,57 @@
           }
         }
       },
+      "Enroll": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/NewPasskey"
+          },
+          {
+            "type": "object",
+            "required": [
+              "token"
+            ],
+            "properties": {
+              "token": {
+                "type": "string"
+              }
+            }
+          }
+        ]
+      },
+      "EnrollCeremony": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/Ceremony"
+          },
+          {
+            "type": "object",
+            "required": [
+              "identity"
+            ],
+            "properties": {
+              "identity": {
+                "type": "string",
+                "description": "The identity: `user @ account`, or `root @ account`."
+              }
+            }
+          }
+        ],
+        "description": "What an enrollment link is for, and the options to make a new login's\npasskey for it (signed out; signed in, `/enroll/link` adds it to the\nlogin instead)."
+      },
       "Enrollment": {
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The token of the enrollment link (after its `#`)."
+          }
+        }
+      },
+      "EnrollmentLink": {
         "type": "object",
         "description": "A one-time link for a role to register its first passkey for the\nconsole, valid 24 hours.",
         "required": [
@@ -3562,6 +4192,44 @@
           },
           "permission": {
             "$ref": "#/components/schemas/Permission"
+          }
+        }
+      },
+      "IdentitySummary": {
+        "type": "object",
+        "description": "An identity of the login.",
+        "required": [
+          "account_id",
+          "account",
+          "operator",
+          "arn",
+          "admin"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string"
+          },
+          "admin": {
+            "type": "boolean",
+            "description": "Whether the user has `AdministratorAccess` (a root may do anything in\nits account anyway)."
+          },
+          "arn": {
+            "type": "string",
+            "description": "The identity's ARN, which policies name it by."
+          },
+          "operator": {
+            "type": "boolean",
+            "description": "Whether it's the operator account's (the superadmins')."
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user's name; `null`: the account's root."
           }
         }
       },
@@ -4075,6 +4743,27 @@
         },
         "additionalProperties": false
       },
+      "LinkedProvider": {
+        "type": "object",
+        "required": [
+          "provider",
+          "label"
+        ],
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        }
+      },
       "Listing": {
         "type": "object",
         "description": "A page of a bucket's keys, rolled up at `/` like a directory listing.",
@@ -4094,6 +4783,21 @@
               "null"
             ],
             "description": "What to pass as `after` for the next page, if there is one."
+          }
+        }
+      },
+      "Login": {
+        "type": "object",
+        "required": [
+          "challenge_id",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "$ref": "#/components/schemas/Assertion"
           }
         }
       },
@@ -4220,8 +4924,61 @@
           "sweep_shard": {
             "type": "integer",
             "format": "int32",
-            "description": "Where the GC's file sweep is, of `shards` (blob directories; the\nnames are the dashboard's).",
+            "description": "Where the GC's file sweep is, of `shards` (blob directories; the\nnames are the console's).",
             "minimum": 0
+          }
+        }
+      },
+      "Me": {
+        "type": "object",
+        "description": "The signed-in login: who it acts as now, its identities, its passkeys.",
+        "required": [
+          "name",
+          "identity",
+          "identities",
+          "fresh",
+          "passkeys",
+          "oidc"
+        ],
+        "properties": {
+          "fresh": {
+            "type": "boolean",
+            "description": "Whether its passkey was used (or it signed in at its provider)\nwithin five minutes: acting as the operator takes that."
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IdentitySummary"
+            },
+            "description": "Every identity of the login, the operator account's last."
+          },
+          "identity": {
+            "$ref": "#/components/schemas/IdentitySummary",
+            "description": "Who the session acts as."
+          },
+          "name": {
+            "type": "string",
+            "description": "The login's name."
+          },
+          "oidc": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LinkedProvider"
+            },
+            "description": "Its identities at OIDC providers, which sign it in too."
+          },
+          "passkeys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PasskeySummary"
+            }
+          },
+          "signed_in_at": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The OIDC provider this session was signed in at, if it was."
           }
         }
       },
@@ -4343,6 +5100,26 @@
           }
         }
       },
+      "NewPasskey": {
+        "type": "object",
+        "required": [
+          "challenge_id",
+          "name",
+          "credential"
+        ],
+        "properties": {
+          "challenge_id": {
+            "type": "string"
+          },
+          "credential": {
+            "$ref": "#/components/schemas/Registration"
+          },
+          "name": {
+            "type": "string",
+            "description": "What to call it, e.g. \"Laptop\"."
+          }
+        }
+      },
       "NewRate": {
         "type": "object",
         "required": [
@@ -4362,13 +5139,6 @@
           "name"
         ],
         "properties": {
-          "account": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The account (its ID) to make it in, on the dashboard; the first\ntenant account if not given. A console session's own, there."
-          },
           "admin": {
             "type": "boolean"
           },
@@ -4620,11 +5390,11 @@
             }
           }
         ],
-        "description": "What a node reports about itself, for the dashboard of any node (see\n`peer`'s `/stats`)."
+        "description": "What a node reports about itself, for the console of any node (see\n`peer`'s `/stats`)."
       },
       "ObjectInfo": {
         "type": "object",
-        "description": "Every version of a key (the newest 200), each with its parts and where their\nblobs are stored.",
+        "description": "Every version of a key (the newest 200).",
         "required": [
           "bucket",
           "key",
@@ -4741,6 +5511,42 @@
               "null"
             ],
             "description": "`<console URL>/api/oidc/callback`, if this node serves the console."
+          }
+        }
+      },
+      "OidcRedirect": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "url": {
+            "type": "string",
+            "description": "Where to send the browser: the provider's sign-in."
+          }
+        }
+      },
+      "OidcStart": {
+        "type": "object",
+        "required": [
+          "purpose"
+        ],
+        "properties": {
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "purpose": {
+            "type": "string",
+            "description": "`login`, `enroll` (with `token`), `link` or `reauth` (with\n`account_id`), the latter two signed in."
+          },
+          "token": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -4865,85 +5671,6 @@
           }
         }
       },
-      "PartInfo": {
-        "type": "object",
-        "required": [
-          "number",
-          "size",
-          "etag",
-          "blob_id",
-          "blob_offset",
-          "blob_size",
-          "blob_state",
-          "data_shards",
-          "created_at",
-          "nodes",
-          "lost"
-        ],
-        "properties": {
-          "blob_id": {
-            "type": "string"
-          },
-          "blob_offset": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Where in the blob the part's bytes start."
-          },
-          "blob_size": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "blob_state": {
-            "type": "string"
-          },
-          "crc64nvme": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The CRC64/NVME of the part's bytes, in hex; none for old data."
-          },
-          "created_at": {
-            "type": "number",
-            "format": "double"
-          },
-          "data_shards": {
-            "type": "integer",
-            "format": "int32",
-            "description": "The blob's data shards: 1 if it's replicated, else it's erasure-coded,\nand readable with as many live shards."
-          },
-          "etag": {
-            "type": "string"
-          },
-          "lost": {
-            "type": "array",
-            "items": {
-              "type": "array",
-              "items": {
-                "type": "integer",
-                "format": "int64"
-              }
-            },
-            "description": "The byte ranges of the part (as stored) that are intact on no\nreplica, as [start, stop) from its start (see `scrub`)."
-          },
-          "nodes": {
-            "type": "array",
-            "items": {
-              "type": "integer",
-              "format": "int32"
-            },
-            "description": "The nodes holding a shard of the blob."
-          },
-          "number": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "size": {
-            "type": "integer",
-            "format": "int64"
-          }
-        }
-      },
       "PartUploaded": {
         "type": "object",
         "required": [
@@ -4953,6 +5680,55 @@
           "etag": {
             "type": "string",
             "description": "What to complete the upload with."
+          }
+        }
+      },
+      "PasskeyName": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "PasskeySummary": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "backed_up",
+          "created_at",
+          "current"
+        ],
+        "properties": {
+          "backed_up": {
+            "type": "boolean",
+            "description": "Whether it's synced (backed up) by its provider, as it last said."
+          },
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "current": {
+            "type": "boolean",
+            "description": "Whether this session was signed in with it."
+          },
+          "id": {
+            "type": "string",
+            "description": "Its credential ID (base64url)."
+          },
+          "last_used_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "name": {
+            "type": "string"
           }
         }
       },
@@ -4973,6 +5749,42 @@
         ],
         "properties": {
           "document": {
+            "type": "string"
+          }
+        }
+      },
+      "ProviderButton": {
+        "type": "object",
+        "description": "A provider to sign in at.",
+        "required": [
+          "name",
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "Registration": {
+        "type": "object",
+        "description": "What `navigator.credentials.create()` gave the page (its parts, in\nbase64url).",
+        "required": [
+          "id",
+          "client_data_json",
+          "attestation_object"
+        ],
+        "properties": {
+          "attestation_object": {
+            "type": "string"
+          },
+          "client_data_json": {
+            "type": "string"
+          },
+          "id": {
             "type": "string"
           }
         }
@@ -5045,8 +5857,6 @@
         "description": "A role, never with its secret.",
         "required": [
           "name",
-          "account_id",
-          "account",
           "id",
           "admin",
           "created_at",
@@ -5055,13 +5865,6 @@
           "policies"
         ],
         "properties": {
-          "account": {
-            "type": "string"
-          },
-          "account_id": {
-            "type": "string",
-            "description": "Its account's ID and name."
-          },
           "admin": {
             "type": "boolean"
           },
@@ -5338,6 +6141,35 @@
           }
         }
       },
+      "Switch": {
+        "type": "object",
+        "required": [
+          "account_id"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "description": "The account (its ID) to act in."
+          },
+          "challenge_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A fresh assertion, for the operator account, if the session's\npasskey wasn't used within five minutes (`Me.fresh`): its challenge\n(from `/login/options`) and the browser's response."
+          },
+          "credential": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Assertion"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "Tag": {
         "type": "object",
         "description": "A tag of a bucket or an object version (see `s3::tags`).",
@@ -5374,7 +6206,6 @@
           "size",
           "last_modified",
           "tags",
-          "parts",
           "lost_bytes"
         ],
         "properties": {
@@ -5415,12 +6246,6 @@
             "type": "integer",
             "format": "int64",
             "description": "How many of its parts' bytes are intact on no replica."
-          },
-          "parts": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/PartInfo"
-            }
           },
           "size": {
             "type": "integer",

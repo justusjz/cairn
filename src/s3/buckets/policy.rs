@@ -255,7 +255,7 @@ pub async fn bucket_policy_main(args: BucketPolicyArgs) -> anyhow::Result<()> {
             match set(&client, &bucket, Some(&policy)).await? {
                 Set::Set => {}
                 Set::Blocked => anyhow::bail!(
-                    "{BLOCKED}: turn the bucket's off first (DeletePublicAccessBlock, or on the dashboard), \
+                    "{BLOCKED}: turn the bucket's off first (DeletePublicAccessBlock, or in the console), \
                      or the cluster's (cairn config set block-public-policy 0)"
                 ),
                 Set::NoSuchBucket => anyhow::bail!("no bucket named {bucket:?}"),

@@ -1,8 +1,8 @@
 import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { For, Match, Show, Switch, createEffect, createSignal, on, onMount } from "solid-js";
-import { type Bucket, type BucketAccess, type Entry, type PublicAccessBlock, api, downloadUrl, isConsole } from "../api";
+import { type Bucket, type BucketAccess, type Entry, type PublicAccessBlock, api, downloadUrl } from "../api";
 import { CorsDialog, TagsDialog } from "../components/Editors";
-import { Badge, LiveDot, Loading, Panel, Table, act, poll, toast } from "../components/ui";
+import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { bytes, date, num, pretty } from "../format";
 
 const enc = encodeURIComponent;
@@ -35,7 +35,7 @@ export function bucketUrl(bucket: string, prefix = "", deleted = false) {
   return `/buckets/${enc(bucket)}` + (q ? "?" + q : "");
 }
 
-export function objectUrl(bucket: string, key: string) {
+function objectUrl(bucket: string, key: string) {
   return `/buckets/${enc(bucket)}/object?key=${enc(key)}`;
 }
 
@@ -66,8 +66,9 @@ function PublicAccess(props: { bucket: Bucket; cluster: PublicAccessBlock }) {
   );
 }
 
-/** The cluster's public access block, which every bucket gets too. */
-function ClusterBlock(props: { block: PublicAccessBlock; changed: () => void }) {
+/** The cluster's public access block, which every bucket gets too: the
+ * operator's to set (on the Accounts page). */
+export function ClusterBlock(props: { block: PublicAccessBlock; changed: () => void }) {
   const set = async (name: string, on: boolean) => {
     if (await act(() => api.setSetting(name, on ? 1 : 0), `${name} ${on ? "on" : "off"}`)) props.changed();
   };
@@ -122,7 +123,6 @@ export function BucketList() {
           </button>
         </form>
       </div>
-      <Show when={!isConsole() && cluster()}>{(c) => <ClusterBlock block={c()} changed={data.refresh} />}</Show>
       <Show when={buckets.data()} fallback={<Loading error={buckets.error()} />}>
         {(list) => (
           <Panel>
@@ -582,8 +582,7 @@ export function ObjectPage() {
   const [search] = useSearchParams();
   const bucket = () => params.bucket ?? "";
   const key = () => (typeof search.key === "string" ? search.key : "");
-  // The cluster (where parts are stored) is the operator's to see.
-  const data = poll(() => Promise.all([api.object(bucket(), key()), isConsole() ? null : api.cluster()]));
+  const data = poll(() => Promise.all([api.object(bucket(), key())]));
   const [tagging, setTagging] = createSignal<{ version: string; tags: { key: string; value: string }[] }>();
   const removeVersion = async (version: string) => {
     if (!confirm(`Delete version ${version} of "${key()}" for good?`)) return;
@@ -610,9 +609,6 @@ export function ObjectPage() {
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
         {(d) => {
           const obj = () => d()[0];
-          const cluster = () => d()[1];
-          const node = (id: number) => cluster()?.nodes.find((n) => n.id === id);
-          const liveCopies = (ids: number[]) => ids.filter((id) => node(id)?.live).length;
           return (
             <>
               <Panel>
@@ -696,67 +692,6 @@ export function ObjectPage() {
                             <TagList tags={v.tags} />
                           </dd>
                         </dl>
-                        <Show when={cluster()}>
-                        <div class="parts">
-                          <Table
-                            count={v.parts.length}
-                            empty="No parts."
-                            columns={[{ label: "Part", num: true }, { label: "Size", num: true }, "Blob", "Replicas", "CRC64/NVME"]}
-                          >
-                            <For each={v.parts}>
-                              {(p) => (
-                                <tr>
-                                  <td class="num">{p.number}</td>
-                                  <td class="num">{bytes(p.size)}</td>
-                                  <td class="mono small">
-                                    {p.blob_id}
-                                    <div class="subtle">
-                                      at {num(p.blob_offset)} of {bytes(p.blob_size)}
-                                      {p.blob_size > p.size ? " (packed)" : ""}
-                                    </div>
-                                    <Show when={p.lost.length}>
-                                      <div class="lost-ranges" title="intact on no replica: reads of these bytes fail">
-                                        <Badge tone="bad">lost</Badge> bytes{" "}
-                                        {p.lost.map(([a, b]) => `${num(a)}–${num(b - 1)}`).join(", ")} of the part
-                                      </div>
-                                    </Show>
-                                  </td>
-                                  <td>
-                                    <Show when={p.nodes.length} fallback={<Badge tone="bad">no copies</Badge>}>
-                                      <For each={p.nodes}>
-                                        {(id) => (
-                                          <span class="chip" title={node(id)?.peer_url ?? ""}>
-                                            <LiveDot live={!!node(id)?.live} />#{id}
-                                          </span>
-                                        )}
-                                      </For>
-                                    </Show>
-                                    <Show when={p.data_shards > 1}>
-                                      {" "}
-                                      <Badge>coded {p.data_shards}+{p.nodes.length - p.data_shards}</Badge>
-                                    </Show>
-                                    <Show
-                                      when={liveCopies(p.nodes) >= p.data_shards}
-                                      fallback={
-                                        <>
-                                          {" "}
-                                          <Badge tone="bad">unavailable</Badge>
-                                        </>
-                                      }
-                                    >
-                                      <Show when={liveCopies(p.nodes) < p.data_shards + (cluster()?.replication_factor ?? 1) - 1}>
-                                        {" "}
-                                        <Badge tone="warn">under-replicated</Badge>
-                                      </Show>
-                                    </Show>
-                                  </td>
-                                  <td class="mono small">{p.crc64nvme ?? "–"}</td>
-                                </tr>
-                              )}
-                            </For>
-                          </Table>
-                        </div>
-                        </Show>
                       </Show>
                     </div>
                   )}

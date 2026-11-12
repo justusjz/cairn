@@ -1,4 +1,4 @@
-//! Embeds the dashboard's UI: every file in `ui/dist`, as built by `npm run
+//! Embeds the console's UI: every file in `ui/dist`, as built by `npm run
 //! build` in `ui/`. Cairn doesn't build without it: run `npm ci && npm run
 //! build` there first (`build-release.sh` does). It isn't built from here, so
 //! that building Cairn never runs npm, say whenever an editor re-runs build
@@ -17,8 +17,6 @@ const SOURCES: &[&str] = &[
     "ui/package.json",
     "ui/package-lock.json",
     "ui/vite.config.ts",
-    "ui/vite.console.config.ts",
-    "ui/console.html",
     "ui/tsconfig.json",
 ];
 
@@ -30,12 +28,9 @@ fn main() {
     for source in SOURCES {
         println!("cargo:rerun-if-changed={source}");
     }
-    // Both pages: the dashboard's, and the console's.
-    let pages = [dist.join("index.html"), dist.join("console/console.html")];
-    let built = pages.iter().map(|page| page.metadata().and_then(|m| m.modified()).ok()).collect::<Option<Vec<_>>>();
-    let Some(built) = built.and_then(|b| b.into_iter().min()) else {
+    let Ok(built) = dist.join("index.html").metadata().and_then(|m| m.modified()) else {
         eprintln!(
-            "error: the UI isn't built (no ui/dist/index.html or ui/dist/console/console.html).\n\
+            "error: the UI isn't built (no ui/dist/index.html).\n\
              Build it first, with Node.js 26 or later: cd ui && npm ci && npm run build"
         );
         std::process::exit(1);
@@ -43,7 +38,7 @@ fn main() {
     let newest = SOURCES.iter().filter_map(|s| newest(&root.join(s))).max();
     if newest.is_some_and(|newest| newest > built) {
         println!(
-            "cargo:warning=ui/dist is older than the UI's sources, so the dashboard may be \
+            "cargo:warning=ui/dist is older than the UI's sources, so the console may be \
              out of date; run `npm run build` in ui/"
         );
     }
@@ -62,7 +57,7 @@ fn main() {
         .unwrap();
     }
     out.push_str("];\n");
-    let target = Path::new(&std::env::var("OUT_DIR").unwrap()).join("dashboard_assets.rs");
+    let target = Path::new(&std::env::var("OUT_DIR").unwrap()).join("ui_assets.rs");
     std::fs::write(target, out).unwrap();
 }
 

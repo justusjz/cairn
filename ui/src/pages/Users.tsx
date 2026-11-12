@@ -1,5 +1,5 @@
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type AccessKey, type Bucket, type Cluster, type Permission, type User, api, isConsole, isOperator } from "../api";
+import { type AccessKey, type Bucket, type Cluster, type Permission, type User, api, isOperator } from "../api";
 import { Badge, Loading, Panel, SecretDialog, Table, act, poll, toast } from "../components/ui";
 import { ago, date, pretty } from "../format";
 
@@ -29,7 +29,7 @@ export default function Users() {
   const cluster = isOperator() ? poll(() => api.cluster(), 10000) : undefined;
   const kms = () => cluster?.data()?.nodes.some((n) => n.stats?.kms) ?? false;
   const [secret, setSecret] = createSignal<NewSecret>();
-  const [editing, setEditing] = createSignal<{ user: string; account: string; policy?: string }>();
+  const [editing, setEditing] = createSignal<{ user: string; policy?: string }>();
   const [enrollment, setEnrollment] = createSignal<{ user: string; url?: string | null; path: string }>();
   const [name, setName] = createSignal("");
   const [newSecret, setNewSecret] = createSignal("");
@@ -50,7 +50,7 @@ export default function Users() {
   return (
     <>
       <div class="page-head">
-        <h1>Users</h1>
+        <h1>{isOperator() ? "Superadmins" : "Users"}</h1>
       </div>
       <Panel title="New user">
         <form class="form-row" onSubmit={create}>
@@ -101,7 +101,7 @@ export default function Users() {
                     kms={kms()}
                     changed={data.refresh}
                     showSecret={setSecret}
-                    editPolicy={(policy) => setEditing({ user: user.name, account: user.account_id, policy })}
+                    editPolicy={(policy) => setEditing({ user: user.name, policy })}
                     showEnrollment={(e) => setEnrollment({ user: user.name, ...e })}
                   />
                 )}
@@ -132,7 +132,6 @@ export default function Users() {
         {(e) => (
           <PolicyDialog
             user={e().user}
-            account={e().account}
             policy={e().policy}
             onClose={() => setEditing(undefined)}
             changed={data.refresh}
@@ -277,30 +276,30 @@ function UserRow(props: {
   const grant = async (e: SubmitEvent) => {
     e.preventDefault();
     const ps = perms();
-    if (await act(() => api.grant(r().name, bucket(), ps, r().account_id), `Granted ${ps.join(", ")} on ${bucket()}`)) props.changed();
+    if (await act(() => api.grant(r().name, bucket(), ps), `Granted ${ps.join(", ")} on ${bucket()}`)) props.changed();
   };
   const revoke = async (b: string, p: Permission) => {
-    if (await act(() => api.revoke(r().name, b, p, r().account_id), `Revoked ${p} on ${b}`)) props.changed();
+    if (await act(() => api.revoke(r().name, b, p), `Revoked ${p} on ${b}`)) props.changed();
   };
   const toggleAdmin = async () => {
     if (r().admin && !confirm(`Revoke admin from "${r().name}"?`)) return;
     const msg = r().admin ? `${r().name} is no longer an admin` : `${r().name} is now an admin`;
-    if (await act(() => api.setAdmin(r().name, !r().admin, r().account_id), msg)) props.changed();
+    if (await act(() => api.setAdmin(r().name, !r().admin), msg)) props.changed();
   };
   const newKey = async () => {
-    const res = await act(() => api.createKey(r().name, r().account_id), `Made a new access key for ${r().name}`);
+    const res = await act(() => api.createKey(r().name), `Made a new access key for ${r().name}`);
     if (!res) return;
     props.showSecret(res.value);
     props.changed();
   };
   const enroll = async () => {
-    const res = await act(() => api.createEnrollment(r().name, r().account_id));
+    const res = await act(() => api.createEnrollment(r().name));
     if (res) props.showEnrollment(res.value);
   };
   const remove = async () => {
     if (!confirm(`Delete user "${r().name}", with its access keys, grants and policies? Clients using it stop working.`))
       return;
-    if (await act(() => api.deleteRole(r().name, r().account_id), `Deleted user ${r().name}`)) props.changed();
+    if (await act(() => api.deleteRole(r().name), `Deleted user ${r().name}`)) props.changed();
   };
 
   return (
@@ -310,9 +309,6 @@ function UserRow(props: {
         <div class="subtle small" title="The user's name (alias) in the KMS's auth mount for Cairn">
           id {r().id}
         </div>
-        <Show when={!isConsole()}>
-          <div class="subtle small">account {r().account}</div>
-        </Show>
         <Show
           when={r().kms_entity_id}
           fallback={
@@ -338,7 +334,7 @@ function UserRow(props: {
       <td>
         <Show when={r().keys.length} fallback={<div class="subtle">no access keys</div>}>
           <For each={r().keys}>
-            {(k) => <KeyLine user={r().name} account={r().account_id} accessKey={k} changed={props.changed} showSecret={props.showSecret} />}
+            {(k) => <KeyLine user={r().name} accessKey={k} changed={props.changed} showSecret={props.showSecret} />}
           </For>
         </Show>
         <button
@@ -426,7 +422,6 @@ function UserRow(props: {
  * key and deleting the old one. */
 function KeyLine(props: {
   user: string;
-  account: string;
   accessKey: AccessKey;
   changed: () => void;
   showSecret: (s: NewSecret) => void;
@@ -436,16 +431,16 @@ function KeyLine(props: {
     if (!active && !confirm(`Deactivate access key "${k().id}"? Clients using it stop working until it's activated.`))
       return;
     const msg = `${active ? "Activated" : "Deactivated"} access key ${k().id}`;
-    if (await act(() => api.setKeyActive(props.user, k().id, active, props.account), msg)) props.changed();
+    if (await act(() => api.setKeyActive(props.user, k().id, active), msg)) props.changed();
   };
   const rotate = async () => {
     if (!confirm(`Replace the secret of "${k().id}"? Clients using the old one stop working.`)) return;
-    const res = await act(() => api.rotateSecret(props.user, props.account));
+    const res = await act(() => api.rotateSecret(props.user));
     if (res) props.showSecret({ id: res.value.name, secret: res.value.secret });
   };
   const remove = async () => {
     if (!confirm(`Delete access key "${k().id}"? Clients using it stop working.`)) return;
-    if (await act(() => api.deleteKey(props.user, k().id, props.account), `Deleted access key ${k().id}`)) props.changed();
+    if (await act(() => api.deleteKey(props.user, k().id), `Deleted access key ${k().id}`)) props.changed();
   };
   return (
     <div class="key-line">
@@ -474,7 +469,7 @@ function KeyLine(props: {
 
 /** A user's inline policy, to view, edit or delete (`policy`), or a new one.
  * The server checks it as an identity policy, and says what's wrong. */
-function PolicyDialog(props: { user: string; account: string; policy?: string; onClose: () => void; changed: () => void }) {
+function PolicyDialog(props: { user: string; policy?: string; onClose: () => void; changed: () => void }) {
   let dialog!: HTMLDialogElement;
   const [name, setName] = createSignal(props.policy ?? "");
   const [document, setDocument] = createSignal(props.policy ? "" : TEMPLATE);
@@ -484,7 +479,7 @@ function PolicyDialog(props: { user: string; account: string; policy?: string; o
     dialog.showModal();
     if (!props.policy) return;
     try {
-      const p = await api.policy(props.user, props.policy, props.account);
+      const p = await api.policy(props.user, props.policy);
       setDocument(pretty(p.document));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -495,7 +490,7 @@ function PolicyDialog(props: { user: string; account: string; policy?: string; o
     e.preventDefault();
     const n = name().trim();
     try {
-      await api.putPolicy(props.user, n, document(), props.account);
+      await api.putPolicy(props.user, n, document());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       return;
@@ -506,7 +501,7 @@ function PolicyDialog(props: { user: string; account: string; policy?: string; o
   };
   const remove = async () => {
     if (!confirm(`Delete policy "${props.policy}" of "${props.user}"?`)) return;
-    if (await act(() => api.deletePolicy(props.user, props.policy!, props.account), `Deleted policy ${props.policy}`)) {
+    if (await act(() => api.deletePolicy(props.user, props.policy!), `Deleted policy ${props.policy}`)) {
       props.changed();
       dialog.close();
     }

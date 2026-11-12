@@ -42,17 +42,13 @@ pub fn valid_bucket_name(name: &str) -> bool {
         && !RESERVED_SUFFIXES.iter().any(|s| name.ends_with(s))
 }
 
-/// Creates a bucket of account `account` (its ID; `None`: the first tenant
-/// account). Shared by CreateBucket and the dashboard.
-pub async fn create(app: &App, name: &str, account: Option<&str>) -> anyhow::Result<Creation> {
+/// Creates a bucket of account `account` (its ID). Shared by CreateBucket
+/// and the console.
+pub async fn create(app: &App, name: &str, account: &str) -> anyhow::Result<Creation> {
     if !valid_bucket_name(name) {
         return Ok(Creation::InvalidName);
     }
     let client = app.pool.get().await?;
-    let account = match account {
-        Some(account) => account.to_owned(),
-        None => crate::roles::account(&client).await?,
-    };
     let operator: bool = client
         .query_opt_cached("SELECT operator FROM accounts WHERE id = $1", &[&account])
         .await?
@@ -83,7 +79,7 @@ pub async fn create(app: &App, name: &str, account: Option<&str>) -> anyhow::Res
 /// that exists succeeds, as it does for its owner in S3's us-east-1; another
 /// account's is BucketAlreadyExists, as in S3.
 pub async fn create_bucket(app: &App, bucket: &str, account: &str) -> anyhow::Result<Response<Full<Bytes>>> {
-    match create(app, bucket, Some(account)).await? {
+    match create(app, bucket, account).await? {
         Creation::InvalidName => {
             return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidBucketName", "the specified bucket is not valid"));
         }
@@ -132,7 +128,7 @@ mod tests {
             "a..b",
             "a_b",
             "a/b",
-            "_dashboard",
+            "_console",
             &"a".repeat(64),
             "192.168.5.123",
             "xn--bucket",

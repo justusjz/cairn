@@ -11,7 +11,7 @@
 //! versions read per hour), so that however much there is to sweep, they
 //! never take more of the database than that. If a day isn't enough for every
 //! bucket's sweep at that rate, they take longer, and expirations come late;
-//! the dashboard shows how long a round of them takes, so that the admin can
+//! the console shows how long a round of them takes, so that the admin can
 //! raise the rate.
 //!
 //! Sweeps take turns: there's one step at a time in the whole cluster, about

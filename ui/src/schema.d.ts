@@ -386,6 +386,63 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/enroll": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Makes a new login, with a first passkey, for an enrollment link's
+         *     identity (using the link up), and signs in with it.
+         */
+        post: operations["enroll"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/enroll/link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Adds an enrollment link's identity to the signed-in login (using the
+         *     link up), and acts as it, unless it's the operator account's, which
+         *     takes a fresh passkey assertion first (`/switch`).
+         */
+        post: operations["enroll_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/enroll/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["enroll_options"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/integrity": {
         parameters: {
             query?: never;
@@ -452,6 +509,75 @@ export interface paths {
         };
         get?: never;
         put: operations["set_lifecycle_rate"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Signs in with a passkey, as the login's identity in its first account
+         *     (by name; the operator account last).
+         */
+        post: operations["login"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/login/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["login_options"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/logout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Signs out: ends the session. */
+        post: operations["logout"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/me": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["me"];
+        put?: never;
         post?: never;
         delete?: never;
         options?: never;
@@ -528,6 +654,134 @@ export interface paths {
         post?: never;
         /** Removes an OIDC provider: the identities at it no longer sign anyone in. */
         delete: operations["delete_oidc_provider"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oidc/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Where providers send the browser back to (register it with them): ends
+         *     the sign-in, and goes on to the console.
+         */
+        get: operations["oidc_callback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oidc/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The OIDC providers people may sign in at (for the sign-in page). */
+        get: operations["oidc_providers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oidc/{provider}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unlinks the signed-in login's identity at a provider (not its last way
+         *     in).
+         */
+        delete: operations["oidc_unlink"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/oidc/{provider}/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Starts a sign-in at a provider. */
+        post: operations["oidc_start"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/passkeys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Adds a passkey to the signed-in login. */
+        post: operations["add_passkey"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/passkeys/options": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["passkey_options"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/passkeys/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Renames one of the signed-in login's passkeys. */
+        put: operations["rename_passkey"];
+        post?: never;
+        /**
+         * Removes one of the signed-in login's passkeys (not its last), and ends
+         *     the sessions signed in with it.
+         */
+        delete: operations["delete_passkey"];
         options?: never;
         head?: never;
         patch?: never;
@@ -749,6 +1003,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/switch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acts as the login's identity in another account. */
+        post: operations["switch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -781,6 +1052,15 @@ export interface components {
         };
         AdminFlag: {
             admin: boolean;
+        };
+        /** @description What `navigator.credentials.get()` gave the page. */
+        Assertion: {
+            authenticator_data: string;
+            client_data_json: string;
+            id: string;
+            signature: string;
+            /** @description The login the passkey is of, as the authenticator says. */
+            user_handle?: string | null;
         };
         Backlog: {
             /**
@@ -930,6 +1210,15 @@ export interface components {
              */
             versions: number;
         };
+        /**
+         * @description A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:
+         *     `PublicKeyCredentialCreationOptionsJSON` or `…RequestOptionsJSON`), and
+         *     the ID of its challenge, to send back with the response.
+         */
+        Ceremony: {
+            challenge_id: string;
+            options: Record<string, never>;
+        };
         Cluster: {
             nodes: components["schemas"]["ClusterNode"][];
             /** Format: double */
@@ -1044,11 +1333,27 @@ export interface components {
              */
             kms_key_version?: number | null;
         };
+        Enroll: components["schemas"]["NewPasskey"] & {
+            token: string;
+        };
+        /**
+         * @description What an enrollment link is for, and the options to make a new login's
+         *     passkey for it (signed out; signed in, `/enroll/link` adds it to the
+         *     login instead).
+         */
+        EnrollCeremony: components["schemas"]["Ceremony"] & {
+            /** @description The identity: `user @ account`, or `root @ account`. */
+            identity: string;
+        };
+        Enrollment: {
+            /** @description The token of the enrollment link (after its `#`). */
+            token: string;
+        };
         /**
          * @description A one-time link for a role to register its first passkey for the
          *     console, valid 24 hours.
          */
-        Enrollment: {
+        EnrollmentLink: {
             /** @description The link's path, for the console's URL. */
             path: string;
             /** @description The link, if this node serves the console (and so knows its URL). */
@@ -1130,6 +1435,22 @@ export interface components {
         Grant: {
             bucket: string;
             permission: components["schemas"]["Permission"];
+        };
+        /** @description An identity of the login. */
+        IdentitySummary: {
+            account: string;
+            account_id: string;
+            /**
+             * @description Whether the user has `AdministratorAccess` (a root may do anything in
+             *     its account anyway).
+             */
+            admin: boolean;
+            /** @description The identity's ARN, which policies name it by. */
+            arn: string;
+            /** @description Whether it's the operator account's (the superadmins'). */
+            operator: boolean;
+            /** @description The user's name; `null`: the account's root. */
+            user?: string | null;
         };
         /**
          * @description What the scrubber found (see `scrub`): damaged and missing copies, and the
@@ -1358,11 +1679,20 @@ export interface components {
             id?: string;
             noncurrent_expiration?: components["schemas"]["LifecycleNoncurrentExpiration"] | null;
         };
+        LinkedProvider: {
+            email?: string | null;
+            label: string;
+            provider: string;
+        };
         /** @description A page of a bucket's keys, rolled up at `/` like a directory listing. */
         Listing: {
             entries: components["schemas"]["Entry"][];
             /** @description What to pass as `after` for the next page, if there is one. */
             next?: string | null;
+        };
+        Login: {
+            challenge_id: string;
+            credential: components["schemas"]["Assertion"];
         };
         LostObject: {
             bucket: string;
@@ -1412,9 +1742,28 @@ export interface components {
             /**
              * Format: int32
              * @description Where the GC's file sweep is, of `shards` (blob directories; the
-             *     names are the dashboard's).
+             *     names are the console's).
              */
             sweep_shard: number;
+        };
+        /** @description The signed-in login: who it acts as now, its identities, its passkeys. */
+        Me: {
+            /**
+             * @description Whether its passkey was used (or it signed in at its provider)
+             *     within five minutes: acting as the operator takes that.
+             */
+            fresh: boolean;
+            /** @description Every identity of the login, the operator account's last. */
+            identities: components["schemas"]["IdentitySummary"][];
+            /** @description Who the session acts as. */
+            identity: components["schemas"]["IdentitySummary"];
+            /** @description The login's name. */
+            name: string;
+            /** @description Its identities at OIDC providers, which sign it in too. */
+            oidc: components["schemas"]["LinkedProvider"][];
+            passkeys: components["schemas"]["PasskeySummary"][];
+            /** @description The OIDC provider this session was signed in at, if it was. */
+            signed_in_at?: string | null;
         };
         /** @description A node's metrics. Times are seconds since the Unix epoch. */
         MetricsReport: {
@@ -1460,6 +1809,12 @@ export interface components {
             /** @description `openid email profile` if not given. */
             scopes?: string | null;
         };
+        NewPasskey: {
+            challenge_id: string;
+            credential: components["schemas"]["Registration"];
+            /** @description What to call it, e.g. "Laptop". */
+            name: string;
+        };
         NewRate: {
             /**
              * Format: int64
@@ -1468,11 +1823,6 @@ export interface components {
             rate: number;
         };
         NewRole: {
-            /**
-             * @description The account (its ID) to make it in, on the dashboard; the first
-             *     tenant account if not given. A console session's own, there.
-             */
-            account?: string | null;
             admin?: boolean;
             name: string;
             /** @description At least 8 characters; one is generated if not given. */
@@ -1554,7 +1904,7 @@ export interface components {
             shards: number;
         };
         /**
-         * @description What a node reports about itself, for the dashboard of any node (see
+         * @description What a node reports about itself, for the console of any node (see
          *     `peer`'s `/stats`).
          */
         NodeStats: components["schemas"]["MetricsReport"] & {
@@ -1577,10 +1927,7 @@ export interface components {
             scrub_rate: number;
             version: string;
         };
-        /**
-         * @description Every version of a key (the newest 200), each with its parts and where their
-         *     blobs are stored.
-         */
+        /** @description Every version of a key (the newest 200). */
         ObjectInfo: {
             bucket: string;
             key: string;
@@ -1624,6 +1971,19 @@ export interface components {
             providers: components["schemas"]["OidcProvider"][];
             /** @description `<console URL>/api/oidc/callback`, if this node serves the console. */
             redirect_uri?: string | null;
+        };
+        OidcRedirect: {
+            /** @description Where to send the browser: the provider's sign-in. */
+            url: string;
+        };
+        OidcStart: {
+            account_id?: string | null;
+            /**
+             * @description `login`, `enroll` (with `token`), `link` or `reauth` (with
+             *     `account_id`), the latter two signed in.
+             */
+            purpose: string;
+            token?: string | null;
         };
         OpCounts: components["schemas"]["Counts"] & {
             op: string;
@@ -1678,42 +2038,25 @@ export interface components {
             /** Format: int64 */
             parts: number;
         };
-        PartInfo: {
-            blob_id: string;
-            /**
-             * Format: int64
-             * @description Where in the blob the part's bytes start.
-             */
-            blob_offset: number;
-            /** Format: int64 */
-            blob_size: number;
-            blob_state: string;
-            /** @description The CRC64/NVME of the part's bytes, in hex; none for old data. */
-            crc64nvme?: string | null;
-            /** Format: double */
-            created_at: number;
-            /**
-             * Format: int32
-             * @description The blob's data shards: 1 if it's replicated, else it's erasure-coded,
-             *     and readable with as many live shards.
-             */
-            data_shards: number;
-            etag: string;
-            /**
-             * @description The byte ranges of the part (as stored) that are intact on no
-             *     replica, as [start, stop) from its start (see `scrub`).
-             */
-            lost: number[][];
-            /** @description The nodes holding a shard of the blob. */
-            nodes: number[];
-            /** Format: int32 */
-            number: number;
-            /** Format: int64 */
-            size: number;
-        };
         PartUploaded: {
             /** @description What to complete the upload with. */
             etag: string;
+        };
+        PasskeyName: {
+            name: string;
+        };
+        PasskeySummary: {
+            /** @description Whether it's synced (backed up) by its provider, as it last said. */
+            backed_up: boolean;
+            /** Format: double */
+            created_at: number;
+            /** @description Whether this session was signed in with it. */
+            current: boolean;
+            /** @description Its credential ID (base64url). */
+            id: string;
+            /** Format: double */
+            last_used_at?: number | null;
+            name: string;
         };
         /**
          * @description A bucket-level permission a role can be granted.
@@ -1723,6 +2066,20 @@ export interface components {
         /** @description An inline policy: a JSON document in IAM's policy language. */
         PolicyDocument: {
             document: string;
+        };
+        /** @description A provider to sign in at. */
+        ProviderButton: {
+            label: string;
+            name: string;
+        };
+        /**
+         * @description What `navigator.credentials.create()` gave the page (its parts, in
+         *     base64url).
+         */
+        Registration: {
+            attestation_object: string;
+            client_data_json: string;
+            id: string;
         };
         /**
          * @description The committed blobs of `data_shards` data shards (1: replicated) with
@@ -1755,9 +2112,6 @@ export interface components {
         };
         /** @description A role, never with its secret. */
         RoleSummary: {
-            account: string;
-            /** @description Its account's ID and name. */
-            account_id: string;
             admin: boolean;
             /** Format: double */
             created_at: number;
@@ -1862,6 +2216,17 @@ export interface components {
             /** Format: double */
             started: number;
         };
+        Switch: {
+            /** @description The account (its ID) to act in. */
+            account_id: string;
+            /**
+             * @description A fresh assertion, for the operator account, if the session's
+             *     passkey wasn't used within five minutes (`Me.fresh`): its challenge
+             *     (from `/login/options`) and the browser's response.
+             */
+            challenge_id?: string | null;
+            credential?: components["schemas"]["Assertion"] | null;
+        };
         /** @description A tag of a bucket or an object version (see `s3::tags`). */
         Tag: {
             key: string;
@@ -1883,7 +2248,6 @@ export interface components {
              * @description How many of its parts' bytes are intact on no replica.
              */
             lost_bytes: number;
-            parts: components["schemas"]["PartInfo"][];
             /** Format: int64 */
             size: number;
             /** @description Its tags, sorted by key. */
@@ -1994,7 +2358,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Enrollment"];
+                    "application/json": components["schemas"]["EnrollmentLink"];
                 };
             };
             "4XX": {
@@ -3052,6 +3416,124 @@ export interface operations {
             };
         };
     };
+    enroll: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Enroll"];
+            };
+        };
+        responses: {
+            /** @description Signed in; the session's cookie is set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    enroll_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Enrollment"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    enroll_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Enrollment"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnrollCeremony"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_integrity: {
         parameters: {
             query?: never;
@@ -3167,6 +3649,142 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    login: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Login"];
+            };
+        };
+        responses: {
+            /** @description Signed in; the session's cookie is set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    login_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Ceremony"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    logout: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Signed out; the cookie is cleared */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    me: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
             };
             "4XX": {
                 headers: {
@@ -3370,6 +3988,282 @@ export interface operations {
             };
         };
     };
+    oidc_callback: {
+        parameters: {
+            query?: {
+                state?: string;
+                code?: string;
+                error?: string;
+                error_description?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description On to the console, signed in (or to the sign-in page, with what went wrong) */
+            303: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    oidc_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderButton"][];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    oidc_unlink: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Unlinked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    oidc_start: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                provider: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OidcStart"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OidcRedirect"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    add_passkey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewPasskey"];
+            };
+        };
+        responses: {
+            /** @description Added */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    passkey_options: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Ceremony"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    rename_passkey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PasskeyName"];
+            };
+        };
+        responses: {
+            /** @description Renamed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_passkey: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_public_access: {
         parameters: {
             query?: never;
@@ -3465,10 +4359,7 @@ export interface operations {
     };
     delete_role: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3504,10 +4395,7 @@ export interface operations {
     };
     set_admin: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3547,10 +4435,7 @@ export interface operations {
     };
     create_enrollment: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3564,7 +4449,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Enrollment"];
+                    "application/json": components["schemas"]["EnrollmentLink"];
                 };
             };
             "4XX": {
@@ -3587,10 +4472,7 @@ export interface operations {
     };
     grant: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3632,8 +4514,6 @@ export interface operations {
         parameters: {
             query: {
                 bucket: string;
-                /** @description The user's account (its ID), on the dashboard (see `InAccount`). */
-                account?: string;
                 /** @description The permission to revoke; all of them on the bucket if not given. */
                 permission?: components["schemas"]["Permission"];
             };
@@ -3672,10 +4552,7 @@ export interface operations {
     };
     create_key: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3712,10 +4589,7 @@ export interface operations {
     };
     set_key: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3756,10 +4630,7 @@ export interface operations {
     };
     delete_key: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3796,10 +4667,7 @@ export interface operations {
     };
     get_policy: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3837,10 +4705,7 @@ export interface operations {
     };
     put_policy: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3881,10 +4746,7 @@ export interface operations {
     };
     delete_policy: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -3921,10 +4783,7 @@ export interface operations {
     };
     rotate_secret: {
         parameters: {
-            query?: {
-                /** @description The account (its ID), on the dashboard. */
-                account?: string;
-            };
+            query?: never;
             header?: never;
             path: {
                 role: string;
@@ -4019,6 +4878,45 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Storage"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    switch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Switch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "5XX": {

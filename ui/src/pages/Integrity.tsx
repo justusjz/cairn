@@ -1,9 +1,7 @@
-import { A } from "@solidjs/router";
 import { For, Show, createMemo } from "solid-js";
 import { type Cluster, type Integrity as IntegrityInfo, type Storage, api, statsOf } from "../api";
 import { Badge, Card, LiveDot, Loading, Panel, type Tone, Table, poll } from "../components/ui";
 import { ago, bytes, date, duration, num, pct, plural } from "../format";
-import { objectUrl } from "./Buckets";
 
 /** The least time between two checks of a copy (`scrub::MIN_INTERVAL`). */
 const MIN_PERIOD = 7 * 86400;
@@ -173,7 +171,7 @@ function View(props: { integrity: IntegrityInfo; storage: Storage; cluster: Clus
               <tr>
                 <td class="key">
                   <span class="subtle">{o.bucket}/</span>
-                  <A href={objectUrl(o.bucket, o.key)}>{o.key}</A>
+                  {o.key}
                 </td>
                 <td>
                   <Show

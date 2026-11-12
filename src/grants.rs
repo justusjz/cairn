@@ -7,7 +7,7 @@
 //! to any S3 or IAM tool.
 //!
 //! Each permission is one statement, `CairnGrant<Permission>`, naming the
-//! users granted it; the dashboard and console show those as grants, and
+//! users granted it; the console shows those as grants, and
 //! leave the policy's other statements alone. A change is a compare-and-swap
 //! of the bucket's policy (an UPDATE whose condition is on the bucket's row
 //! only, re-checked under its lock: F2), retried if another got in first.

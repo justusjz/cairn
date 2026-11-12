@@ -104,7 +104,6 @@ nav a.active { background: var(--accent-soft); color: var(--accent); font-weight
 .nav-count.bad { background: var(--bad); color: var(--panel); }
 .warn-text { color: var(--warn); font-weight: 600; }
 .badge-link:hover { text-decoration: none; }
-.lost-ranges { margin-top: 4px; font-family: inherit; color: var(--bad); }
 .nav-count.warn { background: var(--warn-soft); color: var(--warn); }
 
 main { max-width: 1400px; margin: 0 auto; padding: 20px 20px 60px; }
@@ -160,7 +159,6 @@ td.actions > * + * { margin-left: 6px; }
 td.key { word-break: break-all; }
 td.disk { min-width: 200px; }
 td.share { min-width: 140px; }
-.parts { margin-top: 10px; }
 form.grant { margin-top: 6px; }
 .empty { color: var(--muted); padding: 18px 10px; text-align: center; }
 

@@ -1,6 +1,6 @@
-//! What a node keeps track of for the dashboard: the S3 requests it served, and
+//! What a node keeps track of for the console: the S3 requests it served, and
 //! how its maintenance passes went. Kept in memory only, so it starts over when
-//! the node restarts, and each node only knows its own. The dashboard asks every
+//! the node restarts, and each node only knows its own. The console asks every
 //! live node for its share (see `peer`'s `/stats`).
 
 use std::collections::VecDeque;
@@ -356,7 +356,7 @@ impl Metrics {
             .event("maintenance", true, message);
     }
 
-    /// Everything, as the dashboard reports it.
+    /// Everything, as the console reports it.
     pub fn report(&self) -> MetricsReport {
         let requests = self.requests.lock().unwrap();
         let ops = Op::ALL
@@ -475,7 +475,7 @@ pub struct MaintenanceReport {
     /// How many seconds the last pass took.
     pub last_duration: Option<f64>,
     /// Where the GC's file sweep is, of `shards` (blob directories; the
-    /// names are the dashboard's).
+    /// names are the console's).
     pub sweep_shard: u32,
     pub shards: u32,
     pub gc: GcTotals,

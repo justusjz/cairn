@@ -1,5 +1,5 @@
-// The console's JSON API (`src/console/api.rs`), through openapi-fetch, typed
-// by `console-openapi.json` (`npm run gen` writes `schema.d.ts`). The session
+// The console's sign-in API (`src/console/api.rs`), through openapi-fetch,
+// typed by `openapi.json` (`npm run gen` writes `schema.d.ts`). The session
 // is a cookie the browser sends by itself.
 
 import createClient from "openapi-fetch";

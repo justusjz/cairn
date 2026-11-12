@@ -1,16 +1,18 @@
 import { defineConfig } from "vite";
 import solid from "vite-plugin-solid";
 
-// `npm run dev` serves the UI with hot reloading, and passes API requests on
-// to a running node's peer endpoint: CAIRN_URL, or the default one.
-const node = process.env.CAIRN_URL ?? "http://127.0.0.1:9431";
+// The console's UI, served from the root of the console's origin
+// (`--listen-console`). `npm run dev` serves it with hot reloading, and
+// passes API requests on to a running node's console: CAIRN_CONSOLE, or the
+// default one. (Passkeys are bound to the console URL's host, so sign in
+// through the node's own port when trying it against `localhost`.)
+const node = process.env.CAIRN_CONSOLE ?? "http://localhost:9480";
 
 export default defineConfig({
-  // Where the node serves the dashboard (`dashboard::PREFIX`).
-  base: "/_dashboard/",
+  base: "/",
   plugins: [solid()],
   server: {
-    proxy: { "/_dashboard/api": { target: node, changeOrigin: true } },
+    proxy: { "/api": { target: node, changeOrigin: true } },
   },
   build: {
     target: "es2022",

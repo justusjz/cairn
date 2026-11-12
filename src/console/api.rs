@@ -1,8 +1,9 @@
 //! The console's JSON API, under `/api`: signing in with a passkey (a new
 //! login's first through an enrollment link, which adds its identity to a
 //! signed-in login instead), switching between the login's accounts,
-//! signing out, and the login's own passkeys. Its OpenAPI spec is committed as `ui/console-openapi.json`,
-//! which the console UI's types are generated from.
+//! signing out, and the login's own passkeys. Its OpenAPI spec, with
+//! `manage`'s routes, is committed as `ui/openapi.json`, which the UI's
+//! types are generated from.
 //!
 //! The ceremonies take two requests each: the options (with a challenge,
 //! kept in the database for five minutes, and used once), which the page
@@ -26,14 +27,14 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::{Console, Signed, cleared_cookie, session_cookie, session_token, store, webauthn};
-use crate::dashboard::{ApiError, ErrorBody};
+use super::web::{ApiError, ErrorBody};
 
 type Result<T> = std::result::Result<T, ApiError>;
 type ConsoleState = State<Arc<Console>>;
 
 #[derive(OpenApi)]
 #[openapi(
-    info(title = "Cairn console API", description = "The API of Cairn's console."),
+    info(title = "Cairn console", description = "The API of Cairn's console."),
     servers((url = "/api")),
     components(schemas(ErrorBody))
 )]
@@ -58,10 +59,10 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
         .routes(routes!(oidc_unlink))
 }
 
-/// The API's OpenAPI spec, as committed in `ui/console-openapi.json`.
+/// The API's OpenAPI spec, as committed in `ui/openapi.json`.
 pub fn openapi() -> utoipa::openapi::OpenApi {
     let mut spec = router().split_for_parts().1;
-    spec.merge(crate::dashboard::shared_router().split_for_parts().1);
+    spec.merge(super::manage::router().split_for_parts().1);
     spec
 }
 

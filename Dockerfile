@@ -20,8 +20,9 @@ ENV CAIRN_DATA_DIR=/var/lib/cairn \
     CAIRN_LISTEN_CLIENT=0.0.0.0:9000 \
     CAIRN_LISTEN_PEER=0.0.0.0:9431
 VOLUME /var/lib/cairn
-# The S3 API, and the peer endpoint with the dashboard. The latter is
-# unauthenticated, so don't publish it beyond a trusted network.
+# The S3 API, and the peer endpoint. The latter is unauthenticated, so don't
+# publish it beyond a trusted network. The console (--listen-console) is off
+# unless set.
 EXPOSE 9000 9431
 
 ENTRYPOINT ["/usr/local/bin/cairn"]

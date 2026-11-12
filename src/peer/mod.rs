@@ -1,5 +1,5 @@
-//! The peer endpoint: blob traffic between nodes, each node's metrics, and
-//! the dashboard. Unauthenticated, for the private network only.
+//! The peer endpoint: blob traffic between nodes, and each node's metrics.
+//! Unauthenticated, for the private network only.
 
 use std::{sync::Arc, time::Duration};
 
@@ -8,7 +8,7 @@ use axum::{
     body::Body,
     extract::{Path, RawQuery, State},
     http::{HeaderValue, StatusCode, header},
-    response::{IntoResponse, Redirect, Response},
+    response::{IntoResponse, Response},
     routing::{any, get},
 };
 use http_body_util::{BodyExt, Empty};
@@ -29,6 +29,8 @@ use crate::{
     gc, packer,
     shards::{Layout, STRIPE_UNIT},
 };
+
+pub mod stats;
 
 /// Response header of a blob PUT: the hex CRC64/NVME of the file the replica
 /// stored (the data plus its checksum table and blob ID).
@@ -101,18 +103,7 @@ pub fn router(app: Arc<App>) -> Router {
             get(get_blob).put(put_blob).delete(delete_blob),
         )
         .route("/blobs/{blob_id}/table", get(get_table))
-        .nest(
-            crate::dashboard::PREFIX,
-            crate::dashboard::router(app.clone()),
-        )
-        // `nest` doesn't match the prefix with a trailing slash.
-        .route("/", get(to_dashboard))
-        .route(&format!("{}/", crate::dashboard::PREFIX), get(to_dashboard))
         .with_state(app)
-}
-
-async fn to_dashboard() -> Redirect {
-    Redirect::to(crate::dashboard::PREFIX)
 }
 
 /// For tests: runs a maintenance pass now (as the background one would, but
@@ -159,9 +150,9 @@ async fn move_shards(State(app): State<Arc<App>>) -> Result<Response, Failed> {
         .into_response())
 }
 
-/// This node's own metrics, for the dashboard of whichever node it's open on.
-async fn stats(State(app): State<Arc<App>>) -> axum::Json<crate::dashboard::NodeStats> {
-    axum::Json(crate::dashboard::node_stats(&app).await)
+/// This node's own metrics, for the console of whichever node it's open on.
+async fn stats(State(app): State<Arc<App>>) -> axum::Json<stats::NodeStats> {
+    axum::Json(stats::node_stats(&app).await)
 }
 
 /// Dumb data plane: streams whatever bytes we hold of a blob from disk (our

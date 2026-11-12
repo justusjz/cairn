@@ -12,8 +12,8 @@
 //!   (unless the client gave that entry itself), as canonical JSON. So a
 //!   data key only opens for an object of the name it was made for. The KMS
 //!   is asked as the role that made the request, so it decides which roles
-//!   may use which keys (see `kms`); a request of no role (the dashboard's)
-//!   may use none.
+//!   may use which keys (see `kms`); a request of no role (an account's root's,
+//!   in the console) may use none.
 //!
 //! - SSE-S3: the same, but with a data key Cairn has from its own SSE-S3 key,
 //!   as itself (see `kms`), which it shares among the objects a node writes
@@ -613,7 +613,7 @@ impl Envelope {
 }
 
 /// The 403 for a request that would need a KMS key without a role to ask
-/// the KMS for it as: the dashboard's. The KMS decides which roles may use
+/// the KMS for it as: an account's root's, in the console. The KMS decides which roles may use
 /// a key, so a request of none may use none.
 fn no_role() -> Response<Full<Bytes>> {
     format_s3_error(

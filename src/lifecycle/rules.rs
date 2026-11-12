@@ -311,7 +311,7 @@ impl Configuration {
     }
 
     /// Checks a configuration as it's given other than in S3's XML (by the
-    /// dashboard), for everything that parsing the XML checks too, and gives
+    /// console), for everything that parsing the XML checks too, and gives
     /// the rules without an ID one. What's wrong, if anything.
     pub fn check(mut self) -> Result<Configuration, String> {
         if self.rules.is_empty() {
@@ -1109,7 +1109,7 @@ mod tests {
         );
         assert_eq!(Configuration::parse(&xml).unwrap(), rules);
         assert_eq!(Configuration::from_json(&rules.to_json()).unwrap(), rules);
-        // As the dashboard gives them, checked the same.
+        // As the console gives them, checked the same.
         let check = |json: &str| Configuration::from_json(json).unwrap().check();
         check(r#"{"rules":[{"id":"a","enabled":true,"filter":{"tags":[{"key":"k","value":"v"}]},"expiration":{"days":1}}]}"#)
             .unwrap();

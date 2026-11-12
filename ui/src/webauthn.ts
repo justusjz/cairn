@@ -2,7 +2,7 @@
 // binary values as base64url) into what `navigator.credentials` takes, and
 // its credentials back into what the server checks.
 
-import type { Assertion, Registration } from "./api";
+import type { Assertion, Registration } from "./session";
 
 function decode(text: string): ArrayBuffer {
   const base64 = text.replace(/-/g, "+").replace(/_/g, "/");

@@ -1,16 +1,17 @@
-//! Who a request of the bucket and object API acts as. That API is shared:
-//! the dashboard serves it to the operator, who may do anything (the peer
-//! endpoint is theirs), and the console to a signed-in user, whom it allows
-//! exactly what the user's S3 requests would be: each call is checked as its
-//! S3 operation's actions, by the same policies (the user's grants, admin
-//! flag and inline policies, and the bucket's), as `s3::access` decides them.
+//! Who a request of the console's API (`manage`) acts as: its session's
+//! identity, whom it allows exactly what the identity's S3 and IAM requests
+//! would be: each call is checked as its operation's actions, by the same
+//! policies (the user's grants, admin flag and inline policies, and the
+//! bucket's), as `s3::access` decides them. The cluster's own calls are
+//! checked as the operator's actions (`cairn:`), which only the operator
+//! account's identities may be allowed.
 
 use std::net::IpAddr;
 use std::sync::Arc;
 
 use axum::http::{HeaderMap, Method};
 
-use super::ApiError;
+use super::web::ApiError;
 use crate::{
     App,
     policy::Verdict,
@@ -21,17 +22,11 @@ use crate::{
     },
 };
 
-/// Who a request acts as (a request extension, which each app's router
-/// sets).
+/// Who a request acts as (a request extension, which `as_user` sets): a
+/// console session's identity, a user or an account's root, under the
+/// policies that apply to it.
 #[derive(Clone)]
-pub(crate) enum Actor {
-    /// The dashboard's operator: everything is allowed, whatever policies
-    /// say.
-    Operator,
-    /// A console session's identity: a user, or an account's root, under
-    /// the policies that apply to it.
-    User(Arc<User>),
-}
+pub(crate) struct Actor(pub Arc<User>);
 
 /// Who a console session acts as.
 pub(crate) enum Subject {
@@ -64,33 +59,25 @@ impl User {
 }
 
 impl Actor {
-    /// The user's ID, which the KMS knows it by (`None` for the operator and
-    /// a root, which have no identity in the KMS).
+    /// The user's ID, which the KMS knows it by (`None` for a root, which
+    /// has no identity in the KMS).
     pub fn kms_role(&self) -> Option<uuid::Uuid> {
-        match self {
-            Actor::User(user) => match &user.subject {
-                Subject::User(principal) => Some(principal.id),
-                Subject::Root => None,
-            },
-            Actor::Operator => None,
+        match &self.0.subject {
+            Subject::User(principal) => Some(principal.id),
+            Subject::Root => None,
         }
     }
 
-    /// The account a console session acts in (`None`: the operator's
-    /// dashboard, which isn't in one).
-    pub fn account(&self) -> Option<&str> {
-        match self {
-            Actor::User(user) => Some(&user.account),
-            Actor::Operator => None,
-        }
+    /// The account the session acts in (its ID).
+    pub fn account(&self) -> &str {
+        &self.0.account
     }
 
     /// Which of `buckets` (name, owning account) are listed to the actor, as
-    /// ListBuckets lists them: to the operator, all; to those allowed
-    /// `s3:ListAllMyBuckets` (and a root), their account's; else those whose
-    /// policies name the user.
+    /// ListBuckets lists them: to those allowed `s3:ListAllMyBuckets` (and a
+    /// root), their account's; else those whose policies name the user.
     pub async fn listed(&self, app: &Arc<App>, buckets: &[(&str, &str)]) -> Result<Vec<bool>, ApiError> {
-        let Actor::User(user) = self else { return Ok(vec![true; buckets.len()]) };
+        let user = &self.0;
         if self.allows(app, "s3:ListAllMyBuckets", On::Account).await? {
             return Ok(buckets.iter().map(|(_, account)| *account == user.account).collect());
         }
@@ -101,9 +88,7 @@ impl Actor {
 
     /// The verdicts on `checks`, with the buckets' policies loaded.
     async fn verdicts(&self, app: &Arc<App>, checks: &[Check]) -> Result<Vec<Verdict>, ApiError> {
-        let Actor::User(user) = self else {
-            return Ok(vec![Verdict::Allow; checks.len()]);
-        };
+        let user = &self.0;
         let origin = Origin { peer: user.peer, trusted_proxies: &app.trusted_proxies, signed: None, form: false };
         let mut access = match &user.subject {
             Subject::User(principal) => {
@@ -129,10 +114,9 @@ impl Actor {
     /// Refuses the request unless every one of `checks` is allowed.
     pub async fn check_all(&self, app: &Arc<App>, checks: &[Check]) -> Result<(), ApiError> {
         let verdicts = self.verdicts(app, checks).await?;
-        let Actor::User(user) = self else { return Ok(()) };
         match checks.iter().zip(verdicts).find(|(_, v)| *v != Verdict::Allow) {
             None => Ok(()),
-            Some((check, verdict)) => Err(ApiError::Forbidden(denied(user, check, verdict))),
+            Some((check, verdict)) => Err(ApiError::Forbidden(denied(&self.0, check, verdict))),
         }
     }
 }

@@ -79,12 +79,12 @@ pub struct ListQuery<'a> {
     /// leaves out).
     pub delete_markers: bool,
     /// Work out each common prefix's totals, which costs reading all of its
-    /// keys (the dashboard shows them; S3 doesn't).
+    /// keys (the console shows them; S3 doesn't).
     pub totals: bool,
 }
 
 /// A page of the current versions in `bucket`, or `None` if there's no such
-/// bucket. Shared by ListObjects(V2) and the dashboard.
+/// bucket. Shared by ListObjects(V2) and the console.
 pub async fn list(app: &App, bucket: &str, q: &ListQuery<'_>) -> anyhow::Result<Option<Listing>> {
     let mut client = app.pool.get().await?;
     let tx = client.transaction().await?;

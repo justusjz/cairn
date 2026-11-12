@@ -41,7 +41,7 @@ async fn a_user_signs_with_any_of_its_active_keys() {
     assert!(Principal::load(&client, &id).await.unwrap().is_none());
     roles::set_key_active(&client, None, &id, true).await.unwrap();
     assert!(Principal::load(&client, &id).await.unwrap().is_some());
-    // Only the user's own, when the user is named (as the dashboard does).
+    // Only the user's own, when the user is named (as the console does).
     roles::create(&client, "mallory", None, false).await.unwrap();
     assert!(roles::set_key_active(&client, Some((&crate::roles::account(&client).await.unwrap(), "mallory")), &id, false).await.is_err());
     assert!(roles::delete_key(&client, Some((&crate::roles::account(&client).await.unwrap(), "mallory")), &id).await.is_err());
