@@ -494,7 +494,10 @@ async fn handle_request(
                 acl::put_bucket_acl(&app, &bucket, req.headers()).await?
             }
             hyper::Method::PUT if operation.name == "CreateBucket" => match acl::check_write(req.headers(), acl::On::Bucket) {
-                Ok(()) => create_bucket(&app, &bucket).await?,
+                Ok(()) => match &principal {
+                    Some(principal) => create_bucket(&app, &bucket, &principal.account).await?,
+                    None => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
+                },
                 Err(refused) => refused,
             },
             // DeleteObjects (batch): POST /{bucket}?delete with a <Delete> body,

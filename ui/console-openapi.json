@@ -804,7 +804,7 @@
     },
     "/enroll": {
       "post": {
-        "summary": "Registers a user's first passkey through its enrollment link (which it\nuses up), and signs in with it.",
+        "summary": "Makes a new login, with a first passkey, for an enrollment link's\nidentity (using the link up), and signs in with it.",
         "operationId": "enroll",
         "requestBody": {
           "content": {
@@ -819,6 +819,51 @@
         "responses": {
           "200": {
             "description": "Signed in; the session's cookie is set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/enroll/link": {
+      "post": {
+        "summary": "Adds an enrollment link's identity to the signed-in login (using the\nlink up), and acts as it, unless it's the operator account's, which\ntakes a fresh passkey assertion first (`/switch`).",
+        "operationId": "enroll_link",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Enrollment"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
             "content": {
               "application/json": {
                 "schema": {
@@ -894,7 +939,7 @@
     },
     "/login": {
       "post": {
-        "summary": "Signs in with a passkey.",
+        "summary": "Signs in with a passkey, as the login's identity in its first account\n(by name; the operator account last).",
         "operationId": "login",
         "requestBody": {
           "content": {
@@ -1028,7 +1073,7 @@
     },
     "/passkeys": {
       "post": {
-        "summary": "Adds a passkey to the signed-in user.",
+        "summary": "Adds a passkey to the signed-in login.",
         "operationId": "add_passkey",
         "requestBody": {
           "content": {
@@ -1101,7 +1146,7 @@
     },
     "/passkeys/{id}": {
       "put": {
-        "summary": "Renames one of the signed-in user's passkeys.",
+        "summary": "Renames one of the signed-in login's passkeys.",
         "operationId": "rename_passkey",
         "parameters": [
           {
@@ -1148,7 +1193,7 @@
         }
       },
       "delete": {
-        "summary": "Removes one of the signed-in user's passkeys (not its last), and ends the\nsessions signed in with it.",
+        "summary": "Removes one of the signed-in login's passkeys (not its last), and ends\nthe sessions signed in with it.",
         "operationId": "delete_passkey",
         "parameters": [
           {
@@ -1210,6 +1255,51 @@
           }
         }
       }
+    },
+    "/switch": {
+      "post": {
+        "summary": "Acts as the login's identity in another account.",
+        "operationId": "switch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Switch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1241,7 +1331,7 @@
               "string",
               "null"
             ],
-            "description": "The user the passkey is of, as the authenticator says."
+            "description": "The login the passkey is of, as the authenticator says."
           }
         }
       },
@@ -1325,6 +1415,7 @@
         "type": "object",
         "required": [
           "name",
+          "account",
           "created_at",
           "versioning",
           "objects",
@@ -1337,6 +1428,10 @@
           "public"
         ],
         "properties": {
+          "account": {
+            "type": "string",
+            "description": "The account that owns it."
+          },
           "bytes": {
             "type": "integer",
             "format": "int64"
@@ -1482,16 +1577,17 @@
           {
             "type": "object",
             "required": [
-              "user"
+              "identity"
             ],
             "properties": {
-              "user": {
-                "type": "string"
+              "identity": {
+                "type": "string",
+                "description": "The identity: `user @ account`, or `root @ account`."
               }
             }
           }
         ],
-        "description": "The options to register a user's first passkey, through an enrollment\nlink, and whose it'll be."
+        "description": "What an enrollment link is for, and the options to make a new login's\npasskey for it (signed out; signed in, `/enroll/link` adds it to the\nlogin instead)."
       },
       "Enrollment": {
         "type": "object",
@@ -1596,6 +1692,44 @@
           "error": {
             "type": "string",
             "description": "What went wrong, for a person to read."
+          }
+        }
+      },
+      "IdentitySummary": {
+        "type": "object",
+        "description": "An identity of the login.",
+        "required": [
+          "account_id",
+          "account",
+          "operator",
+          "arn",
+          "admin"
+        ],
+        "properties": {
+          "account": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string"
+          },
+          "admin": {
+            "type": "boolean",
+            "description": "Whether the user has `AdministratorAccess` (a root may do anything in\nits account anyway)."
+          },
+          "arn": {
+            "type": "string",
+            "description": "The identity's ARN, which policies name it by."
+          },
+          "operator": {
+            "type": "boolean",
+            "description": "Whether it's the operator account's (the superadmins')."
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The user's name; `null`: the account's root."
           }
         }
       },
@@ -1808,23 +1942,33 @@
       },
       "Me": {
         "type": "object",
-        "description": "The signed-in user.",
+        "description": "The signed-in login: who it acts as now, its identities, its passkeys.",
         "required": [
           "name",
-          "arn",
-          "admin",
+          "identity",
+          "identities",
+          "fresh",
           "passkeys"
         ],
         "properties": {
-          "admin": {
-            "type": "boolean"
+          "fresh": {
+            "type": "boolean",
+            "description": "Whether its passkey was used within five minutes: acting as the\noperator takes that."
           },
-          "arn": {
-            "type": "string",
-            "description": "The user's ARN, which policies name it by."
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IdentitySummary"
+            },
+            "description": "Every identity of the login, the operator account's last."
+          },
+          "identity": {
+            "$ref": "#/components/schemas/IdentitySummary",
+            "description": "Who the session acts as."
           },
           "name": {
-            "type": "string"
+            "type": "string",
+            "description": "The login's name."
           },
           "passkeys": {
             "type": "array",
@@ -2058,6 +2202,35 @@
           },
           "id": {
             "type": "string"
+          }
+        }
+      },
+      "Switch": {
+        "type": "object",
+        "required": [
+          "account_id"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string",
+            "description": "The account (its ID) to act in."
+          },
+          "challenge_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A fresh assertion, for the operator account, if the session's\npasskey wasn't used within five minutes (`Me.fresh`): its challenge\n(from `/login/options`) and the browser's response."
+          },
+          "credential": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Assertion"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },

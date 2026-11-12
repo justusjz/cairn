@@ -1,7 +1,12 @@
-//! The console's rows (migration 30): enrollment links, ceremonies'
-//! challenges, passkeys and sessions. Tokens (links' and sessions') are
-//! random, handed out once, and kept as their SHA-256 only, so the database
-//! can't sign anyone in.
+//! The console's rows (migrations 30 and 34): logins, the identities they
+//! act as, their passkeys, enrollment links, ceremonies' challenges and
+//! sessions. Tokens (links' and sessions') are random, handed out once, and
+//! kept as their SHA-256 only, so the database can't sign anyone in.
+//!
+//! A login is a person: its passkeys sign it in, and it's linked to at most
+//! one identity per account, a user of the account, or the account's root;
+//! an identity belongs to at most one login. A session acts as one of its
+//! login's identities at a time, which it can switch.
 
 use std::time::Duration;
 
@@ -20,7 +25,10 @@ pub const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 /// How long a session lasts at most, and unused.
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 pub const SESSION_IDLE: Duration = Duration::from_secs(3600);
-/// The most passkeys a user may have, as IAM's MFA devices (I10).
+/// How recently a session's passkey must have been used to act as the
+/// operator account (a fresh assertion, else).
+pub const OPERATOR_FRESHNESS: Duration = Duration::from_secs(5 * 60);
+/// The most passkeys a login may have, as IAM's MFA devices (I10).
 pub const MAX_PASSKEYS: i32 = 8;
 
 /// A random token, URL-safe, and the hash it's kept as.
@@ -42,22 +50,63 @@ fn secs(d: Duration) -> f64 {
 }
 
 /// A user, as the console knows it.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct User {
     pub id: Uuid,
     pub name: String,
     pub admin: bool,
 }
 
-/// Makes `user` an enrollment link's token, which replaces any it had.
+/// An identity: who a session acts as in an account.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Identity {
+    pub account_id: String,
+    pub account: String,
+    /// Whether it's the operator account (see `plans/policies.md`).
+    pub operator: bool,
+    /// The user; `None`: the account's root.
+    pub user: Option<User>,
+}
+
+impl Identity {
+    /// Its ARN.
+    pub fn arn(&self) -> String {
+        match &self.user {
+            Some(user) => format!("arn:aws:iam::{}:user/{}", self.account_id, user.name),
+            None => format!("arn:aws:iam::{}:root", self.account_id),
+        }
+    }
+
+    /// How it's named to people: `user @ account`, or `root @ account`.
+    pub fn label(&self) -> String {
+        let who = self.user.as_ref().map_or("root", |u| u.name.as_str());
+        format!("{who} @ {}", self.account)
+    }
+}
+
+/// The columns an identity is read from, as `identity_of` takes them, from
+/// `a` (accounts) and `r` (roles, left joined).
+const IDENTITY: &str = "a.id, a.name, a.operator, r.id, r.name, r.admin";
+
+fn identity_of(row: &tokio_postgres::Row, at: usize) -> Identity {
+    let user = row.get::<_, Option<Uuid>>(at + 3).map(|id| User {
+        id,
+        name: row.get(at + 4),
+        admin: row.get(at + 5),
+    });
+    Identity { account_id: row.get(at), account: row.get(at + 1), operator: row.get(at + 2), user }
+}
+
+/// Makes an enrollment link's token for user `user`, which replaces any it
+/// had.
 pub async fn create_enrollment(client: &Object, user: &str) -> anyhow::Result<String> {
     let (token, hash) = token()?;
     let made = client
         .execute_cached(
-            "WITH r AS (SELECT id FROM roles WHERE name = $1),
+            "WITH r AS (SELECT id, account_id FROM roles WHERE name = $1),
                   d AS (DELETE FROM console_enrollments e USING r WHERE e.role_id = r.id)
-             INSERT INTO console_enrollments (token_hash, role_id, expires_at)
-             SELECT $2, r.id, now() + make_interval(secs => $3) FROM r",
+             INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
+             SELECT $2, r.id, r.account_id, now() + make_interval(secs => $3) FROM r",
             &[&user, &hash, &secs(ENROLLMENT_TTL)],
         )
         .await?;
@@ -67,16 +116,39 @@ pub async fn create_enrollment(client: &Object, user: &str) -> anyhow::Result<St
     Ok(token)
 }
 
-/// Whose enrollment link `token` is, while it works.
-pub async fn enrollment(client: &Object, token: &str) -> anyhow::Result<Option<User>> {
+/// Makes an enrollment link's token for the root of the account named
+/// `account`, which replaces any it had: a new account's first, or its
+/// recovery, if its passkeys are lost.
+pub async fn create_root_enrollment(client: &Object, account: &str) -> anyhow::Result<String> {
+    let (token, hash) = token()?;
+    let made = client
+        .execute_cached(
+            "WITH a AS (SELECT id FROM accounts WHERE name = $1),
+                  d AS (DELETE FROM console_enrollments e USING a WHERE e.account_id = a.id AND e.role_id IS NULL)
+             INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
+             SELECT $2, NULL, a.id, now() + make_interval(secs => $3) FROM a",
+            &[&account, &hash, &secs(ENROLLMENT_TTL)],
+        )
+        .await?;
+    if made == 0 {
+        return Err(Invalid(format!("no account named {account:?}")).into());
+    }
+    Ok(token)
+}
+
+/// The identity enrollment link `token` is for, while it works.
+pub async fn enrollment(client: &Object, token: &str) -> anyhow::Result<Option<Identity>> {
     let row = client
         .query_opt_cached(
-            "SELECT r.id, r.name, r.admin FROM console_enrollments e JOIN roles r ON r.id = e.role_id
-             WHERE e.token_hash = $1 AND e.expires_at > now()",
+            &format!(
+                "SELECT {IDENTITY} FROM console_enrollments e
+                 JOIN accounts a ON a.id = e.account_id LEFT JOIN roles r ON r.id = e.role_id
+                 WHERE e.token_hash = $1 AND e.expires_at > now() AND (e.role_id IS NULL OR r.id IS NOT NULL)"
+            ),
             &[&hash(token)],
         )
         .await?;
-    Ok(row.map(|r| User { id: r.get(0), name: r.get(1), admin: r.get(2) }))
+    Ok(row.map(|r| identity_of(&r, 0)))
 }
 
 /// What a challenge is for.
@@ -97,16 +169,17 @@ impl Purpose {
     }
 }
 
-/// A new challenge for a ceremony: its ID and bytes.
-pub async fn create_challenge(client: &Object, purpose: Purpose, user: Option<Uuid>) -> anyhow::Result<(Uuid, Vec<u8>)> {
+/// A new challenge for a ceremony (of `login`, adding a passkey): its ID
+/// and bytes.
+pub async fn create_challenge(client: &Object, purpose: Purpose, login: Option<Uuid>) -> anyhow::Result<(Uuid, Vec<u8>)> {
     let mut challenge = vec![0u8; 32];
     getrandom::fill(&mut challenge).map_err(|e| anyhow::anyhow!("generating a challenge: {e}"))?;
     let id = Uuid::new_v4();
     client
         .execute_cached(
-            "INSERT INTO console_challenges (id, challenge, purpose, role_id, expires_at)
+            "INSERT INTO console_challenges (id, challenge, purpose, login_id, expires_at)
              VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
-            &[&id, &challenge, &purpose.as_str(), &user, &secs(CHALLENGE_TTL)],
+            &[&id, &challenge, &purpose.as_str(), &login, &secs(CHALLENGE_TTL)],
         )
         .await?;
     Ok((id, challenge))
@@ -118,7 +191,7 @@ pub async fn take_challenge(client: &Object, id: Uuid, purpose: Purpose) -> anyh
     let row = client
         .query_opt_cached(
             "DELETE FROM console_challenges WHERE id = $1 AND purpose = $2 AND expires_at > now()
-             RETURNING challenge, role_id",
+             RETURNING challenge, login_id",
             &[&id, &purpose.as_str()],
         )
         .await?;
@@ -135,16 +208,62 @@ pub struct NewPasskey<'a> {
     pub backed_up: bool,
 }
 
-/// Gives `user` a passkey (T30), through the enrollment link `enrollment`
-/// (which it uses up), or signed in (`None`).
-pub async fn add_passkey(client: &Object, user: Uuid, enrollment: Option<&str>, key: &NewPasskey<'_>) -> anyhow::Result<()> {
-    let enrollment = enrollment.map(hash);
+fn no_enrollment() -> anyhow::Error {
+    Invalid("this enrollment link has been used, or has expired".into()).into()
+}
+
+/// A new login `login`, named `name`, with passkey `key`, linked to the
+/// identity of enrollment link `token`, which it uses up (T34): the
+/// identity's account.
+pub async fn new_login(client: &Object, login: Uuid, name: &str, token: &str, key: &NewPasskey<'_>) -> anyhow::Result<String> {
+    let row = client
+        .query_one_cached(
+            "SELECT * FROM pg_temp.cairn_new_login($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            &[
+                &login,
+                &name,
+                &hash(token),
+                &key.credential_id,
+                &key.public_key,
+                &i64::from(key.sign_count),
+                &key.name,
+                &key.backup_eligible,
+                &key.backed_up,
+            ],
+        )
+        .await?;
+    match row.get::<_, &str>(0) {
+        "created" => Ok(row.get(2)),
+        "no_enrollment" => Err(no_enrollment()),
+        "account_taken" => unreachable!("a new login has no identities"),
+        "taken" => Err(Invalid("this passkey is registered already: sign in with it, then open the link again".into()).into()),
+        status => unreachable!("cairn_new_login: unknown status {status}"),
+    }
+}
+
+/// Links the identity of enrollment link `token` to `login` (T33): the
+/// identity's account.
+pub async fn enroll(client: &Object, login: Uuid, token: &str) -> anyhow::Result<String> {
+    let row = client.query_one_cached("SELECT * FROM pg_temp.cairn_enroll($1, $2)", &[&login, &hash(token)]).await?;
+    match row.get::<_, &str>(0) {
+        "linked" => Ok(row.get(1)),
+        "no_enrollment" => Err(no_enrollment()),
+        "account_taken" => Err(Invalid(
+            "you're in this account as someone else already: an account has one identity per login".into(),
+        )
+        .into()),
+        "no_such_login" => Err(Invalid("sign in again".into()).into()),
+        status => unreachable!("cairn_enroll: unknown status {status}"),
+    }
+}
+
+/// Gives `login` a passkey (T30), signed in.
+pub async fn add_passkey(client: &Object, login: Uuid, key: &NewPasskey<'_>) -> anyhow::Result<()> {
     let status = client
         .query_one_cached(
-            "SELECT pg_temp.cairn_add_passkey($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "SELECT pg_temp.cairn_add_passkey($1, $2, $3, $4, $5, $6, $7, $8)",
             &[
-                &user,
-                &enrollment,
+                &login,
                 &key.credential_id,
                 &key.public_key,
                 &i64::from(key.sign_count),
@@ -157,9 +276,8 @@ pub async fn add_passkey(client: &Object, user: Uuid, enrollment: Option<&str>, 
         .await?;
     match status.get::<_, &str>(0) {
         "added" => Ok(()),
-        "no_such_user" => Err(Invalid("the user no longer exists".into()).into()),
-        "no_enrollment" => Err(Invalid("this enrollment link has been used, or has expired".into()).into()),
-        "too_many" => Err(Invalid(format!("a user has at most {MAX_PASSKEYS} passkeys; remove one first")).into()),
+        "no_such_login" => Err(Invalid("sign in again".into()).into()),
+        "too_many" => Err(Invalid(format!("a login has at most {MAX_PASSKEYS} passkeys; remove one first")).into()),
         "taken" => Err(Invalid("this passkey is registered already".into()).into()),
         status => unreachable!("cairn_add_passkey: unknown status {status}"),
     }
@@ -167,7 +285,7 @@ pub async fn add_passkey(client: &Object, user: Uuid, enrollment: Option<&str>, 
 
 /// A passkey, to check an assertion by.
 pub struct Passkey {
-    pub user: User,
+    pub login: Uuid,
     pub public_key: Vec<u8>,
     pub sign_count: u32,
 }
@@ -175,16 +293,11 @@ pub struct Passkey {
 pub async fn passkey(client: &Object, credential_id: &[u8]) -> anyhow::Result<Option<Passkey>> {
     let row = client
         .query_opt_cached(
-            "SELECT r.id, r.name, r.admin, p.public_key, p.sign_count
-             FROM passkeys p JOIN roles r ON r.id = p.role_id WHERE p.credential_id = $1",
+            "SELECT login_id, public_key, sign_count FROM passkeys WHERE credential_id = $1",
             &[&credential_id],
         )
         .await?;
-    Ok(row.map(|r| Passkey {
-        user: User { id: r.get(0), name: r.get(1), admin: r.get(2) },
-        public_key: r.get(3),
-        sign_count: r.get::<_, i64>(4) as u32,
-    }))
+    Ok(row.map(|r| Passkey { login: r.get(0), public_key: r.get(1), sign_count: r.get::<_, i64>(2) as u32 }))
 }
 
 /// Records a passkey's use, if its signature counter went forward (or it
@@ -202,14 +315,30 @@ pub async fn record_use(client: &Object, credential_id: &[u8], sign_count: u32, 
     Ok(updated == 1)
 }
 
-/// A session's token, for `user`, signed in with `credential_id`.
-pub async fn create_session(client: &Object, user: Uuid, credential_id: &[u8]) -> anyhow::Result<String> {
+/// A login's identities, by account name.
+pub async fn identities(client: &Object, login: Uuid) -> anyhow::Result<Vec<Identity>> {
+    let rows = client
+        .query_cached(
+            &format!(
+                "SELECT {IDENTITY} FROM login_identities i
+                 JOIN accounts a ON a.id = i.account_id LEFT JOIN roles r ON r.id = i.role_id
+                 WHERE i.login_id = $1 ORDER BY a.operator, a.name"
+            ),
+            &[&login],
+        )
+        .await?;
+    Ok(rows.iter().map(|r| identity_of(r, 0)).collect())
+}
+
+/// A session's token, for `login`, signed in with `credential_id`, acting as
+/// its identity in `account` (by ID).
+pub async fn create_session(client: &Object, login: Uuid, account: &str, credential_id: &[u8]) -> anyhow::Result<String> {
     let (token, hash) = token()?;
     client
         .execute_cached(
-            "INSERT INTO console_sessions (token_hash, role_id, credential_id, expires_at)
-             VALUES ($1, $2, $3, now() + make_interval(secs => $4))",
-            &[&hash, &user, &credential_id, &secs(SESSION_TTL)],
+            "INSERT INTO console_sessions (token_hash, login_id, account_id, credential_id, expires_at)
+             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+            &[&hash, &login, &account, &credential_id, &secs(SESSION_TTL)],
         )
         .await?;
     Ok(token)
@@ -218,9 +347,15 @@ pub async fn create_session(client: &Object, user: Uuid, credential_id: &[u8]) -
 /// A signed-in session.
 #[derive(Clone, Debug)]
 pub struct Session {
-    pub user: User,
+    pub login: Uuid,
+    /// The login's name (its first identity's, when it was made).
+    pub login_name: String,
+    /// Who it acts as.
+    pub identity: Identity,
     /// The passkey it was signed in with.
     pub credential_id: Vec<u8>,
+    /// Whether its passkey was used within `OPERATOR_FRESHNESS`.
+    pub fresh: bool,
 }
 
 /// The session of `token`, while it lasts; it was used just now (noted at
@@ -228,23 +363,49 @@ pub struct Session {
 pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Session>> {
     let row = client
         .query_opt_cached(
-            "SELECT r.id, r.name, r.admin, s.credential_id, s.last_seen_at < now() - interval '1 minute'
-             FROM console_sessions s JOIN roles r ON r.id = s.role_id
-             WHERE s.token_hash = $1 AND s.expires_at > now()
-               AND s.last_seen_at > now() - make_interval(secs => $2)",
-            &[&hash(token), &secs(SESSION_IDLE)],
+            &format!(
+                "SELECT {IDENTITY}, s.login_id, l.name, s.credential_id,
+                        s.verified_at > now() - make_interval(secs => $3),
+                        s.last_seen_at < now() - interval '1 minute'
+                 FROM console_sessions s
+                 JOIN logins l ON l.id = s.login_id
+                 JOIN login_identities i ON i.login_id = s.login_id AND i.account_id = s.account_id
+                 JOIN accounts a ON a.id = i.account_id LEFT JOIN roles r ON r.id = i.role_id
+                 WHERE s.token_hash = $1 AND s.expires_at > now()
+                   AND s.last_seen_at > now() - make_interval(secs => $2)"
+            ),
+            &[&hash(token), &secs(SESSION_IDLE), &secs(OPERATOR_FRESHNESS)],
         )
         .await?;
     let Some(row) = row else { return Ok(None) };
-    if row.get::<_, bool>(4) {
+    if row.get::<_, bool>(10) {
         client
             .execute_cached("UPDATE console_sessions SET last_seen_at = now() WHERE token_hash = $1", &[&hash(token)])
             .await?;
     }
     Ok(Some(Session {
-        user: User { id: row.get(0), name: row.get(1), admin: row.get(2) },
-        credential_id: row.get(3),
+        identity: identity_of(&row, 0),
+        login: row.get(6),
+        login_name: row.get(7),
+        credential_id: row.get(8),
+        fresh: row.get(9),
     }))
+}
+
+/// Has session `token` act as its login's identity in account `account` (by
+/// ID); `verified`: its passkey was just used (an assertion), which acting
+/// as the operator account needs. Whether the login has an identity there.
+pub async fn switch(client: &Object, token: &str, account: &str, verified: bool) -> anyhow::Result<bool> {
+    let updated = client
+        .execute_cached(
+            "UPDATE console_sessions s
+             SET account_id = $2, verified_at = CASE WHEN $3 THEN now() ELSE s.verified_at END
+             WHERE s.token_hash = $1
+               AND EXISTS (SELECT 1 FROM login_identities i WHERE i.login_id = s.login_id AND i.account_id = $2)",
+            &[&hash(token), &account, &verified],
+        )
+        .await?;
+    Ok(updated == 1)
 }
 
 pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {
@@ -252,7 +413,7 @@ pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A passkey, as its user sees it.
+/// A passkey, as its login sees it.
 pub struct PasskeyInfo {
     pub credential_id: Vec<u8>,
     pub name: String,
@@ -261,14 +422,14 @@ pub struct PasskeyInfo {
     pub last_used_at: Option<f64>,
 }
 
-/// `user`'s passkeys, oldest first.
-pub async fn passkeys(client: &Object, user: Uuid) -> anyhow::Result<Vec<PasskeyInfo>> {
+/// `login`'s passkeys, oldest first.
+pub async fn passkeys(client: &Object, login: Uuid) -> anyhow::Result<Vec<PasskeyInfo>> {
     let rows = client
         .query_cached(
             "SELECT credential_id, name, backed_up, extract(epoch FROM created_at)::float8,
                     extract(epoch FROM last_used_at)::float8
-             FROM passkeys WHERE role_id = $1 ORDER BY created_at, credential_id",
-            &[&user],
+             FROM passkeys WHERE login_id = $1 ORDER BY created_at, credential_id",
+            &[&login],
         )
         .await?;
     Ok(rows
@@ -283,19 +444,19 @@ pub async fn passkeys(client: &Object, user: Uuid) -> anyhow::Result<Vec<Passkey
         .collect())
 }
 
-/// The credential IDs of `user`'s passkeys (for a new one not to be on the
+/// The credential IDs of `login`'s passkeys (for a new one not to be on the
 /// same authenticator).
-pub async fn credential_ids(client: &Object, user: Uuid) -> anyhow::Result<Vec<Vec<u8>>> {
-    let rows = client.query_cached("SELECT credential_id FROM passkeys WHERE role_id = $1", &[&user]).await?;
+pub async fn credential_ids(client: &Object, login: Uuid) -> anyhow::Result<Vec<Vec<u8>>> {
+    let rows = client.query_cached("SELECT credential_id FROM passkeys WHERE login_id = $1", &[&login]).await?;
     Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
-/// Renames one of `user`'s passkeys.
-pub async fn rename_passkey(client: &Object, user: Uuid, credential_id: &[u8], name: &str) -> anyhow::Result<()> {
+/// Renames one of `login`'s passkeys.
+pub async fn rename_passkey(client: &Object, login: Uuid, credential_id: &[u8], name: &str) -> anyhow::Result<()> {
     let updated = client
         .execute_cached(
-            "UPDATE passkeys SET name = $3 WHERE role_id = $1 AND credential_id = $2",
-            &[&user, &credential_id, &name],
+            "UPDATE passkeys SET name = $3 WHERE login_id = $1 AND credential_id = $2",
+            &[&login, &credential_id, &name],
         )
         .await?;
     if updated == 0 {
@@ -304,11 +465,11 @@ pub async fn rename_passkey(client: &Object, user: Uuid, credential_id: &[u8], n
     Ok(())
 }
 
-/// Removes one of `user`'s passkeys, and ends the sessions signed in with
-/// it, unless it's the user's last (T31).
-pub async fn delete_passkey(client: &Object, user: Uuid, credential_id: &[u8]) -> anyhow::Result<()> {
+/// Removes one of `login`'s passkeys, and ends the sessions signed in with
+/// it, unless it's the login's last (T31).
+pub async fn delete_passkey(client: &Object, login: Uuid, credential_id: &[u8]) -> anyhow::Result<()> {
     let status = client
-        .query_one_cached("SELECT pg_temp.cairn_delete_passkey($1, $2)", &[&user, &credential_id])
+        .query_one_cached("SELECT pg_temp.cairn_delete_passkey($1, $2)", &[&login, &credential_id])
         .await?;
     match status.get::<_, &str>(0) {
         "deleted" => Ok(()),
@@ -333,7 +494,7 @@ pub async fn reap(client: &Object) -> anyhow::Result<u64> {
     Ok(reaped)
 }
 
-/// A passkey's name, as its user gives it.
+/// A passkey's name, as its login gives it.
 pub fn check_name(name: &str) -> Result<&str, Invalid> {
     let name = name.trim();
     if name.is_empty() || name.chars().count() > 64 || name.chars().any(char::is_control) {

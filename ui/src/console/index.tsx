@@ -13,7 +13,7 @@ import { useConsoleApi } from "../api";
 import { BucketBrowser, BucketList, ObjectPage } from "../pages/Buckets";
 import Lifecycle from "../pages/Lifecycle";
 import "../styles.css";
-import { ApiError, type Me, type Passkey, api } from "./api";
+import { ApiError, type Identity, type Me, type Passkey, api } from "./api";
 import { authenticate, deviceName, explain, register, supported } from "./webauthn";
 
 useConsoleApi();
@@ -67,7 +67,7 @@ function Layout(props: RouteSectionProps) {
         <Show when={me()}>
           {(m) => (
             <div class="whoami">
-              <span class="mono">{m().name}</span>
+              <AccountPicker me={m()} />
               <button class="small" onClick={logout}>
                 Sign out
               </button>
@@ -78,6 +78,65 @@ function Layout(props: RouteSectionProps) {
       <main>{props.children}</main>
       <Toasts />
     </>
+  );
+}
+
+/** `user @ account`, or `root @ account`. */
+function label(i: Identity): string {
+  return `${i.user ?? "root"} @ ${i.account}`;
+}
+
+/** Switches the session to the login's identity in another account: the
+ * operator account's takes a fresh passkey assertion, if the session's
+ * passkey wasn't used within five minutes. */
+async function switchTo(target: Identity) {
+  try {
+    let next: Me;
+    try {
+      next = await api.switchTo(target.account_id);
+    } catch (e) {
+      if (!(e instanceof ApiError && e.status === 401 && target.operator)) throw e;
+      const ceremony = await api.loginOptions();
+      const credential = await authenticate(ceremony.options);
+      next = await api.switchTo(target.account_id, ceremony.challenge_id, credential);
+    }
+    setMe(next);
+    toast(`Now ${label(next.identity)}`);
+  } catch (e) {
+    toast(explain(e), true);
+  }
+}
+
+/** Who the session acts as, and the login's other identities to switch to. */
+function AccountPicker(props: { me: Me }) {
+  const navigate = useNavigate();
+  const change = async (accountId: string) => {
+    const target = props.me.identities.find((i) => i.account_id === accountId);
+    if (!target || accountId === props.me.identity.account_id) return;
+    await switchTo(target);
+    navigate("/buckets");
+  };
+  return (
+    <Show
+      when={props.me.identities.length > 1}
+      fallback={<span class="mono">{label(props.me.identity)}</span>}
+    >
+      <select
+        aria-label="Account"
+        class="mono"
+        value={props.me.identity.account_id}
+        onChange={(e) => change(e.currentTarget.value)}
+      >
+        <For each={props.me.identities}>
+          {(i) => (
+            <option value={i.account_id}>
+              {label(i)}
+              {i.operator ? " (operator)" : ""}
+            </option>
+          )}
+        </For>
+      </select>
+    </Show>
   );
 }
 
@@ -143,6 +202,19 @@ function Enroll() {
   // The token stays out of the history and the address bar once read.
   history.replaceState(null, "", location.pathname);
   const [ceremony] = createResource(async () => (token ? api.enrollOptions(token) : Promise.reject(new Error("This link has no token."))));
+  /** Signed in: the link's identity joins this login, with no new passkey. */
+  const link = async () => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      setMe(await api.enrollLink(token));
+      toast(`Added ${ceremony()?.identity ?? "the account"} to your login`);
+      navigate("/account");
+    } catch (e) {
+      setError(explain(e));
+      setBusy(false);
+    }
+  };
   const [name, setName] = createSignal(deviceName());
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string>();
@@ -169,9 +241,23 @@ function Enroll() {
           <Show when={ceremony()} fallback={<Loading error={ceremony.error && (ceremony.error as Error).message} />}>
             {(c) => (
               <form onSubmit={enroll}>
+                <Show when={me()}>
+                  {(m) => (
+                    <>
+                      <p>
+                        You're signed in as <span class="mono">{m().name}</span>. Add{" "}
+                        <span class="mono">{c().identity}</span> to this login, to switch to it with the same passkeys:
+                      </p>
+                      <button type="button" class="primary" disabled={busy()} onClick={link}>
+                        Add to my login
+                      </button>
+                      <p class="subtle small">Or make a separate login for it, with a passkey of its own:</p>
+                    </>
+                  )}
+                </Show>
                 <p>
-                  Welcome, <span class="mono">{c().user}</span>. Make a passkey for this console: your device keeps it,
-                  and asks for your fingerprint, face, PIN or security key when you sign in. There's no password.
+                  Welcome, <span class="mono">{c().identity}</span>. Make a passkey for this console: your device keeps
+                  it, and asks for your fingerprint, face, PIN or security key when you sign in. There's no password.
                 </p>
                 <label class="field">
                   Name it
@@ -202,18 +288,41 @@ function Home() {
       {(m) => (
         <>
           <div class="page-head">
-            <h1>{m.name}</h1>
+            <h1>{label(m.identity)}</h1>
           </div>
-          <Panel title="You">
-            <p>
-              <span class="mono">{m.arn}</span>{" "}
-              <Show when={m.admin}>
-                <Badge tone="accent">admin</Badge>
-              </Show>
-            </p>
+          <Panel title="Your accounts" note={`login ${m.name}`}>
+            <Table count={m.identities.length} columns={["Account", "As", "ARN", ""]}>
+              <For each={m.identities}>
+                {(i) => (
+                  <tr>
+                    <td>
+                      {i.account}{" "}
+                      <Show when={i.operator}>
+                        <Badge tone="warn">operator</Badge>
+                      </Show>
+                    </td>
+                    <td>
+                      {i.user ?? "root"}{" "}
+                      <Show when={i.admin}>
+                        <Badge tone="accent">admin</Badge>
+                      </Show>
+                    </td>
+                    <td class="mono small">{i.arn}</td>
+                    <td class="actions">
+                      <Show when={i.account_id !== m.identity.account_id} fallback={<Badge tone="ok">current</Badge>}>
+                        <button class="small" onClick={() => switchTo(i)}>
+                          Switch
+                        </button>
+                      </Show>
+                    </td>
+                  </tr>
+                )}
+              </For>
+            </Table>
             <p class="subtle small">
-              Policies name you by this ARN. What you may do here is what your access keys may do over S3: your grants,
-              admin rights and policies, and the buckets' policies, decide both.
+              One login, with these passkeys, for each account you're in. Policies name you by the ARN. As a user, what
+              you may do here is what your access keys may do over S3; as an account's root, anything in the account
+              but what its buckets' policies deny. Switching to the operator account asks for your passkey again.
             </p>
           </Panel>
           <Passkeys passkeys={m.passkeys} />

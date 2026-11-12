@@ -206,10 +206,31 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Registers a user's first passkey through its enrollment link (which it
-         *     uses up), and signs in with it.
+         * Makes a new login, with a first passkey, for an enrollment link's
+         *     identity (using the link up), and signs in with it.
          */
         post: operations["enroll"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/enroll/link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Adds an enrollment link's identity to the signed-in login (using the
+         *     link up), and acts as it, unless it's the operator account's, which
+         *     takes a fresh passkey assertion first (`/switch`).
+         */
+        post: operations["enroll_link"];
         delete?: never;
         options?: never;
         head?: never;
@@ -241,7 +262,10 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Signs in with a passkey. */
+        /**
+         * Signs in with a passkey, as the login's identity in its first account
+         *     (by name; the operator account last).
+         */
         post: operations["login"];
         delete?: never;
         options?: never;
@@ -307,7 +331,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Adds a passkey to the signed-in user. */
+        /** Adds a passkey to the signed-in login. */
         post: operations["add_passkey"];
         delete?: never;
         options?: never;
@@ -339,12 +363,12 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Renames one of the signed-in user's passkeys. */
+        /** Renames one of the signed-in login's passkeys. */
         put: operations["rename_passkey"];
         post?: never;
         /**
-         * Removes one of the signed-in user's passkeys (not its last), and ends the
-         *     sessions signed in with it.
+         * Removes one of the signed-in login's passkeys (not its last), and ends
+         *     the sessions signed in with it.
          */
         delete: operations["delete_passkey"];
         options?: never;
@@ -372,6 +396,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/switch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Acts as the login's identity in another account. */
+        post: operations["switch"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -382,7 +423,7 @@ export interface components {
             client_data_json: string;
             id: string;
             signature: string;
-            /** @description The user the passkey is of, as the authenticator says. */
+            /** @description The login the passkey is of, as the authenticator says. */
             user_handle?: string | null;
         };
         /** @description A public access block's four flags. */
@@ -413,6 +454,8 @@ export interface components {
             configuration?: components["schemas"]["LifecycleConfiguration"] | null;
         };
         BucketSummary: {
+            /** @description The account that owns it. */
+            account: string;
             /** Format: int64 */
             bytes: number;
             /** Format: double */
@@ -479,11 +522,13 @@ export interface components {
             token: string;
         };
         /**
-         * @description The options to register a user's first passkey, through an enrollment
-         *     link, and whose it'll be.
+         * @description What an enrollment link is for, and the options to make a new login's
+         *     passkey for it (signed out; signed in, `/enroll/link` adds it to the
+         *     login instead).
          */
         EnrollCeremony: components["schemas"]["Ceremony"] & {
-            user: string;
+            /** @description The identity: `user @ account`, or `root @ account`. */
+            identity: string;
         };
         Enrollment: {
             /** @description The token of the enrollment link (after its `#`). */
@@ -515,6 +560,22 @@ export interface components {
         ErrorBody: {
             /** @description What went wrong, for a person to read. */
             error: string;
+        };
+        /** @description An identity of the login. */
+        IdentitySummary: {
+            account: string;
+            account_id: string;
+            /**
+             * @description Whether the user has `AdministratorAccess` (a root may do anything in
+             *     its account anyway).
+             */
+            admin: boolean;
+            /** @description The identity's ARN, which policies name it by. */
+            arn: string;
+            /** @description Whether it's the operator account's (the superadmins'). */
+            operator: boolean;
+            /** @description The user's name; `null`: the account's root. */
+            user?: string | null;
         };
         /** @description A bucket's lifecycle configuration. */
         LifecycleConfiguration: {
@@ -585,11 +646,18 @@ export interface components {
             challenge_id: string;
             credential: components["schemas"]["Assertion"];
         };
-        /** @description The signed-in user. */
+        /** @description The signed-in login: who it acts as now, its identities, its passkeys. */
         Me: {
-            admin: boolean;
-            /** @description The user's ARN, which policies name it by. */
-            arn: string;
+            /**
+             * @description Whether its passkey was used within five minutes: acting as the
+             *     operator takes that.
+             */
+            fresh: boolean;
+            /** @description Every identity of the login, the operator account's last. */
+            identities: components["schemas"]["IdentitySummary"][];
+            /** @description Who the session acts as. */
+            identity: components["schemas"]["IdentitySummary"];
+            /** @description The login's name. */
             name: string;
             passkeys: components["schemas"]["PasskeySummary"][];
         };
@@ -677,6 +745,17 @@ export interface components {
             attestation_object: string;
             client_data_json: string;
             id: string;
+        };
+        Switch: {
+            /** @description The account (its ID) to act in. */
+            account_id: string;
+            /**
+             * @description A fresh assertion, for the operator account, if the session's
+             *     passkey wasn't used within five minutes (`Me.fresh`): its challenge
+             *     (from `/login/options`) and the browser's response.
+             */
+            challenge_id?: string | null;
+            credential?: components["schemas"]["Assertion"] | null;
         };
         /** @description A tag of a bucket or an object version (see `s3::tags`). */
         Tag: {
@@ -1403,6 +1482,45 @@ export interface operations {
             };
         };
     };
+    enroll_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Enrollment"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     enroll_options: {
         parameters: {
             query?: never;
@@ -1742,6 +1860,45 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Block"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    switch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Switch"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "5XX": {

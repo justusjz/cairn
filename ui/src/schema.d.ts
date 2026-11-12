@@ -661,6 +661,8 @@ export interface components {
             configuration?: components["schemas"]["LifecycleConfiguration"] | null;
         };
         BucketSummary: {
+            /** @description The account that owns it. */
+            account: string;
             /** Format: int64 */
             bytes: number;
             /** Format: double */

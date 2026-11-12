@@ -788,6 +788,8 @@ pub(super) async fn integrity(app: &App) -> anyhow::Result<Integrity> {
 #[derive(Serialize, ToSchema)]
 pub(super) struct BucketSummary {
     name: String,
+    /// The account that owns it.
+    account: String,
     created_at: f64,
     versioning: Versioning,
     /// The KMS key of its default encryption (SSE-KMS), if it has one: what a
@@ -830,10 +832,10 @@ fn tag_list(stored: &str) -> Vec<Tag> {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn list_buckets(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<BucketSummary>>> {
-    let all = actor.allows(&app, "s3:ListAllMyBuckets", On::Account).await?;
-    let mut buckets = buckets(&app).await?;
-    buckets.retain(|b| actor.lists(all, &b.name));
-    Ok(Json(buckets))
+    let buckets = buckets(&app).await?;
+    let owners: Vec<(&str, &str)> = buckets.iter().map(|b| (b.name.as_str(), b.account.as_str())).collect();
+    let listed = actor.listed(&app, &owners).await?;
+    Ok(Json(buckets.into_iter().zip(listed).filter(|(_, l)| *l).map(|(b, _)| b).collect()))
 }
 
 /// Every bucket (as ListBuckets lists them), with what's in it.
@@ -874,8 +876,14 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
-    let roles =
-        counts("SELECT bucket, count(DISTINCT role) FROM role_grants GROUP BY bucket").await?;
+    // Users with a grant on it (see `grants`).
+    let mut roles: HashMap<String, i64> = HashMap::new();
+    let mut granted: Vec<(String, String)> =
+        crate::grants::list(&client).await?.into_iter().map(|(bucket, user, _)| (bucket, user)).collect();
+    granted.dedup();
+    for (bucket, _) in granted {
+        *roles.entry(bucket).or_default() += 1;
+    }
     let mut tags: HashMap<String, String> = client
         .query_cached("SELECT name, tags FROM buckets WHERE tags IS NOT NULL", &[])
         .await?
@@ -908,6 +916,7 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
                 public: access.get(&b.name).is_some_and(|(public, _)| *public),
                 public_access_block: access.remove(&b.name).and_then(|(_, block)| block),
                 name: b.name,
+                account: b.account,
                 created_at: b.created_at.epoch,
                 versioning: b.versioning,
                 objects,
@@ -931,12 +940,14 @@ struct NewBucket {
 ))]
 async fn create_bucket(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewBucket>) -> Result<StatusCode> {
     actor.check(&app, "s3:CreateBucket", On::Bucket(body.name.clone())).await?;
-    match create::create(&app, &body.name).await? {
+    // The console's user's account's; the operator's, the first tenant's.
+    match create::create(&app, &body.name, actor.account()).await? {
         create::Creation::Created => Ok(StatusCode::CREATED),
-        create::Creation::Exists => Err(ApiError::Conflict(format!(
+        create::Creation::Exists | create::Creation::OwnedByOther => Err(ApiError::Conflict(format!(
             "a bucket named {:?} already exists",
             body.name
         ))),
+        create::Creation::Operator => Err(ApiError::Forbidden("the operator account owns no buckets".into())),
         create::Creation::InvalidName => Err(ApiError::BadRequest(
             "a bucket name has 3 to 63 lowercase letters, digits, dots and hyphens, \
              and starts and ends with a letter or digit"
@@ -2658,11 +2669,12 @@ mod e2e {
     #[tokio::test]
     async fn s3_refuses_invalid_bucket_names() {
         let Some(app) = node().await else { return };
-        let resp = crate::s3::buckets::create::create_bucket(&app, "Bad_Name")
+        let account = roles::account(&app.pool.get().await.unwrap()).await.unwrap();
+        let resp = crate::s3::buckets::create::create_bucket(&app, "Bad_Name", &account)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let resp = crate::s3::buckets::create::create_bucket(&app, BUCKET)
+        let resp = crate::s3::buckets::create::create_bucket(&app, BUCKET, &account)
             .await
             .unwrap();
         assert_eq!(

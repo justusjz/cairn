@@ -194,3 +194,72 @@ async fn bucket_policies_name_users_as_they_were() {
     assert!(allowed(second).await);
     client.execute("UPDATE buckets SET policy = NULL WHERE name = $1", &[&BUCKET]).await.unwrap();
 }
+
+/// Grants from before they were bucket policies (rows of `role_grants`)
+/// move into their buckets' policies, once, and allow what they did; the
+/// policy's other statements stay.
+#[tokio::test]
+async fn old_grants_move_into_bucket_policies() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    roles::create(&client, "olga", None, false).await.unwrap();
+    let account = roles::account(&client).await.unwrap();
+    let mine = format!(
+        r#"{{"Statement":[{{"Sid":"Mine","Effect":"Deny","Principal":"*","Action":"s3:DeleteBucket","Resource":"arn:aws:s3:::{BUCKET}"}}]}}"#
+    );
+    crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, mine.into()).await.unwrap();
+    client
+        .execute(
+            "INSERT INTO role_grants (role, bucket, permission) VALUES ('olga', $1, 'read'), ('olga', $1, 'write')",
+            &[&BUCKET],
+        )
+        .await
+        .unwrap();
+    assert_eq!(crate::grants::convert(&client).await.unwrap(), 2);
+    assert_eq!(crate::grants::convert(&client).await.unwrap(), 0);
+    let left: i64 = client.query_one("SELECT count(*) FROM role_grants", &[]).await.unwrap().get(0);
+    assert_eq!(left, 0);
+    let grants = crate::grants::list(&client).await.unwrap();
+    assert_eq!(
+        grants,
+        [(BUCKET.to_owned(), "olga".to_owned(), roles::Permission::Read), (BUCKET.to_owned(), "olga".to_owned(), roles::Permission::Write)]
+    );
+    let policy: String =
+        client.query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
+    assert!(policy.contains(r#""Sid":"Mine""#), "{policy}");
+    assert!(policy.contains(&format!("arn:aws:iam::{account}:user/olga")), "{policy}");
+    // Listed to the user, as its grants' buckets are.
+    let principal = Principal::load(&client, "olga").await.unwrap().unwrap();
+    assert!(crate::grants::visible(&client, principal.id).await.unwrap().contains(BUCKET));
+
+    // Revoked, and gone with the user.
+    roles::revoke(&client, "olga", BUCKET, &[roles::Permission::Write]).await.unwrap();
+    assert_eq!(crate::grants::list(&client).await.unwrap().len(), 1);
+    roles::delete(&client, "olga").await.unwrap();
+    assert!(crate::grants::list(&client).await.unwrap().is_empty());
+    let policy: String =
+        client.query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
+    assert!(!policy.contains("CairnGrant"), "{policy}");
+}
+
+/// There's an operator account besides the first tenant account; it owns
+/// no buckets, and users and buckets are the tenant's unless said otherwise.
+#[tokio::test]
+async fn the_operator_account_owns_no_buckets() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let accounts = client.query("SELECT name, operator FROM accounts ORDER BY operator", &[]).await.unwrap();
+    let accounts: Vec<(String, bool)> = accounts.iter().map(|r| (r.get(0), r.get(1))).collect();
+    assert_eq!(accounts, [("default".to_owned(), false), ("operator".to_owned(), true)]);
+    let owner: String =
+        client.query_one("SELECT a.name FROM buckets b JOIN accounts a ON a.id = b.account_id WHERE b.name = $1", &[&BUCKET]).await.unwrap().get(0);
+    assert_eq!(owner, "default");
+    let refused = client
+        .execute("UPDATE buckets SET account_id = (SELECT id FROM accounts WHERE operator) WHERE name = $1", &[&BUCKET])
+        .await
+        .unwrap_err();
+    assert!(refused.to_string().contains("owns no buckets") || format!("{refused:?}").contains("owns no buckets"), "{refused:?}");
+    roles::create_in(&client, Some("operator"), "superadmin", None, false).await.unwrap();
+    let principal = Principal::load(&client, "superadmin").await.unwrap().unwrap();
+    assert_ne!(principal.account, roles::account(&client).await.unwrap());
+}

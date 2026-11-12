@@ -73,6 +73,8 @@ pub enum Principal<'a> {
     /// A user of `account` (its 12-digit ID), by its name and its ID
     /// (which a bucket policy names it by: see `Policy::with_ids`).
     User { account: &'a str, name: &'a str, id: &'a str },
+    /// The root of `account`: the account itself (`arn:aws:iam::<account>:root`).
+    Root { account: &'a str },
 }
 
 /// One check of a request: whether `principal` may do `action` (`s3:...`) to
@@ -109,26 +111,63 @@ pub enum Verdict {
 /// for an anonymous request) and `bucket` (the bucket's policy, if it has
 /// one): an explicit Deny in either denies; else an Allow in either allows;
 /// else it's denied.
+#[cfg(test)]
 pub fn verdict<'p>(
     identity: impl IntoIterator<Item = &'p Policy>,
     bucket: Option<&'p Policy>,
     request: &Request,
 ) -> Verdict {
-    let mut allowed = false;
+    verdict_across(identity, bucket, request, false)
+}
+
+/// As `verdict`, for a resource of another account than the principal's
+/// (`cross`), when that's so: then an identity policy's Allow alone isn't
+/// enough, nor the bucket's alone: both must allow it, as in AWS.
+pub fn verdict_across<'p>(
+    identity: impl IntoIterator<Item = &'p Policy>,
+    bucket: Option<&'p Policy>,
+    request: &Request,
+    cross: bool,
+) -> Verdict {
+    let mut identity_allows = false;
     let anonymous = request.principal == Principal::Anonymous;
     for policy in identity.into_iter().filter(|_| !anonymous) {
         match policy.evaluate(request) {
             Decision::Deny => return Verdict::ExplicitDeny { identity: true },
-            Decision::Allow => allowed = true,
+            Decision::Allow => identity_allows = true,
             Decision::NotApplicable => {}
         }
     }
-    match bucket.map(|policy| policy.evaluate(request)) {
+    let bucket_allows = match bucket.map(|policy| policy.evaluate(request)) {
         Some(Decision::Deny) => return Verdict::ExplicitDeny { identity: false },
-        Some(Decision::Allow) => allowed = true,
-        _ => {}
-    }
+        Some(Decision::Allow) => true,
+        _ => false,
+    };
+    let allowed = match cross && !anonymous {
+        true => identity_allows && bucket_allows,
+        false => identity_allows || bucket_allows,
+    };
     if allowed { Verdict::Allow } else { Verdict::ImplicitDeny }
+}
+
+/// The actions on a bucket's policy, which its account's root may always
+/// take, whatever the policy says: AWS's way out of a policy that denies
+/// everyone.
+const ROOT_EXEMPT: [&str; 3] = ["s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"];
+
+/// The verdict on a request by an account's root (`request.principal`):
+/// identity policies don't restrict it, so it may do anything to what its
+/// account owns (`owns`), but what the bucket's policy denies it, other than
+/// getting, setting and deleting that policy; something of another account
+/// only if that bucket's policy allows it.
+pub fn root_verdict(bucket: Option<&Policy>, request: &Request, owns: bool) -> Verdict {
+    let exempt = owns && ROOT_EXEMPT.contains(&request.action);
+    match bucket.map(|policy| policy.evaluate(request)) {
+        Some(Decision::Deny) if !exempt => Verdict::ExplicitDeny { identity: false },
+        Some(Decision::Allow) => Verdict::Allow,
+        _ if owns => Verdict::Allow,
+        _ => Verdict::ImplicitDeny,
+    }
 }
 
 /// What a policy is attached to, which decides what it may say.
@@ -189,6 +228,11 @@ impl Principals {
     fn about(&self, principal: Principal, allow: bool, ids: &HashMap<String, String>) -> bool {
         match principal {
             Principal::Anonymous => self.everyone != self.not,
+            // The account itself: named by the account (its ID or root ARN).
+            Principal::Root { account } => {
+                let whole = self.accounts.iter().any(|a| a == account);
+                (self.everyone || whole) != self.not
+            }
             Principal::User { account, name, id } => {
                 let user = self.users.iter().any(|(a, n)| {
                     a == account && n == name && ids.get(&user_arn(a, n)).is_some_and(|named| named == id)

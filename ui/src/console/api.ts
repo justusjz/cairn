@@ -8,6 +8,7 @@ import type { components, paths } from "./schema";
 type Schemas = components["schemas"];
 export type Me = Schemas["Me"];
 export type Passkey = Schemas["PasskeySummary"];
+export type Identity = Schemas["IdentitySummary"];
 
 const client = createClient<paths>({
   baseUrl: "/api",
@@ -43,6 +44,9 @@ export const api = {
   enrollOptions: (token: string) => ok(client.POST("/enroll/options", { body: { token } })),
   enroll: (token: string, challenge_id: string, name: string, credential: Registration) =>
     ok(client.POST("/enroll", { body: { token, challenge_id, name, credential } })),
+  enrollLink: (token: string) => ok(client.POST("/enroll/link", { body: { token } })),
+  switchTo: (account_id: string, challenge_id?: string, credential?: Assertion) =>
+    ok(client.POST("/switch", { body: { account_id, challenge_id: challenge_id ?? null, credential: credential ?? null } })),
   loginOptions: () => ok(client.POST("/login/options")),
   login: (challenge_id: string, credential: Assertion) => ok(client.POST("/login", { body: { challenge_id, credential } })),
   logout: () => ok(client.POST("/logout")),

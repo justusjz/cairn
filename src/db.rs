@@ -67,7 +67,7 @@ async fn install_functions(client: &tokio_postgres::Client) -> Result<(), tokio_
         .batch_execute(&format!(
             "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED;
              SET cairn.protocol = '{PROTOCOL}';
-             SET cairn.users = '1'"
+             SET cairn.users = '2'"
         ))
         .await?;
     client.batch_execute(CATALOG_FUNCTIONS).await
@@ -202,6 +202,8 @@ const MIGRATIONS: &[&str] = &[
     CONSOLE,
     PRINCIPAL_IDS,
     PUBLIC_ACCESS_BLOCK,
+    ACCOUNTS,
+    LOGINS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1245,6 +1247,133 @@ const PUBLIC_ACCESS_BLOCK: &str = r#"
 ALTER TABLE buckets ADD COLUMN public_access_block smallint
     CHECK (public_access_block BETWEEN 0 AND 15);
 ALTER TABLE buckets ALTER COLUMN public_access_block SET DEFAULT 15;
+"#;
+
+/// Migration 33: accounts as AWS's (see `plans/policies.md`, "Accounts,
+/// root users and logins"). Each has a name; the one there is becomes the
+/// first tenant account, `default`, and an operator account is added, whose
+/// users are the superadmins, and which owns no buckets. Every user and
+/// every bucket belongs to an account: the ones there are to `default`, as
+/// are buckets that older Cairns create (the column's default).
+///
+/// Grants move into buckets' policies (see `grants`), which a Cairn moves at
+/// its start: older Cairns may no longer write `role_grants`, nor change
+/// users, unless their sessions declare `cairn.users = '2'`. (Those of 0.5.1
+/// read bucket policies, so they see the grants there.)
+const ACCOUNTS: &str = r#"
+ALTER TABLE accounts ADD COLUMN name text;
+ALTER TABLE accounts ADD COLUMN operator boolean NOT NULL DEFAULT false;
+UPDATE accounts SET name = 'default';
+ALTER TABLE accounts ALTER COLUMN name SET NOT NULL;
+ALTER TABLE accounts ADD CONSTRAINT accounts_name UNIQUE (name);
+ALTER TABLE accounts ADD CONSTRAINT accounts_name_check CHECK (name ~ '^[a-z0-9][a-z0-9-]{0,62}$');
+CREATE UNIQUE INDEX accounts_one_operator ON accounts (operator) WHERE operator;
+INSERT INTO accounts (id, name, operator)
+SELECT id, 'operator', true FROM (
+    SELECT lpad(floor(random() * 1e12)::bigint::text, 12, '0') AS id FROM generate_series(1, 10)
+) c WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = c.id) LIMIT 1;
+
+ALTER TABLE roles ADD COLUMN account_id text REFERENCES accounts (id);
+UPDATE roles SET account_id = (SELECT id FROM accounts WHERE name = 'default');
+ALTER TABLE roles ALTER COLUMN account_id SET NOT NULL;
+CREATE INDEX roles_account ON roles (account_id);
+
+ALTER TABLE buckets ADD COLUMN account_id text REFERENCES accounts (id);
+UPDATE buckets SET account_id = (SELECT id FROM accounts WHERE name = 'default');
+DO $$ BEGIN
+    EXECUTE format('ALTER TABLE buckets ALTER COLUMN account_id SET DEFAULT %L',
+                   (SELECT id FROM accounts WHERE name = 'default'));
+END $$;
+ALTER TABLE buckets ALTER COLUMN account_id SET NOT NULL;
+CREATE INDEX buckets_account ON buckets (account_id);
+
+-- The operator account owns no buckets.
+CREATE FUNCTION cairn_tenant_buckets() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (SELECT operator FROM accounts WHERE id = NEW.account_id) THEN
+        RAISE EXCEPTION 'the operator account owns no buckets' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER buckets_tenant BEFORE INSERT OR UPDATE OF account_id ON buckets
+    FOR EACH ROW EXECUTE FUNCTION cairn_tenant_buckets();
+
+CREATE OR REPLACE FUNCTION cairn_require_users() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.users', true) IS DISTINCT FROM '2' THEN
+        RAISE EXCEPTION 'this Cairn is too old to change users or grants, which are bucket policies now; upgrade it'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER role_grants_users BEFORE INSERT OR UPDATE ON role_grants
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+"#;
+
+/// Migration 34: the console's logins (see `console`): a person, with
+/// passkeys, linked to at most one identity per account, an identity being a
+/// user, or (no user) the account's root; an identity belongs to at most one
+/// login. Passkeys move from users to logins (each user that had some gets
+/// a login of its own, with the user's ID); enrollment links are for an
+/// identity; sessions act as one of their login's identities, and end
+/// with its link. Sessions and challenges in progress are dropped.
+const LOGINS: &str = r#"
+CREATE TABLE logins (
+    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    name       text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE TABLE login_identities (
+    login_id   uuid NOT NULL REFERENCES logins (id) ON DELETE CASCADE,
+    account_id text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    role_id    uuid REFERENCES roles (id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (login_id, account_id)
+);
+CREATE UNIQUE INDEX login_identities_user ON login_identities (role_id) WHERE role_id IS NOT NULL;
+CREATE UNIQUE INDEX login_identities_root ON login_identities (account_id) WHERE role_id IS NULL;
+
+INSERT INTO logins (id, name)
+SELECT r.id, r.name FROM roles r WHERE EXISTS (SELECT 1 FROM passkeys p WHERE p.role_id = r.id);
+INSERT INTO login_identities (login_id, account_id, role_id)
+SELECT r.id, r.account_id, r.id FROM roles r WHERE EXISTS (SELECT 1 FROM logins l WHERE l.id = r.id);
+
+DELETE FROM console_sessions;
+DELETE FROM console_challenges;
+
+ALTER TABLE passkeys ADD COLUMN login_id uuid REFERENCES logins (id) ON DELETE CASCADE;
+UPDATE passkeys SET login_id = role_id;
+ALTER TABLE passkeys ALTER COLUMN login_id SET NOT NULL;
+DROP INDEX passkeys_role;
+ALTER TABLE passkeys DROP COLUMN role_id;
+CREATE INDEX passkeys_login ON passkeys (login_id);
+
+ALTER TABLE console_enrollments ADD COLUMN account_id text REFERENCES accounts (id) ON DELETE CASCADE;
+UPDATE console_enrollments e SET account_id = r.account_id FROM roles r WHERE r.id = e.role_id;
+ALTER TABLE console_enrollments ALTER COLUMN account_id SET NOT NULL;
+ALTER TABLE console_enrollments ALTER COLUMN role_id DROP NOT NULL;
+CREATE INDEX console_enrollments_account ON console_enrollments (account_id);
+
+ALTER TABLE console_challenges DROP COLUMN role_id;
+ALTER TABLE console_challenges ADD COLUMN login_id uuid REFERENCES logins (id) ON DELETE CASCADE;
+CREATE INDEX console_challenges_login ON console_challenges (login_id);
+
+DROP INDEX console_sessions_role;
+ALTER TABLE console_sessions DROP COLUMN role_id;
+ALTER TABLE console_sessions ADD COLUMN login_id uuid NOT NULL REFERENCES logins (id) ON DELETE CASCADE;
+ALTER TABLE console_sessions ADD COLUMN account_id text NOT NULL;
+ALTER TABLE console_sessions ADD FOREIGN KEY (login_id, account_id)
+    REFERENCES login_identities (login_id, account_id) ON DELETE CASCADE;
+ALTER TABLE console_sessions ADD COLUMN verified_at timestamptz NOT NULL DEFAULT now();
+CREATE INDEX console_sessions_identity ON console_sessions (login_id, account_id);
+
+CREATE TRIGGER logins_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON logins
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER login_identities_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON login_identities
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

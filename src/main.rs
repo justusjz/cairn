@@ -26,6 +26,7 @@ use crate::writing::WritingSet;
 
 mod peer;
 
+mod accounts;
 mod auth;
 mod aws_chunked;
 mod blob_file;
@@ -39,6 +40,7 @@ mod db;
 mod e2e;
 mod encryption;
 mod gc;
+mod grants;
 mod kms;
 mod lifecycle;
 mod metrics;
@@ -158,6 +160,8 @@ enum Command {
     /// Manage users: their S3 access keys, bucket permissions and policies.
     #[command(alias = "role")]
     User(roles::RoleArgs),
+    /// List or make accounts, and their roots' console enrollment links.
+    Account(accounts::AccountArgs),
     /// Show, set or delete a bucket's policy, whatever it allows.
     BucketPolicy(s3::buckets::policy::BucketPolicyArgs),
     /// Show or change the cluster's settings.
@@ -242,6 +246,7 @@ async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve_main(args).await,
         Command::User(args) => roles::role_main(args).await,
+        Command::Account(args) => accounts::account_main(args).await,
         Command::BucketPolicy(args) => s3::buckets::policy::bucket_policy_main(args).await,
         Command::Config(args) => settings::config_main(args).await,
         Command::Node(args) => nodes::node_main(args).await,
@@ -264,6 +269,11 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     }
     let kms = kms::Kms::new(&args.kms)?;
     let pool = db::connect(&args.database).await?;
+    // Grants from before they were bucket policies (see `grants`).
+    let moved = grants::convert(&pool.get().await?).await?;
+    if moved > 0 {
+        eprintln!("moved {moved} grants into their buckets' policies");
+    }
     let store = Store::new(args.data_dir)?;
     // The URL peers use to reach us: explicit if given, otherwise derived from
     // the (always-set) peer bind address.

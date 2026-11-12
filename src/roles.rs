@@ -14,6 +14,7 @@
 //! against the database, and the dashboard (see `dashboard`) through the same
 //! functions.
 
+#[cfg(test)]
 use std::collections::HashSet;
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -38,7 +39,7 @@ pub enum Permission {
 
 impl Permission {
     /// The permission a `role_grants.permission` names.
-    fn from_db(s: &str) -> anyhow::Result<Permission> {
+    pub(crate) fn from_db(s: &str) -> anyhow::Result<Permission> {
         match s {
             "read" => Ok(Permission::Read),
             "write" => Ok(Permission::Write),
@@ -62,16 +63,23 @@ pub struct Principal {
     /// The user's ID, which the KMS knows it by (see `kms`).
     pub id: uuid::Uuid,
     pub name: String,
-    /// The account the user is of (the cluster's).
+    /// The account the user is of.
     pub account: String,
     /// The secret of the access key the request is signed with.
     pub secret: String,
+    /// Whether it has `AdministratorAccess` (see `s3::actions::admin_policy`).
     pub admin: bool,
-    read: HashSet<String>,
-    write: HashSet<String>,
-    delete_version: HashSet<String>,
     /// The user's inline identity policies, as they were set.
     pub policies: Vec<String>,
+    /// Grants, for tests of what they allowed before they were bucket
+    /// policies (`s3::authorize`); grants are statements of buckets'
+    /// policies now (see `grants`).
+    #[cfg(test)]
+    read: HashSet<String>,
+    #[cfg(test)]
+    write: HashSet<String>,
+    #[cfg(test)]
+    delete_version: HashSet<String>,
 }
 
 impl Principal {
@@ -96,13 +104,7 @@ impl Principal {
     ) -> anyhow::Result<Option<Self>> {
         let row = client
             .query_opt_cached(
-                &format!("SELECT {secret}, r.admin, r.id, r.name, (SELECT id FROM accounts),
-                        ARRAY(SELECT bucket FROM role_grants
-                              WHERE role = r.name AND permission = 'read'),
-                        ARRAY(SELECT bucket FROM role_grants
-                              WHERE role = r.name AND permission = 'write'),
-                        ARRAY(SELECT bucket FROM role_grants
-                              WHERE role = r.name AND permission = 'delete-version'),
+                &format!("SELECT {secret}, r.admin, r.id, r.name, r.account_id,
                         ARRAY(SELECT document FROM role_policies WHERE role_id = r.id ORDER BY name)
                  {from}"),
                 &[param],
@@ -114,10 +116,13 @@ impl Principal {
             id: r.get(2),
             name: r.get(3),
             account: r.get(4),
-            read: r.get::<_, Vec<String>>(5).into_iter().collect(),
-            write: r.get::<_, Vec<String>>(6).into_iter().collect(),
-            delete_version: r.get::<_, Vec<String>>(7).into_iter().collect(),
-            policies: r.get(8),
+            policies: r.get(5),
+            #[cfg(test)]
+            read: HashSet::new(),
+            #[cfg(test)]
+            write: HashSet::new(),
+            #[cfg(test)]
+            delete_version: HashSet::new(),
         }))
     }
 
@@ -129,6 +134,13 @@ impl Principal {
             Permission::Write => self.write.contains(bucket),
             Permission::DeleteVersion => self.delete_version.contains(bucket),
         }
+    }
+
+    /// Whether a role with these grants could learn that `bucket` exists,
+    /// before there were policies (see `s3::authorize`).
+    #[cfg(test)]
+    pub fn can_see(&self, bucket: &str) -> bool {
+        self.admin || self.read.contains(bucket) || self.write.contains(bucket) || self.delete_version.contains(bucket)
     }
 
     /// A role with these grants, for tests.
@@ -150,22 +162,6 @@ impl Principal {
         }
     }
 
-    /// The user's grants, as (permission, bucket).
-    pub fn grants(&self) -> impl Iterator<Item = (Permission, &str)> {
-        let read = self.read.iter().map(|b| (Permission::Read, b.as_str()));
-        let write = self.write.iter().map(|b| (Permission::Write, b.as_str()));
-        let delete_version = self.delete_version.iter().map(|b| (Permission::DeleteVersion, b.as_str()));
-        read.chain(write).chain(delete_version)
-    }
-
-    /// Whether the role may learn that `bucket` exists: admins see every bucket,
-    /// others only the ones they hold a grant on.
-    pub fn can_see(&self, bucket: &str) -> bool {
-        self.admin
-            || self.read.contains(bucket)
-            || self.write.contains(bucket)
-            || self.delete_version.contains(bucket)
-    }
 }
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -189,15 +185,19 @@ enum RoleCommand {
         /// Use this secret instead of generating one (at least 8 characters).
         #[arg(long)]
         secret: Option<String>,
-        /// Allow the user to create, delete, and list all buckets.
+        /// Give the user `AdministratorAccess`: everything in its account.
         #[arg(long)]
         admin: bool,
+        /// The account (by name) to make it in; the first tenant account
+        /// (`default`) if not given.
+        #[arg(long)]
+        account: Option<String>,
     },
     /// Change a user's admin flag, and/or the secret of its access key named
     /// as it.
     Update {
         name: String,
-        /// Grant (true) or revoke (false) bucket management.
+        /// Give (true) or take (false) `AdministratorAccess`.
         #[arg(long)]
         admin: Option<bool>,
         /// Replace the secret with a newly generated one, and print it.
@@ -286,9 +286,10 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
             name,
             secret,
             admin,
+            account,
         } => {
             let generated = secret.is_none();
-            let secret = create(&client, &name, secret, admin).await?;
+            let secret = create_in(&client, account.as_deref(), &name, secret, admin).await?;
             println!("access key: {name}");
             if generated {
                 println!("secret key: {secret}");
@@ -420,14 +421,34 @@ pub fn generate_secret() -> anyhow::Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// Creates a user, with an access key named as it, of `secret` or else a
-/// generated one, and returns its secret.
+/// Creates a user of the first tenant account, with an access key named as
+/// it, of `secret` or else a generated one, and returns its secret.
 pub async fn create(
     client: &Object,
     name: &str,
     secret: Option<String>,
     admin: bool,
 ) -> anyhow::Result<String> {
+    create_in(client, None, name, secret, admin).await
+}
+
+/// Creates a user of the account named `account` (`None`: the first tenant
+/// account), as `create`.
+pub async fn create_in(
+    client: &Object,
+    account: Option<&str>,
+    name: &str,
+    secret: Option<String>,
+    admin: bool,
+) -> anyhow::Result<String> {
+    let account_id = match account {
+        Some(account) => client
+            .query_opt_cached("SELECT id FROM accounts WHERE name = $1", &[&account])
+            .await?
+            .map(|row| row.get::<_, String>(0))
+            .ok_or_else(|| invalid(format!("no account named {account:?}")))?,
+        None => self::account(client).await?,
+    };
     validate_name(name)?;
     let secret = match secret {
         Some(s) => {
@@ -444,11 +465,11 @@ pub async fn create(
     let inserted = client
         .execute_cached(
             "WITH r AS (
-                 INSERT INTO roles (name, secret, admin) VALUES ($1, $2, $3)
+                 INSERT INTO roles (name, secret, admin, account_id) VALUES ($1, $2, $3, $4)
                  ON CONFLICT DO NOTHING RETURNING id
              )
              INSERT INTO access_keys (access_key_id, role_id, secret) SELECT $1, id, $2 FROM r",
-            &[&name, &secret, &admin],
+            &[&name, &secret, &admin, &account_id],
         )
         .await;
     match inserted {
@@ -462,14 +483,18 @@ pub async fn create(
     }
 }
 
-/// The cluster's account ID (see `accounts`), which never changes (until
-/// there are tenants), so it's read once.
+/// The ID of the first tenant account (`default`; see `accounts`), which
+/// users and buckets belong to unless said otherwise, while there are no
+/// other tenants; it never changes, so it's read once.
 pub async fn account(client: &Object) -> anyhow::Result<String> {
     static ACCOUNT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if let Some(account) = ACCOUNT.get() {
         return Ok(account.clone());
     }
-    let account: String = client.query_one_cached("SELECT id FROM accounts", &[]).await?.get(0);
+    let account: String = client
+        .query_one_cached("SELECT id FROM accounts WHERE NOT operator ORDER BY created_at, id LIMIT 1", &[])
+        .await?
+        .get(0);
     // Each test's database has an account of its own.
     if !cfg!(test) {
         let _ = ACCOUNT.set(account.clone());
@@ -670,7 +695,9 @@ pub async fn update(
 
 /// Deletes a role and all its grants.
 pub async fn delete(client: &Object, name: &str) -> anyhow::Result<()> {
-    // Its grants are locked in the lock protocol's order first (see
+    // Its grants first: they're statements of buckets' policies.
+    crate::grants::forget_user(client, name).await?;
+    // Any rows of `role_grants` left are locked in the lock protocol's order first (see
     // `cairn_delete_role`).
     let deleted: bool = client
         .query_one_cached("SELECT pg_temp.cairn_delete_role($1)", &[&name])
@@ -746,10 +773,7 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
     let rows = client
         .query_cached(
             "SELECT r.name, r.admin, extract(epoch FROM r.created_at)::float8,
-                    ARRAY(SELECT g.bucket FROM role_grants g
-                          WHERE g.role = r.name ORDER BY g.bucket, g.permission),
-                    ARRAY(SELECT g.permission FROM role_grants g
-                          WHERE g.role = r.name ORDER BY g.bucket, g.permission),
+                    NULL, NULL,
                     r.id, r.kms_entity_id,
                     ARRAY(SELECT k.access_key_id FROM access_keys k WHERE k.role_id = r.id
                           ORDER BY k.created_at, k.access_key_id),
@@ -762,12 +786,17 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
             &[],
         )
         .await?;
+    let grants = crate::grants::list(client).await?;
     rows.iter()
         .map(|r| {
-            let buckets = r.get::<_, Vec<String>>(3);
-            let permissions = r.get::<_, Vec<String>>(4);
+            let name: String = r.get(0);
             Ok(RoleInfo {
-                name: r.get(0),
+                grants: grants
+                    .iter()
+                    .filter(|(_, user, _)| *user == name)
+                    .map(|(bucket, _, permission)| (bucket.clone(), *permission))
+                    .collect(),
+                name,
                 admin: r.get(1),
                 created_at: r.get(2),
                 id: r.get(5),
@@ -780,11 +809,6 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                     .map(|((id, active), created_at)| KeyInfo { id, active, created_at })
                     .collect(),
                 policies: r.get(10),
-                grants: buckets
-                    .into_iter()
-                    .zip(permissions.iter())
-                    .map(|(bucket, p)| Ok((bucket, Permission::from_db(p)?)))
-                    .collect::<anyhow::Result<_>>()?,
             })
         })
         .collect()
@@ -803,27 +827,20 @@ async fn require_role(client: &Object, name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Grants permissions on an existing bucket (`cairn_grant`, which locks the
-/// bucket and the role in the lock protocol's order before inserting).
+/// Grants `name` permissions on an existing bucket of its account: as
+/// statements of the bucket's policy (see `grants`).
 pub async fn grant(
     client: &Object,
     name: &str,
     bucket: &str,
     permissions: &[Permission],
 ) -> anyhow::Result<()> {
-    let permissions: Vec<&str> = permissions.iter().map(|p| p.as_str()).collect();
-    let status = client
-        .query_one_cached("SELECT pg_temp.cairn_grant($1, $2, $3)", &[&name, &bucket, &permissions])
-        .await?;
-    match status.get::<_, &str>(0) {
-        "granted" => Ok(()),
-        "no_such_role" => Err(invalid(format!("no user named {name:?}"))),
-        "no_such_bucket" => Err(invalid(format!("no bucket named {bucket:?}; create it first"))),
-        status => unreachable!("cairn_grant: unknown status {status}"),
-    }
+    require_role(client, name).await?;
+    let changes: Vec<_> = permissions.iter().map(|p| (name, *p, true)).collect();
+    crate::grants::change(client, bucket, &changes).await
 }
 
-/// Revokes permissions on a bucket; all of them if `permissions` is empty.
+/// Revokes `name`'s permissions on a bucket; all of them if none are given.
 pub async fn revoke(
     client: &Object,
     name: &str,
@@ -831,16 +848,8 @@ pub async fn revoke(
     permissions: &[Permission],
 ) -> anyhow::Result<()> {
     require_role(client, name).await?;
-    let permissions: Vec<&str> = if permissions.is_empty() {
-        vec!["read", "write", "delete-version"]
-    } else {
-        permissions.iter().map(|p| p.as_str()).collect()
-    };
-    client
-        .execute_cached(
-            "SELECT pg_temp.cairn_revoke($1, $2, $3)",
-            &[&name, &bucket, &permissions],
-        )
-        .await?;
-    Ok(())
+    let all = [Permission::Read, Permission::Write, Permission::DeleteVersion];
+    let permissions = if permissions.is_empty() { &all[..] } else { permissions };
+    let changes: Vec<_> = permissions.iter().map(|p| (name, *p, false)).collect();
+    crate::grants::change(client, bucket, &changes).await
 }

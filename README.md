@@ -238,12 +238,16 @@ What a user may do is decided by policies, in IAM's policy language, as in
 S3: an explicit `Deny` in any that applies wins; else an `Allow` in any
 allows; else it's denied. They are:
 
-- its **grants**, the simple way, which are built-in policies:
-  - **admin** (`--admin`): create and delete buckets, configure them
-    ([versioning](#versioning), lifecycle, CORS, tags, policies, ...), read
-    their configuration, and see every bucket in ListBuckets. Admin does
-    **not** grant access to objects, nor HEAD a bucket (that's
-    `s3:ListBucket`, as in S3: listing what's in it).
+- **admin** (`--admin`): the built-in managed policy `AdministratorAccess`,
+  as AWS's: everything in the user's account (its buckets, their objects
+  and configuration), but what a bucket's policy denies it.
+- its **grants**, the simple way, which are statements of the bucket's
+  policy (`CairnGrantRead`, `CairnGrantWrite`, `CairnGrantDeleteVersion`,
+  each naming the users granted it), so they go with the bucket, and show
+  in GetBucketPolicy as what they are. Setting a bucket's policy over S3
+  replaces its grants too, as it replaces any statement; the dashboard and
+  console show them as grants, and leave the policy's other statements
+  alone:
   - **`read`** on a bucket: GetObject, HeadObject, GetObjectAttributes,
     HeadBucket, ListObjects, reading an object's [tags](#tags), and being the
     source of a
@@ -260,11 +264,27 @@ allows; else it's denied. They are:
   in S3. A bucket policy can allow other users, or anyone: unsigned requests
   are **anonymous**, and only a bucket policy with `"Principal": "*"` can
   allow them (a public bucket, say). Users are named in policies as
-  `arn:aws:iam::<account>:user/<name>`; the cluster is one account, whose ID
-  `cairn user list` shows. As in S3, a bucket policy names the user that
+  `arn:aws:iam::<account>:user/<name>`; their account's ID is in
+  `cairn user list`. As in S3, a bucket policy names the user that
   had the name when the policy was set: a user deleted and created again
   under the same name isn't allowed what the first was, and the policy then
   shows the first by its ID.
+
+**Accounts**, as AWS's: every user and bucket belongs to one (a 12-digit ID,
+and a name). The users and buckets from before accounts are the `default`
+account's. A user's policies reach only its own account's buckets: another
+account's bucket also needs that bucket's policy to allow the request, as in
+AWS. Bucket names stay global; a name another account has is
+`BucketAlreadyExists`. The **operator account** is the superadmins': it owns
+no buckets. `cairn account list`, `cairn account create <name>`, and
+`cairn user create --account <name>` manage them. Each account has a
+**root**, the account itself (`arn:aws:iam::<account>:root`), which signs in
+to the [console](#console) only (no access keys): it may do anything in its
+account but what its buckets' policies deny it, and it may always get, set
+and delete those policies, as AWS's root may, so a policy that denies
+everyone can't lock its bucket for good. `cairn account enroll <name>` makes
+its enrollment link (a new account's first, or one for a root that lost its
+passkeys).
 
 ```sh
 aws s3api put-bucket-policy --bucket my-bucket --policy '{"Version": "2012-10-17", "Statement": [
@@ -331,7 +351,7 @@ Manage users with `cairn user --database <URL> <command>`:
 
 | Command | Description |
 | --- | --- |
-| `create <name> [--admin] [--secret <S>]` | Create a user, with an access key named as it. Prints a generated 40-char secret unless `--secret` is given (min. 8 chars). |
+| `create <name> [--admin] [--secret <S>] [--account <A>]` | Create a user, with an access key named as it. Prints a generated 40-char secret unless `--secret` is given (min. 8 chars). |
 | `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret of the key named as the user (`--rotate-secret` prints the new one). |
 | `delete <name>` | Delete a user, with its keys, grants and policies. |
 | `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket. |
@@ -341,7 +361,7 @@ Manage users with `cairn user --database <URL> <command>`:
 | `policy put <name> <policy> <file>` | Set an inline policy (JSON; `-` reads stdin). A user's policies hold at most 2048 characters together, as in IAM. |
 | `policy get\|delete <name> <policy>` | Show or delete an inline policy. |
 | `list` | List users, their ARNs, admin flags, keys, grants and policies (secrets are not shown). |
-| `enroll <name> [--console-url <URL>]` | Print a one-time link (24 hours) for the user to set up a passkey for the [console](#console). A new link replaces the last. |
+| `enroll <name> [--console-url <URL>]` | Print a one-time link (24 hours) for the user to sign in to the [console](#console): a new login with a passkey, or (opened signed in) added to the login. A new link replaces the last. |
 
 A bucket policy can deny everyone everything, its admins too, as in S3. The
 superadmin, with access to the database, can always remove it, as an AWS
@@ -492,8 +512,13 @@ The console is a web UI for the account's people, apart from the dashboard
 (which is the operator's, on the private network, without a sign-in). It's
 off unless a node is started with `--listen-console` and `--console-url`.
 People sign in with **passkeys** only: there are no passwords, and access
-keys are for S3, never for the console. Signed in, people manage their
-passkeys, and the buckets and objects: create and delete buckets, browse,
+keys are for S3, never for the console. A **login** (a person, with
+passkeys) acts in each account it's in as one identity there, a user or the
+account's root, and switches between them; switching into the operator
+account takes the passkey again, unless it was used in the last five
+minutes. An enrollment link is for an identity: opened signed out, it makes
+a new login; signed in, it adds the identity to that login. Signed in,
+people manage their passkeys, and the buckets and objects: create and delete buckets, browse,
 upload (up to 5 GiB a file), download and delete objects and versions,
 versioning, lifecycle rules, bucket policies and public access blocks. Users
 come next (see `plans/console.md`).

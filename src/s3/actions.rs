@@ -254,12 +254,14 @@ pub fn delete(version: bool) -> &'static str {
     if version { "s3:DeleteObjectVersion" } else { "s3:DeleteObject" }
 }
 
-/// What a grant of `permission` on `bucket` allows, as a policy: exactly
-/// what the grant allowed before there were policies (see `roles`), but
-/// HeadBucket (`s3:ListBucket`), which only `read` allows now, as in S3.
-pub fn grant_policy(permission: crate::roles::Permission, bucket: &str) -> String {
+/// What a grant of `permission` allows on its bucket and the bucket's
+/// objects: exactly what the grant allowed before there were policies (see
+/// `roles`), but HeadBucket (`s3:ListBucket`), which only `read` allows now,
+/// as in S3; and reading the bucket's configuration (but its policy), with
+/// any of them.
+pub fn grant_actions(permission: crate::roles::Permission) -> Vec<&'static str> {
     use crate::roles::Permission;
-    let actions: Vec<&str> = match permission {
+    let mut actions: Vec<&str> = match permission {
         Permission::Read => vec![
             "s3:GetObject",
             "s3:GetObjectVersion",
@@ -289,38 +291,26 @@ pub fn grant_policy(permission: crate::roles::Permission, bucket: &str) -> Strin
         ],
         Permission::DeleteVersion => vec!["s3:DeleteObjectVersion"],
     };
-    let list = |actions: &mut dyn Iterator<Item = &str>| {
-        actions.map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(",")
-    };
+    actions.extend(configuration_reads());
+    actions
+}
+
+/// A grant of `permission` on `bucket`, as an identity policy (for tests:
+/// grants are statements of their buckets' policies, see `grants`).
+#[cfg(test)]
+pub fn grant_policy(permission: crate::roles::Permission, bucket: &str) -> String {
+    let actions = grant_actions(permission).iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(",");
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[\
-         {{\"Effect\":\"Allow\",\"Action\":[{}],\"Resource\":[\"arn:aws:s3:::{bucket}\",\"arn:aws:s3:::{bucket}/*\"]}},\
-         {{\"Effect\":\"Allow\",\"Action\":[{}],\"Resource\":\"arn:aws:s3:::{bucket}\"}}]}}",
-        list(&mut actions.into_iter()),
-        list(&mut configuration_reads()),
+         {{\"Effect\":\"Allow\",\"Action\":[{actions}],\"Resource\":[\"arn:aws:s3:::{bucket}\",\"arn:aws:s3:::{bucket}/*\"]}}]}}"
     )
 }
 
-/// What `admin` allows, as a policy: managing every bucket (making,
-/// deleting, listing and configuring them), not what's in them.
+/// The built-in managed policy `AdministratorAccess`, which an admin has
+/// attached: everything, as AWS's. Bounded to the admin's own account, as
+/// in AWS, by whose resources are whose (see `plans/policies.md`).
 pub fn admin_policy() -> String {
-    let mut actions: Vec<&str> =
-        vec!["s3:CreateBucket", "s3:DeleteBucket", "s3:GetBucketPolicy", "s3:GetBucketPolicyStatus"];
-    actions.extend(configuration_reads());
-    for (_, _, write) in CONFIGURATION {
-        if let Some((_, put, _, delete)) = write {
-            actions.push(put);
-            if !delete.is_empty() && delete != put {
-                actions.push(delete);
-            }
-        }
-    }
-    let actions = actions.iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(",");
-    format!(
-        "{{\"Version\":\"2012-10-17\",\"Statement\":[\
-         {{\"Effect\":\"Allow\",\"Action\":[{actions}],\"Resource\":\"arn:aws:s3:::*\"}},\
-         {{\"Effect\":\"Allow\",\"Action\":\"s3:ListAllMyBuckets\",\"Resource\":\"*\"}}]}}"
-    )
+    r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#.to_owned()
 }
 
 #[cfg(test)]
@@ -443,18 +433,33 @@ mod tests {
         assert!(operation(&Method::PATCH, "b", "k", "", &HeaderMap::new()).is_none());
     }
 
-    /// The policies a role's grants (and admin flag) become.
-    fn policies(grants: &[(Permission, &str)], admin: bool) -> Vec<Policy> {
-        let mut policies: Vec<Policy> =
-            grants.iter().map(|(p, b)| Policy::parse(&grant_policy(*p, b), Kind::Identity).unwrap()).collect();
+    /// The policies a role's grants (statements of the buckets' policies,
+    /// see `grants`) and admin flag become: its identity policies, and the
+    /// buckets'.
+    fn policies(grants: &[(Permission, &str)], admin: bool) -> (Vec<Policy>, Vec<(&'static str, Policy)>) {
+        let mut identity = Vec::new();
         if admin {
-            policies.push(Policy::parse(&admin_policy(), Kind::Identity).unwrap());
+            identity.push(Policy::parse(&admin_policy(), Kind::Identity).unwrap());
         }
-        policies
+        let buckets = ["b", "src"]
+            .into_iter()
+            .filter_map(|bucket| {
+                let changes: Vec<_> = grants
+                    .iter()
+                    .filter(|(_, b)| *b == bucket)
+                    .map(|(p, _)| ("arn:aws:iam::123456789012:user/r".to_owned(), *p, true))
+                    .collect();
+                let text = crate::grants::changed(None, bucket, &changes).unwrap()?;
+                // Its users bound to their IDs, as stored policies' are.
+                let ids = [("arn:aws:iam::123456789012:user/r".to_owned(), "r".to_owned())].into();
+                Some((bucket, Policy::parse(&text, Kind::Bucket(bucket)).unwrap().with_ids(ids)))
+            })
+            .collect();
+        (identity, buckets)
     }
 
     /// Whether these policies allow every check of `operation`.
-    fn allowed(policies: &[Policy], operation: &Operation) -> bool {
+    fn allowed((identity, buckets): &(Vec<Policy>, Vec<(&str, Policy)>), operation: &Operation) -> bool {
         let context = Context::default();
         operation.checks.iter().all(|check| {
             let resource = check.on.arn();
@@ -464,12 +469,14 @@ mod tests {
                 resource: &resource,
                 context: &context,
             };
-            verdict(policies, None, &request) == Verdict::Allow
+            let bucket = buckets.iter().find(|(b, _)| Some(*b) == check.on.bucket()).map(|(_, p)| p);
+            verdict(identity, bucket, &request) == Verdict::Allow
         })
     }
 
     /// Every combination of grants on the bucket and a copy's source allows
-    /// exactly what `authorize` allowed it, but where S3 says otherwise.
+    /// exactly what `authorize` allowed it, but where S3 says otherwise; and
+    /// an admin (`AdministratorAccess`) is allowed everything.
     #[test]
     fn grants_allow_what_they_did() {
         let permissions = [Permission::Read, Permission::Write, Permission::DeleteVersion];
@@ -496,6 +503,10 @@ mod tests {
                 let copy_source = headers.get("x-amz-copy-source").and_then(|v| v.to_str().ok());
                 let before = crate::s3::authorize(&principal, &method, bucket, key, query, copy_source);
                 let after = allowed(&policies, &operation);
+                if admin {
+                    assert!(after, "{}", operation.name);
+                    continue;
+                }
                 if before != after {
                     differences.push((operation.name, before, after));
                 }
@@ -503,9 +514,9 @@ mod tests {
         }
         differences.sort();
         differences.dedup();
-        // HeadBucket is `s3:ListBucket`: only `read` (and not a writer or an
-        // admin, who could HEAD any bucket they could see) may; and the
-        // bucket policy is for admins only, not everyone who sees the bucket.
+        // HeadBucket is `s3:ListBucket`: only `read` (and not a writer, who
+        // could HEAD any bucket they could see) may; and the bucket policy is
+        // for admins only, not everyone who sees the bucket.
         assert_eq!(
             differences,
             [("GetBucketPolicy", true, false), ("GetBucketPolicyStatus", true, false), ("HeadBucket", true, false)],

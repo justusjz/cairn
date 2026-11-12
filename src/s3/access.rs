@@ -74,6 +74,8 @@ fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Result<Arc<Polic
 /// A bucket, as a request's checks see it.
 struct Loaded {
     exists: bool,
+    /// The account that owns it.
+    account: Option<String>,
     policy: Option<Arc<Policy>>,
     /// Whether its policy is public, and RestrictPublicBuckets is on (the
     /// bucket's or the cluster's; see `public_access`): then it allows
@@ -97,6 +99,8 @@ pub struct Origin<'a> {
 pub struct Access {
     /// The user, by its account, name and ID; `None` if anonymous.
     user: Option<(String, String, String)>,
+    /// An account's root (by its account) acts, rather than a user.
+    root: Option<String>,
     identity: Vec<Arc<Policy>>,
     pub context: Context,
     /// Each bucket loaded: whether it exists, and its policy (see `Loaded`).
@@ -116,9 +120,6 @@ impl Access {
     ) -> anyhow::Result<Access> {
         let mut identity = Vec::new();
         if let Some(principal) = principal {
-            for (permission, bucket) in principal.grants() {
-                identity.push(parsed(&actions::grant_policy(permission, bucket), Kind::Identity, None)?);
-            }
             if principal.admin {
                 identity.push(parsed(&actions::admin_policy(), Kind::Identity, None)?);
             }
@@ -127,11 +128,24 @@ impl Access {
             }
         }
         Ok(Access {
+            root: None,
             user: principal.map(|p| (p.account.clone(), p.name.clone(), p.id.to_string())),
             identity,
             context: context(principal, account, method, headers, query, origin),
             buckets: HashMap::new(),
         })
+    }
+
+    /// The access of `account`'s root (see `policy::root_verdict`), for a
+    /// request (the console's) with `headers` and `query`, from `origin`.
+    pub fn root(account: &str, method: &Method, headers: &HeaderMap, query: &str, origin: &Origin) -> Access {
+        let mut context = context(None, account, method, headers, query, origin);
+        context.set("aws:userid", account);
+        context.set("aws:PrincipalArn", format!("arn:aws:iam::{account}:root"));
+        context.set("aws:PrincipalAccount", account);
+        context.set("aws:PrincipalType", "Account");
+        context.set("aws:PrincipalIsAWSService", "false");
+        Access { user: None, root: Some(account.to_owned()), identity: Vec::new(), context, buckets: HashMap::new() }
     }
 
     /// Loads `bucket`'s policy, for the checks on it; whether it exists.
@@ -144,7 +158,7 @@ impl Access {
             .get()
             .await?
             .query_opt_cached(
-                "SELECT policy, policy_principals::text,
+                "SELECT policy, policy_principals::text, account_id,
                         public_access_block & 8 <> 0
                         OR coalesce((SELECT value FROM settings WHERE name = 'restrict-public-buckets'), '0') <> '0'
                  FROM buckets WHERE name = $1",
@@ -160,9 +174,10 @@ impl Access {
             }
             None => None,
         };
-        let restrict = row.as_ref().and_then(|row| row.get::<_, Option<bool>>(2)).unwrap_or(false);
+        let restrict = row.as_ref().and_then(|row| row.get::<_, Option<bool>>(3)).unwrap_or(false);
+        let account = row.as_ref().map(|row| row.get::<_, String>(2));
         let restricted = restrict && policy.as_ref().is_some_and(|policy| policy.is_public());
-        self.buckets.insert(bucket.to_owned(), Loaded { exists: row.is_some(), policy, restricted });
+        self.buckets.insert(bucket.to_owned(), Loaded { exists: row.is_some(), account, policy, restricted });
         Ok(row.is_some())
     }
 
@@ -178,17 +193,29 @@ impl Access {
     /// bucket is taken to have none).
     pub fn verdict(&self, check: &Check) -> Verdict {
         let resource = check.on.arn();
-        let principal = match &self.user {
-            Some((account, name, id)) => Who::User { account, name, id },
-            None => Who::Anonymous,
+        let principal = match (&self.user, &self.root) {
+            (Some((account, name, id)), _) => Who::User { account, name, id },
+            (None, Some(account)) => Who::Root { account },
+            (None, None) => Who::Anonymous,
         };
         let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &self.context };
         let loaded = check.on.bucket().and_then(|b| self.buckets.get(b));
         // A restricted bucket's public policy is none to anonymous requests.
         let bucket = loaded
-            .filter(|loaded| !(loaded.restricted && self.user.is_none()))
+            .filter(|loaded| !(loaded.restricted && self.user.is_none() && self.root.is_none()))
             .and_then(|loaded| loaded.policy.as_deref());
-        crate::policy::verdict(self.identity.iter().map(|p| &**p), bucket, &request)
+        // Whose the resource is: a bucket's owner; else (no bucket, or none
+        // by its name) the principal's own account's. A bucket to create is
+        // the principal's, whoever has its name (that's BucketAlreadyExists).
+        let owner = loaded.and_then(|loaded| loaded.account.as_deref()).filter(|_| check.action != "s3:CreateBucket");
+        if let Some(account) = &self.root {
+            return crate::policy::root_verdict(bucket, &request, owner.is_none_or(|owner| owner == account));
+        }
+        let cross = match (&self.user, owner) {
+            (Some((account, _, _)), Some(owner)) => account != owner,
+            _ => false,
+        };
+        crate::policy::verdict_across(self.identity.iter().map(|p| &**p), bucket, &request, cross)
     }
 
     /// Whether `check` is allowed.

@@ -477,13 +477,21 @@ async fn bucket_policies_see_forms_as_posted() {
                 "Condition":{{"StringEquals":{{"s3:authType":"{auth_type}","s3:signatureversion":"AWS4-HMAC-SHA256"}}}}}}]}}"#
         ))
     };
+    // Grants are statements of the bucket's policy, which a PutBucketPolicy
+    // replaces, as any other: so the signer's is made again after it.
+    let regrant = || async {
+        let client = app.pool.get().await.unwrap();
+        crate::roles::grant(&client, &signer.0, BUCKET, &[Permission::Write]).await.unwrap();
+    };
     let set = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, deny("POST")).await.unwrap();
     assert_eq!(set.status(), StatusCode::NO_CONTENT);
+    regrant().await;
     let (status, code) = outcome(post(&app, form(&keyed(&signer, "denied.txt", "", &[]), "f", b"x", &[])).await).await;
     assert_eq!((status, code.as_str()), (StatusCode::FORBIDDEN, "AccessDenied"));
     assert!(get(&app, "denied.txt").await.is_none());
 
     crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, deny("REST-HEADER")).await.unwrap();
+    regrant().await;
     let response = post(&app, form(&keyed(&signer, "allowed.txt", "", &[]), "f", b"x", &[])).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }

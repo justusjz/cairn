@@ -219,11 +219,11 @@ info "OpenBao is ready."
 
 # ─── 2. Roles ────────────────────────────────────────────────────────────────
 # Roles live in Postgres and are managed with `cairn role`, so set them up before
-# the server starts. testkey is an admin (bucket management); since grants need
+# the server starts. testkey is an admin (AdministratorAccess); since grants need
 # an existing bucket, it's granted read/write on each test bucket right after
 # creating it (mb_granted). The others exercise permission checks: reader can
 # only read $BUCKET, writer can only use $OBUCKET (both granted once those
-# exist), and bucketadmin can manage buckets but holds no grants.
+# exist), and bucketadmin is an admin that holds no grants.
 cairn_role() { (cd "$SCRIPT_DIR" && cargo run -q -- role --database "$DB_URL" "$@"); }
 info "Creating roles..."
 {
@@ -2190,8 +2190,6 @@ list_buckets_filtered_ok() {
         | tr '\t' '\n' | grep -qx "$OBUCKET"
 }
 
-# Admin is bucket management only: bucketadmin can create, HEAD, and delete a
-# bucket, but can't touch objects without a grant.
 cairn_user() { (cd "$SCRIPT_DIR" && cargo run -q -- user --database "$DB_URL" "$@"); }
 cairn_bucket_policy() { (cd "$SCRIPT_DIR" && cargo run -q -- bucket-policy --database "$DB_URL" "$@"); }
 
@@ -2233,6 +2231,8 @@ bucket_policy_ok() {
     awss3 s3api delete-public-access-block --bucket "$b" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-public-access-block --bucket "$b" >/dev/null 2>&1 || return 1
     awss3 s3api put-bucket-policy --bucket "$b" --policy "file://$doc" >/dev/null 2>&1 || return 1
+    # Grants are statements of the bucket's policy, which that replaced.
+    cairn_role grant writer "$b" write >/dev/null 2>&1 || return 1
     awss3 s3api get-bucket-policy --bucket "$b" --query Policy --output text 2>/dev/null \
         | grep -qF "\"Principal\":{\"AWS\":\"arn:aws:iam::$account:root\"}" || return 1
     [ "$(awss3 s3api get-bucket-policy-status --bucket "$b" --query PolicyStatus.IsPublic --output text 2>/dev/null)" = True ] \
@@ -2315,14 +2315,18 @@ user_keys_and_policies_ok() {
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
+# An admin has AdministratorAccess, as AWS's: bucketadmin, without a single
+# grant, creates, HEADs and deletes buckets, and reads and writes objects in
+# any bucket of its account (here: its own, and lists $BUCKET).
 admin_scope_ok() {
     local a=(as_role bucketadmin adminsecret) b="adm-$(date +%s)"
     "${a[@]}" s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
     "${a[@]}" s3api get-bucket-location --bucket "$b" >/dev/null 2>&1 || return 1
-    # HeadBucket is s3:ListBucket, as in S3: listing what's in it.
-    ! "${a[@]}" s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 1
-    ! "${a[@]}" s3api put-object --bucket "$b" --key x.txt --body "$SMALL" >/dev/null 2>&1 || return 1
-    ! "${a[@]}" s3api get-object --bucket "$BUCKET" --key big.bin "$WORK_DIR/adm.bin" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api put-object --bucket "$b" --key x.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api get-object --bucket "$b" --key x.txt "$WORK_DIR/adm.bin" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api list-objects-v2 --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    "${a[@]}" s3api delete-object --bucket "$b" --key x.txt >/dev/null 2>&1 || return 1
     "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
@@ -2502,7 +2506,7 @@ run_test    "Create second bucket, grant roles"     setup_role_buckets
 run_test    "Read-only role can read, not write"    reader_permissions_ok
 run_test    "Tags: read with read, changed with write" tagging_roles_ok
 run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
-run_test    "Admin manages buckets, not objects"    admin_scope_ok
+run_test    "Admin has AdministratorAccess"          admin_scope_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok

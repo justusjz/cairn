@@ -14,6 +14,8 @@ use crate::{
 
 pub struct BucketInfo {
     pub name: String,
+    /// The account that owns it.
+    pub account: String,
     pub created_at: Timestamp,
     pub versioning: Versioning,
 }
@@ -24,7 +26,7 @@ pub async fn buckets(app: &App) -> anyhow::Result<Vec<BucketInfo>> {
     let rows = client
         .query_cached(
             &format!(
-                "SELECT name, versioning, {} FROM buckets ORDER BY name",
+                "SELECT name, versioning, {}, account_id FROM buckets ORDER BY name",
                 timestamp_sql("created_at")
             ),
             &[],
@@ -34,6 +36,7 @@ pub async fn buckets(app: &App) -> anyhow::Result<Vec<BucketInfo>> {
         .iter()
         .map(|r| BucketInfo {
             name: r.get(0),
+            account: r.get(4),
             versioning: Versioning::from_db(r.get(1)),
             created_at: Timestamp {
                 iso: r.get(2),
@@ -71,10 +74,17 @@ pub async fn list_buckets(
         },
     };
     let prefix = query_param(query, "prefix").unwrap_or_default();
+    // Those its account owns, to whom `s3:ListAllMyBuckets` is allowed, as
+    // in S3; else those whose policies name the user (as MinIO lists them).
+    let visible = match all {
+        true => Default::default(),
+        false => crate::grants::visible(&app.pool.get().await?, principal.id).await?,
+    };
     let mut listed: Vec<BucketInfo> = buckets(app)
         .await?
         .into_iter()
-        .filter(|b| (all || principal.can_see(&b.name)) && b.name.starts_with(&prefix))
+        .filter(|b| if all { b.account == principal.account } else { visible.contains(&b.name) })
+        .filter(|b| b.name.starts_with(&prefix))
         .filter(|b| after.as_ref().is_none_or(|after| b.name > *after))
         .take(max + 1)
         .collect();

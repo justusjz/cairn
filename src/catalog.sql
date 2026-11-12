@@ -63,11 +63,16 @@
 --           the key. Together, S and K make every two writers of a key
 --           conflict: both take K, or one holds S exclusively, which conflicts
 --           with the other's S in either mode.
---   G(g)    The role_grants rows. Locked (exclusively, in primary-key order)
---           before they're deleted.
---   R(r)    The role's (user's) row. Shared: granting it a permission.
---           Exclusive: giving it an access key, a passkey, or setting an
---           inline policy (I10); deleting the user (by deleting the row).
+--   G(g)    The role_grants rows, from before grants were bucket policies
+--           (see `grants`; only deleted now). Locked (exclusively, in
+--           primary-key order) before they're deleted.
+--   R(r)    The role's (user's) row.
+--           Exclusive: giving it an access key, or setting an inline
+--           policy (I10); deleting the user (by deleting the row).
+--   L(l)    A console login's row (see `console`). Exclusive: giving it a
+--           passkey, removing one, linking an identity to it (I10).
+--   E(e)    An enrollment link's row: locked by the transaction that uses
+--           it up, so that it's used once.
 --   X(x)    The blob's row. Shared: referencing it, changing or deleting
 --           a part on it, or changing its `lost_ranges` (the scrubber,
 --           which locks the row with nothing else). Exclusive: committing it, deleting it, removing a
@@ -150,9 +155,10 @@
 -- I10. A user has at most two access keys, and its inline policies hold at
 --     most 2048 characters (but whitespace) together, as in IAM: making a
 --     key, or setting a policy, holds R(r) exclusively, and counts what the
---     user has in a later statement (T28, T29). Likewise at most 8
---     passkeys, as IAM's MFA devices (T30), and at least one, once it has
---     any, but by deleting the user (T31, likewise). Deleting a key or a
+--     user has in a later statement (T28, T29). Likewise a console login
+--     has at most 8 passkeys, as IAM's MFA devices, and at least one, but
+--     by being deleted, under L(l) (T30, T31); and at most one identity per
+--     account (T33, T34; the login_identities indexes are a backstop). Deleting a key or a
 --     policy only takes from them. The console's enrollments, challenges and
 --     sessions are each used up or ended by a single DELETE, whose condition
 --     is on its own row (F2), so each is used once.
@@ -190,9 +196,9 @@
 -- scrubber's and reads' updates of a location's `checked_at`, and the
 -- scrubber's changes to `scrub_findings`) hold nothing that anyone waits for
 -- while they wait, so they can't be part of a cycle either. (A location insert's FK checks lock its node's row shared,
--- but nothing ever locks a node's row exclusively.) An insert whose FK checks
--- would lock rows out of order (a grant's: the role, then the bucket) is a
--- function that locks them in order first (`cairn_grant`). The GC
+-- but nothing ever locks a node's row exclusively.) Grants are statements of
+-- buckets' policies (see `grants`), changed by plain UPDATEs of the bucket's
+-- row. The GC
 -- and the packer's and the mover's claims use SKIP LOCKED, so they never wait at all. What
 -- remains is DDL (migrations), whose table locks a running cluster can
 -- deadlock with; the retry covers that.
@@ -1480,33 +1486,24 @@ BEGIN
 END
 $$;
 
--- T30: gives a user a passkey, unless it has `p_max` already (I10): through
--- the enrollment link whose token hashes to `p_enrollment`, which it uses up,
--- or (NULL) signed in. Takes R(r) exclusively, then uses up the link, and
--- counts the user's passkeys. Returns 'added', 'no_such_user',
--- 'no_enrollment' (used, expired, or another user's), 'too_many' or 'taken'
--- (the credential is registered already).
+-- T30: gives a login a passkey, signed in, unless it has `p_max` already
+-- (I10). Takes L(l) exclusively, then counts. Returns 'added',
+-- 'no_such_login', 'too_many' or 'taken' (the credential is registered
+-- already).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_add_passkey(
-    p_role uuid, p_enrollment bytea, p_credential bytea, p_public_key bytea, p_sign_count bigint,
+    p_login uuid, p_credential bytea, p_public_key bytea, p_sign_count bigint,
     p_name text, p_backup_eligible boolean, p_backed_up boolean, p_max integer)
 RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
-    PERFORM 1 FROM roles WHERE id = p_role FOR UPDATE;
+    PERFORM 1 FROM logins WHERE id = p_login FOR UPDATE;
     IF NOT FOUND THEN
-        RETURN 'no_such_user';
+        RETURN 'no_such_login';
     END IF;
-    IF p_enrollment IS NOT NULL THEN
-        DELETE FROM console_enrollments
-        WHERE token_hash = p_enrollment AND role_id = p_role AND expires_at > now();
-        IF NOT FOUND THEN
-            RETURN 'no_enrollment';
-        END IF;
-    END IF;
-    IF (SELECT count(*) FROM passkeys WHERE role_id = p_role) >= p_max THEN
+    IF (SELECT count(*) FROM passkeys WHERE login_id = p_login) >= p_max THEN
         RETURN 'too_many';
     END IF;
-    INSERT INTO passkeys (credential_id, role_id, public_key, sign_count, name, backup_eligible, backed_up)
-    VALUES (p_credential, p_role, p_public_key, p_sign_count, p_name, p_backup_eligible, p_backed_up)
+    INSERT INTO passkeys (credential_id, login_id, public_key, sign_count, name, backup_eligible, backed_up)
+    VALUES (p_credential, p_login, p_public_key, p_sign_count, p_name, p_backup_eligible, p_backed_up)
     ON CONFLICT DO NOTHING;
     IF NOT FOUND THEN
         RETURN 'taken';
@@ -1515,22 +1512,109 @@ BEGIN
 END
 $$;
 
--- T31: removes one of a user's passkeys (and so the sessions signed in with
--- it), unless it's the user's last, so that no one locks themselves out of
--- the console. Takes R(r) exclusively, then counts. Returns 'deleted',
+-- T31: removes one of a login's passkeys (and so the sessions signed in with
+-- it), unless it's the login's last, so that no one locks themselves out of
+-- the console. Takes L(l) exclusively, then counts. Returns 'deleted',
 -- 'no_such_passkey' or 'last'.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_passkey(p_role uuid, p_credential bytea)
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_passkey(p_login uuid, p_credential bytea)
 RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
-    PERFORM 1 FROM roles WHERE id = p_role FOR UPDATE;
-    IF NOT EXISTS (SELECT 1 FROM passkeys WHERE role_id = p_role AND credential_id = p_credential) THEN
+    PERFORM 1 FROM logins WHERE id = p_login FOR UPDATE;
+    IF NOT EXISTS (SELECT 1 FROM passkeys WHERE login_id = p_login AND credential_id = p_credential) THEN
         RETURN 'no_such_passkey';
     END IF;
-    IF (SELECT count(*) FROM passkeys WHERE role_id = p_role) <= 1 THEN
+    IF (SELECT count(*) FROM passkeys WHERE login_id = p_login) <= 1 THEN
         RETURN 'last';
     END IF;
-    DELETE FROM passkeys WHERE role_id = p_role AND credential_id = p_credential;
+    DELETE FROM passkeys WHERE login_id = p_login AND credential_id = p_credential;
     RETURN 'deleted';
+END
+$$;
+
+-- Links the identity of enrollment `p_enrollment` (an account's user, or
+-- its root) to login `p_login`, which holds L(l) exclusively, using the
+-- enrollment up: moved from the login it was linked to, if any (its passkeys
+-- lost, say). The enrollment's row is locked first (E), so that it's used
+-- once. Returns 'linked', 'no_enrollment' (used, expired, or its user gone)
+-- or 'account_taken' (the login has another identity in that account), and
+-- the identity's account.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_link_identity(p_login uuid, p_enrollment bytea,
+    OUT status text, OUT account text)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_role uuid;
+BEGIN
+    SELECT e.account_id, e.role_id INTO account, v_role FROM console_enrollments e
+    WHERE e.token_hash = p_enrollment AND e.expires_at > now()
+      AND (e.role_id IS NULL OR EXISTS (SELECT 1 FROM roles r WHERE r.id = e.role_id))
+    FOR UPDATE;
+    IF NOT FOUND THEN
+        status := 'no_enrollment';
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM login_identities WHERE login_id = p_login AND account_id = account
+               AND role_id IS DISTINCT FROM v_role) THEN
+        status := 'account_taken';
+        RETURN;
+    END IF;
+    DELETE FROM console_enrollments WHERE token_hash = p_enrollment;
+    DELETE FROM login_identities
+    WHERE account_id = account AND role_id IS NOT DISTINCT FROM v_role AND login_id <> p_login;
+    INSERT INTO login_identities (login_id, account_id, role_id) VALUES (p_login, account, v_role)
+    ON CONFLICT DO NOTHING;
+    status := 'linked';
+END
+$$;
+
+-- T33: links an enrollment's identity to a signed-in login (see
+-- `cairn_link_identity`). Takes L(l) exclusively, then E. Returns as that.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_enroll(p_login uuid, p_enrollment bytea,
+    OUT status text, OUT account text)
+LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM logins WHERE id = p_login FOR UPDATE;
+    IF NOT FOUND THEN
+        status := 'no_such_login';
+        RETURN;
+    END IF;
+    SELECT * INTO status, account FROM pg_temp.cairn_link_identity(p_login, p_enrollment);
+END
+$$;
+
+-- T34: a new login `p_login`, named `p_name`, with its first passkey, for the identity
+-- of enrollment `p_enrollment` (see `cairn_link_identity`): all of it, or
+-- nothing. The new login's row is no one else's yet (L), then E. Returns
+-- 'created', 'no_enrollment' or 'taken' (the credential is registered
+-- already), the login and the identity's account.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_new_login(
+    p_login uuid, p_name text, p_enrollment bytea, p_credential bytea, p_public_key bytea, p_sign_count bigint,
+    p_passkey text, p_backup_eligible boolean, p_backed_up boolean,
+    OUT status text, OUT login uuid, OUT account text)
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM console_enrollments e WHERE e.token_hash = p_enrollment AND e.expires_at > now()) THEN
+        status := 'no_enrollment';
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM passkeys WHERE credential_id = p_credential) THEN
+        status := 'taken';
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM logins WHERE id = p_login) THEN
+        status := 'taken';
+        RETURN;
+    END IF;
+    INSERT INTO logins (id, name) VALUES (p_login, p_name) RETURNING id INTO login;
+    SELECT l.status, l.account INTO status, account FROM pg_temp.cairn_link_identity(login, p_enrollment) l;
+    IF status <> 'linked' THEN
+        -- Used up meanwhile: the new login goes again.
+        DELETE FROM logins WHERE id = login;
+        login := NULL;
+        RETURN;
+    END IF;
+    INSERT INTO passkeys (credential_id, login_id, public_key, sign_count, name, backup_eligible, backed_up)
+    VALUES (p_credential, login, p_public_key, p_sign_count, p_passkey, p_backup_eligible, p_backed_up);
+    status := 'created';
 END
 $$;
 
@@ -1575,43 +1659,6 @@ BEGIN
     DELETE FROM roles WHERE name = p_role;
     GET DIAGNOSTICS v_deleted = ROW_COUNT;
     RETURN v_deleted > 0;
-END
-$$;
-
--- Revokes a role's permissions on a bucket. Takes G on those grants (in
--- order).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_revoke(p_role text, p_bucket text, p_permissions text[])
-RETURNS void LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM 1 FROM role_grants
-    WHERE role = p_role AND bucket = p_bucket AND permission = ANY(p_permissions)
-    ORDER BY role, bucket, permission FOR UPDATE;
-    DELETE FROM role_grants
-    WHERE role = p_role AND bucket = p_bucket AND permission = ANY(p_permissions);
-END
-$$;
-
--- Grants a role permissions on a bucket. Takes B(b) shared, then R(r) shared,
--- which the inserts' FK checks would otherwise take the other way round.
--- Returns 'granted', 'no_such_role' or 'no_such_bucket'.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_grant(p_role text, p_bucket text, p_permissions text[])
-RETURNS text LANGUAGE plpgsql AS $$
-DECLARE
-    v_bucket boolean;
-BEGIN
-    PERFORM 1 FROM buckets WHERE name = p_bucket FOR KEY SHARE;
-    v_bucket := FOUND;
-    PERFORM 1 FROM roles WHERE name = p_role FOR KEY SHARE;
-    -- A missing role is reported first.
-    IF NOT FOUND THEN
-        RETURN 'no_such_role';
-    ELSIF NOT v_bucket THEN
-        RETURN 'no_such_bucket';
-    END IF;
-    INSERT INTO role_grants (role, bucket, permission)
-    SELECT p_role, p_bucket, p FROM unnest(p_permissions) AS p
-    ON CONFLICT DO NOTHING;
-    RETURN 'granted';
 END
 $$;
 

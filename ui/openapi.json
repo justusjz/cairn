@@ -2056,6 +2056,7 @@
         "type": "object",
         "required": [
           "name",
+          "account",
           "created_at",
           "versioning",
           "objects",
@@ -2068,6 +2069,10 @@
           "public"
         ],
         "properties": {
+          "account": {
+            "type": "string",
+            "description": "The account that owns it."
+          },
           "bytes": {
             "type": "integer",
             "format": "int64"
