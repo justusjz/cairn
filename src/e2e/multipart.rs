@@ -70,7 +70,7 @@ async fn complete(
         .collect();
     let body = Bytes::from(format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>"));
     let response =
-        complete_multipart_upload(app, BUCKET, key, upload_id, body, &Preconditions::default(), None, None, None)
+        complete_multipart_upload(app, BUCKET, key, upload_id, body, &Preconditions::default(), None, None, None, None)
             .await
             .unwrap();
     let status = response.status();
@@ -206,7 +206,7 @@ async fn an_sse_c_upload_makes_an_sse_c_object() {
         .collect();
     let request = Bytes::from(format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>"));
     let other = super::customer_key(&[4; 32]);
-    let response = complete_multipart_upload(&app, BUCKET, "k", &upload_id, request, &Preconditions::default(), Some(&other), None, None)
+    let response = complete_multipart_upload(&app, BUCKET, "k", &upload_id, request, &Preconditions::default(), Some(&other), None, None, None)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -256,7 +256,7 @@ async fn parts_but_the_last_must_be_5_mib() {
         "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{tiny}\"</ETag></Part>\
          <Part><PartNumber>2</PartNumber><ETag>\"{e2}\"</ETag></Part></CompleteMultipartUpload>"
     );
-    let response = complete_multipart_upload(&app, BUCKET, "k", &upload_id, Bytes::from(listed), &Preconditions::default(), None, None, None)
+    let response = complete_multipart_upload(&app, BUCKET, "k", &upload_id, Bytes::from(listed), &Preconditions::default(), None, None, None, None)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
@@ -356,11 +356,128 @@ async fn if_match_without_an_object_is_no_such_key() {
          <Part><PartNumber>2</PartNumber><ETag>\"{e2}\"</ETag></Part></CompleteMultipartUpload>"
     );
     let conditions = Preconditions::from_headers(&headers);
-    let response = complete_multipart_upload(&app, BUCKET, "k", &upload_id, Bytes::from(listed), &conditions, None, None, None)
+    let response = complete_multipart_upload(&app, BUCKET, "k", &upload_id, Bytes::from(listed), &conditions, None, None, None, None)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     let body = response.into_body().collect().await.unwrap().to_bytes();
     assert!(std::str::from_utf8(&body).unwrap().contains("<Code>NoSuchKey</Code>"));
     assert_eq!(complete(&app, "k", &upload_id, &[(1, &e1), (2, &e2)]).await.0, StatusCode::OK);
+}
+
+/// A read of one part (`?partNumber=N`), as S3 answers it: a multipart
+/// object's Nth part, with its part count; any other object is one part,
+/// all of it; a part it doesn't have is a 416.
+#[tokio::test]
+async fn reads_one_part() {
+    use crate::s3::objects::get::{get_object, head_object};
+    let Some(app) = node().await else { return };
+    let (upload_id, etags) = staged(&app, "parts").await;
+    let (status, _, _) = complete(&app, "parts", &upload_id, &[(1, &etags[0]), (2, &etags[1])]).await;
+    assert_eq!(status, StatusCode::OK);
+    let min = crate::s3::util::MIN_PART;
+    let read = |key: &'static str, part| {
+        let app = app.clone();
+        async move {
+            get_object(&app, BUCKET, key, None, None, Some(part), &Preconditions::default(), None, None, false)
+                .await
+                .unwrap()
+        }
+    };
+    let response = read("parts", 2).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    let header = |name| response.headers().get(name).map(|v| v.to_str().unwrap().to_owned());
+    assert_eq!(header("content-range").as_deref(), Some(format!("bytes {min}-{}/{}", min + 99, min + 100).as_str()));
+    assert_eq!(header("x-amz-mp-parts-count").as_deref(), Some("2"));
+    assert_eq!(response.into_body().collect().await.unwrap().to_bytes().to_vec(), vec![1u8; 100]);
+    let head = head_object(&app, BUCKET, "parts", None, None, Some(1), &Preconditions::default(), None, None, false)
+        .await
+        .unwrap();
+    assert_eq!(head.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(head.headers()["content-length"], min.to_string().as_str());
+    assert_eq!(head.headers()["x-amz-mp-parts-count"], "2");
+    let past = read("parts", 3).await;
+    assert_eq!(past.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    let body = past.into_body().collect().await.unwrap().to_bytes();
+    let body = std::str::from_utf8(&body).unwrap();
+    assert!(body.contains("<Code>InvalidPartNumber</Code>") && body.contains("<ActualPartCount>2</ActualPartCount>"), "{body}");
+
+    // One that isn't multipart.
+    crate::e2e::put(&app, "single", b"hello".to_vec()).await;
+    let response = read("single", 1).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(response.headers()["content-range"], "bytes 0-4/5");
+    assert!(!response.headers().contains_key("x-amz-mp-parts-count"));
+    assert_eq!(read("single", 2).await.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+}
+
+/// GetObjectAttributes: a multipart object's parts are counted; a single
+/// PUT's aren't told.
+#[tokio::test]
+async fn tells_an_objects_attributes() {
+    use crate::s3::objects::attributes::{Asked, get_object_attributes};
+    let Some(app) = node().await else { return };
+    let (upload_id, etags) = staged(&app, "attributes").await;
+    let (_, etag, _) = complete(&app, "attributes", &upload_id, &[(1, &etags[0]), (2, &etags[1])]).await;
+    crate::e2e::put(&app, "single", b"hello".to_vec()).await;
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("x-amz-object-attributes", "ETag,ObjectParts,ObjectSize,StorageClass".parse().unwrap());
+    let asked = Asked::from_headers(&headers).unwrap();
+    let attributes = |key: &'static str| {
+        let app = app.clone();
+        let asked = &asked;
+        async move {
+            let response = get_object_attributes(&app, BUCKET, key, None, asked, None, None).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().contains_key("last-modified"));
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(body.to_vec()).unwrap()
+        }
+    };
+    let min = crate::s3::util::MIN_PART;
+    let etag = etag.unwrap();
+    let etag = etag.trim_matches('"');
+    assert!(
+        attributes("attributes").await.ends_with(&format!(
+            "<ETag>{etag}</ETag><ObjectParts><PartsCount>2</PartsCount></ObjectParts>\
+             <StorageClass>STANDARD</StorageClass><ObjectSize>{}</ObjectSize></GetObjectAttributesResponse>",
+            min + 100
+        )),
+    );
+    let single = attributes("single").await;
+    assert!(single.contains("<ObjectSize>5</ObjectSize>") && !single.contains("ObjectParts"), "{single}");
+    let missing = get_object_attributes(&app, BUCKET, "missing", None, &asked, None, None).await.unwrap();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}
+
+/// `x-amz-mp-object-size`: a Complete whose parts don't add up to it is
+/// refused, and the upload stays.
+#[tokio::test]
+async fn checks_the_expected_size() {
+    let Some(app) = node().await else { return };
+    let (upload_id, etags) = staged(&app, "sized").await;
+    let size = crate::s3::util::MIN_PART + 100;
+    let listed = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{}\"</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>\"{}\"</ETag></Part></CompleteMultipartUpload>",
+        etags[0], etags[1]
+    );
+    let complete = |expected| {
+        let app = app.clone();
+        let (upload_id, listed) = (upload_id.clone(), listed.clone());
+        async move {
+            complete_multipart_upload(
+                &app, BUCKET, "sized", &upload_id, Bytes::from(listed), &Preconditions::default(), None, None,
+                Some(expected), None,
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let refused = complete(size + 1).await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body = refused.into_body().collect().await.unwrap().to_bytes();
+    let expected = format!("value {} does not match what was computed: {size}", size + 1);
+    assert!(std::str::from_utf8(&body).unwrap().contains(&expected));
+    assert_eq!(complete(size).await.status(), StatusCode::OK);
 }

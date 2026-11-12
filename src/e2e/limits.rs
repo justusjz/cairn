@@ -164,7 +164,7 @@ async fn objects_are_limited_to_5_tib() {
         &upload,
         body,
         &Preconditions::default(),
-        None, None, None,
+        None, None, None, None,
     )
     .await
     .unwrap();

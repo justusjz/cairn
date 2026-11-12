@@ -319,9 +319,14 @@ fn canonical_request(
     let uri = if path.is_empty() { "/" } else { path };
     let mut canonical_headers = String::new();
     for name in &auth.signed_headers {
-        let value = headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("");
-        // Trim and collapse internal whitespace runs, per the SigV4 spec.
-        let value = value.split_whitespace().collect::<Vec<_>>().join(" ");
+        // Trim and collapse internal whitespace runs, per the SigV4 spec; a
+        // header sent more than once is its values, joined by commas.
+        let value = headers
+            .get_all(name)
+            .iter()
+            .map(|v| v.to_str().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>()
+            .join(",");
         canonical_headers.push_str(name);
         canonical_headers.push(':');
         canonical_headers.push_str(&value);
@@ -798,6 +803,26 @@ pub(crate) mod tests {
             let h = signed(&[BASE[0], ("x-amz-content-sha256", keyword), BASE[2]], &[]);
             assert_eq!(verify(&h), Ok(()), "{keyword}");
         }
+    }
+
+    /// A header sent more than once is signed as its values, joined by
+    /// commas (as the SigV4 spec says, and botocore signs it).
+    #[test]
+    fn signs_a_repeated_headers_values_together() {
+        let mut headers = HeaderMap::new();
+        headers.append("x-amz-object-attributes", "ETag".parse().unwrap());
+        headers.append("x-amz-object-attributes", " Object  Size ".parse().unwrap());
+        let auth = Authorization {
+            access_key: String::new(),
+            date: String::new(),
+            region: String::new(),
+            service: String::new(),
+            scope: String::new(),
+            signed_headers: vec!["x-amz-object-attributes".to_owned()],
+            signature: String::new(),
+        };
+        let canonical = canonical_request("GET", "/b/k", "attributes", &headers, &auth, EMPTY_SHA256);
+        assert!(canonical.contains("\nx-amz-object-attributes:ETag,Object Size\n"), "{canonical}");
     }
 
     #[test]

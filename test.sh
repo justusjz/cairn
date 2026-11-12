@@ -64,7 +64,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=110
+TOTAL=111
 STEP=0
 PASS=0
 FAIL=0
@@ -1535,9 +1535,40 @@ unsupported_subresources_refused() {
     [ "$(scurl PUT "$path?legal-hold" "$hash" "$xml")" = 501 ] || return 1
     [ "$(scurl PUT "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
-    [ "$(scurl GET "$path?partNumber=1" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl GET "$path?legal-hold" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "/${BUCKET}?website" "$EMPTY_SHA256" -)" = 501 ] || return 1
     check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
+}
+
+# A multipart object, read part by part (GetObject and HeadObject with
+# --part-number), its attributes (GetObjectAttributes), and a Complete that
+# says what size it expects (--mpu-object-size): refused if it's wrong.
+parts_and_attributes_ok() {
+    local key=parts/mp.bin p1="$WORK_DIR/part1.bin" p2="$WORK_DIR/part2.bin" out="$WORK_DIR/part.out" uid e1 e2 err
+    head -c 8388608 "$MULTIPART" >"$p1"
+    tail -c +8388609 "$MULTIPART" >"$p2"
+    uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key "$key" \
+        --query UploadId --output text 2>/dev/null) || return 1
+    e1=$(awss3 s3api upload-part --bucket "$BUCKET" --key "$key" --upload-id "$uid" --part-number 1 \
+        --body "$p1" --query ETag --output text 2>/dev/null) || return 1
+    e2=$(awss3 s3api upload-part --bucket "$BUCKET" --key "$key" --upload-id "$uid" --part-number 2 \
+        --body "$p2" --query ETag --output text 2>/dev/null) || return 1
+    local parts="{\"Parts\":[{\"PartNumber\":1,\"ETag\":${e1}},{\"PartNumber\":2,\"ETag\":${e2}}]}"
+    err=$(awss3 s3api complete-multipart-upload --bucket "$BUCKET" --key "$key" --upload-id "$uid" \
+        --multipart-upload "$parts" --mpu-object-size 1 2>&1) && return 1
+    echo "$err" | grep -q "does not match what was computed: 16777216" || return 1
+    awss3 s3api complete-multipart-upload --bucket "$BUCKET" --key "$key" --upload-id "$uid" \
+        --multipart-upload "$parts" --mpu-object-size 16777216 >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-object --bucket "$BUCKET" --key "$key" --part-number 2 "$out" \
+        --query PartsCount --output text 2>/dev/null)" = 2 ] || return 1
+    cmp -s "$out" "$p2" || return 1
+    [ "$(awss3 s3api head-object --bucket "$BUCKET" --key "$key" --part-number 1 \
+        --query ContentLength --output text 2>/dev/null)" = 8388608 ] || return 1
+    ! awss3 s3api head-object --bucket "$BUCKET" --key "$key" --part-number 3 >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-object-attributes --bucket "$BUCKET" --key "$key" \
+        --object-attributes ObjectParts ObjectSize --query '[ObjectParts.TotalPartsCount, ObjectSize]' \
+        --output text 2>/dev/null)" = "$(printf '2\t16777216')" ] || return 1
+    s3 del "s3://${BUCKET}/${key}" >/dev/null 2>&1
 }
 
 # DeleteObjects via aws-cli — which sends an x-amz-checksum-crc32 (not Content-MD5).
@@ -2173,6 +2204,7 @@ bucket_policy_ok() {
     ! awss3 s3api get-bucket-policy --bucket "$b" >/dev/null 2>&1 || return 1
     printf '%s' '{"Version":"2012-10-17","Statement":[
  {"Sid":"PublicRead","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/pub/*"},
+ {"Sid":"Drop","Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::'"$b"'/drop/*"},
  {"Effect":"Allow","Principal":{"AWS":"'"$arn"'"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/private.txt"},
  {"Effect":"Deny","Principal":{"AWS":"'"$account"'"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::'"$b"'/locked/*"}]}' \
         > "$doc"
@@ -2188,6 +2220,12 @@ bucket_policy_ok() {
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/missing.txt")" = 403 ] || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' -T "$WORK_DIR/pub.txt" "$url/pub/new.txt")" = 403 ] || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url?list-type=2")" = 403 ] || return 1
+    # An unsigned form, where the policy allows anyone to upload, and not
+    # elsewhere.
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -F key=drop/form.txt -F "file=@$WORK_DIR/pub.txt" "$url")" = 204 ] \
+        || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -F key=pub/form.txt -F "file=@$WORK_DIR/pub.txt" "$url")" = 403 ] \
+        || return 1
     # The writer: a read its grant doesn't give, and a write the policy takes.
     as_role writer writersecret s3api get-object --bucket "$b" --key private.txt "$WORK_DIR/pol.out" >/dev/null 2>&1 \
         || return 1
@@ -2218,7 +2256,7 @@ bucket_policy_ok() {
     cairn_bucket_policy delete "$b" >/dev/null 2>&1 || return 1
     awss3 s3api get-object --bucket "$b" --key pub/a.txt "$WORK_DIR/pol.out" >/dev/null 2>&1 || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/a.txt")" = 403 ] || return 1
-    for key in pub/a.txt private.txt open/x.txt; do
+    for key in pub/a.txt private.txt open/x.txt drop/form.txt; do
         awss3 s3api delete-object --bucket "$b" --key "$key" >/dev/null 2>&1
     done
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
@@ -2421,6 +2459,7 @@ run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "CORS configuration and preflights"     cors_ok
 run_test    "Object and bucket tags"                tagging_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
+run_test    "Parts, attributes and expected sizes"   parts_and_attributes_ok
 run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok
 run_test    "Presigned GET/PUT, response headers"   presigned_ok
 run_test    "POST Object with a signed policy"      post_object_ok

@@ -3,7 +3,9 @@
 //! `policy` field (see `post_policy`) says what it may hold, and is signed
 //! with SigV4 by the role it's uploaded as (see `auth::PostSignature`), so
 //! one server can let another upload under conditions (a size range, a key
-//! prefix, the encryption to use) without giving it a key.
+//! prefix, the encryption to use) without giving it a key. A form without
+//! any signature (and so without a policy) is anonymous, as in S3: only a
+//! bucket policy can allow it.
 //!
 //! The fields before the file are read whole, at most `MAX_PRE_DATA` of
 //! them, as S3 limits them; the file is streamed into the object, as a
@@ -285,28 +287,35 @@ where
         }
     }
 
-    // Who signed it, and what they allow.
-    let signature = match PostSignature::from_fields(|name| field(&fields, name)) {
-        Ok(signature) => signature,
-        Err(rejection) => return Ok(rejection_response(&rejection)),
-    };
+    // Who signed it, and what they allow; no one, if it isn't signed at all
+    // (anonymous: only a bucket policy can allow it, as in S3).
     let client = app.pool.get().await?;
-    let Some(principal) = Principal::load(&client, &signature.access_key).await? else {
-        return Ok(format_s3_error(StatusCode::FORBIDDEN, "InvalidAccessKeyId", "the access key ID does not exist"));
+    let signed = match SIGNING_FIELDS.iter().any(|name| field(&fields, name).is_some()) {
+        false => None,
+        true => {
+            let signature = match PostSignature::from_fields(|name| field(&fields, name)) {
+                Ok(signature) => signature,
+                Err(rejection) => return Ok(rejection_response(&rejection)),
+            };
+            let Some(principal) = Principal::load(&client, &signature.access_key).await? else {
+                return Ok(format_s3_error(StatusCode::FORBIDDEN, "InvalidAccessKeyId", "the access key ID does not exist"));
+            };
+            if let Err(rejection) = signature.verify(&principal.secret) {
+                return Ok(rejection_response(&rejection));
+            }
+            let document = field(&fields, "policy").unwrap_or("");
+            let Ok(document) = STANDARD.decode(document.trim()) else { return Ok(malformed("")) };
+            let policy = match Policy::parse(&document) {
+                Ok(policy) => policy,
+                Err(rejection) => return Ok(rejection_response(&rejection)),
+            };
+            let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs() as i64;
+            if let Err(rejection) = policy.check(&fields, &bucket, now) {
+                return Ok(rejection_response(&rejection));
+            }
+            Some((signature, principal, policy))
+        }
     };
-    if let Err(rejection) = signature.verify(&principal.secret) {
-        return Ok(rejection_response(&rejection));
-    }
-    let document = field(&fields, "policy").unwrap_or("");
-    let Ok(document) = STANDARD.decode(document.trim()) else { return Ok(malformed("")) };
-    let policy = match Policy::parse(&document) {
-        Ok(policy) => policy,
-        Err(rejection) => return Ok(rejection_response(&rejection)),
-    };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs() as i64;
-    if let Err(rejection) = policy.check(&fields, &bucket, now) {
-        return Ok(rejection_response(&rejection));
-    }
     let account = crate::roles::account(&client).await?;
     drop(client);
     let key = match field(&fields, "key") {
@@ -333,9 +342,10 @@ where
         tagged.insert("x-amz-tagging", HeaderValue::from_static("form"));
     }
     let operation = actions::operation(&Method::PUT, &bucket, &key, "", &tagged).expect("a PUT is an operation");
-    let signed = signature.signed();
-    let origin = access::Origin { peer, trusted_proxies: &app.trusted_proxies, signed: Some(&signed), form: true };
-    let mut access = access::Access::new(Some(&principal), &account, &Method::POST, &headers, "", &origin)?;
+    let signature = signed.as_ref().map(|(signature, _, _)| signature.signed());
+    let principal = signed.as_ref().map(|(_, principal, _)| principal);
+    let origin = access::Origin { peer, trusted_proxies: &app.trusted_proxies, signed: signature.as_ref(), form: true };
+    let mut access = access::Access::new(principal, &account, &Method::POST, &headers, "", &origin)?;
     let exists = access.load(app, &bucket).await?;
     if let Some((check, verdict)) = access.first_denied(&operation.checks) {
         return Ok(match exists {
@@ -378,8 +388,9 @@ where
         .and_then(|v| v.to_str().ok())
         .unwrap_or("application/octet-stream")
         .to_owned();
-    let (min, max) = policy.length_range().unwrap_or((0, util::MAX_UPLOAD));
-    let payload = match Payload::new(&headers, &principal.secret, true)
+    let (min, max) = signed.as_ref().and_then(|(_, _, policy)| policy.length_range()).unwrap_or((0, util::MAX_UPLOAD));
+    let secret = principal.map_or("", |principal| principal.secret.as_str());
+    let payload = match Payload::new(&headers, secret, true)
         .and_then(|payload| payload.at_most(max.min(util::MAX_UPLOAD)))
     {
         Ok(payload) => payload.at_least(min),
@@ -389,7 +400,7 @@ where
         return Ok(refused);
     }
     let conditions = Preconditions::default();
-    let role = Some(principal.id);
+    let role = principal.map(|principal| principal.id);
     let body = FileBody(file);
     let response = match put_object(app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &conditions, wanted, role)
         .await
@@ -407,6 +418,11 @@ where
     }
     Ok(respond(response, &fields, &bucket, &key, location))
 }
+
+/// The fields that sign a form (SigV4's, and SigV2's, which Cairn refuses):
+/// a form with none of them is anonymous.
+const SIGNING_FIELDS: [&str; 7] =
+    ["policy", "x-amz-signature", "x-amz-credential", "x-amz-algorithm", "x-amz-date", "awsaccesskeyid", "signature"];
 
 /// The headers of a PutObject that the form's `fields` stand for. Fields
 /// that aren't one are left out, as a PutObject's other headers are ignored:

@@ -163,7 +163,7 @@ async fn reads_flag_damage() {
     put(&app, "k", vec![3; 200_000]).await;
     let blob_id = blob_of(&app, "k").await;
     flip(&app, blob_id, 100);
-    let response = objects::get::get_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None, None, false)
+    let response = objects::get::get_object(&app, BUCKET, "k", None, None, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
     // No replica has the block intact, so the body is cut off.
@@ -178,7 +178,7 @@ async fn reads_flag_damage() {
     assert_eq!(query_i64(&app, &flagged).await, 0);
 
     // Known to be lost now, so the read fails up front, flagging nothing.
-    let response = objects::get::get_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None, None, false)
+    let response = objects::get::get_object(&app, BUCKET, "k", None, None, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
     assert_eq!(response.status(), hyper::StatusCode::INTERNAL_SERVER_ERROR);
@@ -412,7 +412,7 @@ async fn repairs_leave_nothing_behind() {
 /// Reads (the `range` of) an object through GetObject: its status, and its
 /// body, if it arrived whole.
 async fn read(app: &Arc<App>, key: &str, range: Option<&str>) -> (hyper::StatusCode, Option<Vec<u8>>) {
-    let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), None, None, false)
+    let response = objects::get::get_object(app, BUCKET, key, None, range, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
     let status = response.status();
@@ -451,7 +451,7 @@ async fn lost_data_fails_up_front() {
     let (status, body) = read(&app, "k", Some("bytes=131072-")).await;
     assert_eq!(status, StatusCode::PARTIAL_CONTENT);
     assert_eq!(body.unwrap(), data[131072..]);
-    let head = objects::get::head_object(&app, BUCKET, "k", None, None, &Preconditions::default(), None, None, false)
+    let head = objects::get::head_object(&app, BUCKET, "k", None, None, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
     assert_eq!(head.status(), StatusCode::OK);

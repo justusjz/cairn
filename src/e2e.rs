@@ -279,7 +279,7 @@ async fn put_with(app: &Arc<App>, key: &str, data: Vec<u8>, payload: Payload) {
 
 /// Reads an object through GetObject; `None` if it doesn't exist.
 pub async fn get(app: &Arc<App>, key: &str) -> Option<Vec<u8>> {
-    let response = objects::get::get_object(app, BUCKET, key, None, None, &Preconditions::default(), None, None, false)
+    let response = objects::get::get_object(app, BUCKET, key, None, None, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
     if response.status() == StatusCode::NOT_FOUND {
@@ -350,7 +350,7 @@ pub async fn get_sealed(
     range: Option<&str>,
     customer: Option<&crate::s3::sse_c::CustomerKey>,
 ) -> (StatusCode, Vec<u8>) {
-    let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), customer, None, false)
+    let response = objects::get::get_object(app, BUCKET, key, None, range, None, &Preconditions::default(), customer, None, false)
         .await
         .unwrap();
     let status = response.status();

@@ -115,6 +115,24 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
     }
 }
 
+/// A part number as a read names one (`?partNumber=N`): 1 to 10,000.
+pub fn part_number(text: &str) -> Option<u32> {
+    let number = text.bytes().all(|b| b.is_ascii_digit()).then(|| text.parse::<u32>().ok()).flatten()?;
+    (1..=10_000).contains(&number).then_some(number)
+}
+
+/// S3's 400 for a part number that isn't one (probed).
+pub fn invalid_part_number(text: &str) -> Response<Full<Bytes>> {
+    let mut rejection = Rejection::new(
+        StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        "Part number must be an integer between 1 and 10000, inclusive",
+    );
+    rejection.details.push(("ArgumentName", "partNumber".to_owned()));
+    rejection.details.push(("ArgumentValue", text.to_owned()));
+    rejection_response(&rejection)
+}
+
 /// Sets `x-amz-version-id` on a response, if there's a version ID to report.
 /// Version IDs are checked as they come in (`is_version_id`), so every one
 /// makes a valid header; one that wouldn't is left out rather than panicking.
@@ -293,6 +311,8 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "requestPayment",
             "logging",
             "notification",
+            // Ignored, as S3 ignores it on a bucket (probed): a listing.
+            "attributes",
         ],
         // PutBucketVersioning, PutBucketEncryption,
         // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketTagging,
@@ -302,8 +322,11 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
         // DeleteBucketTagging, DeleteBucketPolicy.
         (true, &Method::DELETE) => &["encryption", "lifecycle", "cors", "tagging", "policy"],
-        // GetObjectAcl (stubbed), ListParts, GetObjectTagging.
-        (false, &Method::GET) => &["acl", "uploadId", "tagging"],
+        // GetObjectAcl (stubbed), ListParts, GetObjectTagging, a part of
+        // the object, GetObjectAttributes.
+        (false, &Method::GET) => &["acl", "uploadId", "tagging", "partNumber", "attributes"],
+        // A part of the object.
+        (false, &Method::HEAD) => &["partNumber"],
         // UploadPart / UploadPartCopy, PutObjectAcl (`acl`), PutObjectTagging.
         (false, &Method::PUT) => &["uploadId", "partNumber", "acl", "tagging"],
         // CreateMultipartUpload / CompleteMultipartUpload.
@@ -547,6 +570,10 @@ mod tests {
             (Method::GET, false, "uploadId=u&max-parts=2"),
             (Method::DELETE, false, "versionId=null"),
             (Method::DELETE, false, "uploadId=u"),
+            (Method::GET, false, "attributes"),
+            (Method::GET, false, "partNumber=1"),
+            (Method::HEAD, false, "partNumber=1"),
+            (Method::GET, true, "attributes"),
         ] {
             assert_eq!(refused(method.clone(), bucket_level, query), None, "{method} {query}");
         }
@@ -554,9 +581,6 @@ mod tests {
         // object, deleting it or the bucket, or serving the wrong bytes.
         for (method, bucket_level, query) in [
             (Method::PUT, false, "retention&versionId=null"),
-            (Method::GET, false, "attributes"),
-            (Method::GET, false, "partNumber=1"),
-            (Method::HEAD, false, "partNumber=1"),
             (Method::POST, false, "restore"),
             (Method::DELETE, true, "website"),
             (Method::GET, true, "inventory"),

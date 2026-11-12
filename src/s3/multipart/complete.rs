@@ -70,6 +70,25 @@ struct Request<'a> {
     listed: &'a Listed,
     claimed: &'a Claimed,
     preconditions: &'a Preconditions,
+    /// The object's size, as `x-amz-mp-object-size` claims it.
+    expected_size: Option<u64>,
+}
+
+/// The object size `x-amz-mp-object-size` claims, if it's there, or S3's
+/// 400 for one that isn't a size (probed).
+pub fn expected_size(headers: &hyper::HeaderMap) -> Result<Option<u64>, Response<Full<Bytes>>> {
+    let Some(value) = headers.get("x-amz-mp-object-size") else { return Ok(None) };
+    let text = String::from_utf8_lossy(value.as_bytes());
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let message = match text.strip_prefix('-') {
+        _ if digits(&text) => match text.parse::<u64>() {
+            Ok(size) => return Ok(Some(size)),
+            Err(_) => format!("Value for x-amz-mp-object-size header is invalid: '{text}'"),
+        },
+        Some(rest) if digits(rest) => format!("Value for x-amz-mp-object-size header is less than zero: '{text}'"),
+        _ => format!("Value for x-amz-mp-object-size header is invalid: '{text}'"),
+    };
+    Err(format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", &message))
 }
 
 /// The parts a CompleteMultipartUpload lists: each one's number, ETag, and
@@ -133,6 +152,7 @@ pub async fn complete_multipart_upload(
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
     role: Option<Uuid>,
+    expected_size: Option<u64>,
     claimed: Claimed,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
@@ -197,7 +217,7 @@ pub async fn complete_multipart_upload(
     let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
-        let request = Request { listed: &listed, claimed: &claimed, preconditions };
+        let request = Request { listed: &listed, claimed: &claimed, preconditions, expected_size };
         let attempt = try_complete(app, &mut client, bucket, key, &upload_id, &request, upload.as_ref(), keys);
         match attempt.await {
             Ok(CompleteOutcome::Done {
@@ -555,6 +575,15 @@ async fn try_complete(
         parts.push(part);
     }
     let Some(combined) = combined else { return Ok(CompleteOutcome::InvalidPart) };
+    // The size the client expects, if it says (S3's 400, probed).
+    let size: u64 = parts.iter().map(|part| part.size).sum();
+    if let Some(expected) = request.expected_size.filter(|expected| *expected != size) {
+        return Ok(CompleteOutcome::Refused(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            &format!("The provided 'x-amz-mp-object-size' header value {expected} does not match what was computed: {size}"),
+        )));
+    }
     let checksum = object_checksum(upload, &parts)?;
     if let Some(bad) = check_claim(request.claimed, checksum.as_ref()) {
         return Ok(bad);
@@ -628,4 +657,41 @@ async fn try_complete(
         version_id: row.get(1),
         reap: reap_columns(&row, 2),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `x-amz-mp-object-size`, as S3 reads it (probed).
+    #[test]
+    fn reads_the_expected_size() {
+        let read = |value: &str| {
+            let mut headers = hyper::HeaderMap::new();
+            headers.insert("x-amz-mp-object-size", value.parse().unwrap());
+            expected_size(&headers).map_err(|refused| {
+                let body = refused.into_body();
+                let body = read_body(body);
+                body[body.find("<Message>").unwrap() + 9..body.find("</Message>").unwrap()].to_owned()
+            })
+        };
+        assert!(matches!(expected_size(&hyper::HeaderMap::new()), Ok(None)));
+        assert_eq!(read("5242885"), Ok(Some(5242885)));
+        assert_eq!(read("05242885"), Ok(Some(5242885)));
+        assert_eq!(read("-1"), Err("Value for x-amz-mp-object-size header is less than zero: '-1'".to_owned()));
+        for bad in ["abc", "", "1e7", "+5", "99999999999999999999"] {
+            assert_eq!(read(bad), Err(format!("Value for x-amz-mp-object-size header is invalid: '{bad}'")));
+        }
+    }
+
+    fn read_body(body: Full<Bytes>) -> String {
+        use http_body_util::BodyExt;
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(body.collect())
+            .unwrap()
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
 }

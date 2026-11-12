@@ -244,8 +244,9 @@ allows; else it's denied. They are:
     their configuration, and see every bucket in ListBuckets. Admin does
     **not** grant access to objects, nor HEAD a bucket (that's
     `s3:ListBucket`, as in S3: listing what's in it).
-  - **`read`** on a bucket: GetObject, HeadObject, HeadBucket, ListObjects,
-    reading an object's [tags](#tags), and being the source of a
+  - **`read`** on a bucket: GetObject, HeadObject, GetObjectAttributes,
+    HeadBucket, ListObjects, reading an object's [tags](#tags), and being the
+    source of a
     CopyObject / UploadPartCopy.
   - **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads
     (listing them and their parts too, to resume one), changing an object's
@@ -359,7 +360,10 @@ SSE-C, which is exempt from the policy's conditions, as in MinIO), and every
 one of them must be in the policy. `success_action_status` and
 `success_action_redirect` say how to answer. For a page on another site to
 send it with `fetch` (or to use a presigned URL), the bucket needs a
-[CORS configuration](#cors).
+[CORS configuration](#cors). A form without any signature (no policy, no
+credential) is anonymous: like any anonymous request, only a
+[bucket policy](#users-and-permissions) that allows everyone `s3:PutObject`
+on its key takes it.
 
 > [!NOTE]
 > Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
@@ -937,6 +941,17 @@ Listings, ListParts, CompleteMultipartUpload and copies report checksums too.
 The checksums of encrypted objects are stored encrypted, as their data is, so
 they can't be used to test guesses at the content. Objects written by earlier
 versions of Cairn have no checksum, but a copy of one gets one.
+
+A multipart object can be read part by part, as S3 reads it (GetObject and
+HeadObject with `partNumber`, which SDKs' transfer managers use to download
+in parallel): its parts are numbered from 1 in order, whatever numbers they
+were uploaded as, and each read tells how many there are
+(`x-amz-mp-parts-count`) and, with `x-amz-checksum-mode`, the part's own
+checksum, if the object's is composite. Any other object is a single part.
+**GetObjectAttributes** tells an object's ETag, checksum, size, storage class
+and parts (each part's size and checksum, for a composite checksum) without
+reading it. A CompleteMultipartUpload with `x-amz-mp-object-size` is refused
+unless its parts add up to that size.
 
 ### Scrubbing
 

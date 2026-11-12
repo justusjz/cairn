@@ -145,7 +145,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
                     .map(|(n, etag)| format!("<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag></Part>"))
                     .collect();
                 let request = Bytes::from(format!("<CompleteMultipartUpload>{listed}</CompleteMultipartUpload>"));
-                let response = complete_multipart_upload(app, BUCKET, &a, &upload_id, request, &Preconditions::default(), None, None, None).await?;
+                let response = complete_multipart_upload(app, BUCKET, &a, &upload_id, request, &Preconditions::default(), None, None, None, None).await?;
                 let (status, body) = text(response).await;
                 anyhow::ensure!(status == StatusCode::OK, "complete: {status} {body}");
             }

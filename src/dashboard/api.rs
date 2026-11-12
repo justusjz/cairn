@@ -1324,6 +1324,7 @@ async fn download(
         &params.key,
         params.version.as_deref(),
         None,
+        None,
         &Preconditions::default(),
         None,
         // No role: the dashboard can't open SSE-KMS objects (see `s3::sse`).

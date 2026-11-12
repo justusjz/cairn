@@ -100,7 +100,7 @@ async fn complete(app: &Arc<App>, key: &str, upload_id: Uuid, parts: &str) {
         &upload_id.to_string(),
         Bytes::from(body),
         &Preconditions::default(),
-        None, None, None,
+        None, None, None, None,
     )
     .await
     .unwrap();

@@ -199,7 +199,7 @@ async fn uploads_a_file() {
     assert_eq!(response.headers()["etag"], format!("\"{md5}\"").as_str());
     assert_eq!(response.headers()["location"], "http://cairn.test/bucket/uploads/note.txt");
     assert!(response.headers().contains_key("x-amz-checksum-crc64nvme"));
-    let read = get_object(&app, BUCKET, "uploads/note.txt", None, None, &Preconditions::default(), None, None, false)
+    let read = get_object(&app, BUCKET, "uploads/note.txt", None, None, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
     assert_eq!(read.headers()["content-type"], "text/plain");
@@ -486,4 +486,32 @@ async fn bucket_policies_see_forms_as_posted() {
     crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, deny("REST-HEADER")).await.unwrap();
     let response = post(&app, form(&keyed(&signer, "allowed.txt", "", &[]), "f", b"x", &[])).await;
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
+}
+
+/// A form without any signature is anonymous, as in S3: refused, unless the
+/// bucket's policy allows anyone to upload there. One that's only partly
+/// signed is refused as unsigned.
+#[tokio::test]
+async fn takes_unsigned_forms_where_a_bucket_policy_allows_them() {
+    let Some(app) = node().await else { return };
+    let unsigned = |key: &str| form(&fields(&[("key", key), ("Content-Type", "text/plain")]), "f", b"anon", &[]);
+    let (status, code) = outcome(post(&app, unsigned("drop/a.txt")).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::FORBIDDEN, "AccessDenied"));
+
+    let policy = format!(
+        r#"{{"Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::{BUCKET}/drop/*"}}]}}"#
+    );
+    let set = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, Bytes::from(policy)).await.unwrap();
+    assert_eq!(set.status(), StatusCode::NO_CONTENT);
+    let response = post(&app, unsigned("drop/a.txt")).await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(get(&app, "drop/a.txt").await.unwrap(), b"anon");
+    // Only where it allows.
+    let (status, code) = outcome(post(&app, unsigned("elsewhere.txt")).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::FORBIDDEN, "AccessDenied"));
+    // A policy without a signature isn't anonymous: it's not signed.
+    let half = form(&fields(&[("key", "drop/b.txt"), ("policy", "e30=")]), "f", b"x", &[]);
+    let (status, code) = outcome(post(&app, half).await).await;
+    assert_eq!((status, code.as_str()), (StatusCode::FORBIDDEN, "AccessDenied"));
+    assert!(get(&app, "drop/b.txt").await.is_none());
 }

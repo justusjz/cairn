@@ -361,6 +361,7 @@ async fn an_sse_c_object_reads_back_with_its_key() {
             &name,
             None,
             None,
+            None,
             &Preconditions::default(),
             Some(&key), None, false,
         )
@@ -418,6 +419,7 @@ async fn an_sse_c_object_needs_its_key() {
             "sealed",
             None,
             None,
+            None,
             &Preconditions::default(),
             customer, None, false,
         )
@@ -429,11 +431,11 @@ async fn an_sse_c_object_needs_its_key() {
     let mut headers = hyper::HeaderMap::new();
     headers.insert("if-none-match", format!("\"{etag}\"").parse().unwrap());
     let conditions = Preconditions::from_headers(&headers);
-    let head = head_object(&app, BUCKET, "sealed", None, None, &conditions, None, None, false)
+    let head = head_object(&app, BUCKET, "sealed", None, None, None, &conditions, None, None, false)
         .await
         .unwrap();
     assert_eq!(head.status(), StatusCode::BAD_REQUEST);
-    let head = head_object(&app, BUCKET, "sealed", None, None, &conditions, Some(&key), None, false)
+    let head = head_object(&app, BUCKET, "sealed", None, None, None, &conditions, Some(&key), None, false)
         .await
         .unwrap();
     assert_eq!(head.status(), StatusCode::NOT_MODIFIED);
@@ -470,6 +472,7 @@ async fn tampering_past_the_crcs_is_caught() {
         &app,
         BUCKET,
         "k",
+        None,
         None,
         None,
         &Preconditions::default(),
@@ -739,7 +742,7 @@ async fn part_copies_of_and_into_sse_c() {
                 &upload_id,
                 body,
                 &Preconditions::default(),
-                None, None, None,
+                None, None, None, None,
             )
             .await
             .unwrap()

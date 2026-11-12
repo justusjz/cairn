@@ -24,13 +24,14 @@ use crate::{
         },
         conditional::Preconditions,
         multipart::{
-            abort::abort_multipart_upload, complete::complete_multipart_upload,
+            abort::abort_multipart_upload, complete::{self, complete_multipart_upload},
             create::create_multipart_upload,
             list::list_multipart_uploads,
             list_parts::{MAX_PARTS, list_parts},
             upload_part::put_part,
         },
         objects::{
+            attributes,
             copy::{CopyKeys, copy_object, copy_part, replaces_metadata},
             delete::{delete_object, delete_objects, missing_checksum},
             get::{get_object, head_object},
@@ -224,6 +225,16 @@ async fn handle_request(
             "KeyTooLongError",
             "Your key is too long",
         )));
+    }
+    // GetObjectAttributes is a GET's only (probed).
+    if !key.is_empty() && *req.method() != Method::GET && query_param(query, "attributes").is_some() {
+        let mut response = format_s3_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        );
+        response.headers_mut().insert(hyper::header::ALLOW, hyper::header::HeaderValue::from_static("GET"));
+        return Ok(box_response(response));
     }
     // Before anything routes on the method alone: an operation Cairn doesn't
     // implement would otherwise run as the plain PUT, DELETE or GET.
@@ -535,6 +546,25 @@ async fn handle_request(
     if let Some(v) = version_id.as_deref().filter(|v| addresses_version && !is_version_id(v)) {
         return Ok(box_response(invalid_version_id("versionId", v)));
     }
+    // A read of one part (`?partNumber=N`), checked before anything's looked
+    // up, as S3 checks it (probed).
+    let part_number = match operation.name {
+        "GetObject" | "HeadObject" => match query_param(&query, "partNumber") {
+            None => None,
+            Some(number) => match util::part_number(&number) {
+                Some(_) if range.is_some() => {
+                    return Ok(box_response(format_s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidRequest",
+                        "Cannot specify both Range header and partNumber query parameter",
+                    )));
+                }
+                Some(number) => Some(number),
+                None => return Ok(box_response(util::invalid_part_number(&number))),
+            },
+        },
+        _ => None,
+    };
     // GetObjectTagging, PutObjectTagging (with a <Tagging> body) and
     // DeleteObjectTagging: an SSE-C object's tags need no key, as in S3.
     if tagging {
@@ -613,6 +643,30 @@ async fn handle_request(
         },
         _ => metadata::Overrides::default(),
     };
+    // GetObjectAttributes (see `attributes`): not with a part number.
+    if operation.name == "GetObjectAttributes" {
+        if query_param(&query, "partNumber").is_some() {
+            return Ok(box_response(attributes::with_part_number()));
+        }
+        let asked = match attributes::Asked::from_headers(req.headers()) {
+            Ok(asked) => asked,
+            Err(refused) => return Ok(box_response(refused)),
+        };
+        let response = attributes::get_object_attributes(
+            &app,
+            &bucket,
+            &key,
+            version_id.as_deref(),
+            &asked,
+            customer_key.as_ref(),
+            role,
+        )
+        .await?;
+        return Ok(box_response(match hides_missing(response.status()) {
+            true => access.denied(&operation.checks[0], crate::policy::Verdict::ImplicitDeny),
+            false => response,
+        }));
+    }
     if *req.method() == hyper::Method::GET {
         // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
         // break XML-parsing clients like `s3cmd info`.
@@ -639,6 +693,7 @@ async fn handle_request(
             &key,
             version_id.as_deref(),
             range.as_deref(),
+            part_number,
             &preconditions,
             customer_key.as_ref(),
             role,
@@ -709,6 +764,7 @@ async fn handle_request(
                 &key,
                 version_id.as_deref(),
                 range.as_deref(),
+                part_number,
                 &preconditions,
                 customer_key.as_ref(),
                 role,
@@ -753,12 +809,16 @@ async fn handle_request(
                 Ok(claimed) => claimed,
                 Err(refused) => return Ok(box_response(refused)),
             };
+            let expected_size = match complete::expected_size(req.headers()) {
+                Ok(size) => size,
+                Err(refused) => return Ok(box_response(refused)),
+            };
             match read_body(req, &secret, false).await? {
                 Ok(body) => {
                     let upload_id = query_param(&query, "uploadId").unwrap_or_default();
                     let customer_key = customer_key.as_ref();
                     complete_multipart_upload(
-                        &app, &bucket, &key, &upload_id, body, &preconditions, customer_key, role, claimed,
+                        &app, &bucket, &key, &upload_id, body, &preconditions, customer_key, role, expected_size, claimed,
                     )
                     .await?
                 }

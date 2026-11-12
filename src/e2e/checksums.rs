@@ -60,7 +60,7 @@ async fn text(response: Response<Full<Bytes>>) -> (StatusCode, HeaderMap, String
 /// algorithm's header's value, and the type.
 async fn told(app: &Arc<App>, key: &str, customer: Option<&CustomerKey>, range: Option<&str>) -> Option<(String, String)> {
     let response =
-        head_object(app, BUCKET, key, None, range, &Preconditions::default(), customer, None, true).await.unwrap();
+        head_object(app, BUCKET, key, None, range, None, &Preconditions::default(), customer, None, true).await.unwrap();
     assert!(response.status().is_success(), "{}", response.status());
     let kind = response.headers().get(checksums::TYPE)?.to_str().unwrap().to_owned();
     let value = Algorithm::ALL
@@ -111,7 +111,7 @@ async fn puts_store_the_clients_checksum_or_crc64nvme() {
     let crc64 = b64(Algorithm::Crc64Nvme, &body);
     assert_eq!(told(&app, "default", None, None).await, Some((format!("CRC64NVME:{crc64}"), "FULL_OBJECT".into())));
     assert_eq!(told(&app, "default", None, Some("bytes=0-9")).await, None);
-    let response = head_object(&app, BUCKET, "default", None, None, &Preconditions::default(), None, None, false)
+    let response = head_object(&app, BUCKET, "default", None, None, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
     assert!(response.headers().get(checksums::TYPE).is_none());
@@ -140,7 +140,7 @@ async fn an_sse_c_objects_checksum_is_sealed() {
     assert_eq!(told(&app, "c", Some(&customer), None).await, Some((format!("CRC64NVME:{crc64}"), "FULL_OBJECT".into())));
     // Without the key, the object can't be read at all.
     let response =
-        head_object(&app, BUCKET, "c", None, None, &Preconditions::default(), None, None, true).await.unwrap();
+        head_object(&app, BUCKET, "c", None, None, None, &Preconditions::default(), None, None, true).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 }
 
@@ -228,6 +228,7 @@ async fn complete(
         body,
         &Preconditions::default(),
         customer,
+        None,
         None,
         claimed,
     )

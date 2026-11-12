@@ -91,7 +91,7 @@ async fn tags_of(app: &App, key: &str, version: Option<&str>) -> (StatusCode, Op
 
 /// The `x-amz-tagging-count` a HEAD tells.
 async fn count(app: &App, key: &str) -> Option<String> {
-    let response = head_object(app, BUCKET, key, None, None, &Preconditions::default(), None, None, false).await.unwrap();
+    let response = head_object(app, BUCKET, key, None, None, None, &Preconditions::default(), None, None, false).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     header(response.headers(), "x-amz-tagging-count").map(str::to_owned)
 }
@@ -127,7 +127,7 @@ async fn writes_store_tags_that_reads_count() {
     let response = crate::e2e::get(&app, "a").await;
     assert_eq!(response, Some(vec![1; 10]));
     let get = crate::s3::objects::get::get_object(
-        &app, BUCKET, "a", None, Some("bytes=0-0"), &Preconditions::default(), None, None, false,
+        &app, BUCKET, "a", None, Some("bytes=0-0"), None, &Preconditions::default(), None, None, false,
     )
     .await
     .unwrap();
@@ -234,7 +234,7 @@ async fn an_sse_c_objects_tags_need_no_key() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(tags_of(&app, "s", None).await.2, "e=1");
     let head =
-        head_object(&app, BUCKET, "s", None, None, &Preconditions::default(), Some(&customer), None, false).await.unwrap();
+        head_object(&app, BUCKET, "s", None, None, None, &Preconditions::default(), Some(&customer), None, false).await.unwrap();
     assert_eq!(header(head.headers(), "x-amz-tagging-count"), Some("1"));
 }
 
@@ -297,7 +297,7 @@ async fn an_upload_gives_its_tags_to_its_object() {
     let UploadResult::Committed { etag, .. } = result.unwrap() else { panic!("not committed") };
     let body = format!("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"{etag}\"</ETag></Part></CompleteMultipartUpload>");
     let response = complete_multipart_upload(
-        &app, BUCKET, "m", &upload_id, Bytes::from(body), &Preconditions::default(), None, None, None,
+        &app, BUCKET, "m", &upload_id, Bytes::from(body), &Preconditions::default(), None, None, None, None,
     )
     .await
     .unwrap();

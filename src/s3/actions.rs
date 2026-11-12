@@ -3,6 +3,7 @@
 //! service authorization reference for S3 (its operations' authorized
 //! actions), which is what the IAM and S3 guides say too:
 //!
+//! - GetObjectAttributes is `s3:GetObjectAttributes` and `s3:GetObject`;
 //! - a read of one version is `s3:GetObjectVersion` (and of its tags,
 //!   `s3:GetObjectVersionTagging`), a delete of one `s3:DeleteObjectVersion`;
 //! - a write that sets tags (`x-amz-tagging`) needs `s3:PutObjectTagging`
@@ -201,6 +202,14 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
         Method::GET if has("tagging") => {
             one("GetObjectTagging", versioned("s3:GetObjectTagging", "s3:GetObjectVersionTagging"), on_object())
         }
+        // Both, as S3 asks for both (its user guide's GetObjectAttributes).
+        Method::GET if has("attributes") => Some(Operation {
+            name: "GetObjectAttributes",
+            checks: vec![
+                check(versioned("s3:GetObjectAttributes", "s3:GetObjectVersionAttributes"), on_object()),
+                check(versioned("s3:GetObject", "s3:GetObjectVersion"), on_object()),
+            ],
+        }),
         Method::GET => one("GetObject", versioned("s3:GetObject", "s3:GetObjectVersion"), on_object()),
         Method::HEAD => one("HeadObject", versioned("s3:GetObject", "s3:GetObjectVersion"), on_object()),
         Method::PUT if has("acl") => one("PutObjectAcl", versioned("s3:PutObjectAcl", "s3:PutObjectVersionAcl"), on_object()),
@@ -249,6 +258,8 @@ pub fn grant_policy(permission: crate::roles::Permission, bucket: &str) -> Strin
         Permission::Read => vec![
             "s3:GetObject",
             "s3:GetObjectVersion",
+            "s3:GetObjectAttributes",
+            "s3:GetObjectVersionAttributes",
             "s3:GetObjectTagging",
             "s3:GetObjectVersionTagging",
             "s3:GetObjectAcl",
@@ -353,6 +364,10 @@ mod tests {
             (Method::GET, "b", "k", "tagging", none()),
             (Method::GET, "b", "k", "tagging&versionId=v", none()),
             (Method::GET, "b", "k", "uploadId=u", none()),
+            (Method::GET, "b", "k", "attributes", none()),
+            (Method::GET, "b", "k", "attributes&versionId=v", none()),
+            (Method::GET, "b", "k", "partNumber=2", none()),
+            (Method::HEAD, "b", "k", "partNumber=2", none()),
             (Method::PUT, "b", "k", "", none()),
             (Method::PUT, "b", "k", "", headers(&[("x-amz-tagging", "a=b")])),
             (Method::PUT, "b", "k", "acl", none()),

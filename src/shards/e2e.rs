@@ -124,7 +124,7 @@ pub(crate) async fn assert_intact(cluster: &Cluster, blob_id: Uuid) {
 /// Reads (the `range` of) an object: its status, and its body if it came
 /// whole.
 pub(crate) async fn read(app: &Arc<App>, key: &str, range: Option<&str>) -> (StatusCode, Option<Vec<u8>>) {
-    let response = objects::get::get_object(app, BUCKET, key, None, range, &Preconditions::default(), None, None, false)
+    let response = objects::get::get_object(app, BUCKET, key, None, range, None, &Preconditions::default(), None, None, false)
         .await
         .unwrap();
     let status = response.status();

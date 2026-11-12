@@ -17,11 +17,13 @@ use crate::{
     body::{FrameSender, ResBody, box_response, channel_body},
     encryption::{Key, Opener, Salt, Storing, segment_range},
     s3::conditional::{Precondition, Preconditions, not_modified},
-    s3::checksums::StoredChecksum,
+    auth::Rejection,
+    encryption::{Field, Owner},
+    s3::checksums::{Checksum, StoredChecksum, Type},
     s3::metadata,
     s3::sse::{self, Stored},
     s3::sse_c::CustomerKey,
-    s3::util::{format_s3_error, with_delete_marker, with_version_id},
+    s3::util::{format_s3_error, rejection_response, with_delete_marker, with_version_id},
     s3::versions::Versioning,
 };
 
@@ -178,6 +180,7 @@ pub async fn get_object(
     key: &str,
     version_id: Option<&str>,
     range_header: Option<&str>,
+    part: Option<u32>,
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
     role: Option<uuid::Uuid>,
@@ -219,10 +222,21 @@ pub async fn get_object(
         Ok(etag) => etag,
         Err(refused) => return Ok(box_response(refused)),
     };
+    // The part asked for, if one is.
+    let part = match part {
+        Some(number) => match PartRead::select(&tx, object_id, &etag, size as u64, number).await? {
+            Ok(part) => Some(part),
+            Err(refused) => return Ok(box_response(refused)),
+        },
+        None => None,
+    };
     // Honour conditional-request headers before doing any streaming work.
     match preconditions.evaluate(&etag, lm_epoch, true) {
         Precondition::Proceed => {}
-        Precondition::NotModified => return Ok(box_response(not_modified(&etag, &last_modified))),
+        Precondition::NotModified => {
+            let response = PartRead::count_onto(part.as_ref(), not_modified(&etag, &last_modified));
+            return Ok(box_response(with_version_id(response, version_id.as_deref())));
+        }
         Precondition::Failed => {
             return Ok(box_response(format_s3_error(
                 StatusCode::PRECONDITION_FAILED,
@@ -234,11 +248,12 @@ pub async fn get_object(
     let size = size as u64;
     // Resolve the requested object range as a half-open [range_start, range_end).
     // No/unsupported Range → the whole object (200); a satisfiable range → 206; a
-    // syntactically valid but unsatisfiable one → 416.
-    let (range_start, range_end, partial) = match parse_range(range_header, size) {
-        Ok(Some((start, end))) => (start, end, true),
-        Ok(None) => (0, size, false),
-        Err(()) => {
+    // syntactically valid but unsatisfiable one → 416. A part is its range.
+    let (range_start, range_end, partial) = match (&part, parse_range(range_header, size)) {
+        (Some(part), _) => (part.start, part.end, part.end > part.start),
+        (None, Ok(Some((start, end)))) => (start, end, true),
+        (None, Ok(None)) => (0, size, false),
+        (None, Err(())) => {
             return Ok(box_response(format_s3_error(
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "InvalidRange",
@@ -249,6 +264,11 @@ pub async fn get_object(
     // Resolve the ordered parts and each part's candidate locations (freshest
     // first) from this same snapshot.
     let parts = resolve_object_parts(&tx, object_id).await?;
+    // A part's own checksum, if it's told: a composite one's.
+    let part_checksum = match (&part, &checksum) {
+        (Some(part), Some(checksum)) if checksum_mode => part.stored_checksum(&tx, object_id, checksum).await?,
+        _ => None,
+    };
     tx.commit().await?;
     // Bytes that no replica holds intact fail the read before it starts,
     // rather than cutting it off there.
@@ -281,10 +301,12 @@ pub async fn get_object(
     let builder = metadata::apply(builder, &metadata);
     let builder = tag_count(builder, &tags);
     let builder = sse::echo(builder, &encryption, customer_key);
-    let builder = match checksum.filter(|_| checksum_mode && !partial) {
-        Some(checksum) => checksum_headers(builder, &checksum, object_key.as_deref(), bucket, key)?,
-        None => builder,
+    let builder = match (&part, checksum.filter(|_| checksum_mode)) {
+        (None, Some(checksum)) if !partial => checksum_headers(builder, &checksum, object_key.as_deref(), bucket, key)?,
+        (Some(part), Some(checksum)) => part.checksum_headers(builder, &checksum, part_checksum, object_key.as_deref(), bucket, key)?,
+        _ => builder,
     };
+    let builder = PartRead::count_header(builder, part.as_ref());
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,
@@ -682,6 +704,7 @@ pub async fn head_object(
     key: &str,
     version_id: Option<&str>,
     range_header: Option<&str>,
+    part: Option<u32>,
     preconditions: &Preconditions,
     customer_key: Option<&CustomerKey>,
     role: Option<uuid::Uuid>,
@@ -689,6 +712,7 @@ pub async fn head_object(
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     let ObjectVersion {
+        id: object_id,
         etag,
         content_type,
         metadata,
@@ -713,10 +737,20 @@ pub async fn head_object(
         Ok(etag) => etag,
         Err(refused) => return Ok(refused),
     };
+    let part = match part {
+        Some(number) => match PartRead::select(&client, object_id, &etag, size as u64, number).await? {
+            Ok(part) => Some(part),
+            Err(refused) => return Ok(refused),
+        },
+        None => None,
+    };
     // Honour conditional-request headers, exactly as GET does.
     match preconditions.evaluate(&etag, lm_epoch, true) {
         Precondition::Proceed => {}
-        Precondition::NotModified => return Ok(not_modified(&etag, &last_modified)),
+        Precondition::NotModified => {
+            let response = PartRead::count_onto(part.as_ref(), not_modified(&etag, &last_modified));
+            return Ok(with_version_id(response, version_id.as_deref()));
+        }
         Precondition::Failed => {
             return Ok(format_s3_error(
                 StatusCode::PRECONDITION_FAILED,
@@ -728,10 +762,11 @@ pub async fn head_object(
     // HEAD returns exactly the headers a GET would, with no body — so mirror the
     // GET range handling (206 + Content-Range for a range, 416 if unsatisfiable).
     let size = size as u64;
-    let (range_start, range_end, partial) = match parse_range(range_header, size) {
-        Ok(Some((start, end))) => (start, end, true),
-        Ok(None) => (0, size, false),
-        Err(()) => {
+    let (range_start, range_end, partial) = match (&part, parse_range(range_header, size)) {
+        (Some(part), _) => (part.start, part.end, part.end > part.start),
+        (None, Ok(Some((start, end)))) => (start, end, true),
+        (None, Ok(None)) => (0, size, false),
+        (None, Err(())) => {
             return Ok(format_s3_error(
                 StatusCode::RANGE_NOT_SATISFIABLE,
                 "InvalidRange",
@@ -750,7 +785,7 @@ pub async fn head_object(
     let builder = sse::echo(builder, &encryption, customer_key);
     // Its checksum, if asked for: an encrypted one's sealed under its key,
     // which, for an SSE-KMS one, is only asked of the KMS then.
-    let builder = match checksum.filter(|_| checksum_mode && !partial) {
+    let builder = match checksum.filter(|_| checksum_mode && (part.is_some() || !partial)) {
         Some(checksum) => {
             let object_key = match encryption {
                 Stored::Plain => None,
@@ -759,10 +794,17 @@ pub async fn head_object(
                     Err(refused) => return Ok(refused),
                 },
             };
-            checksum_headers(builder, &checksum, object_key.as_deref(), bucket, key)?
+            match &part {
+                None => checksum_headers(builder, &checksum, object_key.as_deref(), bucket, key)?,
+                Some(part) => {
+                    let stored = part.stored_checksum(&client, object_id, &checksum).await?;
+                    part.checksum_headers(builder, &checksum, stored, object_key.as_deref(), bucket, key)?
+                }
+            }
         }
         None => builder,
     };
+    let builder = PartRead::count_header(builder, part.as_ref());
     let builder = if partial {
         builder.status(StatusCode::PARTIAL_CONTENT).header(
             header::CONTENT_RANGE,
@@ -772,6 +814,145 @@ pub async fn head_object(
         builder.status(StatusCode::OK)
     };
     Ok(with_version_id(builder.body(Full::new(Bytes::new())).unwrap(), version_id.as_deref()))
+}
+
+/// A read of one part of an object (GET or HEAD `?partNumber=N`), as S3
+/// answers it (probed): a multipart object's Nth part, counting its parts
+/// from 1 whatever numbers they were uploaded as; any other object is one
+/// part, all of it.
+pub(crate) struct PartRead {
+    /// Which part it is (from 1).
+    number: u32,
+    /// How many parts the object has, if it's a multipart object.
+    count: Option<usize>,
+    /// The part's bytes in the object, half-open.
+    start: u64,
+    end: u64,
+}
+
+impl PartRead {
+    /// Part `number` of the object version `object_id` (of `size` bytes, its
+    /// ETag `etag` as clients know it), or S3's 416 if it has no such part.
+    pub(crate) async fn select<C: GenericClient>(
+        client: &C,
+        object_id: i64,
+        etag: &str,
+        size: u64,
+        number: u32,
+    ) -> Result<Result<PartRead, Response<Full<Bytes>>>, tokio_postgres::Error> {
+        let (count, range) = match is_multipart(etag) {
+            false => (None, (number == 1).then_some((0, size))),
+            true => {
+                let sizes = part_sizes(client, object_id).await?;
+                let start: u64 = sizes.iter().take(number as usize - 1).sum();
+                let range = sizes.get(number as usize - 1).map(|size| (start, start + size));
+                (Some(sizes.len()), range)
+            }
+        };
+        Ok(match range {
+            Some((start, end)) => Ok(PartRead { number, count, start, end }),
+            None => {
+                let mut rejection = Rejection::new(
+                    StatusCode::RANGE_NOT_SATISFIABLE,
+                    "InvalidPartNumber",
+                    "The requested partnumber is not satisfiable",
+                );
+                rejection.details.push(("PartNumberRequested", number.to_string()));
+                rejection.details.push(("ActualPartCount", count.unwrap_or(1).to_string()));
+                Err(rejection_response(&rejection))
+            }
+        })
+    }
+
+    /// `x-amz-mp-parts-count`, which a read of a multipart object's part
+    /// tells.
+    fn count_header(builder: hyper::http::response::Builder, part: Option<&PartRead>) -> hyper::http::response::Builder {
+        match part.and_then(|part| part.count) {
+            Some(count) => builder.header(MP_PARTS_COUNT, count),
+            None => builder,
+        }
+    }
+
+    /// `response`, with `x-amz-mp-parts-count` (a 304 tells it too).
+    fn count_onto<B>(part: Option<&PartRead>, mut response: Response<B>) -> Response<B> {
+        if let Some(count) = part.and_then(|part| part.count) {
+            response.headers_mut().insert(MP_PARTS_COUNT, count.into());
+        }
+        response
+    }
+
+    /// The part's own checksum as it's stored, and its salt, if the read
+    /// tells it: a multipart object's with a composite `checksum`. (One
+    /// that isn't multipart tells the object's; one with a full-object
+    /// checksum, none.)
+    async fn stored_checksum<C: GenericClient>(
+        &self,
+        client: &C,
+        object_id: i64,
+        checksum: &StoredChecksum,
+    ) -> Result<Option<(String, Option<Salt>)>, tokio_postgres::Error> {
+        if self.count.is_none() || checksum.kind != Type::Composite {
+            return Ok(None);
+        }
+        let row = client
+            .query_opt_cached(
+                "SELECT checksum, enc_salt FROM parts WHERE object_id = $1
+                 ORDER BY part_number OFFSET $2 LIMIT 1",
+                &[&object_id, &(self.number as i64 - 1)],
+            )
+            .await?;
+        Ok(row.and_then(|row| {
+            let salt = row
+                .get::<_, Option<Vec<u8>>>(1)
+                .map(|salt| salt.try_into().expect("a salt is 16 bytes (parts_encrypted)"));
+            row.get::<_, Option<String>>(0).map(|stored| (stored, salt))
+        }))
+    }
+
+    /// The checksum a read of the part tells, with `x-amz-checksum-mode`:
+    /// the object's, if it's no multipart object; else the part's own
+    /// (`stored`, opened with the object's key), if the object's is
+    /// composite.
+    fn checksum_headers(
+        &self,
+        builder: hyper::http::response::Builder,
+        checksum: &StoredChecksum,
+        stored: Option<(String, Option<Salt>)>,
+        object_key: Option<&Key>,
+        bucket: &str,
+        key: &str,
+    ) -> anyhow::Result<hyper::http::response::Builder> {
+        if self.count.is_none() {
+            return checksum_headers(builder, checksum, object_key, bucket, key);
+        }
+        let Some((stored, salt)) = stored else { return Ok(builder) };
+        let value = match (object_key, &salt) {
+            (None, _) => stored,
+            (Some(object_key), Some(salt)) => Storing::Sealed(object_key).read(Field::Checksum, Owner::Part(salt), &stored)?,
+            (Some(_), None) => anyhow::bail!("a part of an encrypted object has no salt"),
+        };
+        Ok(Checksum { algorithm: checksum.algorithm, kind: Type::Composite, value }.headers(builder))
+    }
+}
+
+/// The header that tells a multipart object's part count.
+const MP_PARTS_COUNT: &str = "x-amz-mp-parts-count";
+
+/// Whether an ETag (as clients know it) is a multipart object's: its parts'
+/// MD5s', with their count.
+pub(crate) fn is_multipart(etag: &str) -> bool {
+    etag.rsplit_once('-').is_some_and(|(_, count)| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The sizes of an object version's parts, in order.
+pub(crate) async fn part_sizes<C: GenericClient>(client: &C, object_id: i64) -> Result<Vec<u64>, tokio_postgres::Error> {
+    let rows = client
+        .query_cached(
+            "SELECT coalesce(plain_size, size) FROM parts WHERE object_id = $1 ORDER BY part_number",
+            &[&object_id],
+        )
+        .await?;
+    Ok(rows.iter().map(|row| row.get::<_, i64>(0) as u64).collect())
 }
 
 /// `x-amz-tagging-count`, as S3 tells it on GET and HEAD: if there are tags.
