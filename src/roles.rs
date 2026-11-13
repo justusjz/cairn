@@ -9,6 +9,10 @@
 //! and it may have inline identity policies of its own (see `policy`). Admin
 //! does not imply object access; that always needs a grant (or a policy).
 //!
+//! The operator account's users are none of that: each is a superadmin by
+//! being one, with no access keys, admin flag, grants or policies (see
+//! `refuse_operator`), and acts only in the console.
+//!
 //! Everything lives in Postgres, so every node sees a change immediately. The
 //! `cairn user …` subcommands (`cairn role …`, as before) manage it directly
 //! against the database, and the console (see `console::manage`) through the same
@@ -89,8 +93,11 @@ impl Principal {
     /// Loads the user whose active access key `access_key` is, or `None` if
     /// there's none.
     pub async fn load(client: &Object, access_key: &str) -> anyhow::Result<Option<Self>> {
+        // Never one of the operator account's: it has none (migration 39),
+        // and signs nothing.
         Self::load_where(client, "FROM access_keys k JOIN roles r ON r.id = k.role_id
-             WHERE k.access_key_id = $1 AND k.active", "k.secret", &access_key).await
+             JOIN accounts a ON a.id = r.account_id
+             WHERE k.access_key_id = $1 AND k.active AND NOT a.operator", "k.secret", &access_key).await
     }
 
     /// Loads user `id` itself, as the console acts as it (no secret: it
@@ -185,7 +192,8 @@ pub struct RoleArgs {
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum RoleCommand {
     /// Create a user, with an access key named as it. Prints the key's
-    /// secret; a random one is generated unless given.
+    /// secret; a random one is generated unless given. In the operator
+    /// account: a superadmin, who gets no key (see `cairn user enroll`).
     Create {
         /// The user's name, which its first access key's ID is too.
         name: String,
@@ -312,6 +320,15 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
             secret,
             admin,
         } => {
+            if is_operator(&client, account_id).await? {
+                if secret.is_some() || admin {
+                    refuse_operator(&client, account_id, "access keys or admin flag").await?;
+                }
+                create_without_key(&client, account_id, &name).await?;
+                let account = args.account.as_deref().unwrap_or("operator");
+                outln!(out, "superadmin {name}: make its console link with `cairn user enroll --account {account} {name}`");
+                return Ok(());
+            }
             let generated = secret.is_none();
             let (key, secret) = create_for(&client, account_id, &name, secret, admin).await?;
             outln!(out, "access key: {key}");
@@ -490,18 +507,26 @@ pub async fn create_in(
             .ok_or_else(|| invalid(format!("no account named {account:?}")))?,
         None => self::account(client).await?,
     };
+    // The operator account's users have no keys: its ID is the name.
+    if is_operator(client, &account_id).await? {
+        create_without_key(client, &account_id, name).await?;
+        return Ok((name.to_owned(), String::new()));
+    }
     create_for(client, &account_id, name, secret, admin).await
 }
 
 /// Creates a user of the account `account_id` without access keys, as
 /// IAM's CreateUser does: it gets them with `create_key`. (`roles.secret`,
-/// which older Cairns read, is none that can be guessed.)
+/// which older Cairns read, is none that can be guessed.) A user of the
+/// operator account is a superadmin, by being one, and never gets keys;
+/// it's marked admin for older nodes (see `db`, migration 39).
 pub async fn create_without_key(client: &Object, account_id: &str, name: &str) -> anyhow::Result<()> {
     validate_name(name)?;
     let inserted = client
         .execute_cached(
             "INSERT INTO roles (name, secret, admin, account_id)
-             VALUES ($1, 'unusable:' || gen_random_uuid() || gen_random_uuid(), false, $2)
+             SELECT $1, 'unusable:' || gen_random_uuid() || gen_random_uuid(), a.operator, a.id
+             FROM accounts a WHERE a.id = $2
              ON CONFLICT DO NOTHING",
             &[&name, &account_id],
         )
@@ -522,6 +547,7 @@ pub async fn create_for(
     admin: bool,
 ) -> anyhow::Result<(String, String)> {
     validate_name(name)?;
+    refuse_operator(client, account_id, "access keys").await?;
     let secret = match secret {
         Some(s) => {
             validate_secret(&s)?;
@@ -592,6 +618,23 @@ pub async fn operator_account(client: &Object) -> anyhow::Result<String> {
     Ok(account)
 }
 
+/// Whether `account` (its ID) is the operator account.
+pub async fn is_operator(client: &Object, account: &str) -> anyhow::Result<bool> {
+    Ok(account == operator_account(client).await?)
+}
+
+/// Refuses the operator account's users `what` (access keys, policies, an
+/// admin flag): they're superadmins by being its users, and act only in
+/// the console, so the IAM that tenants' users have is none of theirs.
+pub async fn refuse_operator(client: &Object, account: &str, what: &str) -> anyhow::Result<()> {
+    if is_operator(client, account).await? {
+        return Err(invalid(format!(
+            "the operator account's users are superadmins by being its users, and have no {what}"
+        )));
+    }
+    Ok(())
+}
+
 async fn key_exists(client: &Object, id: &str) -> anyhow::Result<bool> {
     Ok(client.query_opt_cached("SELECT 1 FROM access_keys WHERE access_key_id = $1", &[&id]).await?.is_some())
 }
@@ -625,6 +668,7 @@ pub async fn create_key(
     id: Option<String>,
     secret: Option<String>,
 ) -> anyhow::Result<(String, String)> {
+    refuse_operator(client, account, "access keys").await?;
     let id = match id {
         Some(id) => {
             validate_name(&id)?;
@@ -715,6 +759,7 @@ fn validate_policy_name(name: &str) -> anyhow::Result<()> {
 /// identity policy (see `policy`), and the user's policies stay within
 /// IAM's size.
 pub async fn put_policy(client: &Object, account: &str, user: &str, name: &str, document: &str) -> anyhow::Result<()> {
+    refuse_operator(client, account, "policies").await?;
     validate_policy_name(name)?;
     crate::policy::Policy::parse(document, crate::policy::Kind::Identity)
         .map_err(|e| invalid(format!("{}: {}", e.code, e.message)))?;
@@ -775,6 +820,7 @@ pub async fn update(
             "nothing to update; pass --admin, --secret, or --rotate-secret",
         ));
     }
+    refuse_operator(client, account, "admin flag or access keys").await?;
     if let Some(s) = &secret {
         validate_secret(s)?;
     }

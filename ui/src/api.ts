@@ -1,3 +1,4 @@
+import { createSignal } from "solid-js";
 // The console's API for what the signed-in identity manages
 // (`src/console/manage.rs`), through openapi-fetch. Its types are generated
 // from `openapi.json`, the spec the API itself is built from (`npm run gen`
@@ -22,6 +23,7 @@ export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
 export type User = Schemas["RoleSummary"];
+export type ConsoleAccess = Schemas["ConsoleAccess"];
 export type Account = Schemas["AccountSummary"];
 export type OidcProvider = Schemas["OidcProvider"];
 export type CorsConfiguration = Schemas["Configuration"];
@@ -44,17 +46,17 @@ const client = createClient<paths>({
   headers: { "x-cairn-ui": "1" },
 });
 
-let operatorMode = false;
+const [operatorMode, setOperatorModeSignal] = createSignal(false);
 
 /** Whether the session acts as the operator account (a superadmin): then
  * the pages show what's the operator's (the cluster, its KMS); the console
- * sets it as it switches. */
+ * sets it as it switches. (A signal: pages follow it.) */
 export function setOperatorMode(operator: boolean) {
-  operatorMode = operator;
+  setOperatorModeSignal(operator);
 }
 
 export function isOperator(): boolean {
-  return operatorMode;
+  return operatorMode();
 }
 
 export class ApiError extends Error {
@@ -99,8 +101,10 @@ export const api = {
   object: (bucket: string, key: string) =>
     ok(client.GET("/buckets/{bucket}/object", { params: { ...bucketPath(bucket), query: { key } } })),
   roles: () => ok(client.GET("/roles")),
-  createRole: (name: string, secret: string, admin: boolean) =>
-    ok(client.POST("/roles", { body: { name, secret: secret || null, admin } })),
+  /** A person (no access key: they sign in through a console link), or a
+   * service (`accessKey`: one, named as it, whose secret comes back once). */
+  createRole: (name: string, opts: { accessKey?: boolean; admin?: boolean } = {}) =>
+    ok(client.POST("/roles", { body: { name, access_key: opts.accessKey ?? false, admin: opts.admin ?? false } })),
   deleteRole: (role: string) => ok(client.DELETE("/roles/{role}", { params: rolePath(role) })),
   rotateSecret: (role: string) =>
     ok(client.POST("/roles/{role}/secret", { params: rolePath(role), body: {} })),

@@ -208,6 +208,7 @@ const MIGRATIONS: &[&str] = &[
     USER_NAMES,
     OBJECT_LOCK,
     SSE_C_SEALED,
+    OPERATOR_MEMBERS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1600,6 +1601,35 @@ ALTER TABLE objects ADD CONSTRAINT objects_sse_c_key
 ALTER TABLE multipart_uploads DROP CONSTRAINT multipart_uploads_sse_c_key;
 ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_sse_c_key
     CHECK (octet_length(sse_c_key) = 72) NOT VALID;
+"#;
+
+/// Migration 39: the operator account's users are members, not IAM users:
+/// each is a superadmin, by being one, with no access keys, inline
+/// policies or grants (see `roles::refuse_operator`). Their keys and
+/// policies go, and triggers keep new ones out. They're all marked admin,
+/// so that an older node, which decides `cairn:` actions by
+/// `AdministratorAccess`, lets each of them do what this one does.
+const OPERATOR_MEMBERS: &str = r#"
+DELETE FROM access_keys k USING roles r, accounts a
+    WHERE r.id = k.role_id AND a.id = r.account_id AND a.operator;
+DELETE FROM role_policies p USING roles r, accounts a
+    WHERE r.id = p.role_id AND a.id = r.account_id AND a.operator;
+UPDATE roles r SET admin = true, secret = 'unusable:' || gen_random_uuid() || gen_random_uuid()
+    FROM accounts a WHERE a.id = r.account_id AND a.operator;
+
+CREATE FUNCTION cairn_operator_members() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (SELECT a.operator FROM roles r JOIN accounts a ON a.id = r.account_id WHERE r.id = NEW.role_id) THEN
+        RAISE EXCEPTION 'the operator account''s users are superadmins, with no access keys or policies'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER access_keys_operator BEFORE INSERT OR UPDATE OF role_id ON access_keys
+    FOR EACH ROW EXECUTE FUNCTION cairn_operator_members();
+CREATE TRIGGER role_policies_operator BEFORE INSERT OR UPDATE OF role_id ON role_policies
+    FOR EACH ROW EXECUTE FUNCTION cairn_operator_members();
 "#;
 
 #[cfg(test)]

@@ -266,9 +266,27 @@ async fn the_operator_account_owns_no_buckets() {
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("owns no buckets") || format!("{refused:?}").contains("owns no buckets"), "{refused:?}");
-    roles::create_in(&client, Some("operator"), "superadmin", None, false).await.unwrap();
-    let principal = Principal::load(&client, "superadmin").await.unwrap().unwrap();
-    assert_ne!(principal.account, roles::account(&client).await.unwrap());
+    // Its users are superadmins by being its users: no access keys, admin
+    // flag or policies, and so nothing that signs requests.
+    let operator = roles::operator_account(&client).await.unwrap();
+    roles::create_without_key(&client, &operator, "superadmin").await.unwrap();
+    let refused = |e: anyhow::Error| assert!(e.to_string().contains("superadmins"), "{e}");
+    refused(roles::create_key(&client, &operator, "superadmin", Some("superadmin".into()), None).await.unwrap_err());
+    refused(roles::create_for(&client, &operator, "another", None, false).await.unwrap_err());
+    refused(roles::update(&client, &operator, "superadmin", Some(false), None).await.unwrap_err());
+    let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
+    refused(roles::put_policy(&client, &operator, "superadmin", "all", policy).await.unwrap_err());
+    // Nor straight into the database (as an older node would).
+    let id = roles::id_of(&client, &operator, "superadmin").await.unwrap();
+    let err = client
+        .execute("INSERT INTO access_keys (access_key_id, role_id, secret) VALUES ('sneaky', $1, 'secret123')", &[&id])
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("superadmins"), "{err:?}");
+    // It's marked admin, for older nodes, which decide by that.
+    let admin: bool = client.query_one("SELECT admin FROM roles WHERE id = $1", &[&id]).await.unwrap().get(0);
+    assert!(admin);
+    assert!(Principal::load(&client, "superadmin").await.unwrap().is_none());
 }
 
 /// User names are unique in their account, as in IAM: two accounts each

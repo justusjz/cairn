@@ -2273,6 +2273,22 @@ pub(super) struct RoleSummary {
     keys: Vec<AccessKey>,
     /// The names of its inline policies.
     policies: Vec<String>,
+    /// How it signs in to the console, if it does (a person's); `None`:
+    /// it doesn't, and no link for it is out (a service's).
+    console: Option<ConsoleAccess>,
+}
+
+/// How a user signs in to the console (see `store::ConsoleAccess`).
+#[derive(Serialize, ToSchema)]
+struct ConsoleAccess {
+    /// Whether it enrolled (a login is linked to it).
+    enrolled: bool,
+    passkeys: i64,
+    /// The OIDC providers (their labels) it signs in at.
+    providers: Vec<String>,
+    last_sign_in: Option<f64>,
+    /// Whether an enrollment link for it is out, and works still.
+    link_pending: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -2295,11 +2311,20 @@ struct Grant {
 async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<RoleSummary>>> {
     // The session's account's users, as ListUsers lists them.
     actor.check(&app, "iam:ListUsers", On::Users(actor.account().to_owned())).await?;
-    let roles = roles::list(&app.pool.get().await?)
+    let client = app.pool.get().await?;
+    let mut console = super::store::console_access(&client, actor.account()).await?;
+    let roles = roles::list(&client)
         .await?
         .into_iter()
         .filter(|r| r.account_id == actor.account())
         .map(|r| RoleSummary {
+            console: console.remove(&r.id).map(|c| ConsoleAccess {
+                enrolled: c.enrolled,
+                passkeys: c.passkeys,
+                providers: c.providers,
+                last_sign_in: c.last_sign_in,
+                link_pending: c.link_pending,
+            }),
             name: r.name,
             id: r.id.to_string(),
             kms_entity_id: r.kms_entity_id,
@@ -2324,10 +2349,23 @@ async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) ->
 #[derive(Deserialize, ToSchema)]
 struct NewRole {
     name: String,
-    /// At least 8 characters; one is generated if not given.
+    /// Whether it gets an access key (a service's), named as it; a person
+    /// gets none, and signs in to the console through its link.
+    #[serde(default)]
+    access_key: bool,
+    /// The access key's secret: at least 8 characters; one is generated if
+    /// not given. Implies `access_key`.
     secret: Option<String>,
     #[serde(default)]
     admin: bool,
+}
+
+/// A new user: its access key's ID and secret, if it got one, which is
+/// shown only this once.
+#[derive(Serialize, ToSchema)]
+struct NewUser {
+    name: String,
+    access_key: Option<Secret>,
 }
 
 /// A role's secret, which is shown only this once.
@@ -2338,7 +2376,7 @@ struct Secret {
 }
 
 #[utoipa::path(post, path = "/roles", request_body = NewRole, responses(
-    (status = 201, body = Secret),
+    (status = 201, body = NewUser),
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
@@ -2346,15 +2384,34 @@ async fn create_role(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Json(body): Json<NewRole>,
-) -> Result<(StatusCode, Json<Secret>)> {
+) -> Result<(StatusCode, Json<NewUser>)> {
     let client = app.pool.get().await?;
     let account = actor.account().to_owned();
     actor.check(&app, "iam:CreateUser", On::User(account.clone(), body.name.clone())).await?;
+    let secret = body.secret.filter(|s| !s.is_empty());
+    let access_key = body.access_key || secret.is_some();
+    if roles::is_operator(&client, &account).await? && (access_key || body.admin) {
+        roles::refuse_operator(&client, &account, "access keys or admin flag").await?;
+    }
     if body.admin {
         actor.check(&app, "iam:AttachUserPolicy", On::User(account.clone(), body.name.clone())).await?;
     }
-    let secret = body.secret.filter(|s| !s.is_empty());
-    let (key, secret) = roles::create_for(&client, &account, &body.name, secret, body.admin).await?;
+    if access_key {
+        actor.check(&app, "iam:CreateAccessKey", On::User(account.clone(), body.name.clone())).await?;
+    }
+    let access_key = match access_key {
+        true => {
+            let (key, secret) = roles::create_for(&client, &account, &body.name, secret, body.admin).await?;
+            Some(Secret { name: key, secret })
+        }
+        false => {
+            roles::create_without_key(&client, &account, &body.name).await?;
+            if body.admin {
+                roles::update(&client, &account, &body.name, Some(true), None).await?;
+            }
+            None
+        }
+    };
     // Its identity in the KMS, so that key owners can grant it keys now; if
     // the KMS can't be reached, the next maintenance pass makes it. In the
     // background: a slow KMS mustn't hold up the role.
@@ -2364,11 +2421,8 @@ async fn create_role(
             eprintln!("kms: identifying roles: {e:#}");
         }
     });
-    Ok((
-        StatusCode::CREATED,
-        // The key's ID (the user's name, if that was free).
-        Json(Secret { name: key, secret }),
-    ))
+    // The key's ID is the user's name, if that was free.
+    Ok((StatusCode::CREATED, Json(NewUser { name: body.name, access_key })))
 }
 
 #[utoipa::path(delete, path = "/roles/{role}", params(("role" = String, Path)), responses(
@@ -3038,9 +3092,21 @@ mod e2e {
         let uri = format!("/api/buckets/{BUCKET}/download?key=nope");
         assert_eq!(admin.send("GET", &uri, None).await.0, StatusCode::NOT_FOUND);
 
-        let (status, secret) = admin.send("POST", "/api/roles", Some(json!({ "name": "ui-role", "admin": false }))).await;
+        let new = json!({ "name": "ui-role", "admin": false, "access_key": true });
+        let (status, created) = admin.send("POST", "/api/roles", Some(new)).await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(secret["secret"].as_str().unwrap().len(), 40);
+        assert_eq!(created["access_key"]["name"], "ui-role");
+        assert_eq!(created["access_key"]["secret"].as_str().unwrap().len(), 40);
+        // A person: no key, and a console link, which lists them as one.
+        let (status, created) = admin.send("POST", "/api/roles", Some(json!({ "name": "ui-person" }))).await;
+        assert_eq!((status, &created["access_key"]), (StatusCode::CREATED, &Value::Null));
+        let person = |roles: Value| roles.as_array().unwrap().iter().find(|r| r["name"] == "ui-person").unwrap().clone();
+        let listed = person(admin.send("GET", "/api/roles", None).await.1);
+        assert_eq!((&listed["keys"], &listed["console"]), (&json!([]), &Value::Null));
+        assert_eq!(admin.send("POST", "/api/roles/ui-person/enrollment", None).await.0, StatusCode::CREATED);
+        let listed = person(admin.send("GET", "/api/roles", None).await.1);
+        assert_eq!(listed["console"]["link_pending"], true);
+        assert_eq!(listed["console"]["enrolled"], false);
         let grant = json!({ "bucket": BUCKET, "permissions": ["read", "delete-version"] });
         let uri = "/api/roles/ui-role/grants";
         assert_eq!(admin.send("POST", uri, Some(grant)).await.0, StatusCode::NO_CONTENT);

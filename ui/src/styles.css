@@ -349,7 +349,32 @@ button.chip.policy:hover { border-color: var(--accent); }
 /* The console. */
 .signin { max-width: 520px; margin: 48px auto; }
 .signin .primary { margin: 8px 0; }
-.whoami { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+/* The person signed in: their identities, sign-in settings and signing out. */
+.user-menu { position: relative; margin-left: auto; flex-shrink: 0; }
+.user-button { border-color: transparent; background: none; padding: 4px 8px; max-width: 46vw; }
+.user-button > .mono { overflow: hidden; text-overflow: ellipsis; }
+.avatar {
+  display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
+  width: 26px; height: 26px; border-radius: 50%;
+  background: var(--accent-soft); color: var(--accent); font-weight: 700; font-size: 13px;
+}
+.user-menu .menu {
+  position: absolute; right: 0; top: calc(100% + 6px); z-index: 20;
+  min-width: 260px; max-width: calc(100vw - 24px);
+  padding: 6px; background: var(--panel); border: 1px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .14);
+}
+.menu-head { padding: 6px 8px 8px; color: var(--muted); font-size: 13px; }
+.menu-head strong { color: var(--text); }
+.menu-label { padding: 4px 8px; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .04em; }
+.menu-item {
+  display: flex; align-items: center; gap: 6px; width: 100%; box-sizing: border-box;
+  padding: 6px 8px; border: none; border-radius: 6px; background: none; color: var(--text); text-align: left;
+}
+.menu-item:hover { background: var(--panel-2); text-decoration: none; }
+.check-mark { width: 14px; color: var(--accent); }
+.user-menu hr { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
+@media (max-width: 700px) { .user-button > .mono, .user-button .badge { display: none; } }
 label.field { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; font-size: 13px; color: var(--muted); }
 label.field input { font-size: 14px; }
 label.file-button { position: relative; overflow: hidden; cursor: pointer; }

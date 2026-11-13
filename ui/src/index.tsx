@@ -5,7 +5,7 @@
 // cluster, accounts and superadmins.
 
 import { A, Navigate, Route, Router, type RouteSectionProps, useNavigate } from "@solidjs/router";
-import { For, Show, createEffect, createResource, createRoot, createSignal } from "solid-js";
+import { For, Show, createEffect, createResource, createRoot, createSignal, onCleanup } from "solid-js";
 import { render } from "solid-js/web";
 import { Badge, Loading, Panel, Table, Toasts, act, poll, toast } from "./components/ui";
 import { ago, date } from "./format";
@@ -94,16 +94,7 @@ function Layout(props: RouteSectionProps) {
             )}
           </Show>
         </nav>
-        <Show when={me()}>
-          {(m) => (
-            <div class="whoami">
-              <AccountPicker me={m()} />
-              <button class="small" onClick={logout}>
-                Sign out
-              </button>
-            </div>
-          )}
-        </Show>
+        <Show when={me()}>{(m) => <UserMenu me={m()} logout={logout} />}</Show>
       </header>
       <main>{props.children}</main>
       <Toasts />
@@ -115,7 +106,6 @@ function Layout(props: RouteSectionProps) {
 const TENANT_NAV: [string, string][] = [
   ["/buckets", "Buckets"],
   ["/users", "Users"],
-  ["/account", "Account"],
 ];
 
 /** What the operator account's sees: the cluster, the accounts, and the
@@ -128,7 +118,6 @@ const OPERATOR_NAV: [string, string][] = [
   ["/accounts", "Accounts"],
   ["/sign-in", "Sign-in"],
   ["/users", "Superadmins"],
-  ["/account", "Account"],
 ];
 
 /** `user @ account`, or `root @ account`. */
@@ -164,36 +153,85 @@ async function switchTo(target: Identity) {
   }
 }
 
-/** Who the session acts as, and the login's other identities to switch to. */
-function AccountPicker(props: { me: Me }) {
+/** The person signed in, not the account: who the session acts as, the
+ * login's other identities to switch to, their own sign-in settings, and
+ * signing out. */
+function UserMenu(props: { me: Me; logout: () => void }) {
   const navigate = useNavigate();
-  const change = async (accountId: string) => {
-    const target = props.me.identities.find((i) => i.account_id === accountId);
-    if (!target || accountId === props.me.identity.account_id) return;
+  const [open, setOpen] = createSignal(false);
+  let menu!: HTMLDivElement;
+  const close = (e: MouseEvent) => {
+    if (!menu.contains(e.target as Node)) setOpen(false);
+  };
+  const key = (e: KeyboardEvent) => e.key === "Escape" && setOpen(false);
+  createEffect(() => {
+    if (open()) {
+      document.addEventListener("click", close);
+      document.addEventListener("keydown", key);
+    } else {
+      document.removeEventListener("click", close);
+      document.removeEventListener("keydown", key);
+    }
+  });
+  onCleanup(() => {
+    document.removeEventListener("click", close);
+    document.removeEventListener("keydown", key);
+  });
+  const change = async (target: Identity) => {
+    setOpen(false);
+    if (target.account_id === props.me.identity.account_id) return;
     await switchTo(target);
     navigate("/");
   };
   return (
-    <Show
-      when={props.me.identities.length > 1}
-      fallback={<span class="mono">{label(props.me.identity)}</span>}
-    >
-      <select
-        aria-label="Account"
-        class="mono"
-        value={props.me.identity.account_id}
-        onChange={(e) => change(e.currentTarget.value)}
-      >
-        <For each={props.me.identities}>
-          {(i) => (
-            <option value={i.account_id}>
-              {label(i)}
-              {i.operator ? " (operator)" : ""}
-            </option>
-          )}
-        </For>
-      </select>
-    </Show>
+    <div class="user-menu" ref={menu}>
+      <button class="user-button" aria-haspopup="menu" aria-expanded={open()} onClick={() => setOpen(!open())}>
+        <span class="avatar" aria-hidden="true">
+          {props.me.name.slice(0, 1).toUpperCase()}
+        </span>
+        <span class="mono">{label(props.me.identity)}</span>
+        <Show when={props.me.identity.operator}>
+          <Badge tone="warn">operator</Badge>
+        </Show>
+        <span aria-hidden="true">▾</span>
+      </button>
+      <Show when={open()}>
+        <div class="menu" role="menu">
+          <div class="menu-head">
+            Signed in as <strong>{props.me.name}</strong>
+          </div>
+          <Show when={props.me.identities.length > 1}>
+            <div class="menu-label">Switch to</div>
+          </Show>
+          <For each={props.me.identities}>
+            {(i) => (
+              <button
+                role="menuitemradio"
+                aria-checked={i.account_id === props.me.identity.account_id}
+                class="menu-item"
+                onClick={() => change(i)}
+              >
+                <span class="check-mark">{i.account_id === props.me.identity.account_id ? "✓" : ""}</span>
+                <span class="mono">{label(i)}</span>
+                <Show when={i.operator}>
+                  <Badge tone="warn">operator</Badge>
+                </Show>
+                <Show when={i.admin && !i.operator}>
+                  <Badge tone="accent">admin</Badge>
+                </Show>
+              </button>
+            )}
+          </For>
+          <hr />
+          <A role="menuitem" class="menu-item" href="/account" onClick={() => setOpen(false)}>
+            Passkeys and sign-in
+          </A>
+          <button role="menuitem" class="menu-item" onClick={props.logout}>
+            Sign out
+          </button>
+        </div>
+      </Show>
+    </div>
   );
 }
 
@@ -390,10 +428,13 @@ function Home() {
       {(m) => (
         <>
           <div class="page-head">
-            <h1>{label(m.identity)}</h1>
+            <h1>Your sign-in</h1>
+            <span class="subtle small">login {m.name}</span>
           </div>
-          <Panel title="Your accounts" note={`login ${m.name}`}>
-            <Table count={m.identities.length} columns={["Account", "As", "ARN", ""]}>
+          <Passkeys passkeys={m.passkeys} others={m.oidc.length} />
+          <Providers me={m} />
+          <Panel title="Your identities" note="switch between them in the menu at the top">
+            <Table count={m.identities.length} columns={["Account", "As", "ARN"]}>
               <For each={m.identities}>
                 {(i) => (
                   <tr>
@@ -401,34 +442,29 @@ function Home() {
                       {i.account}{" "}
                       <Show when={i.operator}>
                         <Badge tone="warn">operator</Badge>
+                      </Show>{" "}
+                      <Show when={i.account_id === m.identity.account_id}>
+                        <Badge tone="ok">current</Badge>
                       </Show>
                     </td>
                     <td>
                       {i.user ?? "root"}{" "}
-                      <Show when={i.admin}>
+                      <Show when={i.admin && !i.operator}>
                         <Badge tone="accent">admin</Badge>
                       </Show>
                     </td>
                     <td class="mono small">{i.arn}</td>
-                    <td class="actions">
-                      <Show when={i.account_id !== m.identity.account_id} fallback={<Badge tone="ok">current</Badge>}>
-                        <button class="small" onClick={() => switchTo(i)}>
-                          Switch
-                        </button>
-                      </Show>
-                    </td>
                   </tr>
                 )}
               </For>
             </Table>
             <p class="subtle small">
-              One login, with these passkeys, for each account you're in. Policies name you by the ARN. As a user, what
-              you may do here is what your access keys may do over S3; as an account's root, anything in the account
-              but what its buckets' policies deny. Switching to the operator account asks for your passkey again.
+              One login, with these passkeys and providers, for each account you're in. Policies name you by the ARN.
+              As a user, what you may do here is what your policies allow; as an account's root, anything in the
+              account but what its buckets' policies deny; in the operator account, you're a superadmin. Switching to
+              the operator account asks for your passkey again.
             </p>
           </Panel>
-          <Passkeys passkeys={m.passkeys} others={m.oidc.length} />
-          <Providers me={m} />
         </>
       )}
     </SignedIn>

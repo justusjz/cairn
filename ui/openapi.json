@@ -2450,7 +2450,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Secret"
+                  "$ref": "#/components/schemas/NewUser"
                 }
               }
             }
@@ -3776,6 +3776,44 @@
           }
         },
         "additionalProperties": false
+      },
+      "ConsoleAccess": {
+        "type": "object",
+        "description": "How a user signs in to the console (see `store::ConsoleAccess`).",
+        "required": [
+          "enrolled",
+          "passkeys",
+          "providers",
+          "link_pending"
+        ],
+        "properties": {
+          "enrolled": {
+            "type": "boolean",
+            "description": "Whether it enrolled (a login is linked to it)."
+          },
+          "last_sign_in": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "link_pending": {
+            "type": "boolean",
+            "description": "Whether an enrollment link for it is out, and works still."
+          },
+          "passkeys": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The OIDC providers (their labels) it signs in at."
+          }
+        }
       },
       "Counts": {
         "type": "object",
@@ -5148,6 +5186,10 @@
           "name"
         ],
         "properties": {
+          "access_key": {
+            "type": "boolean",
+            "description": "Whether it gets an access key (a service's), named as it; a person\ngets none, and signs in to the console through its link."
+          },
           "admin": {
             "type": "boolean"
           },
@@ -5159,7 +5201,7 @@
               "string",
               "null"
             ],
-            "description": "At least 8 characters; one is generated if not given."
+            "description": "The access key's secret: at least 8 characters; one is generated if\nnot given. Implies `access_key`."
           }
         }
       },
@@ -5216,6 +5258,28 @@
             ]
           },
           "key": {
+            "type": "string"
+          }
+        }
+      },
+      "NewUser": {
+        "type": "object",
+        "description": "A new user: its access key's ID and secret, if it got one, which is\nshown only this once.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "access_key": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Secret"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "name": {
             "type": "string"
           }
         }
@@ -5876,6 +5940,17 @@
         "properties": {
           "admin": {
             "type": "boolean"
+          },
+          "console": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConsoleAccess",
+                "description": "How it signs in to the console, if it does (a person's); `None`:\nit doesn't, and no link for it is out (a service's)."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "created_at": {
             "type": "number",

@@ -1267,6 +1267,19 @@ export interface components {
         Configuration: {
             rules: components["schemas"]["Rule"][];
         };
+        /** @description How a user signs in to the console (see `store::ConsoleAccess`). */
+        ConsoleAccess: {
+            /** @description Whether it enrolled (a login is linked to it). */
+            enrolled: boolean;
+            /** Format: double */
+            last_sign_in?: number | null;
+            /** @description Whether an enrollment link for it is out, and works still. */
+            link_pending: boolean;
+            /** Format: int64 */
+            passkeys: number;
+            /** @description The OIDC providers (their labels) it signs in at. */
+            providers: string[];
+        };
         /** @description Counts of requests, by how they ended, and of what they moved. */
         Counts: {
             /** Format: int64 */
@@ -1830,9 +1843,17 @@ export interface components {
             rate: number;
         };
         NewRole: {
+            /**
+             * @description Whether it gets an access key (a service's), named as it; a person
+             *     gets none, and signs in to the console through its link.
+             */
+            access_key?: boolean;
             admin?: boolean;
             name: string;
-            /** @description At least 8 characters; one is generated if not given. */
+            /**
+             * @description The access key's secret: at least 8 characters; one is generated if
+             *     not given. Implies `access_key`.
+             */
             secret?: string | null;
         };
         NewSecret: {
@@ -1855,6 +1876,14 @@ export interface components {
         NewUpload: {
             content_type?: string | null;
             key: string;
+        };
+        /**
+         * @description A new user: its access key's ID and secret, if it got one, which is
+         *     shown only this once.
+         */
+        NewUser: {
+            access_key?: components["schemas"]["Secret"] | null;
+            name: string;
         };
         NewVersioning: {
             /** @description `Enabled` or `Suspended`. */
@@ -2120,6 +2149,7 @@ export interface components {
         /** @description A role, never with its secret. */
         RoleSummary: {
             admin: boolean;
+            console?: components["schemas"]["ConsoleAccess"] | null;
             /** Format: double */
             created_at: number;
             grants: components["schemas"]["Grant"][];
@@ -4343,7 +4373,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["Secret"];
+                    "application/json": components["schemas"]["NewUser"];
                 };
             };
             "4XX": {

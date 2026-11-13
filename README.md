@@ -471,9 +471,15 @@ account, and a link for it to enroll its passkey with. Everyone after that
 can be made in the console.
 
 ```sh
-cairn user create ada --account operator --admin
+cairn user create ada --account operator
 cairn user enroll ada --account operator     # on a node that serves the console
 ```
+
+Everyone in the operator account is a superadmin, by being in it: its users
+have no access keys, admin flag, grants or policies (Cairn refuses them), so
+nothing signed with a key ever acts as a superadmin, and there's no IAM to
+make one with. Superadmins act in the console only, behind a fresh passkey,
+and the `cairn` command line, which takes access to a node.
 
 A **login** (a person, with passkeys) acts in each account it's in as one
 identity there, a user or the account's root, and switches between them;
@@ -486,7 +492,12 @@ The console acts as its identity: it allows exactly what that identity's S3
 and IAM requests would be allowed, by the same policies (the user's grants,
 admin flag and inline policies, and the bucket's policy; an explicit Deny
 wins), and denies with S3's messages. An account's root may do anything in
-its account, as in AWS.
+its account, as in AWS. A superadmin may do everything that's the
+operator's, and nothing in any tenant's account, whatever policies say.
+
+The menu at the top right is the person's, not the account's: who the session
+acts as, the login's other identities to switch to, its passkeys and
+sign-in providers, and signing out.
 
 ### An account's pages
 
@@ -507,17 +518,19 @@ its account, as in AWS.
   permissions, toggle admin, make, deactivate and delete access keys
   (replacing the secret of the one named as the user in place), write
   inline policies, which the server checks as IAM does, and make enrollment
-  links.
-- **Account:** the login's passkeys, its identities at OIDC providers, and
-  the accounts it's in.
+  links. People and service users are listed apart: both are IAM users, as
+  in AWS, but a person signs in to the console (or has a link out to), with
+  how, and when they last did; a service has only access keys. A new person
+  gets a console link and no access key; a new service, an access key.
 
 ### The operator's pages
 
 Superadmins (the operator account's users) see the cluster instead, and no
 tenant's buckets. Their actions are `cairn:` ones (`cairn:GetCluster`,
 `cairn:PutSetting`, `cairn:RemoveNode`, `cairn:CreateAccount`, …) on the
-cluster, which is the operator account's, so a tenant's policies can't allow
-them. Whichever node answers shows the whole cluster:
+cluster, which only the operator account's identities are allowed, by being
+them: no policy, a tenant's or theirs, decides it. Whichever node answers
+shows the whole cluster:
 
 - **Overview:** which nodes are live, how full their disks are, and request
   rates, errors, throughput and latency over the last hour, by S3 operation.
@@ -526,7 +539,8 @@ them. Whichever node answers shows the whole cluster:
   [erasure-coded](#erasure-coding)), how much of it has fewer live shards
   than it should, and what each node holds; and the redundancy settings,
   which can be changed there: `parity-shards`, `data-shards` and
-  `repair-after`.
+  `repair-after`. And the [KMS](#sse-kms) setup: Cairn's public key for
+  OpenBao, and whether each node reaches it.
 - **Integrity:** what the [scrubbers](#scrubbing) checked and found: per
   node, how long a full check takes at its rate and how recently its data was
   checked; damaged and missing copies, and whether they were repaired; and
@@ -541,9 +555,8 @@ them. Whichever node answers shows the whole cluster:
   root's enrollment link (a new account's first, or to recover it); and the
   cluster's public access block, which every bucket gets.
 - **Sign-in:** the OIDC providers people may sign in at.
-- **Superadmins:** the operator account's users, as an account's Users page,
-  and the [KMS](#sse-kms) setup: each user's ID and its identity in the KMS,
-  for granting it keys.
+- **Superadmins:** the operator account's users, with how they sign in;
+  adding one (who gets a console link) and removing one.
 
 Request metrics are kept in memory by each node, so they start over when it
 restarts; everything else is read from the database.
@@ -965,7 +978,7 @@ deleting a key makes its objects unreadable for good (crypto-shredding).
   naming the role by its ID, which is never reused. Cairn logs in once for
   each new role (when the console creates it, or within a minute), so that
   OpenBao makes its entity right away. `cairn user list` and the console
-  show each role's ID and entity; the console's Superadmins page also shows
+  show each role's ID and entity; the console's Storage page also shows
   Cairn's public key, whether each node reaches OpenBao, and how its logins
   went, with what's wrong in OpenBao's setup if they fail. A deleted role's
   entity stays in OpenBao,
@@ -1056,8 +1069,8 @@ roles.
 
 - Cairn logs in to OpenBao through its JWT mount as itself, with the subject
   `cairn` (roles' are their IDs), and its entity must be allowed
-  `datakey/plaintext` and `decrypt` on the key. The console's Superadmins
-  page shows that entity.
+  `datakey/plaintext` and `decrypt` on the key. The console's Storage page
+  shows that entity.
 - As S3's bucket keys do, a node uses one data key from OpenBao for an hour of
   writes, and keeps the data keys it opened for an hour after their last use.
   So OpenBao sees a few calls an hour, not one a request. Every object still
