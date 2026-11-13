@@ -65,6 +65,11 @@ pub struct Malformed(pub &'static str);
 /// How deep values may nest: WebAuthn's go three or four levels down.
 const MAX_DEPTH: usize = 16;
 
+/// How many items an array, or entries a map, may have: WebAuthn's have a
+/// handful (a COSE key's parameters, an attestation's certificates). So a
+/// forged one can't make the duplicate keys' check (quadratic) take long.
+const MAX_ITEMS: usize = 64;
+
 /// Decodes the one value at the start of `bytes`, and says how many bytes it
 /// took (the authenticator data has more after its COSE key, sometimes).
 pub fn decode_prefix(bytes: &[u8]) -> Result<(Value, usize), Malformed> {
@@ -118,6 +123,15 @@ impl<'a> Reader<'a> {
         Ok(n as usize)
     }
 
+    /// An array's or a map's number of items, at most `MAX_ITEMS`.
+    fn count(&mut self, info: u8) -> Result<usize, Malformed> {
+        let n = self.length(info)?;
+        if n > MAX_ITEMS {
+            return Err(Malformed("too many items in a CBOR array or map"));
+        }
+        Ok(n)
+    }
+
     fn value(&mut self, depth: usize) -> Result<Value, Malformed> {
         if depth > MAX_DEPTH {
             return Err(Malformed("CBOR nested too deep"));
@@ -137,7 +151,7 @@ impl<'a> Reader<'a> {
                 Value::Text(text.to_owned())
             }
             4 => {
-                let n = self.length(info)?;
+                let n = self.count(info)?;
                 let mut items = Vec::with_capacity(n);
                 for _ in 0..n {
                     items.push(self.value(depth + 1)?);
@@ -145,10 +159,14 @@ impl<'a> Reader<'a> {
                 Value::Array(items)
             }
             5 => {
-                let n = self.length(info)?;
+                let n = self.count(info)?;
                 let mut entries: Vec<(Value, Value)> = Vec::with_capacity(n);
                 for _ in 0..n {
                     let key = self.value(depth + 1)?;
+                    // As CTAP2's canonical form has them, and cheap to compare.
+                    if !matches!(key, Value::Int(_) | Value::Text(_)) {
+                        return Err(Malformed("a CBOR map key that's neither an integer nor text"));
+                    }
                     if entries.iter().any(|(k, _)| *k == key) {
                         return Err(Malformed("duplicate key in a CBOR map"));
                     }
@@ -266,6 +284,7 @@ pub(crate) mod tests {
             "a201020103", // a duplicate key
             "0000",       // trailing bytes
             "62c328",     // invalid UTF-8
+            "a1410102",   // a key that's neither an integer nor text
         ] {
             assert!(decode(&hex_bytes(hex)).is_err(), "{hex}");
         }
@@ -274,6 +293,19 @@ pub(crate) mod tests {
         assert!(decode(&deep).is_err());
         let ok = [vec![0x81; MAX_DEPTH], vec![0x00]].concat();
         assert!(decode(&ok).is_ok());
+        // Longer than the limit: an array, a map (whose keys would otherwise
+        // take quadratic time to check).
+        let items = |head: u8, n: usize, item: &dyn Fn(usize) -> Vec<u8>| {
+            [vec![head], (n as u16).to_be_bytes().to_vec(), (0..n).flat_map(item).collect()].concat()
+        };
+        let array = |n| items(0x99, n, &|_| vec![0x00]);
+        assert!(decode(&array(MAX_ITEMS)).is_ok());
+        assert!(decode(&array(MAX_ITEMS + 1)).is_err());
+        let map = |n| items(0xb9, n, &|i| vec![0x19, (i >> 8) as u8, i as u8, 0x00]);
+        assert!(decode(&map(MAX_ITEMS)).is_ok());
+        let started = std::time::Instant::now();
+        assert!(decode(&map(60_000)).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
     }
 
     #[test]

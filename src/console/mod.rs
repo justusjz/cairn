@@ -119,9 +119,16 @@ pub fn parse_url(text: &str) -> Result<Party, String> {
     Ok(Party { id: host, origin })
 }
 
+/// The most of a body the sign-in API (`api`) reads: a passkey's
+/// attestation, with its certificates, takes a few KiB.
+const MAX_SIGN_IN_BODY: usize = 64 * 1024;
+
 /// The console.
 pub fn router(console: Arc<Console>) -> Router {
+    // Signing in and enrolling take small JSON documents, before anyone is
+    // known: no more is read of them.
     let (api, _) = api::router().split_for_parts();
+    let api = api.layer(axum::extract::DefaultBodyLimit::max(MAX_SIGN_IN_BODY));
     // What the session's identity manages, as that identity.
     let (managed, _) = manage::router().split_for_parts();
     let managed = managed
