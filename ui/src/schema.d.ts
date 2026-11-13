@@ -787,6 +787,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/policies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_policies"];
+        put?: never;
+        post: operations["create_policy"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/policies/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["update_policy"];
+        post?: never;
+        delete: operations["delete_policy_managed"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/public-access": {
         parameters: {
             query?: never;
@@ -856,6 +888,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/roles/{role}/attached": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Attaches a managed policy to a user. */
+        post: operations["attach_policy"];
+        /** Detaches a managed policy from a user. */
+        delete: operations["detach_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/roles/{role}/enrollment": {
         parameters: {
             query?: never;
@@ -868,23 +918,6 @@ export interface paths {
         /** Makes a role an enrollment link for the console, replacing its last. */
         post: operations["create_enrollment"];
         delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}/grants": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Grants permissions on an existing bucket. */
-        post: operations["grant"];
-        delete: operations["revoke"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1062,6 +1095,10 @@ export interface components {
             /** @description The login the passkey is of, as the authenticator says. */
             user_handle?: string | null;
         };
+        AttachedPolicy: {
+            arn: string;
+            name: string;
+        };
         Backlog: {
             /**
              * Format: int64
@@ -1162,6 +1199,11 @@ export interface components {
             /** @description Whether the policy makes the bucket public. */
             public: boolean;
             public_access_block?: components["schemas"]["Block"] | null;
+            /**
+             * @description The bucket's account's users whose own policies (inline and
+             *     attached) give them access to the whole bucket, and what.
+             */
+            users: components["schemas"]["UserAccess"][];
         };
         /** @description A bucket's CORS configuration. */
         BucketCors: {
@@ -1196,7 +1238,8 @@ export interface components {
             public_access_block?: components["schemas"]["Block"] | null;
             /**
              * Format: int64
-             * @description Roles with a grant on the bucket.
+             * @description The account's users whose policies give them access to the whole
+             *     bucket (see `who_has_access`).
              */
             roles: number;
             /** @description Its tags (PutBucketTagging), sorted by key. */
@@ -1446,10 +1489,6 @@ export interface components {
             files: number;
             /** Format: int64 */
             pending: number;
-        };
-        Grant: {
-            bucket: string;
-            permission: components["schemas"]["Permission"];
         };
         /** @description An identity of the login. */
         IdentitySummary: {
@@ -1803,10 +1842,6 @@ export interface components {
              */
             object_lock?: boolean;
         };
-        NewGrant: {
-            bucket: string;
-            permissions: components["schemas"]["Permission"][];
-        };
         /** @description A new access key, whose secret is shown only this once. */
         NewKey: {
             id: string;
@@ -1833,6 +1868,11 @@ export interface components {
             challenge_id: string;
             credential: components["schemas"]["Registration"];
             /** @description What to call it, e.g. "Laptop". */
+            name: string;
+        };
+        NewPolicy: {
+            description?: string;
+            document: string;
             name: string;
         };
         NewRate: {
@@ -2094,14 +2134,36 @@ export interface components {
             last_used_at?: number | null;
             name: string;
         };
-        /**
-         * @description A bucket-level permission a role can be granted.
-         * @enum {string}
-         */
-        Permission: "read" | "write" | "delete-version";
+        PolicyArn: {
+            arn: string;
+        };
+        PolicyChange: {
+            /** @description Its new description; unchanged if not given. */
+            description?: string | null;
+            /** @description Its new document (a new default version); unchanged if not given. */
+            document?: string | null;
+        };
         /** @description An inline policy: a JSON document in IAM's policy language. */
         PolicyDocument: {
             document: string;
+        };
+        /** @description A managed policy: one of Cairn's (AWS's names), or the account's own. */
+        PolicySummary: {
+            arn: string;
+            /** @description Whether it's one of Cairn's (AWS's), which can't be changed. */
+            aws: boolean;
+            description: string;
+            document: string;
+            name: string;
+            /** Format: double */
+            updated_at?: number | null;
+            /** @description The account's users it's attached to. */
+            users: string[];
+            /**
+             * Format: int32
+             * @description Its default version's number (`v1`, ...).
+             */
+            version: number;
         };
         /** @description A provider to sign in at. */
         ProviderButton: {
@@ -2149,10 +2211,11 @@ export interface components {
         /** @description A role, never with its secret. */
         RoleSummary: {
             admin: boolean;
+            /** @description Its attached managed policies (AdministratorAccess, if it's an admin). */
+            attached: components["schemas"]["AttachedPolicy"][];
             console?: components["schemas"]["ConsoleAccess"] | null;
             /** Format: double */
             created_at: number;
-            grants: components["schemas"]["Grant"][];
             /**
              * @description Its ID, which never changes or comes back: its name (alias) in the
              *     KMS's auth mount for Cairn.
@@ -2271,6 +2334,15 @@ export interface components {
         };
         UploadStarted: {
             upload_id: string;
+        };
+        /** @description What a user's policies allow it on a whole bucket. */
+        UserAccess: {
+            /**
+             * @description Of `list`, `read`, `write`, `delete-versions` and `manage` (its
+             *     configuration and policy).
+             */
+            levels: string[];
+            user: string;
         };
         VersionInfo: {
             content_type?: string | null;
@@ -4301,6 +4373,155 @@ export interface operations {
             };
         };
     };
+    list_policies: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicySummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewPolicy"];
+            };
+        };
+        responses: {
+            /** @description Made */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyChange"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_policy_managed: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_public_access: {
         parameters: {
             query?: never;
@@ -4470,6 +4691,84 @@ export interface operations {
             };
         };
     };
+    attach_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyArn"];
+            };
+        };
+        responses: {
+            /** @description Attached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    detach_policy: {
+        parameters: {
+            query: {
+                arn: string;
+            };
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Detached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     create_enrollment: {
         parameters: {
             query?: never;
@@ -4488,86 +4787,6 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["EnrollmentLink"];
                 };
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    grant: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["NewGrant"];
-            };
-        };
-        responses: {
-            /** @description Granted */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    revoke: {
-        parameters: {
-            query: {
-                bucket: string;
-                /** @description The permission to revoke; all of them on the bucket if not given. */
-                permission?: components["schemas"]["Permission"];
-            };
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Revoked */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
             };
             "4XX": {
                 headers: {

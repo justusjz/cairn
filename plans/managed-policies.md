@@ -1,6 +1,10 @@
 # Managed policies, instead of grants
 
-A draft, for discussion before any of it is built.
+Implemented as described below, with the open questions decided: grants
+became managed policies of the account (one per bucket and permission),
+attached to each user; the console's template writes managed policies by
+default; and Cairn's `AmazonS3FullAccess` is AWS's, `s3:*`. What's left is
+under **Later**.
 
 ## Why
 
@@ -83,14 +87,23 @@ one bucket, its statements are written out, as Cairn's grants are.
   a non-admin create users (`iam:CreateUser` with `iam:PermissionsBoundary`
   as a condition), as AWS delegates user management.
 
-## Open questions
+## Decided
 
-- Migrating grants into managed policies (one per bucket and level) or into
-  each user's inline policy? Managed ones keep the console tidy and are
-  shared; inline ones would hit the 2,048-character limit for users with
-  many buckets. Managed, so far.
-- Does the template write managed or inline policies by default? A person
-  gets the same access as others more often than not (managed); a service
-  user's is usually its own (inline).
-- Should `AmazonS3FullAccess` include `s3:PutBucketPolicy` and the like, as
-  AWS's does (`s3:*`)? Matching AWS seems right: it's what the name says.
+- Grants move into managed policies, one per bucket and level
+  (`<bucket>-read`, `-write`, `-delete-version`), attached to each user
+  granted it; if the account has a policy of that name already, of another
+  document, the grant's is `<name>-grant`. Inline policies would have hit
+  the 2,048-character limit for users with many buckets.
+- The console's template is on the Policies page (managed) and in the
+  inline policy editor alike; the Users page points to the Policies page.
+- `AmazonS3FullAccess` is AWS's document, `s3:*` and `s3-object-lambda:*`.
+
+## How it went in
+
+- `src/managed.rs`: Cairn's policies, the account's (`managed_policies`),
+  attachments (`role_attached_policies`; AdministratorAccess stays
+  `roles.admin`). Migration 40.
+- `src/grants.rs`: grants as managed policies; `to_managed` moves bucket
+  policy statements at start.
+- `src/iam.rs`: the policy actions; `src/console/manage.rs`: `/policies`,
+  `/roles/{role}/attached`, and who has access to a bucket.

@@ -1,26 +1,13 @@
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type AccessKey, type Bucket, type Cluster, type ConsoleAccess, type Permission, type User, api, isOperator } from "../api";
+import { type AccessKey, type Cluster, type ConsoleAccess, type ManagedPolicy, type User, api, isOperator } from "../api";
 import { Badge, Loading, Panel, SecretDialog, Table, act, poll, toast } from "../components/ui";
 import { ago, date, pretty } from "../format";
-
-const PERMISSIONS: Permission[] = ["read", "write", "delete-version"];
+import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
 
 /** The most access keys a user may have (as in IAM). */
 const MAX_KEYS = 2;
 
 type NewSecret = { id: string; secret: string };
-
-/** A starting point for a new inline policy. */
-const TEMPLATE = `{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject"],
-      "Resource": ["arn:aws:s3:::bucket/*"]
-    }
-  ]
-}`;
 
 /** A user's console link, to show. */
 type Enrollment = { user: string; url?: string | null; path: string };
@@ -37,9 +24,10 @@ export default function Users() {
  * the console through a link, services sign requests with access keys. */
 function TenantUsers() {
   // Every few seconds: a new user's identity in the KMS comes a moment later.
-  const data = poll(() => Promise.all([api.roles(), api.buckets()]), 5000);
+  const data = poll(() => Promise.all([api.roles(), api.buckets(), api.policies()]), 5000);
   const [secret, setSecret] = createSignal<NewSecret>();
   const [editing, setEditing] = createSignal<{ user: string; policy?: string }>();
+  const [attaching, setAttaching] = createSignal<User>();
   const [enrollment, setEnrollment] = createSignal<Enrollment>();
   const [name, setName] = createSignal("");
   const [kind, setKind] = createSignal<"person" | "service">("person");
@@ -69,8 +57,8 @@ function TenantUsers() {
         <UserRow
           user={user}
           person={people}
-          buckets={data.data()?.[1] ?? []}
           changed={data.refresh}
+          attach={() => setAttaching(user)}
           showSecret={setSecret}
           editPolicy={(policy) => setEditing({ user: user.name, policy })}
           showEnrollment={(e) => setEnrollment({ user: user.name, ...e })}
@@ -113,9 +101,9 @@ function TenantUsers() {
         </form>
         <p class="subtle small">
           A person gets a one-time console link to set up a passkey (or sign in with a provider), and no access key. A
-          service gets an access key, whose secret is shown once; a user may have {MAX_KEYS}, to rotate them. Admins have
-          AdministratorAccess: everything in their account. Others may do what their grants (statements of the buckets'
-          policies) and inline policies (IAM's policy language) allow; a Deny wins over any Allow.
+          service gets an access key, whose secret is shown once; a user may have {MAX_KEYS}, to rotate them. What a user
+          may do is what its policies allow: managed ones attached to it (see Policies; an admin has AdministratorAccess,
+          everything in the account), and inline ones of its own. A Deny wins over any Allow.
         </p>
       </Panel>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
@@ -123,7 +111,7 @@ function TenantUsers() {
           <Table
             count={count(true)}
             empty="No one yet: create a person, and send them their link."
-            columns={["Name", "Admin", "Sign-in", "Grants", "Policies", "Created", ""]}
+            columns={["Name", "Sign-in", "Policies", "Created", ""]}
           >
             {rows(true)}
           </Table>
@@ -132,7 +120,7 @@ function TenantUsers() {
           <Table
             count={count(false)}
             empty="No service users."
-            columns={["Name", "Admin", "Access keys", "Grants", "Policies", "Created", ""]}
+            columns={["Name", "Access keys", "Policies", "Created", ""]}
           >
             {rows(false)}
           </Table>
@@ -149,7 +137,18 @@ function TenantUsers() {
           <PolicyDialog
             user={e().user}
             policy={e().policy}
+            buckets={(data.data()?.[1] ?? []).map((b) => b.name)}
             onClose={() => setEditing(undefined)}
+            changed={data.refresh}
+          />
+        )}
+      </Show>
+      <Show when={attaching()}>
+        {(u) => (
+          <AttachDialog
+            user={u()}
+            policies={data.data()?.[2] ?? []}
+            onClose={() => setAttaching(undefined)}
             changed={data.refresh}
           />
         )}
@@ -380,30 +379,17 @@ function UserRow(props: {
   user: User;
   /** Shown as a person (signs in to the console), else as a service. */
   person: boolean;
-  buckets: Bucket[];
   changed: () => void;
+  attach: () => void;
   showSecret: (s: NewSecret) => void;
   editPolicy: (policy?: string) => void;
   showEnrollment: (e: { url?: string | null; path: string }) => void;
 }) {
   const r = () => props.user;
-  const [granting, setGranting] = createSignal(false);
-  const [bucket, setBucket] = createSignal(props.buckets[0]?.name ?? "");
-  const [perms, setPerms] = createSignal<Permission[]>(["read"]);
-  const toggle = (p: Permission, on: boolean) => setPerms((ps) => (on ? [...ps, p] : ps.filter((x) => x !== p)));
-
-  const grant = async (e: SubmitEvent) => {
-    e.preventDefault();
-    const ps = perms();
-    if (await act(() => api.grant(r().name, bucket(), ps), `Granted ${ps.join(", ")} on ${bucket()}`)) props.changed();
-  };
-  const revoke = async (b: string, p: Permission) => {
-    if (await act(() => api.revoke(r().name, b, p), `Revoked ${p} on ${b}`)) props.changed();
-  };
-  const toggleAdmin = async () => {
-    if (r().admin && !confirm(`Revoke admin from "${r().name}"?`)) return;
-    const msg = r().admin ? `${r().name} is no longer an admin` : `${r().name} is now an admin`;
-    if (await act(() => api.setAdmin(r().name, !r().admin), msg)) props.changed();
+  const detach = async (name: string, arn: string) => {
+    const admin = name === "AdministratorAccess" ? " They're no longer an admin." : "";
+    if (!confirm(`Detach ${name} from "${r().name}"?${admin}`)) return;
+    if (await act(() => api.detach(r().name, arn), `Detached ${name}`)) props.changed();
   };
   const newKey = async () => {
     const res = await act(() => api.createKey(r().name), `Made a new access key for ${r().name}`);
@@ -416,7 +402,7 @@ function UserRow(props: {
     if (res) props.showEnrollment(res.value);
   };
   const remove = async () => {
-    if (!confirm(`Delete user "${r().name}", with its access keys, grants and policies? Clients using it stop working.`))
+    if (!confirm(`Delete user "${r().name}", with its access keys and policies? Clients using it stop working.`))
       return;
     if (await act(() => api.deleteRole(r().name), `Deleted user ${r().name}`)) props.changed();
   };
@@ -424,7 +410,10 @@ function UserRow(props: {
   return (
     <tr>
       <td class="mono">
-        {r().name}
+        {r().name}{" "}
+        <Show when={r().admin}>
+          <Badge tone="accent">admin</Badge>
+        </Show>
         <div class="subtle small" title="The user's name (alias) in the KMS's auth mount for Cairn">
           id {r().id}
         </div>
@@ -434,11 +423,6 @@ function UserRow(props: {
               KMS entity {entity()}
             </div>
           )}
-        </Show>
-      </td>
-      <td>
-        <Show when={r().admin} fallback={<span class="subtle">–</span>}>
-          <Badge tone="accent">admin</Badge>
         </Show>
       </td>
       <td>
@@ -468,64 +452,37 @@ function UserRow(props: {
         </Show>
       </td>
       <td>
-        <Show when={r().grants.length} fallback={<span class="subtle">no grants</span>}>
-          <For each={r().grants}>
-            {(g) => (
-              <span class="chip">
-                {g.bucket}: {g.permission}
-                <button title="Revoke" aria-label={`Revoke ${g.permission} on ${g.bucket}`} onClick={() => revoke(g.bucket, g.permission)}>
-                  ×
-                </button>
-              </span>
-            )}
-          </For>
-        </Show>
-        <Show when={granting()}>
-          <form class="form-row grant" onSubmit={grant}>
-            <select aria-label="Bucket" value={bucket()} onChange={(e) => setBucket(e.currentTarget.value)}>
-              <For each={props.buckets}>{(b) => <option value={b.name}>{b.name}</option>}</For>
-            </select>
-            <For each={PERMISSIONS}>
-              {(p) => (
-                <label class="check">
-                  <input type="checkbox" checked={perms().includes(p)} onChange={(e) => toggle(p, e.currentTarget.checked)} />
-                  {p}
-                </label>
-              )}
-            </For>
-            <button class="small primary" type="submit" disabled={!perms().length}>
-              Grant
-            </button>
-          </form>
-        </Show>
-      </td>
-      <td>
+        <For each={r().attached}>
+          {(a) => (
+            <span class="chip" title={a.arn}>
+              {a.name}
+              <button title="Detach" aria-label={`Detach ${a.name}`} onClick={() => detach(a.name, a.arn)}>
+                ×
+              </button>
+            </span>
+          )}
+        </For>
         <For each={r().policies}>
           {(p) => (
-            <button class="chip policy" title="View or edit" onClick={() => props.editPolicy(p)}>
+            <button class="chip policy" title="Its own (inline) policy: view or edit" onClick={() => props.editPolicy(p)}>
               {p}
             </button>
           )}
         </For>
-        <div>
-          <button class="small" onClick={() => props.editPolicy()}>
-            New policy
+        <Show when={!r().attached.length && !r().policies.length}>
+          <div class="subtle">none: may do nothing</div>
+        </Show>
+        <div class="key-actions">
+          <button class="small" onClick={props.attach}>
+            Attach…
+          </button>
+          <button class="small" title="A policy of this user's own" onClick={() => props.editPolicy()}>
+            Inline…
           </button>
         </div>
       </td>
       <td>{date(r().created_at)}</td>
       <td class="actions">
-        <button
-          class="small"
-          disabled={!props.buckets.length}
-          title={props.buckets.length ? "" : "Create a bucket first"}
-          onClick={() => setGranting(!granting())}
-        >
-          Grant…
-        </button>
-        <button class="small" onClick={toggleAdmin}>
-          {r().admin ? "Revoke admin" : "Make admin"}
-        </button>
         <button
           class="small"
           title={
@@ -608,10 +565,16 @@ function KeyLine(props: {
 
 /** A user's inline policy, to view, edit or delete (`policy`), or a new one.
  * The server checks it as an identity policy, and says what's wrong. */
-function PolicyDialog(props: { user: string; policy?: string; onClose: () => void; changed: () => void }) {
+function PolicyDialog(props: {
+  user: string;
+  policy?: string;
+  buckets: string[];
+  onClose: () => void;
+  changed: () => void;
+}) {
   let dialog!: HTMLDialogElement;
   const [name, setName] = createSignal(props.policy ?? "");
-  const [document, setDocument] = createSignal(props.policy ? "" : TEMPLATE);
+  const [document, setDocument] = createSignal(props.policy ? "" : EMPTY);
   const [loading, setLoading] = createSignal(!!props.policy);
   const [error, setError] = createSignal<string>();
   onMount(async () => {
@@ -649,7 +612,7 @@ function PolicyDialog(props: { user: string; policy?: string; onClose: () => voi
     <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
       <form onSubmit={save}>
         <h2>
-          {props.policy ? "Policy" : "New policy"} of <span class="mono">{props.user}</span>
+          {props.policy ? "Inline policy" : "New inline policy"} of <span class="mono">{props.user}</span>
         </h2>
         <Show when={!props.policy}>
           <input
@@ -665,18 +628,13 @@ function PolicyDialog(props: { user: string; policy?: string; onClose: () => voi
         <Show when={props.policy}>
           <p class="mono">{props.policy}</p>
         </Show>
-        <p class="subtle small">
-          IAM's policy language, as an identity policy: no Principal; Resource names buckets
-          (<span class="mono">arn:aws:s3:::bucket</span>) and objects (<span class="mono">arn:aws:s3:::bucket/key</span>).
-        </p>
-        <textarea
-          class="policy"
-          aria-label="Policy document"
-          spellcheck={false}
-          disabled={loading()}
-          value={document()}
-          onInput={(e) => setDocument(e.currentTarget.value)}
-        />
+        <Show when={!props.policy}>
+          <p class="subtle small">
+            An inline policy is this user's alone. For access others share, or that's simpler to read later, make a
+            managed policy (Policies) and attach it.
+          </p>
+        </Show>
+        <PolicyEditor document={document()} setDocument={setDocument} buckets={props.buckets} disabled={loading()} />
         <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
         <div class="buttons">
           <Show when={props.policy}>
@@ -696,6 +654,63 @@ function PolicyDialog(props: { user: string; policy?: string; onClose: () => voi
   );
 }
 
+
+/** Attaching a managed policy to a user: those it doesn't have yet. */
+function AttachDialog(props: { user: User; policies: ManagedPolicy[]; onClose: () => void; changed: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const open = () => props.policies.filter((p) => !props.user.attached.some((a) => a.arn === p.arn));
+  const [arn, setArn] = createSignal(open().find((p) => !p.aws)?.arn ?? open()[0]?.arn ?? "");
+  const chosen = () => props.policies.find((p) => p.arn === arn());
+  const attach = async (e: SubmitEvent) => {
+    e.preventDefault();
+    const p = chosen();
+    if (!p) return;
+    if (await act(() => api.attach(props.user.name, p.arn), `Attached ${p.name} to ${props.user.name}`)) {
+      props.changed();
+      dialog.close();
+    }
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={attach}>
+        <h2>
+          Attach a policy to <span class="mono">{props.user.name}</span>
+        </h2>
+        <Show when={open().length} fallback={<p class="subtle">Every policy is attached already.</p>}>
+          <select aria-label="Policy" value={arn()} onChange={(e) => setArn(e.currentTarget.value)}>
+            <optgroup label="The account's">
+              <For each={open().filter((p) => !p.aws)}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
+            </optgroup>
+            <optgroup label="Cairn's (AWS's)">
+              <For each={open().filter((p) => p.aws)}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
+            </optgroup>
+          </select>
+          <Show when={chosen()}>
+            {(p) => (
+              <>
+                <p class="subtle small">{p().description}</p>
+                <div class="pem">{pretty(p().document)}</div>
+              </>
+            )}
+          </Show>
+        </Show>
+        <p class="subtle small">
+          To give access to a bucket that no policy covers yet, make one on the Policies page (its template writes the
+          statements).
+        </p>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit" disabled={!chosen()}>
+            Attach
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
 
 /** A user's enrollment link for the console, shown once. */
 export function EnrollmentDialog(props: { user: string; url?: string | null; path: string; onClose: () => void }) {

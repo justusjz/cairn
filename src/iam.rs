@@ -14,9 +14,10 @@
 //! its policies allow (its own keys, say). Another account's users are none.
 //!
 //! What's there: users (no paths, tags or permissions boundaries: refused),
-//! access keys, inline policies, and attaching the one built-in managed
-//! policy, `AdministratorAccess`. Groups, roles, and managed policies of
-//! one's own aren't (NotImplemented).
+//! access keys, inline policies, and managed policies (see `managed`):
+//! Cairn's, which have AWS's names, and an account's own, of which Cairn
+//! keeps one version, the default. Groups and roles aren't
+//! (NotImplemented).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -29,6 +30,7 @@ use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use crate::{
     App,
     auth::Signed,
+    managed::{self, Named},
     db::Cached,
     policy::Verdict,
     roles::{self, Principal},
@@ -41,9 +43,6 @@ use crate::{
 
 const IAM_XMLNS: &str = "https://iam.amazonaws.com/doc/2010-05-08/";
 const STS_XMLNS: &str = "https://sts.amazonaws.com/doc/2011-06-15/";
-
-/// The one managed policy there is: what `--admin` attaches.
-const ADMINISTRATOR_ACCESS: &str = "arn:aws:iam::aws:policy/AdministratorAccess";
 
 /// The most a request's body may hold: a policy (at most a few KiB), encoded.
 const MAX_BODY: usize = 64 << 10;
@@ -78,6 +77,16 @@ fn validation(message: impl Into<String>) -> Error {
 
 impl From<anyhow::Error> for Error {
     fn from(e: anyhow::Error) -> Error {
+        use crate::managed::Refused;
+        let e = match e.downcast::<Refused>() {
+            Ok(Refused::NoSuch(m)) => return error(StatusCode::NOT_FOUND, "NoSuchEntity", m),
+            Ok(Refused::Exists(m)) => return error(StatusCode::CONFLICT, "EntityAlreadyExists", m),
+            Ok(Refused::Conflict(m)) => return error(StatusCode::CONFLICT, "DeleteConflict", m),
+            Ok(Refused::Limit(m)) => return error(StatusCode::CONFLICT, "LimitExceeded", m),
+            Ok(Refused::Malformed(m)) => return error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", m),
+            Ok(Refused::Invalid(m)) => return invalid(m),
+            Err(e) => e,
+        };
         match e.downcast::<roles::Invalid>() {
             Ok(invalid) => self::invalid(invalid.0),
             Err(e) => {
@@ -238,11 +247,21 @@ async fn respond(
         (_, "AttachUserPolicy") => iam.attach_user_policy(&params, true).await?,
         (_, "DetachUserPolicy") => iam.attach_user_policy(&params, false).await?,
         (_, "ListAttachedUserPolicies") => iam.list_attached_user_policies(&params).await?,
+        (_, "CreatePolicy") => iam.create_policy(&params).await?,
+        (_, "GetPolicy") => iam.get_policy(&params).await?,
+        (_, "DeletePolicy") => iam.delete_policy(&params).await?,
+        (_, "ListPolicies") => iam.list_policies(&params).await?,
+        (_, "GetPolicyVersion") => iam.get_policy_version(&params).await?,
+        (_, "CreatePolicyVersion") => iam.create_policy_version(&params).await?,
+        (_, "ListPolicyVersions") => iam.list_policy_versions(&params).await?,
+        (_, "DeletePolicyVersion") => iam.delete_policy_version(&params).await?,
+        (_, "SetDefaultPolicyVersion") => iam.set_default_policy_version(&params).await?,
+        (_, "ListEntitiesForPolicy") => iam.list_entities_for_policy(&params).await?,
         (_, other) => {
             return Err(error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                format!("Cairn's IAM has users, access keys, inline policies and AdministratorAccess; not {other}"),
+                format!("Cairn's IAM has users, access keys, inline and managed policies; not {other}"),
             ));
         }
     };
@@ -421,7 +440,7 @@ impl Iam<'_> {
         if count("SELECT count(*) FROM role_policies WHERE role_id = $1").await? > 0 {
             return Err(conflict("delete policies"));
         }
-        if user.admin {
+        if user.admin || count("SELECT count(*) FROM role_attached_policies WHERE role_id = $1").await? > 0 {
             return Err(conflict("detach all policies"));
         }
         roles::delete(self.client, self.account(), &user.name).await?;
@@ -577,36 +596,303 @@ impl Iam<'_> {
         Ok(None)
     }
 
-    /// AttachUserPolicy (`attach`) and DetachUserPolicy, of
-    /// `AdministratorAccess`, the one managed policy there is.
+    /// AttachUserPolicy (`attach`) and DetachUserPolicy, of a managed
+    /// policy: Cairn's, or the account's own.
     async fn attach_user_policy(&mut self, params: &Params, attach: bool) -> Result<Option<String>> {
         params.required("UserName")?;
         let arn = params.required("PolicyArn")?.to_owned();
         let action = if attach { "iam:AttachUserPolicy" } else { "iam:DetachUserPolicy" };
         let user = self.user(params, action).await?;
-        if arn != ADMINISTRATOR_ACCESS {
-            return Err(error(
-                StatusCode::NOT_FOUND,
-                "NoSuchEntity",
-                format!("Policy {arn} does not exist or is not attachable."),
-            ));
-        }
-        if !attach && !user.admin {
-            return Err(error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} was not found.")));
-        }
-        roles::update(self.client, self.account(), &user.name, Some(attach), None).await?;
+        managed::attach(self.client, self.account(), &user.name, &arn, attach).await?;
         Ok(None)
     }
 
     async fn list_attached_user_policies(&mut self, params: &Params) -> Result<Option<String>> {
         params.required("UserName")?;
         let user = self.user(params, "iam:ListAttachedUserPolicies").await?;
-        let members = match user.admin {
-            true => format!("<member><PolicyName>AdministratorAccess</PolicyName><PolicyArn>{ADMINISTRATOR_ACCESS}</PolicyArn></member>"),
-            false => String::new(),
-        };
+        let members: String = managed::attached(self.client, self.account(), &user.name)
+            .await?
+            .iter()
+            .map(|p| {
+                format!(
+                    "<member><PolicyName>{}</PolicyName><PolicyArn>{}</PolicyArn></member>",
+                    xml_escape(&p.name),
+                    xml_escape(&p.arn)
+                )
+            })
+            .collect();
         Ok(Some(format!("<AttachedPolicies>{members}</AttachedPolicies><IsTruncated>false</IsTruncated>")))
     }
+
+    /// The policy a request names (`PolicyArn`), allowed `action` on it.
+    async fn policy(&mut self, params: &Params, action: &'static str) -> Result<Policy> {
+        let arn = params.required("PolicyArn")?.to_owned();
+        let named = managed::named(&arn, self.account()).map_err(|_| {
+            error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} does not exist or is not attachable."))
+        })?;
+        let on = match &named {
+            Named::Aws(p) => On::Policy("aws".to_owned(), p.name.to_owned()),
+            Named::Own(name) => On::Policy(self.account().to_owned(), name.clone()),
+        };
+        self.check(action, on).await?;
+        self.load_policy(named).await
+    }
+
+    async fn load_policy(&self, named: Named) -> Result<Policy> {
+        let account = self.account().to_owned();
+        let users = |arn: String| async move {
+            let attached = managed::attached_all(self.client, &account).await?;
+            let ids: Vec<uuid::Uuid> = attached.into_iter().filter(|(_, ps)| ps.iter().any(|p| p.arn == arn)).map(|(id, _)| id).collect();
+            Result::Ok(ids)
+        };
+        Ok(match named {
+            Named::Aws(p) => {
+                let arn = managed::aws_arn(p.name);
+                Policy {
+                    users: users(arn.clone()).await?,
+                    arn,
+                    id: managed::policy_id(None, p.name),
+                    name: p.name.to_owned(),
+                    description: p.description.to_owned(),
+                    document: p.document.to_owned(),
+                    version: 1,
+                    // As AWS's own were made.
+                    created: "2015-02-06T18:39:46Z".to_owned(),
+                    updated: "2015-02-06T18:39:46Z".to_owned(),
+                    aws: true,
+                }
+            }
+            Named::Own(name) => {
+                let row = self
+                    .client
+                    .query_opt_cached(
+                        "SELECT id, name, description, document, version,
+                                to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
+                         FROM managed_policies WHERE account_id = $1 AND name = $2",
+                        &[&self.account(), &name],
+                    )
+                    .await?
+                    .ok_or_else(|| {
+                        let arn = managed::arn(self.account(), &name);
+                        error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} was not found."))
+                    })?;
+                let arn = managed::arn(self.account(), &name);
+                Policy {
+                    users: users(arn.clone()).await?,
+                    arn,
+                    id: managed::policy_id(Some(row.get(0)), &name),
+                    name: row.get(1),
+                    description: row.get(2),
+                    document: row.get(3),
+                    version: row.get(4),
+                    created: row.get(5),
+                    updated: row.get(6),
+                    aws: false,
+                }
+            }
+        })
+    }
+
+    fn policy_xml(policy: &Policy) -> String {
+        let description = match policy.description.is_empty() {
+            true => String::new(),
+            false => format!("<Description>{}</Description>", xml_escape(&policy.description)),
+        };
+        format!(
+            "<PolicyName>{}</PolicyName><DefaultVersionId>v{}</DefaultVersionId><PolicyId>{}</PolicyId><Path>/</Path>\
+             <Arn>{}</Arn><AttachmentCount>{}</AttachmentCount><PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\
+             <IsAttachable>true</IsAttachable>{description}<CreateDate>{}</CreateDate><UpdateDate>{}</UpdateDate>",
+            xml_escape(&policy.name),
+            policy.version,
+            policy.id,
+            xml_escape(&policy.arn),
+            policy.users.len(),
+            policy.created,
+            policy.updated
+        )
+    }
+
+    async fn create_policy(&mut self, params: &Params) -> Result<Option<String>> {
+        let name = params.required("PolicyName")?.to_owned();
+        let document = params.required("PolicyDocument")?;
+        if params.get("Path").is_some_and(|p| p != "/") {
+            return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn's policies have no paths but /"));
+        }
+        if params.has_list("Tags.") {
+            return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn's policies have no tags"));
+        }
+        self.check("iam:CreatePolicy", On::Policy(self.account().to_owned(), name.clone())).await?;
+        managed::create(self.client, self.account(), &name, document, params.get("Description").unwrap_or("")).await?;
+        let policy = self.load_policy(Named::Own(name)).await?;
+        Ok(Some(format!("<Policy>{}</Policy>", Self::policy_xml(&policy))))
+    }
+
+    async fn get_policy(&mut self, params: &Params) -> Result<Option<String>> {
+        let policy = self.policy(params, "iam:GetPolicy").await?;
+        Ok(Some(format!("<Policy>{}</Policy>", Self::policy_xml(&policy))))
+    }
+
+    /// Refuses changing one of Cairn's (AWS's) policies.
+    fn own(policy: &Policy) -> Result<()> {
+        match policy.aws {
+            true => Err(invalid(format!("Policy {} is AWS's (Cairn's own copy): it can't be changed.", policy.arn))),
+            false => Ok(()),
+        }
+    }
+
+    async fn delete_policy(&mut self, params: &Params) -> Result<Option<String>> {
+        let policy = self.policy(params, "iam:DeletePolicy").await?;
+        Self::own(&policy)?;
+        managed::delete(self.client, self.account(), &policy.name).await?;
+        Ok(None)
+    }
+
+    async fn list_policies(&mut self, params: &Params) -> Result<Option<String>> {
+        self.check("iam:ListPolicies", On::Account).await?;
+        let scope = params.get("Scope").unwrap_or("All");
+        if !["All", "AWS", "Local"].contains(&scope) {
+            return Err(validation("Scope is All, AWS or Local"));
+        }
+        let only_attached = params.get("OnlyAttached") == Some("true");
+        // There are no paths: every policy's is `/`.
+        let none = params.get("PathPrefix").is_some_and(|p| p != "/" && !p.is_empty());
+        let mut policies = Vec::new();
+        if scope != "Local" {
+            for p in managed::AWS_POLICIES {
+                policies.push(self.load_policy(Named::Aws(p)).await?);
+            }
+        }
+        if scope != "AWS" {
+            for p in managed::list(self.client, self.account()).await? {
+                policies.push(self.load_policy(Named::Own(p.name)).await?);
+            }
+        }
+        policies.retain(|p| !none && (!only_attached || !p.users.is_empty()));
+        // Paged by ARN.
+        policies.sort_by(|a, b| a.arn.cmp(&b.arn));
+        if let Some(after) = params.get("Marker") {
+            policies.retain(|p| p.arn.as_str() > after);
+        }
+        let max = max_items(params)?;
+        let truncated = policies.len() > max;
+        policies.truncate(max);
+        let members: String = policies.iter().map(|p| format!("<member>{}</member>", Self::policy_xml(p))).collect();
+        let marker = match (truncated, policies.last()) {
+            (true, Some(last)) => format!("<Marker>{}</Marker>", xml_escape(&last.arn)),
+            _ => String::new(),
+        };
+        Ok(Some(format!("<Policies>{members}</Policies><IsTruncated>{truncated}</IsTruncated>{marker}")))
+    }
+
+    /// The version a request names (`VersionId`): the policy's default, the
+    /// only one Cairn keeps.
+    fn version_of(params: &Params, policy: &Policy) -> Result<()> {
+        let id = params.required("VersionId")?;
+        if id != format!("v{}", policy.version) {
+            return Err(error(
+                StatusCode::NOT_FOUND,
+                "NoSuchEntity",
+                format!("Policy {} version {id} does not exist or is not attachable.", policy.arn),
+            ));
+        }
+        Ok(())
+    }
+
+    fn version_xml(policy: &Policy, document: bool) -> String {
+        let document = match document {
+            // URL-encoded, as IAM gives policy documents (RFC 3986).
+            true => format!("<Document>{}</Document>", xml_escape(&utf8_percent_encode(&policy.document, &RFC3986).to_string())),
+            false => String::new(),
+        };
+        format!(
+            "{document}<VersionId>v{}</VersionId><IsDefaultVersion>true</IsDefaultVersion><CreateDate>{}</CreateDate>",
+            policy.version, policy.updated
+        )
+    }
+
+    async fn get_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
+        let policy = self.policy(params, "iam:GetPolicyVersion").await?;
+        Self::version_of(params, &policy)?;
+        Ok(Some(format!("<PolicyVersion>{}</PolicyVersion>", Self::version_xml(&policy, true))))
+    }
+
+    async fn list_policy_versions(&mut self, params: &Params) -> Result<Option<String>> {
+        let policy = self.policy(params, "iam:ListPolicyVersions").await?;
+        Ok(Some(format!(
+            "<Versions><member>{}</member></Versions><IsTruncated>false</IsTruncated>",
+            Self::version_xml(&policy, false)
+        )))
+    }
+
+    /// A new version, which replaces the one Cairn keeps: so it must be the
+    /// default (`SetAsDefault`).
+    async fn create_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
+        let policy = self.policy(params, "iam:CreatePolicyVersion").await?;
+        Self::own(&policy)?;
+        let document = params.required("PolicyDocument")?;
+        if params.get("SetAsDefault") != Some("true") {
+            return Err(error(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                "Cairn keeps one version of a policy, the default: set the new one as the default (SetAsDefault)",
+            ));
+        }
+        managed::update(self.client, self.account(), &policy.name, document).await?;
+        let policy = self.load_policy(Named::Own(policy.name)).await?;
+        Ok(Some(format!("<PolicyVersion>{}</PolicyVersion>", Self::version_xml(&policy, false))))
+    }
+
+    async fn delete_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
+        let policy = self.policy(params, "iam:DeletePolicyVersion").await?;
+        Self::own(&policy)?;
+        Self::version_of(params, &policy)?;
+        Err(error(StatusCode::CONFLICT, "DeleteConflict", "Cannot delete the default version of a policy."))
+    }
+
+    async fn set_default_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
+        let policy = self.policy(params, "iam:SetDefaultPolicyVersion").await?;
+        Self::own(&policy)?;
+        // It's the default already.
+        Self::version_of(params, &policy)?;
+        Ok(None)
+    }
+
+    async fn list_entities_for_policy(&mut self, params: &Params) -> Result<Option<String>> {
+        let policy = self.policy(params, "iam:ListEntitiesForPolicy").await?;
+        let users = match params.get("EntityFilter") {
+            None | Some("User") => policy.users.clone(),
+            Some(_) => Vec::new(),
+        };
+        let mut members = String::new();
+        for id in users {
+            let name: String = self.client.query_one_cached("SELECT name FROM roles WHERE id = $1", &[&id]).await?.get(0);
+            members.push_str(&format!(
+                "<member><UserName>{}</UserName><UserId>{}</UserId></member>",
+                xml_escape(&name),
+                user_id(id)
+            ));
+        }
+        Ok(Some(format!(
+            "<PolicyGroups/><PolicyUsers>{members}</PolicyUsers><PolicyRoles/><IsTruncated>false</IsTruncated>"
+        )))
+    }
+}
+
+/// A managed policy, as IAM shows it.
+struct Policy {
+    arn: String,
+    id: String,
+    name: String,
+    description: String,
+    document: String,
+    version: i32,
+    created: String,
+    updated: String,
+    /// The users it's attached to (their IDs).
+    users: Vec<uuid::Uuid>,
+    /// Whether it's one of Cairn's (AWS's).
+    aws: bool,
 }
 
 /// `MaxItems`: 1 to 1000, 100 if not given, as IAM's.

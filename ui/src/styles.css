@@ -381,3 +381,9 @@ label.file-button { position: relative; overflow: hidden; cursor: pointer; }
 label.file-button input[type="file"] { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
 form.stacked { max-width: 560px; }
 .provider-buttons { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
+
+/* Policies: the template above a document, and a dialog's own fields. */
+.form-row.template { margin: 10px 0 4px; }
+.form-row.template input[type=text] { flex: 0 1 220px; }
+dialog form > input[type=text] { display: block; width: 100%; box-sizing: border-box; margin: 6px 0; }
+dialog select { max-width: 100%; }

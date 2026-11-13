@@ -42,6 +42,7 @@ mod gc;
 mod grants;
 mod iam;
 mod kms;
+mod managed;
 mod lifecycle;
 mod listen;
 mod metrics;
@@ -314,10 +315,14 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     }
     let kms = kms::Kms::new(&args.kms)?;
     let pool = db::connect(&args.database).await?;
-    // Grants from before they were bucket policies (see `grants`).
+    // Grants from before they were managed policies (see `grants`).
     let moved = grants::convert(&pool.get().await?).await?;
     if moved > 0 {
         eprintln!("moved {moved} grants into their buckets' policies");
+    }
+    let moved = grants::to_managed(&pool.get().await?).await?;
+    if moved > 0 {
+        eprintln!("moved {moved} grants from buckets' policies into managed policies");
     }
     let store = Store::new(args.data_dir)?;
     // The URL peers use to reach us: explicit if given, otherwise derived from

@@ -16,6 +16,7 @@ import Integrity from "./pages/Integrity";
 import Jobs from "./pages/Jobs";
 import Lifecycle from "./pages/Lifecycle";
 import Overview from "./pages/Overview";
+import Policies from "./pages/Policies";
 import Storage from "./pages/Storage";
 import SignIn from "./pages/SignIn";
 import Users from "./pages/Users";
@@ -106,6 +107,7 @@ function Layout(props: RouteSectionProps) {
 const TENANT_NAV: [string, string][] = [
   ["/buckets", "Buckets"],
   ["/users", "Users"],
+  ["/policies", "Policies"],
 ];
 
 /** What the operator account's sees: the cluster, the accounts, and the
@@ -619,6 +621,7 @@ render(
       <Route path="/accounts" component={Guarded(Accounts)} />
       <Route path="/sign-in" component={Guarded(SignIn)} />
       <Route path="/users" component={Guarded(Users)} />
+      <Route path="/policies" component={Guarded(Policies)} />
       <Route path="/account" component={Home} />
       <Route path="/buckets" component={Guarded(BucketList)} />
       <Route path="/buckets/:bucket" component={Guarded(BucketBrowser)} />

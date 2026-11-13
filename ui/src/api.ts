@@ -28,7 +28,8 @@ export type Account = Schemas["AccountSummary"];
 export type OidcProvider = Schemas["OidcProvider"];
 export type CorsConfiguration = Schemas["Configuration"];
 export type AccessKey = Schemas["AccessKey"];
-export type Permission = Schemas["Permission"];
+export type ManagedPolicy = Schemas["PolicySummary"];
+export type UserAccess = Schemas["UserAccess"];
 export type Lifecycle = Schemas["Lifecycle"];
 export type LifecycleBucket = Schemas["LifecycleBucket"];
 export type LifecycleConfiguration = Schemas["LifecycleConfiguration"];
@@ -110,8 +111,15 @@ export const api = {
     ok(client.POST("/roles/{role}/secret", { params: rolePath(role), body: {} })),
   setAdmin: (role: string, admin: boolean) =>
     ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
-  grant: (role: string, bucket: string, permissions: Permission[]) =>
-    ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
+  policies: () => ok(client.GET("/policies")),
+  createPolicy: (name: string, document: string, description: string) =>
+    ok(client.POST("/policies", { body: { name, document, description } })),
+  updatePolicy: (name: string, change: { document?: string; description?: string }) =>
+    ok(client.PUT("/policies/{name}", { params: { path: { name } }, body: change })),
+  deleteManagedPolicy: (name: string) => ok(client.DELETE("/policies/{name}", { params: { path: { name } } })),
+  attach: (role: string, arn: string) => ok(client.POST("/roles/{role}/attached", { params: rolePath(role), body: { arn } })),
+  detach: (role: string, arn: string) =>
+    ok(client.DELETE("/roles/{role}/attached", { params: { path: { role }, query: { arn } } })),
   oidcConfig: () => ok(client.GET("/oidc-providers")),
   setOidcProvider: (
     name: string,
@@ -188,8 +196,6 @@ export const api = {
   deleteBucketCors: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/cors", { params: bucketPath(bucket) })),
   setVersioning: (bucket: string, status: "Enabled" | "Suspended") =>
     ok(client.PUT("/buckets/{bucket}/versioning", { params: bucketPath(bucket), body: { status } })),
-  revoke: (role: string, bucket: string, permission: Permission) =>
-    ok(client.DELETE("/roles/{role}/grants", { params: { path: { role }, query: { bucket, permission } } })),
 };
 
 /** Files larger than this are uploaded in parts. */

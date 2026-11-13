@@ -209,6 +209,7 @@ const MIGRATIONS: &[&str] = &[
     OBJECT_LOCK,
     SSE_C_SEALED,
     OPERATOR_MEMBERS,
+    MANAGED_POLICIES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1630,6 +1631,60 @@ CREATE TRIGGER access_keys_operator BEFORE INSERT OR UPDATE OF role_id ON access
     FOR EACH ROW EXECUTE FUNCTION cairn_operator_members();
 CREATE TRIGGER role_policies_operator BEFORE INSERT OR UPDATE OF role_id ON role_policies
     FOR EACH ROW EXECUTE FUNCTION cairn_operator_members();
+"#;
+
+/// Migration 40: managed policies, as IAM's (see `managed`): an account's
+/// own, by name, and their attachments to its users, which are of the
+/// account's own policies (`policy_id`) or of Cairn's, which have AWS's
+/// names (`aws_policy`: `AmazonS3ReadOnlyAccess`, say). AdministratorAccess
+/// stays the users' admin flag, which older nodes read. A policy that's
+/// attached can't be deleted (IAM's DeleteConflict). The operator account's
+/// users get none (see migration 39).
+const MANAGED_POLICIES: &str = r#"
+CREATE TABLE managed_policies (
+    id          uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id  text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    name        text NOT NULL CHECK (name ~ '^[A-Za-z0-9+=,.@_-]{1,128}$'),
+    description text NOT NULL DEFAULT '',
+    document    text NOT NULL,
+    version     integer NOT NULL DEFAULT 1,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (account_id, name)
+);
+
+CREATE TABLE role_attached_policies (
+    role_id    uuid NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+    policy_id  uuid REFERENCES managed_policies (id),
+    aws_policy text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK ((policy_id IS NULL) <> (aws_policy IS NULL))
+);
+CREATE UNIQUE INDEX role_attached_policies_own ON role_attached_policies (role_id, policy_id)
+    WHERE policy_id IS NOT NULL;
+CREATE UNIQUE INDEX role_attached_policies_aws ON role_attached_policies (role_id, aws_policy)
+    WHERE aws_policy IS NOT NULL;
+CREATE INDEX role_attached_policies_policy ON role_attached_policies (policy_id);
+
+-- A user's attached policies are its own account's.
+CREATE FUNCTION cairn_attached_policy_account() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.policy_id IS NOT NULL AND (SELECT account_id FROM managed_policies WHERE id = NEW.policy_id)
+        IS DISTINCT FROM (SELECT account_id FROM roles WHERE id = NEW.role_id) THEN
+        RAISE EXCEPTION 'a user''s managed policies are its own account''s' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER role_attached_policies_account BEFORE INSERT OR UPDATE ON role_attached_policies
+    FOR EACH ROW EXECUTE FUNCTION cairn_attached_policy_account();
+CREATE TRIGGER role_attached_policies_operator BEFORE INSERT OR UPDATE OF role_id ON role_attached_policies
+    FOR EACH ROW EXECUTE FUNCTION cairn_operator_members();
+
+CREATE TRIGGER managed_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON managed_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER role_attached_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON role_attached_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

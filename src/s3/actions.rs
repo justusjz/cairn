@@ -36,6 +36,8 @@ pub enum On {
     User(String, String),
     /// An account's users (by its ID), for `iam:ListUsers`.
     Users(String),
+    /// A managed policy of an account (by its ID), for IAM's actions on it.
+    Policy(String, String),
     /// The cluster, for the operator's actions (`cairn:`): the operator
     /// account's.
     Cluster,
@@ -50,6 +52,7 @@ impl On {
             On::Object(bucket, key) => format!("arn:aws:s3:::{bucket}/{key}"),
             On::User(account, name) => format!("arn:aws:iam::{account}:user/{name}"),
             On::Users(account) => format!("arn:aws:iam::{account}:user/*"),
+            On::Policy(account, name) => format!("arn:aws:iam::{account}:policy/{name}"),
             On::Cluster => "arn:cairn:::cluster".to_owned(),
         }
     }

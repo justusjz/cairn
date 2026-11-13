@@ -664,9 +664,7 @@ mod e2e {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(err["error"].as_str().unwrap().ends_with("with an explicit deny in a resource-based policy"), "{err}");
         assert_eq!(admin.send("DELETE", &format!("/api/buckets/{bucket}/policy"), None).await.0, StatusCode::NO_CONTENT);
-        // The grants were statements of that policy: the writer has none now.
-        assert_eq!(writer.send("DELETE", &delete, None).await.0, StatusCode::FORBIDDEN);
-        roles::grant(&client, &crate::roles::account(&client).await.unwrap(), "writer", bucket, &[roles::Permission::Write]).await.unwrap();
+        // The grant is the writer's own (managed) policy: it stays.
         assert_eq!(writer.send("DELETE", &delete, None).await.0, StatusCode::NO_CONTENT);
 
         // Versioning, as the admin may set it.

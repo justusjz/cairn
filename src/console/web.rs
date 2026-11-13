@@ -97,8 +97,15 @@ pub(crate) struct ErrorBody {
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
         let e = e.into();
-        match e.downcast::<crate::roles::Invalid>() {
-            Ok(invalid) => ApiError::BadRequest(invalid.0),
+        let e = match e.downcast::<crate::roles::Invalid>() {
+            Ok(invalid) => return ApiError::BadRequest(invalid.0),
+            Err(e) => e,
+        };
+        use crate::managed::Refused;
+        match e.downcast::<Refused>() {
+            Ok(Refused::NoSuch(m)) => ApiError::NotFound(m),
+            Ok(Refused::Exists(m) | Refused::Conflict(m) | Refused::Limit(m)) => ApiError::Conflict(m),
+            Ok(Refused::Malformed(m) | Refused::Invalid(m)) => ApiError::BadRequest(m),
             Err(e) => ApiError::Failed(e),
         }
     }

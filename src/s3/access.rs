@@ -241,6 +241,8 @@ impl Access {
         // the principal's, whoever has its name (that's BucketAlreadyExists).
         let owner = match &check.on {
             On::User(account, _) | On::Users(account) => Some(account.as_str()),
+            // Cairn's (AWS's) policies are no account's: as the principal's own.
+            On::Policy(account, _) if account != "aws" => Some(account.as_str()),
             // The operator account's (an unknown one, if it wasn't loaded:
             // no one's).
             On::Cluster => Some(self.operator.as_deref().unwrap_or("")),
@@ -313,6 +315,21 @@ impl Access {
             format!("User: arn:aws:iam::{account}:user/{name} is not authorized to perform: {}{on} {why}", check.action);
         format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", &message)
     }
+}
+
+/// Which of `buckets` (names; its own account's) `principal`'s identity
+/// policies allow it to list (`s3:ListBucket`), as ListBuckets shows them to
+/// a user not allowed `s3:ListAllMyBuckets`: alongside those whose own
+/// policies name it (`grants::visible`). Conditions on the request (its
+/// address, say) are decided as for a request that has none.
+pub fn listable(principal: &Principal, buckets: &[&str]) -> anyhow::Result<std::collections::HashSet<String>> {
+    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+    let access = Access::new(Some(principal), &principal.account, &Method::GET, &HeaderMap::new(), "", &origin)?;
+    Ok(buckets
+        .iter()
+        .filter(|b| access.allows(&Check { action: "s3:ListBucket", on: On::Bucket((**b).to_owned()) }))
+        .map(|b| (*b).to_owned())
+        .collect())
 }
 
 /// The address a request comes from, as `aws:SourceIp` has it (see

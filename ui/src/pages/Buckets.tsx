@@ -149,7 +149,7 @@ export function BucketList() {
                 { label: "Size", num: true },
                 { label: "Older versions", num: true },
                 { label: "Uploads", num: true },
-                { label: "Users", num: true },
+                { label: "Users with access", num: true },
                 "Tags",
                 "Created",
                 "",
@@ -329,7 +329,7 @@ export function BucketBrowser() {
         <A class="button" href={`/buckets/${enc(bucket())}/lifecycle`}>
           Lifecycle rules
         </A>
-        <button onClick={() => setAccess(true)}>Policy and public access</button>
+        <button onClick={() => setAccess(true)}>Access and policy</button>
         <button onClick={() => setEditing("tags")}>Tags{bucketTags().length ? ` (${bucketTags().length})` : ""}</button>
         <button onClick={() => setEditing("cors")}>CORS</button>
         <Show when={versioning()}>
@@ -510,11 +510,29 @@ function AccessDialog(props: { bucket: string; onClose: () => void }) {
   return (
     <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
       <h2>
-        Policy and public access of <span class="mono">{props.bucket}</span>
+        Access to <span class="mono">{props.bucket}</span>
       </h2>
       <Show when={access()} fallback={<Loading error={error()} />}>
         {(a) => (
           <>
+            <h3>Users with access</h3>
+            <p class="subtle small">
+              The account's users whose own policies (attached and inline; see Users and Policies) allow them something
+              on the whole bucket. Access only to a prefix, or under conditions, isn't shown; the bucket policy below
+              may allow more, and its Deny statements win over all of it.
+            </p>
+            <Table count={a().users.length} empty="No one, by their own policies." columns={["User", "May"]}>
+              <For each={a().users}>
+                {(u) => (
+                  <tr>
+                    <td class="mono">{u.user}</td>
+                    <td>
+                      <For each={u.levels}>{(l) => <span class="chip">{l}</span>}</For>
+                    </td>
+                  </tr>
+                )}
+              </For>
+            </Table>
             <h3>Public access block</h3>
             <p class="subtle small">
               <Show when={a().public_access_block} fallback="The bucket has no block of its own: only the cluster's applies.">

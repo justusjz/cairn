@@ -76,7 +76,9 @@ pub struct Principal {
     pub secret: String,
     /// Whether it has `AdministratorAccess` (see `s3::actions::admin_policy`).
     pub admin: bool,
-    /// The user's inline identity policies, as they were set.
+    /// The user's inline identity policies, as they were set, and then the
+    /// documents of its attached managed policies (but AdministratorAccess,
+    /// which is `admin`).
     pub policies: Vec<String>,
     /// Grants, for tests of what they allowed before they were bucket
     /// policies (`s3::authorize`); grants are statements of buckets'
@@ -115,18 +117,29 @@ impl Principal {
         let row = client
             .query_opt_cached(
                 &format!("SELECT {secret}, r.admin, r.id, r.name, r.account_id,
-                        ARRAY(SELECT document FROM role_policies WHERE role_id = r.id ORDER BY name)
+                        ARRAY(SELECT document FROM role_policies WHERE role_id = r.id ORDER BY name),
+                        ARRAY(SELECT m.document FROM role_attached_policies x
+                              JOIN managed_policies m ON m.id = x.policy_id WHERE x.role_id = r.id ORDER BY m.name),
+                        ARRAY(SELECT x.aws_policy FROM role_attached_policies x
+                              WHERE x.role_id = r.id AND x.aws_policy IS NOT NULL ORDER BY x.aws_policy)
                  {from}"),
                 &[param],
             )
             .await?;
         Ok(row.map(|r| Principal {
+            policies: {
+                let mut policies: Vec<String> = r.get(5);
+                policies.extend(r.get::<_, Vec<String>>(6));
+                // Cairn's, by their names (none that isn't one of them).
+                let aws: Vec<String> = r.get(7);
+                policies.extend(aws.iter().filter_map(|name| crate::managed::aws(name)).map(|p| p.document.to_owned()));
+                policies
+            },
             secret: r.get(0),
             admin: r.get(1),
             id: r.get(2),
             name: r.get(3),
             account: r.get(4),
-            policies: r.get(5),
             #[cfg(test)]
             read: HashSet::new(),
             #[cfg(test)]
@@ -235,15 +248,16 @@ enum RoleCommand {
     /// Manage a user's inline identity policies (IAM's policy language).
     #[command(subcommand)]
     Policy(PolicyCommand),
-    /// Grant permissions on an existing bucket. Grants are removed when their
-    /// bucket is deleted.
+    /// Grant permissions on an existing bucket of the account: attaches the
+    /// account's managed policy `<bucket>-<permission>`, made if needed.
     Grant {
         name: String,
         bucket: String,
         #[arg(required = true, value_enum)]
         permissions: Vec<Permission>,
     },
-    /// Revoke permissions on a bucket; all of them if none are listed.
+    /// Revoke permissions on a bucket (detaches their managed policies);
+    /// all of them if none are listed.
     Revoke {
         name: String,
         bucket: String,
@@ -374,8 +388,8 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
                     let state = if key.active { "" } else { " (inactive)" };
                     outln!(out, "  key {}{state}", key.id);
                 }
-                for (bucket, permission) in role.grants {
-                    outln!(out, "  {bucket}:{}", permission.as_str());
+                for policy in crate::managed::attached(&client, account_id, &role.name).await? {
+                    outln!(out, "  attached {}", policy.arn);
                 }
                 for policy in role.policies {
                     outln!(out, "  policy {policy}");
@@ -853,8 +867,6 @@ pub async fn update(
 /// Deletes a role and all its grants.
 pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Result<()> {
     let role = id_of(client, account, name).await?;
-    // Its grants first: they're statements of buckets' policies.
-    crate::grants::forget_user(client, account, name).await?;
     let deleted: bool = client
         .query_one_cached("SELECT pg_temp.cairn_delete_role($1)", &[&role])
         .await?
@@ -918,8 +930,6 @@ pub struct RoleInfo {
     pub id: uuid::Uuid,
     /// Its identity (entity) in the KMS, once Cairn has logged in as it.
     pub kms_entity_id: Option<String>,
-    /// (bucket, permission), sorted.
-    pub grants: Vec<(String, Permission)>,
     /// Its access keys, oldest first.
     pub keys: Vec<KeyInfo>,
     /// The names of its inline policies, sorted.
@@ -945,18 +955,10 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
             &[],
         )
         .await?;
-    let grants = crate::grants::list(client).await?;
     rows.iter()
         .map(|r| {
-            let name: String = r.get(0);
-            let account_id: String = r.get(11);
             Ok(RoleInfo {
-                grants: grants
-                    .iter()
-                    .filter(|(_, (account, user), _)| *account == account_id && *user == name)
-                    .map(|(bucket, _, permission)| (bucket.clone(), *permission))
-                    .collect(),
-                name,
+                name: r.get(0),
                 admin: r.get(1),
                 created_at: r.get(2),
                 id: r.get(5),
@@ -985,8 +987,7 @@ pub async fn grant(
     permissions: &[Permission],
 ) -> anyhow::Result<()> {
     id_of(client, account, name).await?;
-    let changes: Vec<_> = permissions.iter().map(|p| (name, *p, true)).collect();
-    crate::grants::change(client, account, bucket, &changes).await
+    crate::grants::change(client, account, name, bucket, permissions, true).await
 }
 
 /// Revokes `name`'s (of `account`) permissions on a bucket; all of them if
@@ -1001,6 +1002,5 @@ pub async fn revoke(
     id_of(client, account, name).await?;
     let all = [Permission::Read, Permission::Write, Permission::DeleteVersion];
     let permissions = if permissions.is_empty() { &all[..] } else { permissions };
-    let changes: Vec<_> = permissions.iter().map(|p| (name, *p, false)).collect();
-    crate::grants::change(client, account, bucket, &changes).await
+    crate::grants::change(client, account, name, bucket, permissions, false).await
 }
