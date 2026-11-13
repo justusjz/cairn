@@ -194,15 +194,27 @@ impl Condition {
     }
 
     /// Whether the condition limits a statement to fixed values of `key`:
-    /// a positive operator (not over a set), values without wildcards.
+    /// a positive operator (not over a set), values without wildcards. As
+    /// Block Public Access takes them (probed): an `aws:SourceIp` block
+    /// must be no wider than a /8 (IPv4) or a /32 (IPv6); an `aws:userid`
+    /// not anonymous requests' (`anonymous`), but a role's sessions'
+    /// (`StringLike` `<role ID>:*`) are fixed.
     pub fn fixes(&self, key: &str) -> bool {
+        let fixed = |v: &str| !v.contains(['*', '?']);
         self.key.eq_ignore_ascii_case(key)
             && !self.negated
             && !self.if_exists
             && self.set.is_none()
             && self.op != Op::Null
             && !self.values.is_empty()
-            && self.values.iter().all(|v| !v.contains(['*', '?']))
+            && self.values.iter().all(|v| match key.to_ascii_lowercase().as_str() {
+                "aws:sourceip" => cidr(v).is_some_and(|(address, bits)| bits >= if address.is_ipv4() { 8 } else { 32 }),
+                "aws:userid" => {
+                    let sessions = v.strip_suffix(":*").filter(|_| self.op == Op::StringLike);
+                    !v.eq_ignore_ascii_case("anonymous") && fixed(sessions.unwrap_or(v))
+                }
+                _ => fixed(v),
+            })
     }
 }
 

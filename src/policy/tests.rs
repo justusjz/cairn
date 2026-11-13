@@ -71,6 +71,43 @@ fn a_public_read_policy_allows_anyone_to_read_objects() {
     assert_eq!(check(&aws, Principal::Anonymous, "s3:GetObject", &object("a"), &none), Decision::Allow);
 }
 
+/// Which conditions keep an Allow for everyone from being public, as Block
+/// Public Access sees them (probed: plans/probes/public_policy_probe.py).
+#[test]
+fn public_means_what_block_public_access_says() {
+    let public = |condition: &str| {
+        bucket_policy(&format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:GetObject",
+                "Resource":"arn:aws:s3:::examplebucket/*","Condition":{condition}}}]}}"#
+        ))
+        .is_public()
+    };
+    let ip = |cidrs: &str| format!(r#"{{"IpAddress":{{"aws:SourceIp":{cidrs}}}}}"#);
+    for (cidrs, expected) in [
+        (r#""192.0.2.1/32""#, false),
+        (r#""192.0.2.1""#, false),
+        (r#""0.0.0.0/0""#, true),
+        (r#""0.0.0.0/1""#, true),
+        (r#""10.0.0.0/7""#, true),
+        (r#""10.0.0.0/8""#, false),
+        (r#""10.0.0.0/16""#, false),
+        (r#"["10.0.0.0/8","0.0.0.0/0"]"#, true),
+        (r#""::/0""#, true),
+        (r#""2001:db8::/31""#, true),
+        (r#""2001:db8::/32""#, false),
+        (r#""2001:db8::/48""#, false),
+    ] {
+        assert_eq!(public(&ip(cidrs)), expected, "{cidrs}");
+    }
+    assert!(public(r#"{"NotIpAddress":{"aws:SourceIp":"192.0.2.1/32"}}"#));
+    assert!(public(r#"{"StringEquals":{"aws:userid":"anonymous"}}"#));
+    assert!(public(r#"{"StringEquals":{"aws:userid":["AIDAEXAMPLEEXAMPLE","anonymous"]}}"#));
+    assert!(!public(r#"{"StringEquals":{"aws:userid":"AIDAEXAMPLEEXAMPLE"}}"#));
+    assert!(!public(r#"{"StringLike":{"aws:userid":"AROAEXAMPLEEXAMPLE:*"}}"#));
+    assert!(public(r#"{"StringLike":{"aws:userid":"AROA*"}}"#));
+    assert!(!public(r#"{"StringEquals":{"aws:PrincipalAccount":"123456789012"}}"#));
+}
+
 #[test]
 fn a_deny_wins() {
     let identity = identity_policy(
