@@ -197,7 +197,9 @@ impl Access {
         for bucket in checks.iter().filter_map(|c| c.on.bucket()) {
             self.load(app, bucket).await?;
         }
-        if self.operator.is_none() && checks.iter().any(|c| c.on == On::Cluster) {
+        // Which account is the operator's, to tell its users (superadmins)
+        // from tenants'. (Read once per process; see `operator_account`.)
+        if self.operator.is_none() {
             self.operator = Some(crate::roles::operator_account(&app.pool.get().await?).await?);
         }
         Ok(())
@@ -206,6 +208,22 @@ impl Access {
     /// The verdict on `check`, whose bucket's policy is loaded (else the
     /// bucket is taken to have none).
     pub fn verdict(&self, check: &Check) -> Verdict {
+        // The cluster, and the operator account's own users, are its
+        // members' (superadmins'), by being its members: no policy grants
+        // or denies them. And nothing else is: the operator account owns no
+        // buckets, and its users take no part in tenants' IAM.
+        let operator = self.operator.as_deref().filter(|operator| self.account() == Some(*operator));
+        match (&check.on, operator) {
+            (On::Cluster, Some(_)) => return Verdict::Allow,
+            (On::Cluster, None) => return Verdict::ImplicitDeny,
+            (On::User(account, _) | On::Users(account), Some(operator))
+                if account == operator && check.action.starts_with("iam:") =>
+            {
+                return Verdict::Allow;
+            }
+            (_, Some(_)) => return Verdict::ImplicitDeny,
+            (_, None) => {}
+        }
         let resource = check.on.arn();
         let principal = match (&self.user, &self.root) {
             (Some((account, name, id)), _) => Who::User { account, name, id },
@@ -223,6 +241,8 @@ impl Access {
         // the principal's, whoever has its name (that's BucketAlreadyExists).
         let owner = match &check.on {
             On::User(account, _) | On::Users(account) => Some(account.as_str()),
+            // Cairn's (AWS's) policies are no account's: as the principal's own.
+            On::Policy(account, _) if account != "aws" => Some(account.as_str()),
             // The operator account's (an unknown one, if it wasn't loaded:
             // no one's).
             On::Cluster => Some(self.operator.as_deref().unwrap_or("")),
@@ -295,6 +315,21 @@ impl Access {
             format!("User: arn:aws:iam::{account}:user/{name} is not authorized to perform: {}{on} {why}", check.action);
         format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", &message)
     }
+}
+
+/// Which of `buckets` (names; its own account's) `principal`'s identity
+/// policies allow it to list (`s3:ListBucket`), as ListBuckets shows them to
+/// a user not allowed `s3:ListAllMyBuckets`: alongside those whose own
+/// policies name it (`grants::visible`). Conditions on the request (its
+/// address, say) are decided as for a request that has none.
+pub fn listable(principal: &Principal, buckets: &[&str]) -> anyhow::Result<std::collections::HashSet<String>> {
+    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+    let access = Access::new(Some(principal), &principal.account, &Method::GET, &HeaderMap::new(), "", &origin)?;
+    Ok(buckets
+        .iter()
+        .filter(|b| access.allows(&Check { action: "s3:ListBucket", on: On::Bucket((**b).to_owned()) }))
+        .map(|b| (*b).to_owned())
+        .collect())
 }
 
 /// The address a request comes from, as `aws:SourceIp` has it (see

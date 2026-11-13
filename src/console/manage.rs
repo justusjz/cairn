@@ -38,7 +38,7 @@ use crate::db::Cached;
 use crate::{
     App,
     peer::PeerClient,
-    roles::{self, Permission},
+    roles,
     s3::{
         buckets::{create, list as bucket_list},
         conditional::Preconditions,
@@ -105,7 +105,9 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(delete_role))
         .routes(routes!(rotate_secret))
         .routes(routes!(set_admin))
-        .routes(routes!(grant, revoke))
+        .routes(routes!(list_policies, create_policy))
+        .routes(routes!(update_policy, delete_policy_managed))
+        .routes(routes!(attach_policy, detach_policy))
         .routes(routes!(create_enrollment))
         .routes(routes!(create_key))
         .routes(routes!(set_key, delete_key))
@@ -806,7 +808,8 @@ pub(super) struct BucketSummary {
     versions: i64,
     version_bytes: i64,
     uploads: i64,
-    /// Roles with a grant on the bucket.
+    /// The account's users whose policies give them access to the whole
+    /// bucket (see `who_has_access`).
     roles: i64,
     /// Its tags (PutBucketTagging), sorted by key.
     tags: Vec<Tag>,
@@ -841,7 +844,17 @@ async fn list_buckets(State(app): AppState, Extension(actor): Extension<Actor>) 
     let buckets = buckets(&app).await?;
     let owners: Vec<(&str, &str)> = buckets.iter().map(|b| (b.name.as_str(), b.account.as_str())).collect();
     let listed = actor.listed(&app, &owners).await?;
-    Ok(Json(buckets.into_iter().zip(listed).filter(|(_, l)| *l).map(|(b, _)| b).collect()))
+    let mut listed: Vec<BucketSummary> = buckets.into_iter().zip(listed).filter(|(_, l)| *l).map(|(b, _)| b).collect();
+    // How many of the account's users have access to its buckets, by their
+    // policies, if the actor may see its users.
+    if actor.allows(&app, "iam:ListUsers", On::Users(actor.account().to_owned())).await? {
+        let own: Vec<String> = listed.iter().filter(|b| b.account == actor.account()).map(|b| b.name.clone()).collect();
+        let counts = who_has_access(&app.pool.get().await?, actor.account(), &own).await?;
+        for bucket in &mut listed {
+            bucket.roles = counts.get(&bucket.name).map_or(0, |users| users.len() as i64);
+        }
+    }
+    Ok(Json(listed))
 }
 
 /// Every bucket (as ListBuckets lists them), with what's in it.
@@ -882,14 +895,6 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
-    // Users with a grant on it (see `grants`).
-    let mut roles: HashMap<String, i64> = HashMap::new();
-    let mut granted: Vec<(String, (String, String))> =
-        crate::grants::list(&client).await?.into_iter().map(|(bucket, user, _)| (bucket, user)).collect();
-    granted.dedup();
-    for (bucket, _) in granted {
-        *roles.entry(bucket).or_default() += 1;
-    }
     let mut tags: HashMap<String, String> = client
         .query_cached("SELECT name, tags FROM buckets WHERE tags IS NOT NULL", &[])
         .await?
@@ -920,7 +925,8 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
                 objects.remove(&b.name).unwrap_or_default();
             BucketSummary {
                 uploads: uploads.get(&b.name).copied().unwrap_or(0),
-                roles: roles.get(&b.name).copied().unwrap_or(0),
+                // Filled in as the actor lists them.
+                roles: 0,
                 default_kms_key: defaults.remove(&b.name),
                 tags: tags.remove(&b.name).as_deref().map(tag_list).unwrap_or_default(),
                 public: access.get(&b.name).is_some_and(|(public, _)| *public),
@@ -1010,6 +1016,63 @@ struct BucketAccess {
     /// The cluster's (only its policy flags count), which applies to every
     /// bucket as well.
     cluster: crate::s3::buckets::public_access::Block,
+    /// The bucket's account's users whose own policies (inline and
+    /// attached) give them access to the whole bucket, and what.
+    users: Vec<UserAccess>,
+}
+
+/// What a user's policies allow it on a whole bucket.
+#[derive(Serialize, ToSchema)]
+struct UserAccess {
+    user: String,
+    /// Of `list`, `read`, `write`, `delete-versions` and `manage` (its
+    /// configuration and policy).
+    levels: Vec<&'static str>,
+}
+
+/// What each level means: an action on the bucket (or on any object in it).
+const LEVELS: &[(&str, &str, bool)] = &[
+    ("list", "s3:ListBucket", false),
+    ("read", "s3:GetObject", true),
+    ("write", "s3:PutObject", true),
+    ("delete-versions", "s3:DeleteObjectVersion", true),
+    ("manage", "s3:PutBucketPolicy", false),
+];
+
+/// The users of `account` whose own policies (inline and attached: not
+/// the bucket's) allow them something on the whole of each of `buckets`,
+/// and what (see `LEVELS`), by bucket. A policy that allows only some keys
+/// (a prefix), or only under conditions on the request, doesn't count.
+async fn who_has_access(
+    client: &deadpool_postgres::Object,
+    account: &str,
+    buckets: &[String],
+) -> anyhow::Result<HashMap<String, Vec<(String, Vec<&'static str>)>>> {
+    use crate::s3::access::{Access, Origin};
+    let mut found: HashMap<String, Vec<(String, Vec<&'static str>)>> = HashMap::new();
+    let users = client.query_cached("SELECT id, name FROM roles WHERE account_id = $1 ORDER BY name", &[&account]).await?;
+    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+    for row in users {
+        let Some(principal) = roles::Principal::load_user(client, row.get(0)).await? else { continue };
+        let access = Access::new(Some(&principal), account, &axum::http::Method::GET, &Default::default(), "", &origin)?;
+        for bucket in buckets {
+            let levels: Vec<&'static str> = LEVELS
+                .iter()
+                .filter(|(_, action, object)| {
+                    let on = match object {
+                        true => On::Object(bucket.clone(), "*".to_owned()),
+                        false => On::Bucket(bucket.clone()),
+                    };
+                    access.allows(&Check { action, on })
+                })
+                .map(|(level, _, _)| *level)
+                .collect();
+            if !levels.is_empty() {
+                found.entry(bucket.clone()).or_default().push((row.get(1), levels));
+            }
+        }
+    }
+    Ok(found)
 }
 
 #[utoipa::path(get, path = "/buckets/{bucket}/access", params(("bucket" = String, Path)), responses(
@@ -1044,7 +1107,19 @@ async fn get_bucket_access(
         None => false,
     };
     let public_access_block = public_access::get(&app, &bucket).await?.ok_or_else(no_bucket)?;
-    Ok(Json(BucketAccess { policy, public, public_access_block, cluster: public_access::cluster(&client).await? }))
+    // Its account's users, if the actor may see them.
+    let owner: String = client.query_one_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await?.get(0);
+    let users = match owner == actor.account() && actor.allows(&app, "iam:ListUsers", On::Users(owner.clone())).await? {
+        true => who_has_access(&client, &owner, std::slice::from_ref(&bucket))
+            .await?
+            .remove(&bucket)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(user, levels)| UserAccess { user, levels })
+            .collect(),
+        false => Vec::new(),
+    };
+    Ok(Json(BucketAccess { policy, public, public_access_block, cluster: public_access::cluster(&client).await?, users }))
 }
 
 /// Sets a bucket's policy, as PutBucketPolicy does: checked as S3 checks
@@ -2268,11 +2343,28 @@ pub(super) struct RoleSummary {
     kms_entity_id: Option<String>,
     admin: bool,
     created_at: f64,
-    grants: Vec<Grant>,
+    /// Its attached managed policies (AdministratorAccess, if it's an admin).
+    attached: Vec<AttachedPolicy>,
     /// Its access keys, oldest first (never their secrets).
     keys: Vec<AccessKey>,
     /// The names of its inline policies.
     policies: Vec<String>,
+    /// How it signs in to the console, if it does (a person's); `None`:
+    /// it doesn't, and no link for it is out (a service's).
+    console: Option<ConsoleAccess>,
+}
+
+/// How a user signs in to the console (see `store::ConsoleAccess`).
+#[derive(Serialize, ToSchema)]
+struct ConsoleAccess {
+    /// Whether it enrolled (a login is linked to it).
+    enrolled: bool,
+    passkeys: i64,
+    /// The OIDC providers (their labels) it signs in at.
+    providers: Vec<String>,
+    last_sign_in: Option<f64>,
+    /// Whether an enrollment link for it is out, and works still.
+    link_pending: bool,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -2283,9 +2375,9 @@ struct AccessKey {
 }
 
 #[derive(Serialize, ToSchema)]
-struct Grant {
-    bucket: String,
-    permission: Permission,
+struct AttachedPolicy {
+    name: String,
+    arn: String,
 }
 
 #[utoipa::path(get, path = "/roles", responses(
@@ -2295,20 +2387,31 @@ struct Grant {
 async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<RoleSummary>>> {
     // The session's account's users, as ListUsers lists them.
     actor.check(&app, "iam:ListUsers", On::Users(actor.account().to_owned())).await?;
-    let roles = roles::list(&app.pool.get().await?)
+    let client = app.pool.get().await?;
+    let mut console = super::store::console_access(&client, actor.account()).await?;
+    let mut attached = crate::managed::attached_all(&client, actor.account()).await?;
+    let roles = roles::list(&client)
         .await?
         .into_iter()
         .filter(|r| r.account_id == actor.account())
         .map(|r| RoleSummary {
+            console: console.remove(&r.id).map(|c| ConsoleAccess {
+                enrolled: c.enrolled,
+                passkeys: c.passkeys,
+                providers: c.providers,
+                last_sign_in: c.last_sign_in,
+                link_pending: c.link_pending,
+            }),
             name: r.name,
             id: r.id.to_string(),
             kms_entity_id: r.kms_entity_id,
             admin: r.admin,
             created_at: r.created_at,
-            grants: r
-                .grants
+            attached: attached
+                .remove(&r.id)
+                .unwrap_or_default()
                 .into_iter()
-                .map(|(bucket, permission)| Grant { bucket, permission })
+                .map(|a| AttachedPolicy { name: a.name, arn: a.arn })
                 .collect(),
             keys: r
                 .keys
@@ -2324,10 +2427,23 @@ async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) ->
 #[derive(Deserialize, ToSchema)]
 struct NewRole {
     name: String,
-    /// At least 8 characters; one is generated if not given.
+    /// Whether it gets an access key (a service's), named as it; a person
+    /// gets none, and signs in to the console through its link.
+    #[serde(default)]
+    access_key: bool,
+    /// The access key's secret: at least 8 characters; one is generated if
+    /// not given. Implies `access_key`.
     secret: Option<String>,
     #[serde(default)]
     admin: bool,
+}
+
+/// A new user: its access key's ID and secret, if it got one, which is
+/// shown only this once.
+#[derive(Serialize, ToSchema)]
+struct NewUser {
+    name: String,
+    access_key: Option<Secret>,
 }
 
 /// A role's secret, which is shown only this once.
@@ -2338,7 +2454,7 @@ struct Secret {
 }
 
 #[utoipa::path(post, path = "/roles", request_body = NewRole, responses(
-    (status = 201, body = Secret),
+    (status = 201, body = NewUser),
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
@@ -2346,15 +2462,34 @@ async fn create_role(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Json(body): Json<NewRole>,
-) -> Result<(StatusCode, Json<Secret>)> {
+) -> Result<(StatusCode, Json<NewUser>)> {
     let client = app.pool.get().await?;
     let account = actor.account().to_owned();
     actor.check(&app, "iam:CreateUser", On::User(account.clone(), body.name.clone())).await?;
+    let secret = body.secret.filter(|s| !s.is_empty());
+    let access_key = body.access_key || secret.is_some();
+    if roles::is_operator(&client, &account).await? && (access_key || body.admin) {
+        roles::refuse_operator(&client, &account, "access keys or admin flag").await?;
+    }
     if body.admin {
         actor.check(&app, "iam:AttachUserPolicy", On::User(account.clone(), body.name.clone())).await?;
     }
-    let secret = body.secret.filter(|s| !s.is_empty());
-    let (key, secret) = roles::create_for(&client, &account, &body.name, secret, body.admin).await?;
+    if access_key {
+        actor.check(&app, "iam:CreateAccessKey", On::User(account.clone(), body.name.clone())).await?;
+    }
+    let access_key = match access_key {
+        true => {
+            let (key, secret) = roles::create_for(&client, &account, &body.name, secret, body.admin).await?;
+            Some(Secret { name: key, secret })
+        }
+        false => {
+            roles::create_without_key(&client, &account, &body.name).await?;
+            if body.admin {
+                roles::update(&client, &account, &body.name, Some(true), None).await?;
+            }
+            None
+        }
+    };
     // Its identity in the KMS, so that key owners can grant it keys now; if
     // the KMS can't be reached, the next maintenance pass makes it. In the
     // background: a slow KMS mustn't hold up the role.
@@ -2364,11 +2499,8 @@ async fn create_role(
             eprintln!("kms: identifying roles: {e:#}");
         }
     });
-    Ok((
-        StatusCode::CREATED,
-        // The key's ID (the user's name, if that was free).
-        Json(Secret { name: key, secret }),
-    ))
+    // The key's ID is the user's name, if that was free.
+    Ok((StatusCode::CREATED, Json(NewUser { name: body.name, access_key })))
 }
 
 #[utoipa::path(delete, path = "/roles/{role}", params(("role" = String, Path)), responses(
@@ -2452,66 +2584,180 @@ async fn set_admin(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize, ToSchema)]
-struct NewGrant {
-    bucket: String,
-    permissions: Vec<Permission>,
+// ─── Managed policies ────────────────────────────────────────────────────────
+
+/// A managed policy: one of Cairn's (AWS's names), or the account's own.
+#[derive(Serialize, ToSchema)]
+struct PolicySummary {
+    name: String,
+    arn: String,
+    /// Whether it's one of Cairn's (AWS's), which can't be changed.
+    aws: bool,
+    description: String,
+    document: String,
+    /// Its default version's number (`v1`, ...).
+    version: i32,
+    updated_at: Option<f64>,
+    /// The account's users it's attached to.
+    users: Vec<String>,
 }
 
-/// Grants permissions on an existing bucket.
-#[utoipa::path(post, path = "/roles/{role}/grants", params(("role" = String, Path)),
-    request_body = NewGrant, responses(
-        (status = 204, description = "Granted"),
-        (status = "4XX", body = ErrorBody),
-        (status = "5XX", body = ErrorBody),
-    ))]
-async fn grant(
+#[utoipa::path(get, path = "/policies", responses(
+    (status = 200, body = Vec<PolicySummary>),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<PolicySummary>>> {
+    actor.check(&app, "iam:ListPolicies", On::Account).await?;
+    let client = app.pool.get().await?;
+    let account = actor.account();
+    let attached = crate::managed::attached_all(&client, account).await?;
+    let names: HashMap<uuid::Uuid, String> = client
+        .query_cached("SELECT id, name FROM roles WHERE account_id = $1", &[&account])
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    let users_of = |arn: &str| {
+        let mut users: Vec<String> = attached
+            .iter()
+            .filter(|(_, policies)| policies.iter().any(|p| p.arn == arn))
+            .filter_map(|(id, _)| names.get(id).cloned())
+            .collect();
+        users.sort();
+        users
+    };
+    let mut policies: Vec<PolicySummary> = crate::managed::AWS_POLICIES
+        .iter()
+        .map(|p| {
+            let arn = crate::managed::aws_arn(p.name);
+            PolicySummary {
+                users: users_of(&arn),
+                name: p.name.to_owned(),
+                arn,
+                aws: true,
+                description: p.description.to_owned(),
+                document: p.document.to_owned(),
+                version: 1,
+                updated_at: None,
+            }
+        })
+        .collect();
+    for p in crate::managed::list(&client, account).await? {
+        policies.push(PolicySummary {
+            arn: crate::managed::arn(account, &p.name),
+            name: p.name,
+            aws: false,
+            description: p.description,
+            document: p.document,
+            version: p.version,
+            updated_at: Some(p.updated_at),
+            users: p.users,
+        });
+    }
+    Ok(Json(policies))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct NewPolicy {
+    name: String,
+    document: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[utoipa::path(post, path = "/policies", request_body = NewPolicy, responses(
+    (status = 201, description = "Made"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_policy(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewPolicy>) -> Result<StatusCode> {
+    let account = actor.account().to_owned();
+    actor.check(&app, "iam:CreatePolicy", On::Policy(account.clone(), body.name.clone())).await?;
+    crate::managed::create(&app.pool.get().await?, &account, &body.name, &body.document, &body.description).await?;
+    Ok(StatusCode::CREATED)
+}
+
+#[derive(Deserialize, ToSchema)]
+struct PolicyChange {
+    /// Its new document (a new default version); unchanged if not given.
+    document: Option<String>,
+    /// Its new description; unchanged if not given.
+    description: Option<String>,
+}
+
+#[utoipa::path(put, path = "/policies/{name}", params(("name" = String, Path)), request_body = PolicyChange, responses(
+    (status = 204, description = "Changed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn update_policy(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
-    Path(role): Path<String>,
-    Json(body): Json<NewGrant>,
+    Path(name): Path<String>,
+    Json(body): Json<PolicyChange>,
 ) -> Result<StatusCode> {
-    if body.permissions.is_empty() {
-        return Err(ApiError::BadRequest("pick at least one permission".into()));
+    let account = actor.account().to_owned();
+    actor.check(&app, "iam:CreatePolicyVersion", On::Policy(account.clone(), name.clone())).await?;
+    let client = app.pool.get().await?;
+    if let Some(document) = &body.document {
+        crate::managed::update(&client, &account, &name, document).await?;
     }
-    // A grant is a statement of the bucket's policy (see `grants`).
-    let account = account_of(&app, &actor, &role).await?;
-    actor.check(&app, "s3:PutBucketPolicy", On::Bucket(body.bucket.clone())).await?;
-    roles::grant(
-        &app.pool.get().await?,
-        &account,
-        &role,
-        &body.bucket,
-        &body.permissions,
-    )
-    .await?;
+    if let Some(description) = &body.description {
+        crate::managed::describe(&client, &account, &name, description).await?;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize, IntoParams)]
-#[into_params(parameter_in = Query)]
-struct RevokeParams {
-    bucket: String,
-    /// The permission to revoke; all of them on the bucket if not given.
-    permission: Option<Permission>,
+#[utoipa::path(delete, path = "/policies/{name}", params(("name" = String, Path)), responses(
+    (status = 204, description = "Deleted"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_policy_managed(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+    let account = actor.account().to_owned();
+    actor.check(&app, "iam:DeletePolicy", On::Policy(account.clone(), name.clone())).await?;
+    crate::managed::delete(&app.pool.get().await?, &account, &name).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
-#[utoipa::path(delete, path = "/roles/{role}/grants", params(("role" = String, Path), RevokeParams),
-    responses(
-        (status = 204, description = "Revoked"),
-        (status = "4XX", body = ErrorBody),
-        (status = "5XX", body = ErrorBody),
-    ))]
-async fn revoke(
+#[derive(Deserialize, ToSchema, IntoParams)]
+#[into_params(parameter_in = Query)]
+struct PolicyArn {
+    arn: String,
+}
+
+/// Attaches a managed policy to a user.
+#[utoipa::path(post, path = "/roles/{role}/attached", params(("role" = String, Path)), request_body = PolicyArn, responses(
+    (status = 204, description = "Attached"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn attach_policy(
     State(app): AppState,
     Extension(actor): Extension<Actor>,
     Path(role): Path<String>,
-    Query(params): Query<RevokeParams>,
+    Json(body): Json<PolicyArn>,
 ) -> Result<StatusCode> {
-    let account = account_of(&app, &actor, &role).await?;
-    actor.check(&app, "s3:PutBucketPolicy", On::Bucket(params.bucket.clone())).await?;
-    let permissions: Vec<Permission> = params.permission.into_iter().collect();
-    roles::revoke(&app.pool.get().await?, &account, &role, &params.bucket, &permissions).await?;
+    let account = check_user(&app, &actor, "iam:AttachUserPolicy", &role).await?;
+    crate::managed::attach(&app.pool.get().await?, &account, &role, &body.arn, true).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Detaches a managed policy from a user.
+#[utoipa::path(delete, path = "/roles/{role}/attached", params(("role" = String, Path), PolicyArn), responses(
+    (status = 204, description = "Detached"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn detach_policy(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(role): Path<String>,
+    Query(params): Query<PolicyArn>,
+) -> Result<StatusCode> {
+    let account = check_user(&app, &actor, "iam:DetachUserPolicy", &role).await?;
+    crate::managed::attach(&app.pool.get().await?, &account, &role, &params.arn, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3038,23 +3284,59 @@ mod e2e {
         let uri = format!("/api/buckets/{BUCKET}/download?key=nope");
         assert_eq!(admin.send("GET", &uri, None).await.0, StatusCode::NOT_FOUND);
 
-        let (status, secret) = admin.send("POST", "/api/roles", Some(json!({ "name": "ui-role", "admin": false }))).await;
+        let new = json!({ "name": "ui-role", "admin": false, "access_key": true });
+        let (status, created) = admin.send("POST", "/api/roles", Some(new)).await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(secret["secret"].as_str().unwrap().len(), 40);
-        let grant = json!({ "bucket": BUCKET, "permissions": ["read", "delete-version"] });
-        let uri = "/api/roles/ui-role/grants";
-        assert_eq!(admin.send("POST", uri, Some(grant)).await.0, StatusCode::NO_CONTENT);
-        let bad = json!({ "bucket": BUCKET, "permissions": ["admin"] });
-        assert!(admin.send("POST", uri, Some(bad)).await.0.is_client_error());
+        assert_eq!(created["access_key"]["name"], "ui-role");
+        assert_eq!(created["access_key"]["secret"].as_str().unwrap().len(), 40);
+        // A person: no key, and a console link, which lists them as one.
+        let (status, created) = admin.send("POST", "/api/roles", Some(json!({ "name": "ui-person" }))).await;
+        assert_eq!((status, &created["access_key"]), (StatusCode::CREATED, &Value::Null));
+        let person = |roles: Value| roles.as_array().unwrap().iter().find(|r| r["name"] == "ui-person").unwrap().clone();
+        let listed = person(admin.send("GET", "/api/roles", None).await.1);
+        assert_eq!((&listed["keys"], &listed["console"]), (&json!([]), &Value::Null));
+        assert_eq!(admin.send("POST", "/api/roles/ui-person/enrollment", None).await.0, StatusCode::CREATED);
+        let listed = person(admin.send("GET", "/api/roles", None).await.1);
+        assert_eq!(listed["console"]["link_pending"], true);
+        assert_eq!(listed["console"]["enrolled"], false);
+        // Managed policies: Cairn's (AWS's), and the account's own.
+        let (_, policies) = admin.send("GET", "/api/policies", None).await;
+        let names: Vec<_> = policies.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["AdministratorAccess", "AmazonS3FullAccess", "AmazonS3ReadOnlyAccess"]);
+        let read = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:Get*","s3:List*"],"Resource":["arn:aws:s3:::{BUCKET}","arn:aws:s3:::{BUCKET}/*"]}}]}}"#
+        );
+        let new = json!({ "name": "bucket-read", "document": read, "description": "Reads the bucket" });
+        assert_eq!(admin.send("POST", "/api/policies", Some(new.clone())).await.0, StatusCode::CREATED);
+        assert_eq!(admin.send("POST", "/api/policies", Some(new)).await.0, StatusCode::CONFLICT);
+        let bad = json!({ "name": "bad", "document": r#"{"Statement":[{"Effect":"Allow","Action":"s3:Nope","Resource":"*"}]}"# });
+        assert_eq!(admin.send("POST", "/api/policies", Some(bad)).await.0, StatusCode::BAD_REQUEST);
+        let account = roles::account(&app.pool.get().await.unwrap()).await.unwrap();
+        let arn = format!("arn:aws:iam::{account}:policy/bucket-read");
+        let attach = |arn: &str| Some(json!({ "arn": arn }));
+        assert_eq!(admin.send("POST", "/api/roles/ui-role/attached", attach(&arn)).await.0, StatusCode::NO_CONTENT);
+        let s3_read = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess";
+        assert_eq!(admin.send("POST", "/api/roles/ui-role/attached", attach(s3_read)).await.0, StatusCode::NO_CONTENT);
+        let nope = "arn:aws:iam::aws:policy/AmazonEC2FullAccess";
+        assert_eq!(admin.send("POST", "/api/roles/ui-role/attached", attach(nope)).await.0, StatusCode::NOT_FOUND);
         let ui_role = |roles: Value| roles.as_array().unwrap().iter().find(|r| r["name"] == "ui-role").unwrap().clone();
         let role = ui_role(admin.send("GET", "/api/roles", None).await.1);
         assert_eq!(
-            role["grants"],
-            json!([
-                { "bucket": BUCKET, "permission": "delete-version" },
-                { "bucket": BUCKET, "permission": "read" },
-            ])
+            role["attached"],
+            json!([{ "name": "AmazonS3ReadOnlyAccess", "arn": s3_read }, { "name": "bucket-read", "arn": arn }])
         );
+        // Who has access to the bucket, by their policies.
+        let (_, access) = admin.send("GET", &format!("/api/buckets/{BUCKET}/access"), None).await;
+        let ui = access["users"].as_array().unwrap().iter().find(|u| u["user"] == "ui-role").unwrap().clone();
+        assert_eq!(ui["levels"], json!(["list", "read"]));
+        // Attached, it can't be deleted; changed, it's a new version.
+        assert_eq!(admin.send("DELETE", "/api/policies/bucket-read", None).await.0, StatusCode::CONFLICT);
+        let (status, _) = admin.send("PUT", "/api/policies/bucket-read", Some(json!({ "description": "Reads it" }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let detach = format!("/api/roles/ui-role/attached?arn={}", utf8_percent_encode(&arn, NON_ALPHANUMERIC));
+        assert_eq!(admin.send("DELETE", &detach, None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("DELETE", &detach, None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(admin.send("DELETE", "/api/policies/bucket-read", None).await.0, StatusCode::NO_CONTENT);
         // A link to enroll a passkey for the console (this node serves none).
         let (status, enrollment) = admin.send("POST", "/api/roles/ui-role/enrollment", None).await;
         assert_eq!(status, StatusCode::CREATED);

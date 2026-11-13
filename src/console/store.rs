@@ -116,6 +116,57 @@ pub async fn create_enrollment(client: &Object, account: &str, user: &str) -> an
     Ok(token)
 }
 
+/// How a user of an account signs in to the console, if it does: a person,
+/// as opposed to a service, which only has access keys.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ConsoleAccess {
+    /// Whether a login is linked to it (it enrolled).
+    pub enrolled: bool,
+    /// How many passkeys its login has.
+    pub passkeys: i64,
+    /// The OIDC providers (their labels) its login signs in at.
+    pub providers: Vec<String>,
+    /// When its login last signed in (by a passkey or a provider).
+    pub last_sign_in: Option<f64>,
+    /// Whether an enrollment link for it is out, and works still.
+    pub link_pending: bool,
+}
+
+/// How each user of `account` (its ID) signs in to the console, by the
+/// user's ID; users with neither a login nor a link out aren't in it.
+pub async fn console_access(client: &Object, account: &str) -> anyhow::Result<std::collections::HashMap<Uuid, ConsoleAccess>> {
+    let rows = client
+        .query_cached(
+            "SELECT r.id, li.login_id IS NOT NULL,
+                    (SELECT count(*) FROM passkeys p WHERE p.login_id = li.login_id),
+                    ARRAY(SELECT op.label FROM login_oidc o JOIN oidc_providers op ON op.name = o.provider
+                          WHERE o.login_id = li.login_id ORDER BY op.label),
+                    extract(epoch FROM greatest(
+                        (SELECT max(p.last_used_at) FROM passkeys p WHERE p.login_id = li.login_id),
+                        (SELECT max(o.last_used_at) FROM login_oidc o WHERE o.login_id = li.login_id)))::float8,
+                    EXISTS (SELECT 1 FROM console_enrollments e WHERE e.role_id = r.id AND e.expires_at > now())
+             FROM roles r LEFT JOIN login_identities li ON li.role_id = r.id
+             WHERE r.account_id = $1
+               AND (li.login_id IS NOT NULL
+                    OR EXISTS (SELECT 1 FROM console_enrollments e WHERE e.role_id = r.id AND e.expires_at > now()))",
+            &[&account],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let access = ConsoleAccess {
+                enrolled: row.get(1),
+                passkeys: row.get(2),
+                providers: row.get(3),
+                last_sign_in: row.get(4),
+                link_pending: row.get(5),
+            };
+            (row.get(0), access)
+        })
+        .collect())
+}
+
 /// Makes an enrollment link's token for the root of the account named
 /// `account`, which replaces any it had: a new account's first, or its
 /// recovery, if its passkeys are lost.

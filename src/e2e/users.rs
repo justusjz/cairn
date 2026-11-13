@@ -199,11 +199,16 @@ async fn bucket_policies_name_users_as_they_were() {
     client.execute("UPDATE buckets SET policy = NULL WHERE name = $1", &[&BUCKET]).await.unwrap();
 }
 
-/// Grants from before they were bucket policies (rows of `role_grants`)
-/// move into their buckets' policies, once, and allow what they did; the
-/// policy's other statements stay.
+/// The names of the managed policies attached to `user` of `account`.
+async fn attached(client: &deadpool_postgres::Object, account: &str, user: &str) -> Vec<String> {
+    crate::managed::attached(client, account, user).await.unwrap().into_iter().map(|a| a.name).collect()
+}
+
+/// Grants from before they were managed policies (rows of `role_grants`,
+/// then statements of buckets' policies) move into managed policies, once,
+/// and allow what they did; the bucket policy's other statements stay.
 #[tokio::test]
-async fn old_grants_move_into_bucket_policies() {
+async fn old_grants_move_into_managed_policies() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
     roles::create(&client, "olga", None, false).await.unwrap();
@@ -223,30 +228,39 @@ async fn old_grants_move_into_bucket_policies() {
     assert_eq!(crate::grants::convert(&client).await.unwrap(), 0);
     let left: i64 = client.query_one("SELECT count(*) FROM role_grants", &[]).await.unwrap().get(0);
     assert_eq!(left, 0);
-    let grants = crate::grants::list(&client).await.unwrap();
-    assert_eq!(
-        grants,
-        [
-            (BUCKET.to_owned(), (account.clone(), "olga".to_owned()), roles::Permission::Read),
-            (BUCKET.to_owned(), (account.clone(), "olga".to_owned()), roles::Permission::Write)
-        ]
-    );
+    // In the bucket's policy, as 0.6 kept them; then into managed policies.
+    let policy: String =
+        client.query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
+    assert!(policy.contains(&format!("arn:aws:iam::{account}:user/olga")), "{policy}");
+    // One the account has already, of another document, keeps its name.
+    let other = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
+    crate::managed::create(&client, &account, &format!("{BUCKET}-write"), other, "").await.unwrap();
+    assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 2);
+    assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 0);
+    assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read"), format!("{BUCKET}-write-grant")]);
     let policy: String =
         client.query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
     assert!(policy.contains(r#""Sid":"Mine""#), "{policy}");
-    assert!(policy.contains(&format!("arn:aws:iam::{account}:user/olga")), "{policy}");
-    // Listed to the user, as its grants' buckets are.
-    let principal = Principal::load(&client, "olga").await.unwrap().unwrap();
-    assert!(crate::grants::visible(&client, principal.id).await.unwrap().contains(BUCKET));
-
-    // Revoked, and gone with the user.
-    roles::revoke(&client, &crate::roles::account(&client).await.unwrap(), "olga", BUCKET, &[roles::Permission::Write]).await.unwrap();
-    assert_eq!(crate::grants::list(&client).await.unwrap().len(), 1);
-    roles::delete(&client, &crate::roles::account(&client).await.unwrap(), "olga").await.unwrap();
-    assert!(crate::grants::list(&client).await.unwrap().is_empty());
-    let policy: String =
-        client.query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
     assert!(!policy.contains("CairnGrant"), "{policy}");
+    // What they allow.
+    let principal = Principal::load(&client, "olga").await.unwrap().unwrap();
+    let origin = crate::s3::access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+    let access = crate::s3::access::Access::new(Some(&principal), &account, &hyper::Method::GET, &Default::default(), "", &origin).unwrap();
+    let on = || crate::s3::actions::On::Object(BUCKET.to_owned(), "a".to_owned());
+    for (action, allowed) in [("s3:GetObject", true), ("s3:PutObject", true), ("s3:DeleteObjectVersion", false)] {
+        assert_eq!(access.allows(&crate::s3::actions::Check { action, on: on() }), allowed, "{action}");
+    }
+    // Listed to the user, as buckets its policies let it list are.
+    assert!(crate::s3::access::listable(&principal, &[BUCKET]).unwrap().contains(BUCKET));
+
+    // Revoked (detached), and gone with the user.
+    roles::revoke(&client, &account, "olga", BUCKET, &[roles::Permission::Write]).await.unwrap();
+    assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read")]);
+    roles::grant(&client, &account, "olga", BUCKET, &[roles::Permission::Write]).await.unwrap();
+    assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read"), format!("{BUCKET}-write-grant")]);
+    roles::delete(&client, &account, "olga").await.unwrap();
+    let left: i64 = client.query_one("SELECT count(*) FROM role_attached_policies", &[]).await.unwrap().get(0);
+    assert_eq!(left, 0);
 }
 
 /// There's an operator account besides the first tenant account; it owns
@@ -266,9 +280,27 @@ async fn the_operator_account_owns_no_buckets() {
         .await
         .unwrap_err();
     assert!(refused.to_string().contains("owns no buckets") || format!("{refused:?}").contains("owns no buckets"), "{refused:?}");
-    roles::create_in(&client, Some("operator"), "superadmin", None, false).await.unwrap();
-    let principal = Principal::load(&client, "superadmin").await.unwrap().unwrap();
-    assert_ne!(principal.account, roles::account(&client).await.unwrap());
+    // Its users are superadmins by being its users: no access keys, admin
+    // flag or policies, and so nothing that signs requests.
+    let operator = roles::operator_account(&client).await.unwrap();
+    roles::create_without_key(&client, &operator, "superadmin").await.unwrap();
+    let refused = |e: anyhow::Error| assert!(e.to_string().contains("superadmins"), "{e}");
+    refused(roles::create_key(&client, &operator, "superadmin", Some("superadmin".into()), None).await.unwrap_err());
+    refused(roles::create_for(&client, &operator, "another", None, false).await.unwrap_err());
+    refused(roles::update(&client, &operator, "superadmin", Some(false), None).await.unwrap_err());
+    let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
+    refused(roles::put_policy(&client, &operator, "superadmin", "all", policy).await.unwrap_err());
+    // Nor straight into the database (as an older node would).
+    let id = roles::id_of(&client, &operator, "superadmin").await.unwrap();
+    let err = client
+        .execute("INSERT INTO access_keys (access_key_id, role_id, secret) VALUES ('sneaky', $1, 'secret123')", &[&id])
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("superadmins"), "{err:?}");
+    // It's marked admin, for older nodes, which decide by that.
+    let admin: bool = client.query_one("SELECT admin FROM roles WHERE id = $1", &[&id]).await.unwrap().get(0);
+    assert!(admin);
+    assert!(Principal::load(&client, "superadmin").await.unwrap().is_none());
 }
 
 /// User names are unique in their account, as in IAM: two accounts each
@@ -292,12 +324,12 @@ async fn accounts_have_users_of_the_same_name() {
     // A grant is the bucket's account's ada's.
     roles::grant(&client, &default, "ada", BUCKET, &[roles::Permission::Read]).await.unwrap();
     assert!(roles::grant(&client, &acme, "ada", BUCKET, &[roles::Permission::Read]).await.is_err());
-    let grants = crate::grants::list(&client).await.unwrap();
-    assert_eq!(grants, [(BUCKET.to_owned(), (default.clone(), "ada".to_owned()), roles::Permission::Read)]);
+    assert_eq!(attached(&client, &default, "ada").await, [format!("{BUCKET}-read")]);
+    assert!(attached(&client, &acme, "ada").await.is_empty());
     let ours = Principal::load(&client, &first).await.unwrap().unwrap();
     let theirs = Principal::load(&client, &second).await.unwrap().unwrap();
-    assert!(crate::grants::visible(&client, ours.id).await.unwrap().contains(BUCKET));
-    assert!(crate::grants::visible(&client, theirs.id).await.unwrap().is_empty());
+    assert!(crate::s3::access::listable(&ours, &[BUCKET]).unwrap().contains(BUCKET));
+    assert!(crate::s3::access::listable(&theirs, &[BUCKET]).unwrap().is_empty());
 
     // A bucket policy naming acme's ada binds acme's.
     let policy = format!(

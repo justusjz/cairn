@@ -664,9 +664,7 @@ mod e2e {
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(err["error"].as_str().unwrap().ends_with("with an explicit deny in a resource-based policy"), "{err}");
         assert_eq!(admin.send("DELETE", &format!("/api/buckets/{bucket}/policy"), None).await.0, StatusCode::NO_CONTENT);
-        // The grants were statements of that policy: the writer has none now.
-        assert_eq!(writer.send("DELETE", &delete, None).await.0, StatusCode::FORBIDDEN);
-        roles::grant(&client, &crate::roles::account(&client).await.unwrap(), "writer", bucket, &[roles::Permission::Write]).await.unwrap();
+        // The grant is the writer's own (managed) policy: it stays.
         assert_eq!(writer.send("DELETE", &delete, None).await.0, StatusCode::NO_CONTENT);
 
         // Versioning, as the admin may set it.
@@ -876,8 +874,21 @@ mod e2e {
         let (_, users) = ops.send("GET", "/api/roles", None).await;
         let names: Vec<_> = users.as_array().unwrap().iter().map(|u| u["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["super"]);
-        let new = json!({ "name": "super-2", "admin": true });
-        assert_eq!(ops.send("POST", "/api/roles", Some(new)).await.0, StatusCode::CREATED);
+        // ... who are superadmins by being members: no keys, flags or policies.
+        for refused in [json!({ "name": "super-x", "admin": true }), json!({ "name": "super-y", "access_key": true })] {
+            assert_eq!(ops.send("POST", "/api/roles", Some(refused)).await.0, StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(ops.send("POST", "/api/roles", Some(json!({ "name": "super-2" }))).await.0, StatusCode::CREATED);
+        assert_eq!(ops.send("POST", "/api/roles/super-2/keys", None).await.0, StatusCode::BAD_REQUEST);
+        let policy = json!({ "document": r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"# });
+        assert_eq!(ops.send("PUT", "/api/roles/super-2/policies/all", Some(policy)).await.0, StatusCode::BAD_REQUEST);
+        let (_, users) = ops.send("GET", "/api/roles", None).await;
+        assert!(users.as_array().unwrap().iter().all(|u| u["keys"] == json!([]) && u["admin"] == true), "{users}");
+        assert_eq!(users[0]["console"]["enrolled"], true);
+        // A tenant's admin, whatever its policies say, isn't one.
+        let all = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"cairn:*","Resource":"*"}]}"#;
+        roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "tenant-admin", "cairn", all).await.unwrap();
+        assert_eq!(tenant.send("GET", "/api/cluster", None).await.0, StatusCode::FORBIDDEN);
         assert_eq!(ops.send("DELETE", "/api/roles/tenant-admin", None).await.0, StatusCode::BAD_REQUEST);
 
         // No tenant's buckets, nor their objects.

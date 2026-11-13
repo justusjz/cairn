@@ -82,7 +82,9 @@ impl Actor {
             return Ok(buckets.iter().map(|(_, account)| *account == user.account).collect());
         }
         let Subject::User(principal) = &user.subject else { return Ok(vec![false; buckets.len()]) };
-        let visible = crate::grants::visible(&app.pool.get().await?, principal.id).await?;
+        let mut visible = crate::grants::visible(&app.pool.get().await?, principal.id).await?;
+        let own: Vec<&str> = buckets.iter().filter(|(_, account)| *account == user.account).map(|(name, _)| *name).collect();
+        visible.extend(crate::s3::access::listable(principal, &own)?);
         Ok(buckets.iter().map(|(name, _)| visible.contains(*name)).collect())
     }
 

@@ -2404,6 +2404,55 @@ iam_api_ok() {
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
+# Managed policies over the IAM API, as the AWS CLI calls it: an account's
+# own (made, read back, attached, a new version, deleted once detached) and
+# Cairn's (AWS's ARNs), which allow what AWS's do and can't be changed.
+iam_managed_ok() {
+    local u="iamm-$(date +%s)" b="iammb-$(date +%s)" doc="$WORK_DIR/iam-managed.json" key id secret out acct arn
+    acct=$(awss3 sts get-caller-identity --query Account --output text 2>/dev/null) || return 1
+    awss3 iam create-user --user-name "$u" >/dev/null 2>&1 || return 1
+    key=$(awss3 iam create-access-key --user-name "$u" \
+        --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>/dev/null) || return 1
+    id=$(echo "$key" | cut -f1); secret=$(echo "$key" | cut -f2)
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::'"$b"'"}]}' \
+        > "$doc"
+    arn=$(awss3 iam create-policy --policy-name "$b-list" --policy-document "file://$doc" \
+        --query Policy.Arn --output text 2>/dev/null) || return 1
+    [ "$arn" = "arn:aws:iam::$acct:policy/$b-list" ] || return 1
+    awss3 iam get-policy-version --policy-arn "$arn" --version-id v1 \
+        --query PolicyVersion.Document.Statement[0].Action --output text 2>/dev/null | grep -qx s3:ListBucket || return 1
+    ! as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    awss3 iam attach-user-policy --user-name "$u" --policy-arn "$arn" >/dev/null 2>&1 || return 1
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    awss3 iam list-entities-for-policy --policy-arn "$arn" --query 'PolicyUsers[0].UserName' --output text \
+        2>/dev/null | grep -qx "$u" || return 1
+    out=$(awss3 iam delete-policy --policy-arn "$arn" 2>&1) && return 1
+    echo "$out" | grep -q DeleteConflict || return 1
+    # A new version: the bucket's objects' keys aren't listed any more.
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/*"}]}' \
+        > "$doc"
+    awss3 iam create-policy-version --policy-arn "$arn" --policy-document "file://$doc" --set-as-default \
+        --query PolicyVersion.VersionId --output text 2>/dev/null | grep -qx v2 || return 1
+    ! as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    # Cairn's: AWS's read-only access lists every bucket of the account.
+    awss3 iam attach-user-policy --user-name "$u" \
+        --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess >/dev/null 2>&1 || return 1
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    ! as_role "$id" "$secret" s3api delete-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    out=$(awss3 iam delete-policy --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess 2>&1) && return 1
+    awss3 iam list-attached-user-policies --user-name "$u" --query 'length(AttachedPolicies)' \
+        --output text 2>/dev/null | grep -qx 2 || return 1
+    out=$(awss3 iam delete-user --user-name "$u" 2>&1) && return 1
+    awss3 iam detach-user-policy --user-name "$u" --policy-arn "$arn" >/dev/null 2>&1 || return 1
+    awss3 iam detach-user-policy --user-name "$u" \
+        --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess >/dev/null 2>&1 || return 1
+    awss3 iam delete-policy --policy-arn "$arn" >/dev/null 2>&1 || return 1
+    awss3 iam delete-access-key --user-name "$u" --access-key-id "$id" >/dev/null 2>&1 || return 1
+    awss3 iam delete-user --user-name "$u" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
 # writer holds read/write on $OBUCKET only. It can use its own bucket, but can't
 # copy out of $BUCKET (no read on the source), nor reach an upload in $BUCKET by
 # its ID through its own bucket's URL.
@@ -2582,6 +2631,7 @@ run_test    "Tags: read with read, changed with write" tagging_roles_ok
 run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
 run_test    "Admin has AdministratorAccess"          admin_scope_ok
 run_test    "IAM API: users, keys, inline policies"  iam_api_ok
+run_test    "IAM API: managed policies"              iam_managed_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok

@@ -56,7 +56,8 @@ Done:
 - **Console, accounts and IAM.** Implemented: a web UI with passkey and
   OIDC sign-in on a listener of its own, which replaced the dashboard;
   accounts as tenants, with an operator account of superadmins; IAM
-  policies, bucket policies across accounts, and the IAM API. Open:
+  policies, inline and managed (Cairn's with AWS's names, and accounts'
+  own), bucket policies across accounts, and the IAM API. Open:
   permissions boundaries, groups, and quotas per account.
 
 - **Object Lock.** Retention periods and legal holds, which keep versions

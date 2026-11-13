@@ -258,16 +258,21 @@ What a user may do is decided by policies, in IAM's policy language, as in
 S3: an explicit `Deny` in any that applies wins; else an `Allow` in any
 allows; else it's denied. They are:
 
-- **admin** (`--admin`): the built-in managed policy `AdministratorAccess`,
-  as AWS's: everything in the user's account (its buckets, their objects
-  and configuration), but what a bucket's policy denies it.
-- its **grants**, the simple way, which are statements of the bucket's
-  policy (`CairnGrantRead`, `CairnGrantWrite`, `CairnGrantDeleteVersion`,
-  each naming the users granted it), so they go with the bucket, and show
-  in GetBucketPolicy as what they are. Setting a bucket's policy over S3
-  replaces its grants too, as it replaces any statement; the console shows
-  them as grants, and leave the policy's other statements
-  alone:
+- its **managed policies**, as in IAM: documents of their own, attached to
+  any number of users. There are Cairn's, which have AWS's names and say what
+  AWS's do, so that policies and tools written for AWS work as they are:
+  - **admin** (`--admin`) is `AdministratorAccess`: everything in the
+    user's account (its buckets, their objects and configuration), but what
+    a bucket's policy denies it.
+  - `AmazonS3FullAccess` (`s3:*`, on every bucket of the account) and
+    `AmazonS3ReadOnlyAccess` (`s3:Get*`, `s3:List*`).
+
+  And the account's own (`arn:aws:iam::<account>:policy/<name>`), made with
+  the console's Policies page or the IAM API: a document of up to 6,144
+  characters (but whitespace); a user has at most 10 attached, as in IAM.
+  **Grants** are the simple way to make them: `cairn user grant` attaches
+  the account's policy `<bucket>-<permission>` (making it, the first time),
+  which allows:
   - **`read`** on a bucket: GetObject, HeadObject, GetObjectAttributes,
     HeadBucket, ListObjects, reading an object's [tags](#tags) and its
     [Object Lock](#object-lock), and being the source of a
@@ -280,6 +285,12 @@ allows; else it's denied. They are:
     default retention.
   - **`delete-version`** on a bucket: DeleteObject(s) naming a version ID,
     which removes that version for good.
+
+  (Grants used to be statements of the bucket's policy, `CairnGrantRead`
+  and the like. A Cairn moves any it finds into these managed policies as
+  it starts, attached to the same users, and takes them out of the
+  bucket's policy; the access is the same. Upgrade every node: one from
+  before doesn't know managed policies, and denies what they allow.)
 - its **inline policies**: identity policies of its own, for anything finer
   (per key prefix, by condition, ...), set with `cairn user policy`;
 - each bucket's **bucket policy**, set with PutBucketPolicy (by an admin), as
@@ -325,7 +336,7 @@ can't be found by guessing.
 
 **Block Public Access** guards against making a bucket public by accident,
 as in S3. A bucket's public access block (PutPublicAccessBlock, or the
-bucket's *Policy and public access* in the console) has S3's four flags:
+bucket's *Access and policy* in the console) has S3's four flags:
 `BlockPublicPolicy` refuses a bucket policy that makes the bucket public
 (one that allows everyone something, with no condition that limits it to
 fixed addresses, accounts or the like), and `RestrictPublicBuckets` makes a
@@ -349,16 +360,16 @@ address, or for HTTPS) take the client's address and protocol from
 `--trusted-proxy`; otherwise, the connection's own address counts, and it's
 not HTTPS (Cairn speaks only HTTP).
 
-A user sees the buckets it holds a grant on in ListBuckets (or all of them,
+A user sees in ListBuckets the buckets its policies let it list
+(`s3:ListBucket`), and those whose policies name it (or all of its account's,
 if a policy allows it `s3:ListAllMyBuckets`, as admin does). A bucket must
 exist before you can grant access to it, so the setup order is: an admin
 creates the bucket (with any S3 client), then you grant users access.
-Deleting a bucket removes its grants, so a bucket re-created under the same
-name starts with no access for anyone; inline policies name buckets by name,
-and outlive them, as in AWS.
+Policies name buckets by name, and outlive them, as in AWS: a bucket deleted
+and made again under the same name is open to whoever's policies name it.
 
 There are no ACLs: as with S3's default for new buckets ("bucket owner
-enforced"), access is a matter of grants alone. A request that asks for an ACL
+enforced"), access is a matter of policies alone. A request that asks for an ACL
 other than the owner's (`bucket-owner-full-control` for an object, `private`
 for a bucket) is refused with `AccessControlListNotSupported`, as S3 refuses
 it; one asking for the owner's is fine, and reading an ACL shows the owner with
@@ -376,14 +387,14 @@ Manage users with `cairn user [--account <name>] <command>`
 | --- | --- |
 | `create <name> [--admin] [--secret <S>] [--account <A>]` | Create a user, with an access key named as it. Prints a generated 40-char secret unless `--secret` is given (min. 8 chars). |
 | `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret of the key named as the user (`--rotate-secret` prints the new one). |
-| `delete <name>` | Delete a user, with its keys, grants and policies. |
-| `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket. |
-| `revoke <name> <bucket> [read\|write\|delete-version]...` | Revoke permissions on a bucket; all of them if none are listed. |
+| `delete <name>` | Delete a user, with its keys and policies. |
+| `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket of the account: attaches its managed policy `<bucket>-<permission>`, made the first time. |
+| `revoke <name> <bucket> [read\|write\|delete-version]...` | Revoke permissions on a bucket (detaches those policies); all of them if none are listed. |
 | `key create <name> [--id <ID>] [--secret <S>]` | Make the user another access key (at most two). Prints its ID and secret. |
 | `key activate\|deactivate\|delete <ID>` | Let a key sign requests, stop it, or delete it. |
 | `policy put <name> <policy> <file>` | Set an inline policy (JSON; `-` reads stdin). A user's policies hold at most 2048 characters together, as in IAM. |
 | `policy get\|delete <name> <policy>` | Show or delete an inline policy. |
-| `list` | List users, their ARNs, admin flags, keys, grants and policies (secrets are not shown). |
+| `list` | List users, their ARNs, admin flags, keys, attached and inline policies (secrets are not shown). |
 | `enroll <name>` | Print a one-time link (24 hours) for the user to sign in to the [console](#console): a new login with a passkey, or (opened signed in) added to the login. A new link replaces the last. It's made from the console URL of the node the command runs on; one that serves no console prints the link's path. |
 
 **The IAM API** is on the S3 endpoint too: requests signed for the `iam`
@@ -397,10 +408,14 @@ another user what its policies allow (its own keys, with a policy on
 `arn:aws:iam::*:user/${aws:username}`, say). There are users (CreateUser,
 GetUser, ListUsers, DeleteUser, which refuses while keys or policies are
 left, as IAM does), access keys (Create, List, Update, Delete), inline
-policies (Put, Get, List, Delete), and the one managed policy,
-`arn:aws:iam::aws:policy/AdministratorAccess` (Attach, Detach,
-ListAttached: the admin flag). Groups, roles, managed policies of one's own,
-paths, tags and permissions boundaries are NotImplemented. STS's
+policies (Put, Get, List, Delete), and managed policies: CreatePolicy,
+GetPolicy, ListPolicies, DeletePolicy (refused while attached),
+ListEntitiesForPolicy, and AttachUserPolicy, DetachUserPolicy and
+ListAttachedUserPolicies, of Cairn's (AWS's ARNs) or the account's own.
+Cairn keeps one version of a policy, the default (`v1`, `v2`, ...):
+CreatePolicyVersion replaces it, and must set it as the default;
+GetPolicyVersion and ListPolicyVersions show it. Groups, roles, paths, tags
+and permissions boundaries are NotImplemented. STS's
 `GetCallerIdentity` answers too (signed for `sts`), which Terraform's AWS
 provider calls as it starts. The AWS CLI refuses access key IDs shorter than
 16 characters as parameters (`--access-key-id`): the keys IAM makes are 20,
@@ -471,9 +486,15 @@ account, and a link for it to enroll its passkey with. Everyone after that
 can be made in the console.
 
 ```sh
-cairn user create ada --account operator --admin
+cairn user create ada --account operator
 cairn user enroll ada --account operator     # on a node that serves the console
 ```
+
+Everyone in the operator account is a superadmin, by being in it: its users
+have no access keys, admin flag, grants or policies (Cairn refuses them), so
+nothing signed with a key ever acts as a superadmin, and there's no IAM to
+make one with. Superadmins act in the console only, behind a fresh passkey,
+and the `cairn` command line, which takes access to a node.
 
 A **login** (a person, with passkeys) acts in each account it's in as one
 identity there, a user or the account's root, and switches between them;
@@ -483,10 +504,15 @@ signed out, it makes a new login; signed in, it adds the identity to that
 login.
 
 The console acts as its identity: it allows exactly what that identity's S3
-and IAM requests would be allowed, by the same policies (the user's grants,
-admin flag and inline policies, and the bucket's policy; an explicit Deny
+and IAM requests would be allowed, by the same policies (the user's attached
+and inline policies, and the bucket's policy; an explicit Deny
 wins), and denies with S3's messages. An account's root may do anything in
-its account, as in AWS.
+its account, as in AWS. A superadmin may do everything that's the
+operator's, and nothing in any tenant's account, whatever policies say.
+
+The menu at the top right is the person's, not the account's: who the session
+acts as, the login's other identities to switch to, its passkeys and
+sign-in providers, and signing out.
 
 ### An account's pages
 
@@ -497,27 +523,37 @@ its account, as in AWS.
   versioning, tags, CORS, [lifecycle rules](#lifecycle-rules), bucket policy
   and public access block are edited there; the list shows which buckets
   are public. An admin creates buckets, but reads and writes objects only
-  with a grant or a policy that allows it, as over S3. Downloads are always
+  with a policy that allows it, as over S3. Downloads are always
   attachments, sandboxed, so that nothing of an object is shown in the
   console's origin; SSE-KMS objects open with the keys the user may use (an
   SSE-C object, whose key Cairn doesn't have, can't be downloaded).
 - **Users:** everything `cairn user` does, as IAM's actions allow (an admin
   may do all of it; others what their policies say, as `iam:CreateAccessKey`
-  on their own user, say): create and delete users, grant and revoke
-  permissions, toggle admin, make, deactivate and delete access keys
-  (replacing the secret of the one named as the user in place), write
-  inline policies, which the server checks as IAM does, and make enrollment
-  links.
-- **Account:** the login's passkeys, its identities at OIDC providers, and
-  the accounts it's in.
+  on their own user, say): create and delete users, attach and detach
+  managed policies (AdministratorAccess makes an admin), make, deactivate
+  and delete access keys (replacing the secret of the one named as the user
+  in place), write inline policies, which the server checks as IAM does,
+  and make enrollment links. People and service users are listed apart:
+  both are IAM users, as in AWS, but a person signs in to the console (or
+  has a link out to), with how, and when they last did; a service has only
+  access keys. A new person gets a console link and no access key; a new
+  service, an access key.
+- **Policies:** the account's managed policies and Cairn's, who has each
+  attached, and making, changing (a new version) and deleting the account's
+  own. The editor has a template: pick a bucket and a level (read, read and
+  write, or `s3:*`), and it adds the statement, as one would write it.
+  A bucket's *Access and policy* shows which of the account's users its
+  policies give access to the whole bucket, and what, besides its bucket
+  policy and public access block.
 
 ### The operator's pages
 
 Superadmins (the operator account's users) see the cluster instead, and no
 tenant's buckets. Their actions are `cairn:` ones (`cairn:GetCluster`,
 `cairn:PutSetting`, `cairn:RemoveNode`, `cairn:CreateAccount`, …) on the
-cluster, which is the operator account's, so a tenant's policies can't allow
-them. Whichever node answers shows the whole cluster:
+cluster, which only the operator account's identities are allowed, by being
+them: no policy, a tenant's or theirs, decides it. Whichever node answers
+shows the whole cluster:
 
 - **Overview:** which nodes are live, how full their disks are, and request
   rates, errors, throughput and latency over the last hour, by S3 operation.
@@ -526,7 +562,8 @@ them. Whichever node answers shows the whole cluster:
   [erasure-coded](#erasure-coding)), how much of it has fewer live shards
   than it should, and what each node holds; and the redundancy settings,
   which can be changed there: `parity-shards`, `data-shards` and
-  `repair-after`.
+  `repair-after`. And the [KMS](#sse-kms) setup: Cairn's public key for
+  OpenBao, and whether each node reaches it.
 - **Integrity:** what the [scrubbers](#scrubbing) checked and found: per
   node, how long a full check takes at its rate and how recently its data was
   checked; damaged and missing copies, and whether they were repaired; and
@@ -541,9 +578,8 @@ them. Whichever node answers shows the whole cluster:
   root's enrollment link (a new account's first, or to recover it); and the
   cluster's public access block, which every bucket gets.
 - **Sign-in:** the OIDC providers people may sign in at.
-- **Superadmins:** the operator account's users, as an account's Users page,
-  and the [KMS](#sse-kms) setup: each user's ID and its identity in the KMS,
-  for granting it keys.
+- **Superadmins:** the operator account's users, with how they sign in;
+  adding one (who gets a console link) and removing one.
 
 Request metrics are kept in memory by each node, so they start over when it
 restarts; everything else is read from the database.
@@ -965,7 +1001,7 @@ deleting a key makes its objects unreadable for good (crypto-shredding).
   naming the role by its ID, which is never reused. Cairn logs in once for
   each new role (when the console creates it, or within a minute), so that
   OpenBao makes its entity right away. `cairn user list` and the console
-  show each role's ID and entity; the console's Superadmins page also shows
+  show each role's ID and entity; the console's Storage page also shows
   Cairn's public key, whether each node reaches OpenBao, and how its logins
   went, with what's wrong in OpenBao's setup if they fail. A deleted role's
   entity stays in OpenBao,
@@ -1056,8 +1092,8 @@ roles.
 
 - Cairn logs in to OpenBao through its JWT mount as itself, with the subject
   `cairn` (roles' are their IDs), and its entity must be allowed
-  `datakey/plaintext` and `decrypt` on the key. The console's Superadmins
-  page shows that entity.
+  `datakey/plaintext` and `decrypt` on the key. The console's Storage page
+  shows that entity.
 - As S3's bucket keys do, a node uses one data key from OpenBao for an hour of
   writes, and keeps the data keys it opened for an hour after their last use.
   So OpenBao sees a few calls an hour, not one a request. Every object still

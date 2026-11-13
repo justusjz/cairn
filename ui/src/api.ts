@@ -1,3 +1,4 @@
+import { createSignal } from "solid-js";
 // The console's API for what the signed-in identity manages
 // (`src/console/manage.rs`), through openapi-fetch. Its types are generated
 // from `openapi.json`, the spec the API itself is built from (`npm run gen`
@@ -22,11 +23,13 @@ export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
 export type User = Schemas["RoleSummary"];
+export type ConsoleAccess = Schemas["ConsoleAccess"];
 export type Account = Schemas["AccountSummary"];
 export type OidcProvider = Schemas["OidcProvider"];
 export type CorsConfiguration = Schemas["Configuration"];
 export type AccessKey = Schemas["AccessKey"];
-export type Permission = Schemas["Permission"];
+export type ManagedPolicy = Schemas["PolicySummary"];
+export type UserAccess = Schemas["UserAccess"];
 export type Lifecycle = Schemas["Lifecycle"];
 export type LifecycleBucket = Schemas["LifecycleBucket"];
 export type LifecycleConfiguration = Schemas["LifecycleConfiguration"];
@@ -44,17 +47,17 @@ const client = createClient<paths>({
   headers: { "x-cairn-ui": "1" },
 });
 
-let operatorMode = false;
+const [operatorMode, setOperatorModeSignal] = createSignal(false);
 
 /** Whether the session acts as the operator account (a superadmin): then
  * the pages show what's the operator's (the cluster, its KMS); the console
- * sets it as it switches. */
+ * sets it as it switches. (A signal: pages follow it.) */
 export function setOperatorMode(operator: boolean) {
-  operatorMode = operator;
+  setOperatorModeSignal(operator);
 }
 
 export function isOperator(): boolean {
-  return operatorMode;
+  return operatorMode();
 }
 
 export class ApiError extends Error {
@@ -99,15 +102,24 @@ export const api = {
   object: (bucket: string, key: string) =>
     ok(client.GET("/buckets/{bucket}/object", { params: { ...bucketPath(bucket), query: { key } } })),
   roles: () => ok(client.GET("/roles")),
-  createRole: (name: string, secret: string, admin: boolean) =>
-    ok(client.POST("/roles", { body: { name, secret: secret || null, admin } })),
+  /** A person (no access key: they sign in through a console link), or a
+   * service (`accessKey`: one, named as it, whose secret comes back once). */
+  createRole: (name: string, opts: { accessKey?: boolean; admin?: boolean } = {}) =>
+    ok(client.POST("/roles", { body: { name, access_key: opts.accessKey ?? false, admin: opts.admin ?? false } })),
   deleteRole: (role: string) => ok(client.DELETE("/roles/{role}", { params: rolePath(role) })),
   rotateSecret: (role: string) =>
     ok(client.POST("/roles/{role}/secret", { params: rolePath(role), body: {} })),
   setAdmin: (role: string, admin: boolean) =>
     ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
-  grant: (role: string, bucket: string, permissions: Permission[]) =>
-    ok(client.POST("/roles/{role}/grants", { params: rolePath(role), body: { bucket, permissions } })),
+  policies: () => ok(client.GET("/policies")),
+  createPolicy: (name: string, document: string, description: string) =>
+    ok(client.POST("/policies", { body: { name, document, description } })),
+  updatePolicy: (name: string, change: { document?: string; description?: string }) =>
+    ok(client.PUT("/policies/{name}", { params: { path: { name } }, body: change })),
+  deleteManagedPolicy: (name: string) => ok(client.DELETE("/policies/{name}", { params: { path: { name } } })),
+  attach: (role: string, arn: string) => ok(client.POST("/roles/{role}/attached", { params: rolePath(role), body: { arn } })),
+  detach: (role: string, arn: string) =>
+    ok(client.DELETE("/roles/{role}/attached", { params: { path: { role }, query: { arn } } })),
   oidcConfig: () => ok(client.GET("/oidc-providers")),
   setOidcProvider: (
     name: string,
@@ -184,8 +196,6 @@ export const api = {
   deleteBucketCors: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/cors", { params: bucketPath(bucket) })),
   setVersioning: (bucket: string, status: "Enabled" | "Suspended") =>
     ok(client.PUT("/buckets/{bucket}/versioning", { params: bucketPath(bucket), body: { status } })),
-  revoke: (role: string, bucket: string, permission: Permission) =>
-    ok(client.DELETE("/roles/{role}/grants", { params: { path: { role }, query: { bucket, permission } } })),
 };
 
 /** Files larger than this are uploaded in parts. */

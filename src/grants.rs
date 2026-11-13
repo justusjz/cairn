@@ -1,19 +1,16 @@
-//! Grants: a user's `read`, `write` or `delete-version` on a bucket, kept as
-//! statements of the bucket's policy, as AWS people share a bucket with a
-//! few users (see `plans/policies.md`, "Accounts, root users and logins").
-//! So a grant goes with its bucket (a bucket re-created under an old name
-//! starts with no access), no user runs into a size limit however many
-//! buckets it's granted, and what's in effect is what GetBucketPolicy shows,
-//! to any S3 or IAM tool.
+//! Grants: a user's `read`, `write` or `delete-version` on a bucket, as
+//! managed policies (see `managed`): `<bucket>-read`, `<bucket>-write` and
+//! `<bucket>-delete-version`, of the bucket's account, each allowing what
+//! its permission does on the bucket and its objects, attached to the
+//! users granted it. `cairn user grant` and `revoke` attach and detach them,
+//! making them as needed; they're ordinary policies, which IAM tools see
+//! and the console edits as any other.
 //!
-//! Each permission is one statement, `CairnGrant<Permission>`, naming the
-//! users granted it; the console shows those as grants, and
-//! leave the policy's other statements alone. A change is a compare-and-swap
-//! of the bucket's policy (an UPDATE whose condition is on the bucket's row
-//! only, re-checked under its lock: F2), retried if another got in first.
-//!
-//! Grants used to be rows of `role_grants`; a Cairn moves any that are left
-//! into their buckets' policies as it starts (`convert`).
+//! Grants used to be statements of the bucket's policy,
+//! `CairnGrant<Permission>`, naming the users granted it, and before that
+//! rows of `role_grants`. A Cairn moves any that are left into managed
+//! policies as it starts (`convert`, `to_managed`): the same access within
+//! the account, kept where IAM keeps it.
 
 use std::collections::HashSet;
 
@@ -123,25 +120,6 @@ pub fn changed(policy: Option<&str>, bucket: &str, changes: &[(String, Permissio
     Ok(Some(policy.normalized().to_owned()))
 }
 
-/// Makes `changes` to `bucket`'s grants: (user of `account`, permission,
-/// grant or revoke). The bucket must be of that account (another account's
-/// users are named by its policy itself, for cross-account access).
-pub async fn change(client: &Object, account: &str, bucket: &str, changes: &[(&str, Permission, bool)]) -> anyhow::Result<()> {
-    let Some(row) = client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await? else {
-        return Err(Invalid(format!("no bucket named {bucket:?}; create it first")).into());
-    };
-    let owner: String = row.get(0);
-    if owner != account && changes.iter().any(|(_, _, grant)| *grant) {
-        return Err(Invalid(format!("{bucket:?} is another account's bucket")).into());
-    }
-    let mut arns = Vec::new();
-    for (user, permission, grant) in changes {
-        arns.push((user_arn(account, user), *permission, *grant));
-    }
-    apply(client, bucket, &arns).await?;
-    Ok(())
-}
-
 /// Applies `changes` to `bucket`'s policy, by compare-and-swap. Whether the
 /// bucket exists.
 async fn apply(client: &Object, bucket: &str, changes: &[(String, Permission, bool)]) -> anyhow::Result<bool> {
@@ -165,51 +143,6 @@ async fn apply(client: &Object, bucket: &str, changes: &[(String, Permission, bo
         }
     }
     Err(crate::Contended(format!("changing the grants of bucket {bucket:?}")).into())
-}
-
-/// A grant: the bucket, its user (account ID, name), the permission.
-pub type Grant = (String, (String, String), Permission);
-
-/// Every grant, of users who exist.
-pub async fn list(client: &Object) -> anyhow::Result<Vec<Grant>> {
-    let rows = client
-        .query_cached(
-            "SELECT b.name, b.policy, a.id FROM buckets b JOIN accounts a ON a.id = b.account_id
-             WHERE b.policy LIKE '%\"CairnGrant%' ORDER BY b.name",
-            &[],
-        )
-        .await?;
-    let users: HashSet<(String, String)> =
-        client.query_cached("SELECT account_id, name FROM roles", &[]).await?.iter().map(|r| (r.get(0), r.get(1))).collect();
-    let mut grants = Vec::new();
-    for row in rows {
-        let (bucket, policy, account): (String, String, String) = (row.get(0), row.get(1), row.get(2));
-        let prefix = user_arn(&account, "");
-        for (arn, permission) in in_policy(&policy) {
-            if let Some(user) = arn.strip_prefix(&prefix)
-                && users.contains(&(account.clone(), user.to_owned()))
-            {
-                grants.push((bucket.clone(), (account.clone(), user.to_owned()), permission));
-            }
-        }
-    }
-    grants.sort_by(|a, b| (&a.0, &a.1, a.2.as_str()).cmp(&(&b.0, &b.1, b.2.as_str())));
-    Ok(grants)
-}
-
-/// Revokes everything user `user` of `account` was granted (as it's
-/// deleted).
-pub async fn forget_user(client: &Object, account: &str, user: &str) -> anyhow::Result<()> {
-    let mine: Vec<_> =
-        list(client).await?.into_iter().filter(|(_, (a, u), _)| a == account && u == user).collect();
-    let mut buckets: Vec<&String> = mine.iter().map(|(b, _, _)| b).collect();
-    buckets.dedup();
-    for bucket in buckets {
-        let changes: Vec<_> =
-            mine.iter().filter(|(b, _, _)| b == bucket).map(|(_, (_, u), p)| (u.as_str(), *p, false)).collect();
-        change(client, account, bucket, &changes).await?;
-    }
-    Ok(())
 }
 
 /// The buckets whose policies name user `id`: as ListBuckets lists them to
@@ -262,6 +195,113 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
             )
             .await?;
         moved += changes.len();
+    }
+    Ok(moved)
+}
+
+/// The managed policy a grant of `permission` on `bucket` is: the names it
+/// may have (the first, unless an account's own policy of another
+/// document has it), and its document.
+pub fn policy_for(bucket: &str, permission: Permission) -> ([String; 2], String) {
+    let name = format!("{bucket}-{}", permission.as_str());
+    let document = json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": crate::s3::actions::grant_actions(permission),
+            "Resource": [format!("arn:aws:s3:::{bucket}"), format!("arn:aws:s3:::{bucket}/*")],
+        }],
+    });
+    ([name.clone(), format!("{name}-grant")], document.to_string())
+}
+
+/// The name of the account's managed policy for a grant of `permission` on
+/// `bucket`, made if there's none (`make`); `None` if there's none.
+async fn grant_policy(client: &Object, account: &str, bucket: &str, permission: Permission, make: bool) -> anyhow::Result<Option<String>> {
+    use crate::managed::{self, Refused};
+    let (names, document) = policy_for(bucket, permission);
+    for name in names {
+        match managed::get(client, account, &name).await {
+            Ok(policy) if policy.document == document => return Ok(Some(name)),
+            // Another policy of that name: the next one.
+            Ok(_) => continue,
+            Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::NoSuch(_))) => {
+                if !make {
+                    continue;
+                }
+                let description = format!("{} on bucket {bucket} (a grant)", permission.as_str());
+                match managed::create(client, account, &name, &document, &description).await {
+                    Ok(_) => return Ok(Some(name)),
+                    // Made meanwhile (by another node): as it is now.
+                    Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => {
+                        if managed::get(client, account, &name).await?.document == document {
+                            return Ok(Some(name));
+                        }
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    if make {
+        return Err(Invalid(format!("the account has policies named {bucket}-{} already, of other documents", permission.as_str())).into());
+    }
+    Ok(None)
+}
+
+/// Grants (`grant`) or revokes `permissions` on `bucket` to user `user` of
+/// `account`: attaches or detaches their managed policies. The bucket must
+/// be the account's (another account's users are named by its policy
+/// itself, for cross-account access).
+pub async fn change(client: &Object, account: &str, user: &str, bucket: &str, permissions: &[Permission], grant: bool) -> anyhow::Result<()> {
+    let Some(row) = client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await? else {
+        return Err(Invalid(format!("no bucket named {bucket:?}; create it first")).into());
+    };
+    if row.get::<_, String>(0) != account {
+        return Err(Invalid(format!("{bucket:?} is another account's bucket")).into());
+    }
+    for permission in permissions {
+        let Some(name) = grant_policy(client, account, bucket, *permission, grant).await? else { continue };
+        let arn = crate::managed::arn(account, &name);
+        match crate::managed::attach(client, account, user, &arn, grant).await {
+            Ok(()) => {}
+            // Revoking what wasn't granted.
+            Err(e) if !grant && matches!(e.downcast_ref::<crate::managed::Refused>(), Some(crate::managed::Refused::NoSuch(_))) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Moves the grants left in buckets' policies (`CairnGrant<Permission>`
+/// statements) into managed policies attached to their users, bucket by
+/// bucket: the policies are made and attached, then the statements leave
+/// the bucket's policy (a compare-and-swap). Safe to run on several nodes
+/// at once, and again. Users of other accounts, which no grant could name,
+/// are dropped from them. The number of grants moved.
+pub async fn to_managed(client: &Object) -> anyhow::Result<usize> {
+    let rows = client
+        .query_cached(
+            "SELECT b.name, b.policy, b.account_id FROM buckets b WHERE b.policy LIKE '%\"CairnGrant%' ORDER BY b.name",
+            &[],
+        )
+        .await?;
+    let mut moved = 0;
+    for row in rows {
+        let (bucket, policy, account): (String, String, String) = (row.get(0), row.get(1), row.get(2));
+        let prefix = user_arn(&account, "");
+        let grants = in_policy(&policy);
+        for (arn, permission) in &grants {
+            let Some(user) = arn.strip_prefix(&prefix) else { continue };
+            if client.query_opt_cached("SELECT 1 FROM roles WHERE account_id = $1 AND name = $2", &[&account, &user]).await?.is_none() {
+                continue;
+            }
+            change(client, &account, user, &bucket, &[*permission], true).await?;
+            moved += 1;
+        }
+        let revoked: Vec<_> = grants.into_iter().map(|(arn, permission)| (arn, permission, false)).collect();
+        apply(client, &bucket, &revoked).await?;
     }
     Ok(moved)
 }

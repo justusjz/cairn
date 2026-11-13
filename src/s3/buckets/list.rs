@@ -76,12 +76,18 @@ pub async fn list_buckets(
     let prefix = query_param(query, "prefix").unwrap_or_default();
     // Those its account owns, to whom `s3:ListAllMyBuckets` is allowed, as
     // in S3; else those whose policies name the user (as MinIO lists them).
+    let all_buckets = buckets(app).await?;
     let visible = match all {
         true => Default::default(),
-        false => crate::grants::visible(&app.pool.get().await?, principal.id).await?,
+        false => {
+            let mut visible = crate::grants::visible(&app.pool.get().await?, principal.id).await?;
+            let own: Vec<&str> =
+                all_buckets.iter().filter(|b| b.account == principal.account).map(|b| b.name.as_str()).collect();
+            visible.extend(crate::s3::access::listable(principal, &own)?);
+            visible
+        }
     };
-    let mut listed: Vec<BucketInfo> = buckets(app)
-        .await?
+    let mut listed: Vec<BucketInfo> = all_buckets
         .into_iter()
         .filter(|b| if all { b.account == principal.account } else { visible.contains(&b.name) })
         .filter(|b| b.name.starts_with(&prefix))
