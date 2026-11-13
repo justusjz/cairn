@@ -82,6 +82,8 @@ pub(crate) enum ApiError {
     NotFound(String),
     /// It conflicts with how things are, e.g. a name that's taken.
     Conflict(String),
+    /// The client asked too often (see `limit`).
+    TooManyRequests(String),
     /// A fault, or too few nodes; logged, and not described to the client.
     Failed(anyhow::Error),
 }
@@ -110,6 +112,7 @@ impl IntoResponse for ApiError {
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
+            ApiError::TooManyRequests(m) => (StatusCode::TOO_MANY_REQUESTS, m),
             ApiError::Failed(e) => {
                 eprintln!("console request failed: {e:#}");
                 if e.downcast_ref::<crate::Unavailable>().is_some() {

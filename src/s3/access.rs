@@ -301,6 +301,12 @@ impl Access {
     }
 }
 
+/// The address a request comes from, as `aws:SourceIp` has it (see
+/// `source`): its connection's `peer`, or what a trusted proxy says.
+pub fn client_address(headers: &HeaderMap, peer: Option<IpAddr>, trusted_proxies: &[Network]) -> Option<IpAddr> {
+    source(headers, &Origin { peer, trusted_proxies, signed: None, form: false }).0
+}
+
 /// Where a request comes from: its peer, or (from a trusted proxy) the
 /// first address in `X-Forwarded-For` that isn't one; and whether it came
 /// over HTTPS (Cairn speaks only HTTP, so that's a trusted proxy's word).

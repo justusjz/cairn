@@ -41,6 +41,7 @@ use crate::{App, roles::Principal};
 pub(crate) mod actor;
 mod api;
 pub mod cbor;
+mod limit;
 mod manage;
 pub mod oidc;
 pub mod store;
@@ -68,11 +69,13 @@ pub struct Shared {
     /// The console's origin, if this node serves it: enrollment links are
     /// made from it.
     origin: Option<String>,
+    /// How often each client may start signing in (see `limit`).
+    sign_ins: limit::Limiter,
 }
 
 impl Shared {
     pub fn new(origin: Option<String>) -> Shared {
-        Shared { storage: tokio::sync::Mutex::default(), origin }
+        Shared { storage: tokio::sync::Mutex::default(), origin, sign_ins: limit::Limiter::default() }
     }
 
     /// The console's origin, if this node serves it.
@@ -128,7 +131,9 @@ pub fn router(console: Arc<Console>) -> Router {
     // Signing in and enrolling take small JSON documents, before anyone is
     // known: no more is read of them.
     let (api, _) = api::router().split_for_parts();
-    let api = api.layer(axum::extract::DefaultBodyLimit::max(MAX_SIGN_IN_BODY));
+    let api = api
+        .layer(middleware::from_fn_with_state(console.clone(), limit_sign_ins))
+        .layer(axum::extract::DefaultBodyLimit::max(MAX_SIGN_IN_BODY));
     // What the session's identity manages, as that identity.
     let (managed, _) = manage::router().split_for_parts();
     let managed = managed
@@ -148,6 +153,25 @@ pub fn router(console: Arc<Console>) -> Router {
         .fallback(static_file)
         .layer(middleware::map_response(web::security_headers))
         .with_state(console)
+}
+
+/// Refuses a start of signing in or enrolling (which writes a row before
+/// anyone is known) to a client that started too many lately (see `limit`).
+async fn limit_sign_ins(State(console): State<Arc<Console>>, req: Request, next: Next) -> Response {
+    let path = req.uri().path();
+    let starts = path.ends_with("/login/options")
+        || path.ends_with("/enroll/options")
+        || (path.contains("/oidc/") && path.ends_with("/start"));
+    if req.method() == Method::POST && starts {
+        let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
+        let client = crate::s3::access::client_address(req.headers(), peer, &console.app.trusted_proxies);
+        if let Some(client) = client
+            && !console.app.console.sign_ins.allow(client)
+        {
+            return ApiError::TooManyRequests("too many sign-ins from here; wait a minute".into()).into_response();
+        }
+    }
+    next.run(req).await
 }
 
 /// Refuses requests that change something unless they come from the
@@ -1178,5 +1202,31 @@ mod e2e {
         let resp = router(console).oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["content-type"], "text/html; charset=utf-8");
+    }
+
+    /// A client may only start signing in so often (each start writes a
+    /// challenge), by its address; others aren't held up by it.
+    #[tokio::test]
+    async fn limits_how_often_a_client_starts_signing_in() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = Arc::new(Console { app, party: party() });
+        let start = |client: &str| {
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/api/login/options")
+                .header("origin", party().origin)
+                .header("x-cairn-ui", "1")
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let address: SocketAddr = format!("{client}:50000").parse().unwrap();
+            req.extensions_mut().insert(ConnectInfo(address));
+            let console = console.clone();
+            async move { router(console).oneshot(req).await.unwrap().status() }
+        };
+        for _ in 0..20 {
+            assert_eq!(start("192.0.2.1").await, StatusCode::OK);
+        }
+        assert_eq!(start("192.0.2.1").await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(start("192.0.2.2").await, StatusCode::OK);
     }
 }
