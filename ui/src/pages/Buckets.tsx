@@ -100,11 +100,18 @@ export function BucketList() {
   const buckets = { data: () => data.data()?.[0], error: data.error, refresh: data.refresh };
   const cluster = () => data.data()?.[1];
   const [name, setName] = createSignal("");
+  const [objectLock, setObjectLock] = createSignal(false);
   const create = async (e: SubmitEvent) => {
     e.preventDefault();
     const n = name().trim();
-    if (await act(() => api.createBucket(n), `Created bucket ${n}`)) {
+    if (
+      objectLock() &&
+      !confirm(`Create "${n}" with Object Lock? It can't be disabled again, and the bucket stays versioned.`)
+    )
+      return;
+    if (await act(() => api.createBucket(n, objectLock()), `Created bucket ${n}`)) {
       setName("");
+      setObjectLock(false);
       buckets.refresh();
     }
   };
@@ -118,6 +125,10 @@ export function BucketList() {
         <h1>Buckets</h1>
         <form class="form-row" onSubmit={create}>
           <input type="text" placeholder="new-bucket-name" aria-label="Bucket name" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+          <label title="Keeps versions from being deleted for a retention period, or under a legal hold, as S3's Object Lock">
+            <input type="checkbox" checked={objectLock()} onChange={(e) => setObjectLock(e.currentTarget.checked)} />
+            Object Lock
+          </label>
           <button class="primary" type="submit">
             Create bucket
           </button>
@@ -151,7 +162,9 @@ export function BucketList() {
                       <A href={bucketUrl(b.name)}>{b.name}</A>
                     </td>
                     <td>
-                      {b.versioning === "enabled" ? (
+                      {b.object_lock ? (
+                        <Badge tone="accent">versioned, locked</Badge>
+                      ) : b.versioning === "enabled" ? (
                         <Badge tone="accent">versioned</Badge>
                       ) : b.versioning === "suspended" ? (
                         <Badge tone="warn">suspended</Badge>

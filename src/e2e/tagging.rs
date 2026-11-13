@@ -68,6 +68,7 @@ async fn put_tagged(app: &Arc<App>, key: &str, data: Vec<u8>, header: &str) -> O
         sealing: None,
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: stored(header),
+        lock: Default::default(),
     };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked()).await.unwrap();
     let UploadResult::Committed { version_id, .. } = result else { panic!("not committed") };
@@ -194,7 +195,7 @@ async fn each_version_has_its_own_tags() {
     assert_eq!(tags_of(&app, "v", Some(&old)).await.2, "v=a2");
     assert_eq!(tags_of(&app, "v", None).await, (StatusCode::OK, Some(new.clone()), "v=b".to_owned()));
     // A delete marker has none: 405, named or current, as S3 answers.
-    let deleted = delete_object(&app, BUCKET, "v", None).await.unwrap();
+    let deleted = delete_object(&app, BUCKET, "v", None, false).await.unwrap();
     let marker = header(deleted.headers(), "x-amz-version-id").unwrap().to_owned();
     for version in [None, Some(marker.as_str())] {
         for response in [
@@ -282,7 +283,7 @@ async fn copies_keep_or_replace_tags() {
 async fn an_upload_gives_its_tags_to_its_object() {
     let Some(app) = node().await else { return };
     let response =
-        create_multipart_upload(&app, BUCKET, "m", "x", "", &stored("m=1"), Wanted::Plain, None, None).await.unwrap();
+        create_multipart_upload(&app, BUCKET, "m", "x", "", &stored("m=1"), Wanted::Plain, None, None, Default::default()).await.unwrap();
     let (_, _, body) = text(response).await;
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
     let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();

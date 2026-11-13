@@ -302,6 +302,35 @@ async fn newer_noncurrent_versions_are_kept() {
     assert_eq!(get(&app, "a").await, Some(vec![4]));
 }
 
+/// Object Lock keeps versions from lifecycle rules too, as in S3: a
+/// current version still gets its delete marker, but a locked noncurrent
+/// one stays.
+#[tokio::test]
+async fn locked_versions_are_not_expired() {
+    let Some(app) = node().await else { return };
+    enable_versioning(&app).await;
+    let body = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>30</Days></DefaultRetention></Rule>\
+                </ObjectLockConfiguration>";
+    let response = crate::s3::object_lock::put_object_lock_configuration(&app, BUCKET, Bytes::from(body)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    put(&app, "a", vec![1]).await;
+    configure(
+        &app,
+        "<Rule><ID>current</ID><Filter/><Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule>\
+         <Rule><ID>noncurrent</ID><Filter/><Status>Enabled</Status>\
+         <NoncurrentVersionExpiration><NoncurrentDays>1</NoncurrentDays></NoncurrentVersionExpiration></Rule>",
+    )
+    .await;
+    let report = run_in(&app, 3).await.unwrap();
+    assert_eq!(report.expired, 1);
+    assert_eq!(get(&app, "a").await, None);
+    run_in(&app, 6).await.unwrap();
+    // The version, under its delete marker, retained for 30 days (by the
+    // real clock, which the sweeps here run ahead of).
+    assert_eq!(versions(&app, "a").await, 2);
+}
+
 #[tokio::test]
 async fn a_version_written_since_is_not_expired() {
     let Some(app) = node().await else { return };
@@ -455,7 +484,7 @@ async fn deleting_the_configuration_stops_expirations() {
 async fn incomplete_uploads_are_aborted() {
     let Some(app) = node().await else { return };
     for key in ["tmp/a", "b"] {
-        let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None).await.unwrap();
+        let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default()).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
     configure(

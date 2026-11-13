@@ -67,7 +67,7 @@ async fn put_multipart(app: &Arc<App>, key: &str, parts: &[Vec<u8>]) {
 }
 
 async fn create_upload(app: &Arc<App>, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "", "", Wanted::Plain, None, None)
+    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "", "", Wanted::Plain, None, None, Default::default())
         .await
         .unwrap();
     Uuid::parse_str(&xml_field(&body_text(response).await, "UploadId")).unwrap()

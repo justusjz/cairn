@@ -19,11 +19,14 @@ use crate::{
 struct Target {
     key: String,
     version_id: Option<String>,
+    /// Whether it may bypass a GOVERNANCE retention (see `s3::object_lock`).
+    bypass: bool,
 }
 
 enum DeleteStatus {
-    /// One outcome per target, in order.
-    Deleted(Vec<Deleted>),
+    /// One outcome per target, in order: `None` for a version Object Lock
+    /// keeps.
+    Deleted(Vec<Option<Deleted>>),
     NoSuchBucket,
     /// It kept conflicting with concurrent requests.
     Contended,
@@ -45,11 +48,12 @@ async fn try_delete(
     let version_ids: Vec<Option<&str>> = targets.iter().map(|t| t.version_id.as_deref()).collect();
     // A fresh version ID for each target, should it need a delete marker.
     let marker_ids: Vec<String> = targets.iter().map(|_| new_version_id()).collect();
+    let bypass: Vec<bool> = targets.iter().map(|t| t.bypass).collect();
     let row = client
         .query_one_cached(
-            "SELECT status, version_ids, delete_markers, reap_blob, reap_node, reap_peer
-             FROM pg_temp.cairn_delete_objects($1, $2, $3, $4)",
-            &[&bucket, &keys, &version_ids, &marker_ids],
+            "SELECT status, version_ids, delete_markers, locked, reap_blob, reap_node, reap_peer
+             FROM pg_temp.cairn_delete_objects($1, $2, $3, $4, $5)",
+            &[&bucket, &keys, &version_ids, &marker_ids, &bypass],
         )
         .await?;
     match row.get::<_, &str>(0) {
@@ -60,15 +64,14 @@ async fn try_delete(
     }
     let version_ids: Vec<Option<String>> = row.get(1);
     let delete_markers: Vec<bool> = row.get(2);
+    let locked: Vec<bool> = row.get(3);
     let outcomes = version_ids
         .into_iter()
         .zip(delete_markers)
-        .map(|(version_id, delete_marker)| Deleted {
-            version_id,
-            delete_marker,
-        })
+        .zip(locked)
+        .map(|((version_id, delete_marker), locked)| (!locked).then_some(Deleted { version_id, delete_marker }))
         .collect();
-    let reap = reap_columns(&row, 3);
+    let reap = reap_columns(&row, 4);
     Ok((DeleteStatus::Deleted(outcomes), reap))
 }
 
@@ -97,22 +100,26 @@ async fn delete_targets(
 
 /// DeleteObject: `DELETE /{bucket}/{key}`, optionally `?versionId=V` to remove one
 /// version for good. Reports the version concerned (the removed one, or the delete
-/// marker just created) in `x-amz-version-id` / `x-amz-delete-marker`.
+/// marker just created) in `x-amz-version-id` / `x-amz-delete-marker`. A
+/// version that Object Lock keeps is S3's 403, unless it's in GOVERNANCE
+/// mode and the request may bypass that (`bypass`).
 pub async fn delete_object(
     app: &Arc<App>,
     bucket: &str,
     key: &str,
     version_id: Option<&str>,
+    bypass: bool,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let target = Target {
         key: key.to_owned(),
         version_id: version_id.map(str::to_owned),
+        bypass,
     };
     // Idempotent: deleting a key or version that isn't there still returns 204,
     // per S3.
     match delete_targets(app, bucket, &[target]).await? {
         DeleteStatus::Deleted(outcomes) => {
-            let deleted = &outcomes[0];
+            let Some(deleted) = &outcomes[0] else { return Ok(crate::s3::object_lock::locked()) };
             let resp = Response::builder()
                 .status(StatusCode::NO_CONTENT)
                 .body(Full::new(Bytes::new()))
@@ -151,6 +158,7 @@ fn parse_delete_request(body: &str) -> Option<(Vec<Target>, bool)> {
         targets.push(Target {
             key: child("Key")?.to_owned(),
             version_id: child("VersionId").map(str::to_owned),
+            bypass: false,
         });
     }
     // Quiet mode (default false): suppress the per-key <Deleted> entries, leaving
@@ -169,7 +177,9 @@ fn parse_delete_request(body: &str) -> Option<(Vec<Target>, bool)> {
 /// ([`missing_checksum`]). Authorization is per entry, as in S3: whether
 /// `allowed` the entry's key, and whether it names a version
 /// (`s3:DeleteObjectVersion`, else `s3:DeleteObject`); a denied entry is
-/// reported as an AccessDenied `<Error>` and the rest still proceed.
+/// reported as an AccessDenied `<Error>` and the rest still proceed. So is a
+/// version that Object Lock keeps, unless it's in GOVERNANCE mode and
+/// `bypass` its key (the request asks to, and may).
 /// The error for a DeleteObjects without an integrity header. The body *is*
 /// the list of things to destroy, so S3 requires one: Content-MD5 (minio-go)
 /// or an x-amz-checksum-* (aws-cli).
@@ -186,6 +196,7 @@ pub async fn delete_objects(
     bucket: &str,
     body: Bytes,
     allowed: &(dyn Fn(&str, bool) -> bool + Sync),
+    bypass: &(dyn Fn(&str) -> bool + Sync),
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let Ok(body_str) = std::str::from_utf8(&body) else {
         return Ok(format_s3_error(
@@ -219,8 +230,11 @@ pub async fn delete_objects(
     let (malformed, targets): (Vec<Target>, Vec<Target>) = targets
         .into_iter()
         .partition(|t| t.version_id.as_deref().is_some_and(|v| !is_version_id(v)));
-    let (permitted, denied): (Vec<Target>, Vec<Target>) =
+    let (mut permitted, denied): (Vec<Target>, Vec<Target>) =
         targets.into_iter().partition(|t| allowed(&t.key, t.version_id.is_some()));
+    for target in &mut permitted {
+        target.bypass = target.version_id.is_some() && bypass(&target.key);
+    }
     let outcomes = match delete_targets(app, bucket, &permitted).await? {
         DeleteStatus::Deleted(outcomes) => outcomes,
         DeleteStatus::NoSuchBucket => {
@@ -242,6 +256,7 @@ pub async fn delete_objects(
     // that marker's version ID.
     if !quiet {
         for (t, deleted) in permitted.iter().zip(&outcomes) {
+            let Some(deleted) = deleted else { continue };
             out.push_str("<Deleted>");
             out.push_str(&format!("<Key>{}</Key>", xml_escape(&t.key)));
             if let Some(v) = &t.version_id {
@@ -260,6 +275,9 @@ pub async fn delete_objects(
         }
     }
     // Errors are reported even in quiet mode.
+    for (t, _) in permitted.iter().zip(&outcomes).filter(|(_, deleted)| deleted.is_none()) {
+        out.push_str(&crate::s3::object_lock::locked_error(&t.key, t.version_id.as_deref()));
+    }
     let errors = denied
         .iter()
         .map(|t| (t, "AccessDenied", "Access Denied"))

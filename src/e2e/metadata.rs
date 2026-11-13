@@ -44,6 +44,7 @@ async fn put_with(app: &Arc<App>, key: &str, metadata: String) {
         sealing: None,
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: String::new(),
+        lock: Default::default(),
     };
     let body = Full::new(Bytes::from_static(b"data"));
     let result = crate::upload_part(app, body, &attach, Payload::unchecked()).await.unwrap();

@@ -1443,6 +1443,8 @@ enum AttachTarget {
         checksum: s3::checksums::Wanted,
         /// Its tags, stored form (see `s3::tags`).
         tags: String,
+        /// The Object Lock it asks for (see `s3::object_lock`).
+        lock: s3::object_lock::Lock,
     },
     /// A part staged under an in-progress multipart upload, encrypted with
     /// `key` if the upload is encrypted (SSE-C, SSE-KMS or SSE-S3), whose
@@ -1841,8 +1843,10 @@ async fn try_commit_part(
             metadata,
             sealing,
             tags,
+            lock,
             ..
         } => {
+            let (lock_mode, lock_until, legal_hold) = lock.columns();
             let plain = s3::sse::Stored::Plain;
             let sse = sealing.as_ref().map_or(&plain, |sealing| &sealing.stored).columns();
             let row = client
@@ -1851,7 +1855,7 @@ async fn try_commit_part(
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                                                       $11, $12, $13, $14, $15, $16, $17, $18,
                                                       $19, $20, $21, $22, $23, $24, $25, $26,
-                                                      $27, $28, $29, $30, $31)",
+                                                      $27, $28, $29, $30, $31, $32, $33, $34)",
                     &[
                         &written.blob_id,
                         &nodes,
@@ -1884,6 +1888,9 @@ async fn try_commit_part(
                         &expected.is_some(),
                         &expected.flatten(),
                         &s3::versions::new_version_id(),
+                        &lock_mode,
+                        &lock_until,
+                        &legal_hold,
                     ],
                 )
                 .await?;

@@ -81,12 +81,6 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
              <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></VersioningConfiguration>"
                 .to_string(),
         ))
-    } else if present("object-lock") {
-        Some(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "ObjectLockConfigurationNotFoundError",
-            "object lock configuration does not exist for this bucket",
-        ))
     } else if present("website") {
         Some(format_s3_error(
             StatusCode::NOT_FOUND,
@@ -318,20 +312,29 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
         // PutBucketVersioning, PutBucketEncryption,
         // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketTagging,
         // PutBucketPolicy, PutBucketAcl (`acl`).
-        (true, &Method::PUT) => {
-            &["versioning", "encryption", "lifecycle", "cors", "tagging", "policy", "acl", "publicAccessBlock"]
-        }
+        (true, &Method::PUT) => &[
+            "versioning",
+            "encryption",
+            "lifecycle",
+            "cors",
+            "tagging",
+            "policy",
+            "acl",
+            "publicAccessBlock",
+            "object-lock",
+        ],
         (true, &Method::POST) => &["delete"],
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
         // DeleteBucketTagging, DeleteBucketPolicy.
         (true, &Method::DELETE) => &["encryption", "lifecycle", "cors", "tagging", "policy", "publicAccessBlock"],
         // GetObjectAcl (stubbed), ListParts, GetObjectTagging, a part of
         // the object, GetObjectAttributes.
-        (false, &Method::GET) => &["acl", "uploadId", "tagging", "partNumber", "attributes"],
+        (false, &Method::GET) => &["acl", "uploadId", "tagging", "partNumber", "attributes", "retention", "legal-hold"],
         // A part of the object.
         (false, &Method::HEAD) => &["partNumber"],
-        // UploadPart / UploadPartCopy, PutObjectAcl (`acl`), PutObjectTagging.
-        (false, &Method::PUT) => &["uploadId", "partNumber", "acl", "tagging"],
+        // UploadPart / UploadPartCopy, PutObjectAcl (`acl`), PutObjectTagging,
+        // PutObjectRetention, PutObjectLegalHold.
+        (false, &Method::PUT) => &["uploadId", "partNumber", "acl", "tagging", "retention", "legal-hold"],
         // CreateMultipartUpload / CompleteMultipartUpload.
         (false, &Method::POST) => &["uploads", "uploadId"],
         // AbortMultipartUpload, DeleteObjectTagging.
@@ -583,7 +586,7 @@ mod tests {
         // Each of these used to run as the plain operation: overwriting the
         // object, deleting it or the bucket, or serving the wrong bytes.
         for (method, bucket_level, query) in [
-            (Method::PUT, false, "retention&versionId=null"),
+            (Method::DELETE, false, "retention&versionId=null"),
             (Method::POST, false, "restore"),
             (Method::DELETE, true, "website"),
             (Method::GET, true, "inventory"),

@@ -61,6 +61,7 @@ pub(crate) mod sse;
 pub(crate) mod sse_c;
 pub(crate) mod tags;
 pub(crate) mod multipart;
+pub(crate) mod object_lock;
 pub(crate) mod objects;
 pub(crate) mod post_policy;
 pub(crate) mod util;
@@ -254,18 +255,49 @@ async fn handle_request(
     };
     let exists = access.load(&app, &bucket).await?;
     access.load_all(&app, &operation.checks).await?;
-    if let Some((check, verdict)) = access.first_denied(&operation.checks) {
-        // As in S3, a bucket that doesn't exist is a 404 to anyone: bucket
-        // names aren't secret, only what's in them is. Except to CreateBucket,
-        // which is about a bucket that isn't there yet.
-        if !exists && operation.name != "CreateBucket" {
-            return Ok(box_response(format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchBucket",
-                "the specified bucket does not exist",
-            )));
+    // The Object Lock a write asks for, as policies may test it.
+    if matches!(operation.name, "PutObject" | "CopyObject" | "CreateMultipartUpload") {
+        let header = |name| req.headers().get(name).and_then(|v| v.to_str().ok());
+        let (mode, until, hold) = (header(object_lock::MODE), header(object_lock::RETAIN_UNTIL), header(object_lock::LEGAL_HOLD));
+        object_lock::set_context(&mut access.context, mode, until, hold);
+    }
+    // PutObjectRetention and PutObjectLegalHold: what they ask for is in
+    // their bodies, which policies may test, so they're read before the
+    // request is authorized. S3 requires a checksum of either.
+    if matches!(operation.name, "PutObjectRetention" | "PutObjectLegalHold") {
+        let version_id = query_param(query, "versionId");
+        if let Some(v) = version_id.as_deref().filter(|v| !is_version_id(v)) {
+            return Ok(box_response(invalid_version_id("versionId", v)));
         }
-        return Ok(box_response(access.denied(check, verdict)));
+        if !payload::has_body_checksum(req.headers()) {
+            return Ok(box_response(missing_checksum()));
+        }
+        let asks_to_bypass = object_lock::asks_to_bypass(req.headers());
+        let body = match read_body(req, &secret, true).await? {
+            Ok(body) => body,
+            Err(rejection) => return Ok(box_response(util::rejection_response(&rejection))),
+        };
+        if operation.name == "PutObjectRetention" {
+            if let Some((mode, until)) = object_lock::parse_retention(&body) {
+                object_lock::set_context(&mut access.context, mode.as_deref(), until.as_deref(), None);
+            }
+        } else if let Some(status) = object_lock::parse_legal_hold(&body) {
+            object_lock::set_context(&mut access.context, None, None, Some(&status));
+        }
+        if let Some(refused) = refusal(&access, &operation, exists) {
+            return Ok(box_response(refused));
+        }
+        let version_id = version_id.as_deref();
+        let resp = if operation.name == "PutObjectRetention" {
+            let bypass = asks_to_bypass && access.allows(&bypass_check(&bucket, &key));
+            object_lock::put_object_retention(&app, &bucket, &key, version_id, &body, bypass).await?
+        } else {
+            object_lock::put_object_legal_hold(&app, &bucket, &key, version_id, &body).await?
+        };
+        return Ok(box_response(resp));
+    }
+    if let Some(refused) = refusal(&access, &operation, exists) {
+        return Ok(box_response(refused));
     }
     // A bucket's policy is its account's alone: another account's request
     // its policy allows is a 405, as S3 answers it.
@@ -288,8 +320,8 @@ async fn handle_request(
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
         // Bucket sub-resource GETs: versioning, encryption, lifecycle, CORS,
-        // policy and tagging are real; the rest (acl, location,
-        // object-lock, website, ...) are stubbed — Cairn implements none of
+        // policy, tagging and Object Lock are real; the rest (acl, location,
+        // website, ...) are stubbed — Cairn implements none of
         // them, so answer as S3 does for an unconfigured bucket before
         // falling through to a listing. Each goes where `operation` says,
         // which is what was authorized: a request naming two subresources
@@ -318,6 +350,9 @@ async fn handle_request(
             }
             if operation.name == "GetBucketTagging" {
                 return Ok(box_response(get_bucket_tagging(&app, &bucket).await?));
+            }
+            if operation.name == "GetObjectLockConfiguration" {
+                return Ok(box_response(object_lock::get_object_lock_configuration(&app, &bucket).await?));
             }
             if operation.name == "GetBucketOwnershipControls" {
                 return Ok(box_response(acl::ownership_controls()));
@@ -502,13 +537,28 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
+            // PutObjectLockConfiguration: PUT /{bucket}?object-lock with an
+            // <ObjectLockConfiguration> body, which must declare a checksum,
+            // as in S3.
+            hyper::Method::PUT if operation.name == "PutObjectLockConfiguration" => {
+                if !payload::has_body_checksum(req.headers()) {
+                    return Ok(box_response(missing_checksum()));
+                }
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => object_lock::put_object_lock_configuration(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
             // PutBucketAcl: there are no ACLs (`acl`).
             hyper::Method::PUT if operation.name == "PutBucketAcl" => {
                 acl::put_bucket_acl(&app, &bucket, req.headers()).await?
             }
             hyper::Method::PUT if operation.name == "CreateBucket" => match acl::check_write(req.headers(), acl::On::Bucket) {
                 Ok(()) => match &principal {
-                    Some(principal) => create_bucket(&app, &bucket, &principal.account).await?,
+                    Some(principal) => {
+                        let object_lock = object_lock::asks_for_bucket(req.headers());
+                        create_bucket(&app, &bucket, &principal.account, object_lock).await?
+                    }
                     None => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
                 },
                 Err(refused) => refused,
@@ -519,6 +569,7 @@ async fn handle_request(
                 if !payload::has_body_checksum(req.headers()) {
                     return Ok(box_response(missing_checksum()));
                 }
+                let asks_to_bypass = object_lock::asks_to_bypass(req.headers());
                 match read_body(req, &secret, true).await? {
                     Ok(body) => {
                         // Each key on its own, as in S3.
@@ -526,7 +577,8 @@ async fn handle_request(
                             let on = actions::On::Object(bucket.clone(), key.to_owned());
                             access.allows(&actions::Check { action: actions::delete(version), on })
                         };
-                        delete_objects(&app, &bucket, body, &allowed).await?
+                        let bypass = |key: &str| asks_to_bypass && access.allows(&bypass_check(&bucket, key));
+                        delete_objects(&app, &bucket, body, &allowed, &bypass).await?
                     }
                     Err(rejection) => util::rejection_response(&rejection),
                 }
@@ -577,6 +629,21 @@ async fn handle_request(
     let version_id = query_param(&query, "versionId");
     let tagging = matches!(operation.name, "GetObjectTagging" | "PutObjectTagging" | "DeleteObjectTagging");
     let addresses_version = tagging || matches!(*req.method(), Method::GET | Method::HEAD | Method::DELETE);
+    // Whether the version's retention and legal hold may be told (GET and
+    // HEAD tell them only then, as S3 does).
+    let on_object = || actions::On::Object(bucket.clone(), key.clone());
+    let tells_retention = access.allows(&actions::Check { action: "s3:GetObjectRetention", on: on_object() });
+    let tells_legal_hold = access.allows(&actions::Check { action: "s3:GetObjectLegalHold", on: on_object() });
+    // A delete's bypass of GOVERNANCE mode: asked for, and allowed.
+    let bypass = object_lock::asks_to_bypass(req.headers()) && access.allows(&bypass_check(&bucket, &key));
+    // The Object Lock a write asks for (see `object_lock`).
+    let lock = match operation.name {
+        "PutObject" | "CopyObject" | "CreateMultipartUpload" => match object_lock::Lock::from_headers(req.headers()) {
+            Ok(lock) => lock,
+            Err(refused) => return Ok(box_response(refused)),
+        },
+        _ => object_lock::Lock::default(),
+    };
     if let Some(v) = version_id.as_deref().filter(|v| addresses_version && !is_version_id(v)) {
         return Ok(box_response(invalid_version_id("versionId", v)));
     }
@@ -611,6 +678,15 @@ async fn handle_request(
             },
             _ => delete_object_tagging(&app, &bucket, &key, version_id).await?,
         };
+        return Ok(box_response(resp));
+    }
+    // GetObjectRetention and GetObjectLegalHold (see `object_lock`).
+    if operation.name == "GetObjectRetention" {
+        let resp = object_lock::get_object_retention(&app, &bucket, &key, version_id.as_deref()).await?;
+        return Ok(box_response(resp));
+    }
+    if operation.name == "GetObjectLegalHold" {
+        let resp = object_lock::get_object_legal_hold(&app, &bucket, &key, version_id.as_deref()).await?;
         return Ok(box_response(resp));
     }
     // SSE-C: the key the request names for its object, if any. Refused if it's
@@ -737,7 +813,7 @@ async fn handle_request(
         if hides_missing(response.status()) {
             return Ok(box_response(access.denied(&operation.checks[0], crate::policy::Verdict::ImplicitDeny)));
         }
-        return Ok(overrides.apply(response));
+        return Ok(overrides.apply(object_lock::strip(response, tells_retention, tells_legal_hold)));
     }
     let content_type = req
         .headers()
@@ -807,7 +883,7 @@ async fn handle_request(
             .await?;
             match hides_missing(response.status()) {
                 true => access.denied(&operation.checks[0], crate::policy::Verdict::ImplicitDeny),
-                false => overrides.apply(response),
+                false => overrides.apply(object_lock::strip(response, tells_retention, tells_legal_hold)),
             }
         }
         // AbortMultipartUpload
@@ -816,7 +892,7 @@ async fn handle_request(
             abort_multipart_upload(&app, &bucket, &key, &upload_id).await?
         }
         hyper::Method::DELETE => {
-            delete_object(&app, &bucket, &key, version_id.as_deref()).await?
+            delete_object(&app, &bucket, &key, version_id.as_deref(), bypass).await?
         }
         // CreateMultipartUpload
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {
@@ -824,7 +900,7 @@ async fn handle_request(
                 (Ok(metadata), Ok(tags)) => match checksums::requested_upload(req.headers()) {
                     Ok(checksum) => {
                         create_multipart_upload(
-                            &app, &bucket, &key, &content_type, &metadata, &tags, wanted, role, checksum,
+                            &app, &bucket, &key, &content_type, &metadata, &tags, wanted, role, checksum, lock,
                         )
                         .await?
                     }
@@ -940,7 +1016,7 @@ async fn handle_request(
                 &metadata,
                 tags.as_deref(),
                 &copy_source_preconditions,
-                CopyKeys { source: source_key.as_ref(), dest: wanted, role, checksum },
+                CopyKeys { source: source_key.as_ref(), dest: wanted, role, checksum, lock },
             )
             .await?
         }
@@ -949,9 +1025,14 @@ async fn handle_request(
                 if let Err(refused) = checksums::check_put_type(req.headers(), payload.declared_algorithm()) {
                     return Ok(box_response(refused));
                 }
+                // A retained object's body must declare a checksum, as in S3.
+                if !object_lock::declares_checksum(req.headers()) && object_lock::needs_checksum(&app, &bucket, &lock).await? {
+                    return Ok(box_response(object_lock::missing_checksum()));
+                }
                 let body = req.into_body();
                 put_object(
                     &app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &preconditions, wanted, role,
+                    lock,
                 )
                 .await?
             }
@@ -1037,6 +1118,30 @@ pub fn error_response(e: &anyhow::Error) -> Response<ResBody> {
         )
     };
     box_response(resp)
+}
+
+/// Why a request is refused by policy, if it is: as S3 refuses it, a
+/// bucket that doesn't exist is a 404 to anyone (bucket names aren't
+/// secret, only what's in them is), but to CreateBucket, which is about a
+/// bucket that isn't there yet.
+fn refusal(
+    access: &access::Access,
+    operation: &actions::Operation,
+    exists: bool,
+) -> Option<hyper::Response<http_body_util::Full<hyper::body::Bytes>>> {
+    let (check, verdict) = access.first_denied(&operation.checks)?;
+    if !exists && operation.name != "CreateBucket" {
+        return Some(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist"));
+    }
+    Some(access.denied(check, verdict))
+}
+
+/// The check of bypassing a GOVERNANCE retention of a version of `key`.
+fn bypass_check(bucket: &str, key: &str) -> actions::Check {
+    actions::Check {
+        action: "s3:BypassGovernanceRetention",
+        on: actions::On::Object(bucket.to_owned(), key.to_owned()),
+    }
 }
 
 /// A 403 with the given S3 error code.

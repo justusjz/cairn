@@ -80,6 +80,7 @@ async fn put_with(app: &Arc<App>, key: &str, data: Vec<u8>, pairs: &[(&str, &str
         sealing: None,
         checksum: Wanted::ClientsOr(Algorithm::Crc64Nvme),
         tags: String::new(),
+        lock: Default::default(),
     };
     let unsigned = [&[("x-amz-content-sha256", "UNSIGNED-PAYLOAD")], pairs].concat();
     let payload = Payload::new(&headers(&unsigned), "secret", true).unwrap();
@@ -148,7 +149,7 @@ async fn an_sse_c_objects_checksum_is_sealed() {
 /// it's given. Its ID.
 async fn create(app: &Arc<App>, key: &str, checksum: Option<(Algorithm, Type)>, customer: Option<&CustomerKey>) -> String {
     let wanted = sse::Wanted::new(customer, None);
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, None, checksum).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, None, checksum, Default::default()).await.unwrap();
     let (status, headers, body) = text(response).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(

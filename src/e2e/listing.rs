@@ -290,7 +290,7 @@ async fn a_version_marker_may_be_gone() {
     let delete_version = |v: String| {
         let app = app.clone();
         async move {
-            let response = delete_object(&app, BUCKET, "k", Some(&v)).await.unwrap();
+            let response = delete_object(&app, BUCKET, "k", Some(&v), false).await.unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
         }
     };
@@ -373,7 +373,7 @@ async fn walks_uploads_and_common_prefixes() {
     // Created out of key order: each key's uploads list in the order they
     // were created, after the keys before it.
     for key in ["c", "b/2", "a", "b/1", "a"] {
-        let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None).await.unwrap();
+        let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default()).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let body = std::str::from_utf8(&body).unwrap();
         let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();

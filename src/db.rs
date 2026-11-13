@@ -46,7 +46,7 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "4";
+pub(crate) const PROTOCOL: &str = "5";
 
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
@@ -206,6 +206,7 @@ const MIGRATIONS: &[&str] = &[
     LOGINS,
     OIDC,
     USER_NAMES,
+    OBJECT_LOCK,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1458,6 +1459,91 @@ BEGIN
     RETURN NEW;
 END
 $$;
+"#;
+
+/// Migration 37: Object Lock, as in S3 (see `s3::object_lock`). A bucket
+/// may have it enabled (for good: then it stays versioned), with a default
+/// retention for new versions; a version may have a retention (a mode and
+/// the time it lasts until) and a legal hold, as may an upload, for the
+/// version it completes. Locked versions are kept from being deleted by
+/// the catalog's functions, and, for a legal hold and compliance mode, by
+/// triggers too, which no request can get around.
+///
+/// Lock protocol 5: the protocol itself doesn't change, but a node of
+/// protocol 4 knows no locks, and would delete locked versions.
+const OBJECT_LOCK: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '5' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE buckets
+    ADD COLUMN object_lock boolean NOT NULL DEFAULT false,
+    ADD COLUMN lock_mode text CHECK (lock_mode IN ('GOVERNANCE', 'COMPLIANCE')),
+    ADD COLUMN lock_days int CHECK (lock_days > 0),
+    ADD COLUMN lock_years int CHECK (lock_years > 0),
+    ADD CONSTRAINT buckets_lock_default CHECK (
+        (lock_mode IS NULL AND lock_days IS NULL AND lock_years IS NULL)
+        OR (object_lock AND lock_mode IS NOT NULL AND (lock_days IS NULL) <> (lock_years IS NULL))
+    ),
+    ADD CONSTRAINT buckets_lock_versioned CHECK (NOT object_lock OR versioning = 'enabled');
+
+ALTER TABLE objects
+    ADD COLUMN retain_mode text CHECK (retain_mode IN ('GOVERNANCE', 'COMPLIANCE')),
+    ADD COLUMN retain_until timestamptz,
+    ADD COLUMN legal_hold boolean,
+    ADD CONSTRAINT objects_retention CHECK ((retain_mode IS NULL) = (retain_until IS NULL));
+ALTER TABLE multipart_uploads
+    ADD COLUMN retain_mode text CHECK (retain_mode IN ('GOVERNANCE', 'COMPLIANCE')),
+    ADD COLUMN retain_until timestamptz,
+    ADD COLUMN legal_hold boolean,
+    ADD CONSTRAINT multipart_uploads_retention CHECK ((retain_mode IS NULL) = (retain_until IS NULL));
+
+-- Object Lock stays enabled once it is.
+CREATE FUNCTION cairn_keep_object_lock() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    RAISE EXCEPTION 'Object Lock can''t be disabled on bucket %', OLD.name
+        USING ERRCODE = 'insufficient_privilege';
+END
+$$;
+CREATE TRIGGER buckets_object_lock BEFORE UPDATE OF object_lock ON buckets
+    FOR EACH ROW WHEN (OLD.object_lock AND NOT NEW.object_lock)
+    EXECUTE FUNCTION cairn_keep_object_lock();
+
+-- A version under a legal hold, or retained in compliance mode, is never
+-- deleted, and its compliance retention only ever lengthens while it lasts.
+CREATE FUNCTION cairn_protect_locked() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        IF OLD.legal_hold OR (OLD.retain_mode = 'COMPLIANCE' AND OLD.retain_until > now()) THEN
+            RAISE EXCEPTION 'version % of %/% is protected by Object Lock', OLD.version_id, OLD.bucket, OLD.key
+                USING ERRCODE = 'insufficient_privilege';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF OLD.retain_mode = 'COMPLIANCE' AND OLD.retain_until > now()
+       AND (NEW.retain_mode IS DISTINCT FROM 'COMPLIANCE' OR NEW.retain_until IS NULL
+            OR NEW.retain_until < OLD.retain_until
+            OR NEW.bucket <> OLD.bucket OR NEW.key <> OLD.key OR NEW.version_id <> OLD.version_id) THEN
+        RAISE EXCEPTION 'the compliance retention of version % of %/% can''t be shortened', OLD.version_id, OLD.bucket, OLD.key
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    IF OLD.legal_hold AND NEW.legal_hold
+       AND (NEW.bucket <> OLD.bucket OR NEW.key <> OLD.key OR NEW.version_id <> OLD.version_id) THEN
+        RAISE EXCEPTION 'version % of %/% is under a legal hold', OLD.version_id, OLD.bucket, OLD.key
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER objects_locked BEFORE DELETE OR UPDATE ON objects
+    FOR EACH ROW WHEN (OLD.legal_hold OR OLD.retain_mode = 'COMPLIANCE')
+    EXECUTE FUNCTION cairn_protect_locked();
 "#;
 
 #[cfg(test)]

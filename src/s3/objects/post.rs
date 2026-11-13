@@ -43,7 +43,7 @@ use crate::{
         buckets::encryption::default_request,
         checksums,
         conditional::Preconditions,
-        metadata,
+        metadata, object_lock,
         objects::put::put_object,
         post_policy::{Fields, Policy, field},
         sse, sse_c,
@@ -355,6 +355,9 @@ where
     let principal = signed.as_ref().map(|(_, principal, _)| principal);
     let origin = access::Origin { peer, trusted_proxies: &app.trusted_proxies, signed: signature.as_ref(), form: true };
     let mut access = access::Access::new(principal, &account, &Method::POST, &headers, "", &origin)?;
+    let header = |name| headers.get(name).and_then(|v| v.to_str().ok());
+    let (mode, until, hold) = (header(object_lock::MODE), header(object_lock::RETAIN_UNTIL), header(object_lock::LEGAL_HOLD));
+    object_lock::set_context(&mut access.context, mode, until, hold);
     let exists = access.load(app, &bucket).await?;
     if let Some((check, verdict)) = access.first_denied(&operation.checks) {
         return Ok(match exists {
@@ -408,10 +411,15 @@ where
     if let Err(refused) = checksums::check_put_type(&headers, payload.declared_algorithm()) {
         return Ok(refused);
     }
+    // Its Object Lock, as a PutObject's headers ask for it.
+    let lock = match object_lock::Lock::from_headers(&headers) {
+        Ok(lock) => lock,
+        Err(refused) => return Ok(refused),
+    };
     let conditions = Preconditions::default();
     let role = principal.map(|principal| principal.id);
     let body = FileBody(file);
-    let response = match put_object(app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &conditions, wanted, role)
+    let response = match put_object(app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &conditions, wanted, role, lock)
         .await
     {
         Ok(response) => response,
@@ -437,7 +445,7 @@ const SIGNING_FIELDS: [&str; 7] =
 /// that aren't one are left out, as a PutObject's other headers are ignored:
 /// none of them can say anything about how the body is framed or signed.
 fn headers(fields: &Fields) -> Result<HeaderMap, Response<Full<Bytes>>> {
-    const SAME: [&str; 17] = [
+    const SAME: [&str; 20] = [
         "content-type",
         "cache-control",
         "content-disposition",
@@ -455,6 +463,9 @@ fn headers(fields: &Fields) -> Result<HeaderMap, Response<Full<Bytes>>> {
         checksums::TYPE,
         "x-amz-storage-class",
         "x-amz-acl",
+        object_lock::MODE,
+        object_lock::RETAIN_UNTIL,
+        object_lock::LEGAL_HOLD,
     ];
     let mut headers = HeaderMap::new();
     for (name, value) in fields {

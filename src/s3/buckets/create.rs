@@ -43,8 +43,9 @@ pub fn valid_bucket_name(name: &str) -> bool {
 }
 
 /// Creates a bucket of account `account` (its ID). Shared by CreateBucket
-/// and the console.
-pub async fn create(app: &App, name: &str, account: &str) -> anyhow::Result<Creation> {
+/// and the console. With `object_lock`, it has Object Lock enabled (see
+/// `s3::object_lock`), and so is versioned, from the start.
+pub async fn create(app: &App, name: &str, account: &str, object_lock: bool) -> anyhow::Result<Creation> {
     if !valid_bucket_name(name) {
         return Ok(Creation::InvalidName);
     }
@@ -58,8 +59,10 @@ pub async fn create(app: &App, name: &str, account: &str) -> anyhow::Result<Crea
     }
     let inserted = client
         .execute_cached(
-            "INSERT INTO buckets (name, account_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            &[&name, &account],
+            "INSERT INTO buckets (name, account_id, object_lock, versioning)
+             VALUES ($1, $2, $3, CASE WHEN $3 THEN 'enabled' ELSE 'unversioned' END)
+             ON CONFLICT DO NOTHING",
+            &[&name, &account, &object_lock],
         )
         .await?;
     if inserted == 1 {
@@ -75,11 +78,17 @@ pub async fn create(app: &App, name: &str, account: &str) -> anyhow::Result<Crea
     })
 }
 
-/// CreateBucket: `PUT /{bucket}`, by a user of `account`. Creating a bucket
-/// that exists succeeds, as it does for its owner in S3's us-east-1; another
-/// account's is BucketAlreadyExists, as in S3.
-pub async fn create_bucket(app: &App, bucket: &str, account: &str) -> anyhow::Result<Response<Full<Bytes>>> {
-    match create(app, bucket, account).await? {
+/// CreateBucket: `PUT /{bucket}`, by a user of `account`, with Object Lock
+/// if `object_lock` (`x-amz-bucket-object-lock-enabled: true`). Creating a
+/// bucket that exists succeeds, as it does for its owner in S3's us-east-1
+/// (and changes nothing); another account's is BucketAlreadyExists, as in S3.
+pub async fn create_bucket(
+    app: &App,
+    bucket: &str,
+    account: &str,
+    object_lock: bool,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    match create(app, bucket, account, object_lock).await? {
         Creation::InvalidName => {
             return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidBucketName", "the specified bucket is not valid"));
         }

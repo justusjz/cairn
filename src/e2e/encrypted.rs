@@ -49,7 +49,7 @@ async fn commit(
                      $1, ARRAY[$2::int], ARRAY[0::smallint], $3, 65536, 1::smallint, 0::smallint, 1048576,
                      ARRAY[0::bigint], 0, $4, $4, $5, $6,
                      $7, $8, 'application/octet-stream', '', $9, NULL, NULL, NULL, NULL, false,
-                     NULL, NULL, NULL, '', false, NULL, $10)",
+                     NULL, NULL, NULL, '', false, NULL, $10, NULL, NULL, NULL)",
                     &[
                         &blob,
                         &app.node,
@@ -135,7 +135,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
         .query_one(
             "SELECT status FROM pg_temp.cairn_copy_object(
                  $1, ARRAY[$2::bigint], ARRAY[1016::bigint], $3, 'c', 1000, 'etag', 'x', '', $4,
-                 NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, '', false, $5)",
+                 NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, '', false, $5, NULL, NULL, NULL)",
             &[&object_id, &part_id, &BUCKET, &&KEY_CHECK[..], &crate::s3::versions::new_version_id()],
         )
         .await
@@ -287,7 +287,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
                      $1, ARRAY[$2::int], ARRAY[0::smallint], 1016, 65536, 1::smallint, 0::smallint, 1048576,
                      ARRAY[0::bigint], 0, 'etag', 'etag', $3, $4,
                      $5, 'bad', 'x', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL,
-                     '', false, NULL, $6)",
+                     '', false, NULL, $6, NULL, NULL, NULL)",
                 &[
                     &blob,
                     &app.node,
@@ -554,6 +554,7 @@ async fn copies_keep_or_change_encryption() {
         source: Some(&k1),
         dest: Wanted::Customer(&k1), role: None,
         checksum: None,
+        lock: Default::default(),
     };
     assert_eq!(
         copy(&app, "src", "same", same).await,
@@ -581,6 +582,7 @@ async fn copies_keep_or_change_encryption() {
                 source: Some(&k1),
                 dest: Wanted::Customer(&k2), role: None,
                 checksum: None,
+                lock: Default::default(),
             },
             Some(&k2),
         ),
@@ -591,6 +593,7 @@ async fn copies_keep_or_change_encryption() {
                 source: Some(&k1),
                 dest: Wanted::Plain, role: None,
                 checksum: None,
+                lock: Default::default(),
             },
             None,
         ),
@@ -601,6 +604,7 @@ async fn copies_keep_or_change_encryption() {
                 source: None,
                 dest: Wanted::Customer(&k2), role: None,
                 checksum: None,
+                lock: Default::default(),
             },
             Some(&k2),
         ),
@@ -644,6 +648,7 @@ async fn copies_keep_or_change_encryption() {
             source,
             dest: Wanted::Customer(&k1), role: None,
             checksum: None,
+            lock: Default::default(),
         };
         assert_eq!(
             copy(&app, "src", "nope", keys).await.0,
@@ -659,6 +664,7 @@ async fn copies_keep_or_change_encryption() {
         source: Some(&k1),
         dest: Wanted::Customer(&k2), role: None,
         checksum: None,
+        lock: Default::default(),
     };
     assert_eq!(copy(&app, "src", "src", rotate).await.0, StatusCode::OK);
     assert_eq!(
@@ -684,7 +690,7 @@ async fn part_copies_of_and_into_sse_c() {
         let app = app.clone();
         let customer = customer.map(|c| customer_key(c.key()));
         async move {
-            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", "", Wanted::new(customer.as_ref(), None), None, None)
+            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", "", Wanted::new(customer.as_ref(), None), None, None, Default::default())
                 .await
                 .unwrap();
             use http_body_util::BodyExt;
@@ -761,6 +767,7 @@ async fn part_copies_of_and_into_sse_c() {
                 source: None,
                 dest: Wanted::Plain, role: None,
                 checksum: None,
+                lock: Default::default(),
             }
         )
         .await,
@@ -775,6 +782,7 @@ async fn part_copies_of_and_into_sse_c() {
                 source: Some(&k1),
                 dest: Wanted::Plain, role: None,
                 checksum: None,
+                lock: Default::default(),
             }
         )
         .await,
@@ -797,6 +805,7 @@ async fn part_copies_of_and_into_sse_c() {
                 source: None,
                 dest: Wanted::Plain, role: None,
                 checksum: None,
+                lock: Default::default(),
             }
         )
         .await,
@@ -811,6 +820,7 @@ async fn part_copies_of_and_into_sse_c() {
                 source: None,
                 dest: Wanted::Customer(&k1), role: None,
                 checksum: None,
+                lock: Default::default(),
             }
         )
         .await,
@@ -825,6 +835,7 @@ async fn part_copies_of_and_into_sse_c() {
                 source: None,
                 dest: Wanted::Customer(&k2), role: None,
                 checksum: None,
+                lock: Default::default(),
             }
         )
         .await,

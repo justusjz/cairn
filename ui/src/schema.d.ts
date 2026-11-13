@@ -1184,6 +1184,8 @@ export interface components {
              */
             default_kms_key?: string | null;
             name: string;
+            /** @description Whether it has Object Lock enabled (see `s3::object_lock`). */
+            object_lock: boolean;
             /**
              * Format: int64
              * @description Current versions that aren't delete markers.
@@ -1782,6 +1784,11 @@ export interface components {
         };
         NewBucket: {
             name: string;
+            /**
+             * @description Whether it has Object Lock enabled (and so is versioned) from the
+             *     start: it can't be disabled again.
+             */
+            object_lock?: boolean;
         };
         NewGrant: {
             bucket: string;
