@@ -106,12 +106,20 @@ type Result<T> = std::result::Result<T, Error>;
 struct Params(HashMap<String, String>);
 
 impl Params {
-    fn parse(text: &str, into: &mut HashMap<String, String>) {
+    /// Adds `text`'s parameters to `into`. A parameter given twice (in the
+    /// query and the body, say) is refused, rather than one overriding the
+    /// other: the query's may be all a signature covers.
+    fn parse(text: &str, into: &mut HashMap<String, String>) -> Result<()> {
         for pair in text.split('&').filter(|p| !p.is_empty()) {
             let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
             let decode = |s: &str| decode_path_param(&s.replace('+', " "));
-            into.insert(decode(k), decode(v));
+            let name = decode(k);
+            if into.contains_key(&name) {
+                return Err(error(StatusCode::BAD_REQUEST, "MalformedQueryString", format!("the parameter {name} is given more than once")));
+            }
+            into.insert(name, decode(v));
         }
+        Ok(())
     }
 
     fn get(&self, name: &str) -> Option<&str> {
@@ -197,10 +205,10 @@ async fn respond(
     crate::auth::verify_sigv4_with_body(parts.method.as_str(), parts.uri.path(), query, &parts.headers, &principal.secret, &body)
         .map_err(|r| error(r.status, if r.code == "SignatureDoesNotMatch" { "SignatureDoesNotMatch" } else { "AccessDenied" }, r.message))?;
     let mut params = HashMap::new();
-    Params::parse(query, &mut params);
+    Params::parse(query, &mut params)?;
     if !body.is_empty() {
         let text = std::str::from_utf8(&body).map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body isn't UTF-8"))?;
-        Params::parse(text, &mut params);
+        Params::parse(text, &mut params)?;
     }
     let params = Params(params);
     let action = params.required("Action")?.to_owned();
@@ -631,8 +639,10 @@ mod tests {
     #[test]
     fn decodes_forms() {
         let mut params = HashMap::new();
-        Params::parse("Action=PutUserPolicy&PolicyDocument=%7B%22a%22%3A+1%7D&UserName=a%2Bb", &mut params);
+        Params::parse("Action=PutUserPolicy&PolicyDocument=%7B%22a%22%3A+1%7D&UserName=a%2Bb", &mut params).ok().unwrap();
         assert_eq!(params["PolicyDocument"], "{\"a\": 1}");
         assert_eq!(params["UserName"], "a+b");
+        // Not given twice: the body can't override the (signed) query.
+        assert!(Params::parse("Action=CreateAccessKey", &mut params).is_err());
     }
 }

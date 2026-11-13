@@ -484,7 +484,7 @@ fn verify_sigv4_at(
     body_hash: Option<&str>,
 ) -> Result<(), Rejection> {
     if !headers.contains_key("authorization") {
-        return verify_presigned_at(method, path, query, headers, secret, now);
+        return verify_presigned_at(method, path, query, headers, secret, now, body_hash);
     }
     if presigned(query) {
         return Err(Rejection::new(
@@ -560,8 +560,10 @@ fn verify_sigv4_at(
 
 /// Verifies a presigned URL: a SigV4 signature in the query (`X-Amz-*`), as S3
 /// does. It's valid from its `X-Amz-Date` (give or take the clock skew S3
-/// allows) for `X-Amz-Expires` seconds, at most a week. Its body is unsigned,
-/// unless it comes with a (signed) `x-amz-content-sha256`; `host` and every
+/// allows) for `X-Amz-Expires` seconds, at most a week. For S3 its body is
+/// unsigned, unless it comes with a (signed) `x-amz-content-sha256`; for
+/// another service (`body_hash`), its signature covers its body, as with a
+/// signed header, so a body can't be added to a leaked URL. `host` and every
 /// `x-amz-*` header must be signed, as with a signed header.
 fn verify_presigned_at(
     method: &str,
@@ -570,6 +572,7 @@ fn verify_presigned_at(
     headers: &HeaderMap,
     secret: &str,
     now: i64,
+    body_hash: Option<&str>,
 ) -> Result<(), Rejection> {
     let parameters_error = |message: &str| {
         Rejection::new(
@@ -615,6 +618,15 @@ fn verify_presigned_at(
         return Err(access_denied("Request has expired"));
     }
     let payload_hash = match headers.get("x-amz-content-sha256").map(|v| v.to_str()) {
+        Some(Ok(value)) if body_hash.is_some_and(|hash| hash == value) => value,
+        Some(_) if body_hash.is_some() => {
+            return Err(Rejection::new(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "x-amz-content-sha256 isn't the body's SHA-256",
+            ));
+        }
+        None if body_hash.is_some() => body_hash.unwrap(),
         None => "UNSIGNED-PAYLOAD",
         Some(Ok(value)) if valid_payload_hash(value) => value,
         Some(_) => {
@@ -902,6 +914,33 @@ pub(crate) mod tests {
 
     fn verify_aws_presigned(query: &str, headers: &HeaderMap, now: i64) -> Result<(), Rejection> {
         verify_sigv4_at("GET", "/test.txt", query, headers, AWS_SECRET, now, None)
+    }
+
+    /// A presigned IAM request (another service than S3) signs its body:
+    /// one presigned with none can't be sent with one, to run another action.
+    #[test]
+    fn a_presigned_iam_request_signs_its_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert("host", "localhost:8333".parse().unwrap());
+        let query = format!(
+            "Action=ListAccessKeys&Version=2010-05-08&X-Amz-Algorithm=AWS4-HMAC-SHA256\
+             &X-Amz-Credential=akid%2F{}%2Fus-east-1%2Fiam%2Faws4_request\
+             &X-Amz-Date={DATE}&X-Amz-Expires=3600&X-Amz-SignedHeaders=host",
+            &DATE[..8]
+        );
+        let auth = Authorization::from_query(&format!("{query}&X-Amz-Signature=x")).unwrap();
+        let canonical = canonical_request("POST", "/", &query, &headers, &auth, EMPTY_SHA256);
+        let sts = format!("AWS4-HMAC-SHA256\n{DATE}\n{}\n{}", auth.scope, sha256_hex(canonical.as_bytes()));
+        let key = derive_signing_key(SECRET, &auth.date, &auth.region, &auth.service);
+        let signature: String = hmac_sha256(&key, sts.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
+        let query = format!("{query}&X-Amz-Signature={signature}");
+        let now = parse_amz_date(DATE).unwrap();
+        let verify = |body: &[u8]| {
+            verify_sigv4_at("POST", "/", &query, &headers, SECRET, now, Some(&sha256_hex(body)))
+        };
+        assert_eq!(verify(b""), Ok(()));
+        let rejection = verify(b"Action=CreateAccessKey&UserName=root").unwrap_err();
+        assert_eq!(rejection.code, "SignatureDoesNotMatch");
     }
 
     fn aws_host() -> HeaderMap {
