@@ -138,8 +138,9 @@ impl Counts {
         } else if status.is_server_error() {
             self.server_errors += 1;
         }
-        self.bytes_in += bytes_in;
-        self.latency_us += latency.as_micros() as u64;
+        // What a client claims to send can be anything.
+        self.bytes_in = self.bytes_in.saturating_add(bytes_in);
+        self.latency_us = self.latency_us.saturating_add(latency.as_micros() as u64);
     }
 }
 
@@ -605,9 +606,12 @@ pub fn bytes_in(headers: &HeaderMap) -> u64 {
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
     };
+    // At most an object's size: S3 takes no more, so a request that claims
+    // more is refused, whatever it sends.
     header("x-amz-decoded-content-length")
         .or_else(|| header("content-length"))
         .unwrap_or(0)
+        .min(crate::s3::util::MAX_OBJECT)
 }
 
 #[cfg(test)]
@@ -675,5 +679,19 @@ mod tests {
         assert_eq!(get.counts.bytes_out, 5);
         assert_eq!(get.counts.latency_us, 2000);
         assert_eq!(report.requests.history[0].counts.bytes_out, 5);
+    }
+
+    /// What a client claims to send counts as at most an object's size, and
+    /// the counts saturate rather than overflow (which panics with overflow
+    /// checks, holding the lock every request takes).
+    #[test]
+    fn claimed_sizes_cant_overflow_the_counts() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-length", u64::MAX.to_string().parse().unwrap());
+        assert_eq!(bytes_in(&headers), crate::s3::util::MAX_OBJECT);
+        let mut counts = Counts::default();
+        counts.count(StatusCode::OK, u64::MAX - 1, Duration::ZERO);
+        counts.count(StatusCode::OK, u64::MAX - 1, Duration::ZERO);
+        assert_eq!(counts.bytes_in, u64::MAX);
     }
 }

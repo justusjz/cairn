@@ -203,7 +203,8 @@ pub async fn read_table(
 ) -> io::Result<Vec<u8>> {
     let blocks = expected.blocks_of(of);
     let block_size = blocks.block_size;
-    let end = offset + length;
+    // From a peer's request, so anything: past the end, if it overflows.
+    let end = offset.checked_add(length).unwrap_or(u64::MAX);
     if block_size == 0
         || of >= expected.layout.shards()
         || !offset.is_multiple_of(block_size)
@@ -319,6 +320,8 @@ mod tests {
         assert_eq!(&rest[..1000 - 256], &data[256..]);
 
         assert!(open_range(&mut file, &f, 100, 10).await.is_err(), "unaligned");
+        // A range whose end overflows (as a peer may ask for): past the end.
+        assert!(open_range(&mut file, &f, 256, u64::MAX - 255).await.is_err(), "overflowing");
         let wrong_blob = ShardFile { blob_id: Uuid::now_v7(), ..f };
         assert!(open_range(&mut file, &wrong_blob, 0, 256).await.is_err());
         // A wrong block size with the same block count (and so the same file
