@@ -135,7 +135,7 @@ async fn sizes_salts_and_key_checks_carry_through() {
         .query_one(
             "SELECT status FROM pg_temp.cairn_copy_object(
                  $1, ARRAY[$2::bigint], ARRAY[1016::bigint], $3, 'c', 1000, 'etag', 'x', '', $4,
-                 NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, '', false, $5, NULL, NULL, NULL)",
+                 NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, '', false, $5, NULL, NULL, NULL, false, NULL)",
             &[&object_id, &part_id, &BUCKET, &&KEY_CHECK[..], &crate::s3::versions::new_version_id()],
         )
         .await
@@ -556,6 +556,7 @@ async fn copies_keep_or_change_encryption() {
         dest: Wanted::Customer(&k1), role: None,
         checksum: None,
         lock: Default::default(),
+        conditions: None,
     };
     assert_eq!(
         copy(&app, "src", "same", same).await,
@@ -581,6 +582,7 @@ async fn copies_keep_or_change_encryption() {
         dest: Wanted::Customer(&k2), role: None,
         checksum: None,
         lock: Default::default(),
+        conditions: None,
     };
     assert_eq!(copy(&app, "src", "rekeyed", rekeyed).await, (StatusCode::OK, etag.clone()));
     assert_eq!(blob_and_salt(&app, "rekeyed").await, blob_and_salt(&app, "src").await);
@@ -597,6 +599,7 @@ async fn copies_keep_or_change_encryption() {
                 dest: Wanted::Plain, role: None,
                 checksum: None,
                 lock: Default::default(),
+                conditions: None,
             },
             None,
         ),
@@ -608,6 +611,7 @@ async fn copies_keep_or_change_encryption() {
                 dest: Wanted::Customer(&k2), role: None,
                 checksum: None,
                 lock: Default::default(),
+                conditions: None,
             },
             Some(&k2),
         ),
@@ -652,6 +656,7 @@ async fn copies_keep_or_change_encryption() {
             dest: Wanted::Customer(&k1), role: None,
             checksum: None,
             lock: Default::default(),
+            conditions: None,
         };
         assert_eq!(
             copy(&app, "src", "nope", keys).await.0,
@@ -668,6 +673,7 @@ async fn copies_keep_or_change_encryption() {
         dest: Wanted::Customer(&k2), role: None,
         checksum: None,
         lock: Default::default(),
+        conditions: None,
     };
     // Which changes only its record of the key: its bytes stay.
     let before = blob_and_salt(&app, "src").await;
@@ -774,6 +780,7 @@ async fn part_copies_of_and_into_sse_c() {
                 dest: Wanted::Plain, role: None,
                 checksum: None,
                 lock: Default::default(),
+                conditions: None,
             }
         )
         .await,
@@ -789,6 +796,7 @@ async fn part_copies_of_and_into_sse_c() {
                 dest: Wanted::Plain, role: None,
                 checksum: None,
                 lock: Default::default(),
+                conditions: None,
             }
         )
         .await,
@@ -812,6 +820,7 @@ async fn part_copies_of_and_into_sse_c() {
                 dest: Wanted::Plain, role: None,
                 checksum: None,
                 lock: Default::default(),
+                conditions: None,
             }
         )
         .await,
@@ -827,6 +836,7 @@ async fn part_copies_of_and_into_sse_c() {
                 dest: Wanted::Customer(&k1), role: None,
                 checksum: None,
                 lock: Default::default(),
+                conditions: None,
             }
         )
         .await,
@@ -842,6 +852,7 @@ async fn part_copies_of_and_into_sse_c() {
                 dest: Wanted::Customer(&k2), role: None,
                 checksum: None,
                 lock: Default::default(),
+                conditions: None,
             }
         )
         .await,

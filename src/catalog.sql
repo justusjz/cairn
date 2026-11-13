@@ -843,7 +843,10 @@ $$;
 -- T3: CopyObject's commit: a new version at (bucket, key) with parts on the
 -- source version's bytes ('committed', with the new version's last-modified
 -- time in ISO 8601, as CopyObject reports it), unless the source changed since the
--- copy read it ('source_changed') or the bucket is gone ('no_such_bucket').
+-- copy read it ('source_changed') or the bucket is gone ('no_such_bucket'),
+-- or a conditional copy (If-Match, If-None-Match) was decided against
+-- another version than the current one (`p_expected`, NULL for none;
+-- 'stale', for the caller to decide again).
 -- Takes B(b) shared, K(b,k), then X: the source's blobs shared, and those of
 -- the version it replaces. The copy's checksum is Cairn's to work out; its
 -- parts keep the source's parts' checksums if `p_part_checksums` (they're in
@@ -855,6 +858,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean, p_checksum_algorithm text,
     p_checksum_type text, p_checksum text, p_tags text, p_part_checksums boolean,
     p_new_version_id text, p_lock_mode text, p_lock_until timestamptz, p_legal_hold boolean,
+    p_conditional boolean, p_expected bigint,
     OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -876,6 +880,11 @@ BEGIN
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
+    IF p_conditional
+       AND pg_temp.cairn_current_version(p_bucket, p_key) IS DISTINCT FROM p_expected THEN
+        status := 'stale';
+        RETURN;
+    END IF;
     v_sources := pg_temp.cairn_source_blobs(p_source);
     v_freed := pg_temp.cairn_freed_by_put(p_bucket, p_key, v_versioning);
     SELECT * INTO f FROM pg_temp.cairn_freeable(v_freed);

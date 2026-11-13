@@ -750,6 +750,10 @@ async fn handle_request(
     // The headers a read's `response-*` parameters replace (GET and HEAD).
     let overrides = match *req.method() {
         Method::GET | Method::HEAD => match metadata::Overrides::from_query(&query) {
+            // Only a signed read may choose its response's headers.
+            Ok(overrides) if principal.is_none() && !overrides.is_empty() => {
+                return Ok(box_response(metadata::Overrides::refused_anonymously()));
+            }
             Ok(overrides) => overrides,
             Err(refused) => return Ok(box_response(refused)),
         },
@@ -821,7 +825,7 @@ async fn handle_request(
         .headers()
         .get(hyper::header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
+        .unwrap_or(metadata::DEFAULT_CONTENT_TYPE)
         .to_owned();
     // A PUT carrying x-amz-copy-source is a CopyObject (server-side copy); its
     // metadata-directive decides whether the destination inherits the source's
@@ -868,6 +872,12 @@ async fn handle_request(
         Some(b"REPLACE") => Ok(true),
         Some(_) => Err(format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", "Unknown tagging directive.")),
     };
+    // A write's If-None-Match is `*`, if any (see `unsupported_on_write`).
+    if matches!(operation.name, "PutObject" | "CopyObject")
+        && let Some(refused) = preconditions.unsupported_on_write()
+    {
+        return Ok(box_response(refused));
+    }
     let resp = match req.method().clone() {
         hyper::Method::HEAD => {
             let response = head_object(
@@ -983,6 +993,11 @@ async fn handle_request(
         // variant, UploadPartCopy, is handled above). The source is read
         // server-side, so the request body is ignored.
         hyper::Method::PUT if copy_source.is_some() => {
+            // COPY (the default) or REPLACE, case-sensitive, as in S3 (probed).
+            if !matches!(metadata_directive.as_deref(), None | Some("COPY" | "REPLACE")) {
+                let message = "Unknown metadata directive.";
+                return Ok(box_response(format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message)));
+            }
             // The request's tags only matter if they replace the source's.
             let tags = match replaces_tags {
                 Ok(false) => None,
@@ -1018,7 +1033,7 @@ async fn handle_request(
                 &metadata,
                 tags.as_deref(),
                 &copy_source_preconditions,
-                CopyKeys { source: source_key.as_ref(), dest: wanted, role, checksum, lock },
+                CopyKeys { source: source_key.as_ref(), dest: wanted, role, checksum, lock, conditions: Some(&preconditions) },
             )
             .await?
         }

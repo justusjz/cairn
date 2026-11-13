@@ -310,7 +310,7 @@ async fn copy(
         "x",
         "", None,
         &Preconditions::default(),
-        CopyKeys { lock: Default::default(), source, dest, role: Some(role), checksum: None },
+        CopyKeys { lock: Default::default(), source, dest, role: Some(role), checksum: None, conditions: None },
     )
     .await
     .unwrap();

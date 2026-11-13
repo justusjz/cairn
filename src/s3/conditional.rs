@@ -23,6 +23,10 @@ pub struct Preconditions {
 }
 
 impl Preconditions {
+    /// No conditions at all.
+    pub const NONE: Preconditions =
+        Preconditions { if_match: None, if_none_match: None, if_modified_since: None, if_unmodified_since: None };
+
     /// Reads the standard conditional headers (If-Match, If-None-Match,
     /// If-Modified-Since, If-Unmodified-Since) — used by GET and HEAD.
     pub fn from_headers(headers: &HeaderMap) -> Self {
@@ -87,6 +91,18 @@ impl Preconditions {
     /// date conditions are not honored on writes, so they don't count.
     pub fn has_write_conditions(&self) -> bool {
         self.if_match.is_some() || self.if_none_match.is_some()
+    }
+
+    /// S3's 501 for a write's If-None-Match other than `*` (probed): it only
+    /// writes if there's no object, not if there's another.
+    pub fn unsupported_on_write(&self) -> Option<Response<Full<Bytes>>> {
+        self.if_none_match.as_deref().filter(|value| value.trim() != "*").map(|_| {
+            crate::s3::util::format_s3_error(
+                StatusCode::NOT_IMPLEMENTED,
+                "NotImplemented",
+                "A header you provided implies functionality that is not implemented",
+            )
+        })
     }
 
     /// Whether there's an If-Match, which, without an object to match, is a
@@ -345,5 +361,18 @@ mod tests {
             conds(Some("\"abc\""), None, None, Some(EARLIER)).evaluate("abc", REF, true),
             Precondition::Proceed
         );
+    }
+
+    #[test]
+    fn a_write_takes_if_none_match_star_alone() {
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert("if-none-match", value.parse().unwrap());
+            Preconditions::from_headers(&headers)
+        };
+        assert!(with("*").unsupported_on_write().is_none());
+        assert!(with(" * ").unsupported_on_write().is_none());
+        assert!(with("\"abc\"").unsupported_on_write().is_some());
+        assert!(Preconditions::NONE.unsupported_on_write().is_none());
     }
 }

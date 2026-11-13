@@ -106,7 +106,7 @@ async fn copy_object(
 ) -> String {
     let size: i64 = source.2.iter().sum();
     tx.query_one(
-        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, '', false, $7, NULL, NULL, NULL)",
+        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, '', false, $7, NULL, NULL, NULL, false, NULL)",
         &[&source.0, &source.1, &source.2, &BUCKET, &key, &size, &crate::s3::versions::new_version_id()],
     )
     .await

@@ -400,7 +400,7 @@ where
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream")
+        .unwrap_or(metadata::DEFAULT_CONTENT_TYPE)
         .to_owned();
     let (min, max) = signed.as_ref().and_then(|(_, _, policy)| policy.length_range()).unwrap_or((0, util::MAX_UPLOAD));
     let secret = principal.map_or("", |principal| principal.secret.as_str());

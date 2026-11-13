@@ -112,7 +112,7 @@ where
 }
 
 /// S3's 404 for an If-Match without an object to match.
-fn no_such_key() -> Response<Full<Bytes>> {
+pub(crate) fn no_such_key() -> Response<Full<Bytes>> {
     format_s3_error(
         StatusCode::NOT_FOUND,
         "NoSuchKey",
@@ -130,7 +130,7 @@ fn no_such_bucket() -> Response<Full<Bytes>> {
 
 /// The 412 returned when a conditional-write guard (If-Match / If-None-Match)
 /// doesn't hold.
-fn precondition_failed() -> Response<Full<Bytes>> {
+pub(crate) fn precondition_failed() -> Response<Full<Bytes>> {
     format_s3_error(
         StatusCode::PRECONDITION_FAILED,
         "PreconditionFailed",

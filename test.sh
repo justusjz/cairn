@@ -606,10 +606,13 @@ metadata_ok() {
     local key="meta/m.txt" got big
     awss3 s3api put-object --bucket "$BUCKET" --key "$key" --body "$SMALL" \
         --metadata color=blue,shape=round --cache-control max-age=60 \
-        --content-disposition attachment >/dev/null 2>&1 || return 1
+        --content-disposition attachment --website-redirect-location /elsewhere >/dev/null 2>&1 || return 1
     got=$(awss3 s3api head-object --bucket "$BUCKET" --key "$key" \
-        --query '[Metadata.color, Metadata.shape, CacheControl, ContentDisposition]' --output text 2>/dev/null)
-    [ "$got" = "$(printf 'blue\tround\tmax-age=60\tattachment')" ] || return 1
+        --query '[Metadata.color, Metadata.shape, CacheControl, ContentDisposition, WebsiteRedirectLocation, ContentType]' \
+        --output text 2>/dev/null)
+    [ "$got" = "$(printf 'blue\tround\tmax-age=60\tattachment\t/elsewhere\tbinary/octet-stream')" ] || return 1
+    ! awss3 s3api put-object --bucket "$BUCKET" --key meta/bad.txt --body "$SMALL" \
+        --website-redirect-location elsewhere >/dev/null 2>&1 || return 1
     awss3 s3api copy-object --bucket "$BUCKET" --key meta/kept.txt \
         --copy-source "${BUCKET}/$key" >/dev/null 2>&1 || return 1
     got=$(awss3 s3api head-object --bucket "$BUCKET" --key meta/kept.txt \
@@ -975,6 +978,16 @@ conditional_put_ok() {
     etag=${etag//\"/}
     [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$SMALL" "If-Match: \"$etag\"")" = 200 ] || return 1
     [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$SMALL" "If-Match: $zero")" = 412 ] || return 1
+    # A write's If-None-Match is `*` or nothing (S3: 501).
+    [ "$(scurl PUT "/${BUCKET}/${key}" UNSIGNED-PAYLOAD "$SMALL" "If-None-Match: \"$etag\"")" = 501 ] || return 1
+    # A copy's are on its destination, as a PUT's.
+    local copy=(PUT "/${BUCKET}/${key}" "$EMPTY_SHA256" - "x-amz-copy-source: /${BUCKET}/small.txt")
+    [ "$(scurl "${copy[@]}" "If-None-Match: *")" = 412 ] || return 1
+    [ "$(scurl "${copy[@]}" "If-Match: $zero")" = 412 ] || return 1
+    [ "$(scurl "${copy[@]}" "If-Match: \"$etag\"")" = 200 ] || return 1
+    [ "$(scurl PUT "/${BUCKET}/${key}-new" "$EMPTY_SHA256" - "x-amz-copy-source: /${BUCKET}/small.txt" "If-Match: \"$etag\"")" = 404 ] || return 1
+    # Its metadata directive is COPY or REPLACE, case-sensitive.
+    [ "$(scurl "${copy[@]}" "x-amz-metadata-directive: replace")" = 400 ] || return 1
     awss3 s3api delete-object --bucket "$BUCKET" --key "$key" >/dev/null 2>&1
 }
 
@@ -2266,6 +2279,9 @@ bucket_policy_ok() {
         || return 1
     # Anonymous.
     [ "$(curl -s "$url/pub/a.txt")" = public ] || return 1
+    # Only a signed read may choose its response's headers (S3: 400).
+    curl -s "$url/pub/a.txt?response-content-type=text%2Fhtml" | grep -q '<Code>InvalidRequest</Code>' || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -I "$url/pub/a.txt?response-cache-control=x")" = 400 ] || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/private.txt")" = 403 ] || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/missing.txt")" = 403 ] || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' -T "$WORK_DIR/pub.txt" "$url/pub/new.txt")" = 403 ] || return 1

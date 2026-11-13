@@ -44,6 +44,9 @@ fn copy_precondition_failed() -> Response<Full<Bytes>> {
     )
 }
 
+/// A copy's conditions on its destination when it has none.
+static NO_CONDITIONS: Preconditions = Preconditions::NONE;
+
 /// How often a copy starts over because its source changed while it ran.
 const MAX_SOURCE_ATTEMPTS: usize = 5;
 
@@ -90,6 +93,9 @@ pub struct CopyKeys<'a> {
     /// The Object Lock its destination asks for (see `s3::object_lock`): a
     /// copy never has its source's.
     pub lock: crate::s3::object_lock::Lock,
+    /// Its conditions on the destination (If-Match, If-None-Match), as a
+    /// PutObject's; `None`, none.
+    pub conditions: Option<&'a Preconditions>,
 }
 
 impl CopyKeys<'_> {
@@ -161,6 +167,7 @@ pub async fn copy_object(
     preconditions: &Preconditions,
     keys: CopyKeys<'_>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
+    let dest_conditions = keys.conditions.unwrap_or(&NO_CONDITIONS);
     let (src_bucket, src_key, src_version) = match parse_copy_source(copy_source) {
         Some(source) => source,
         None => {
@@ -227,6 +234,12 @@ pub async fn copy_object(
         if preconditions.evaluate(&source_etag, version.lm_epoch, true) != Precondition::Proceed {
             return Ok(copy_precondition_failed());
         }
+        // Then its own on the destination (If-Match, If-None-Match), against
+        // the object there now; the commit checks it's still the current one.
+        let expected = match decide(app, dest_bucket, dest_key, dest_conditions).await? {
+            Ok(expected) => expected,
+            Err(refused) => return Ok(refused),
+        };
         // Lost bytes aren't copied, not even by reference: that would make a
         // new object of them, unnoticed.
         let client = app.pool.get().await?;
@@ -281,17 +294,26 @@ pub async fn copy_object(
             .or(version.checksum.as_ref().map(|checksum| checksum.algorithm))
             .unwrap_or(Algorithm::Crc64Nvme);
         if !keys.shares(encryption) {
-            let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, tags, checksum: checksum_algorithm, lock: keys.lock };
+            let dest = Dest {
+                bucket: dest_bucket,
+                key: dest_key,
+                content_type,
+                metadata,
+                tags,
+                checksum: checksum_algorithm,
+                lock: keys.lock,
+                conditions: dest_conditions,
+            };
             let sealing = match sse::seal(app, keys.dest, keys.role, dest_bucket, dest_key).await? {
                 Ok(sealing) => sealing,
                 Err(refused) => return Ok(refused),
             };
             let stored = sealing.as_ref().map_or(Stored::Plain, |sealing| sealing.stored.clone());
             match stream_object_copy(app, &source, &dest, source_key, sealing).await {
-                Ok(Some((etag, checksum, version_id, last_modified))) => {
+                Ok(Ok((etag, checksum, version_id, last_modified))) => {
                     return Ok(respond(&etag, checksum.as_ref(), version_id.as_deref(), &last_modified, &stored));
                 }
-                Ok(None) => return Ok(no_such_bucket()),
+                Ok(Err(refused)) => return Ok(refused),
                 // Its data went with it: copy what it is now.
                 Err(_) if source.changed(app).await? => continue,
                 Err(e) => return Err(e),
@@ -359,9 +381,18 @@ pub async fn copy_object(
         // (not just the ETag header). It comes from the commit itself: read
         // afterwards, a concurrent write to the key could have replaced the
         // version already.
-        let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, tags, checksum: checksum_algorithm, lock: keys.lock };
+        let dest = Dest {
+            bucket: dest_bucket,
+            key: dest_key,
+            content_type,
+            metadata,
+            tags,
+            checksum: checksum_algorithm,
+            lock: keys.lock,
+            conditions: dest_conditions,
+        };
         let (version_id, last_modified) =
-            match commit_object_copy(app, &source, &dest, &stored_etag, &stored, &copied).await? {
+            match commit_object_copy(app, &source, &dest, &stored_etag, &stored, &copied, expected).await? {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
                 ObjectCopy::SourceChanged => continue, // copy what it is now
                 ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
@@ -371,10 +402,37 @@ pub async fn copy_object(
     Err(Contended("the copy source kept changing".to_owned()).into())
 }
 
+/// Decides a copy's `conditions` on its destination (If-Match,
+/// If-None-Match) against the object there now, as a PutObject's are: the
+/// version its commit is to find still current (`None` without conditions),
+/// or the response to refuse the copy with.
+async fn decide(
+    app: &Arc<App>,
+    bucket: &str,
+    key: &str,
+    conditions: &Preconditions,
+) -> anyhow::Result<Result<Option<Option<i64>>, Response<Full<Bytes>>>> {
+    if !conditions.has_write_conditions() {
+        return Ok(Ok(None));
+    }
+    let current = match crate::s3::versions::current_object(app, bucket, key).await? {
+        Ok(current) => current,
+        Err(refused) => return Ok(Err(refused)),
+    };
+    if !conditions.allows_write(current.as_ref().map(|c| c.etag.as_str())) {
+        // If-Match for a key without an object is S3's 404, not a 412.
+        if conditions.has_if_match() && current.is_none() {
+            return Ok(Err(crate::s3::objects::put::no_such_key()));
+        }
+        return Ok(Err(crate::s3::objects::put::precondition_failed()));
+    }
+    Ok(Ok(Some(current.map(|c| c.id))))
+}
+
 /// Whether a copy's `x-amz-metadata-directive` has it take the request's
 /// metadata (REPLACE), rather than keep the source's (COPY, the default).
 pub fn replaces_metadata(metadata_directive: Option<&str>) -> bool {
-    metadata_directive.is_some_and(|d| d.eq_ignore_ascii_case("REPLACE"))
+    metadata_directive == Some("REPLACE")
 }
 
 /// Where a CopyObject writes, and what its new version is to have.
@@ -388,6 +446,8 @@ struct Dest<'a> {
     /// The algorithm of its checksum (FULL_OBJECT).
     checksum: Algorithm,
     lock: crate::s3::object_lock::Lock,
+    /// Its If-Match and If-None-Match.
+    conditions: &'a Preconditions,
 }
 
 /// The checksum of a copy that shares its source's parts, as it's stored, and
@@ -457,14 +517,15 @@ async fn copy_checksum(
 /// (and decrypted with `source_key`) like a GET, and written (encrypted as
 /// `sealing` says) like a PUT, which works out the ETag as it streams. For a
 /// copy that can't share the source's bytes. The new version's ETag, version
-/// ID to report and last-modified time, or `None` if the bucket is gone.
+/// ID to report and last-modified time, or why it's refused: the bucket is
+/// gone, or its conditions don't hold (decided again as it commits).
 async fn stream_object_copy(
     app: &Arc<App>,
     source: &Source,
     dest: &Dest<'_>,
     source_key: Option<Zeroizing<Key>>,
     sealing: Option<Sealing>,
-) -> anyhow::Result<Option<(String, Option<Checksum>, Option<String>, String)>> {
+) -> anyhow::Result<Result<(String, Option<Checksum>, Option<String>, String), Response<Full<Bytes>>>> {
     let (sender, body) = channel_body();
     let size = source.version.size as u64;
     let slices = select_parts_in_range(source.locations.clone(), 0, size, source_key.as_deref());
@@ -474,7 +535,7 @@ async fn stream_object_copy(
         key: dest.key.to_owned(),
         content_type: dest.content_type.to_owned(),
         metadata: dest.metadata.to_owned(),
-        conditions: Preconditions::default(),
+        conditions: dest.conditions.clone(),
         sealing,
         checksum: checksums::Wanted::Exactly(dest.checksum),
         tags: dest.tags.to_owned(),
@@ -483,21 +544,20 @@ async fn stream_object_copy(
     // The source stream is data from within Cairn (verified as it's read), so
     // there's nothing to check it against.
     match crate::upload_part(app, body, &attach, Payload::unchecked_of(size)).await? {
-        UploadResult::Committed { etag, checksum, version_id, last_modified, .. } => Ok(Some((
+        UploadResult::Committed { etag, checksum, version_id, last_modified, .. } => Ok(Ok((
             etag,
             checksum,
             version_id,
             last_modified.expect("an object write reports its last-modified time"),
         ))),
-        UploadResult::NoSuchBucket => Ok(None),
-        // Nothing is checked, there are no conditions, and an object has no upload.
-        UploadResult::Rejected(_)
-        | UploadResult::Refused(_)
-        | UploadResult::PreconditionFailed
-        | UploadResult::NoSuchKey
-        | UploadResult::NoSuchUpload => {
+        UploadResult::NoSuchBucket => Ok(Err(no_such_bucket())),
+        UploadResult::PreconditionFailed => Ok(Err(crate::s3::objects::put::precondition_failed())),
+        UploadResult::NoSuchKey => Ok(Err(crate::s3::objects::put::no_such_key())),
+        UploadResult::Refused(refused) => Ok(Err(refused)),
+        // Nothing is checked, and an object has no upload.
+        UploadResult::Rejected(_) | UploadResult::NoSuchUpload => {
             unreachable!(
-                "an unchecked, unconditional object write only commits, or finds no bucket"
+                "an unchecked object write only commits, finds no bucket, or its conditions failing"
             )
         }
     }
@@ -510,7 +570,8 @@ enum ObjectCopy {
         version_id: Option<String>,
         last_modified: String,
     },
-    /// The source changed since it was read.
+    /// The source changed since it was read, or the destination since the
+    /// copy's conditions were decided: copy again.
     SourceChanged,
     /// The destination bucket was deleted meanwhile.
     NoSuchBucket,
@@ -525,6 +586,7 @@ async fn commit_object_copy(
     etag: &str,
     stored: &Stored,
     copied: &Copied,
+    expected: Option<Option<i64>>,
 ) -> anyhow::Result<ObjectCopy> {
     let (part_ids, part_sizes) = source.part_keys();
     let sse = stored.columns();
@@ -538,7 +600,7 @@ async fn commit_object_copy(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                                                     $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                                                    $21, $22, $23, $24)",
+                                                    $21, $22, $23, $24, $25, $26)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -564,13 +626,15 @@ async fn commit_object_copy(
                         &lock_mode,
                         &lock_until,
                         &legal_hold,
+                        &expected.is_some(),
+                        &expected.flatten(),
                     ],
                 )
                 .await?;
             // On anything but a commit, the function changed nothing.
             match row.get::<_, &str>(0) {
                 "committed" => {}
-                "source_changed" => return Ok((ObjectCopy::SourceChanged, Vec::new())),
+                "source_changed" | "stale" => return Ok((ObjectCopy::SourceChanged, Vec::new())),
                 "no_such_bucket" => return Ok((ObjectCopy::NoSuchBucket, Vec::new())),
                 status => unreachable!("cairn_copy_object: unknown status {status}"),
             }

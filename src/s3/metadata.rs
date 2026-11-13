@@ -18,9 +18,18 @@ const STORED: &[&str] = &[
     "content-encoding",
     "content-language",
     "expires",
+    REDIRECT,
 ];
 
+/// Where a website serving the object would redirect to instead. Cairn
+/// serves no websites, but stores and returns it, as S3 does (probed).
+const REDIRECT: &str = "x-amz-website-redirect-location";
+
 const USER_PREFIX: &str = "x-amz-meta-";
+
+/// The Content-Type of an object whose write gives none (probed: S3's, not
+/// `application/octet-stream`).
+pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
 
 /// The most user-defined metadata S3 stores with an object: its names (after
 /// the prefix) and values, in bytes.
@@ -64,6 +73,13 @@ pub fn from_request(headers: &HeaderMap) -> Result<String, Response<Full<Bytes>>
         }
         if let Some(user) = user {
             user_size += user.len() + value.len();
+        }
+        if name == REDIRECT && !["/", "http://", "https://"].iter().any(|prefix| value.starts_with(prefix)) {
+            return Err(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRedirectLocation",
+                "The website redirect location must have a prefix of 'http://' or 'https://' or '/'.",
+            ));
         }
         stored.push((name, value));
     }
@@ -112,6 +128,21 @@ impl Overrides {
             overrides.push((header, value));
         }
         Ok(Overrides(overrides))
+    }
+
+    /// Whether the read asks for any.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// S3's refusal of overrides in an anonymous read (probed; a HEAD's
+    /// has no body).
+    pub fn refused_anonymously() -> Response<Full<Bytes>> {
+        format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "Request specific response headers cannot be used for anonymous GET requests.",
+        )
     }
 
     /// Replaces the headers of a successful read's `response`.
@@ -216,5 +247,16 @@ mod tests {
         let over = "x".repeat(MAX_USER_METADATA);
         let refused = from_request(&headers(&[("x-amz-meta-k", &over)])).unwrap_err();
         assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn keeps_a_website_redirect_location_that_is_one() {
+        for location in ["/other", "http://example.com/x", "https://example.com/"] {
+            let got = from_request(&headers(&[("x-amz-website-redirect-location", location)])).unwrap();
+            assert_eq!(got, format!("x-amz-website-redirect-location: {location}\n"));
+        }
+        for location in ["nope", "ftp://example.com/", ""] {
+            assert!(from_request(&headers(&[("x-amz-website-redirect-location", location)])).is_err(), "{location}");
+        }
     }
 }

@@ -305,3 +305,53 @@ async fn a_copy_reports_its_last_modified_time() {
         .get(0);
     assert_eq!(reported, stored);
 }
+
+/// A copy's If-Match and If-None-Match are on its destination, as a
+/// PutObject's (probed): `*` creates only if absent, If-Match writes only
+/// over that ETag, and If-Match without an object is NoSuchKey. Both when
+/// the copy shares its source's bytes and when it's streamed (here, into
+/// SSE-C).
+#[tokio::test]
+async fn a_copy_is_conditional_on_its_destination() {
+    let Some(app) = node().await else { return };
+    let customer = super::customer_key(&[7; 32]);
+    put(&app, "source", content(3000, 2)).await;
+    put(&app, "dest", content(100, 3)).await;
+    let dest_etag = format!("\"{}\"", md5_hex(&content(100, 3)));
+    let source = format!("{BUCKET}/source");
+    for streamed in [false, true] {
+        let dest = if streamed { Wanted::Customer(&customer) } else { Wanted::Plain };
+        let copy = |key: &'static str, name: &'static str, value: String| {
+            let (app, source) = (app.clone(), source.clone());
+            async move {
+                let mut headers = hyper::HeaderMap::new();
+                headers.insert(name, value.parse().unwrap());
+                let conditions = Preconditions::from_headers(&headers);
+                let keys = crate::s3::objects::copy::CopyKeys { dest, conditions: Some(&conditions), ..Default::default() };
+                copy_object(&app, BUCKET, key, &source, None, "", "", None, &Preconditions::default(), keys)
+                    .await
+                    .unwrap()
+                    .status()
+            }
+        };
+        let case = if streamed { "streamed" } else { "shared" };
+        assert_eq!(copy("dest", "if-none-match", "*".into()).await, StatusCode::PRECONDITION_FAILED, "{case}");
+        let wrong = format!("\"{}\"", md5_hex(b"other"));
+        assert_eq!(copy("dest", "if-match", wrong).await, StatusCode::PRECONDITION_FAILED, "{case}");
+        assert_eq!(copy("absent", "if-match", dest_etag.clone()).await, StatusCode::NOT_FOUND, "{case}");
+        assert_eq!(get(&app, "dest").await, Some(content(100, 3)), "{case}: unchanged");
+        assert_eq!(copy("new", "if-none-match", "*".into()).await, StatusCode::OK, "{case}");
+        delete(&app, "new").await;
+    }
+    // The ETag it was written over: the copy goes ahead.
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert("if-match", dest_etag.parse().unwrap());
+    let conditions = Preconditions::from_headers(&headers);
+    let keys = crate::s3::objects::copy::CopyKeys { conditions: Some(&conditions), ..Default::default() };
+    let response = copy_object(&app, BUCKET, "dest", &source, None, "", "", None, &Preconditions::default(), keys).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(get(&app, "dest").await, Some(content(3000, 2)));
+    delete(&app, "dest").await;
+    delete(&app, "source").await;
+    assert_files(&app, 0).await;
+}
