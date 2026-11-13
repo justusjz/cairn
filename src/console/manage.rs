@@ -11,7 +11,7 @@
 //! is fine for a page an operator looks at, but not for anything that runs on
 //! its own. Times are seconds since the Unix epoch.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -814,6 +814,8 @@ pub(super) struct BucketSummary {
     public: bool,
     /// Its public access block, if it has one.
     public_access_block: Option<crate::s3::buckets::public_access::Block>,
+    /// Whether it has Object Lock enabled (see `s3::object_lock`).
+    object_lock: bool,
 }
 
 /// A tag of a bucket or an object version (see `s3::tags`).
@@ -896,8 +898,12 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         .collect();
     // Each bucket's policy (whether it's public), and its block.
     let mut access: HashMap<String, (bool, Option<crate::s3::buckets::public_access::Block>)> = HashMap::new();
-    for row in client.query_cached("SELECT name, policy, public_access_block FROM buckets", &[]).await? {
+    let mut locked: HashSet<String> = HashSet::new();
+    for row in client.query_cached("SELECT name, policy, public_access_block, object_lock FROM buckets", &[]).await? {
         let name: String = row.get(0);
+        if row.get::<_, bool>(3) {
+            locked.insert(name.clone());
+        }
         let public = match row.get::<_, Option<&str>>(1) {
             Some(text) => crate::policy::Policy::parse(text, crate::policy::Kind::Bucket(&name))
                 .map_err(|e| anyhow::anyhow!("bucket {name}'s policy doesn't parse: {}", e.message))?
@@ -919,6 +925,7 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
                 tags: tags.remove(&b.name).as_deref().map(tag_list).unwrap_or_default(),
                 public: access.get(&b.name).is_some_and(|(public, _)| *public),
                 public_access_block: access.remove(&b.name).and_then(|(_, block)| block),
+                object_lock: locked.contains(&b.name),
                 name: b.name,
                 account: b.account,
                 created_at: b.created_at.epoch,
@@ -935,6 +942,10 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
 #[derive(Deserialize, ToSchema)]
 struct NewBucket {
     name: String,
+    /// Whether it has Object Lock enabled (and so is versioned) from the
+    /// start: it can't be disabled again.
+    #[serde(default)]
+    object_lock: bool,
 }
 
 #[utoipa::path(post, path = "/buckets", request_body = NewBucket, responses(
@@ -944,8 +955,13 @@ struct NewBucket {
 ))]
 async fn create_bucket(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewBucket>) -> Result<StatusCode> {
     actor.check(&app, "s3:CreateBucket", On::Bucket(body.name.clone())).await?;
+    // As S3's CreateBucket with Object Lock asks for.
+    if body.object_lock {
+        actor.check(&app, "s3:PutBucketObjectLockConfiguration", On::Bucket(body.name.clone())).await?;
+        actor.check(&app, "s3:PutBucketVersioning", On::Bucket(body.name.clone())).await?;
+    }
     // The console's user's account's; the operator's, the first tenant's.
-    match create::create(&app, &body.name, actor.account()).await? {
+    match create::create(&app, &body.name, actor.account(), body.object_lock).await? {
         create::Creation::Created => Ok(StatusCode::CREATED),
         create::Creation::Exists | create::Creation::OwnedByOther => Err(ApiError::Conflict(format!(
             "a bucket named {:?} already exists",
@@ -1260,7 +1276,7 @@ async fn mark_lost(app: &App, bucket: &str, entries: &mut [Entry]) -> anyhow::Re
             Entry::Prefix { .. } => None,
         })
         .collect();
-    let lost: std::collections::HashSet<String> = client
+    let lost: HashSet<String> = client
         .query_cached(
             "SELECT DISTINCT o.key FROM objects o
              JOIN parts p ON p.object_id = o.id
@@ -1575,6 +1591,7 @@ async fn upload(
         &Preconditions::default(),
         crate::s3::sse::Wanted::Plain,
         actor.kms_role(),
+        Default::default(),
     )
     .await?;
     match resp.status() {
@@ -1607,7 +1624,7 @@ async fn delete_object(
 ) -> Result<StatusCode> {
     let action = crate::s3::actions::delete(params.version.is_some());
     actor.check(&app, action, On::Object(bucket.clone(), params.key.clone())).await?;
-    let resp = crate::s3::objects::delete::delete_object(&app, &bucket, &params.key, params.version.as_deref()).await?;
+    let resp = crate::s3::objects::delete::delete_object(&app, &bucket, &params.key, params.version.as_deref(), false).await?;
     match resp.status() {
         StatusCode::NO_CONTENT | StatusCode::OK => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),
@@ -1910,6 +1927,7 @@ async fn create_upload(
         crate::s3::sse::Wanted::Plain,
         actor.kms_role(),
         None,
+        Default::default(),
     )
     .await?;
     if resp.status() != StatusCode::OK {
@@ -3107,11 +3125,11 @@ mod e2e {
     async fn s3_refuses_invalid_bucket_names() {
         let Some(app) = node().await else { return };
         let account = roles::account(&app.pool.get().await.unwrap()).await.unwrap();
-        let resp = crate::s3::buckets::create::create_bucket(&app, "Bad_Name", &account)
+        let resp = crate::s3::buckets::create::create_bucket(&app, "Bad_Name", &account, false)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let resp = crate::s3::buckets::create::create_bucket(&app, BUCKET, &account)
+        let resp = crate::s3::buckets::create::create_bucket(&app, BUCKET, &account, false)
             .await
             .unwrap();
         assert_eq!(

@@ -66,7 +66,7 @@ async fn commit_object(tx: &Transaction<'_>, app: &App, blob: Uuid, key: &str) -
                      ARRAY[0::bigint], 0, 'd41d8cd98f00b204e9800998ecf8427e',
                      'd41d8cd98f00b204e9800998ecf8427e', NULL, NULL,
              $3, $4, 'application/octet-stream', '', NULL, NULL, NULL, NULL, NULL, false,
-             NULL, NULL, NULL, '', false, NULL, $5)",
+             NULL, NULL, NULL, '', false, NULL, $5, NULL, NULL, NULL)",
         &[&blob, &app.node, &BUCKET, &key, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -106,7 +106,7 @@ async fn copy_object(
 ) -> String {
     let size: i64 = source.2.iter().sum();
     tx.query_one(
-        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, '', false, $7)",
+        "SELECT status FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, 'etag', 'text/plain', '', NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, '', false, $7, NULL, NULL, NULL)",
         &[&source.0, &source.1, &source.2, &BUCKET, &key, &size, &crate::s3::versions::new_version_id()],
     )
     .await
@@ -163,12 +163,12 @@ async fn a_put_waits_for_versioning_to_change() {
     put(&app, "k", b"one".to_vec()).await;
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
-    let changed: bool = tx
+    let changed: String = tx
         .query_one("SELECT pg_temp.cairn_set_versioning($1, 'enabled')", &[&BUCKET])
         .await
         .unwrap()
         .get(0);
-    assert!(changed);
+    assert_eq!(changed, "set");
 
     let app2 = app.clone();
     let putting = tokio::spawn(async move { put(&app2, "k", b"two".to_vec()).await });
@@ -299,6 +299,7 @@ async fn a_conditional_write_decides_again_if_the_object_changed() {
             sealing: None,
             checksum: crate::e2e::OBJECT_CHECKSUM,
             tags: String::new(),
+            lock: Default::default(),
         };
         let body = Full::new(hyper::body::Bytes::from_static(b"two"));
         crate::upload_part(&app2, body, &attach, Payload::unchecked()).await.unwrap()
@@ -373,7 +374,7 @@ async fn a_copy_keeps_its_source_blob_from_a_delete() {
     assert_eq!(copy_object(&tx, &src, "dst").await, "committed");
 
     let app2 = app.clone();
-    let deleting = tokio::spawn(async move { delete_object(&app2, BUCKET, "src", None).await.unwrap() });
+    let deleting = tokio::spawn(async move { delete_object(&app2, BUCKET, "src", None, false).await.unwrap() });
     assert_waits(&deleting).await;
     tx.commit().await.unwrap();
     assert_eq!(deleting.await.unwrap().status(), StatusCode::NO_CONTENT);
@@ -392,7 +393,7 @@ async fn a_copy_after_a_delete_finds_the_source_changed() {
     let tx = held.transaction().await.unwrap();
     let deleted: Vec<Uuid> = tx
         .query_one(
-            "SELECT reap_blob FROM pg_temp.cairn_delete_objects($1, '{src}', '{NULL}', '{x}')",
+            "SELECT reap_blob FROM pg_temp.cairn_delete_objects($1, '{src}', '{NULL}', '{x}', '{}')",
             &[&BUCKET],
         )
         .await
@@ -413,7 +414,7 @@ async fn a_copy_after_a_delete_finds_the_source_changed() {
 
 /// Creates an upload for `key`, returning its ID.
 async fn create_upload(app: &App, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", "", Wanted::Plain, None, None).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", "", Wanted::Plain, None, None, Default::default()).await.unwrap();
     let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -601,6 +602,7 @@ async fn a_put_into_a_missing_bucket_writes_nothing() {
         sealing: None,
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: String::new(),
+        lock: Default::default(),
     };
     let body = http_body_util::Full::new(hyper::body::Bytes::from_static(b"data"));
     let result = crate::upload_part(&app, body, &attach, Payload::unchecked())
@@ -630,7 +632,7 @@ async fn delete_keys(tx: &Transaction<'_>, keys: &[String]) -> String {
     let versions: Vec<Option<&str>> = keys.iter().map(|_| None).collect();
     let markers: Vec<String> = keys.iter().map(|_| crate::s3::versions::new_version_id()).collect();
     tx.query_one(
-        "SELECT status FROM pg_temp.cairn_delete_objects($1, $2, $3, $4)",
+        "SELECT status FROM pg_temp.cairn_delete_objects($1, $2, $3, $4, '{}')",
         &[&BUCKET, &keys, &versions, &markers],
     )
     .await

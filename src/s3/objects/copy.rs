@@ -87,6 +87,9 @@ pub struct CopyKeys<'a> {
     pub role: Option<Uuid>,
     /// The algorithm of the checksum it asks for (`x-amz-checksum-algorithm`).
     pub checksum: Option<Algorithm>,
+    /// The Object Lock its destination asks for (see `s3::object_lock`): a
+    /// copy never has its source's.
+    pub lock: crate::s3::object_lock::Lock,
 }
 
 impl CopyKeys<'_> {
@@ -185,6 +188,10 @@ pub async fn copy_object(
         return Ok(no_such_bucket());
     }
     drop(client);
+    // A lock only where there's Object Lock.
+    if let Some(refused) = crate::s3::object_lock::check_write(app, dest_bucket, &keys.lock).await? {
+        return Ok(refused);
+    }
 
     for _ in 0..MAX_SOURCE_ATTEMPTS {
         let source = match read_source(app, &src_bucket, &src_key, src_version.as_deref()).await? {
@@ -270,7 +277,7 @@ pub async fn copy_object(
             .or(version.checksum.as_ref().map(|checksum| checksum.algorithm))
             .unwrap_or(Algorithm::Crc64Nvme);
         if !keys.shares(encryption) {
-            let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, tags, checksum: checksum_algorithm };
+            let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, tags, checksum: checksum_algorithm, lock: keys.lock };
             let sealing = match sse::seal(app, keys.dest, keys.role, dest_bucket, dest_key).await? {
                 Ok(sealing) => sealing,
                 Err(refused) => return Ok(refused),
@@ -348,7 +355,7 @@ pub async fn copy_object(
         // (not just the ETag header). It comes from the commit itself: read
         // afterwards, a concurrent write to the key could have replaced the
         // version already.
-        let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, tags, checksum: checksum_algorithm };
+        let dest = Dest { bucket: dest_bucket, key: dest_key, content_type, metadata, tags, checksum: checksum_algorithm, lock: keys.lock };
         let (version_id, last_modified) =
             match commit_object_copy(app, &source, &dest, &stored_etag, &stored, &copied).await? {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
@@ -376,6 +383,7 @@ struct Dest<'a> {
     tags: &'a str,
     /// The algorithm of its checksum (FULL_OBJECT).
     checksum: Algorithm,
+    lock: crate::s3::object_lock::Lock,
 }
 
 /// The checksum of a copy that shares its source's parts, as it's stored, and
@@ -466,6 +474,7 @@ async fn stream_object_copy(
         sealing,
         checksum: checksums::Wanted::Exactly(dest.checksum),
         tags: dest.tags.to_owned(),
+        lock: dest.lock,
     };
     // The source stream is data from within Cairn (verified as it's read), so
     // there's nothing to check it against.
@@ -515,6 +524,7 @@ async fn commit_object_copy(
 ) -> anyhow::Result<ObjectCopy> {
     let (part_ids, part_sizes) = source.part_keys();
     let sse = stored.columns();
+    let (lock_mode, lock_until, legal_hold) = dest.lock.columns();
     let client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
@@ -524,7 +534,7 @@ async fn commit_object_copy(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                                                     $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                                                    $21)",
+                                                    $21, $22, $23, $24)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -547,6 +557,9 @@ async fn commit_object_copy(
                         &dest.tags,
                         &copied.part_checksums,
                         &new_version_id(),
+                        &lock_mode,
+                        &lock_until,
+                        &legal_hold,
                     ],
                 )
                 .await?;

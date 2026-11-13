@@ -35,6 +35,7 @@ mod listing;
 mod locking;
 mod metadata;
 mod multipart;
+mod object_lock;
 mod post_object;
 mod public_access;
 mod users;
@@ -271,6 +272,7 @@ async fn put_with(app: &Arc<App>, key: &str, data: Vec<u8>, payload: Payload) {
         sealing: None,
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: String::new(),
+        lock: Default::default(),
     };
     let body = Full::new(Bytes::from(data));
     let result = crate::upload_part(app, body, &attach, payload)
@@ -337,6 +339,7 @@ async fn put_sealed_with(
         }),
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: String::new(),
+        lock: Default::default(),
     };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, payload)
         .await
@@ -360,7 +363,7 @@ pub async fn get_sealed(
 }
 
 pub async fn delete(app: &Arc<App>, key: &str) {
-    let response = objects::delete::delete_object(app, BUCKET, key, None)
+    let response = objects::delete::delete_object(app, BUCKET, key, None, false)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);

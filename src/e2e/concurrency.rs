@@ -26,6 +26,7 @@ async fn try_put(app: &Arc<App>, key: &str, data: Vec<u8>) -> anyhow::Result<()>
         sealing: None,
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: String::new(),
+        lock: Default::default(),
     };
     let body = Full::new(Bytes::from(data));
     let result = crate::upload_part(app, body, &attach, Payload::unchecked()).await?;
@@ -101,7 +102,7 @@ async fn deletes_in_one_packed_blob_dont_conflict() {
     let mut second = app.pool.get().await.unwrap();
     let t1 = first.transaction().await.unwrap();
     let t2 = second.transaction().await.unwrap();
-    let delete = "SELECT reap_blob FROM pg_temp.cairn_delete_objects($1, $2, '{NULL}', '{x}')";
+    let delete = "SELECT reap_blob FROM pg_temp.cairn_delete_objects($1, $2, '{NULL}', '{x}', '{}')";
     let bucket = BUCKET;
     let reap1: Vec<Uuid> = t1.query_one(delete, &[&bucket, &vec!["o0"]]).await.unwrap().get(0);
     let reap2: Vec<Uuid> = t2.query_one(delete, &[&bucket, &vec!["o1"]]).await.unwrap().get(0);

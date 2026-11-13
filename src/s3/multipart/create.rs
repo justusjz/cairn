@@ -6,6 +6,7 @@ use crate::db::Cached;
 use crate::{
     App,
     s3::checksums::{self, Algorithm, Type},
+    s3::object_lock::{self, Lock},
     s3::sse::{self, Wanted},
     s3::util::{format_s3_error, xml_escape, xml_ok},
 };
@@ -13,7 +14,8 @@ use crate::{
 /// CreateMultipartUpload: `POST /{bucket}/{key}?uploads`. Stages an upload and
 /// hands back its UploadId. Nothing about the live object changes until
 /// CompleteMultipartUpload. `tags` are the object's, stored form (see
-/// `s3::tags`): an upload's tags are fixed now, as in S3.
+/// `s3::tags`): an upload's tags are fixed now, as in S3, as is the Object
+/// Lock it asks for (`lock`, see `s3::object_lock`).
 #[allow(clippy::too_many_arguments)]
 pub async fn create_multipart_upload(
     app: &App,
@@ -25,6 +27,7 @@ pub async fn create_multipart_upload(
     wanted: Wanted<'_>,
     role: Option<Uuid>,
     checksum: Option<(Algorithm, Type)>,
+    lock: Lock,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     if client
@@ -39,6 +42,11 @@ pub async fn create_multipart_upload(
         ));
     }
     drop(client);
+    // A lock only where there's Object Lock.
+    if let Some(refused) = object_lock::check_write(app, bucket, &lock).await? {
+        return Ok(refused);
+    }
+    let (lock_mode, lock_until, legal_hold) = lock.columns();
     // The content type, metadata and tags are captured now and applied to the object
     // at completion; so is its encryption, which its parts need: the check of
     // an SSE-C upload's key, or the sealed key of an SSE-KMS one (see `sse`).
@@ -55,8 +63,9 @@ pub async fn create_multipart_upload(
             "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, metadata,
                                             sse_c_key, sse_kms_key_id, sse_kms_data_key,
                                             sse_kms_sealed, sse_kms_context, sse_s3,
-                                            checksum_algorithm, checksum_type, tags, initiated_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW())",
+                                            checksum_algorithm, checksum_type, tags, initiated_at,
+                                            retain_mode, retain_until, legal_hold)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17)",
             &[
                 &upload_id,
                 &bucket,
@@ -72,6 +81,9 @@ pub async fn create_multipart_upload(
                 &checksum.map(|(algorithm, _)| algorithm.name()),
                 &checksum.map(|(_, kind)| kind.name()),
                 &tags,
+                &lock_mode,
+                &lock_until,
+                &legal_hold,
             ],
         )
         .await?;

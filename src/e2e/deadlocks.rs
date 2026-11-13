@@ -93,7 +93,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
             );
         }
         9 | 10 => {
-            let status = delete_object(app, BUCKET, &a, None).await?.status();
+            let status = delete_object(app, BUCKET, &a, None, false).await?.status();
             anyhow::ensure!(status == StatusCode::NO_CONTENT, "delete {a}: {status}");
         }
         // A DeleteObjects of a few keys (locked one by one) or of many
@@ -106,7 +106,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
             loop {
                 match client
                     .query_one(
-                        "SELECT status FROM pg_temp.cairn_delete_objects($1, $2, $3, $4)",
+                        "SELECT status FROM pg_temp.cairn_delete_objects($1, $2, $3, $4, '{}')",
                         &[&BUCKET, &keys, &versions, &markers],
                     )
                     .await
@@ -119,7 +119,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
         }
         // Part re-uploads racing each other, then a complete or an abort.
         12..=16 => {
-            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "", "", Wanted::Plain, None, None).await?).await;
+            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "", "", Wanted::Plain, None, None, Default::default()).await?).await;
             let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
             let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
             let mut parts = JoinSet::new();

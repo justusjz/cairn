@@ -49,6 +49,8 @@ pub(crate) struct ObjectVersion {
     pub checksum: Option<StoredChecksum>,
     /// Its tags, stored form (see `s3::tags`).
     pub tags: String,
+    /// Its Object Lock (see `s3::object_lock`).
+    pub lock: crate::s3::object_lock::Stored,
 }
 
 /// Why a read found nothing to read. Each read reports it differently.
@@ -110,21 +112,20 @@ pub(crate) async fn lookup_version<C: GenericClient>(
     key: &str,
     version_id: Option<&str>,
 ) -> Result<Result<ObjectVersion, Missing>, tokio_postgres::Error> {
-    let row = client
-        .query_opt_cached(
-            "SELECT o.id, o.etag, o.content_type, o.size,
+    let sql = format!(
+        "SELECT o.id, o.etag, o.content_type, o.size,
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'Dy, DD Mon YYYY HH24:MI:SS \"GMT\"'),
                     to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
                     floor(extract(epoch FROM o.last_modified))::bigint,
                     o.version_id, o.is_delete_marker, b.versioning, o.metadata, o.sse_c_key,
                     o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed, o.sse_kms_context,
-                    o.sse_s3, o.checksum_algorithm, o.checksum_type, o.checksum, o.tags
+                    o.sse_s3, o.checksum_algorithm, o.checksum_type, o.checksum, o.tags, {}
              FROM objects o JOIN buckets b ON b.name = o.bucket
              WHERE o.bucket = $1 AND o.key = $2
                AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",
-            &[&bucket, &key, &version_id],
-        )
-        .await?;
+        crate::s3::object_lock::COLUMNS
+    );
+    let row = client.query_opt_cached(&sql, &[&bucket, &key, &version_id]).await?;
     let Some(row) = row else {
         return Ok(Err(match version_id {
             Some(_) => Missing::NoSuchVersion,
@@ -153,6 +154,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
         version_id: reported,
         checksum: StoredChecksum::from_row(&row, 17),
         tags: row.get(20),
+        lock: crate::s3::object_lock::Stored::from_row(&row, 21),
     }))
 }
 
@@ -210,6 +212,7 @@ pub async fn get_object(
         version_id,
         checksum,
         tags,
+        lock,
         ..
     } = version;
     // An SSE-C object only with its key; before the conditions, which would
@@ -300,6 +303,7 @@ pub async fn get_object(
         .header(header::LAST_MODIFIED, last_modified);
     let builder = metadata::apply(builder, &metadata);
     let builder = tag_count(builder, &tags);
+    let builder = lock.headers(builder);
     let builder = sse::echo(builder, &encryption, customer_key);
     let builder = match (&part, checksum.filter(|_| checksum_mode)) {
         (None, Some(checksum)) if !partial => checksum_headers(builder, &checksum, object_key.as_deref(), bucket, key)?,
@@ -723,6 +727,7 @@ pub async fn head_object(
         version_id,
         checksum,
         tags,
+        lock,
         ..
     } = match lookup_version(&client, bucket, key, version_id).await? {
         Ok(version) => version,
@@ -782,6 +787,7 @@ pub async fn head_object(
         .header(header::LAST_MODIFIED, last_modified);
     let builder = metadata::apply(builder, &metadata);
     let builder = tag_count(builder, &tags);
+    let builder = lock.headers(builder);
     let builder = sse::echo(builder, &encryption, customer_key);
     // Its checksum, if asked for: an encrypted one's sealed under its key,
     // which, for an SSE-KMS one, is only asked of the KMS then.

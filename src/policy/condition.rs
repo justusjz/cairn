@@ -428,6 +428,10 @@ const S3_EVALUATED: &[&str] = &[
     "s3:if-match",
     "s3:if-none-match",
     "s3:max-keys",
+    "s3:object-lock-legal-hold",
+    "s3:object-lock-mode",
+    "s3:object-lock-remaining-retention-days",
+    "s3:object-lock-retain-until-date",
     "s3:prefix",
     "s3:resourceaccount",
     "s3:signatureage",
@@ -494,7 +498,7 @@ pub fn support(key: &str) -> Option<Support> {
     if S3_ABSENT.iter().any(|entry| named(entry)) {
         return Some(Support::Absent);
     }
-    // The rest of S3's keys (existing object and bucket tags, object lock,
+    // The rest of S3's keys (existing object and bucket tags, event holds,
     // TLS versions, the tags a request sets: PutObjectTagging's are in its
     // body, which is read after it's authorized, ...) aren't evaluated yet.
     let known = super::s3_actions::CONDITION_KEYS.iter().any(|entry| {
@@ -662,7 +666,8 @@ mod tests {
         assert_eq!(support("s3:RequestObjectTag/Project"), Some(Support::Unsupported));
         assert_eq!(support("s3:RequestObjectTag/"), None);
         assert_eq!(support("s3:ExistingObjectTag/Project"), Some(Support::Unsupported));
-        assert_eq!(support("s3:object-lock-mode"), Some(Support::Unsupported));
+        assert_eq!(support("s3:object-lock-mode"), Some(Support::Evaluated));
+        assert_eq!(support("s3:object-lock-event-hold"), Some(Support::Unsupported));
         assert_eq!(support("s3:DataAccessPointArn"), Some(Support::Absent));
         assert_eq!(support("aws:PrincipalTag/team"), Some(Support::Absent));
         assert_eq!(support("aws:ResourceTag/team"), Some(Support::Unsupported));

@@ -269,13 +269,15 @@ allows; else it's denied. They are:
   them as grants, and leave the policy's other statements
   alone:
   - **`read`** on a bucket: GetObject, HeadObject, GetObjectAttributes,
-    HeadBucket, ListObjects, reading an object's [tags](#tags), and being the
-    source of a
+    HeadBucket, ListObjects, reading an object's [tags](#tags) and its
+    [Object Lock](#object-lock), and being the source of a
     CopyObject / UploadPartCopy.
   - **`write`** on a bucket: PutObject, DeleteObject(s), multipart uploads
     (listing them and their parts too, to resume one), changing an object's
     tags (any version's), and being the destination of a copy. In a
-    versioned bucket, a delete only adds a delete marker.
+    versioned bucket, a delete only adds a delete marker. Not setting a
+    version's Object Lock: a writer's versions get only the bucket's
+    default retention.
   - **`delete-version`** on a bucket: DeleteObject(s) naming a version ID,
     which removes that version for good.
 - its **inline policies**: identity policies of its own, for anything finer
@@ -666,14 +668,81 @@ aws s3api copy-object --bucket my-bucket --key some/key \
 Old versions take up space until they're deleted, by hand or by
 [lifecycle rules](#lifecycle-rules).
 
+To keep versions even from admins, use [Object Lock](#object-lock).
+
+## Object Lock
+
+Object Lock keeps object versions from being deleted or overwritten for a
+fixed time, or indefinitely, as in S3 (write once, read many): by anyone, and
+by lifecycle rules. That makes history safe from stolen admin credentials too.
+
+A bucket has it enabled when it's created, or later, once it's versioned
+(PutObjectLockConfiguration); it can't be disabled again, and the bucket's
+versioning can't be suspended:
+
+```sh
+aws s3api create-bucket --bucket backups --object-lock-enabled-for-bucket
+aws s3api put-object-lock-configuration --bucket backups --object-lock-configuration \
+    '{"ObjectLockEnabled": "Enabled", "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE", "Days": 30}}}'
+aws s3api get-object-lock-configuration --bucket backups
+```
+
+A version can have a **retention**, a mode and a date it lasts until, and a
+**legal hold**, independently. The bucket's default retention (days or
+years, optional) applies to every new version that asks for none. While a
+retention lasts, or a legal hold is on, the version can't be deleted
+(DeleteObject with its version ID is `403 AccessDenied`), and lifecycle rules
+leave it alone; deleting the key without a version ID still adds a delete
+marker on top, as ever. The modes are S3's:
+
+- **`GOVERNANCE`:** whom `s3:BypassGovernanceRetention` is allowed (admins,
+  say) may delete the version, or shorten or remove its retention, by
+  asking to (`x-amz-bypass-governance-retention: true`, aws-cli's
+  `--bypass-governance-retention`).
+- **`COMPLIANCE`:** no one can, until the date has passed: not an admin,
+  not the account's root, not a superadmin, not even with access to the
+  database, whose triggers refuse it too. The retention can only be
+  lengthened. The bucket can't be deleted while it has versions.
+
+A legal hold lasts until it's lifted (`s3:PutObjectLegalHold`), whatever the
+retention. A write sets both with its headers (PutObject, CopyObject, which
+doesn't copy its source's, CreateMultipartUpload, whose upload completes
+with them, and POST Object's fields of the same names), or they're changed
+later; a PutObject that's retained (by its headers or the bucket's default)
+must declare a checksum of its body, as in S3:
+
+```sh
+aws s3api put-object --bucket backups --key db.dump --body db.dump \
+    --object-lock-mode GOVERNANCE --object-lock-retain-until-date 2027-01-01T00:00:00Z \
+    --object-lock-legal-hold-status ON
+aws s3api put-object-retention --bucket backups --key db.dump --version-id <id> \
+    --retention '{"Mode": "COMPLIANCE", "RetainUntilDate": "2028-01-01T00:00:00Z"}'
+aws s3api put-object-legal-hold --bucket backups --key db.dump --legal-hold Status=OFF
+aws s3api get-object-retention --bucket backups --key db.dump
+aws s3api get-object-legal-hold --bucket backups --key db.dump
+```
+
+GET and HEAD tell a version's lock (`x-amz-object-lock-mode`,
+`-retain-until-date`, `-legal-hold`) to whom may read it
+(`s3:GetObjectRetention`, `s3:GetObjectLegalHold`, which `read` grants).
+Setting a lock takes `s3:PutObjectRetention` or `s3:PutObjectLegalHold`,
+which no grant gives (an admin has them), and creating a bucket with Object
+Lock takes `s3:PutBucketObjectLockConfiguration` and `s3:PutBucketVersioning`.
+Policies can test what a request asks for with S3's condition keys
+`s3:object-lock-mode`, `s3:object-lock-retain-until-date`,
+`s3:object-lock-remaining-retention-days` and `s3:object-lock-legal-hold`,
+to cap retention periods, say. The console creates buckets with Object Lock,
+and deletes versions as DeleteObject does, without a bypass.
+
 ## Lifecycle rules
 
 A bucket's lifecycle configuration expires objects automatically, as in S3.
 Setting one is bucket management, as `PutLifecycleConfiguration` is its own
 permission in S3, so only an admin can, and needs no grant on the bucket's
 objects: the rules are carried out by Cairn, not as the admin. A role that may
-only write can't make its writes expire, nor stop an admin's rules. (S3 keeps
-versions from lifecycle rules with Object Lock, which Cairn doesn't have yet.)
+only write can't make its writes expire, nor stop an admin's rules. Versions
+that [Object Lock](#object-lock) keeps aren't expired, as in S3 (a current
+one still gets its delete marker).
 
 ```sh
 aws s3api put-bucket-lifecycle-configuration --bucket my-bucket \

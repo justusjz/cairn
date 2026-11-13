@@ -8,7 +8,12 @@
 //!   `s3:GetObjectVersionTagging`), a delete of one `s3:DeleteObjectVersion`;
 //! - a write that sets tags (`x-amz-tagging`) needs `s3:PutObjectTagging`
 //!   too, and one that sets an ACL `s3:PutObjectAcl` (`s3:PutBucketAcl`, for
-//!   a bucket);
+//!   a bucket), and one that sets a retention or a legal hold
+//!   `s3:PutObjectRetention` or `s3:PutObjectLegalHold` (a bucket created
+//!   with Object Lock, `s3:PutBucketObjectLockConfiguration` and
+//!   `s3:PutBucketVersioning`);
+//! - bypassing a GOVERNANCE retention needs `s3:BypassGovernanceRetention`,
+//!   checked where it's asked for (see `s3::object_lock`);
 //! - a copy needs the source's read, on the source;
 //! - HeadBucket is `s3:ListBucket`;
 //! - deleting a bucket's configuration is its `Put` action.
@@ -18,7 +23,7 @@
 
 use hyper::{HeaderMap, Method};
 
-use crate::s3::{objects::copy::parse_copy_source, util::query_param};
+use crate::s3::{object_lock, objects::copy::parse_copy_source, util::query_param};
 
 /// What an action is checked against.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -119,7 +124,11 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
     ("acl", ("GetBucketAcl", "s3:GetBucketAcl"), Some(("PutBucketAcl", "s3:PutBucketAcl", "", ""))),
     ("ownershipControls", ("GetBucketOwnershipControls", "s3:GetBucketOwnershipControls"), None),
     ("location", ("GetBucketLocation", "s3:GetBucketLocation"), None),
-    ("object-lock", ("GetObjectLockConfiguration", "s3:GetBucketObjectLockConfiguration"), None),
+    (
+        "object-lock",
+        ("GetObjectLockConfiguration", "s3:GetBucketObjectLockConfiguration"),
+        Some(("PutObjectLockConfiguration", "s3:PutBucketObjectLockConfiguration", "", "")),
+    ),
     ("website", ("GetBucketWebsite", "s3:GetBucketWebsite"), None),
     ("replication", ("GetBucketReplication", "s3:GetReplicationConfiguration"), None),
     ("accelerate", ("GetBucketAccelerateConfiguration", "s3:GetAccelerateConfiguration"), None),
@@ -176,6 +185,11 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
                 if sets_acl(headers) {
                     checks.push(check("s3:PutBucketAcl", on_bucket()));
                 }
+                // Object Lock, which a bucket is created with by both.
+                if crate::s3::object_lock::asks_for_bucket(headers) {
+                    checks.push(check("s3:PutBucketObjectLockConfiguration", on_bucket()));
+                    checks.push(check("s3:PutBucketVersioning", on_bucket()));
+                }
                 Some(Operation { name: "CreateBucket", checks })
             }
             (Method::DELETE, Some((_, _, Some((_, _, name, action))))) if !name.is_empty() => {
@@ -192,11 +206,18 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
     let version = has("versionId");
     let versioned = |plain, of_version| if version { of_version } else { plain };
     let tags = headers.contains_key("x-amz-tagging");
-    // A write that makes an object: its tags and ACL are actions of their own.
+    // A write that makes an object: its tags, ACL and Object Lock are
+    // actions of their own.
     let writes = |name| {
         let mut checks = vec![check("s3:PutObject", on_object())];
         if tags {
             checks.push(check("s3:PutObjectTagging", on_object()));
+        }
+        if headers.contains_key(object_lock::MODE) || headers.contains_key(object_lock::RETAIN_UNTIL) {
+            checks.push(check("s3:PutObjectRetention", on_object()));
+        }
+        if headers.contains_key(object_lock::LEGAL_HOLD) {
+            checks.push(check("s3:PutObjectLegalHold", on_object()));
         }
         if sets_acl(headers) {
             checks.push(check("s3:PutObjectAcl", on_object()));
@@ -214,6 +235,10 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
     match method.clone() {
         Method::GET if has("acl") => one("GetObjectAcl", versioned("s3:GetObjectAcl", "s3:GetObjectVersionAcl"), on_object()),
         Method::GET if has("uploadId") => one("ListParts", "s3:ListMultipartUploadParts", on_object()),
+        Method::GET if has("retention") => one("GetObjectRetention", "s3:GetObjectRetention", on_object()),
+        Method::GET if has("legal-hold") => one("GetObjectLegalHold", "s3:GetObjectLegalHold", on_object()),
+        Method::PUT if has("retention") => one("PutObjectRetention", "s3:PutObjectRetention", on_object()),
+        Method::PUT if has("legal-hold") => one("PutObjectLegalHold", "s3:PutObjectLegalHold", on_object()),
         Method::GET if has("tagging") => {
             one("GetObjectTagging", versioned("s3:GetObjectTagging", "s3:GetObjectVersionTagging"), on_object())
         }
@@ -268,7 +293,9 @@ pub fn delete(version: bool) -> &'static str {
 /// objects: exactly what the grant allowed before there were policies (see
 /// `roles`), but HeadBucket (`s3:ListBucket`), which only `read` allows now,
 /// as in S3; and reading the bucket's configuration (but its policy), with
-/// any of them.
+/// any of them. A `read` grant may read versions' Object Lock, but no grant
+/// may set one (only the bucket's default retention applies to a writer's
+/// writes), nor bypass one.
 pub fn grant_actions(permission: crate::roles::Permission) -> Vec<&'static str> {
     use crate::roles::Permission;
     let mut actions: Vec<&str> = match permission {
@@ -281,6 +308,8 @@ pub fn grant_actions(permission: crate::roles::Permission) -> Vec<&'static str> 
             "s3:GetObjectVersionTagging",
             "s3:GetObjectAcl",
             "s3:GetObjectVersionAcl",
+            "s3:GetObjectRetention",
+            "s3:GetObjectLegalHold",
             "s3:ListBucket",
             "s3:ListBucketVersions",
             "s3:ListBucketMultipartUploads",
@@ -391,6 +420,12 @@ mod tests {
             (Method::DELETE, "b", "k", "uploadId=u", none()),
             (Method::DELETE, "b", "k", "tagging", none()),
             (Method::DELETE, "b", "k", "tagging&versionId=v", none()),
+            (Method::GET, "b", "k", "retention", none()),
+            (Method::GET, "b", "k", "legal-hold&versionId=v", none()),
+            (Method::PUT, "b", "k", "retention", none()),
+            (Method::PUT, "b", "k", "legal-hold", none()),
+            (Method::PUT, "b", "k", "", headers(&[("x-amz-object-lock-legal-hold", "ON")])),
+            (Method::PUT, "b", "", "", headers(&[("x-amz-bucket-object-lock-enabled", "true")])),
         ]);
         requests
     }
@@ -526,11 +561,19 @@ mod tests {
         differences.sort();
         differences.dedup();
         // HeadBucket is `s3:ListBucket`: only `read` (and not a writer, who
-        // could HEAD any bucket they could see) may; and the bucket policy is
-        // for admins only, not everyone who sees the bucket.
+        // could HEAD any bucket they could see) may; the bucket policy is
+        // for admins only, not everyone who sees the bucket; and setting
+        // a version's Object Lock is no writer's.
         assert_eq!(
             differences,
-            [("GetBucketPolicy", true, false), ("GetBucketPolicyStatus", true, false), ("HeadBucket", true, false)],
+            [
+                ("GetBucketPolicy", true, false),
+                ("GetBucketPolicyStatus", true, false),
+                ("HeadBucket", true, false),
+                ("PutObject", true, false),
+                ("PutObjectLegalHold", true, false),
+                ("PutObjectRetention", true, false),
+            ],
             "{differences:?}"
         );
     }

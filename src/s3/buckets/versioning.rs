@@ -70,25 +70,27 @@ fn parse_versioning(body: &str) -> Option<Requested> {
 /// One attempt at the update (`cairn_set_versioning`). It locks the bucket
 /// row, which every write and delete in the bucket holds while it reads the
 /// state and lands, so each lands entirely before or entirely after the change
-/// (I2 in `catalog.sql`). Returns whether the bucket exists.
+/// (I2 in `catalog.sql`). Returns its status: 'set', 'no_such_bucket', or
+/// 'locked' (a bucket with Object Lock stays versioned).
 async fn try_update(
     client: &mut Object,
     bucket: &str,
     versioning: Versioning,
-) -> Result<bool, tokio_postgres::Error> {
-    let exists: bool = client
+) -> Result<String, tokio_postgres::Error> {
+    let status: String = client
         .query_one_cached(
             "SELECT pg_temp.cairn_set_versioning($1, $2)",
             &[&bucket, &versioning.as_db()],
         )
         .await?
         .get(0);
-    Ok(exists)
+    Ok(status)
 }
 
 /// PutBucketVersioning: `PUT /{bucket}?versioning` with a
 /// `<VersioningConfiguration>` body. Enables or suspends versioning. Suspending
 /// keeps every existing version; it only changes how new writes and deletes land.
+/// A bucket with Object Lock can't be suspended, as in S3.
 /// The body has been checked against its integrity headers (see `Payload`).
 pub async fn put_bucket_versioning(
     app: &App,
@@ -124,11 +126,19 @@ pub async fn put_bucket_versioning(
     };
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
-        match try_update(&mut client, bucket, versioning).await {
-            Ok(true) => return Ok(ok()),
-            Ok(false) => return Ok(no_such_bucket()),
-            Err(e) if db::is_conflict(&e) => continue,
-            Err(e) => return Err(e.into()),
+        let status = try_update(&mut client, bucket, versioning).await;
+        match status.as_deref() {
+            Ok("set") => return Ok(ok()),
+            Ok("locked") => {
+                return Ok(format_s3_error(
+                    StatusCode::CONFLICT,
+                    "InvalidBucketState",
+                    "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
+                ));
+            }
+            Ok(_) => return Ok(no_such_bucket()),
+            Err(e) if db::is_conflict(e) => continue,
+            Err(_) => return Err(status.unwrap_err().into()),
         }
     }
     Ok(slow_down())

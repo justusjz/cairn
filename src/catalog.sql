@@ -163,6 +163,14 @@
 --     policy only takes from them. The console's enrollments, challenges and
 --     sessions are each used up or ended by a single DELETE, whose condition
 --     is on its own row (F2), so each is used once.
+-- I11. A version that Object Lock keeps (a legal hold, or a retention that
+--     lasts: see `cairn_locked`) is never removed, and its retention only
+--     changes as S3 lets it (T39). Guard: K(b,k): every remover of a named
+--     version (T8, T17) checks the lock after taking K, and every change of
+--     a version's lock (T39, T40) takes K. Writes never remove versions of
+--     a bucket with Object Lock, which stays versioned (T10, and the
+--     `buckets_lock_versioned` constraint). The `objects_locked` trigger is
+--     the backstop for legal holds and compliance mode.
 --
 -- DEADLOCKS
 --
@@ -454,6 +462,22 @@ BEGIN
 END
 $$;
 
+-- Whether Object Lock keeps the version with row id `p_id` from being
+-- deleted (see `s3::object_lock`): a legal hold, or a retention that lasts,
+-- unless it's in governance mode and the deleter may bypass it
+-- (`p_bypass`). Under K(b,k).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_locked(p_id bigint, p_bypass boolean)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    result boolean;
+BEGIN
+    SELECT coalesce(legal_hold, false)
+           OR coalesce(retain_until > NOW() AND (retain_mode = 'COMPLIANCE' OR NOT p_bypass), false)
+    INTO result FROM objects WHERE id = p_id;
+    RETURN coalesce(result, false);
+END
+$$;
+
 -- The parts that writing a new version of the key would remove: those of its
 -- null version, unless the bucket is versioned (see `cairn_put_version`).
 -- Under K(b,k), so they stay the key's.
@@ -535,7 +559,10 @@ $$;
 -- metadata (see `s3::metadata`) and encryption (see `s3::sse`): its SSE-C key
 -- check, or its SSE-KMS (or SSE-S3, if `p_sse_s3`) key, data key, sealed
 -- object key and context (NULLs for what it isn't), and its checksum (see
--- `s3::checksums`; NULLs for none), and its tags (see `s3::tags`). `p_size`
+-- `s3::checksums`; NULLs for none), its tags (see `s3::tags`), and its
+-- Object Lock (see `s3::object_lock`): a retention (`p_lock_mode` and
+-- `p_lock_until`; NULLs for the bucket's default retention, if it has one)
+-- and a legal hold (NULL for none set). `p_size`
 -- is its plaintext's. `p_new_version_id` is
 -- the fresh version ID to use if the bucket is versioned. Returns the new
 -- row's id, and the version ID to report (NULL unless versioning is enabled).
@@ -546,12 +573,21 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_content_type text, p_metadata text, p_sse_c_key bytea, p_kms_key_id text,
     p_kms_data_key text, p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean,
     p_checksum_algorithm text, p_checksum_type text, p_checksum text, p_tags text,
-    p_new_version_id text,
+    p_new_version_id text, p_lock_mode text, p_lock_until timestamptz, p_legal_hold boolean,
     OUT id bigint, OUT version_id text
 ) LANGUAGE plpgsql AS $$
 DECLARE
     v_version_id text;
+    v_mode text := p_lock_mode;
+    v_until timestamptz := p_lock_until;
 BEGIN
+    -- The bucket's default retention, as of the write, if it asks for none.
+    IF v_mode IS NULL THEN
+        SELECT b.lock_mode,
+               NOW() + make_interval(years => coalesce(b.lock_years, 0), days => coalesce(b.lock_days, 0))
+        INTO v_mode, v_until
+        FROM buckets b WHERE b.name = p_bucket AND b.object_lock AND b.lock_mode IS NOT NULL;
+    END IF;
     IF p_versioning = 'enabled' THEN
         v_version_id := p_new_version_id;
     ELSE
@@ -563,11 +599,12 @@ BEGIN
     INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker,
                          size, etag, content_type, metadata, sse_c_key, sse_kms_key_id,
                          sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
-                         checksum_algorithm, checksum_type, checksum, tags, last_modified)
+                         checksum_algorithm, checksum_type, checksum, tags, last_modified,
+                         retain_mode, retain_until, legal_hold)
     VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
             p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags,
-            NOW())
+            NOW(), v_mode, v_until, p_legal_hold)
     RETURNING objects.id INTO id;
     -- A write's version ID is reported only where it's a new one: S3 reports
     -- none for the null version (unversioned or suspended).
@@ -639,7 +676,7 @@ $$;
 -- `p_size` is the blob's (and the part's); an encrypted part also has its
 -- plaintext's size and its salt (NULL for a plain one), and an encrypted
 -- object its encryption, as `cairn_put_version` takes it, as it does the
--- object's checksum and tags.
+-- object's checksum, tags and Object Lock.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_blob uuid, p_nodes int[], p_shards smallint[], p_size bigint, p_block_size int,
     p_data_shards smallint, p_parity_shards smallint, p_stripe_unit int, p_shard_crcs bigint[],
@@ -648,6 +685,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_kms_key_id text, p_kms_data_key text, p_kms_sealed bytea, p_kms_context text,
     p_sse_s3 boolean, p_checksum_algorithm text, p_checksum_type text, p_checksum text,
     p_tags text, p_conditional boolean, p_expected bigint, p_new_version_id text,
+    p_lock_mode text, p_lock_until timestamptz, p_legal_hold boolean,
     OUT status text, OUT present bigint, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -686,7 +724,8 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, coalesce(p_plain_size, p_size), p_etag, p_content_type,
         p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
-        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags, p_new_version_id);
+        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags, p_new_version_id,
+        p_lock_mode, p_lock_until, p_legal_hold);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -815,7 +854,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_metadata text, p_sse_c_key bytea, p_kms_key_id text, p_kms_data_key text,
     p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean, p_checksum_algorithm text,
     p_checksum_type text, p_checksum text, p_tags text, p_part_checksums boolean,
-    p_new_version_id text,
+    p_new_version_id text, p_lock_mode text, p_lock_until timestamptz, p_legal_hold boolean,
     OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -853,7 +892,8 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_metadata,
         p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
-        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags, p_new_version_id);
+        p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags, p_new_version_id,
+        p_lock_mode, p_lock_until, p_legal_hold);
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -968,8 +1008,8 @@ BEGIN
     reap_peer := '{}';
     -- An upload's bucket exists as long as the upload does.
     v_versioning := pg_temp.cairn_lock_bucket(p_bucket);
-    -- The upload defines the object's content type, metadata, encryption and
-    -- tags.
+    -- The upload defines the object's content type, metadata, encryption,
+    -- tags and Object Lock (but the bucket's default retention, as of now).
     -- It must belong to the request's bucket and key: authorization only
     -- checked the bucket.
     SELECT * INTO u
@@ -1021,7 +1061,8 @@ BEGIN
     SELECT * INTO v FROM pg_temp.cairn_put_version(
         p_bucket, p_key, v_versioning, v_total, p_etag, u.content_type, u.metadata,
         u.sse_c_key, u.sse_kms_key_id, u.sse_kms_data_key, u.sse_kms_sealed, u.sse_kms_context,
-        u.sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, u.tags, p_new_version_id);
+        u.sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, u.tags, p_new_version_id,
+        u.retain_mode, u.retain_until, u.legal_hold);
     version_id := v.version_id;
     UPDATE objects SET upload_id = p_upload WHERE id = v.id;
     UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);
@@ -1072,10 +1113,13 @@ $$;
 -- and a version ID or NULL) the way the bucket's versioning state dictates
 -- ('deleted', with each one's version ID to report and whether it concerns a
 -- delete marker), or reports 'no_such_bucket'. `p_marker_ids` holds a fresh
--- version ID per target, for a delete marker in an enabled bucket.
+-- version ID per target, for a delete marker in an enabled bucket. A named
+-- version that Object Lock keeps (`cairn_locked`, bypassing governance mode
+-- where `p_bypass` says so) isn't deleted, and is `locked` instead (with no
+-- version ID or delete marker to report).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_objects(
-    p_bucket text, p_keys text[], p_version_ids text[], p_marker_ids text[],
-    OUT status text, OUT version_ids text[], OUT delete_markers boolean[],
+    p_bucket text, p_keys text[], p_version_ids text[], p_marker_ids text[], p_bypass boolean[],
+    OUT status text, OUT version_ids text[], OUT delete_markers boolean[], OUT locked boolean[],
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -1084,12 +1128,14 @@ DECLARE
     f record;
     v_locked uuid[];
     d record;
+    v_kept boolean;
 BEGIN
     reap_blob := '{}';
     reap_node := '{}';
     reap_peer := '{}';
     version_ids := '{}';
     delete_markers := '{}';
+    locked := '{}';
     v_versioning := pg_temp.cairn_lock_bucket(p_bucket);
     IF v_versioning IS NULL THEN
         status := 'no_such_bucket';
@@ -1099,6 +1145,12 @@ BEGIN
     -- Every version the targets name or may remove exists now, under the
     -- keys' locks; the deletes only add delete markers, which have no parts.
     FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP
+        v_kept := p_version_ids[i] IS NOT NULL AND pg_temp.cairn_locked(
+            (SELECT o.id FROM objects o
+             WHERE o.bucket = p_bucket AND o.key = p_keys[i] AND o.version_id = p_version_ids[i]),
+            coalesce(p_bypass[i], false));
+        locked := locked || v_kept;
+        CONTINUE WHEN v_kept;
         v_freed := v_freed || pg_temp.cairn_freed_by_delete(
             p_bucket, p_keys[i], v_versioning, p_version_ids[i]);
     END LOOP;
@@ -1106,6 +1158,11 @@ BEGIN
     v_locked := pg_temp.cairn_lock_blobs(f.blobs, f.exclusive);
     PERFORM pg_temp.cairn_check_on(v_freed, v_locked);
     FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP
+        IF locked[i] THEN
+            version_ids := version_ids || NULL::text;
+            delete_markers := delete_markers || false;
+            CONTINUE;
+        END IF;
         SELECT * INTO d FROM pg_temp.cairn_delete_key(
             p_bucket, p_keys[i], v_versioning, p_version_ids[i], p_marker_ids[i]);
         version_ids := version_ids || d.version_id;
@@ -1170,17 +1227,46 @@ END
 $$;
 
 -- T10: PutBucketVersioning. Takes B(b) exclusive, so that the change is
--- ordered against every write and delete in the bucket (I2). Returns whether
--- the bucket exists.
+-- ordered against every write and delete in the bucket (I2), and against
+-- enabling Object Lock (T38). Returns 'set', 'no_such_bucket', or 'locked'
+-- for a bucket with Object Lock, which stays versioned.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_set_versioning(p_bucket text, p_versioning text)
-RETURNS boolean LANGUAGE plpgsql AS $$
+RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
     PERFORM 1 FROM buckets WHERE name = p_bucket FOR UPDATE;
     IF NOT FOUND THEN
-        RETURN false;
+        RETURN 'no_such_bucket';
+    END IF;
+    IF p_versioning <> 'enabled' AND (SELECT object_lock FROM buckets WHERE name = p_bucket) THEN
+        RETURN 'locked';
     END IF;
     UPDATE buckets SET versioning = p_versioning WHERE name = p_bucket;
-    RETURN true;
+    RETURN 'set';
+END
+$$;
+
+-- T38: PutObjectLockConfiguration: enables Object Lock on the bucket, which
+-- must be versioned ('not_versioned'), and sets its default retention (a
+-- mode, and days or years; NULLs for none). Takes the bucket's row as a
+-- plain UPDATE does, which orders it against a change of versioning (T10),
+-- and checks the versioning state under it. Writes read the default as they
+-- land (`cairn_put_version`); enabling Object Lock only lets them take
+-- locks, which they may as soon as it's committed. 'set', 'not_versioned'
+-- or 'no_such_bucket'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_object_lock(
+    p_bucket text, p_mode text, p_days int, p_years int
+) RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM buckets WHERE name = p_bucket FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_bucket';
+    END IF;
+    IF (SELECT versioning FROM buckets WHERE name = p_bucket) <> 'enabled' THEN
+        RETURN 'not_versioned';
+    END IF;
+    UPDATE buckets SET object_lock = true, lock_mode = p_mode, lock_days = p_days, lock_years = p_years
+    WHERE name = p_bucket;
+    RETURN 'set';
 END
 $$;
 
@@ -1216,7 +1302,9 @@ $$;
 --                 only one; removed for good.
 --   'noncurrent'  not the current version, the version after it still
 --                 `p_successors` (which made it noncurrent when it did), and
---                 at least `p_newer` versions newer than it; removed for good.
+--                 at least `p_newer` versions newer than it, and not kept by
+--                 Object Lock (as in S3, lifecycle rules never bypass it);
+--                 removed for good.
 --
 -- A 'current' or 'noncurrent' target must also still have the tags the sweep
 -- read, `p_tags` (stored form): a version re-tagged since may no longer match
@@ -1278,7 +1366,7 @@ BEGIN
                 SELECT 1 FROM objects
                 WHERE id = p_ids[i] AND bucket = p_bucket AND key = p_keys[i] AND NOT is_latest
                   AND tags = p_tags[i]
-            ) AND (
+            ) AND NOT pg_temp.cairn_locked(p_ids[i], false) AND (
                 SELECT min(id) FROM objects
                 WHERE bucket = p_bucket AND key = p_keys[i] AND id > p_ids[i]
             ) IS NOT DISTINCT FROM p_successors[i] AND (
@@ -1374,6 +1462,102 @@ BEGIN
     END IF;
     UPDATE objects SET tags = p_tags WHERE id = o.id;
     status := 'tagged';
+END
+$$;
+
+-- T39: PutObjectRetention: sets the retention (`p_mode` and `p_until`;
+-- NULLs to remove it) of the version `p_version_id` of the key, or of its
+-- current version if NULL, in place, as S3 lets it be changed: a retention
+-- that still lasts only lengthens, and stays in compliance mode; one in
+-- governance mode may also become compliance mode, and may be shortened or
+-- removed only by whom may bypass it (`p_bypass`). Takes B(b) shared and
+-- K(b,k), as T22 does: deletes and lifecycle sweeps check a version's
+-- retention under K. Returns 'set', or 'no_such_bucket', 'no_object_lock'
+-- (the bucket hasn't Object Lock enabled), 'no_such_key',
+-- 'no_such_version', 'delete_marker', or 'locked' (the change isn't
+-- allowed); and the bucket's versioning state and the version's ID, as
+-- T22 does.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_retention(
+    p_bucket text, p_key text, p_version_id text, p_mode text, p_until timestamptz, p_bypass boolean,
+    OUT status text, OUT versioning text, OUT version_id text
+) LANGUAGE plpgsql AS $$
+DECLARE
+    o record;
+BEGIN
+    versioning := pg_temp.cairn_lock_bucket(p_bucket);
+    IF versioning IS NULL THEN
+        status := 'no_such_bucket';
+        RETURN;
+    END IF;
+    IF NOT (SELECT object_lock FROM buckets WHERE name = p_bucket) THEN
+        status := 'no_object_lock';
+        RETURN;
+    END IF;
+    PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
+    SELECT ob.id, ob.version_id, ob.is_delete_marker, ob.retain_mode, ob.retain_until INTO o
+    FROM objects ob
+    WHERE ob.bucket = p_bucket AND ob.key = p_key
+      AND CASE WHEN p_version_id IS NULL THEN ob.is_latest ELSE ob.version_id = p_version_id END;
+    IF NOT FOUND THEN
+        status := CASE WHEN p_version_id IS NULL THEN 'no_such_key' ELSE 'no_such_version' END;
+        RETURN;
+    END IF;
+    version_id := o.version_id;
+    IF o.is_delete_marker THEN
+        status := 'delete_marker';
+        RETURN;
+    END IF;
+    IF o.retain_until > NOW() THEN
+        IF o.retain_mode = 'COMPLIANCE' THEN
+            IF p_mode IS DISTINCT FROM 'COMPLIANCE' OR p_until < o.retain_until THEN
+                status := 'locked';
+                RETURN;
+            END IF;
+        ELSIF NOT p_bypass AND (p_mode IS NULL OR p_until < o.retain_until) THEN
+            status := 'locked';
+            RETURN;
+        END IF;
+    END IF;
+    UPDATE objects SET retain_mode = p_mode, retain_until = p_until WHERE id = o.id;
+    status := 'set';
+END
+$$;
+
+-- T40: PutObjectLegalHold: sets the legal hold of the version, as T39 sets
+-- its retention, under the same locks, with the same statuses but
+-- 'locked': anyone allowed to may set or lift it.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_legal_hold(
+    p_bucket text, p_key text, p_version_id text, p_hold boolean,
+    OUT status text, OUT versioning text, OUT version_id text
+) LANGUAGE plpgsql AS $$
+DECLARE
+    o record;
+BEGIN
+    versioning := pg_temp.cairn_lock_bucket(p_bucket);
+    IF versioning IS NULL THEN
+        status := 'no_such_bucket';
+        RETURN;
+    END IF;
+    IF NOT (SELECT object_lock FROM buckets WHERE name = p_bucket) THEN
+        status := 'no_object_lock';
+        RETURN;
+    END IF;
+    PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
+    SELECT ob.id, ob.version_id, ob.is_delete_marker INTO o
+    FROM objects ob
+    WHERE ob.bucket = p_bucket AND ob.key = p_key
+      AND CASE WHEN p_version_id IS NULL THEN ob.is_latest ELSE ob.version_id = p_version_id END;
+    IF NOT FOUND THEN
+        status := CASE WHEN p_version_id IS NULL THEN 'no_such_key' ELSE 'no_such_version' END;
+        RETURN;
+    END IF;
+    version_id := o.version_id;
+    IF o.is_delete_marker THEN
+        status := 'delete_marker';
+        RETURN;
+    END IF;
+    UPDATE objects SET legal_hold = p_hold WHERE id = o.id;
+    status := 'set';
 END
 $$;
 

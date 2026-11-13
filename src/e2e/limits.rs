@@ -48,7 +48,7 @@ async fn error_code(
 }
 
 async fn new_upload(app: &Arc<App>, key: &str) -> String {
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", Wanted::Plain, None, None)
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default())
         .await
         .unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();

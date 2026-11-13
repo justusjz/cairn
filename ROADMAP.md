@@ -61,7 +61,8 @@ Done:
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes
-  history safe from admin credentials too.
+  history safe from admin credentials too. Implemented, with governance
+  and compliance modes.
 - **Lifecycle transitions.** Moving objects between storage classes by
   lifecycle rules, once Cairn has more than one (erasure-coded storage, say).
   Expiration rules are done.

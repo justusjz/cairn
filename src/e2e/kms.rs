@@ -62,6 +62,7 @@ async fn put_kms(
         sealing,
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: String::new(),
+        lock: Default::default(),
     };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
         .await
@@ -246,7 +247,7 @@ async fn put_part(app: &Arc<App>, role: Uuid, upload_id: Uuid, key: &str, part_n
 }
 
 async fn create(app: &Arc<App>, role: Uuid, key: &str, wanted: Wanted<'_>) -> (Uuid, Headers) {
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, Some(role), None).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, Some(role), None, Default::default()).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let headers = Headers::of(response.headers());
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -309,7 +310,7 @@ async fn copy(
         "x",
         "", None,
         &Preconditions::default(),
-        CopyKeys { source, dest, role: Some(role), checksum: None },
+        CopyKeys { lock: Default::default(), source, dest, role: Some(role), checksum: None },
     )
     .await
     .unwrap();
@@ -680,6 +681,7 @@ async fn put_s3(app: &Arc<App>, role: Uuid, key: &str, data: Vec<u8>) {
         sealing,
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: String::new(),
+        lock: Default::default(),
     };
     let result = crate::upload_part(app, Full::new(Bytes::from(data)), &attach, Payload::unchecked())
         .await
@@ -855,6 +857,7 @@ async fn sse_s3_etags_are_md5s_stored_sealed() {
                 sealing,
                 checksum: crate::e2e::OBJECT_CHECKSUM,
                 tags: String::new(),
+                lock: Default::default(),
             };
             crate::upload_part(&app, Full::new(Bytes::from(data(10))), &attach, Payload::unchecked()).await.unwrap()
         }

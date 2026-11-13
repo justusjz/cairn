@@ -9,13 +9,15 @@ use crate::{
     payload::Payload,
     s3::checksums::{self, Algorithm},
     s3::conditional::Preconditions,
+    s3::object_lock::{self, Lock},
     s3::sse::{self, Wanted},
     s3::util::{format_s3_error, rejection_response, with_version_id},
     s3::versions::current_object,
 };
 
 /// PutObject, and POST Object (see `post`), whose body is a part of a form.
-/// `tags` are the object's, stored form (see `s3::tags`).
+/// `tags` are the object's, stored form (see `s3::tags`), and `lock` the
+/// Object Lock it asks for (see `s3::object_lock`).
 #[allow(clippy::too_many_arguments)]
 pub async fn put_object<B>(
     app: &Arc<App>,
@@ -29,11 +31,16 @@ pub async fn put_object<B>(
     conditions: &Preconditions,
     wanted: Wanted<'_>,
     role: Option<uuid::Uuid>,
+    lock: Lock,
 ) -> anyhow::Result<Response<Full<Bytes>>>
 where
     B: Body<Data = Bytes> + Unpin + Send,
     B::Error: std::error::Error + Send + Sync + 'static,
 {
+    // A lock only where there's Object Lock.
+    if let Some(refused) = object_lock::check_write(app, bucket, &lock).await? {
+        return Ok(refused);
+    }
     // Fast-fail a conditional write (If-Match / If-None-Match) before streaming the
     // body, so a client "create if absent" against an existing key doesn't upload
     // the whole object just to be rejected. This is only an optimization — the
@@ -79,6 +86,7 @@ where
         // The client's checksum, or S3's default.
         checksum: checksums::Wanted::ClientsOr(Algorithm::Crc64Nvme),
         tags: tags.to_owned(),
+        lock,
     };
     match crate::upload_part(app, body, &attach, payload).await? {
         UploadResult::Committed { etag, checksum, version_id, .. } => {

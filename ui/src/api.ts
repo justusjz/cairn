@@ -87,7 +87,8 @@ export const api = {
   storage: () => ok(client.GET("/storage")),
   integrity: () => ok(client.GET("/integrity")),
   buckets: () => ok(client.GET("/buckets")),
-  createBucket: (name: string) => ok(client.POST("/buckets", { body: { name } })),
+  createBucket: (name: string, objectLock = false) =>
+    ok(client.POST("/buckets", { body: { name, object_lock: objectLock } })),
   deleteBucket: (bucket: string) => ok(client.DELETE("/buckets/{bucket}", { params: bucketPath(bucket) })),
   objects: (bucket: string, prefix: string, after: string, deleted: boolean) =>
     ok(
