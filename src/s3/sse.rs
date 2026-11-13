@@ -8,9 +8,10 @@
 //!   (XChaCha20-Poly1305) under a data key from the KMS (see `kms`). The data
 //!   key is kept as its KMS ciphertext, which only the KMS can open, and only
 //!   with the same associated data: the encryption context the client gave
-//!   (if any), with `"aws:s3:arn": "arn:aws:s3:::<bucket>/<key>"` added
-//!   (unless the client gave that entry itself), as canonical JSON. So a
-//!   data key only opens for an object of the name it was made for. The KMS
+//!   (if any), with `"aws:s3:arn": "arn:aws:s3:::<bucket>/<key>"` added, as
+//!   canonical JSON. So a data key only opens for an object of the name it
+//!   was made for. A client may name that entry itself, but only as the
+//!   object's own ARN, as S3 has it (see `for_object`). The KMS
 //!   is asked as the role that made the request, so it decides which roles
 //!   may use which keys (see `kms`); a request of no role (an account's root's,
 //!   in the console) may use none.
@@ -657,14 +658,52 @@ fn kms_refusal(e: KmsError, key_id: &KeyId, role: Uuid) -> anyhow::Result<Respon
 }
 
 /// The associated data an object's data key is bound to: its client's
-/// context (canonical JSON, if any), and the object's ARN.
+/// context (canonical JSON, if any), and the object's ARN, whatever the
+/// context says it is.
 fn associated_data(context: Option<&str>, bucket: &str, key: &str) -> Vec<u8> {
     let mut map: BTreeMap<String, String> = context
         .map(|c| serde_json::from_str(c).expect("a stored context is a JSON object of strings"))
         .unwrap_or_default();
-    map.entry("aws:s3:arn".to_owned())
-        .or_insert_with(|| format!("arn:aws:s3:::{bucket}/{key}"));
+    map.insert(ARN_KEY.to_owned(), object_arn(bucket, key));
     serde_json::to_vec(&map).unwrap()
+}
+
+/// The encryption context's entry S3 adds: the object's ARN.
+const ARN_KEY: &str = "aws:s3:arn";
+
+fn object_arn(bucket: &str, key: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/{key}")
+}
+
+/// What `requested` asks for, as a write of `bucket`/`key` takes it, or why
+/// it's refused: an encryption context with pairs of the client's is the
+/// object's, so it has the object's ARN (`aws:s3:arn`), as S3 answers with
+/// it; one with no other pair is none. A client may name the ARN itself,
+/// but no other one, nor have a key that's `aws:s3:arn` in another case,
+/// which S3 (KMS) refuses as two keys that differ only in case (probed).
+pub fn for_object(
+    request: Option<ServerSide>,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<ServerSide>, Response<Full<Bytes>>> {
+    let Some(ServerSide::Kms(KmsRequest { key_id, context: Some(mut context) })) = request else {
+        return Ok(request);
+    };
+    if context.keys().any(|k| k != ARN_KEY && k.eq_ignore_ascii_case(ARN_KEY)) {
+        return Err(bad_request(
+            "KMS.ValidationException",
+            "EncryptionContext must not contain multiple keys that only differ in case",
+        ));
+    }
+    let arn = object_arn(bucket, key);
+    if context.remove(ARN_KEY).is_some_and(|named| named != arn) {
+        return Err(bad_request("InvalidArgument", "The context value for 'aws:s3:arn' shall be equal to object's ARN"));
+    }
+    let context = (!context.is_empty()).then(|| {
+        context.insert(ARN_KEY.to_owned(), arn);
+        context
+    });
+    Ok(Some(ServerSide::Kms(KmsRequest { key_id, context })))
 }
 
 fn seal_object_key(data_key: &Key, object_key: &Key, ad: &[u8]) -> Vec<u8> {
@@ -812,9 +851,43 @@ mod tests {
         let ad = |context, key| String::from_utf8(associated_data(context, "b", key)).unwrap();
         assert_eq!(ad(None, "k"), r#"{"aws:s3:arn":"arn:aws:s3:::b/k"}"#);
         assert_eq!(ad(Some(r#"{"z":"1","a":"2"}"#), "k"), r#"{"a":"2","aws:s3:arn":"arn:aws:s3:::b/k","z":"1"}"#);
-        // The client's own entry stands.
-        assert_eq!(ad(Some(r#"{"aws:s3:arn":"x"}"#), "k"), r#"{"aws:s3:arn":"x"}"#);
+        // Whatever a stored context says it is.
+        assert_eq!(ad(Some(r#"{"aws:s3:arn":"x"}"#), "k"), r#"{"aws:s3:arn":"arn:aws:s3:::b/k"}"#);
         assert_ne!(ad(None, "k"), ad(None, "k2"));
+    }
+
+    /// A write's context, as S3 takes it (probed: plans/probes/kms_context_probe.py).
+    #[test]
+    fn a_context_is_the_objects() {
+        let kms = |context: Option<&str>| {
+            Some(ServerSide::Kms(KmsRequest {
+                key_id: KeyId::parse("transit/k").unwrap(),
+                context: context.map(|c| serde_json::from_str(c).unwrap()),
+            }))
+        };
+        let context = |request: Result<Option<ServerSide>, _>| match request.unwrap() {
+            Some(ServerSide::Kms(request)) => request.context.map(|c| serde_json::to_string(&c).unwrap()),
+            _ => panic!("not SSE-KMS"),
+        };
+        assert_eq!(context(for_object(kms(None), "b", "k")), None);
+        // Pairs of the client's, with the object's ARN, which it answers with.
+        let own = for_object(kms(Some(r#"{"a":"1"}"#)), "b", "k");
+        assert_eq!(context(own).as_deref(), Some(r#"{"a":"1","aws:s3:arn":"arn:aws:s3:::b/k"}"#));
+        // The object's own ARN alone is no context.
+        assert_eq!(context(for_object(kms(Some(r#"{"aws:s3:arn":"arn:aws:s3:::b/k"}"#)), "b", "k")), None);
+        let named = for_object(kms(Some(r#"{"aws:s3:arn":"arn:aws:s3:::b/k","a":"1"}"#)), "b", "k");
+        assert_eq!(context(named).as_deref(), Some(r#"{"a":"1","aws:s3:arn":"arn:aws:s3:::b/k"}"#));
+        // Not another's, nor anything else.
+        for arn in ["arn:aws:s3:::b/other", "arn:aws:s3:::other/k", "arn:aws:s3:::b", "hello"] {
+            let refused = for_object(kms(Some(&format!(r#"{{"aws:s3:arn":"{arn}"}}"#))), "b", "k").unwrap_err();
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{arn}");
+        }
+        // Nor the key in another case.
+        let refused = for_object(kms(Some(r#"{"AWS:S3:ARN":"arn:aws:s3:::b/k"}"#)), "b", "k").unwrap_err();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        // SSE-S3, none: as they are.
+        assert_eq!(for_object(Some(ServerSide::S3), "b", "k").unwrap(), Some(ServerSide::S3));
+        assert_eq!(for_object(None, "b", "k").unwrap(), None);
     }
 
     #[test]

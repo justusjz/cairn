@@ -370,7 +370,9 @@ where
         Err(refused) => return Ok(refused),
     };
     let sse_s3 = app.kms.as_ref().is_some_and(|kms| kms.sse_s3_key().is_some());
-    let server = match sse::requested(&headers, customer_key.is_some(), app.kms.is_some(), sse_s3) {
+    let server = match sse::requested(&headers, customer_key.is_some(), app.kms.is_some(), sse_s3)
+        .and_then(|request| sse::for_object(request, &bucket, &key))
+    {
         Ok(None) if customer_key.is_none() => match default_request(app, &bucket).await? {
             Ok(request) => request,
             Err(refused) => return Ok(refused),

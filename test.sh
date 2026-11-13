@@ -740,9 +740,17 @@ sse_kms_ok() {
     # There's no default key.
     ! awss3 s3api put-object --bucket "$BUCKET" --key kms/x.bin --body "$SMALL" \
         --server-side-encryption aws:kms >/dev/null 2>&1 || return 1
-    awss3 s3api put-object --bucket "$BUCKET" --key kms/other.bin --body "$BIG" \
+    # The context is told back as the object's, with its ARN; one naming
+    # another object's ARN is refused (as S3 has it).
+    [ "$(awss3 s3api put-object --bucket "$BUCKET" --key kms/other.bin --body "$BIG" \
         --server-side-encryption aws:kms --ssekms-key-id cairn-other \
-        --ssekms-encryption-context "$context" >/dev/null 2>&1 || return 1
+        --ssekms-encryption-context "$context" --query SSEKMSEncryptionContext --output text 2>/dev/null \
+        | base64 -d)" = "{\"aws:s3:arn\":\"arn:aws:s3:::${BUCKET}/kms/other.bin\",\"team\":\"storage\"}" ] \
+        || return 1
+    ! awss3 s3api put-object --bucket "$BUCKET" --key kms/x.bin --body "$SMALL" \
+        --server-side-encryption aws:kms --ssekms-key-id cairn-other \
+        --ssekms-encryption-context "$(printf '{"aws:s3:arn":"arn:aws:s3:::%s/kms/other.bin"}' "$BUCKET" | base64)" \
+        >/dev/null 2>&1 || return 1
     for key in default other; do
         awss3 s3api get-object --bucket "$BUCKET" --key "kms/$key.bin" "$out" >/dev/null 2>&1 || return 1
         cmp -s "$BIG" "$out" || return 1

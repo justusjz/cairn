@@ -713,7 +713,9 @@ async fn handle_request(
     let server = match *req.method() {
         _ if writes_object => {
             let sse_s3 = app.kms.as_ref().is_some_and(|kms| kms.sse_s3_key().is_some());
-            match sse::requested(req.headers(), customer_key.is_some(), app.kms.is_some(), sse_s3) {
+            match sse::requested(req.headers(), customer_key.is_some(), app.kms.is_some(), sse_s3)
+                .and_then(|request| sse::for_object(request, &bucket, &key))
+            {
                 Ok(request) => request,
                 Err(refused) => return Ok(box_response(refused)),
             }
