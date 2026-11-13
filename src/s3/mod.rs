@@ -267,6 +267,15 @@ async fn handle_request(
         }
         return Ok(box_response(access.denied(check, verdict)));
     }
+    // A bucket's policy is its account's alone: another account's request
+    // its policy allows is a 405, as S3 answers it.
+    if operation.checks.iter().any(|c| access.foreign(c)) {
+        return Ok(box_response(format_s3_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        )));
+    }
     // A key (or version) that isn't there is a 403 to whom may not list the
     // bucket, as in S3 (probed), so that keys can't be found by guessing.
     let hides_missing = |status: StatusCode| {

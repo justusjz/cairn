@@ -79,7 +79,8 @@ struct Loaded {
     policy: Option<Arc<Policy>>,
     /// Whether its policy is public, and RestrictPublicBuckets is on (the
     /// bucket's or the cluster's; see `public_access`): then it allows
-    /// anonymous requests nothing.
+    /// nothing to anyone outside the bucket's account, anonymous or not, not
+    /// even what it allows another account by name (as in S3).
     restricted: bool,
 }
 
@@ -213,9 +214,10 @@ impl Access {
         };
         let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &self.context };
         let loaded = check.on.bucket().and_then(|b| self.buckets.get(b));
-        // A restricted bucket's public policy is none to anonymous requests.
+        // A restricted bucket's public policy is none to anyone outside its
+        // account.
         let bucket = loaded
-            .filter(|loaded| !(loaded.restricted && self.user.is_none() && self.root.is_none()))
+            .filter(|loaded| !(loaded.restricted && loaded.account.as_deref() != self.account()))
             .and_then(|loaded| loaded.policy.as_deref());
         // Whose the resource is: a bucket's owner; else (no bucket, or none
         // by its name) the principal's own account's. A bucket to create is
@@ -235,6 +237,23 @@ impl Access {
             _ => false,
         };
         crate::policy::verdict_across(self.identity.iter().map(|p| &**p), bucket, &request, cross)
+    }
+
+    /// The account the principal acts in; `None` if anonymous.
+    fn account(&self) -> Option<&str> {
+        match (&self.user, &self.root) {
+            (Some((account, _, _)), _) => Some(account),
+            (None, root) => root.as_deref(),
+        }
+    }
+
+    /// Whether `check` is one only its bucket's own account may make (on
+    /// the bucket's policy), and the principal is of another (or anonymous),
+    /// whatever the policy allows it: S3 answers it 405 MethodNotAllowed.
+    /// (Its bucket must be loaded.)
+    pub fn foreign(&self, check: &Check) -> bool {
+        let owner = check.on.bucket().and_then(|b| self.buckets.get(b)).and_then(|l| l.account.as_deref());
+        crate::policy::POLICY_ACTIONS.contains(&check.action) && owner.is_some_and(|owner| self.account() != Some(owner))
     }
 
     /// Whether `check` is allowed.

@@ -88,6 +88,12 @@ impl Actor {
 
     /// The verdicts on `checks`, with the buckets' policies loaded.
     async fn verdicts(&self, app: &Arc<App>, checks: &[Check]) -> Result<Vec<Verdict>, ApiError> {
+        let access = self.access(app, checks).await?;
+        Ok(checks.iter().map(|c| access.verdict(c)).collect())
+    }
+
+    /// The actor's access, with the buckets of `checks` loaded.
+    async fn access(&self, app: &Arc<App>, checks: &[Check]) -> Result<Access, ApiError> {
         let user = &self.0;
         let origin = Origin { peer: user.peer, trusted_proxies: &app.trusted_proxies, signed: None, form: false };
         let mut access = match &user.subject {
@@ -97,7 +103,7 @@ impl Actor {
             Subject::Root => Access::root(&user.account, &user.method, &user.headers, &user.query, &origin),
         };
         access.load_all(app, checks).await?;
-        Ok(checks.iter().map(|c| access.verdict(c)).collect())
+        Ok(access)
     }
 
     /// Whether `action` on `on` is allowed.
@@ -112,12 +118,19 @@ impl Actor {
     }
 
     /// Refuses the request unless every one of `checks` is allowed.
+    /// A bucket's policy is its account's alone (see `Access::foreign`).
     pub async fn check_all(&self, app: &Arc<App>, checks: &[Check]) -> Result<(), ApiError> {
-        let verdicts = self.verdicts(app, checks).await?;
-        match checks.iter().zip(verdicts).find(|(_, v)| *v != Verdict::Allow) {
-            None => Ok(()),
-            Some((check, verdict)) => Err(ApiError::Forbidden(denied(&self.0, check, verdict))),
+        let access = self.access(app, checks).await?;
+        if let Some((check, verdict)) = checks.iter().map(|c| (c, access.verdict(c))).find(|(_, v)| *v != Verdict::Allow) {
+            return Err(ApiError::Forbidden(denied(&self.0, check, verdict)));
         }
+        if let Some(check) = checks.iter().find(|c| access.foreign(c)) {
+            return Err(ApiError::Forbidden(format!(
+                "only the bucket's own account may {} (its policy's)",
+                check.action
+            )));
+        }
+        Ok(())
     }
 }
 

@@ -151,9 +151,10 @@ pub fn verdict_across<'p>(
 }
 
 /// The actions on a bucket's policy, which its account's root may always
-/// take, whatever the policy says: AWS's way out of a policy that denies
-/// everyone.
-const ROOT_EXEMPT: [&str; 3] = ["s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"];
+/// take, whatever the policy says (AWS's way out of a policy that denies
+/// everyone), and no other account may take, whatever it allows (see
+/// `s3::access::Access::foreign`).
+pub const POLICY_ACTIONS: [&str; 3] = ["s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"];
 
 /// The verdict on a request by an account's root (`request.principal`):
 /// identity policies don't restrict it, so it may do anything to what its
@@ -161,7 +162,7 @@ const ROOT_EXEMPT: [&str; 3] = ["s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:
 /// getting, setting and deleting that policy; something of another account
 /// only if that bucket's policy allows it.
 pub fn root_verdict(bucket: Option<&Policy>, request: &Request, owns: bool) -> Verdict {
-    let exempt = owns && ROOT_EXEMPT.contains(&request.action);
+    let exempt = owns && POLICY_ACTIONS.contains(&request.action);
     match bucket.map(|policy| policy.evaluate(request)) {
         Some(Decision::Deny) if !exempt => Verdict::ExplicitDeny { identity: false },
         Some(Decision::Allow) => Verdict::Allow,
