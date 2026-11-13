@@ -212,7 +212,6 @@ impl Access {
             (None, Some(account)) => Who::Root { account },
             (None, None) => Who::Anonymous,
         };
-        let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &self.context };
         let loaded = check.on.bucket().and_then(|b| self.buckets.get(b));
         // A restricted bucket's public policy is none to anyone outside its
         // account.
@@ -229,6 +228,21 @@ impl Access {
             On::Cluster => Some(self.operator.as_deref().unwrap_or("")),
             _ => loaded.and_then(|loaded| loaded.account.as_deref()).filter(|_| check.action != "s3:CreateBucket"),
         };
+        // `aws:ResourceAccount` is that account (else the principal's own;
+        // anonymously, the one the request was made in).
+        let resource_account = owner.or(self.account());
+        let with_resource_account;
+        let context = match resource_account {
+            Some(account) if self.context.get("aws:ResourceAccount").is_none_or(|v| v != [account]) => {
+                let mut context = self.context.clone();
+                context.set("aws:ResourceAccount", account);
+                context.set("s3:ResourceAccount", account);
+                with_resource_account = context;
+                &with_resource_account
+            }
+            _ => &self.context,
+        };
+        let request = crate::policy::Request { principal, action: check.action, resource: &resource, context };
         if let Some(account) = &self.root {
             return crate::policy::root_verdict(bucket, &request, owner.is_none_or(|owner| owner == account));
         }

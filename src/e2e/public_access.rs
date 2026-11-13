@@ -101,7 +101,8 @@ async fn may(app: &App, asker: Asker<'_>, action: &'static str, on: On) -> (bool
     let method = hyper::Method::GET;
     let default = crate::roles::account(&app.pool.get().await.unwrap()).await.unwrap();
     let mut access = match asker {
-        Asker::User(principal) => access::Access::new(Some(principal), &principal.account, &method, &headers, "", &origin).unwrap(),
+        // As the S3 API makes it: in the cluster's first account.
+        Asker::User(principal) => access::Access::new(Some(principal), &default, &method, &headers, "", &origin).unwrap(),
         Asker::Root(account) => access::Access::root(account, &method, &headers, "", &origin),
         Asker::Anonymous => access::Access::new(None, &default, &method, &headers, "", &origin).unwrap(),
     };
@@ -162,4 +163,26 @@ async fn other_accounts_get_nothing_of_restricted_buckets_nor_their_policies() {
     assert_eq!(may(&app, Asker::Root(&acme), "s3:GetObject", object()).await.0, false);
     assert_eq!(may(&app, Asker::Anonymous, "s3:GetObject", object()).await.0, false);
     assert_eq!(may(&app, Asker::User(&ada), "s3:GetObject", object()).await.0, true);
+}
+
+/// `aws:ResourceAccount` is the account of the resource checked: a
+/// bucket's owner's, not the cluster's first account's, nor the user's.
+#[tokio::test]
+async fn the_resource_account_is_the_buckets() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let acme = crate::accounts::create(&client, "acme").await.unwrap();
+    let theirs = format!("ra-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    assert!(matches!(create::create(&app, &theirs, &acme).await.unwrap(), create::Creation::Created));
+    // eve may do anything, but only in acme's own resources.
+    crate::roles::create_for(&client, &acme, "eve", None, false).await.unwrap();
+    let mut eve = crate::roles::Principal::load(&client, "eve").await.unwrap().unwrap();
+    eve.policies.push(format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:*","Resource":"*",
+            "Condition":{{"StringEquals":{{"aws:ResourceAccount":"{acme}"}}}}}}]}}"#
+    ));
+    let object = |bucket: &str| On::Object(bucket.to_owned(), "k".to_owned());
+    assert_eq!(may(&app, Asker::User(&eve), "s3:GetObject", object(&theirs)).await.0, true);
+    // Not in the default account's bucket (whose policy allows her nothing).
+    assert_eq!(may(&app, Asker::User(&eve), "s3:GetObject", object(BUCKET)).await.0, false);
 }
