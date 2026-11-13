@@ -489,10 +489,54 @@ async fn a_page_holds_whole_keys() {
     put(&app, "b", vec![1]).await;
     let (versions, last, last_page) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
     assert_eq!((last.as_str(), last_page), ("a", false));
-    assert_eq!(versions["a"].len(), super::PAGE as usize + 5);
+    // The first page's worth of them (the sweep reads the rest).
+    assert_eq!(versions["a"].len(), super::PAGE as usize);
     let (versions, last, last_page) = page(&client, BUCKET, "a", &everything(), super::PAGE).await.unwrap().unwrap();
     assert_eq!((versions.len(), last.as_str(), last_page), (1, "b", true));
     assert!(page(&client, BUCKET, "b", &everything(), super::PAGE).await.unwrap().is_none());
+}
+
+/// A key with more versions than pages hold has them all swept, a page at
+/// a time: every one a rule expires is, in one sweep, however many expire
+/// with it.
+#[tokio::test]
+async fn a_key_with_many_versions_is_swept_a_page_at_a_time() {
+    for n in [3 * super::BATCH as i32 + 5, 2 * super::PAGE as i32 + 5] {
+        many_versions_expire(n).await;
+    }
+}
+
+/// Expires all but 4 of `n` versions of a key, in one sweep.
+async fn many_versions_expire(n: i32) {
+    let Some(app) = node().await else { return };
+    enable_versioning(&app).await;
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker, size, etag,
+                                  content_type, last_modified)
+             SELECT $1, 'a', 'v' || n, n = $2, true, 0, NULL, NULL, now()
+             FROM generate_series(1, $2::int) AS n",
+            &[&BUCKET, &n],
+        )
+        .await
+        .unwrap();
+    configure(
+        &app,
+        "<Rule><ID>r</ID><Filter/><Status>Enabled</Status><NoncurrentVersionExpiration>\
+         <NoncurrentDays>1</NoncurrentDays><NewerNoncurrentVersions>3</NewerNoncurrentVersions>\
+         </NoncurrentVersionExpiration></Rule>",
+    )
+    .await;
+    let report = run_in(&app, 3).await.unwrap();
+    assert!(report.finished, "{report:?}");
+    assert_eq!(report.read, n as i64);
+    // All in one sweep, but the current version and the three newest
+    // noncurrent ones: none found its successor gone.
+    assert_eq!(report.removed, n as i64 - 4);
+    assert_eq!(versions(&app, "a").await, 4);
 }
 
 #[tokio::test]

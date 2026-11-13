@@ -366,18 +366,30 @@ async fn turn(
                 end = true;
                 break;
             };
-            let due: Vec<(String, Due)> = versions
-                .iter()
-                .flat_map(|(key, versions)| rules.due(key, versions, today).into_iter().map(|due| (key.clone(), due)))
-                .collect();
-            for batch in due.chunks(BATCH) {
-                if !expire(app, client, &sweep.bucket, sweep.generation, batch, &mut report).await? {
+            // A key with more versions than the page held: all of them, a
+            // page at a time (in this turn: a sweep resumes at a key).
+            if versions.len() == 1 && versions.values().all(|v| v.len() as i64 == limit) {
+                if !long_key(app, client, &sweep, &rules, &last, today, now, &mut report, budget).await? {
                     return interrupted(report);
                 }
+            } else {
+                // Each key's oldest first: so that none's successor, or the
+                // newer versions a rule keeps, are gone by the time it's
+                // expired, as they would be if a newer one went first.
+                let mut due: Vec<(String, Due)> = versions
+                    .iter()
+                    .flat_map(|(key, versions)| rules.due(key, versions, today).into_iter().map(|due| (key.clone(), due)))
+                    .collect();
+                due.reverse();
+                for batch in due.chunks(BATCH) {
+                    if !expire(app, client, &sweep.bucket, sweep.generation, batch, &mut report).await? {
+                        return interrupted(report);
+                    }
+                }
+                let read = versions.values().map(|v| v.len() as i64).sum::<i64>();
+                report.read += read;
+                *budget -= read;
             }
-            let read = versions.values().map(|v| v.len() as i64).sum::<i64>();
-            report.read += read;
-            *budget -= read;
             after = last;
             if !save(client, &sweep, started, &after, &report).await? {
                 return interrupted(report);
@@ -435,7 +447,8 @@ type Page = BTreeMap<String, Vec<Version>>;
 /// `prefixes` (in order, none under another, as `Configuration::prefixes`
 /// gives them), the last key in it, and whether it's the last page. `None`
 /// past the last key. A page holds whole keys only, so it ends before a key
-/// it can't hold all of, or holds just that one, whole, if it's the first.
+/// it can't hold all of; but if that's its first, it holds just the first
+/// `limit` of that key's versions, and the rest are for `older` to read.
 async fn page(
     client: &Object,
     bucket: &str,
@@ -495,21 +508,84 @@ async fn page(
     }
     let mut versions = BTreeMap::new();
     rows.iter().for_each(|row| add(&mut versions, row));
-    if rows.len() as i64 == limit {
-        let (last, _) = versions.pop_last().expect("a full page has keys");
-        if versions.is_empty() {
-            // One key with a page of versions or more: all of them.
-            let rows = client
-                .query_cached(
-                    &format!("SELECT {COLUMNS} FROM objects WHERE bucket = $1 AND key = $2 ORDER BY id DESC"),
-                    &[&bucket, &last],
-                )
-                .await?;
-            rows.iter().for_each(|row| add(&mut versions, row));
-        }
+    if rows.len() as i64 == limit && versions.len() > 1 {
+        versions.pop_last();
     }
     let last_page = last_range && (rows.len() as i64) < limit;
     Ok(versions.last_key_value().map(|(last, _)| last.clone()).map(|last| (versions, last, last_page)))
+}
+
+/// Expires what's due of `key`, which has more versions than a page holds:
+/// a page of them at a time, so that no number of versions takes more
+/// memory, and from the oldest up, so that none's successor, or the newer
+/// versions a rule keeps, are gone by the time it's expired. Counts what it
+/// reads; whether the sweep is still the bucket's (see `expire`).
+#[allow(clippy::too_many_arguments)]
+async fn long_key(
+    app: &Arc<App>,
+    client: &Object,
+    sweep: &Sweep,
+    rules: &Configuration,
+    key: &str,
+    today: Day,
+    now: SystemTime,
+    report: &mut Report,
+    budget: &mut i64,
+) -> anyhow::Result<bool> {
+    let total: i64 = client
+        .query_one_cached("SELECT count(*) FROM objects WHERE bucket = $1 AND key = $2", &[&sweep.bucket, &key])
+        .await?
+        .get(0);
+    // The last version read (by its ID), and how many have been.
+    let (mut after, mut read) = (0i64, 0i64);
+    loop {
+        // A page, and the version after it (to be the successor of its newest).
+        let rows = client
+            .query_cached(
+                "SELECT id, version_id, is_latest, is_delete_marker, size, last_modified, tags FROM objects
+                 WHERE bucket = $1 AND key = $2 AND id > $3 ORDER BY id LIMIT $4",
+                &[&sweep.bucket, &key, &after, &(PAGE + 1)],
+            )
+            .await?;
+        let mut run: Vec<Version> = rows
+            .iter()
+            .map(|row| Version {
+                id: row.get(0),
+                version_id: row.get(1),
+                is_latest: row.get(2),
+                delete_marker: row.get(3),
+                size: row.get(4),
+                last_modified: row.get(5),
+                tags: row.get(6),
+            })
+            .collect();
+        let next = (run.len() as i64 > PAGE).then(|| run.pop()).flatten();
+        let Some(last) = run.last() else { break };
+        after = last.id;
+        let n = run.len() as i64;
+        // Newest first, as `due_after` takes them, after the next one: as
+        // many versions are newer than it as weren't read yet (as of
+        // `total`, which newer versions written since only add to: the
+        // expiry checks again what it needs).
+        run.reverse();
+        let before = next.as_ref().map(|next| (next, (total - read - n - 1).max(0) as usize));
+        let mut due: Vec<(String, Due)> =
+            rules.due_after(key, before, &run, today).into_iter().map(|due| (key.to_owned(), due)).collect();
+        due.reverse();
+        for batch in due.chunks(BATCH) {
+            if !expire(app, client, &sweep.bucket, sweep.generation, batch, report).await? {
+                return Ok(false);
+            }
+        }
+        read += n;
+        report.read += n;
+        *budget -= n;
+        extend(client, now).await?;
+        if next.is_none() {
+            break;
+        }
+    }
+    Ok(true)
 }
 
 /// Expires a batch of due versions (`cairn_lifecycle_expire`), counting

@@ -395,9 +395,17 @@ impl Configuration {
     /// What's due among the versions of `key` (all of them, newest first),
     /// as of `today`.
     pub fn due(&self, key: &str, versions: &[Version], today: Day) -> Vec<Due> {
+        self.due_after(key, None, versions, today)
+    }
+
+    /// `due`, for a run of `key`'s versions (newest first) that comes
+    /// right after `before`: the version before them, and its place among
+    /// all of them (0: the newest). `None`: they start with the newest. So
+    /// a key with many versions is taken a run at a time.
+    pub fn due_after(&self, key: &str, before: Option<(&Version, usize)>, versions: &[Version], today: Day) -> Vec<Due> {
         let mut due = Vec::new();
         let Some((newest, older)) = versions.split_first() else { return due };
-        if newest.is_latest {
+        if before.is_none() && newest.is_latest {
             let rules = || self.enabled().filter(|r| r.filter.matches(key, newest));
             let expired = if newest.delete_marker {
                 // Only a delete marker that hides nothing: removing it
@@ -414,18 +422,28 @@ impl Configuration {
             }
         }
         // A version became noncurrent when the next one was written.
-        for (i, version) in versions.iter().enumerate().skip(1) {
-            let successor = &versions[i - 1];
+        let start = before.map_or(0, |(_, at)| at + 1);
+        for (i, version) in versions.iter().enumerate() {
+            let successor = match (i, before) {
+                (0, Some((before, _))) => before,
+                (0, None) => continue,
+                _ => &versions[i - 1],
+            };
             // Newer noncurrent versions: all newer ones, but the current.
-            let newer = i - 1;
-            let expired = self.enabled().filter(|r| r.filter.matches(key, version)).any(|r| {
-                r.noncurrent_expiration.as_ref().is_some_and(|n| {
-                    successor.last_modified <= today.cutoff(n.days)
-                        && newer >= n.newer_versions.unwrap_or(0) as usize
-                })
-            });
-            if expired {
-                let kind = Kind::Noncurrent { successor: successor.id, newer: i as i32 };
+            let newer = start + i - 1;
+            // The fewest newer versions a rule that expires it keeps: they
+            // must still be there when it's expired.
+            let keeps = self
+                .enabled()
+                .filter(|r| r.filter.matches(key, version))
+                .filter_map(|r| r.noncurrent_expiration.as_ref())
+                .filter(|n| successor.last_modified <= today.cutoff(n.days))
+                .map(|n| n.newer_versions.unwrap_or(0) as usize)
+                .filter(|keeps| newer >= *keeps)
+                .min();
+            if let Some(keeps) = keeps {
+                // Those noncurrent versions, and the current one.
+                let kind = Kind::Noncurrent { successor: successor.id, newer: keeps as i32 + 1 };
                 due.push(Due { version: version.clone(), kind });
             }
         }
@@ -816,7 +834,10 @@ pub enum Kind {
     /// A delete marker, the key's only version, is removed.
     Marker,
     /// A noncurrent version is removed: the version after it is
-    /// `successor`, and there are `newer` versions newer than it.
+    /// `successor`, and at least `newer` versions are newer than it (those
+    /// the rule keeps, and the current one), which must still be so when
+    /// it's removed. (Not how many were newer when it was read: others
+    /// expired since, in an earlier batch, don't make it undue.)
     Noncurrent { successor: i64, newer: i32 },
 }
 
@@ -1251,13 +1272,20 @@ mod tests {
         // the 1st, so from the 4th.
         assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 2))), vec![]);
         let noncurrent = |successor, newer| Kind::Noncurrent { successor, newer };
-        assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 3))), vec![(1, noncurrent(2, 3))]);
-        assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 4))), vec![(1, noncurrent(2, 3))]);
+        // Each needs the noncurrent version kept, and the current one, to be
+        // there still when it's expired.
+        assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 3))), vec![(1, noncurrent(2, 2))]);
+        assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 4))), vec![(1, noncurrent(2, 2))]);
         assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 5))).len(), 2);
-        assert_eq!(
-            kinds(&rules.due("a", &versions, Day(first.0 + 30))),
-            vec![(2, noncurrent(3, 2)), (1, noncurrent(2, 3))]
-        );
+        let later = Day(first.0 + 30);
+        assert_eq!(kinds(&rules.due("a", &versions, later)), vec![(2, noncurrent(3, 2)), (1, noncurrent(2, 2))]);
+        // A run of versions at a time (as a key with many is taken), the same.
+        for split in 1..versions.len() {
+            let (run, rest) = versions.split_at(split);
+            let mut due = rules.due_after("a", None, run, later);
+            due.extend(rules.due_after("a", Some((&run[split - 1], split - 1)), rest, later));
+            assert_eq!(due, rules.due("a", &versions, later), "{split}");
+        }
         // The current version never is.
         assert_eq!(rules.due("a", &versions[..1], Day(first.0 + 30)), vec![]);
     }
