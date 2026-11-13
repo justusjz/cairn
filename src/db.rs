@@ -236,6 +236,28 @@ async fn init(pool: &Pool) -> anyhow::Result<()> {
         );
     }
     for (version, sql) in (1..).zip(MIGRATIONS).skip(current as usize) {
+        // Each step runs as the lock protocol of its own time, which the
+        // gate (`PROTOCOL_GATE`) requires: on a fresh database, a step that
+        // writes a gated table runs before the gate is raised to this
+        // Cairn's protocol. That's the protocol the step raises the gate to,
+        // if it does (it does so first), else the gate's as the steps before
+        // left it. For this transaction only.
+        match gate_of(sql) {
+            Some(protocol) => {
+                tx.execute("SELECT set_config('cairn.protocol', $1, true)", &[&protocol]).await?;
+            }
+            None => {
+                tx.execute(
+                    "SELECT set_config('cairn.protocol', coalesce(
+                         (SELECT substring(p.prosrc FROM 'IS DISTINCT FROM ''([0-9]+)''')
+                          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                          WHERE p.proname = 'cairn_require_protocol' AND n.nspname = 'public'),
+                         $1), true)",
+                    &[&PROTOCOL],
+                )
+                .await?;
+            }
+        }
         tx.batch_execute(sql).await?;
         tx.execute(
             "INSERT INTO schema_migrations (version) VALUES ($1)",
@@ -246,6 +268,14 @@ async fn init(pool: &Pool) -> anyhow::Result<()> {
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// The protocol a migration step raises the gate to, if it defines the
+/// gate's function.
+fn gate_of(sql: &str) -> Option<String> {
+    let (_, rest) = sql.split_once("FUNCTION cairn_require_protocol() RETURNS")?;
+    let (_, rest) = rest.split_once("IS DISTINCT FROM '")?;
+    Some(rest.split('\'').next()?.to_owned())
 }
 
 /// Migration 1: the schema as it stood before migrations were tracked. Written
