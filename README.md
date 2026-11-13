@@ -119,6 +119,12 @@ command line wins. The other commands read `CAIRN_PEER_URL` as well.
 | `--kms-sse-s3-key <ID>` | `CAIRN_KMS_SSE_S3_KEY` | none | The key for [SSE-S3](#sse-s3) (`<mount>/<key>`), which Cairn uses as itself. Without it, SSE-S3 is refused. |
 | `--kms-ca-cert <PATH>` | `CAIRN_KMS_CA_CERT` | public roots | PEM file of the CA certificates to trust for the KMS's TLS. |
 | `--scrub-rate <RATE>` | `CAIRN_SCRUB_RATE` | `25MiB` | How many bytes per second the [scrubber](#scrubbing) reads, e.g. `100MB`. `0` turns it off. |
+| `--max-connections <N>` | `CAIRN_MAX_CONNECTIONS` | `4096` | How many connections the S3 API serves at once; more wait to be accepted. Cairn raises its limit on open files to the hard limit (`LimitNOFILE=` under systemd), and warns if that leaves too few. |
+
+The S3 API and the console close a connection that sits idle, or takes its
+time sending a request's head, for 30 seconds; a request whose body sends
+nothing for 30 seconds fails with `RequestTimeout`, and a response the client
+takes none of for a minute is cut off.
 
 On SIGTERM or Ctrl-C, a node stops accepting connections and finishes the
 requests in flight before it exits; a second signal exits right away. Anything

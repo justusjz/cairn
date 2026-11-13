@@ -5,9 +5,8 @@ use deadpool_postgres::{Object, Pool};
 use http_body_util::BodyExt;
 use hyper::{
     Method, Request, StatusCode, body::Body, body::Bytes, body::Frame,
-    server::conn::http1, service::service_fn,
+    service::service_fn,
 };
-use hyper_util::{rt::TokioIo, server::graceful::GracefulShutdown};
 use md5::{Digest, Md5};
 use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinSet};
 use uuid::Uuid;
@@ -44,6 +43,7 @@ mod grants;
 mod iam;
 mod kms;
 mod lifecycle;
+mod listen;
 mod metrics;
 mod mover;
 mod nodes;
@@ -237,9 +237,17 @@ struct ServeArgs {
     /// Passkeys are bound to its host.
     #[arg(long, env = "CAIRN_CONSOLE_URL", value_parser = console::parse_url)]
     console_url: Option<console::webauthn::Party>,
+    /// How many connections the S3 API serves at once; more wait to be
+    /// accepted. Each takes a file descriptor (the process's limit is raised
+    /// to its hard limit), besides those for data and the database.
+    #[arg(long, env = "CAIRN_MAX_CONNECTIONS", default_value_t = 4096)]
+    max_connections: usize,
     #[command(flatten)]
     kms: kms::KmsArgs,
 }
+
+/// How many connections the console serves at once.
+const CONSOLE_MAX_CONNECTIONS: usize = 512;
 
 /// How often a node refreshes its `nodes` row (last_seen / free_space).
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
@@ -291,6 +299,15 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     // SAFETY: prctl with PR_SET_DUMPABLE takes no pointers.
     if unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0) } != 0 {
         anyhow::bail!("couldn't make the process non-dumpable: {}", std::io::Error::last_os_error());
+    }
+    match listen::raise_open_files_limit() {
+        Ok(limit) if (limit as usize) < args.max_connections + 1024 => eprintln!(
+            "warning: only {limit} files may be open, too few for --max-connections {} \
+             and the node's other files: raise the hard limit (LimitNOFILE=) or lower it",
+            args.max_connections
+        ),
+        Ok(_) => {}
+        Err(e) => eprintln!("warning: couldn't raise the limit on open files: {e}"),
     }
     let kms = kms::Kms::new(&args.kms)?;
     let pool = db::connect(&args.database).await?;
@@ -356,7 +373,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     let (stop_peer, peer_stopped) = tokio::sync::oneshot::channel::<()>();
     let (stop_console, console_stopped) = tokio::sync::oneshot::channel::<()>();
     let client = async {
-        let result = serve_client(listen_client_addr, app.clone(), shutdown_signal()).await;
+        let result = serve_client(listen_client_addr, args.max_connections, app.clone(), shutdown_signal()).await;
         let _ = stop_peer.send(());
         let _ = stop_console.send(());
         result
@@ -372,11 +389,19 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         let console = Arc::new(console::Console { app: app.clone(), party: party.clone() });
         let listener = TcpListener::bind(addr).await?;
         eprintln!("console at {} (listening on {addr})", party.origin);
-        axum::serve(listener, console::router(console).into_make_service_with_connect_info::<SocketAddr>())
-            .with_graceful_shutdown(async {
-                let _ = console_stopped.await;
+        let router = console::router(console);
+        let stopped = async {
+            let _ = console_stopped.await;
+        };
+        listen::serve(listener, CONSOLE_MAX_CONNECTIONS, stopped, |client| {
+            let router = router.clone();
+            service_fn(move |mut req: hyper::Request<hyper::body::Incoming>| {
+                use tower::ServiceExt;
+                req.extensions_mut().insert(axum::extract::ConnectInfo(client));
+                router.clone().oneshot(req.map(listen::ClientBody::new))
             })
-            .await?;
+        })
+        .await;
         anyhow::Ok(())
     };
     tokio::try_join!(client, peer, console)?;
@@ -565,56 +590,43 @@ impl std::error::Error for Contended {}
 /// `shutdown` resolves; then waits for the requests in flight to finish.
 async fn serve_client(
     addr: SocketAddr,
+    max_connections: usize,
     app: Arc<App>,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    let graceful = GracefulShutdown::new();
-    tokio::pin!(shutdown);
-    loop {
-        let (stream, peer_addr) = tokio::select! {
-            accepted = listener.accept() => accepted?,
-            () = &mut shutdown => break,
-        };
-        let io = TokioIo::new(stream);
+    listen::serve(listener, max_connections, shutdown, |peer_addr| {
         let app = app.clone();
-        let watcher = graceful.watcher();
-        tokio::task::spawn(async move {
-            let service = service_fn(move |req| {
-                let app = app.clone();
-                async move {
-                    // Where the request goes, wherever it names its bucket.
-                    let route = s3::hosting::Route::of(app.domain.as_deref(), req.headers(), req.uri().path());
-                    let what = format!("{} {}", req.method(), route.path);
-                    let started = std::time::Instant::now();
-                    let in_flight = app.metrics.begin();
-                    let op = metrics::Op::classify(
-                        req.method(),
-                        &route.path,
-                        req.uri().query().unwrap_or(""),
-                        req.headers(),
-                    );
-                    let bytes_in = metrics::bytes_in(req.headers());
-                    // A handler error must still produce a response (`handle`
-                    // makes one): returning it to hyper would drop the
-                    // connection without one, which clients take as a network
-                    // fault and retry with backoff.
-                    let res = s3::handle(req, app.clone(), &what, &route, peer_addr.ip()).await;
-                    let (parts, body) = res.into_parts();
-                    let body =
-                        app.metrics
-                            .record(op, parts.status, bytes_in, started.elapsed(), body, in_flight);
-                    Ok::<_, std::convert::Infallible>(hyper::Response::from_parts(parts, body))
-                }
-            });
-            let conn = http1::Builder::new().serve_connection(io, service);
-            if let Err(err) = watcher.watch(conn).await {
-                eprintln!("Error serving connection: {:?}", err);
+        service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+            let app = app.clone();
+            async move {
+                let req = req.map(listen::ClientBody::new);
+                // Where the request goes, wherever it names its bucket.
+                let route = s3::hosting::Route::of(app.domain.as_deref(), req.headers(), req.uri().path());
+                let what = format!("{} {}", req.method(), route.path);
+                let started = std::time::Instant::now();
+                let in_flight = app.metrics.begin();
+                let op = metrics::Op::classify(
+                    req.method(),
+                    &route.path,
+                    req.uri().query().unwrap_or(""),
+                    req.headers(),
+                );
+                let bytes_in = metrics::bytes_in(req.headers());
+                // A handler error must still produce a response (`handle`
+                // makes one): returning it to hyper would drop the
+                // connection without one, which clients take as a network
+                // fault and retry with backoff.
+                let res = s3::handle(req, app.clone(), &what, &route, peer_addr.ip()).await;
+                let (parts, body) = res.into_parts();
+                let body =
+                    app.metrics
+                        .record(op, parts.status, bytes_in, started.elapsed(), body, in_flight);
+                Ok::<_, std::convert::Infallible>(hyper::Response::from_parts(parts, body))
             }
-        });
-    }
-    drop(listener);
-    graceful.shutdown().await;
+        })
+    })
+    .await;
     Ok(())
 }
 

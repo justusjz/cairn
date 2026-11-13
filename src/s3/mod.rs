@@ -82,7 +82,7 @@ pub fn request_id() -> Option<String> {
 /// 503), logged with `what` the request was. It goes where `route` says (see
 /// `hosting`).
 pub async fn handle(
-    req: Request<hyper::body::Incoming>,
+    req: Request<crate::listen::ClientBody>,
     app: Arc<App>,
     what: &str,
     route: &Route,
@@ -121,7 +121,7 @@ fn bucket_of(path: &str) -> String {
 }
 
 async fn handle_request(
-    req: Request<hyper::body::Incoming>,
+    req: Request<crate::listen::ClientBody>,
     app: Arc<App>,
     route: &Route,
     peer: std::net::IpAddr,
@@ -966,7 +966,7 @@ const MAX_WHOLE_BODY: usize = 8 << 20;
 /// `x-amz-checksum-*` header is one of the body. `Err` holds why it was
 /// refused.
 async fn read_body(
-    req: Request<hyper::body::Incoming>,
+    req: Request<crate::listen::ClientBody>,
     secret: &str,
     checksum_headers: bool,
 ) -> anyhow::Result<Result<hyper::body::Bytes, Rejection>> {
@@ -1008,6 +1008,12 @@ async fn read_body(
 pub fn error_response(e: &anyhow::Error) -> Response<ResBody> {
     let resp = if e.downcast_ref::<crate::Contended>().is_some() {
         util::slow_down()
+    } else if crate::listen::ClientTimedOut::caused(e) {
+        format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "RequestTimeout",
+            "Your socket connection to the server was not read from or written to within the timeout period. Idle connections will be closed.",
+        )
     } else if e.downcast_ref::<crate::Unavailable>().is_some() {
         format_s3_error(
             StatusCode::SERVICE_UNAVAILABLE,

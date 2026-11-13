@@ -145,7 +145,7 @@ fn lower_first(name: &str) -> String {
 }
 
 /// An IAM or STS request, on the S3 port.
-pub async fn handle(app: &Arc<App>, req: Request<hyper::body::Incoming>, signed: Signed, peer: IpAddr) -> Response<Full<Bytes>> {
+pub async fn handle(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed: Signed, peer: IpAddr) -> Response<Full<Bytes>> {
     let sts = signed.service == "sts";
     let request_id = uuid::Uuid::new_v4().to_string();
     let result = respond(app, req, &signed, peer, &request_id).await;
@@ -187,7 +187,7 @@ type Answer = (String, Option<String>);
 
 async fn respond(
     app: &Arc<App>,
-    req: Request<hyper::body::Incoming>,
+    req: Request<crate::listen::ClientBody>,
     signed: &Signed,
     peer: IpAddr,
     _request_id: &str,
