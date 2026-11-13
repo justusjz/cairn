@@ -433,8 +433,9 @@ export function BucketBrowser() {
   );
 }
 
-/** A starting point for a bucket's policy: anyone may read what's under
- * `public/`. */
+/** An example of a bucket's policy: anyone may read what's under
+ * `public/`. Only ever a placeholder, or put in on request: a bucket without
+ * a policy mustn't look like it has this one, nor get it by a stray Save. */
 const POLICY_TEMPLATE = (bucket: string) => `{
   "Version": "2012-10-17",
   "Statement": [
@@ -477,7 +478,7 @@ function AccessDialog(props: { bucket: string; onClose: () => void }) {
       const a = await api.bucketAccess(props.bucket);
       setAccess(a);
       if (a.public_access_block) setBlock({ ...a.public_access_block });
-      setDocument(a.policy ? pretty(a.policy) : POLICY_TEMPLATE(props.bucket));
+      setDocument(a.policy ? pretty(a.policy) : "");
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -575,12 +576,18 @@ function AccessDialog(props: { bucket: string; onClose: () => void }) {
               IAM's policy language, as a bucket policy: each statement names its Principal (
               <span class="mono">"*"</span> is anyone, unsigned requests too; a user is{" "}
               <span class="mono">arn:aws:iam::ACCOUNT:user/NAME</span>); Resource is the bucket or its objects.
-              <Show when={!a().policy}> It has none; this is an example.</Show>
             </p>
+            <Show when={!a().policy}>
+              <p>
+                <strong>The bucket has no policy.</strong>{" "}
+                <span class="subtle small">Write one below to set it; the example (which makes public/ readable by anyone) isn't set.</span>
+              </p>
+            </Show>
             <textarea
               class="policy"
               aria-label="Bucket policy"
               spellcheck={false}
+              placeholder={a().policy ? undefined : POLICY_TEMPLATE(props.bucket)}
               value={document()}
               onInput={(e) => setDocument(e.currentTarget.value)}
             />
@@ -591,10 +598,15 @@ function AccessDialog(props: { bucket: string; onClose: () => void }) {
                   Delete policy
                 </button>
               </Show>
+              <Show when={!a().policy && !document().trim()}>
+                <button type="button" onClick={() => setDocument(POLICY_TEMPLATE(props.bucket))}>
+                  Use example
+                </button>
+              </Show>
               <button type="button" onClick={() => dialog.close()}>
                 Close
               </button>
-              <button type="button" class="primary" onClick={savePolicy}>
+              <button type="button" class="primary" disabled={!document().trim()} onClick={savePolicy}>
                 Save policy
               </button>
             </div>
