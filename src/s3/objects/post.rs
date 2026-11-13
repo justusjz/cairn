@@ -280,7 +280,16 @@ where
     };
     let Some((file, file_name)) = file else { return Ok(malformed("The file or text content is missing")) };
     // `${filename}` is the file's name, in every field, before the policy's
-    // checked.
+    // checked. The fields may be no longer for it than they may be sent:
+    // else a long name in many `${filename}`s would make megabytes of them,
+    // before any signature is checked.
+    let expanded = fields
+        .iter()
+        .map(|(_, value)| value.len() + value.matches("${filename}").count() * file_name.len())
+        .sum::<usize>();
+    if expanded > MAX_PRE_DATA {
+        return Ok(pre_data_too_large());
+    }
     for (_, value) in &mut fields {
         if value.contains("${filename}") {
             *value = value.replace("${filename}", &file_name);

@@ -452,6 +452,11 @@ async fn refuses_malformed_forms() {
     let padded = keyed(&signer, "k", "", &[("x-ignore-pad", &long)]);
     let response = post(&app, form(&padded, "f", b"x", &[])).await;
     assert_eq!(outcome(response).await, (StatusCode::BAD_REQUEST, "MaxPostPreDataLengthExceededError".to_owned()));
+    // Nor once a long file name fills in many `${filename}`s.
+    let many = "${filename}".repeat(1000);
+    let padded = keyed(&signer, "k", "", &[("x-ignore-pad", &many)]);
+    let response = post(&app, form(&padded, &"n".repeat(1000), b"x", &[])).await;
+    assert_eq!(outcome(response).await, (StatusCode::BAD_REQUEST, "MaxPostPreDataLengthExceededError".to_owned()));
     // Not a form: no boundary.
     let request = Request::builder().method("POST").uri("/bucket").header("content-type", "multipart/form-data");
     let response = post_object(&app, request.body(Full::new(Bytes::new())).unwrap(), BUCKET, false, None).await.unwrap();
