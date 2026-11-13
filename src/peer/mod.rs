@@ -1,5 +1,6 @@
-//! The peer endpoint: blob traffic between nodes, and each node's metrics.
-//! Unauthenticated, for the private network only.
+//! The peer endpoint: blob traffic between nodes, each node's metrics, and
+//! the CLI's commands (see `admin`). Unauthenticated, for the private
+//! network only.
 
 use std::{sync::Arc, time::Duration};
 
@@ -9,7 +10,7 @@ use axum::{
     extract::{Path, RawQuery, State},
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use http_body_util::{BodyExt, Empty};
 use hyper::{
@@ -98,6 +99,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/scrub", any(scrub))
         .route("/move", any(move_shards))
         .route("/stats", get(stats))
+        // The CLI's commands (see `admin`).
+        .route("/admin", post(crate::admin::serve))
         .route(
             "/blobs/{blob_id}",
             get(get_blob).put(put_blob).delete(delete_blob),

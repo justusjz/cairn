@@ -27,6 +27,7 @@ use crate::writing::WritingSet;
 mod peer;
 
 mod accounts;
+mod admin;
 mod auth;
 mod aws_chunked;
 mod blob_file;
@@ -249,13 +250,32 @@ pub(crate) const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve_main(args).await,
-        Command::User(args) => roles::role_main(args).await,
-        Command::Account(args) => accounts::account_main(args).await,
-        Command::Oidc(args) => console::oidc::oidc_main(args).await,
-        Command::BucketPolicy(args) => s3::buckets::policy::bucket_policy_main(args).await,
-        Command::Config(args) => settings::config_main(args).await,
-        Command::Node(args) => nodes::node_main(args).await,
+        // The rest run on a node (see `admin`).
+        command => {
+            let (remote, command) = remote_command(command)?;
+            admin::send(&remote, command).await
+        }
     }
+}
+
+/// A command that runs on a node, as the CLI sends it there (with what it
+/// takes from files read), and where to.
+fn remote_command(command: Command) -> anyhow::Result<(admin::Remote, admin::Command)> {
+    Ok(match command {
+        Command::Serve(_) => anyhow::bail!("`cairn serve` runs here"),
+        Command::User(mut args) => {
+            args.prepare()?;
+            (args.remote.clone(), admin::Command::User(args))
+        }
+        Command::Account(args) => (args.remote.clone(), admin::Command::Account(args)),
+        Command::Oidc(args) => (args.remote.clone(), admin::Command::Oidc(args)),
+        Command::BucketPolicy(mut args) => {
+            args.prepare()?;
+            (args.remote.clone(), admin::Command::BucketPolicy(args))
+        }
+        Command::Config(args) => (args.remote.clone(), admin::Command::Config(args)),
+        Command::Node(args) => (args.remote.clone(), admin::Command::Node(args)),
+    })
 }
 
 /// A `--trusted-proxy`: an address, or a CIDR block.

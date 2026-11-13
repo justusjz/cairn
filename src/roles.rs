@@ -20,6 +20,9 @@ use std::collections::HashSet;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use clap::{Args, Subcommand, ValueEnum};
 use deadpool_postgres::Object;
+use serde::{Deserialize, Serialize};
+
+use crate::admin::outln;
 use crate::db::Cached;
 
 /// A bucket-level permission a role can be granted.
@@ -166,11 +169,11 @@ impl Principal {
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Serialize, Deserialize)]
 pub struct RoleArgs {
-    /// PostgreSQL connection string (the same one the nodes use).
-    #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
-    database: String,
+    #[command(flatten)]
+    #[serde(skip)]
+    pub remote: crate::admin::Remote,
     /// The account (by name) whose users these are: user names are unique
     /// in an account. The first tenant account (`default`) if not given.
     #[arg(long, global = true)]
@@ -179,7 +182,7 @@ pub struct RoleArgs {
     command: RoleCommand,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum RoleCommand {
     /// Create a user, with an access key named as it. Prints the key's
     /// secret; a random one is generated unless given.
@@ -215,14 +218,9 @@ enum RoleCommand {
     /// Print a one-time link (valid 24 hours) for a user to register its
     /// first passkey for the console, and sign in. A new link replaces the
     /// user's last; one for a user with passkeys adds another (when it lost
-    /// them, say).
-    Enroll {
-        name: String,
-        /// The console's URL (as `cairn serve` has it), to make the link
-        /// from; without it, the link's path and token are printed.
-        #[arg(long, env = "CAIRN_CONSOLE_URL", value_parser = crate::console::parse_url)]
-        console_url: Option<crate::console::webauthn::Party>,
-    },
+    /// them, say). Made from the node's console URL; if the node serves no
+    /// console, only the link's path is printed.
+    Enroll { name: String },
     /// Manage a user's access keys (at most two).
     #[command(subcommand)]
     Key(KeyCommand),
@@ -246,7 +244,7 @@ enum RoleCommand {
     },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum KeyCommand {
     /// Make a new access key for a user. Prints its ID and secret.
     Create {
@@ -266,21 +264,38 @@ enum KeyCommand {
     Deactivate { id: String },
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum PolicyCommand {
     /// Set a user's inline policy `name` to the JSON in `file` (`-`: stdin).
-    Put { user: String, name: String, file: String },
+    Put {
+        user: String,
+        name: String,
+        #[serde(skip)]
+        file: String,
+        /// The file's contents, as the CLI read them (see `prepare`).
+        #[arg(skip)]
+        document: String,
+    },
     /// Print a user's inline policy.
     Get { user: String, name: String },
     /// Delete a user's inline policy.
     Delete { user: String, name: String },
 }
 
-/// `cairn user …` (or `cairn role …`): user management, straight against
-/// the database.
-pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
-    let pool = crate::db::connect(&args.database).await?;
-    let client = pool.get().await?;
+impl RoleArgs {
+    /// Reads what the command takes from files, where the CLI runs.
+    pub fn prepare(&mut self) -> anyhow::Result<()> {
+        if let RoleCommand::Policy(PolicyCommand::Put { file, document, .. }) = &mut self.command {
+            *document = crate::admin::read_document(file)?;
+        }
+        Ok(())
+    }
+}
+
+/// `cairn user …` (or `cairn role …`): user management, on a node (see
+/// `admin`).
+pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
     // The account's ID.
     let account_id = match &args.account {
         Some(name) => client
@@ -299,10 +314,19 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
         } => {
             let generated = secret.is_none();
             let (key, secret) = create_for(&client, account_id, &name, secret, admin).await?;
-            println!("access key: {key}");
+            outln!(out, "access key: {key}");
             if generated {
-                println!("secret key: {secret}");
+                outln!(out, "secret key: {secret}");
             }
+            // Its identity in the KMS, so that key owners can grant it keys
+            // now; if the KMS can't be reached, the next maintenance pass
+            // makes it.
+            let identifying = app.clone();
+            tokio::spawn(async move {
+                if let Err(e) = identify(&identifying).await {
+                    eprintln!("kms: identifying roles: {e:#}");
+                }
+            });
         }
         RoleCommand::Update {
             name,
@@ -316,55 +340,50 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
             };
             update(&client, account_id, &name, admin, secret.clone()).await?;
             if rotate_secret && let Some(s) = secret {
-                println!("secret key: {s}");
+                outln!(out, "secret key: {s}");
             }
         }
         RoleCommand::Delete { name } => delete(&client, account_id, &name).await?,
         RoleCommand::List => {
             for role in list(&client).await?.into_iter().filter(|r| r.account_id == account_id) {
                 let admin = if role.admin { " (admin)" } else { "" };
-                println!("{}{admin}", role.name);
-                println!("  arn:aws:iam::{account_id}:user/{}", role.name);
-                println!("  id {}", role.id);
+                outln!(out, "{}{admin}", role.name);
+                outln!(out, "  arn:aws:iam::{account_id}:user/{}", role.name);
+                outln!(out, "  id {}", role.id);
                 if let Some(entity) = role.kms_entity_id {
-                    println!("  KMS entity {entity}");
+                    outln!(out, "  KMS entity {entity}");
                 }
                 for key in role.keys {
                     let state = if key.active { "" } else { " (inactive)" };
-                    println!("  key {}{state}", key.id);
+                    outln!(out, "  key {}{state}", key.id);
                 }
                 for (bucket, permission) in role.grants {
-                    println!("  {bucket}:{}", permission.as_str());
+                    outln!(out, "  {bucket}:{}", permission.as_str());
                 }
                 for policy in role.policies {
-                    println!("  policy {policy}");
+                    outln!(out, "  policy {policy}");
                 }
             }
         }
-        RoleCommand::Enroll { name, console_url } => {
+        RoleCommand::Enroll { name } => {
             let token = crate::console::store::create_enrollment(&client, account_id, &name).await?;
-            let origin = console_url.map(|party| party.origin).unwrap_or_default();
-            println!("{origin}/enroll#{token}");
+            enrollment_link(app, &token, out);
         }
         RoleCommand::Key(command) => match command {
             KeyCommand::Create { user, id, secret } => {
                 let (id, secret) = create_key(&client, account_id, &user, id, secret).await?;
-                println!("access key: {id}");
-                println!("secret key: {secret}");
+                outln!(out, "access key: {id}");
+                outln!(out, "secret key: {secret}");
             }
             KeyCommand::Delete { id } => delete_key(&client, None, &id).await?,
             KeyCommand::Activate { id } => set_key_active(&client, None, &id, true).await?,
             KeyCommand::Deactivate { id } => set_key_active(&client, None, &id, false).await?,
         },
         RoleCommand::Policy(command) => match command {
-            PolicyCommand::Put { user, name, file } => {
-                let document = match file.as_str() {
-                    "-" => std::io::read_to_string(std::io::stdin())?,
-                    path => std::fs::read_to_string(path)?,
-                };
+            PolicyCommand::Put { user, name, document, .. } => {
                 put_policy(&client, account_id, &user, &name, &document).await?;
             }
-            PolicyCommand::Get { user, name } => println!("{}", get_policy(&client, account_id, &user, &name).await?),
+            PolicyCommand::Get { user, name } => outln!(out, "{}", get_policy(&client, account_id, &user, &name).await?),
             PolicyCommand::Delete { user, name } => delete_policy(&client, account_id, &user, &name).await?,
         },
         RoleCommand::Grant {
@@ -379,6 +398,18 @@ pub async fn role_main(args: RoleArgs) -> anyhow::Result<()> {
         } => revoke(&client, account_id, &name, &bucket, &permissions).await?,
     }
     Ok(())
+}
+
+/// Prints an enrollment link made of `token`: from the node's console URL,
+/// or, if it serves no console, the path to open there.
+pub(crate) fn enrollment_link(app: &crate::App, token: &str, out: &mut crate::admin::Output) {
+    match app.console.origin() {
+        Some(origin) => outln!(out, "{origin}/enroll#{token}"),
+        None => {
+            out.warn("this node serves no console (--listen-console, --console-url): open this path there");
+            outln!(out, "/enroll#{token}");
+        }
+    }
 }
 
 /// A request to change roles that can't be carried out as asked: a bad name, an

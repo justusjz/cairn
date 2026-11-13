@@ -16,7 +16,8 @@ The schema is created automatically; just point Cairn at an empty database.
 
 > [!WARNING]
 > The peer endpoint (`--listen-peer`, default `127.0.0.1:9431`) is
-> unauthenticated: it can read and delete blobs. Only bind it to a
+> unauthenticated: it can read and delete blobs, and it takes the `cairn`
+> CLI's commands, which manage users and settings. Only bind it to a
 > trusted/private network — never expose it to the public internet.
 
 ## Installing
@@ -70,10 +71,17 @@ to manage buckets, and an application user with access to a bucket (see
 [Users and permissions](#users-and-permissions)):
 
 ```sh
-DB="postgres://user:pass@localhost:5432/cairn"
-cairn user --database "$DB" create admin --admin        # prints a generated secret
-cairn user --database "$DB" create app                  # prints a generated secret
+cairn user create admin --admin        # prints a generated secret
+cairn user create app                  # prints a generated secret
 ```
+
+The `cairn` commands that manage the cluster (`user`, `account`, `oidc`,
+`bucket-policy`, `config` and `node`) don't touch the database themselves:
+they run on a node, sent to its peer endpoint. That's the node on this
+host by default (`http://127.0.0.1:9431`, the default `--listen-peer`), or
+the one `--peer-url` (`CAIRN_PEER_URL`, as `cairn serve` has it) names, so
+a node's own environment points them at it. Any node does, as they share the
+database; it has to be running.
 
 Create a bucket as the admin, grant the application user access to it, and use
 it:
@@ -81,7 +89,7 @@ it:
 ```sh
 s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
     --access_key=admin --secret_key=<admin secret> mb s3://my-bucket
-cairn user --database "$DB" grant app my-bucket read write
+cairn user grant app my-bucket read write
 s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
     --access_key=app --secret_key=<app secret> put file.txt s3://my-bucket/
 ```
@@ -89,7 +97,7 @@ s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
 ### `serve` flags
 
 Every flag can also be set through its environment variable; a flag on the
-command line wins. `cairn user` reads `CAIRN_DATABASE` as well.
+command line wins. The other commands read `CAIRN_PEER_URL` as well.
 
 | Flag | Environment | Default | Description |
 | --- | --- | --- | --- |
@@ -181,8 +189,8 @@ database, than on every node, where the nodes can disagree. It's the
 every node goes by it (within a heartbeat), and ignores its flag:
 
 ```sh
-cairn config --database "$DB" set parity-shards 2     # 3 copies of every new blob
-cairn config --database "$DB" unset parity-shards     # back to each node's flag
+cairn config set parity-shards 2     # 3 copies of every new blob
+cairn config unset parity-shards     # back to each node's flag
 ```
 
 A change applies to blobs written from then on, and existing blobs are
@@ -200,8 +208,8 @@ blob, or a piece of it if it's [erasure-coded](#erasure-coding)). To take a
 node out of the cluster, remove it:
 
 ```sh
-cairn node --database "$DB" list          # nodes, their state, the shards they hold
-cairn node --database "$DB" remove 3
+cairn node list          # nodes, their state, the shards they hold
+cairn node remove 3
 ```
 
 A node that's being removed gets no new data, and every node moves its shards
@@ -219,7 +227,7 @@ node back from a reboot needs none of it. To have a node's shards rebuilt
 once it has been down for long enough, without removing it, set:
 
 ```sh
-cairn config --database "$DB" set repair-after 60   # minutes; 0, the default, is off
+cairn config set repair-after 60   # minutes; 0, the default, is off
 ```
 
 The console's Overview shows each node's state, and its Jobs page how many
@@ -350,7 +358,7 @@ hyphens, starting and ending with a letter or digit, not formatted like an IP
 address, and without the prefixes and suffixes S3 reserves (such as `xn--` or
 `-s3alias`).
 
-Manage users with `cairn user --database <URL> [--account <name>] <command>`
+Manage users with `cairn user [--account <name>] <command>`
 (the `default` account's, without `--account`):
 
 | Command | Description |
@@ -365,7 +373,7 @@ Manage users with `cairn user --database <URL> [--account <name>] <command>`
 | `policy put <name> <policy> <file>` | Set an inline policy (JSON; `-` reads stdin). A user's policies hold at most 2048 characters together, as in IAM. |
 | `policy get\|delete <name> <policy>` | Show or delete an inline policy. |
 | `list` | List users, their ARNs, admin flags, keys, grants and policies (secrets are not shown). |
-| `enroll <name> [--console-url <URL>]` | Print a one-time link (24 hours) for the user to sign in to the [console](#console): a new login with a passkey, or (opened signed in) added to the login. A new link replaces the last. |
+| `enroll <name>` | Print a one-time link (24 hours) for the user to sign in to the [console](#console): a new login with a passkey, or (opened signed in) added to the login. A new link replaces the last. It's made from the console URL of the node the command runs on; one that serves no console prints the link's path. |
 
 **The IAM API** is on the S3 endpoint too: requests signed for the `iam`
 service (SigV4's credential scope) are IAM's, whatever their path, so the AWS
@@ -388,9 +396,9 @@ provider calls as it starts. The AWS CLI refuses access key IDs shorter than
 but a user's first key is named as the user.
 
 A bucket policy can deny everyone everything, its admins too, as in S3. The
-superadmin, with access to the database, can always remove it, as an AWS
-account's root user can: `cairn bucket-policy --database <URL> delete
-<bucket>` (or `get`, or `put <bucket> <file>`).
+operator, on a node's peer endpoint, can always remove it, as an AWS
+account's root user can: `cairn bucket-policy delete <bucket>` (or `get`, or
+`put <bucket> <file>`).
 
 Secrets are stored in plaintext in the `access_keys` table: SigV4 is an HMAC scheme,
 so verifying a signature needs the secret itself. Restrict access to the
@@ -453,7 +461,7 @@ can be made in the console.
 
 ```sh
 cairn user create ada --account operator --admin
-cairn user enroll ada --account operator --console-url https://console.example.com
+cairn user enroll ada --account operator     # on a node that serves the console
 ```
 
 A **login** (a person, with passkeys) acts in each account it's in as one
@@ -539,7 +547,7 @@ restarts; everything else is read from the database.
   secure). Passkeys are bound to the console URL's host, so changing it
   makes everyone enroll again.
 - **Enrollment.** An identity gets a first passkey through a one-time link,
-  valid 24 hours: `cairn user enroll <name> --console-url <URL>` (`cairn
+  valid 24 hours: `cairn user enroll <name>` (`cairn
   account enroll <account>` for an account's root), or the Users (Accounts)
   page. Once signed in, people add more passkeys (at most 8; a second one,
   on another device, keeps them from being locked out) and remove them, but
@@ -705,8 +713,8 @@ per hour (1,000,000 by default; 0 pauses them), so that however much there is
 to sweep, they never take more of the database than that:
 
 ```sh
-cairn config --database "$DB" set lifecycle-rate 2000000
-cairn config --database "$DB" get              # every setting, with its default
+cairn config set lifecycle-rate 2000000
+cairn config get              # every setting, with its default
 ```
 
 Or on the console's Jobs page, which also shows each bucket's sweep, the rate
@@ -1148,8 +1156,8 @@ into larger ones.
 Coding is off until you choose *k*, for the whole cluster, next to *m*:
 
 ```sh
-cairn config --database "$DB" set parity-shards 2
-cairn config --database "$DB" set data-shards 4      # blobs over 64 MiB are coded 4+2
+cairn config set parity-shards 2
+cairn config set data-shards 4      # blobs over 64 MiB are coded 4+2
 ```
 
 Cairn never picks *k* itself: only you know how many nodes the cluster will

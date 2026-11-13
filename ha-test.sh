@@ -183,13 +183,6 @@ info "Building (cargo build)..."
 BIN="$SCRIPT_DIR/target/debug/$BIN_NAME"
 [ -x "$BIN" ] || fatal "binary not found at $BIN — adjust BIN_NAME at the top of this script"
 
-# Roles live in Postgres, shared by every instance: one admin role, granted
-# read/write on the test bucket once it exists (mb_granted).
-cairn_role() { "$BIN" role --database "postgres://${PG_USER}:${PG_PASS}@127.0.0.1:${PG_PORT}/${PG_DB}" "$@"; }
-info "Creating test role..."
-cairn_role create "$ACCESS_KEY" --admin --secret "$SECRET_KEY" >"$WORK_DIR/roles.log" 2>&1 \
-    || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create role"; }
-
 start_instance() {  # start_instance <n>
     local n="$1" cport pport
     cport="$(client_port "$n")"; pport="$(peer_port "$n")"
@@ -219,6 +212,8 @@ start_instance() {  # start_instance <n>
         [ "$elapsed" -ge "$STARTUP_TIMEOUT" ] && fatal "instance $n did not open port ${cport} in ${STARTUP_TIMEOUT}s"
     done
     exec 3>&- 3<&- 2>/dev/null
+    until (exec 3<>"/dev/tcp/${SERVER_HOST}/${pport}") 2>/dev/null; do sleep 0.2; done
+    exec 3>&- 3<&- 2>/dev/null
 }
 
 kill_instance() {  # kill_instance <n> — SIGKILL to simulate a crash, not a clean shutdown
@@ -235,6 +230,23 @@ for i in $(seq 1 "$INSTANCES"); do
     start_instance "$i"
 done
 info "All $INSTANCES instances are up."
+
+# Roles live in Postgres, shared by every instance: one admin role, granted
+# read/write on the test bucket once it exists (mb_granted). `cairn role`
+# runs on a node: the first one that's running.
+cairn_role() {
+    local n
+    for n in $(seq 1 "$INSTANCES"); do
+        if [ -n "${PIDS[$n]}" ]; then
+            "$BIN" role --peer-url "http://${SERVER_HOST}:$(peer_port "$n")" "$@"
+            return
+        fi
+    done
+    echo "no instance is running" >&2; return 1
+}
+info "Creating test role..."
+cairn_role create "$ACCESS_KEY" --admin --secret "$SECRET_KEY" >"$WORK_DIR/roles.log" 2>&1 \
+    || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create role"; }
 
 # ─── 3. One s3cmd config per instance ────────────────────────────────────────
 for i in $(seq 1 "$INSTANCES"); do

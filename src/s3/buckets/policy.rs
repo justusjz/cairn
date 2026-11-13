@@ -213,42 +213,59 @@ pub async fn get_bucket_policy_status(app: &App, bucket: &str) -> anyhow::Result
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
 pub struct BucketPolicyArgs {
-    /// PostgreSQL connection string (the same one the nodes use).
-    #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
-    database: String,
+    #[command(flatten)]
+    #[serde(skip)]
+    pub remote: crate::admin::Remote,
     #[command(subcommand)]
     command: BucketPolicyCommand,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, serde::Serialize, serde::Deserialize)]
 enum BucketPolicyCommand {
     /// Print a bucket's policy.
     Get { bucket: String },
     /// Set a bucket's policy to the JSON in `file` (`-`: stdin).
-    Put { bucket: String, file: String },
+    Put {
+        bucket: String,
+        #[serde(skip)]
+        file: String,
+        /// The file's contents, as the CLI read them (see `prepare`).
+        #[arg(skip)]
+        document: String,
+    },
     /// Delete a bucket's policy, whatever it says.
     Delete { bucket: String },
 }
 
-/// `cairn bucket-policy …`: a bucket's policy, straight against the
-/// database, whatever the policy says about who may change it.
-pub async fn bucket_policy_main(args: BucketPolicyArgs) -> anyhow::Result<()> {
-    let pool = crate::db::connect(&args.database).await?;
-    let client = pool.get().await?;
+impl BucketPolicyArgs {
+    /// Reads what the command takes from files, where the CLI runs.
+    pub fn prepare(&mut self) -> anyhow::Result<()> {
+        if let BucketPolicyCommand::Put { file, document, .. } = &mut self.command {
+            *document = crate::admin::read_document(file)?;
+        }
+        Ok(())
+    }
+}
+
+/// `cairn bucket-policy …`: a bucket's policy, on a node (see `admin`),
+/// whatever the policy says about who may change it.
+pub async fn run(
+    app: &std::sync::Arc<crate::App>,
+    args: BucketPolicyArgs,
+    out: &mut crate::admin::Output,
+) -> anyhow::Result<()> {
+    use crate::admin::outln;
+    let client = app.pool.get().await?;
     match args.command {
         BucketPolicyCommand::Get { bucket } => match shown(&client, &bucket).await? {
             None => anyhow::bail!("no bucket named {bucket:?}"),
             Some(None) => anyhow::bail!("{bucket:?} has no policy"),
-            Some(Some(policy)) => println!("{policy}"),
+            Some(Some(policy)) => outln!(out, "{policy}"),
         },
-        BucketPolicyCommand::Put { bucket, file } => {
-            let text = match file.as_str() {
-                "-" => std::io::read_to_string(std::io::stdin())?,
-                path => std::fs::read_to_string(path)?,
-            };
-            let policy = match check(&client, &bucket, &text).await? {
+        BucketPolicyCommand::Put { bucket, document, .. } => {
+            let policy = match check(&client, &bucket, &document).await? {
                 Ok(policy) => policy,
                 Err(refused) => anyhow::bail!("{}: {}", refused.code, refused.message),
             };

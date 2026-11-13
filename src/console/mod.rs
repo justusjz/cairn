@@ -74,6 +74,11 @@ impl Shared {
     pub fn new(origin: Option<String>) -> Shared {
         Shared { storage: tokio::sync::Mutex::default(), origin }
     }
+
+    /// The console's origin, if this node serves it.
+    pub fn origin(&self) -> Option<&str> {
+        self.origin.as_deref()
+    }
 }
 
 /// What the console's handlers have.

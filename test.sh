@@ -217,38 +217,16 @@ POLICY
 } >/dev/null 2>&1 || fatal "could not set up OpenBao"
 info "OpenBao is ready."
 
-# ─── 2. Roles ────────────────────────────────────────────────────────────────
-# Roles live in Postgres and are managed with `cairn role`, so set them up before
-# the server starts. testkey is an admin (AdministratorAccess); since grants need
-# an existing bucket, it's granted read/write on each test bucket right after
-# creating it (mb_granted). The others exercise permission checks: reader can
-# only read $BUCKET, writer can only use $OBUCKET (both granted once those
-# exist), and bucketadmin is an admin that holds no grants.
-cairn_role() { (cd "$SCRIPT_DIR" && cargo run -q -- role --database "$DB_URL" "$@"); }
-info "Creating roles..."
+# ─── 2. Cairn's identity in OpenBao ──────────────────────────────────────────
+# Made beforehand, as an OpenBao admin can, so that SSE-S3 works from the
+# first request: an entity, and its alias on Cairn's mount, `cairn`.
 {
-    cairn_role create "$ACCESS_KEY" --admin --secret "$SECRET_KEY" &&
-    cairn_role create reader --secret readersecret &&
-    cairn_role create writer --secret writersecret &&
-    cairn_role create bucketadmin --admin --secret adminsecret
-} >"$WORK_DIR/roles.log" 2>&1 || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create roles"; }
-
-# ─── 2a. testkey's and Cairn's identities in OpenBao ─────────────────────────
-# Made beforehand, as an OpenBao admin can, so that they may use their keys
-# from the first request: entities, and their aliases on Cairn's mount: the
-# role's ID, and `cairn` for Cairn itself (for SSE-S3). (Cairn would make them
-# when it starts; the other roles get theirs that way.)
-{
-    role_id=$(podman exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc \
-        "SELECT id FROM roles WHERE name = '$ACCESS_KEY'") &&
     accessor=$(bao read -field=accessor sys/auth/cairn) &&
-    entity=$(bao write -field=id identity/entity name=cairn-testkey policies=cairn-test-keys) &&
-    bao write identity/entity-alias name="$role_id" canonical_id="$entity" mount_accessor="$accessor" &&
     entity=$(bao write -field=id identity/entity name=cairn-itself policies=cairn-sse-s3) &&
     bao write identity/entity-alias name=cairn canonical_id="$entity" mount_accessor="$accessor"
-} >"$WORK_DIR/kms-identity.log" 2>&1 || { cat "$WORK_DIR/kms-identity.log" >&2; fatal "could not set up testkey in OpenBao"; }
+} >"$WORK_DIR/kms-identity.log" 2>&1 || { cat "$WORK_DIR/kms-identity.log" >&2; fatal "could not set up Cairn in OpenBao"; }
 
-# ─── 2b. Run the server ───────────────────────────────────────────────────────
+# ─── 2a. Run the server ───────────────────────────────────────────────────────
 info "Starting server (cargo run) on ${SERVER_HOST}:${SERVER_PORT}..."
 (cd "$SCRIPT_DIR" && exec cargo run ${CARGO_ARGS[@]+"${CARGO_ARGS[@]}"} >"$SERVER_LOG" 2>&1) &
 SERVER_PID=$!
@@ -265,6 +243,40 @@ until (exec 3<>"/dev/tcp/${SERVER_HOST}/${SERVER_PORT}") 2>/dev/null; do
 done
 exec 3>&- 3<&- 2>/dev/null
 info "Server is up."
+# The CLI talks to its peer endpoint.
+until (exec 3<>"/dev/tcp/127.0.0.1/9431") 2>/dev/null; do sleep 0.2; done
+exec 3>&- 3<&- 2>/dev/null
+
+
+# ─── 2b. Roles ───────────────────────────────────────────────────────────────
+# Managed with `cairn role`, which runs on the node (its peer endpoint, at the
+# default 127.0.0.1:9431). testkey is an admin (AdministratorAccess); since
+# grants need an existing bucket, it's granted read/write on each test bucket
+# right after creating it (mb_granted). The others exercise permission
+# checks: reader can only read $BUCKET, writer can only use $OBUCKET (both
+# granted once those exist), and bucketadmin is an admin that holds no grants.
+cairn_role() { (cd "$SCRIPT_DIR" && cargo run -q -- role "$@"); }
+info "Creating roles..."
+{
+    cairn_role create "$ACCESS_KEY" --admin --secret "$SECRET_KEY" &&
+    cairn_role create reader --secret readersecret &&
+    cairn_role create writer --secret writersecret &&
+    cairn_role create bucketadmin --admin --secret adminsecret
+} >"$WORK_DIR/roles.log" 2>&1 || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create roles"; }
+
+# ─── 2c. testkey's keys in OpenBao ───────────────────────────────────────────
+# The node makes each new role's entity in OpenBao as it creates it; testkey's
+# is then given the test's keys, as a key owner would.
+{
+    entity=""
+    for _ in $(seq 1 30); do
+        entity=$(podman exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc \
+            "SELECT kms_entity_id FROM roles WHERE name = '$ACCESS_KEY' AND kms_entity_id IS NOT NULL")
+        [ -n "$entity" ] && break
+        sleep 1
+    done
+    [ -n "$entity" ] && bao write identity/entity/id/"$entity" policies=cairn-test-keys
+} >"$WORK_DIR/kms-testkey.log" 2>&1 || { cat "$WORK_DIR/kms-testkey.log" >&2; fatal "could not give testkey its keys in OpenBao"; }
 
 # ─── 3. Client configuration ─────────────────────────────────────────────────
 # s3cmd (SigV4)
@@ -2193,8 +2205,8 @@ list_buckets_filtered_ok() {
         | tr '\t' '\n' | grep -qx "$OBUCKET"
 }
 
-cairn_user() { (cd "$SCRIPT_DIR" && cargo run -q -- user --database "$DB_URL" "$@"); }
-cairn_bucket_policy() { (cd "$SCRIPT_DIR" && cargo run -q -- bucket-policy --database "$DB_URL" "$@"); }
+cairn_user() { (cd "$SCRIPT_DIR" && cargo run -q -- user "$@"); }
+cairn_bucket_policy() { (cd "$SCRIPT_DIR" && cargo run -q -- bucket-policy "$@"); }
 
 # Bucket policies: only an admin sets one; it reads back as S3 keeps it, and
 # decides requests as S3's does: anonymous ones (a public prefix, and nothing

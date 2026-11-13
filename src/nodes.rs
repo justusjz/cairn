@@ -1,20 +1,27 @@
 //! `cairn node`: the cluster's nodes, and removing them (see `mover`).
 
+use std::sync::Arc;
+
 use clap::{Args, Subcommand};
 use deadpool_postgres::GenericClient;
+use serde::{Deserialize, Serialize};
 
-use crate::db::Cached;
+use crate::{
+    App,
+    admin::{Output, outln},
+    db::Cached,
+};
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Serialize, Deserialize)]
 pub struct NodeArgs {
-    /// PostgreSQL connection string (the same one the nodes use).
-    #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
-    database: String,
+    #[command(flatten)]
+    #[serde(skip)]
+    pub remote: crate::admin::Remote,
     #[command(subcommand)]
     command: NodeCommand,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum NodeCommand {
     /// List the nodes: their state, whether they're live, and how many shards
     /// they hold.
@@ -34,9 +41,9 @@ enum NodeCommand {
     },
 }
 
-pub async fn node_main(args: NodeArgs) -> anyhow::Result<()> {
-    let pool = crate::db::connect(&args.database).await?;
-    let client = pool.get().await?;
+/// `cairn node …`, on a node (see `admin`).
+pub async fn run(app: &Arc<App>, args: NodeArgs, out: &mut Output) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
     match args.command {
         NodeCommand::List => {
             let rows = client
@@ -47,22 +54,22 @@ pub async fn node_main(args: NodeArgs) -> anyhow::Result<()> {
                     &[],
                 )
                 .await?;
-            println!("{:>4}  {:<9} {:<5} {:>10}  peer URL", "id", "state", "live", "shards");
+            outln!(out, "{:>4}  {:<9} {:<5} {:>10}  peer URL", "id", "state", "live", "shards");
             for r in rows {
                 let live = if r.get::<_, bool>(3) { "yes" } else { "no" };
                 let (id, url, state, shards): (i32, String, String, i64) = (r.get(0), r.get(1), r.get(2), r.get(4));
-                println!("{id:>4}  {state:<9} {live:<5} {shards:>10}  {url}");
+                outln!(out, "{id:>4}  {state:<9} {live:<5} {shards:>10}  {url}");
             }
         }
         NodeCommand::Remove { id } => match remove(&client, id).await? {
-            Ok(shards) => println!(
+            Ok(shards) => outln!(out, 
                 "node {id} is being removed: its {shards} shards move to other nodes \
                  (`cairn node list` shows how many are left)"
             ),
             Err(why) => anyhow::bail!("node {id} {why}"),
         },
         NodeCommand::Keep { id } => match keep(&client, id).await? {
-            Ok(()) => println!("node {id} is kept: it gets new shards again"),
+            Ok(()) => outln!(out, "node {id} is kept: it gets new shards again"),
             Err(why) => anyhow::bail!("node {id} {why}"),
         },
     }

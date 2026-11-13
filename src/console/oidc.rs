@@ -669,16 +669,16 @@ pub async fn reap(client: &Object) -> anyhow::Result<u64> {
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, serde::Serialize, serde::Deserialize)]
 pub struct OidcArgs {
-    /// PostgreSQL connection string (the same one the nodes use).
-    #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
-    database: String,
+    #[command(flatten)]
+    #[serde(skip)]
+    pub remote: crate::admin::Remote,
     #[command(subcommand)]
     command: OidcCommand,
 }
 
-#[derive(clap::Subcommand, Debug)]
+#[derive(clap::Subcommand, Debug, serde::Serialize, serde::Deserialize)]
 enum OidcCommand {
     /// List the providers people may sign in to the console at.
     List,
@@ -706,15 +706,15 @@ enum OidcCommand {
     Remove { name: String },
 }
 
-/// `cairn oidc …`.
-pub async fn oidc_main(args: OidcArgs) -> anyhow::Result<()> {
-    let pool = crate::db::connect(&args.database).await?;
-    let client = pool.get().await?;
+/// `cairn oidc …`, on a node (see `admin`).
+pub async fn run(app: &std::sync::Arc<crate::App>, args: OidcArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
+    use crate::admin::outln;
+    let client = app.pool.get().await?;
     match args.command {
         OidcCommand::List => {
             for p in providers(&client).await? {
                 let kind = if p.client_secret.is_some() { "confidential" } else { "public" };
-                println!("{} ({})\n  issuer {}\n  client {} ({kind}), scopes {}", p.name, p.label, p.issuer, p.client_id, p.scopes);
+                outln!(out, "{} ({})\n  issuer {}\n  client {} ({kind}), scopes {}", p.name, p.label, p.issuer, p.client_id, p.scopes);
             }
         }
         OidcCommand::Set { name, issuer, client_id, client_secret, label, scopes } => {

@@ -4,21 +4,29 @@
 //! them, and makes a root's enrollment link for the console: a new account's
 //! first, or one to recover it, if its root's passkeys are lost.
 
+use std::sync::Arc;
+
 use clap::{Args, Subcommand};
 use deadpool_postgres::Object;
+use serde::{Deserialize, Serialize};
 
-use crate::{db::Cached, roles::Invalid};
+use crate::{
+    App,
+    admin::{Output, outln},
+    db::Cached,
+    roles::Invalid,
+};
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Serialize, Deserialize)]
 pub struct AccountArgs {
-    /// PostgreSQL connection string (the same one the nodes use).
-    #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
-    database: String,
+    #[command(flatten)]
+    #[serde(skip)]
+    pub remote: crate::admin::Remote,
     #[command(subcommand)]
     command: AccountCommand,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum AccountCommand {
     /// List the accounts: their IDs, names, users and buckets.
     List,
@@ -29,13 +37,11 @@ enum AccountCommand {
         name: String,
     },
     /// Print a one-time link (valid 24 hours) for an account's root to set up
-    /// a passkey for the console. A new link replaces the last.
+    /// a passkey for the console. A new link replaces the last. Made from
+    /// the node's console URL.
     Enroll {
         /// The account's name (`operator` for the operator account).
         name: String,
-        /// The console's URL, to make the link from.
-        #[arg(long, env = "CAIRN_CONSOLE_URL", value_parser = crate::console::parse_url)]
-        console_url: Option<crate::console::webauthn::Party>,
     },
 }
 
@@ -70,10 +76,9 @@ pub async fn create(client: &Object, name: &str) -> anyhow::Result<String> {
     anyhow::bail!("couldn't draw an unused account ID")
 }
 
-/// `cairn account …`.
-pub async fn account_main(args: AccountArgs) -> anyhow::Result<()> {
-    let pool = crate::db::connect(&args.database).await?;
-    let client = pool.get().await?;
+/// `cairn account …`, on a node (see `admin`).
+pub async fn run(app: &Arc<App>, args: AccountArgs, out: &mut Output) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
     match args.command {
         AccountCommand::List => {
             let rows = client
@@ -91,17 +96,16 @@ pub async fn account_main(args: AccountArgs) -> anyhow::Result<()> {
                 let (users, buckets, root): (i64, i64, bool) = (row.get(3), row.get(4), row.get(5));
                 let kind = if operator { " (operator)" } else { "" };
                 let root = if root { "root enrolled" } else { "root not enrolled" };
-                println!("{name}{kind}\n  id {id}\n  {users} users, {buckets} buckets, {root}");
+                outln!(out, "{name}{kind}\n  id {id}\n  {users} users, {buckets} buckets, {root}");
             }
         }
         AccountCommand::Create { name } => {
             let id = create(&client, &name).await?;
-            println!("account {name}: {id}");
+            outln!(out, "account {name}: {id}");
         }
-        AccountCommand::Enroll { name, console_url } => {
+        AccountCommand::Enroll { name } => {
             let token = crate::console::store::create_root_enrollment(&client, &name).await?;
-            let origin = console_url.map(|party| party.origin).unwrap_or_default();
-            println!("{origin}/enroll#{token}");
+            crate::roles::enrollment_link(app, &token, out);
         }
     }
     Ok(())

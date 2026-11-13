@@ -165,16 +165,16 @@ impl Setting {
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ConfigArgs {
-    /// PostgreSQL connection string (the same one the nodes use).
-    #[arg(long, env = "CAIRN_DATABASE", hide_env_values = true)]
-    database: String,
+    #[command(flatten)]
+    #[serde(skip)]
+    pub remote: crate::admin::Remote,
     #[command(subcommand)]
     command: ConfigCommand,
 }
 
-#[derive(Subcommand, Debug)]
+#[derive(Subcommand, Debug, serde::Serialize, serde::Deserialize)]
 enum ConfigCommand {
     /// Show every setting's value, or one's.
     Get { name: Option<String> },
@@ -184,9 +184,14 @@ enum ConfigCommand {
     Unset { name: String },
 }
 
-pub async fn config_main(args: ConfigArgs) -> anyhow::Result<()> {
-    let pool = crate::db::connect(&args.database).await?;
-    let client = pool.get().await?;
+/// `cairn config …`, on a node (see `admin`).
+pub async fn run(
+    app: &std::sync::Arc<crate::App>,
+    args: ConfigArgs,
+    out: &mut crate::admin::Output,
+) -> anyhow::Result<()> {
+    use crate::admin::outln;
+    let client = app.pool.get().await?;
     let find = |name: &str| {
         named(name).ok_or_else(|| {
             let known: Vec<&str> = ALL.iter().map(|s| s.name).collect();
@@ -197,9 +202,9 @@ pub async fn config_main(args: ConfigArgs) -> anyhow::Result<()> {
         ConfigCommand::Get { name: Some(name) } => {
             let setting = find(&name)?;
             match (setting.get_set(&client).await?, setting.unset) {
-                (Some(value), _) => println!("{value}"),
-                (None, Some(unset)) => println!("unset: {unset}"),
-                (None, None) => println!("{}", setting.default),
+                (Some(value), _) => outln!(out, "{value}"),
+                (None, Some(unset)) => outln!(out, "unset: {unset}"),
+                (None, None) => outln!(out, "{}", setting.default),
             }
         }
         ConfigCommand::Get { name: None } => {
@@ -210,7 +215,7 @@ pub async fn config_main(args: ConfigArgs) -> anyhow::Result<()> {
                     (None, None) => setting.default.to_string(),
                 };
                 let default = setting.unset.map_or(setting.default.to_string(), |_| "unset".to_owned());
-                println!("{} = {value}  # {} (default {default})", setting.name, setting.help);
+                outln!(out, "{} = {value}  # {} (default {default})", setting.name, setting.help);
             }
         }
         ConfigCommand::Set { name, value } => {
@@ -218,12 +223,15 @@ pub async fn config_main(args: ConfigArgs) -> anyhow::Result<()> {
             setting.set(&client, value).await?;
             if [DATA_SHARDS.name, PARITY_SHARDS.name].contains(&setting.name) {
                 for warning in placement_warnings(&client).await? {
-                    eprintln!("warning: {warning}");
+                    out.warn(warning);
                 }
             }
         }
         ConfigCommand::Unset { name } => find(&name)?.unset(&client).await?,
     }
+    // The node answering goes by it at once; the others at their next
+    // heartbeat.
+    crate::refresh_settings(app).await?;
     Ok(())
 }
 
