@@ -231,18 +231,14 @@ impl Access {
         // `aws:ResourceAccount` is that account (else the principal's own;
         // anonymously, the one the request was made in).
         let resource_account = owner.or(self.account());
-        let with_resource_account;
-        let context = match resource_account {
-            Some(account) if self.context.get("aws:ResourceAccount").is_none_or(|v| v != [account]) => {
-                let mut context = self.context.clone();
-                context.set("aws:ResourceAccount", account);
-                context.set("s3:ResourceAccount", account);
-                with_resource_account = context;
-                &with_resource_account
-            }
-            _ => &self.context,
-        };
-        let request = crate::policy::Request { principal, action: check.action, resource: &resource, context };
+        let mut context = self.context.clone();
+        if let Some(account) = resource_account {
+            context.set("aws:ResourceAccount", account);
+            context.set("s3:ResourceAccount", account);
+        }
+        // Only the `s3:` keys this action takes (see `Context::for_action`).
+        let context = context.for_action(check.action);
+        let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &context };
         if let Some(account) = &self.root {
             return crate::policy::root_verdict(bucket, &request, owner.is_none_or(|owner| owner == account));
         }
@@ -424,14 +420,14 @@ fn context(
     {
         context.set("s3:versionid", version);
     }
-    // A listing's: what it lists, and how much (always there).
-    for name in ["prefix", "delimiter"] {
+    // A listing's: what it lists, and how much, as far as it says (an
+    // empty `prefix=` is there, empty; no `max-keys`, no `s3:max-keys`:
+    // probed). Only actions that take them see them (`for_action`).
+    for name in ["prefix", "delimiter", "max-keys"] {
         if let Some(value) = query_param(query, name) {
             context.set(&format!("s3:{name}"), value);
         }
     }
-    let max = query_param(query, "max-keys").unwrap_or_else(|| "1000".to_owned());
-    context.set("s3:max-keys", max);
     context
 }
 

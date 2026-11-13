@@ -542,3 +542,37 @@ fn names_users_as_they_were() {
     assert_eq!(shown, policy.normalized().replacen(&format!("\"{bob}\""), "\"id-1\"", 1));
     assert!(shown.contains(&format!("\"aws:PrincipalArn\":\"{bob}\"")), "{shown}");
 }
+
+#[test]
+fn an_action_sees_only_the_s3_keys_it_takes() {
+    // As probed: a request may carry `?prefix=`, `?max-keys=` or `x-amz-acl`
+    // whatever it does, but S3 has those keys only for the actions that
+    // take them, so conditions on them hold for those alone.
+    let policy = bucket_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/bob"},
+            "Action":"s3:*","Resource":["arn:aws:s3:::examplebucket","arn:aws:s3:::examplebucket/*"],
+            "Condition":{"StringLike":{"s3:prefix":"bob/*"}}}]}"#,
+    );
+    let mut request = context_of("bob");
+    request.set("s3:prefix", "bob/x");
+    request.set("s3:max-keys", "5000");
+    request.set("s3:x-amz-acl", "private");
+    request.set("s3:authType", "REST-HEADER");
+    let bucket = format!("arn:aws:s3:::{BUCKET}");
+    let decide = |action, resource: &str| check(&policy, user("bob"), action, resource, &request.clone().for_action(action));
+    assert_eq!(decide("s3:ListBucket", &bucket), Decision::Allow);
+    for action in ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"] {
+        assert_eq!(decide(action, &object("secret")), Decision::NotApplicable, "{action}");
+    }
+    let kept = |action| request.clone().for_action(action);
+    let listing = kept("s3:ListBucket");
+    assert!(listing.get("s3:prefix").is_some() && listing.get("s3:max-keys").is_some());
+    assert!(listing.get("s3:x-amz-acl").is_none());
+    let put = kept("s3:PutObject");
+    assert!(put.get("s3:prefix").is_none() && put.get("s3:max-keys").is_none());
+    assert_eq!(put.get("s3:x-amz-acl"), Some(&["private".to_owned()][..]));
+    // Global keys, and the `s3:` ones every action takes, stay.
+    assert!(put.get("aws:username").is_some() && put.get("s3:authtype").is_some());
+    // An action that isn't S3's takes no `s3:` key.
+    assert!(kept("iam:GetUser").get("s3:authType").is_none());
+}

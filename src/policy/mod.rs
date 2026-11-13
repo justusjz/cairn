@@ -63,6 +63,21 @@ impl Context {
     pub fn get(&self, key: &str) -> Option<&[String]> {
         self.values.get(&key.to_ascii_lowercase()).map(Vec::as_slice)
     }
+
+    /// The context `action` is decided in: every global (`aws:`) key, but
+    /// of the `s3:` keys only those S3 sets for it (see `ACTIONS`). A
+    /// request may carry `?prefix=` or `x-amz-acl` whatever it does; S3 has
+    /// `s3:prefix` only for a listing, `s3:x-amz-acl` only for a write that
+    /// takes an ACL, and so on, so a condition on such a key holds only
+    /// where it's meant to.
+    pub fn for_action(mut self, action: &str) -> Context {
+        let name = action.split_once(':').filter(|(service, _)| service.eq_ignore_ascii_case("s3")).map(|(_, n)| n);
+        let keys = name
+            .and_then(|name| ACTIONS.iter().find(|(a, _, _)| a.eq_ignore_ascii_case(name)))
+            .map_or(&[][..], |(_, _, keys)| *keys);
+        self.values.retain(|key, _| !key.starts_with("s3:") || takes_key(keys, key));
+        self
+    }
 }
 
 /// Who makes a request.
