@@ -53,7 +53,8 @@ fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> 
 }
 
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    // ASCII, so that the slices below are of whole characters.
+    if s.len() % 2 != 0 || !s.is_ascii() {
         return None;
     }
     (0..s.len() / 2)
@@ -357,7 +358,8 @@ const MAX_CLOCK_SKEW_SECS: i64 = 15 * 60;
 /// it isn't in exactly that form or names an impossible date/time.
 pub(crate) fn parse_amz_date(s: &str) -> Option<i64> {
     let b = s.as_bytes();
-    if b.len() != 16 || b[8] != b'T' || b[15] != b'Z' {
+    // ASCII, so that the slices below are of whole characters.
+    if b.len() != 16 || !s.is_ascii() || b[8] != b'T' || b[15] != b'Z' {
         return None;
     }
     let num = |range: std::ops::Range<usize>| -> Option<i64> {
@@ -1070,8 +1072,15 @@ pub(crate) mod tests {
             "20261301T000000Z",
             "20260613T240000Z",
             "+0260613T000000Z",
+            // Not ASCII: its digits' byte ranges aren't characters.
+            "20260\u{e9}3T000000Z",
+            "2026061\u{e9}000000Z",
         ] {
             assert_eq!(parse_amz_date(bad), None, "{bad:?}");
+        }
+        assert_eq!(hex_decode("0aff"), Some(vec![0x0a, 0xff]));
+        for bad in ["a", "0g", "a\u{e9}1", "\u{e9}\u{e9}"] {
+            assert_eq!(hex_decode(bad), None, "{bad:?}");
         }
     }
 

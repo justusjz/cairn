@@ -218,7 +218,11 @@ fn parse_time(s: &str) -> Option<i64> {
             let at = time.rfind(['+', '-'])?;
             let (time, offset) = time.split_at(at);
             let (hours, minutes) = offset[1..].split_once(':')?;
-            let minutes: i64 = hours.parse::<i64>().ok()? * 60 + minutes.parse::<i64>().ok()?;
+            let minutes = hours.parse::<i64>().ok()?.checked_mul(60)?.checked_add(minutes.parse::<i64>().ok()?)?;
+            // At most a day either way (real offsets are within ±14 hours).
+            if !(0..=24 * 60).contains(&minutes) {
+                return None;
+            }
             (time, if offset.starts_with('-') { -minutes } else { minutes } * 60)
         }
     };
@@ -262,7 +266,17 @@ mod tests {
         assert_eq!(parse_time("2026-11-10T12:00:00Z"), Some(NOW + 1));
         assert_eq!(parse_time("2026-11-10T13:00:00+01:00"), Some(NOW + 1));
         assert_eq!(parse_time("2026-11-10T11:30:00-00:30"), Some(NOW + 1));
-        for bad in ["2026-11-10", "2026-11-10T12:00:00", "2026-11-10T12:00:00.Z", "20261110T120000Z", "2026-13-10T12:00:00Z"] {
+        for bad in [
+            "2026-11-10",
+            "2026-11-10T12:00:00",
+            "2026-11-10T12:00:00.Z",
+            "20261110T120000Z",
+            "2026-13-10T12:00:00Z",
+            "2026-11-10T12:00:00+25:00",
+            "2026-11-10T12:00:00+999999999999999999:00",
+            "2026-11-10T12:00:00-153722867280912930:00",
+            "2026-11-1\u{e9}T12:00:00Z",
+        ] {
             assert_eq!(parse_time(bad), None, "{bad}");
         }
     }
