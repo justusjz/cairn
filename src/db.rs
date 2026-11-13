@@ -46,7 +46,7 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "5";
+pub(crate) const PROTOCOL: &str = "6";
 
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
@@ -207,6 +207,7 @@ const MIGRATIONS: &[&str] = &[
     OIDC,
     USER_NAMES,
     OBJECT_LOCK,
+    SSE_C_SEALED,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1574,6 +1575,31 @@ $$;
 CREATE TRIGGER objects_locked BEFORE DELETE OR UPDATE ON objects
     FOR EACH ROW WHEN (OLD.legal_hold OR OLD.retain_mode = 'COMPLIANCE')
     EXECUTE FUNCTION cairn_protect_locked();
+"#;
+
+/// Migration 38: SSE-C's `sse_c_key` holds the object key sealed under the
+/// client's key (72 bytes: nonce, key, tag; see `s3::sse`), no longer a
+/// check of the client's key (48), as SSE-C objects now have keys of their
+/// own, as SSE-KMS ones do. The protocol goes to 6, so that an older node
+/// writes no checks into it. SSE-C objects from before can't be read any
+/// more (no deployment had any).
+const SSE_C_SEALED: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '6' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE objects DROP CONSTRAINT objects_sse_c_key;
+ALTER TABLE objects ADD CONSTRAINT objects_sse_c_key
+    CHECK (octet_length(sse_c_key) = 72) NOT VALID;
+ALTER TABLE multipart_uploads DROP CONSTRAINT multipart_uploads_sse_c_key;
+ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_sse_c_key
+    CHECK (octet_length(sse_c_key) = 72) NOT VALID;
 "#;
 
 #[cfg(test)]

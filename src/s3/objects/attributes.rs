@@ -114,7 +114,7 @@ pub async fn get_object_attributes(
             Ok(version) => version,
             Err(missing) => return Ok(missing.read_response()),
         };
-    if let Err(refused) = sse::check(&encryption, customer_key) {
+    if let Err(refused) = sse::check(&encryption, customer_key, bucket, key) {
         return Ok(refused);
     }
     let etag = match sse::plain_etag(app, &encryption, &etag, bucket, key).await? {

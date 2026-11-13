@@ -210,7 +210,7 @@ pub async fn complete_multipart_upload(
             ));
         }
         if customer_key.is_some()
-            && let Err(refused) = sse::check(&upload.encryption, customer_key)
+            && let Err(refused) = sse::check(&upload.encryption, customer_key, bucket, key)
         {
             return Ok(refused);
         }

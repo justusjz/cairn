@@ -94,19 +94,19 @@ pub struct CopyKeys<'a> {
 
 impl CopyKeys<'_> {
     /// Whether the destination can share the bytes of a source encrypted as
-    /// `source` is: both are plain, or SSE-C with the same key, or both SSE-KMS
-    /// (under any key: the copy seals the same object key under a data key of
-    /// its own), or both SSE-S3. Otherwise the data is decrypted and encrypted
-    /// again: so is a copy between SSE-KMS and SSE-S3, whose ETags differ (an
-    /// SSE-S3 object's is its content's MD5, which this works out).
+    /// `source` is: both are plain, or both SSE-S3, or each SSE-C or SSE-KMS,
+    /// under any key (the copy seals the same object key under a key of its
+    /// own: the client's, or a data key). Otherwise the data is decrypted and
+    /// encrypted again: so is a copy between SSE-S3 and the others, whose
+    /// ETags differ (an SSE-S3 object's is its content's MD5, which this
+    /// works out; the others' are their parts' salts).
     fn shares(&self, source: &Stored) -> bool {
-        match (source, self.dest) {
-            (Stored::Plain, Wanted::Plain) | (Stored::Kms(_), Wanted::Kms(_)) | (Stored::S3(_), Wanted::S3) => true,
-            (Stored::Customer { .. }, Wanted::Customer(dest)) => {
-                self.source.is_some_and(|source| source.key() == dest.key())
-            }
-            _ => false,
-        }
+        matches!(
+            (source, self.dest),
+            (Stored::Plain, Wanted::Plain)
+                | (Stored::S3(_), Wanted::S3)
+                | (Stored::Customer { .. } | Stored::Kms(_), Wanted::Customer(_) | Wanted::Kms(_))
+        )
     }
 
     /// Whether a copy of a source encrypted as `source` onto itself leaves its
@@ -116,7 +116,9 @@ impl CopyKeys<'_> {
     fn keeps(&self, source: &Stored) -> bool {
         match (source, self.dest) {
             (Stored::Plain, Wanted::Plain) => true,
-            (Stored::Customer { .. }, Wanted::Customer(_)) => self.shares(source),
+            (Stored::Customer { .. }, Wanted::Customer(dest)) => {
+                self.source.is_some_and(|source| source.key() == dest.key())
+            }
             _ => false,
         }
     }
@@ -132,10 +134,12 @@ impl CopyKeys<'_> {
 /// data is read once to work it out (but not written).
 ///
 /// An SSE-C source needs its key (`keys.source`). The copy shares its bytes
-/// if it's encrypted with the same key, or both are plain, or both SSE-KMS
-/// (see `CopyKeys::shares`); then an encrypted copy's ETag is the source's (an
-/// MD5 of the data would give it away). Otherwise the data is read, decrypted,
-/// and written again, encrypted as `keys.dest` asks.
+/// unless it changes between plain, SSE-S3 and the others (see
+/// `CopyKeys::shares`): an encrypted one seals its source's object key under
+/// its own key (so a copy onto itself with another SSE-C key changes only
+/// that), and has its source's ETag (an MD5 of the data would give it away).
+/// Otherwise the data is read, decrypted, and written again, encrypted as
+/// `keys.dest` asks.
 ///
 /// `metadata_directive` is `x-amz-metadata-directive` (COPY, the default, or
 /// REPLACE). Under COPY the destination inherits the source's content-type and
@@ -201,7 +205,7 @@ pub async fn copy_object(
         // An SSE-C source only with its key; before the conditions, which would
         // tell about it otherwise.
         let encryption = &source.version.encryption;
-        if let Err(refused) = sse::check(encryption, keys.source) {
+        if let Err(refused) = sse::check(encryption, keys.source, &src_bucket, &src_key) {
             return Ok(refused);
         }
         if same_object && !replace && request_tags.is_none() && keys.keeps(encryption) {
@@ -320,11 +324,11 @@ pub async fn copy_object(
                 }
             }
         };
-        // The copy's own record of the same key: a check of the client's, or
-        // the object key sealed under a data key for the copy.
+        // The copy's own record of the same key: the object key sealed under
+        // the client's key, or a data key, for the copy.
         let stored = match (keys.dest, &source_key) {
             (Wanted::Plain, _) => Stored::Plain,
-            (Wanted::Customer(dest), _) => Stored::Customer { check: dest.new_check() },
+            (Wanted::Customer(dest), Some(object_key)) => sse::reseal_customer(dest, object_key, dest_bucket, dest_key),
             (Wanted::Kms(request), Some(object_key)) => {
                 match sse::reseal(app, object_key, request, keys.role, dest_bucket, dest_key).await? {
                     Ok(envelope) => Stored::Kms(envelope),
@@ -337,8 +341,8 @@ pub async fn copy_object(
                     Err(refused) => return Ok(refused),
                 }
             }
-            (Wanted::Kms(_) | Wanted::S3, None) => {
-                unreachable!("an SSE-KMS or SSE-S3 copy shares only an encrypted source's parts")
+            (Wanted::Customer(_) | Wanted::Kms(_) | Wanted::S3, None) => {
+                unreachable!("an encrypted copy shares only an encrypted source's parts")
             }
         };
         // Its checksum, under the key it shares with its source, if it's
@@ -658,7 +662,7 @@ pub async fn copy_part(
         checksums::Wanted::Exactly(algorithm) => Some(algorithm),
         _ => None,
     };
-    if let Err(refused) = sse::check(&upload_encryption, dest_key) {
+    if let Err(refused) = sse::check(&upload_encryption, dest_key, bucket, key) {
         return Ok(refused);
     }
 
@@ -667,7 +671,7 @@ pub async fn copy_part(
             Ok(source) => source,
             Err(missing) => return Ok(missing),
         };
-        if let Err(refused) = sse::check(&source.version.encryption, source_key) {
+        if let Err(refused) = sse::check(&source.version.encryption, source_key, &src_bucket, &src_key) {
             return Ok(refused);
         }
         let version = &source.version;

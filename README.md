@@ -921,8 +921,9 @@ Send the
 `x-amz-server-side-encryption-customer-*` headers with the PUT, as with S3
 (`aws s3api put-object --sse-customer-algorithm AES256 --sse-customer-key
 fileb://key`), and the same key with every GET and HEAD of the object. Cairn
-never stores the key: only a salted HMAC of it, to refuse a wrong one.
-Without the key, the data can't be read, by anyone.
+never stores the key. The object has a random key of its own, which encrypts
+its data, kept encrypted under yours (as MinIO does): a wrong key fails to
+open it. Without your key, the data can't be read, by anyone.
 
 - The key travels in a request header, so it's only accepted over HTTPS: a
   request must come through a proxy that sets `X-Forwarded-Proto: https` (or
@@ -931,8 +932,11 @@ Without the key, the data can't be read, by anyone.
 - Multipart uploads: send the key with CreateMultipartUpload and every
   UploadPart (CompleteMultipartUpload doesn't need it).
 - Copies: send the source's key in the `x-amz-copy-source-server-side-encryption-customer-*`
-  headers, and the copy's (if any) in the usual ones. A copy with the same key
-  shares the source's data; one with another key, or none, is written anew.
+  headers, and the copy's (if any) in the usual ones. A copy with a key
+  (yours, the same or another, or an SSE-KMS one) shares the source's data:
+  it keeps the source's object key, encrypted under its own. So changing an
+  object's key, by copying it onto itself, doesn't rewrite it, and the old key
+  opens nothing of it after. A copy without a key is written anew.
   Copying an object onto itself with another key changes its key.
 
 ### SSE-KMS
@@ -986,12 +990,11 @@ deleting a key makes its objects unreadable for good (crypto-shredding).
   as in MinIO: every object has keys of its own anyway.
 - Multipart uploads: ask for SSE-KMS with CreateMultipartUpload. Its parts
   need the role's use of the key, but no headers.
-- Copies to another SSE-KMS key or context share the source's data, as copies
-  under the same SSE-C key do: the copy seals the same object key under a data
-  key of its own. That changes who may open it, but not the key the data is
-  encrypted with: anyone who could open the source's can read the copy's
-  data. To change that (if a key may have leaked, say), copy to a plain or
-  SSE-C object and back, which writes the data anew.
+- Copies to another SSE-KMS key or context, or to SSE-C, share the source's
+  data: the copy seals the same object key under a data key of its own. That
+  changes who may open it, but not the key the data is encrypted with. To
+  change that too (if an object's key may have leaked, say), copy to SSE-S3
+  or a plain object and back, which writes the data anew.
 - If the KMS can't be reached, reads and writes of SSE-KMS objects fail with
   `503`, and nothing else is affected (HEAD needs no KMS).
 
@@ -1062,8 +1065,9 @@ roles.
 - That also means revoking Cairn's access to the key, or deleting the key (to
   shred every SSE-S3 object at once), stops nodes reading SSE-S3 objects
   within an hour, and at once only after they restart.
-- Copies between SSE-S3 and SSE-KMS objects share their data, as copies among
-  SSE-KMS objects do.
+- Copies among SSE-S3 objects share their data. Copies between SSE-S3 and the
+  other kinds are written anew, as their ETags differ (an SSE-S3 object's is
+  its content's MD5).
 
 Setting it up, after the JWT mount above:
 

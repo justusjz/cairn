@@ -333,10 +333,7 @@ async fn put_sealed_with(
         content_type: "application/octet-stream".to_owned(),
         metadata: String::new(),
         conditions: Preconditions::default(),
-        sealing: Some(crate::Sealing {
-            key: zeroize::Zeroizing::new(*customer.key()),
-            stored: crate::s3::sse::Stored::Customer { check: customer.new_check() },
-        }),
+        sealing: Some(crate::s3::sse::seal_customer(customer, BUCKET, key)),
         checksum: crate::e2e::OBJECT_CHECKSUM,
         tags: String::new(),
         lock: Default::default(),

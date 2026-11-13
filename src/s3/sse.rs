@@ -1,12 +1,14 @@
 //! Server-side encryption: how a stored object (or an upload) is encrypted, as
 //! the catalog records it, and SSE-KMS's requests. SSE-C's are in `sse_c`.
 //!
-//! Every encrypted object's parts are in `encryption`'s format, under one key:
+//! Every encrypted object's parts are in `encryption`'s format, under an
+//! object key of its own, random, which the object keeps sealed under
+//! another key (XChaCha20-Poly1305), as MinIO does for all three:
 //!
-//! - SSE-C: the client's own, which the object keeps only a check of;
-//! - SSE-KMS: an object key of its own, random, which the object keeps sealed
-//!   (XChaCha20-Poly1305) under a data key from the KMS (see `kms`). The data
-//!   key is kept as its KMS ciphertext, which only the KMS can open, and only
+//! - SSE-C: under the client's key, with the object's name as associated
+//!   data (see `sse_c`). The client's key is never stored: a wrong one fails
+//!   to open the object key;
+//! - SSE-KMS: under a data key from the KMS (see `kms`). The data key is kept as its KMS ciphertext, which only the KMS can open, and only
 //!   with the same associated data: the encryption context the client gave
 //!   (if any), with `"aws:s3:arn": "arn:aws:s3:::<bucket>/<key>"` added, as
 //!   canonical JSON. So a data key only opens for an object of the name it
@@ -28,12 +30,11 @@
 //! CompleteMultipartUpload decide in Cairn, and the catalog only checks that
 //! what they decided on is still there (see `catalog.sql`).
 //!
-//! The two levels are MinIO's, and let a copy share its source's parts under
-//! another KMS key, or context: it takes a data key of its own, and seals the
-//! same object key under it. That doesn't re-key the data: anyone who could
-//! open the source's data key can read the copy's parts. Nor does SSE-C ever
-//! share parts across keys, since that's what a client changing its key
-//! wants to stop.
+//! The two levels let a copy share its source's parts under another key (an
+//! SSE-C one, a KMS key, a context): it seals the same object key under its
+//! own, so changing an object's key (a copy onto itself) is a matter of its
+//! catalog row. That doesn't re-key the data, which is the copy's anyway: the
+//! source's old key opens nothing of it once the source is gone.
 
 use std::collections::BTreeMap;
 
@@ -73,6 +74,8 @@ const SEALED_KEY_AD: &[u8] = b"cairn sse-kms object key v1";
 /// The start of the associated data an SSE-S3 object key is sealed with,
 /// before the object's name, `<bucket>/<key>` (a bucket's name has no `/`).
 const SSE_S3_SEALED_KEY_AD: &[u8] = b"cairn sse-s3 object key v1\0";
+/// The same, for an SSE-C object key, sealed under the client's key.
+const SSE_C_SEALED_KEY_AD: &[u8] = b"cairn sse-c object key v1\0";
 const NONCE_LEN: usize = 24;
 /// Bytes of a sealed object key: nonce, ciphertext, tag.
 pub const SEALED_LEN: usize = NONCE_LEN + 32 + 16;
@@ -81,8 +84,8 @@ pub const SEALED_LEN: usize = NONCE_LEN + 32 + 16;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stored {
     Plain,
-    /// SSE-C: a check of the client's key (see `sse_c`).
-    Customer { check: Vec<u8> },
+    /// SSE-C: the object key, sealed under the client's key (see `sse_c`).
+    Customer { sealed: Vec<u8> },
     Kms(Envelope),
     /// SSE-S3: as SSE-KMS, but under Cairn's key, without a context.
     S3(Envelope),
@@ -119,10 +122,10 @@ impl Stored {
     /// From a row's six catalog columns (as `Columns` lists them), from
     /// `first` on.
     pub fn from_row(row: &Row, first: usize) -> Stored {
-        let check: Option<Vec<u8>> = row.get(first);
+        let sealed: Option<Vec<u8>> = row.get(first);
         let key_id: Option<String> = row.get(first + 1);
-        match (check, key_id) {
-            (Some(check), _) => Stored::Customer { check },
+        match (sealed, key_id) {
+            (Some(sealed), _) => Stored::Customer { sealed },
             (None, Some(key_id)) => {
                 let envelope = Envelope {
                     key_id,
@@ -150,7 +153,7 @@ impl Stored {
         };
         match self {
             Stored::Plain => {}
-            Stored::Customer { check } => columns.sse_c_key = Some(check),
+            Stored::Customer { sealed } => columns.sse_c_key = Some(sealed),
             Stored::Kms(envelope) | Stored::S3(envelope) => {
                 columns.kms_key_id = Some(&envelope.key_id);
                 columns.kms_data_key = Some(&envelope.data_key);
@@ -400,12 +403,16 @@ pub fn refuse_on_other_writes(headers: &HeaderMap) -> Option<Response<Full<Bytes
     })
 }
 
-/// Whether a stored object may be read with the SSE-C key `given` (if any),
-/// or why not.
-pub fn check(stored: &Stored, given: Option<&CustomerKey>) -> Result<(), Response<Full<Bytes>>> {
+/// Whether a stored object, at `bucket`/`key`, may be read with the SSE-C key
+/// `given` (if any), or why not: an SSE-C one only with the key its object
+/// key opens under.
+pub fn check(stored: &Stored, given: Option<&CustomerKey>, bucket: &str, key: &str) -> Result<(), Response<Full<Bytes>>> {
     match stored {
-        Stored::Plain => crate::s3::sse_c::check_read(None, given),
-        Stored::Customer { check } => crate::s3::sse_c::check_read(Some(check), given),
+        Stored::Plain => crate::s3::sse_c::check_read(false, given.map(|_| false)),
+        Stored::Customer { sealed } => {
+            let opens = given.map(|given| open_customer(given, sealed, bucket, key).is_some());
+            crate::s3::sse_c::check_read(true, opens)
+        }
         Stored::Kms(_) | Stored::S3(_) if given.is_some() => Err(bad_request(
             "InvalidRequest",
             "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
@@ -428,9 +435,12 @@ pub async fn open(
 ) -> anyhow::Result<Result<Option<Zeroizing<Key>>, Response<Full<Bytes>>>> {
     match stored {
         Stored::Plain => Ok(Ok(None)),
-        Stored::Customer { .. } => {
+        Stored::Customer { sealed } => {
             let given = given.expect("an SSE-C object is read with its key (`check`)");
-            Ok(Ok(Some(Zeroizing::new(*given.key()))))
+            match open_customer(given, sealed, bucket, key) {
+                Some(object_key) => Ok(Ok(Some(object_key))),
+                None => anyhow::bail!("the sealed key of {bucket}/{key} doesn't open under the key it was `check`ed with"),
+            }
         }
         Stored::Kms(envelope) => Ok(open_envelope(app, envelope, role, bucket, key).await?.map(Some)),
         Stored::S3(envelope) => Ok(open_s3(app, envelope, bucket, key).await?.map(Some)),
@@ -466,6 +476,32 @@ async fn open_s3(
 /// The associated data an SSE-S3 object key is sealed with: the object's name.
 fn sse_s3_sealed_ad(bucket: &str, key: &str) -> Vec<u8> {
     [SSE_S3_SEALED_KEY_AD, bucket.as_bytes(), b"/", key.as_bytes()].concat()
+}
+
+/// The associated data an SSE-C object key is sealed with: the object's name.
+fn sse_c_sealed_ad(bucket: &str, key: &str) -> Vec<u8> {
+    [SSE_C_SEALED_KEY_AD, bucket.as_bytes(), b"/", key.as_bytes()].concat()
+}
+
+/// `object_key` sealed under the client's key `customer`, for the object at
+/// `bucket`/`key`: for a new SSE-C object, or a copy that shares another one's
+/// parts (with another key, maybe: rotating it).
+pub fn reseal_customer(customer: &CustomerKey, object_key: &Key, bucket: &str, key: &str) -> Stored {
+    Stored::Customer { sealed: seal_object_key(customer.key(), object_key, &sse_c_sealed_ad(bucket, key)) }
+}
+
+/// A new SSE-C object's key, at `bucket`/`key`, and how it's stored: sealed
+/// under the client's key `customer`.
+pub(crate) fn seal_customer(customer: &CustomerKey, bucket: &str, key: &str) -> Sealing {
+    let object_key = new_object_key();
+    let stored = reseal_customer(customer, &object_key, bucket, key);
+    Sealing { key: object_key, stored }
+}
+
+/// The object key `sealed` (an SSE-C object's, at `bucket`/`key`) holds, if
+/// it opens under the client's key `customer`: whether that's its key.
+fn open_customer(customer: &CustomerKey, sealed: &[u8], bucket: &str, key: &str) -> Option<Zeroizing<Key>> {
+    unseal_object_key(customer.key(), sealed, &sse_c_sealed_ad(bucket, key))
 }
 
 /// Seals `object_key` under the node's SSE-S3 data key, for the object at
@@ -551,10 +587,7 @@ pub async fn seal(
 ) -> anyhow::Result<Result<Option<Sealing>, Response<Full<Bytes>>>> {
     match wanted {
         Wanted::Plain => Ok(Ok(None)),
-        Wanted::Customer(customer) => Ok(Ok(Some(Sealing {
-            key: Zeroizing::new(*customer.key()),
-            stored: Stored::Customer { check: customer.new_check() },
-        }))),
+        Wanted::Customer(customer) => Ok(Ok(Some(seal_customer(customer, bucket, key)))),
         Wanted::Kms(request) => {
             let object_key = new_object_key();
             Ok(reseal(app, &object_key, request, role, bucket, key)
@@ -903,8 +936,36 @@ mod tests {
         assert!(columns.sse_c_key.is_none());
         assert_eq!(columns.kms_key_id, Some("k"));
         assert_eq!(columns.kms_context, Some("{}"));
-        let stored = Stored::Customer { check: vec![1; 48] };
+        let stored = Stored::Customer { sealed: vec![1; SEALED_LEN] };
         let columns = stored.columns();
         assert!(columns.sse_c_key.is_some() && columns.kms_key_id.is_none());
+    }
+
+    /// An SSE-C object's key opens only under its client's key, and only as
+    /// the object it was sealed for; a copy seals it under its own.
+    #[test]
+    fn sse_c_object_keys_open_under_their_key_and_name() {
+        let key = crate::e2e::customer_key(&[1; 32]);
+        let other = crate::e2e::customer_key(&[2; 32]);
+        let sealing = seal_customer(&key, "b", "k");
+        let Stored::Customer { sealed } = &sealing.stored else { panic!("not SSE-C") };
+        assert_eq!(sealed.len(), SEALED_LEN);
+        assert_eq!(open_customer(&key, sealed, "b", "k").as_deref(), Some(&*sealing.key));
+        assert!(check(&sealing.stored, Some(&key), "b", "k").is_ok());
+        // Not the client's key itself, nor the same key twice.
+        assert_ne!(&*sealing.key, key.key());
+        assert_ne!(sealing.key, seal_customer(&key, "b", "k").key);
+        // Another key, another name: refused.
+        assert!(open_customer(&other, sealed, "b", "k").is_none());
+        assert!(open_customer(&key, sealed, "b", "k2").is_none());
+        assert!(open_customer(&key, sealed, "bk", "").is_none());
+        assert!(check(&sealing.stored, Some(&other), "b", "k").is_err());
+        assert!(check(&sealing.stored, None, "b", "k").is_err());
+        assert!(check(&Stored::Plain, Some(&key), "b", "k").is_err());
+        // A copy under another key, elsewhere: the same object key.
+        let copy = reseal_customer(&other, &sealing.key, "b", "c");
+        let Stored::Customer { sealed: copied } = &copy else { panic!("not SSE-C") };
+        assert_eq!(open_customer(&other, copied, "b", "c").as_deref(), Some(&*sealing.key));
+        assert!(open_customer(&key, copied, "b", "c").is_none());
     }
 }

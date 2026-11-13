@@ -217,7 +217,7 @@ pub async fn get_object(
     } = version;
     // An SSE-C object only with its key; before the conditions, which would
     // tell about it otherwise.
-    if let Err(refused) = sse::check(&encryption, customer_key) {
+    if let Err(refused) = sse::check(&encryption, customer_key, bucket, key) {
         return Ok(box_response(refused));
     }
     // Its ETag, as clients know it (an SSE-S3 one's is stored sealed).
@@ -735,7 +735,7 @@ pub async fn head_object(
     };
     // Like GET's, but an SSE-KMS object's key isn't needed (an SSE-S3 one's
     // is, for its ETag).
-    if let Err(refused) = sse::check(&encryption, customer_key) {
+    if let Err(refused) = sse::check(&encryption, customer_key, bucket, key) {
         return Ok(refused);
     }
     let etag = match sse::plain_etag(app, &encryption, &etag, bucket, key).await? {

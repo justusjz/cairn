@@ -69,7 +69,7 @@ where
         return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", &mismatch));
     }
     let encryption = upload.encryption.clone();
-    if let Err(refused) = sse::check(&encryption, customer_key) {
+    if let Err(refused) = sse::check(&encryption, customer_key, bucket, key) {
         return Ok(refused);
     }
     let upload_key = match sse::open(app, &encryption, customer_key, role, bucket, key).await? {

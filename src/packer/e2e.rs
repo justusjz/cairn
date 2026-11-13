@@ -546,7 +546,14 @@ async fn moves_encrypted_parts() {
     assert!(!pass(&app).await.unwrap().is_empty());
     assert_reaped(&app, old).await;
 
-    let slices = objects::get::select_parts_in_range(parts, 70_000, 190_000, Some(customer.key()));
+    // Under its object key, which its SSE-C key opens.
+    let object_key = crate::s3::sse::open(&app, &version.encryption, Some(&customer), None, BUCKET, &key(3))
+        .await
+        .unwrap()
+        .ok()
+        .unwrap()
+        .unwrap();
+    let slices = objects::get::select_parts_in_range(parts, 70_000, 190_000, Some(&object_key));
     let (sender, body) = channel_body();
     objects::get::spawn_range_stream(app.clone(), slices, sender);
     let read = body.collect().await.unwrap().to_bytes();

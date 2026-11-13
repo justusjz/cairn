@@ -163,8 +163,8 @@ async fn a_completed_upload_has_its_metadata() {
     assert_eq!(headers["content-language"], "de");
 }
 
-/// An SSE-C upload: its parts are encrypted with its key, its object has its
-/// key check, and reads back with the key, also in ranges across segments and
+/// An SSE-C upload: its parts are encrypted with its object key, which its
+/// object keeps sealed under the client's key, and reads back with that, also in ranges across segments and
 /// parts. A completion needs no key, but one it's given must be the upload's.
 #[tokio::test]
 async fn an_sse_c_upload_makes_an_sse_c_object() {
@@ -182,11 +182,14 @@ async fn an_sse_c_upload_makes_an_sse_c_object() {
     let lens = [min + 3, min, 1000];
     let data: Vec<Vec<u8>> = lens.iter().enumerate().map(|(i, len)| vec![i as u8 + 1; *len]).collect();
     let mut etags = Vec::new();
+    // The upload's own key, which the client's opens.
+    let upload = crate::s3::multipart::upload(&app, &upload_id.parse().unwrap(), BUCKET, "k").await.unwrap().unwrap();
+    let upload_key = crate::s3::sse::open(&app, &upload.encryption, Some(&customer), None, BUCKET, "k").await.unwrap().ok().unwrap();
     for (i, part) in data.iter().enumerate() {
         let attach = AttachTarget::MultipartPart {
             upload_id: upload_id.parse().unwrap(),
             part_number: i as i32 + 1,
-            key: Some(zeroize::Zeroizing::new(*customer.key())),
+            key: upload_key.clone(),
             sse_s3: false,
             checksum: crate::e2e::PART_CHECKSUM,
         };

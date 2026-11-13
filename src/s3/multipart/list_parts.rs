@@ -73,7 +73,7 @@ pub async fn list_parts(
     // An SSE-C upload's key, if given, must be its own. Its parts' checksums
     // are told only with it (S3 needs it for an upload of an algorithm).
     if customer_key.is_some()
-        && let Err(refused) = sse::check(encryption, customer_key)
+        && let Err(refused) = sse::check(encryption, customer_key, bucket, key)
     {
         return Ok(refused);
     }

@@ -3,10 +3,14 @@
 //! label `AES256`, whatever the server uses; Cairn's format is in
 //! `encryption`), the key (base64 of 256 bits), and its MD5 (base64).
 //!
-//! The key is never stored or logged. An object (and an upload) keeps a check
-//! of it instead: a random salt and the HMAC-SHA256 of the key under it, so a
-//! wrong key is told from the right one before anything is read, and two
-//! objects under one key don't show that they are.
+//! The key is never stored or logged. It doesn't encrypt the data itself: an
+//! object (and an upload) has a random object key, as an SSE-KMS one has (see
+//! `sse`), which it keeps sealed under the client's key, bound to its name. A
+//! wrong key fails to open it, so it's told from the right one before
+//! anything is read; and two objects under one key don't show that they are.
+//! A copy shares its source's parts by sealing the same object key under its
+//! own key, which may be another: so changing an object's key (a copy onto
+//! itself) is a matter of its catalog row, as in MinIO.
 //!
 //! The key travels in a header, so S3 only accepts it over TLS. Cairn sits
 //! behind a TLS-terminating proxy, so it goes by `X-Forwarded-Proto` (or
@@ -16,7 +20,6 @@
 //! lets it through.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use hmac::{Hmac, KeyInit, Mac};
 use http_body_util::Full;
 use hyper::{
     HeaderMap, Response, StatusCode,
@@ -25,7 +28,6 @@ use hyper::{
     http::response::Builder,
 };
 use md5::{Digest, Md5};
-use sha2::Sha256;
 use zeroize::Zeroizing;
 
 use crate::{encryption::Key, s3::util::format_s3_error};
@@ -53,9 +55,6 @@ pub struct Names {
     md5: &'static str,
 }
 
-/// Bytes of a key check: a salt, and an HMAC-SHA256 under it.
-const CHECK_SALT: usize = 16;
-
 /// A client's key, as a request supplied it.
 pub struct CustomerKey {
     key: Zeroizing<Key>,
@@ -66,30 +65,6 @@ pub struct CustomerKey {
 impl CustomerKey {
     pub fn key(&self) -> &Key {
         &self.key
-    }
-
-    /// A new check of this key, to store with an object or upload.
-    pub fn new_check(&self) -> Vec<u8> {
-        let mut check = vec![0; CHECK_SALT];
-        getrandom::fill(&mut check).expect("the OS random number generator failed");
-        let mac = self.mac(&check).finalize().into_bytes();
-        check.extend_from_slice(&mac);
-        check
-    }
-
-    /// Whether this is the key a stored `check` was made of. In constant time.
-    pub fn matches(&self, check: &[u8]) -> bool {
-        check.len() > CHECK_SALT
-            && self
-                .mac(&check[..CHECK_SALT])
-                .verify_slice(&check[CHECK_SALT..])
-                .is_ok()
-    }
-
-    fn mac(&self, salt: &[u8]) -> Hmac<Sha256> {
-        let mut mac = Hmac::<Sha256>::new_from_slice(salt).expect("HMAC accepts any key length");
-        mac.update(self.key.as_slice());
-        mac
     }
 
     /// Adds the headers S3 answers an SSE-C request with: the algorithm, and
@@ -193,25 +168,23 @@ pub fn secure(headers: &HeaderMap, allow_http: bool) -> bool {
     })
 }
 
-/// Whether a stored object (by its key `check`, if it's SSE-C) may be read
-/// with the `given` key, or the error to refuse the request with.
-pub fn check_read(
-    check: Option<&[u8]>,
-    given: Option<&CustomerKey>,
-) -> Result<(), Response<Full<Bytes>>> {
-    match (check, given) {
-        (None, None) => Ok(()),
-        (Some(_), None) => Err(invalid(
+/// Whether a stored object (SSE-C or not: `customer`) may be read with the
+/// key a request gave, if it gave one (`opens`: whether the object's key
+/// opens under it), or the error to refuse the request with.
+pub fn check_read(customer: bool, opens: Option<bool>) -> Result<(), Response<Full<Bytes>>> {
+    match (customer, opens) {
+        (false, None) => Ok(()),
+        (true, None) => Err(invalid(
             "InvalidRequest",
             "The object was stored using a form of Server Side Encryption. The correct parameters must be provided to retrieve the object.",
         )),
-        (None, Some(_)) => Err(invalid(
+        (false, Some(_)) => Err(invalid(
             "InvalidRequest",
             "The encryption parameters are not applicable to this object.",
         )),
-        (Some(check), Some(key)) if key.matches(check) => Ok(()),
+        (true, Some(true)) => Ok(()),
         // S3 answers a wrong key with 400 too.
-        (Some(_), Some(_)) => Err(invalid(
+        (true, Some(false)) => Err(invalid(
             "InvalidRequest",
             "The provided encryption key doesn't match the one the object was stored with.",
         )),
@@ -255,27 +228,12 @@ mod tests {
         let key = requested(&full("AES256", KEY_B64, MD5_B64), &HEADERS, true)
             .unwrap()
             .unwrap();
-        let check = key.new_check();
-        assert_eq!(check.len(), 48);
-        assert!(key.matches(&check));
-        // Another check of the same key looks different, and still matches.
-        let other = key.new_check();
-        assert_ne!(check, other);
-        assert!(key.matches(&other));
-        let another = "6b+WOZ1T3cqZMxgThRcXAQBrS5mXKdDUphvpxptl9/4=";
-        let another = requested(
-            &full("AES256", another, "arxBvwY2V4SiOne6yppVPQ=="),
-            &HEADERS,
-            true,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(!another.matches(&check));
-        assert!(check_read(Some(&check), Some(&key)).is_ok());
-        assert!(check_read(Some(&check), Some(&another)).is_err());
-        assert!(check_read(Some(&check), None).is_err());
-        assert!(check_read(None, Some(&key)).is_err());
-        assert!(check_read(None, None).is_ok());
+        assert_eq!(STANDARD.encode(key.key()), KEY_B64);
+        assert!(check_read(true, Some(true)).is_ok());
+        assert!(check_read(true, Some(false)).is_err());
+        assert!(check_read(true, None).is_err());
+        assert!(check_read(false, Some(true)).is_err());
+        assert!(check_read(false, None).is_ok());
     }
 
     #[test]

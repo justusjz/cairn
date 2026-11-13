@@ -1,8 +1,8 @@
 //! How an encrypted object is stored.
 //!
-//! Every encrypted object has one key: for SSE-KMS and SSE-S3 a random one,
-//! stored wrapped by the KMS, which only opens for the object's name (see
-//! `s3::sse`); for SSE-C the client's own. Everything of the object that's
+//! Every encrypted object has one key, a random one, stored sealed under the
+//! client's key (SSE-C) or a data key of the KMS (SSE-KMS, SSE-S3), which only
+//! opens for the object's name (see `s3::sse`). Everything of the object that's
 //! encrypted is encrypted under that key, with XChaCha20-Poly1305, and
 //! nothing else is:
 //!

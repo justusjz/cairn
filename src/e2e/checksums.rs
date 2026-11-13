@@ -376,10 +376,14 @@ async fn sse_c_uploads() {
         .collect();
     assert_eq!(parts.len(), 2);
     let salts: Vec<Salt> = parts.iter().map(|(_, salt)| salt.as_slice().try_into().unwrap()).collect();
+    // The object's key, which the client's opens.
+    let sealed: Vec<u8> = app.pool.get().await.unwrap().query_one("SELECT sse_c_key FROM objects WHERE key = 'c'", &[]).await.unwrap().get(0);
+    let stored = sse::Stored::Customer { sealed };
+    let object_key = sse::open(&app, &stored, Some(&customer), None, BUCKET, "c").await.unwrap().ok().unwrap().unwrap();
     for (i, (part, _)) in parts.iter().enumerate() {
         assert!(*part != l1[0].1 && *part != l2[0].1, "a part's checksum is stored in plaintext");
-        let open = |salt| encryption::open_value(customer.key(), Field::Checksum, Owner::Part(salt), part);
-        assert!(open(&salts[i]).is_some(), "sealed under the client's key, as the part's");
+        let open = |salt| encryption::open_value(&object_key, Field::Checksum, Owner::Part(salt), part);
+        assert!(open(&salts[i]).is_some(), "sealed under the object's key, as the part's");
         assert!(open(&salts[1 - i]).is_none(), "not as another part's");
     }
 

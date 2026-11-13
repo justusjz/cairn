@@ -666,6 +666,8 @@ sse_c_ok() {
     awss3 s3api get-object --bucket "$BUCKET" --key sse/big.bin "$out" \
         --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k2" >/dev/null 2>&1 || return 1
     cmp -s "$BIG" "$out" || return 1
+    ! awss3 s3api get-object --bucket "$BUCKET" --key sse/big.bin "$out" \
+        --sse-customer-algorithm AES256 --sse-customer-key "fileb://$k1" >/dev/null 2>&1 || return 1
     awss3 s3api copy-object --bucket "$BUCKET" --key sse/clear.bin --copy-source "${BUCKET}/sse/big.bin" \
         --copy-source-sse-customer-algorithm AES256 --copy-source-sse-customer-key "fileb://$k2" \
         >/dev/null 2>&1 || return 1

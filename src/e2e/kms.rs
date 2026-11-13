@@ -317,9 +317,9 @@ async fn copy(
     (response.status(), Headers::of(response.headers()))
 }
 
-/// A copy between SSE-KMS objects shares the source's parts, under any key
-/// and context, with keys of its own; any other change of encryption copies
-/// the data. Each reads back as it should.
+/// A copy between SSE-KMS and SSE-C objects shares the source's parts, under
+/// any key and context, with keys of its own; any other change of encryption
+/// copies the data. Each reads back as it should.
 #[tokio::test]
 async fn copies_to_from_and_between_kms_objects() {
     let Some(app) = kms_node().await else { return };
@@ -344,8 +344,9 @@ async fn copies_to_from_and_between_kms_objects() {
         assert!(body == plain, "{key}");
     }
 
-    // Decrypted, to a plain object; and plain or SSE-C, to SSE-KMS: the data
-    // is copied.
+    // Decrypted, to a plain object; and plain, to SSE-KMS: the data is
+    // copied. From SSE-C, the parts are shared, as the object key is: the
+    // copy seals it under a data key of its own.
     assert_eq!(copy(&app, r, "src", "decrypted", None, Wanted::Plain).await, (StatusCode::OK, Headers::none()));
     let to_kms = kms(None, &[]);
     for (src, source_key) in [("plain", None), ("sse-c", Some(&k1))] {
@@ -355,7 +356,11 @@ async fn copies_to_from_and_between_kms_objects() {
             (StatusCode::OK, Headers::kms("transit/cairn-test", None))
         );
         let (blob, salt, ..) = stored(&app, &dst).await;
-        assert!(blob != src_blob && salt.is_some());
+        let (from_blob, from_salt, ..) = stored(&app, src).await;
+        match source_key {
+            None => assert!(blob != from_blob && salt.is_some()),
+            Some(_) => assert_eq!((blob, &salt), (from_blob, &from_salt), "{dst}"),
+        }
         let (status, _, body) = get(&app, Some(r), &dst, None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body == plain, "{dst}");
@@ -363,9 +368,11 @@ async fn copies_to_from_and_between_kms_objects() {
     let (blob, salt, key_id, _) = stored(&app, "decrypted").await;
     assert!(blob != src_blob && salt.is_none() && key_id.is_none());
     assert!(get(&app, Some(r), "decrypted", None).await.2 == plain);
-    // To SSE-C.
+    // To SSE-C: shared parts too, the object key sealed under the client's.
     assert_eq!(copy(&app, r, "src", "to-sse-c", None, Wanted::Customer(&k1)).await.0, StatusCode::OK);
+    assert_eq!(stored(&app, "to-sse-c").await.0, src_blob);
     assert_eq!(get_sealed(&app, "to-sse-c", None, Some(&k1)).await, (StatusCode::OK, plain.clone()));
+    assert_eq!(get_sealed(&app, "to-sse-c", None, None).await.0, StatusCode::BAD_REQUEST);
     // An SSE-C source still needs its key.
     assert_eq!(copy(&app, r, "sse-c", "x", None, Wanted::Kms(&to_kms)).await.0, StatusCode::BAD_REQUEST);
 

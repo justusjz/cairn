@@ -48,8 +48,8 @@ pub async fn create_multipart_upload(
     }
     let (lock_mode, lock_until, legal_hold) = lock.columns();
     // The content type, metadata and tags are captured now and applied to the object
-    // at completion; so is its encryption, which its parts need: the check of
-    // an SSE-C upload's key, or the sealed key of an SSE-KMS one (see `sse`).
+    // at completion; so is its encryption, which its parts need: its object
+    // key, sealed under the client's key or a data key (see `sse`).
     let upload_id = Uuid::now_v7();
     let stored = match sse::seal(app, wanted, role, bucket, key).await? {
         Ok(sealing) => sealing.map_or(sse::Stored::Plain, |sealing| sealing.stored),

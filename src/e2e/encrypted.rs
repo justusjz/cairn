@@ -27,7 +27,7 @@ async fn node() -> Option<Arc<App>> {
     node_with(packer::Config::default(), None).await
 }
 
-const KEY_CHECK: [u8; 48] = [3; 48];
+const KEY_CHECK: [u8; 72] = [3; 72];
 
 /// Commits an encrypted part of `plain` bytes, stored in `stored`, with
 /// `salt`: as the object `key`, or as part `part_number` of `upload`.
@@ -538,9 +538,10 @@ async fn blob_and_salt(app: &App, key: &str) -> (Uuid, Option<Vec<u8>>) {
     (row.get(0), row.get(1))
 }
 
-/// A copy shares the source's bytes if both have the same key (or neither has
-/// one); otherwise it decrypts and encrypts again. Either way, it reads back
-/// with its own key only.
+/// A copy shares the source's bytes if both have an SSE-C key, the same or
+/// another (or neither has one): rotating an object's key (a copy onto itself)
+/// changes only its record of it. Otherwise it decrypts and encrypts again.
+/// Either way, it reads back with its own key only.
 #[tokio::test]
 async fn copies_keep_or_change_encryption() {
     let Some(app) = node().await else { return };
@@ -573,19 +574,21 @@ async fn copies_keep_or_change_encryption() {
         StatusCode::BAD_REQUEST
     );
 
-    // Another key, none, or one where there was none: new bytes.
+    // Another key: shared bytes too, under the same object key, which the
+    // copy has sealed under its key; and the source's ETag.
+    let rekeyed = CopyKeys {
+        source: Some(&k1),
+        dest: Wanted::Customer(&k2), role: None,
+        checksum: None,
+        lock: Default::default(),
+    };
+    assert_eq!(copy(&app, "src", "rekeyed", rekeyed).await, (StatusCode::OK, etag.clone()));
+    assert_eq!(blob_and_salt(&app, "rekeyed").await, blob_and_salt(&app, "src").await);
+    assert_eq!(get_sealed(&app, "rekeyed", None, Some(&k2)).await, (StatusCode::OK, plain.clone()));
+    assert_eq!(get_sealed(&app, "rekeyed", None, Some(&k1)).await.0, StatusCode::BAD_REQUEST);
+
+    // None, or one where there was none: new bytes.
     for (name, src, keys, read_with) in [
-        (
-            "rekeyed",
-            "src",
-            CopyKeys {
-                source: Some(&k1),
-                dest: Wanted::Customer(&k2), role: None,
-                checksum: None,
-                lock: Default::default(),
-            },
-            Some(&k2),
-        ),
         (
             "decrypted",
             "src",
@@ -666,7 +669,10 @@ async fn copies_keep_or_change_encryption() {
         checksum: None,
         lock: Default::default(),
     };
+    // Which changes only its record of the key: its bytes stay.
+    let before = blob_and_salt(&app, "src").await;
     assert_eq!(copy(&app, "src", "src", rotate).await.0, StatusCode::OK);
+    assert_eq!(blob_and_salt(&app, "src").await, before);
     assert_eq!(
         get_sealed(&app, "src", None, Some(&k2)).await,
         (StatusCode::OK, plain.clone())
