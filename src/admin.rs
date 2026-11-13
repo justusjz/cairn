@@ -8,13 +8,11 @@
 //! a changed setting at once.
 //!
 //! The peer endpoint is unauthenticated, for the private network only (see
-//! `peer`). So that no web page opened on that network can send commands, a
-//! request must carry the [`HEADER`] (which a cross-site request can't send
-//! without a CORS preflight, which the endpoint never allows), and name a
-//! host no other site can be made to resolve to the node (DNS rebinding): an
-//! IP address, `localhost`, or the host of the node's own peer URL.
+//! `peer`, which also refuses names another site could rebind). So that no
+//! web page opened on that network can send commands, a request must carry
+//! the [`HEADER`], which a cross-site request can't send without a CORS
+//! preflight, which the endpoint never allows.
 
-use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 
 use axum::{
@@ -29,7 +27,7 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use serde::{Deserialize, Serialize};
 
-use crate::{App, db::Cached};
+use crate::App;
 
 /// The header a command must come with: the version of the CLI that sent it.
 pub const HEADER: &str = "x-cairn-cli";
@@ -111,17 +109,6 @@ pub async fn serve(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes)
     let Some(version) = headers.get(HEADER).and_then(|v| v.to_str().ok()) else {
         return refused(StatusCode::FORBIDDEN, format!("commands must come with the {HEADER} header"));
     };
-    let host = headers.get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
-    match own_host(&app).await {
-        Ok(own) if known_host(host, own.as_deref()) => {}
-        Ok(_) => {
-            return refused(
-                StatusCode::FORBIDDEN,
-                "commands are only taken at an IP address, localhost, or the node's peer URL".into(),
-            );
-        }
-        Err(e) => return refused(StatusCode::SERVICE_UNAVAILABLE, format!("{e:#}")),
-    }
     let command: Command = match serde_json::from_slice(&body) {
         Ok(command) => command,
         Err(e) if version != VERSION => {
@@ -133,32 +120,6 @@ pub async fn serve(State(app): State<Arc<App>>, headers: HeaderMap, body: Bytes)
         Err(e) => return refused(StatusCode::BAD_REQUEST, format!("not a command: {e}")),
     };
     Json(run(&app, command).await).into_response()
-}
-
-/// The host of the node's own peer URL.
-async fn own_host(app: &App) -> anyhow::Result<Option<String>> {
-    let client = app.pool.get().await?;
-    let url: String = client.query_one_cached("SELECT peer_url FROM nodes WHERE id = $1", &[&app.node]).await?.get(0);
-    Ok(url.parse::<axum::http::Uri>().ok().and_then(|uri| uri.host().map(str::to_ascii_lowercase)))
-}
-
-/// Whether `host` (a `Host` header, maybe with a port) is an IP address,
-/// `localhost` (or a name under it, which browsers resolve to loopback
-/// themselves), or `own`.
-fn known_host(host: &str, own: Option<&str>) -> bool {
-    let name = match host.strip_prefix('[') {
-        // An IPv6 address, which must be in brackets.
-        Some(rest) => {
-            return rest.split_once(']').is_some_and(|(ip, port)| {
-                (port.is_empty() || port.starts_with(':')) && ip.parse::<Ipv6Addr>().is_ok()
-            });
-        }
-        None => host.split_once(':').map_or(host, |(name, _)| name),
-    };
-    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
-    let own = own.map(|p| p.strip_suffix('.').unwrap_or(p));
-    !name.is_empty()
-        && (name.parse::<IpAddr>().is_ok() || name == "localhost" || name.ends_with(".localhost") || own == Some(&name))
 }
 
 /// Sends `command` to the node at `remote`, prints what it printed, and
@@ -197,41 +158,6 @@ pub fn read_document(file: &str) -> anyhow::Result<String> {
         "-" => std::io::read_to_string(std::io::stdin())?,
         path => std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn knows_hosts_that_cant_be_rebound() {
-        for host in [
-            "10.0.0.1",
-            "10.0.0.1:9431",
-            "[::1]:9431",
-            "[fe80::1]",
-            "localhost:9431",
-            "LocalHost",
-            "app.localhost",
-            "node-a.internal:9431",
-            "node-a.internal.",
-        ] {
-            assert!(known_host(host, Some("node-a.internal")), "{host}");
-        }
-        for host in [
-            "",
-            "evil.example",
-            "evil.example:9431",
-            "localhost.evil.example",
-            "node-a.internal.evil.example",
-            "[::1",
-            "[evil.example]",
-            "[::1]evil",
-        ] {
-            assert!(!known_host(host, Some("node-a.internal")), "{host}");
-        }
-        assert!(!known_host("node-a.internal", None));
-    }
 }
 
 #[cfg(test)]
@@ -333,5 +259,32 @@ mod e2e {
         let (status, body) = answer(&app, request("127.0.0.1:9431", Some("0.0.1"), b"{\"Frobnicate\":{}}".to_vec())).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(String::from_utf8_lossy(&body).contains("of Cairn 0.0.1"));
+    }
+
+    /// Nor start a job (a scrub of everything, say), as an <img> could
+    /// (GET) or a form (POST, without the header); and no page can read or
+    /// write anything through a name rebound to the node.
+    #[tokio::test]
+    async fn no_web_page_can_use_the_peer_endpoint() {
+        let Some(app) = node().await else { return };
+        let send = |method: &str, path: &str, host: &str, cli: bool| {
+            let mut req = axum::http::Request::builder().method(method).uri(path).header(header::HOST, host);
+            if cli {
+                req = req.header(HEADER, VERSION);
+            }
+            answer(&app, req.body(axum::body::Body::empty()).unwrap())
+        };
+        for job in ["/maintain", "/scrub?all", "/move"] {
+            assert_eq!(send("GET", job, "10.0.0.1:9431", true).await.0, StatusCode::METHOD_NOT_ALLOWED, "{job}");
+            assert_eq!(send("POST", job, "10.0.0.1:9431", false).await.0, StatusCode::FORBIDDEN, "{job}");
+            assert_eq!(send("POST", job, "evil.example:9431", true).await.0, StatusCode::FORBIDDEN, "{job}");
+        }
+        assert_eq!(send("POST", "/maintain", "10.0.0.1:9431", true).await.0, StatusCode::OK);
+        let blob = format!("/blobs/{}", uuid::Uuid::new_v4());
+        for (method, path) in [("GET", "/stats"), ("GET", blob.as_str()), ("DELETE", blob.as_str())] {
+            assert_eq!(send(method, path, "evil.example", false).await.0, StatusCode::FORBIDDEN, "{method} {path}");
+            assert_eq!(send(method, path, "", false).await.0, StatusCode::FORBIDDEN, "{method} {path}");
+        }
+        assert_eq!(send("GET", "/stats", "localhost:9431", false).await.0, StatusCode::OK);
     }
 }

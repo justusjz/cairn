@@ -114,6 +114,7 @@ async fn node_on(
         metrics: Arc::default(),
         console: crate::console::Shared::new(None),
         peers: crate::peer::PeerClient::new(),
+        peer_host: crate::peer::url_host(peer_url),
         allow_sse_c_over_http: false,
         trusted_proxies: Vec::new(),
         domain: None,

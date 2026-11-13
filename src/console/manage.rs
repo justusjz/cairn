@@ -3090,7 +3090,7 @@ mod e2e {
     async fn the_peer_endpoint_has_no_ui() {
         let Some(app) = node().await else { return };
         let get = |path: &str| {
-            let req = axum::http::Request::builder().uri(path).body(axum::body::Body::empty()).unwrap();
+            let req = axum::http::Request::builder().uri(path).header("host", "127.0.0.1:9431").body(axum::body::Body::empty()).unwrap();
             let app = app.clone();
             async move { crate::peer::router(app).oneshot(req).await.unwrap().status() }
         };

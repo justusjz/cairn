@@ -1,16 +1,28 @@
 //! The peer endpoint: blob traffic between nodes, each node's metrics, and
 //! the CLI's commands (see `admin`). Unauthenticated, for the private
 //! network only.
+//!
+//! Even so, no web page opened by a browser on that network may use it. It
+//! takes only requests that name a host no other site can be made to resolve
+//! to the node (DNS rebinding, by which a page could read and write what it
+//! likes): an IP address, `localhost`, or the host of the node's own peer
+//! URL. And what changes something without being a blob's PUT or DELETE
+//! (which a page can't send cross-site without a CORS preflight, which the
+//! endpoint never allows) must be a POST with the `x-cairn-cli` header,
+//! which a page can't send either: the CLI's commands, and the jobs an
+//! operator (or a test) may start now.
 
+use std::net::{IpAddr, Ipv6Addr};
 use std::{sync::Arc, time::Duration};
 
 use axum::{
     Router,
     body::Body,
-    extract::{Path, RawQuery, State},
+    extract::{Path, RawQuery, Request as AxumRequest, State},
     http::{HeaderValue, StatusCode, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{any, get, post},
+    routing::{get, post},
 };
 use http_body_util::{BodyExt, Empty};
 use hyper::{
@@ -94,19 +106,73 @@ impl<E: Into<anyhow::Error>> From<E> for Failed {
 }
 
 pub fn router(app: Arc<App>) -> Router {
+    // What an operator (or a test) starts now, and the CLI's commands (see
+    // `admin`, which checks the header itself: its value is the CLI's version).
+    let jobs = Router::new()
+        .route("/maintain", post(maintain))
+        .route("/scrub", post(scrub))
+        .route("/move", post(move_shards))
+        .route_layer(middleware::from_fn(require_cli_header));
     Router::new()
-        .route("/maintain", any(maintain))
-        .route("/scrub", any(scrub))
-        .route("/move", any(move_shards))
-        .route("/stats", get(stats))
-        // The CLI's commands (see `admin`).
+        .merge(jobs)
         .route("/admin", post(crate::admin::serve))
+        .route("/stats", get(stats))
         .route(
             "/blobs/{blob_id}",
             get(get_blob).put(put_blob).delete(delete_blob),
         )
         .route("/blobs/{blob_id}/table", get(get_table))
+        .layer(middleware::from_fn_with_state(app.clone(), require_known_host))
         .with_state(app)
+}
+
+/// Refuses a request whose `Host` another site could have made resolve to
+/// this node (see the module's docs).
+async fn require_known_host(State(app): State<Arc<App>>, req: AxumRequest, next: Next) -> Response {
+    let host = req.headers().get(header::HOST).and_then(|h| h.to_str().ok()).unwrap_or("");
+    if !known_host(host, app.peer_host.as_deref()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "the peer endpoint only takes requests to an IP address, localhost, or this node's peer URL",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+/// Refuses a request without the `x-cairn-cli` header, which no web page can
+/// send cross-site.
+async fn require_cli_header(req: AxumRequest, next: Next) -> Response {
+    if !req.headers().contains_key(crate::admin::HEADER) {
+        let why = format!("this must come with the {} header", crate::admin::HEADER);
+        return (StatusCode::FORBIDDEN, why).into_response();
+    }
+    next.run(req).await
+}
+
+/// The host of a peer URL, lowercase, without a trailing dot.
+pub fn url_host(url: &str) -> Option<String> {
+    let uri = url.parse::<axum::http::Uri>().ok()?;
+    let host = uri.host()?.to_ascii_lowercase();
+    Some(host.strip_suffix('.').map(str::to_owned).unwrap_or(host))
+}
+
+/// Whether `host` (a `Host` header, maybe with a port) is an IP address,
+/// `localhost` (or a name under it, which browsers resolve to loopback
+/// themselves), or `own`: a name no other site can make resolve to the node.
+fn known_host(host: &str, own: Option<&str>) -> bool {
+    let name = match host.strip_prefix('[') {
+        // An IPv6 address, which must be in brackets.
+        Some(rest) => {
+            return rest.split_once(']').is_some_and(|(ip, port)| {
+                (port.is_empty() || port.starts_with(':')) && ip.parse::<Ipv6Addr>().is_ok()
+            });
+        }
+        None => host.split_once(':').map_or(host, |(name, _)| name),
+    };
+    let name = name.strip_suffix('.').unwrap_or(name).to_ascii_lowercase();
+    !name.is_empty()
+        && (name.parse::<IpAddr>().is_ok() || name == "localhost" || name.ends_with(".localhost") || own == Some(&name))
 }
 
 /// For tests: runs a maintenance pass now (as the background one would, but
@@ -354,4 +420,39 @@ fn parse_range(query: &str) -> Option<(u64, u64)> {
     let offset = param(query, "offset")?.parse().ok()?;
     let length = param(query, "length")?.parse().ok()?;
     Some((offset, length))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knows_hosts_that_cant_be_rebound() {
+        for host in [
+            "10.0.0.1",
+            "10.0.0.1:9431",
+            "[::1]:9431",
+            "[fe80::1]",
+            "localhost:9431",
+            "LocalHost",
+            "app.localhost",
+            "node-a.internal:9431",
+            "node-a.internal.",
+        ] {
+            assert!(known_host(host, Some("node-a.internal")), "{host}");
+        }
+        for host in [
+            "",
+            "evil.example",
+            "evil.example:9431",
+            "localhost.evil.example",
+            "node-a.internal.evil.example",
+            "[::1",
+            "[evil.example]",
+            "[::1]evil",
+        ] {
+            assert!(!known_host(host, Some("node-a.internal")), "{host}");
+        }
+        assert!(!known_host("node-a.internal", None));
+    }
 }

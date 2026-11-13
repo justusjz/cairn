@@ -79,6 +79,9 @@ pub struct App {
     console: console::Shared,
     /// Every request to another node goes through this.
     peers: peer::PeerClient,
+    /// The host of this node's peer URL, which the peer endpoint takes as
+    /// a `Host` besides addresses and localhost (see `peer::known_host`).
+    peer_host: Option<String>,
     /// Whether SSE-C keys are accepted over plain HTTP (see `s3::sse_c`).
     allow_sse_c_over_http: bool,
     /// `--trusted-proxy`: the proxies whose `X-Forwarded-For` and
@@ -341,6 +344,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
             args.listen_console.as_ref().and(args.console_url.as_ref()).map(|party| party.origin.clone()),
         ),
         peers: peer::PeerClient::new(),
+        peer_host: peer::url_host(&peer_url),
         allow_sse_c_over_http: args.allow_sse_c_over_http,
         trusted_proxies: args.trusted_proxies.clone(),
         domain: args.domain,

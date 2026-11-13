@@ -19,6 +19,9 @@ The schema is created automatically; just point Cairn at an empty database.
 > unauthenticated: it can read and delete blobs, and it takes the `cairn`
 > CLI's commands, which manage users and settings. Only bind it to a
 > trusted/private network — never expose it to the public internet.
+> So that no web page a browser on that network opens can use it, it only
+> takes requests to an IP address, `localhost`, or the host of the node's
+> `--peer-url`.
 
 ## Installing
 
@@ -1123,7 +1126,10 @@ over for the next; if none matches, the data is recorded as lost. The
 Integrity page shows how much is still left.
 
 `POST /scrub` on a node's peer endpoint checks what's due right away, at
-full speed (`?all`: every copy), and reports what it found.
+full speed (`?all`: every copy), and reports what it found. Like everything
+on the peer endpoint that isn't blob traffic, it needs the header
+`x-cairn-cli` (any value), so that no web page can start it: e.g.
+`curl -X POST -H 'x-cairn-cli: 1' http://10.0.0.1:9431/scrub`.
 
 ## Packing
 

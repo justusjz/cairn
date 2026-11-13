@@ -1969,7 +1969,7 @@ versioned_bucket_not_empty_ok() {
 # as the background one (every minute) would, but sweeping all of the data dir.
 # The peer endpoint answers once the pass is done. The background pass may get
 # to the work first, so the tests check what was done, not which pass did it.
-maintain_now() { curl -fsS -X POST "http://${SERVER_HOST}:9431/maintain" >/dev/null 2>&1; }
+maintain_now() { curl -fsS -X POST -H 'x-cairn-cli: test' "http://${SERVER_HOST}:9431/maintain" >/dev/null 2>&1; }
 
 # The GC removes empty shard directories. Upload then delete a batch of objects
 # (emptying their shard dirs), run a maintenance pass, and confirm the
