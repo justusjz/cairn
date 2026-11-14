@@ -112,7 +112,8 @@ Cairn has a single account (see [§24](#24-cairn-specific-concepts)): all bucket
 | Path-style (`host/bucket/key`) | ✅ Always. |
 | Virtual-hosted-style (`bucket.domain/key`) | ✅ With `--domain <name>`. Only **one** domain can be configured. The bucket is everything in the host before `.<domain>`, dots included (`my.bucket.s3.example.com` is bucket `my.bucket`). Matching ignores case, a port and a trailing dot. IPv6 literal hosts are always path-style. |
 | Website endpoints | ✅ With `--website-domain <name>`: `bucket.<website-domain>`. |
-| Custom domains | ✅ With `--domain` set, any host that is not the domain, a subdomain of it, an IP literal or `localhost` is the website of the bucket named by the whole host, served over HTTPS when the proxy gets certificates on demand ([§16](#16-static-website-hosting)). So clients must reach the S3 API by the domain, an IP address or `localhost`, not by another name. (S3 only serves custom domains over HTTP, or over HTTPS through CloudFront.) |
+| Custom domains for websites | ✅ With `--domain` set, any host that is not the domain, a subdomain of it, an IP literal or `localhost` is the website of the bucket named by the whole host. HTTPS comes built in when the proxy gets certificates on demand ([§16](#16-static-website-hosting)); S3 serves website endpoints over HTTP only, so HTTPS there needs CloudFront. |
+| Custom domains for the S3 API | ❌ A custom host name is always a website, never a bucket's REST API. (S3 takes a CNAME to a bucket named after the host as virtual-hosted-style, over HTTP only.) So clients must reach the S3 API by the domain, an IP address or `localhost`. A reverse proxy can map a custom name to the API, but since the signature covers `Host`, clients must sign for the host Cairn sees. |
 | Dual-stack, FIPS, accelerate, access-point and region-specific endpoints | ❌ No special handling. |
 
 The signature is always checked against the path the client sent, so virtual-hosted requests verify correctly even though they are routed as `/bucket/key`. The proxy must pass `Host` through unchanged.
@@ -1781,7 +1782,7 @@ The most significant differences, for quick reference. Each is described in its 
 - **Scope:** the region and service in the credential scope aren't validated.
 - **Error codes:** `AuthorizationHeaderMalformed` is never returned. Signature and skew errors have no detail elements.
 - **Canonicalization:** the canonical query string uses the wire encoding as-is.
-- **Host names:** only one `--domain` is possible.
+- **Host names:** only one `--domain` is possible. Custom host names are websites only, never a bucket's S3 API.
 
 **Buckets and listings**
 - **CreateBucket:** for the caller's own existing bucket it answers `200`, never `BucketAlreadyOwnedByYou`. `LocationConstraint` is ignored.
