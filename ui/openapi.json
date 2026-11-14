@@ -2643,6 +2643,55 @@
         }
       }
     },
+    "/policies/{name}/default": {
+      "put": {
+        "summary": "Makes one of a managed policy's versions its default (a rollback, say).",
+        "operationId": "set_default_version",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DefaultVersion"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/policies/{name}/tags": {
       "put": {
         "summary": "Sets a managed policy's tags, as IAM's TagPolicy and UntagPolicy would.",
@@ -2670,6 +2719,102 @@
         "responses": {
           "204": {
             "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/policies/{name}/versions": {
+      "get": {
+        "summary": "A managed policy's versions (up to five), newest first.",
+        "operationId": "list_policy_versions",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PolicyVersion"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/policies/{name}/versions/{version}": {
+      "delete": {
+        "summary": "Deletes one of a managed policy's versions, but its default.",
+        "operationId": "delete_policy_version",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "version",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int32"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
           },
           "4XX": {
             "content": {
@@ -4398,6 +4543,18 @@
               "$ref": "#/components/schemas/NodeCoverage"
             },
             "description": "What each node holds of checksummed data, and how recently it was\nchecked."
+          }
+        }
+      },
+      "DefaultVersion": {
+        "type": "object",
+        "required": [
+          "version"
+        ],
+        "properties": {
+          "version": {
+            "type": "integer",
+            "format": "int32"
           }
         }
       },
@@ -6462,6 +6619,34 @@
               "$ref": "#/components/schemas/Tag"
             },
             "description": "All of its tags (keys case-sensitive): those it has of other keys go\n(UntagPolicy), the rest are set (TagPolicy)."
+          }
+        }
+      },
+      "PolicyVersion": {
+        "type": "object",
+        "description": "One of a managed policy's versions.",
+        "required": [
+          "version",
+          "document",
+          "created_at",
+          "default"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "default": {
+            "type": "boolean",
+            "description": "Whether it's the default, which decides."
+          },
+          "document": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Its number (`v1`, ...)."
           }
         }
       },

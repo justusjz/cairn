@@ -111,6 +111,9 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(list_policies, create_policy))
         .routes(routes!(update_policy, delete_policy_managed))
         .routes(routes!(set_policy_tags))
+        .routes(routes!(list_policy_versions))
+        .routes(routes!(set_default_version))
+        .routes(routes!(delete_policy_version))
         .routes(routes!(attach_policy, detach_policy))
         .routes(routes!(create_enrollment))
         .routes(routes!(create_key))
@@ -3003,6 +3006,86 @@ fn policy_context(policy: &crate::managed::Managed) -> Context {
         context.set(&format!("aws:ResourceTag/{key}"), value);
     }
     context
+}
+
+/// One of a managed policy's versions.
+#[derive(Serialize, ToSchema)]
+struct PolicyVersion {
+    /// Its number (`v1`, ...).
+    version: i32,
+    document: String,
+    created_at: f64,
+    /// Whether it's the default, which decides.
+    default: bool,
+}
+
+/// The account's managed policy `name`, if IAM's `action` on it is allowed.
+async fn checked_policy(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str) -> Result<crate::managed::Managed> {
+    let account = actor.account();
+    let policy = crate::managed::get(&app.pool.get().await?, account, name).await?;
+    actor.check_with(app, action, On::policy(account, &policy.path, &policy.name), &policy_context(&policy)).await?;
+    Ok(policy)
+}
+
+/// A managed policy's versions (up to five), newest first.
+#[utoipa::path(get, path = "/policies/{name}/versions", params(("name" = String, Path)), responses(
+    (status = 200, body = Vec<PolicyVersion>),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn list_policy_versions(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+) -> Result<Json<Vec<PolicyVersion>>> {
+    let policy = checked_policy(&app, &actor, "iam:ListPolicyVersions", &name).await?;
+    let versions = crate::managed::versions(&app.pool.get().await?, policy.id).await?;
+    Ok(Json(
+        versions
+            .into_iter()
+            .map(|v| PolicyVersion { version: v.version, document: v.document, created_at: v.created_at, default: v.default })
+            .collect(),
+    ))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct DefaultVersion {
+    version: i32,
+}
+
+/// Makes one of a managed policy's versions its default (a rollback, say).
+#[utoipa::path(put, path = "/policies/{name}/default", params(("name" = String, Path)), request_body = DefaultVersion, responses(
+    (status = 204, description = "Set"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn set_default_version(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+    Json(body): Json<DefaultVersion>,
+) -> Result<StatusCode> {
+    let policy = checked_policy(&app, &actor, "iam:SetDefaultPolicyVersion", &name).await?;
+    let arn = policy.arn(actor.account());
+    crate::managed::set_default(&app.pool.get().await?, policy.id, &arn, body.version).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes one of a managed policy's versions, but its default.
+#[utoipa::path(delete, path = "/policies/{name}/versions/{version}", params(("name" = String, Path), ("version" = i32, Path)), responses(
+    (status = 204, description = "Deleted"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_policy_version(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path((name, version)): Path<(String, i32)>,
+) -> Result<StatusCode> {
+    let policy = checked_policy(&app, &actor, "iam:DeletePolicyVersion", &name).await?;
+    let arn = policy.arn(actor.account());
+    crate::managed::delete_version(&app.pool.get().await?, policy.id, &arn, version).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize, ToSchema)]

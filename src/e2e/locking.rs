@@ -345,6 +345,34 @@ async fn a_policys_tags_are_counted_after_its_row_is_held() {
     assert_eq!(query_i64(&app, "SELECT count(*) FROM managed_policy_tags").await, 30);
 }
 
+/// I13: a policy's fifth version, made but not committed, holds the
+/// policy's row: a sixth waits for it, and then finds five.
+#[tokio::test]
+async fn a_policys_versions_are_counted_after_its_row_is_held() {
+    let Some(app) = node().await else { return };
+    let client = connection(&app).await;
+    let account = crate::roles::account(&client).await.unwrap();
+    let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
+    let policy = crate::managed::create(&client, &account, "p", "/", document, "").await.unwrap();
+    for _ in 0..3 {
+        crate::managed::create_version(&client, policy.id, "p", document, false, false).await.unwrap();
+    }
+    let make = "SELECT pg_temp.cairn_create_policy_version($1, $2, false, false, 5)";
+    let mut held = connection(&app).await;
+    let tx = held.transaction().await.unwrap();
+    let fifth: Option<i32> = tx.query_one(make, &[&policy.id, &document]).await.unwrap().get(0);
+    assert_eq!(fifth, Some(5));
+    let app2 = app.clone();
+    let id = policy.id;
+    let sixth = tokio::spawn(async move {
+        connection(&app2).await.query_one(make, &[&id, &document]).await.unwrap().get::<_, Option<i32>>(0)
+    });
+    assert_waits(&sixth).await;
+    tx.commit().await.unwrap();
+    assert_eq!(sixth.await.unwrap(), Some(0));
+    assert_eq!(query_i64(&app, "SELECT count(*) FROM managed_policy_versions").await, 5);
+}
+
 /// I1: a conditional write is decided (by Cairn) against the current object,
 /// and lands only if that's still the current one when it holds the key: one
 /// that another write replaced meanwhile makes it decide again, against the

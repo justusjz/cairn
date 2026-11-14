@@ -469,3 +469,57 @@ async fn policies_tag_keys_are_case_sensitive() {
     let left: i64 = client.query_one("SELECT count(*) FROM managed_policy_tags", &[]).await.unwrap().get(0);
     assert_eq!(left, 0);
 }
+
+/// A managed policy's versions, as IAM's (probed): up to five, numbered on
+/// and never again, the default deciding (a user's policies are its
+/// default's document), which can't be deleted, nor can the policy while it
+/// has others; the console's edit makes room as Terraform does.
+#[tokio::test]
+async fn policies_keep_five_versions_and_the_default_decides() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let account = roles::account(&client).await.unwrap();
+    let doc = |action: &str| format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"*"}}]}}"#);
+    let policy = crate::managed::create(&client, &account, "p", "/", &doc("s3:ListBucket"), "").await.unwrap();
+    let arn = policy.arn(&account);
+    roles::create(&client, "vera", None, false).await.unwrap();
+    crate::managed::attach(&client, &account, "vera", &arn, true).await.unwrap();
+    let decides = async || Principal::load(&client, "vera").await.unwrap().unwrap().policies;
+    assert_eq!(decides().await, [doc("s3:ListBucket")]);
+
+    let v2 = crate::managed::create_version(&client, policy.id, &arn, &doc("s3:GetObject"), false, false).await.unwrap();
+    assert_eq!(v2, 2);
+    assert_eq!(decides().await, [doc("s3:ListBucket")], "not the default");
+    crate::managed::set_default(&client, policy.id, &arn, 2).await.unwrap();
+    assert_eq!(decides().await, [doc("s3:GetObject")]);
+    assert_eq!(crate::managed::get(&client, &account, "p").await.unwrap().version, 2);
+    let err = crate::managed::delete_version(&client, policy.id, &arn, 2).await.unwrap_err();
+    assert!(err.to_string().contains("default version"), "{err}");
+    let err = crate::managed::set_default(&client, policy.id, &arn, 9).await.unwrap_err();
+    assert!(err.to_string().contains("version v9 does not exist"), "{err}");
+
+    for _ in 0..3 {
+        crate::managed::create_version(&client, policy.id, &arn, &doc("s3:PutObject"), false, false).await.unwrap();
+    }
+    let err = crate::managed::create_version(&client, policy.id, &arn, &doc("s3:PutObject"), true, false).await.unwrap_err();
+    assert!(err.to_string().contains("up to 5 versions"), "{err}");
+    crate::managed::delete_version(&client, policy.id, &arn, 3).await.unwrap();
+    let v6 = crate::managed::create_version(&client, policy.id, &arn, &doc("s3:PutObject"), false, false).await.unwrap();
+    assert_eq!(v6, 6, "numbers aren't reused");
+    let numbers = |vs: Vec<crate::managed::Version>| vs.iter().map(|v| (v.version, v.default)).collect::<Vec<_>>();
+    let versions = crate::managed::versions(&client, policy.id).await.unwrap();
+    assert_eq!(numbers(versions), [(6, false), (5, false), (4, false), (2, true), (1, false)]);
+    // The console's edit: room made by deleting the oldest but the default.
+    assert_eq!(crate::managed::update(&client, &account, "p", &doc("s3:DeleteObject")).await.unwrap(), 7);
+    let versions = crate::managed::versions(&client, policy.id).await.unwrap();
+    assert_eq!(numbers(versions), [(7, true), (6, false), (5, false), (4, false), (2, false)]);
+    assert_eq!(decides().await, [doc("s3:DeleteObject")]);
+
+    crate::managed::attach(&client, &account, "vera", &arn, false).await.unwrap();
+    let err = crate::managed::delete(&client, &account, "p").await.unwrap_err();
+    assert!(err.to_string().contains("more than one version"), "{err}");
+    for v in [2, 4, 5, 6] {
+        crate::managed::delete_version(&client, policy.id, &arn, v).await.unwrap();
+    }
+    crate::managed::delete(&client, &account, "p").await.unwrap();
+}

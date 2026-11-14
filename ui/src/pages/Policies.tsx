@@ -3,7 +3,7 @@
 // attached to users on the Users page. Making, changing (a new version) and
 // deleting (once nothing has it attached) the account's own.
 
-import { For, Show, createSignal, onMount } from "solid-js";
+import { For, Show, createResource, createSignal, onMount } from "solid-js";
 import { type ManagedPolicy, type Tag, api } from "../api";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
@@ -134,6 +134,20 @@ function ManagedPolicyDialog(props: {
   const [error, setError] = createSignal<string>();
   const [path, setPath] = createSignal("");
   const [tags, setTags] = createSignal<Tag[]>((p?.tags ?? []).map((t) => ({ ...t })));
+  const [versions, { refetch: refetchVersions }] = createResource(
+    () => (p && !p.aws ? p.name : undefined),
+    (name) => api.policyVersions(name),
+  );
+  const makeDefault = async (v: number) => {
+    if (await act(() => api.setDefaultVersion(p!.name, v), `v${v} of ${p!.name} decides now`)) {
+      refetchVersions();
+      props.changed();
+    }
+  };
+  const deleteVersion = async (v: number) => {
+    if (!confirm(`Delete v${v} of "${p!.name}"?`)) return;
+    if (await act(() => api.deletePolicyVersion(p!.name, v), `Deleted v${v}`)) refetchVersions();
+  };
   const setTag = (i: number, change: Partial<Tag>) => setTags(tags().map((t, j) => (j === i ? { ...t, ...change } : t)));
   const wantedTags = () => tags().filter((t) => t.key.trim()).map((t) => ({ key: t.key.trim(), value: t.value }));
   const [delegateBoundary, setDelegateBoundary] = createSignal("");
@@ -262,6 +276,35 @@ function ManagedPolicyDialog(props: {
         </Show>
         <Show when={p?.aws}>
           <p class="subtle small">Cairn's policies are AWS's, and can't be changed: make one of your own instead.</p>
+        </Show>
+        <Show when={versions()?.length}>
+          <div class="small">Versions</div>
+          <For each={versions()}>
+            {(v) => (
+              <div class="form-row small">
+                <span class="mono">v{v.version}</span>
+                <Show when={v.default}>
+                  <Badge tone="accent">default</Badge>
+                </Show>
+                <span class="subtle">{ago(v.created_at)}</span>
+                <button type="button" class="small" title="Into the editor: saving makes it a new version" onClick={() => setDocument(pretty(v.document))}>
+                  Load
+                </button>
+                <Show when={!v.default}>
+                  <button type="button" class="small" title="It decides, from now on" onClick={() => makeDefault(v.version)}>
+                    Make default
+                  </button>
+                  <button type="button" class="small danger" onClick={() => deleteVersion(v.version)}>
+                    Delete
+                  </button>
+                </Show>
+              </div>
+            )}
+          </For>
+          <p class="subtle small">
+            A policy keeps up to five versions, as in IAM; the default decides. Saving makes a new default version (and, with
+            five already, deletes the oldest that isn't the default, as Terraform does).
+          </p>
         </Show>
         <Show when={p && !p.aws && p.users.length}>
           <p class="subtle small">

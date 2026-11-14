@@ -360,20 +360,98 @@ pub async fn untag(client: &Object, id: Uuid, keys: &[String]) -> anyhow::Result
     Ok(())
 }
 
-/// Replaces the document of the account's managed policy `name` (its
-/// default version): the new version's number.
+/// A new default version of the account's managed policy `name`, with
+/// `document`: if it has five versions already, the oldest that isn't the
+/// default goes, as Terraform makes room (the console's edit). Its number.
 pub async fn update(client: &Object, account: &str, name: &str, document: &str) -> anyhow::Result<i32> {
+    let policy = get(client, account, name).await?;
+    create_version(client, policy.id, &policy.arn(account), document, true, true).await
+}
+
+/// The most versions a managed policy has, as in IAM.
+pub const MAX_VERSIONS: i32 = 5;
+
+/// A new version of policy `id` (whose ARN is `arn`), with `document`, its
+/// default if `default`; with five already, the oldest that isn't the
+/// default goes first if `prune`, else it's refused, as IAM refuses it
+/// (T44). Its number.
+pub async fn create_version(client: &Object, id: Uuid, arn: &str, document: &str, default: bool, prune: bool) -> anyhow::Result<i32> {
     check_document(document)?;
-    let row = client
-        .query_opt_cached(
-            "UPDATE managed_policies SET document = $3, version = version + 1, updated_at = now()
-             WHERE account_id = $1 AND name = $2 RETURNING version",
-            &[&account, &name, &document],
+    let made: Option<i32> = client
+        .query_one_cached(
+            "SELECT pg_temp.cairn_create_policy_version($1, $2, $3, $4, $5)",
+            &[&id, &document, &default, &prune, &MAX_VERSIONS],
+        )
+        .await?
+        .get(0);
+    match made {
+        Some(0) => refused(Refused::Limit(
+            "A managed policy can have up to 5 versions. Before you create a new version, you must delete an existing version.".into(),
+        )),
+        Some(version) => Ok(version),
+        None => refused(Refused::NoSuch(format!("Policy {arn} was not found."))),
+    }
+}
+
+/// One of a managed policy's versions.
+#[derive(Clone, Debug)]
+pub struct Version {
+    pub version: i32,
+    pub document: String,
+    /// When it was made: ISO 8601 (as IAM writes times), and in seconds
+    /// since the Unix epoch.
+    pub created: String,
+    pub created_at: f64,
+    /// Whether it's the policy's default, which decides.
+    pub default: bool,
+}
+
+/// Policy `id`'s versions, newest first (as IAM lists them).
+pub async fn versions(client: &Object, id: Uuid) -> anyhow::Result<Vec<Version>> {
+    let rows = client
+        .query_cached(
+            "SELECT v.version, v.document, to_char(v.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                    extract(epoch FROM v.created_at)::float8, v.version = m.version
+             FROM managed_policy_versions v JOIN managed_policies m ON m.id = v.policy_id
+             WHERE v.policy_id = $1 ORDER BY v.version DESC",
+            &[&id],
         )
         .await?;
-    match row {
-        Some(row) => Ok(row.get(0)),
-        None => refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, "/", name)))),
+    Ok(rows
+        .iter()
+        .map(|r| Version { version: r.get(0), document: r.get(1), created: r.get(2), created_at: r.get(3), default: r.get(4) })
+        .collect())
+}
+
+/// Why changing a policy's version failed, as IAM says it.
+fn no_such_version(arn: &str, version: i32) -> Refused {
+    Refused::NoSuch(format!("Policy {arn} version v{version} does not exist or is not attachable."))
+}
+
+/// Makes version `version` of policy `id` (whose ARN is `arn`) its default
+/// (T45).
+pub async fn set_default(client: &Object, id: Uuid, arn: &str, version: i32) -> anyhow::Result<()> {
+    let status: String = client
+        .query_one_cached("SELECT pg_temp.cairn_set_default_policy_version($1, $2)", &[&id, &version])
+        .await?
+        .get(0);
+    match status.as_str() {
+        "set" => Ok(()),
+        _ => refused(no_such_version(arn, version)),
+    }
+}
+
+/// Deletes version `version` of policy `id` (whose ARN is `arn`), unless
+/// it's the default (T46).
+pub async fn delete_version(client: &Object, id: Uuid, arn: &str, version: i32) -> anyhow::Result<()> {
+    let status: String = client
+        .query_one_cached("SELECT pg_temp.cairn_delete_policy_version($1, $2)", &[&id, &version])
+        .await?
+        .get(0);
+    match status.as_str() {
+        "deleted" => Ok(()),
+        "default" => refused(Refused::Conflict("Cannot delete the default version of a policy.".into())),
+        _ => refused(no_such_version(arn, version)),
     }
 }
 
@@ -401,6 +479,15 @@ pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Resul
     let policy = get(client, account, name).await?;
     if !policy.users.is_empty() || !policy.bounds.is_empty() {
         return refused(Refused::Conflict("Cannot delete a policy attached to entities.".into()));
+    }
+    // Its other versions go first, as in IAM (probed). (One made meanwhile
+    // goes with the policy.)
+    if versions(client, policy.id).await?.len() > 1 {
+        return refused(Refused::Conflict(
+            "This policy has more than one version. Before you delete a policy, you must delete the policy's versions. \
+             The default version is deleted with the policy."
+                .into(),
+        ));
     }
     let deleted = client
         .execute_cached(

@@ -1186,76 +1186,124 @@ impl Iam<'_> {
         Ok(Some(format!("<Policies>{members}</Policies><IsTruncated>{truncated}</IsTruncated>{marker}")))
     }
 
-    /// The version a request names (`VersionId`): the policy's default, the
-    /// only one Cairn keeps.
-    fn version_of(params: &Params, policy: &Policy) -> Result<()> {
+    /// The version a request names (`VersionId`: `v1`, ..., as IAM checks
+    /// it, probed): its number.
+    fn version_of(params: &Params) -> Result<i32> {
         let id = params.required("VersionId")?;
-        if id != format!("v{}", policy.version) {
-            return Err(error(
-                StatusCode::NOT_FOUND,
-                "NoSuchEntity",
-                format!("Policy {} version {id} does not exist or is not attachable.", policy.arn),
-            ));
+        let pattern = "v[1-9][0-9]*(\\.[A-Za-z0-9-]*)?";
+        let invalid_id = || {
+            validation(format!(
+                "1 validation error detected: Value at 'versionId' failed to satisfy constraint: Member must satisfy regular expression pattern: {pattern}"
+            ))
+        };
+        let rest = id.strip_prefix('v').ok_or_else(invalid_id)?;
+        let (digits, suffix) = rest.split_once('.').map_or((rest, None), |(d, s)| (d, Some(s)));
+        if digits.is_empty()
+            || digits.starts_with('0')
+            || !digits.bytes().all(|b| b.is_ascii_digit())
+            || suffix.is_some_and(|s| !s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+        {
+            return Err(invalid_id());
         }
-        Ok(())
+        // Cairn's are only ever `vN` (a suffix names none of them), and none
+        // past what an i32 holds.
+        match (suffix, digits.parse::<i32>()) {
+            (None, Ok(n)) => Ok(n),
+            _ => Ok(0),
+        }
     }
 
-    fn version_xml(policy: &Policy, document: bool) -> String {
+    /// The versions of `policy` (Cairn's own: its one, `v1`), newest first.
+    async fn versions(&self, policy: &Policy) -> Result<Vec<managed::Version>> {
+        match policy.uuid {
+            Some(id) => Ok(managed::versions(self.client, id).await?),
+            None => Ok(vec![managed::Version {
+                version: policy.version,
+                document: policy.document.clone(),
+                created: policy.created.clone(),
+                created_at: 0.0,
+                default: true,
+            }]),
+        }
+    }
+
+    /// `policy`'s version `version`, as IAM refuses one that isn't there.
+    async fn version(&self, policy: &Policy, version: i32) -> Result<managed::Version> {
+        self.versions(policy).await?.into_iter().find(|v| v.version == version).ok_or_else(|| {
+            error(
+                StatusCode::NOT_FOUND,
+                "NoSuchEntity",
+                format!("Policy {} version v{version} does not exist or is not attachable.", policy.arn),
+            )
+        })
+    }
+
+    fn version_xml(version: &managed::Version, document: bool) -> String {
         let document = match document {
             // URL-encoded, as IAM gives policy documents (RFC 3986).
-            true => format!("<Document>{}</Document>", xml_escape(&utf8_percent_encode(&policy.document, &RFC3986).to_string())),
+            true => format!("<Document>{}</Document>", xml_escape(&utf8_percent_encode(&version.document, &RFC3986).to_string())),
             false => String::new(),
         };
         format!(
-            "{document}<VersionId>v{}</VersionId><IsDefaultVersion>true</IsDefaultVersion><CreateDate>{}</CreateDate>",
-            policy.version, policy.updated
+            "{document}<VersionId>v{}</VersionId><IsDefaultVersion>{}</IsDefaultVersion><CreateDate>{}</CreateDate>",
+            version.version, version.default, version.created
         )
     }
 
     async fn get_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:GetPolicyVersion").await?;
-        Self::version_of(params, &policy)?;
-        Ok(Some(format!("<PolicyVersion>{}</PolicyVersion>", Self::version_xml(&policy, true))))
+        let version = self.version(&policy, Self::version_of(params)?).await?;
+        Ok(Some(format!("<PolicyVersion>{}</PolicyVersion>", Self::version_xml(&version, true))))
     }
 
+    /// ListPolicyVersions: newest first (probed), paged.
     async fn list_policy_versions(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:ListPolicyVersions").await?;
-        Ok(Some(format!(
-            "<Versions><member>{}</member></Versions><IsTruncated>false</IsTruncated>",
-            Self::version_xml(&policy, false)
-        )))
+        let max = max_items(params)?;
+        let mut versions = self.versions(&policy).await?;
+        // A marker is the last version listed.
+        if let Some(after) = params.get("Marker") {
+            let after: i32 = after.parse().map_err(|_| invalid("Invalid Marker."))?;
+            versions.retain(|v| v.version < after);
+        }
+        let truncated = versions.len() > max;
+        versions.truncate(max);
+        let members: String = versions.iter().map(|v| format!("<member>{}</member>", Self::version_xml(v, false))).collect();
+        let marker = match (truncated, versions.last()) {
+            (true, Some(last)) => format!("<Marker>{}</Marker>", last.version),
+            _ => String::new(),
+        };
+        Ok(Some(format!("<Versions>{members}</Versions><IsTruncated>{truncated}</IsTruncated>{marker}")))
     }
 
-    /// A new version, which replaces the one Cairn keeps: so it must be the
-    /// default (`SetAsDefault`).
+    /// CreatePolicyVersion: the policy's default if `SetAsDefault`; refused
+    /// at five versions, as IAM refuses it (probed).
     async fn create_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:CreatePolicyVersion").await?;
         Self::own(&policy)?;
         let document = params.required("PolicyDocument")?;
-        if params.get("SetAsDefault") != Some("true") {
-            return Err(error(
-                StatusCode::NOT_IMPLEMENTED,
-                "NotImplemented",
-                "Cairn keeps one version of a policy, the default: set the new one as the default (SetAsDefault)",
-            ));
-        }
-        managed::update(self.client, self.account(), &policy.name, document).await?;
-        let policy = self.load_policy(Named::Own { path: policy.path, name: policy.name }).await?;
-        Ok(Some(format!("<PolicyVersion>{}</PolicyVersion>", Self::version_xml(&policy, false))))
+        let default = params.get("SetAsDefault") == Some("true");
+        let id = policy.uuid.expect("an account's own");
+        let number = managed::create_version(self.client, id, &policy.arn, document, default, false).await?;
+        let version = managed::versions(self.client, id).await?.into_iter().find(|v| v.version == number).ok_or_else(|| {
+            error(StatusCode::CONFLICT, "ConcurrentModification", "the policy's versions changed meanwhile")
+        })?;
+        Ok(Some(format!("<PolicyVersion>{}</PolicyVersion>", Self::version_xml(&version, false))))
     }
 
     async fn delete_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:DeletePolicyVersion").await?;
         Self::own(&policy)?;
-        Self::version_of(params, &policy)?;
-        Err(error(StatusCode::CONFLICT, "DeleteConflict", "Cannot delete the default version of a policy."))
+        let version = Self::version_of(params)?;
+        managed::delete_version(self.client, policy.uuid.expect("an account's own"), &policy.arn, version).await?;
+        Ok(None)
     }
 
     async fn set_default_policy_version(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:SetDefaultPolicyVersion").await?;
         Self::own(&policy)?;
-        // It's the default already.
-        Self::version_of(params, &policy)?;
+        let version = Self::version_of(params)?;
+        managed::set_default(self.client, policy.uuid.expect("an account's own"), &policy.arn, version).await?;
         Ok(None)
     }
 

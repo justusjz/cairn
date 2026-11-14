@@ -138,6 +138,11 @@ export const api = {
   policies: () => ok(client.GET("/policies")),
   createPolicy: (name: string, document: string, description: string, path?: string, tags: Tag[] = []) =>
     ok(client.POST("/policies", { body: { name, document, description, path: path || null, tags } })),
+  policyVersions: (name: string) => ok(client.GET("/policies/{name}/versions", { params: { path: { name } } })),
+  setDefaultVersion: (name: string, version: number) =>
+    ok(client.PUT("/policies/{name}/default", { params: { path: { name } }, body: { version } })),
+  deletePolicyVersion: (name: string, version: number) =>
+    ok(client.DELETE("/policies/{name}/versions/{version}", { params: { path: { name, version } } })),
   /** Sets all of a managed policy's tags. */
   setPolicyTags: (name: string, tags: Tag[]) =>
     ok(client.PUT("/policies/{name}/tags", { params: { path: { name } }, body: { tags } })),

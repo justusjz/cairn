@@ -449,10 +449,13 @@ their tags (TagPolicy, UntagPolicy, ListPolicyTags; keys case-sensitive, as
 on AWS, and `aws:ResourceTag/…` in IAM actions on the policy).
 Condition keys are IAM's: `iam:PermissionsBoundary`, `iam:PolicyARN`,
 `aws:ResourceTag/…` (and `iam:ResourceTag/…`), `aws:RequestTag/…` and
-`aws:TagKeys`, decided as AWS decides them (probed). Cairn keeps one version
-of a policy, the default (`v1`, `v2`, ...): CreatePolicyVersion replaces it,
-and must set it as the default; GetPolicyVersion and ListPolicyVersions show
-it. Groups and roles are NotImplemented. STS's
+`aws:TagKeys`, decided as AWS decides them (probed). A policy keeps up to
+five versions (`v1`, `v2`, ..., never numbered again), as in IAM: the default
+decides (CreatePolicyVersion, with SetAsDefault or not; SetDefaultPolicyVersion
+rolls back; GetPolicyVersion, ListPolicyVersions, DeletePolicyVersion but of
+the default), and a policy with more than one can't be deleted. The console's
+edit makes a new default version, deleting the oldest that isn't the default
+if there are five already, as Terraform does. Groups and roles are NotImplemented. STS's
 `GetCallerIdentity` answers too (signed for `sts`), which Terraform's AWS
 provider calls as it starts. The AWS CLI refuses access key IDs shorter than
 16 characters as parameters (`--access-key-id`): the keys Cairn makes are

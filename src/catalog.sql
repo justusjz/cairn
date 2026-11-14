@@ -77,7 +77,8 @@
 --           policy, or tagging it (I10); deleting the user (by deleting
 --           the row); setting its permissions boundary (a plain UPDATE,
 --           whose trigger keeps the inline policy `cairn:boundary`).
---   M(m)    A managed policy's row. Exclusive: tagging it (I10).
+--   M(m)    A managed policy's row. Exclusive: tagging it (I10); making,
+--           deleting a version, or setting its default (I13).
 --   L(l)    A console login's row (see `console`). Exclusive: giving it a
 --           passkey, removing one, linking an identity to it (I10).
 --   E(e)    An enrollment link's row: locked by the transaction that uses
@@ -189,6 +190,12 @@
 --     later leaves a policy that's there, as in S3.) Guards: B(b) for the
 --     bucket's block, A(a) for the account's: T27 holds both while it checks
 --     them, T32 changes the bucket's under B, T41 the account's under A.
+-- I13. A managed policy has at most five versions, one of them its default,
+--     whose number and document its own row's `version` and `document` are
+--     (which evaluation reads); version numbers are never reused (its
+--     `next_version`). Every change of its versions (T44, T45, T46) holds
+--     M(m) exclusively, and reads them in a later statement. Its first
+--     version is made with its row, by a trigger (`db::POLICY_VERSIONS`).
 --
 -- DEADLOCKS
 --
@@ -1749,6 +1756,84 @@ BEGIN
     DELETE FROM managed_policy_tags WHERE policy_id = p_policy AND key = ANY (p_keys);
     INSERT INTO managed_policy_tags (policy_id, key, value) SELECT p_policy, k, v FROM unnest(p_keys, p_values) AS t(k, v);
     RETURN 'tagged';
+END
+$$;
+
+-- T44: CreatePolicyVersion: a new version of the managed policy, numbered
+-- next, its default if `p_default`; if it has `p_max` already, the oldest
+-- that isn't the default goes first when `p_prune` (as Terraform does it,
+-- and the console), else it's refused (I13). Takes M(m) exclusively, then
+-- counts in a later statement. Returns the new version's number, 0 if it
+-- has too many, NULL if there's no such policy.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_create_policy_version(
+    p_policy uuid, p_document text, p_default boolean, p_prune boolean, p_max integer)
+RETURNS integer LANGUAGE plpgsql AS $$
+DECLARE
+    v_version integer;
+BEGIN
+    PERFORM 1 FROM managed_policies WHERE id = p_policy FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN NULL;
+    END IF;
+    IF p_prune AND (SELECT count(*) FROM managed_policy_versions WHERE policy_id = p_policy) >= p_max THEN
+        DELETE FROM managed_policy_versions
+        WHERE policy_id = p_policy AND version = (
+            SELECT min(v.version) FROM managed_policy_versions v
+            WHERE v.policy_id = p_policy AND v.version <> (SELECT version FROM managed_policies WHERE id = p_policy));
+    END IF;
+    IF (SELECT count(*) FROM managed_policy_versions WHERE policy_id = p_policy) >= p_max THEN
+        RETURN 0;
+    END IF;
+    UPDATE managed_policies SET next_version = next_version + 1, updated_at = now()
+    WHERE id = p_policy RETURNING next_version - 1 INTO v_version;
+    INSERT INTO managed_policy_versions (policy_id, version, document) VALUES (p_policy, v_version, p_document);
+    IF p_default THEN
+        UPDATE managed_policies SET version = v_version, document = p_document WHERE id = p_policy;
+    END IF;
+    RETURN v_version;
+END
+$$;
+
+-- T45: SetDefaultPolicyVersion: makes version `p_version` of the managed
+-- policy its default (I13). Takes M(m) exclusively, then reads the version.
+-- Returns 'set', 'no_such_policy' or 'no_such_version'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_default_policy_version(p_policy uuid, p_version integer)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_document text;
+BEGIN
+    PERFORM 1 FROM managed_policies WHERE id = p_policy FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_policy';
+    END IF;
+    SELECT document INTO v_document FROM managed_policy_versions WHERE policy_id = p_policy AND version = p_version;
+    IF NOT FOUND THEN
+        RETURN 'no_such_version';
+    END IF;
+    UPDATE managed_policies SET version = p_version, document = v_document, updated_at = now() WHERE id = p_policy;
+    RETURN 'set';
+END
+$$;
+
+-- T46: DeletePolicyVersion: deletes version `p_version` of the managed
+-- policy, unless it's its default (I13). Takes M(m) exclusively, then reads
+-- which is. Returns 'deleted', 'default', 'no_such_policy' or
+-- 'no_such_version'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_policy_version(p_policy uuid, p_version integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM managed_policies WHERE id = p_policy FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_policy';
+    END IF;
+    IF (SELECT version FROM managed_policies WHERE id = p_policy) = p_version THEN
+        RETURN 'default';
+    END IF;
+    DELETE FROM managed_policy_versions WHERE policy_id = p_policy AND version = p_version;
+    IF NOT FOUND THEN
+        RETURN 'no_such_version';
+    END IF;
+    RETURN 'deleted';
 END
 $$;
 

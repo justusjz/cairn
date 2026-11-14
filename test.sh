@@ -2474,6 +2474,48 @@ iam_managed_ok() {
     awss3 iam detach-user-policy --user-name "$u" --policy-arn "$arn" >/dev/null 2>&1 || return 1
     awss3 iam detach-user-policy --user-name "$u" \
         --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess >/dev/null 2>&1 || return 1
+    # Its other version first, as in IAM.
+    awss3 iam delete-policy-version --policy-arn "$arn" --version-id v1 >/dev/null 2>&1 || return 1
+    awss3 iam delete-policy --policy-arn "$arn" >/dev/null 2>&1 || return 1
+    awss3 iam delete-access-key --user-name "$u" --access-key-id "$id" >/dev/null 2>&1 || return 1
+    awss3 iam delete-user --user-name "$u" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
+# A managed policy's versions, as the AWS CLI handles them: up to five, the
+# default deciding (a rollback with SetDefaultPolicyVersion), the default
+# not deletable, nor the policy while it has others; and its tags.
+iam_versions_ok() {
+    local u="iamv-$(date +%s)" b="iamvb-$(date +%s)" doc="$WORK_DIR/iam-ver.json" key id secret out arn
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    awss3 iam create-user --user-name "$u" >/dev/null 2>&1 || return 1
+    key=$(awss3 iam create-access-key --user-name "$u" \
+        --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>/dev/null) || return 1
+    id=$(echo "$key" | cut -f1); secret=$(echo "$key" | cut -f2)
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::'"$b"'"}]}' > "$doc"
+    arn=$(awss3 iam create-policy --policy-name "$b" --policy-document "file://$doc" --tags Key=team,Value=a \
+        --query Policy.Arn --output text 2>/dev/null) || return 1
+    awss3 iam list-policy-tags --policy-arn "$arn" --query 'Tags[0].Key' --output text 2>/dev/null | grep -qx team || return 1
+    awss3 iam attach-user-policy --user-name "$u" --policy-arn "$arn" >/dev/null 2>&1 || return 1
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    # v2, not the default: v1 still decides.
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/*"}]}' > "$doc"
+    awss3 iam create-policy-version --policy-arn "$arn" --policy-document "file://$doc" \
+        --query PolicyVersion.IsDefaultVersion --output text 2>/dev/null | grep -qx False || return 1
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    awss3 iam set-default-policy-version --policy-arn "$arn" --version-id v2 >/dev/null 2>&1 || return 1
+    ! as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    # Rolled back.
+    awss3 iam set-default-policy-version --policy-arn "$arn" --version-id v1 >/dev/null 2>&1 || return 1
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    out=$(awss3 iam delete-policy-version --policy-arn "$arn" --version-id v1 2>&1) && return 1
+    echo "$out" | grep -q DeleteConflict || return 1
+    awss3 iam list-policy-versions --policy-arn "$arn" --query 'Versions[*].VersionId' --output text 2>/dev/null \
+        | grep -qP '^v2\tv1$' || return 1
+    awss3 iam detach-user-policy --user-name "$u" --policy-arn "$arn" >/dev/null 2>&1 || return 1
+    out=$(awss3 iam delete-policy --policy-arn "$arn" 2>&1) && return 1
+    echo "$out" | grep -q 'more than one version' || return 1
+    awss3 iam delete-policy-version --policy-arn "$arn" --version-id v2 >/dev/null 2>&1 || return 1
     awss3 iam delete-policy --policy-arn "$arn" >/dev/null 2>&1 || return 1
     awss3 iam delete-access-key --user-name "$u" --access-key-id "$id" >/dev/null 2>&1 || return 1
     awss3 iam delete-user --user-name "$u" >/dev/null 2>&1 || return 1
@@ -2734,6 +2776,7 @@ run_test    "Admin has AdministratorAccess"          admin_scope_ok
 run_test    "IAM API: users, keys, inline policies"  iam_api_ok
 run_test    "IAM API: managed policies"              iam_managed_ok
 run_test    "IAM API: boundaries, paths, tags"       iam_boundaries_ok
+run_test    "IAM API: policy versions and tags"      iam_versions_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok

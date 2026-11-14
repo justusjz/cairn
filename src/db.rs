@@ -49,9 +49,9 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
 pub(crate) const PROTOCOL: &str = "6";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
-/// gate (`cairn_require_users`, last raised by `BOUNDARIES`) requires of
+/// gate (`cairn_require_users`, last raised by `POLICY_VERSIONS`) requires of
 /// every session that changes users, their keys or policies.
-pub(crate) const USERS_GATE: &str = "3";
+pub(crate) const USERS_GATE: &str = "4";
 
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
@@ -218,6 +218,7 @@ const MIGRATIONS: &[&str] = &[
     ACCOUNT_PUBLIC_ACCESS_BLOCK,
     BOUNDARIES,
     POLICY_TAGS,
+    POLICY_VERSIONS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1864,6 +1865,56 @@ CREATE TABLE managed_policy_tags (
 CREATE TRIGGER managed_policy_tags_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON managed_policy_tags
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
 CREATE TRIGGER managed_policy_tags_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON managed_policy_tags
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 44: managed policies' versions, as IAM's (see `iam`,
+/// `plans/policy-tags-versions.md`): up to five of a policy, numbered on
+/// (never reused), one of them the default, which decides. A policy's own
+/// `version` and `document` stay its default's (catalog.sql's I13), which
+/// older Cairns read, and evaluation still does. A new policy's first
+/// version is made by a trigger. Older Cairns would replace the default
+/// version in place, so they may change no policies any more (`cairn.users`
+/// 4).
+const POLICY_VERSIONS: &str = r#"
+-- The gate is raised first (see `init`).
+CREATE OR REPLACE FUNCTION cairn_require_users() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.users', true) IS DISTINCT FROM '4' THEN
+        RAISE EXCEPTION 'this Cairn is too old to change users or policies, which have versions now; upgrade it'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE TABLE managed_policy_versions (
+    policy_id  uuid NOT NULL REFERENCES managed_policies (id) ON DELETE CASCADE,
+    version    integer NOT NULL CHECK (version >= 1),
+    document   text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (policy_id, version)
+);
+INSERT INTO managed_policy_versions (policy_id, version, document, created_at)
+    SELECT id, version, document, updated_at FROM managed_policies;
+ALTER TABLE managed_policies ADD COLUMN next_version integer;
+UPDATE managed_policies SET next_version = version + 1;
+ALTER TABLE managed_policies ALTER COLUMN next_version SET DEFAULT 2;
+ALTER TABLE managed_policies ALTER COLUMN next_version SET NOT NULL;
+
+CREATE FUNCTION cairn_policy_first_version() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO managed_policy_versions (policy_id, version, document, created_at)
+    VALUES (NEW.id, NEW.version, NEW.document, NEW.created_at);
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER managed_policies_first_version AFTER INSERT ON managed_policies
+    FOR EACH ROW EXECUTE FUNCTION cairn_policy_first_version();
+
+CREATE TRIGGER managed_policy_versions_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON managed_policy_versions
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER managed_policy_versions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON managed_policy_versions
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 #[cfg(test)]

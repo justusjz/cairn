@@ -847,6 +847,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/policies/{name}/default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Makes one of a managed policy's versions its default (a rollback, say). */
+        put: operations["set_default_version"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/policies/{name}/tags": {
         parameters: {
             query?: never;
@@ -859,6 +876,40 @@ export interface paths {
         put: operations["set_policy_tags"];
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/policies/{name}/versions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A managed policy's versions (up to five), newest first. */
+        get: operations["list_policy_versions"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/policies/{name}/versions/{version}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deletes one of a managed policy's versions, but its default. */
+        delete: operations["delete_policy_version"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1427,6 +1478,10 @@ export interface components {
              *     checked.
              */
             nodes: components["schemas"]["NodeCoverage"][];
+        };
+        DefaultVersion: {
+            /** Format: int32 */
+            version: number;
         };
         Disk: {
             /**
@@ -2253,6 +2308,19 @@ export interface components {
              *     (UntagPolicy), the rest are set (TagPolicy).
              */
             tags: components["schemas"]["Tag"][];
+        };
+        /** @description One of a managed policy's versions. */
+        PolicyVersion: {
+            /** Format: double */
+            created_at: number;
+            /** @description Whether it's the default, which decides. */
+            default: boolean;
+            document: string;
+            /**
+             * Format: int32
+             * @description Its number (`v1`, ...).
+             */
+            version: number;
         };
         /** @description A provider to sign in at. */
         ProviderButton: {
@@ -4742,6 +4810,46 @@ export interface operations {
             };
         };
     };
+    set_default_version: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DefaultVersion"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     set_policy_tags: {
         parameters: {
             query?: never;
@@ -4758,6 +4866,80 @@ export interface operations {
         };
         responses: {
             /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_policy_versions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyVersion"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_policy_version: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                version: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
             204: {
                 headers: {
                     [name: string]: unknown;

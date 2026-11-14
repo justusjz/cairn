@@ -453,6 +453,9 @@ impl Policy {
                     "Statement/policy already has instance of {}",
                     rest.split(" at line").next().unwrap_or(rest)
                 )),
+                // IAM's message, for an identity policy (probed); S3's, for
+                // a bucket's.
+                None if kind == Kind::Identity => Invalid::malformed("Syntax errors in policy."),
                 None => Invalid::malformed("This policy contains invalid Json"),
             }
         })?;
