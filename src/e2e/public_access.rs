@@ -133,10 +133,10 @@ async fn other_accounts_get_nothing_of_restricted_buckets_nor_their_policies() {
     assert_eq!(put_bucket_policy(&app, &bucket, Bytes::from(policy)).await.unwrap().status(), StatusCode::NO_CONTENT);
     // acme's eve may do anything, as far as acme is concerned; ada, of the
     // bucket's account, nothing but what the bucket's policy allows.
-    crate::roles::create_for(&client, &acme, "eve", None, true).await.unwrap();
-    crate::roles::create_for(&client, &account, "ada", None, false).await.unwrap();
-    let eve = crate::roles::Principal::load(&client, "eve").await.unwrap().unwrap();
-    let ada = crate::roles::Principal::load(&client, "ada").await.unwrap().unwrap();
+    let (eve, _) = crate::roles::create_for(&client, &acme, "eve", None, true).await.unwrap();
+    let (ada, _) = crate::roles::create_for(&client, &account, "ada", None, false).await.unwrap();
+    let eve = crate::roles::Principal::load(&client, &eve).await.unwrap().unwrap();
+    let ada = crate::roles::Principal::load(&client, &ada).await.unwrap().unwrap();
     let object = || On::Object(bucket.clone(), "k".to_owned());
     let of_bucket = || On::Bucket(bucket.clone());
 
@@ -175,8 +175,8 @@ async fn the_resource_account_is_the_buckets() {
     let theirs = format!("ra-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     assert!(matches!(create::create(&app, &theirs, &acme, false).await.unwrap(), create::Creation::Created));
     // eve may do anything, but only in acme's own resources.
-    crate::roles::create_for(&client, &acme, "eve", None, false).await.unwrap();
-    let mut eve = crate::roles::Principal::load(&client, "eve").await.unwrap().unwrap();
+    let (eve, _) = crate::roles::create_for(&client, &acme, "eve", None, false).await.unwrap();
+    let mut eve = crate::roles::Principal::load(&client, &eve).await.unwrap().unwrap();
     eve.policies.push(format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:*","Resource":"*",
             "Condition":{{"StringEquals":{{"aws:ResourceAccount":"{acme}"}}}}}}]}}"#

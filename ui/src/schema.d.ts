@@ -1884,7 +1884,7 @@ export interface components {
         };
         NewRole: {
             /**
-             * @description Whether it gets an access key (a service's), named as it; a person
+             * @description Whether it gets an access key (a service's), of a random ID; a person
              *     gets none, and signs in to the console through its link.
              */
             access_key?: boolean;

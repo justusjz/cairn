@@ -50,13 +50,15 @@ async fn a_user_signs_with_any_of_its_active_keys() {
     assert!(Principal::load(&client, &id).await.unwrap().is_none());
     assert!(roles::delete_key(&client, None, &id).await.is_err());
 
-    // A key's ID can't be another's; a new user whose name is one gets a
-    // first key of another (random) ID.
+    // A new user's key is of a random ID, as IAM's, not its name; older
+    // Cairns, which know only keys named as users, get no usable secret.
     roles::create_key(&client, &crate::roles::account(&client).await.unwrap(), "alice", Some("shared".to_owned()), None).await.unwrap();
     let account = crate::roles::account(&client).await.unwrap();
-    let (key, _) = roles::create_for(&client, &account, "shared", None, false).await.unwrap();
+    let (key, secret) = roles::create_for(&client, &account, "shared", None, false).await.unwrap();
     assert_ne!(key, "shared");
     assert_eq!(key.len(), 20);
+    assert_eq!(Principal::load(&client, &key).await.unwrap().unwrap().secret, secret);
+    assert!(legacy_secret(&app, "shared").await.starts_with("unusable:"));
     roles::delete(&client, &account, "shared").await.unwrap();
 
     let listed = roles::list(&client).await.unwrap();
@@ -314,8 +316,8 @@ async fn accounts_have_users_of_the_same_name() {
     let acme = crate::accounts::create(&client, "acme").await.unwrap();
     let (first, _) = roles::create_for(&client, &default, "ada", None, false).await.unwrap();
     let (second, _) = roles::create_for(&client, &acme, "ada", None, false).await.unwrap();
-    assert_eq!(first, "ada");
-    assert_ne!(second, "ada");
+    assert_ne!(first, second);
+    assert!(first != "ada" && second != "ada");
     assert_eq!(Principal::load(&client, &first).await.unwrap().unwrap().account, default);
     assert_eq!(Principal::load(&client, &second).await.unwrap().unwrap().account, acme);
     // But not twice in one account.

@@ -2427,7 +2427,7 @@ async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) ->
 #[derive(Deserialize, ToSchema)]
 struct NewRole {
     name: String,
-    /// Whether it gets an access key (a service's), named as it; a person
+    /// Whether it gets an access key (a service's), of a random ID; a person
     /// gets none, and signs in to the console through its link.
     #[serde(default)]
     access_key: bool,
@@ -2499,7 +2499,6 @@ async fn create_role(
             eprintln!("kms: identifying roles: {e:#}");
         }
     });
-    // The key's ID is the user's name, if that was free.
     Ok((StatusCode::CREATED, Json(NewUser { name: body.name, access_key })))
 }
 
@@ -3287,7 +3286,9 @@ mod e2e {
         let new = json!({ "name": "ui-role", "admin": false, "access_key": true });
         let (status, created) = admin.send("POST", "/api/roles", Some(new)).await;
         assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(created["access_key"]["name"], "ui-role");
+        let key = created["access_key"]["name"].as_str().unwrap();
+        assert_eq!(key.len(), 20);
+        assert_ne!(key, "ui-role");
         assert_eq!(created["access_key"]["secret"].as_str().unwrap().len(), 40);
         // A person: no key, and a console link, which lists them as one.
         let (status, created) = admin.send("POST", "/api/roles", Some(json!({ "name": "ui-person" }))).await;

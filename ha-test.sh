@@ -245,7 +245,7 @@ cairn_role() {
     echo "no instance is running" >&2; return 1
 }
 info "Creating test role..."
-cairn_role create "$ACCESS_KEY" --admin --secret "$SECRET_KEY" >"$WORK_DIR/roles.log" 2>&1 \
+cairn_role create "$ACCESS_KEY" --id "$ACCESS_KEY" --admin --secret "$SECRET_KEY" >"$WORK_DIR/roles.log" 2>&1 \
     || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create role"; }
 
 # ─── 3. One s3cmd config per instance ────────────────────────────────────────

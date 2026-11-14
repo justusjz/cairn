@@ -74,8 +74,8 @@ to manage buckets, and an application user with access to a bucket (see
 [Users and permissions](#users-and-permissions)):
 
 ```sh
-cairn user create admin --admin        # prints a generated secret
-cairn user create app                  # prints a generated secret
+cairn user create admin --admin        # prints its access key ID and secret
+cairn user create app                  # prints its access key ID and secret
 ```
 
 The `cairn` commands that manage the cluster (`user`, `account`, `oidc`,
@@ -247,9 +247,9 @@ shards are waiting to move.
 A **user** (called a role before; `cairn role` still works) is who makes S3
 requests. Its name is unique in its [account](#users-and-permissions), as in
 IAM: two accounts may each have an `ada`. It has **access keys**: up to two,
-as in IAM, each an access key ID and a secret; its first key's ID is the
-user's name, unless another account's user has that one (then it's random:
-`cairn user create` prints it). Access key IDs are unique across the
+as in IAM, each an access key ID and a secret. IDs are random, 20
+characters, as IAM's (`cairn user create` prints the first); only a role
+migrated from before access keys keeps a key named as it. Access key IDs are unique across the
 cluster. Users are stored in
 Postgres, so every node picks up a change on the very next request; there is
 nothing to restart or sync.
@@ -385,8 +385,8 @@ Manage users with `cairn user [--account <name>] <command>`
 
 | Command | Description |
 | --- | --- |
-| `create <name> [--admin] [--secret <S>] [--account <A>]` | Create a user, with an access key named as it. Prints a generated 40-char secret unless `--secret` is given (min. 8 chars). |
-| `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret of the key named as the user (`--rotate-secret` prints the new one). |
+| `create <name> [--admin] [--id <ID>] [--secret <S>] [--account <A>]` | Create a user, with an access key of a random 20-char ID (or `--id`). Prints the ID, and a generated 40-char secret unless `--secret` is given (min. 8 chars). |
+| `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret of the key named as the user, which only roles migrated from before access keys have (`--rotate-secret` prints the new one); other keys are rotated with `key create` and `key delete`. |
 | `delete <name>` | Delete a user, with its keys and policies. |
 | `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket of the account: attaches its managed policy `<bucket>-<permission>`, made the first time. |
 | `revoke <name> <bucket> [read\|write\|delete-version]...` | Revoke permissions on a bucket (detaches those policies); all of them if none are listed. |
@@ -418,8 +418,9 @@ GetPolicyVersion and ListPolicyVersions show it. Groups, roles, paths, tags
 and permissions boundaries are NotImplemented. STS's
 `GetCallerIdentity` answers too (signed for `sts`), which Terraform's AWS
 provider calls as it starts. The AWS CLI refuses access key IDs shorter than
-16 characters as parameters (`--access-key-id`): the keys IAM makes are 20,
-but a user's first key is named as the user.
+16 characters as parameters (`--access-key-id`): the keys Cairn makes are
+20, as IAM's, but a role migrated from before access keys keeps its key named
+as it.
 
 A bucket policy can deny everyone everything, its admins too, as in S3. The
 operator, on a node's peer endpoint, can always remove it, as an AWS
@@ -531,8 +532,8 @@ sign-in providers, and signing out.
   may do all of it; others what their policies say, as `iam:CreateAccessKey`
   on their own user, say): create and delete users, attach and detach
   managed policies (AdministratorAccess makes an admin), make, deactivate
-  and delete access keys (replacing the secret of the one named as the user
-  in place), write inline policies, which the server checks as IAM does,
+  and delete access keys (replacing the secret of a migrated role's, named
+  as the user, in place), write inline policies, which the server checks as IAM does,
   and make enrollment links. People and service users are listed apart:
   both are IAM users, as in AWS, but a person signs in to the console (or
   has a link out to), with how, and when they last did; a service has only

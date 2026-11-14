@@ -2,8 +2,8 @@
 //! requests, with which access keys, and what each may do.
 //!
 //! A user has a name (its ARN is `arn:aws:iam::<account>:user/<name>`), up to
-//! two access keys (an ID and a secret; the first is named as the user, as a
-//! role's one key was), and permissions: it may be an *admin*, which allows
+//! two access keys (an ID and a secret; IDs are random, as IAM's, except a
+//! migrated role's one key, which is named as the user), and permissions: it may be an *admin*, which allows
 //! bucket management (create / delete / list every bucket), it holds
 //! per-bucket `read` / `write` / `delete-version` grants for object access,
 //! and it may have inline identity policies of its own (see `policy`). Admin
@@ -204,12 +204,16 @@ pub struct RoleArgs {
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum RoleCommand {
-    /// Create a user, with an access key named as it. Prints the key's
-    /// secret; a random one is generated unless given. In the operator
+    /// Create a user, with an access key of a random ID. Prints the key's
+    /// ID and secret; a random secret is generated unless given. In the operator
     /// account: a superadmin, who gets no key (see `cairn user enroll`).
     Create {
-        /// The user's name, which its first access key's ID is too.
+        /// The user's name.
         name: String,
+        /// Give the key this ID instead of a random one (for scripted
+        /// setups that need a known one).
+        #[arg(long)]
+        id: Option<String>,
         /// Use this secret instead of generating one (at least 8 characters).
         #[arg(long)]
         secret: Option<String>,
@@ -218,7 +222,8 @@ enum RoleCommand {
         admin: bool,
     },
     /// Change a user's admin flag, and/or the secret of its access key named
-    /// as it.
+    /// as it (a migrated role's; others are rotated with `key create` and
+    /// `key delete`).
     Update {
         name: String,
         /// Give (true) or take (false) `AdministratorAccess`.
@@ -331,11 +336,12 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
     match args.command {
         RoleCommand::Create {
             name,
+            id,
             secret,
             admin,
         } => {
             if is_operator(&client, account_id).await? {
-                if secret.is_some() || admin {
+                if id.is_some() || secret.is_some() || admin {
                     refuse_operator(&client, account_id, "access keys or admin flag").await?;
                 }
                 create_without_key(&client, account_id, &name).await?;
@@ -344,7 +350,14 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
                 return Ok(());
             }
             let generated = secret.is_none();
-            let (key, secret) = create_for(&client, account_id, &name, secret, admin).await?;
+            let key = match id {
+                Some(id) => {
+                    validate_name(&id)?;
+                    id
+                }
+                None => generate_key_id()?,
+            };
+            let (key, secret) = create_with_key(&client, account_id, &name, key, secret, admin).await?;
             outln!(out, "access key: {key}");
             if generated {
                 outln!(out, "secret key: {secret}");
@@ -492,7 +505,8 @@ pub fn generate_secret() -> anyhow::Result<String> {
 }
 
 /// Creates a user of the first tenant account, with an access key named as
-/// it, of `secret` or else a generated one, and returns its secret.
+/// it (as a migrated role's, which tests sign with by the user's name), of
+/// `secret` or else a generated one, and returns its secret.
 #[cfg(test)]
 pub async fn create(
     client: &Object,
@@ -526,7 +540,7 @@ pub async fn create_in(
         create_without_key(client, &account_id, name).await?;
         return Ok((name.to_owned(), String::new()));
     }
-    create_for(client, &account_id, name, secret, admin).await
+    create_with_key(client, &account_id, name, name.to_owned(), secret, admin).await
 }
 
 /// Creates a user of the account `account_id` without access keys, as
@@ -551,12 +565,24 @@ pub async fn create_without_key(client: &Object, account_id: &str, name: &str) -
     Ok(())
 }
 
-/// Creates a user of the account `account_id`, with an access key named as
-/// it (if that's free; else a random one): the key's ID and secret.
+/// Creates a user of the account `account_id`, with an access key of a
+/// random ID, as IAM makes them: the key's ID and secret.
 pub async fn create_for(
     client: &Object,
     account_id: &str,
     name: &str,
+    secret: Option<String>,
+    admin: bool,
+) -> anyhow::Result<(String, String)> {
+    create_with_key(client, account_id, name, generate_key_id()?, secret, admin).await
+}
+
+/// Creates a user of the account `account_id`, with the access key `key`.
+async fn create_with_key(
+    client: &Object,
+    account_id: &str,
+    name: &str,
+    key: String,
     secret: Option<String>,
     admin: bool,
 ) -> anyhow::Result<(String, String)> {
@@ -569,18 +595,16 @@ pub async fn create_for(
         }
         None => generate_secret()?,
     };
-    // Its first key is named as it, unless that's taken (by a user of
-    // another account, of the same name): then a random one.
-    let key = match key_exists(client, name).await? {
-        false => name.to_owned(),
-        true => generate_key_id()?,
-    };
     // One statement: the user and its key, or neither. (`roles.secret` is
-    // what older Cairns authenticate with; the key's trigger keeps it.)
+    // what older Cairns authenticate with, as the key named as the user:
+    // the key's secret if it's that one, else none that can be guessed;
+    // the key's trigger keeps it.)
     let inserted = client
         .execute_cached(
             "WITH r AS (
-                 INSERT INTO roles (name, secret, admin, account_id) VALUES ($1, $2, $3, $4)
+                 INSERT INTO roles (name, secret, admin, account_id)
+                 VALUES ($1, CASE WHEN $5 = $1 THEN $2
+                             ELSE 'unusable:' || gen_random_uuid() || gen_random_uuid() END, $3, $4)
                  ON CONFLICT DO NOTHING RETURNING id
              )
              INSERT INTO access_keys (access_key_id, role_id, secret) SELECT $5, id, $2 FROM r",
@@ -590,9 +614,8 @@ pub async fn create_for(
     match inserted {
         Ok(0) => Err(invalid(format!("a user named {name:?} already exists"))),
         Ok(_) => Ok((key, secret)),
-        // Another key took the name meanwhile.
         Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
-            Err(invalid(format!("an access key named {name:?} already exists")))
+            Err(invalid(format!("an access key named {key:?} already exists")))
         }
         Err(e) => Err(e.into()),
     }
@@ -647,10 +670,6 @@ pub async fn refuse_operator(client: &Object, account: &str, what: &str) -> anyh
         )));
     }
     Ok(())
-}
-
-async fn key_exists(client: &Object, id: &str) -> anyhow::Result<bool> {
-    Ok(client.query_opt_cached("SELECT 1 FROM access_keys WHERE access_key_id = $1", &[&id]).await?.is_some())
 }
 
 /// The most access keys a user may have, as in IAM.
@@ -847,7 +866,7 @@ pub async fn update(
         }
     }
     if let Some(secret) = secret {
-        // The key named as the user (its first, a role's only one).
+        // The key named as the user (a migrated role's only one).
         let updated = client
             .execute_cached(
                 "UPDATE access_keys k SET secret = $2 FROM roles r
@@ -857,7 +876,7 @@ pub async fn update(
             .await?;
         if updated == 0 {
             return Err(invalid(format!(
-                "no access key named as the user {name:?}; make the user a new key instead"
+                "no access key named as the user {name:?}; rotate its keys by making a new one and deleting the old"
             )));
         }
     }

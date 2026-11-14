@@ -203,7 +203,12 @@ mod e2e {
         let Some(app) = node().await else { return };
         let out = cairn(&app, &["user", "create", "cli-ada", "--admin"]).await;
         assert_eq!(out.error, None);
-        assert!(out.stdout.starts_with("access key: cli-ada\nsecret key: "), "{}", out.stdout);
+        // A random key ID, as IAM's, unless one is given.
+        let key = out.stdout.strip_prefix("access key: ").and_then(|s| s.split_once('\n')).unwrap().0;
+        assert_eq!(key.len(), 20, "{}", out.stdout);
+        assert!(out.stdout.contains("\nsecret key: "), "{}", out.stdout);
+        let out = cairn(&app, &["user", "create", "cli-bea", "--id", "cli-bea-key"]).await;
+        assert!(out.stdout.starts_with("access key: cli-bea-key\nsecret key: "), "{}", out.stdout);
         let out = cairn(&app, &["user", "list"]).await;
         assert!(out.stdout.contains("cli-ada (admin)"), "{}", out.stdout);
         // Its failures, as the CLI prints them.

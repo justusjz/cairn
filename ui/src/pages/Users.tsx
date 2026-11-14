@@ -513,8 +513,8 @@ function UserRow(props: {
 }
 
 /** One of a user's access keys: its ID and state, and what can be done
- * with it. The key named as the user (its first) can have its secret
- * replaced in place, as a role's could; others are rotated by making a new
+ * with it. The key named as the user (a migrated role's) can have its
+ * secret replaced in place, as a role's could; others are rotated by making a new
  * key and deleting the old one. */
 function KeyLine(props: {
   user: string;

@@ -258,10 +258,10 @@ exec 3>&- 3<&- 2>/dev/null
 cairn_role() { (cd "$SCRIPT_DIR" && cargo run -q -- role "$@"); }
 info "Creating roles..."
 {
-    cairn_role create "$ACCESS_KEY" --admin --secret "$SECRET_KEY" &&
-    cairn_role create reader --secret readersecret &&
-    cairn_role create writer --secret writersecret &&
-    cairn_role create bucketadmin --admin --secret adminsecret
+    cairn_role create "$ACCESS_KEY" --id "$ACCESS_KEY" --admin --secret "$SECRET_KEY" &&
+    cairn_role create reader --id reader --secret readersecret &&
+    cairn_role create writer --id writer --secret writersecret &&
+    cairn_role create bucketadmin --id bucketadmin --admin --secret adminsecret
 } >"$WORK_DIR/roles.log" 2>&1 || { cat "$WORK_DIR/roles.log" >&2; fatal "could not create roles"; }
 
 # ─── 2c. testkey's keys in OpenBao ───────────────────────────────────────────

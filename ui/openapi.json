@@ -5345,7 +5345,7 @@
         "properties": {
           "access_key": {
             "type": "boolean",
-            "description": "Whether it gets an access key (a service's), named as it; a person\ngets none, and signs in to the console through its link."
+            "description": "Whether it gets an access key (a service's), of a random ID; a person\ngets none, and signs in to the console through its link."
           },
           "admin": {
             "type": "boolean"
