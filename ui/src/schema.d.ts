@@ -4,6 +4,34 @@
  */
 
 export interface paths {
+    "/account/public-access-block": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The actor's account's public access block, as S3 Control's
+         *     GetPublicAccessBlock gets it: `null` if it has none.
+         */
+        get: operations["get_account_block"];
+        /**
+         * Sets the actor's account's public access block, which every one of its
+         *     buckets gets too, as S3 Control's PutPublicAccessBlock does.
+         */
+        put: operations["put_account_block"];
+        post?: never;
+        /**
+         * Removes the actor's account's public access block: only its buckets'
+         *     own apply.
+         */
+        delete: operations["delete_account_block"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/accounts": {
         parameters: {
             query?: never;
@@ -248,7 +276,7 @@ export interface paths {
         /** Sets a bucket's public access block, as PutPublicAccessBlock does. */
         put: operations["put_public_access_block"];
         post?: never;
-        /** Removes a bucket's public access block: only the cluster's applies. */
+        /** Removes a bucket's public access block: only its account's applies. */
         delete: operations["delete_public_access_block"];
         options?: never;
         head?: never;
@@ -819,26 +847,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/public-access": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * The cluster's public access block: its settings `block-public-policy`
-         *     and `restrict-public-buckets` (set with `PUT /settings/{name}`).
-         */
-        get: operations["get_public_access"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/roles": {
         parameters: {
             query?: never;
@@ -1007,10 +1015,8 @@ export interface paths {
         get?: never;
         /**
          * Sets one of the redundancy settings (`data-shards`, `parity-shards`,
-         *     `repair-after`), or of the cluster's public access block
-         *     (`block-public-policy`, `restrict-public-buckets`: 0 or 1), for the whole
-         *     cluster, as `cairn config set` does. The node answering goes by it right
-         *     away, the others within a heartbeat (the public access block's, at once).
+         *     `repair-after`) for the whole cluster, as `cairn config set` does. The
+         *     node answering goes by it right away, the others within a heartbeat.
          */
         put: operations["set_setting"];
         post?: never;
@@ -1189,11 +1195,7 @@ export interface components {
          *     policy, and its public access block (see `s3::buckets::public_access`).
          */
         BucketAccess: {
-            /**
-             * @description The cluster's (only its policy flags count), which applies to every
-             *     bucket as well.
-             */
-            cluster: components["schemas"]["Block"];
+            account_public_access_block?: components["schemas"]["Block"] | null;
             /** @description Its policy, as GetBucketPolicy shows it; `null` if it has none. */
             policy?: string | null;
             /** @description Whether the policy makes the bucket public. */
@@ -1216,6 +1218,7 @@ export interface components {
         BucketSummary: {
             /** @description The account that owns it. */
             account: string;
+            account_public_access_block?: components["schemas"]["Block"] | null;
             /** Format: int64 */
             bytes: number;
             /** Format: double */
@@ -2378,6 +2381,113 @@ export interface components {
 }
 export type $defs = Record<string, never>;
 export interface operations {
+    get_account_block: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Block"] | null;
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_account_block: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Block"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_account_block: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_accounts: {
         parameters: {
             query?: never;
@@ -4510,33 +4620,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    get_public_access: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Block"];
                 };
             };
             "5XX": {

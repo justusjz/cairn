@@ -157,14 +157,15 @@ export const api = {
     ok(client.PUT("/buckets/{bucket}/public-access-block", { params: bucketPath(bucket), body: block })),
   deletePublicAccessBlock: (bucket: string) =>
     ok(client.DELETE("/buckets/{bucket}/public-access-block", { params: bucketPath(bucket) })),
-  /** The cluster's public access block (`block-public-policy`,
-   * `restrict-public-buckets`), set with `setSetting`. */
-  publicAccess: () => ok(client.GET("/public-access")),
+  /** The signed-in account's public access block (S3 Control's), which
+   * every one of its buckets gets too; `null` if it has none. */
+  accountBlock: () => ok(client.GET("/account/public-access-block")),
+  putAccountBlock: (block: PublicAccessBlock) => ok(client.PUT("/account/public-access-block", { body: block })),
+  deleteAccountBlock: () => ok(client.DELETE("/account/public-access-block")),
   setLifecycleRate: (rate: number) => ok(client.PUT("/lifecycle/rate", { body: { rate } })),
   /** Sets a redundancy setting (`data-shards`, `parity-shards`,
-   * `repair-after`) or a public access one (`block-public-policy`,
-   * `restrict-public-buckets`); `null` unsets it. Resolves to what's wrong
-   * with the cluster's layouts now, if anything. */
+   * `repair-after`); `null` unsets it. Resolves to what's wrong with the
+   * cluster's layouts now, if anything. */
   setSetting: (name: string, value: number | null) =>
     ok(client.PUT("/settings/{name}", { params: { path: { name } }, body: { value } })),
   removeNode: (id: number) => ok(client.POST("/nodes/{id}/remove", { params: { path: { id } } })),

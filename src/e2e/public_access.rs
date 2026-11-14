@@ -1,5 +1,5 @@
 //! Block Public Access (see `s3::buckets::public_access`): a bucket's block
-//! and the cluster's, against a real Postgres.
+//! and its account's, against a real Postgres.
 
 use std::sync::Arc;
 
@@ -17,7 +17,6 @@ use crate::{
             public_access::{self, Block},
         },
     },
-    settings,
 };
 
 async fn node() -> Option<Arc<App>> {
@@ -42,7 +41,7 @@ async fn anyone_reads(app: &App, bucket: &str) -> bool {
 }
 
 /// A new bucket blocks everything, as S3's do; a public policy is refused
-/// while a block (the bucket's or the cluster's) blocks it, and allows
+/// while a block (the bucket's or its account's) blocks it, and allows
 /// anonymous reads only while none restricts it.
 #[tokio::test]
 async fn blocks_public_policies_and_restricts_public_buckets() {
@@ -70,14 +69,21 @@ async fn blocks_public_policies_and_restricts_public_buckets() {
     assert!(public_access::set(&app, &bucket, None).await.unwrap());
     assert!(anyone_reads(&app, &bucket).await);
 
-    // The cluster's block, whatever the bucket's says.
+    // The account's block, whatever the bucket's says; a new account has
+    // none.
     let client = app.pool.get().await.unwrap();
-    settings::RESTRICT_PUBLIC_BUCKETS.set(&client, 1).await.unwrap();
+    assert_eq!(public_access::account(&client, &account).await.unwrap(), None);
+    assert!(public_access::set_account(&app, &account, Some(restrict)).await.unwrap());
     assert!(!anyone_reads(&app, &bucket).await);
-    settings::RESTRICT_PUBLIC_BUCKETS.unset(&client).await.unwrap();
-    settings::BLOCK_PUBLIC_POLICY.set(&client, 1).await.unwrap();
+    let policies = Block { block_public_policy: true, ..Block::default() };
+    assert!(public_access::set_account(&app, &account, Some(policies)).await.unwrap());
+    assert!(anyone_reads(&app, &bucket).await);
     assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::FORBIDDEN);
-    settings::BLOCK_PUBLIC_POLICY.unset(&client).await.unwrap();
+    assert!(public_access::set_account(&app, &account, None).await.unwrap());
+    assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::NO_CONTENT);
+    // Another account's block is no matter.
+    let acme = crate::accounts::create(&client, "acme").await.unwrap();
+    assert!(public_access::set_account(&app, &acme, Some(Block::from_bits(15))).await.unwrap());
     assert!(anyone_reads(&app, &bucket).await);
 
     // The e2e bucket was made with the column's default, as an older Cairn

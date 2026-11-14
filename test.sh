@@ -2322,6 +2322,46 @@ bucket_policy_ok() {
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
+# An account's public access block (S3 Control's), which every one of its
+# buckets gets, whatever their own says: a new account has none. S3 Control's
+# clients name the account in the host too, so these go through the vhost
+# client (`<account>.localhost`).
+account_block_ok() {
+    local b="acb-$(date +%s)" doc="$WORK_DIR/acb.json" account url out
+    url="http://${SERVER_HOST}:${SERVER_PORT}/$b"
+    account=$(awss3 sts get-caller-identity --query Account --output text 2>/dev/null)
+    [ -n "$account" ] || return 1
+    out=$(awsvhost s3control get-public-access-block --account-id "$account" 2>&1) && return 1
+    echo "$out" | grep -q NoSuchPublicAccessBlockConfiguration || return 1
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-public-access-block --bucket "$b" >/dev/null 2>&1 || return 1
+    printf 'public' > "$WORK_DIR/acb.txt"
+    awss3 s3api put-object --bucket "$b" --key a.txt --body "$WORK_DIR/acb.txt" >/dev/null 2>&1 || return 1
+    printf '%s' '{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/*"}]}' \
+        > "$doc"
+    # BlockPublicPolicy: the bucket's public policy is refused.
+    awsvhost s3control put-public-access-block --account-id "$account" \
+        --public-access-block-configuration BlockPublicPolicy=true >/dev/null 2>&1 || return 1
+    [ "$(awsvhost s3control get-public-access-block --account-id "$account" \
+        --query 'PublicAccessBlockConfiguration.[BlockPublicAcls,BlockPublicPolicy]' --output text 2>/dev/null)" \
+        = "$(printf 'False\tTrue')" ] || return 1
+    out=$(awss3 s3api put-bucket-policy --bucket "$b" --policy "file://$doc" 2>&1) && return 1
+    echo "$out" | grep -q BlockPublicPolicy || return 1
+    # RestrictPublicBuckets: it's taken, but allows anonymous requests nothing.
+    awsvhost s3control put-public-access-block --account-id "$account" \
+        --public-access-block-configuration RestrictPublicBuckets=true >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-policy --bucket "$b" --policy "file://$doc" >/dev/null 2>&1 || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/a.txt")" = 403 ] || return 1
+    awsvhost s3control delete-public-access-block --account-id "$account" >/dev/null 2>&1 || return 1
+    [ "$(curl -s "$url/a.txt")" = public ] || return 1
+    # Only the signer's own account's.
+    out=$(awsvhost s3control get-public-access-block --account-id 000000000000 2>&1) && return 1
+    echo "$out" | grep -q AccessDenied || return 1
+    awss3 s3api delete-bucket-policy --bucket "$b" >/dev/null 2>&1
+    awss3 s3api delete-object --bucket "$b" --key a.txt >/dev/null 2>&1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
 # A user's access keys: a second one signs as the user until it's
 # deactivated; and an inline policy denies what a grant allows.
 user_keys_and_policies_ok() {
@@ -2629,6 +2669,7 @@ run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok
 run_test    "Missing bucket 404, no grant 403"      missing_bucket_404_ok
 run_test    "Revoked grant takes effect"            revoke_takes_effect_ok
 run_test    "Bucket policies, anonymous and signed" bucket_policy_ok
+run_test    "An account's public access block"      account_block_ok
 run_test    "Users' access keys and policies"       user_keys_and_policies_ok
 run_test    "Overwrite object, new content wins"    bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&

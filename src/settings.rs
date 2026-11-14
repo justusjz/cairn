@@ -86,33 +86,9 @@ pub const REPAIR_AFTER: Setting = Setting {
     unset: None,
 };
 
-/// Whether public bucket policies are refused, whatever a bucket's public
-/// access block says: S3's account-level BlockPublicPolicy (see
-/// `s3::buckets::public_access`). Read as each policy is set.
-pub const BLOCK_PUBLIC_POLICY: Setting = Setting {
-    name: "block-public-policy",
-    default: 0,
-    min: 0,
-    max: 1,
-    help: "1 refuses public bucket policies in every bucket, whatever its public access block says",
-    unset: None,
-};
-
-/// Whether a bucket's public policy allows anonymous requests nothing,
-/// whatever its public access block says: S3's account-level
-/// RestrictPublicBuckets. Read with each request.
-pub const RESTRICT_PUBLIC_BUCKETS: Setting = Setting {
-    name: "restrict-public-buckets",
-    default: 0,
-    min: 0,
-    max: 1,
-    help: "1 lets no public bucket policy allow anonymous requests anything, in every bucket",
-    unset: None,
-};
-
 /// Every setting.
 pub const ALL: &[&Setting] =
-    &[&LIFECYCLE_RATE, &DATA_SHARDS, &PARITY_SHARDS, &REPAIR_AFTER, &BLOCK_PUBLIC_POLICY, &RESTRICT_PUBLIC_BUCKETS];
+    &[&LIFECYCLE_RATE, &DATA_SHARDS, &PARITY_SHARDS, &REPAIR_AFTER];
 
 /// The setting named `name`, if there's one.
 pub fn named(name: &str) -> Option<&'static Setting> {

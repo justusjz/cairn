@@ -6,12 +6,10 @@ import { For, Show, createSignal } from "solid-js";
 import { api } from "../api";
 import { Badge, Loading, Panel, Table, act, poll } from "../components/ui";
 import { bytes, date, num } from "../format";
-import { ClusterBlock } from "./Buckets";
 import { EnrollmentDialog } from "./Users";
 
 export default function Accounts() {
   const data = poll(() => api.accounts(), 10000);
-  const block = poll(() => api.publicAccess(), 10000);
   const [name, setName] = createSignal("");
   const [link, setLink] = createSignal<{ user: string; url?: string | null; path: string }>();
   const create = async (e: SubmitEvent) => {
@@ -42,7 +40,6 @@ export default function Accounts() {
         console through an enrollment link, and may do anything in its account. The operator account's users are the
         superadmins: it owns no buckets.
       </p>
-      <Show when={block.data()}>{(b) => <ClusterBlock block={b()} changed={block.refresh} />}</Show>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
         {(list) => (
           <Panel>

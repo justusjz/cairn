@@ -210,6 +210,7 @@ const MIGRATIONS: &[&str] = &[
     SSE_C_SEALED,
     OPERATOR_MEMBERS,
     MANAGED_POLICIES,
+    ACCOUNT_PUBLIC_ACCESS_BLOCK,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1685,6 +1686,24 @@ CREATE TRIGGER managed_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TR
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER role_attached_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON role_attached_policies
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 41: an account's public access block (see
+/// `s3::buckets::public_access`), as S3's account-level one (S3 Control's
+/// PutPublicAccessBlock), its flags as the buckets' bits (migration 32).
+/// NULL: it has none, as a new account doesn't. It replaces the settings
+/// `block-public-policy` and `restrict-public-buckets`, which applied to
+/// every account: those that were on carry over into every tenant account's
+/// block, so that no bucket opens up, and go.
+const ACCOUNT_PUBLIC_ACCESS_BLOCK: &str = r#"
+ALTER TABLE accounts ADD COLUMN public_access_block smallint
+    CHECK (public_access_block BETWEEN 0 AND 15);
+UPDATE accounts SET public_access_block =
+    CASE WHEN EXISTS (SELECT 1 FROM settings WHERE name = 'block-public-policy' AND value <> '0') THEN 4 ELSE 0 END
+    | CASE WHEN EXISTS (SELECT 1 FROM settings WHERE name = 'restrict-public-buckets' AND value <> '0') THEN 8 ELSE 0 END
+WHERE NOT operator
+  AND EXISTS (SELECT 1 FROM settings WHERE name IN ('block-public-policy', 'restrict-public-buckets') AND value <> '0');
+DELETE FROM settings WHERE name IN ('block-public-policy', 'restrict-public-buckets');
 "#;
 
 #[cfg(test)]

@@ -78,7 +78,7 @@ struct Loaded {
     account: Option<String>,
     policy: Option<Arc<Policy>>,
     /// Whether its policy is public, and RestrictPublicBuckets is on (the
-    /// bucket's or the cluster's; see `public_access`): then it allows
+    /// bucket's or its account's; see `public_access`): then it allows
     /// nothing to anyone outside the bucket's account, anonymous or not, not
     /// even what it allows another account by name (as in S3).
     restricted: bool,
@@ -169,10 +169,9 @@ impl Access {
             .get()
             .await?
             .query_opt_cached(
-                "SELECT policy, policy_principals::text, account_id,
-                        public_access_block & 8 <> 0
-                        OR coalesce((SELECT value FROM settings WHERE name = 'restrict-public-buckets'), '0') <> '0'
-                 FROM buckets WHERE name = $1",
+                "SELECT b.policy, b.policy_principals::text, b.account_id,
+                        coalesce(b.public_access_block, 0) & 8 <> 0 OR coalesce(a.public_access_block, 0) & 8 <> 0
+                 FROM buckets b JOIN accounts a ON a.id = b.account_id WHERE b.name = $1",
                 &[&bucket],
             )
             .await?;

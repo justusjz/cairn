@@ -47,6 +47,12 @@
 --   B(b)    The bucket's row. Shared: writing objects or uploads in it,
 --           reading its versioning state. Exclusive: changing the versioning
 --           state, deleting the bucket.
+--   A(a)    The account's row. Shared, as FOR SHARE (not KEY SHARE: what it
+--           guards is changed by a plain UPDATE): setting a bucket's policy,
+--           which reads the account's public access block (I12). Exclusive,
+--           as that plain UPDATE: setting the block (T41). The FK checks of
+--           what references the account take FOR KEY SHARE, which conflicts
+--           with neither.
 --   U(u)    The upload's row. Shared: attaching a part to it. Exclusive:
 --           completing or aborting it.
 --   P(u,n)  An advisory lock per part number of an upload
@@ -171,13 +177,18 @@
 --     a bucket with Object Lock, which stays versioned (T10, and the
 --     `buckets_lock_versioned` constraint). The `objects_locked` trigger is
 --     the backstop for legal holds and compliance mode.
+-- I12. A public bucket policy is only set while neither the bucket's public
+--     access block nor its account's has BlockPublicPolicy. (A block set
+--     later leaves a policy that's there, as in S3.) Guards: B(b) for the
+--     bucket's block, A(a) for the account's: T27 holds both while it checks
+--     them, T32 changes the bucket's under B, T41 the account's under A.
 --
 -- DEADLOCKS
 --
 -- There are none, by three rules, which every transaction follows:
 --
 -- A. All of a transaction's locks are taken up front, in one global order:
---    B, U, P, S (by stripe), K (by lock id), G (by primary key), R, X (by
+--    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, X (by
 --    blob id), each stripe in one mode, each blob
 --    in its final mode (exclusive wins over shared). A transaction that waits
 --    for a lock therefore only ever waits for one that comes later in the
@@ -1595,23 +1606,23 @@ $$;
 
 -- T27: PutBucketPolicy and DeleteBucketPolicy: sets (or, with NULL, removes)
 -- the bucket's policy, unless it's public (`p_public`) and the bucket's
--- public access block, or the cluster's `block-public-policy`, blocks public
--- policies ('blocked'). Takes the bucket's row as a plain UPDATE does (no
--- key update), and checks the block under it, so that a PutPublicAccessBlock
--- (T32) lands entirely before or after. No invariant involves the policy,
--- which requests read as they begin, not under B. 'set', 'blocked' or
--- 'no_such_bucket'.
+-- public access block, or its account's, blocks public policies ('blocked')
+-- (I12). Takes B(b) as a plain UPDATE does (no key update), then A(a) shared,
+-- and checks both blocks in a later statement, so that a PutPublicAccessBlock
+-- of either (T32, T41) lands entirely before or after. Requests read the
+-- policy as they begin, not under B. 'set', 'blocked' or 'no_such_bucket'.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_set_policy(p_bucket text, p_policy text, p_public boolean)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
-    v_block smallint;
+    v_account text;
 BEGIN
-    SELECT public_access_block INTO v_block FROM buckets WHERE name = p_bucket FOR NO KEY UPDATE;
+    SELECT account_id INTO v_account FROM buckets WHERE name = p_bucket FOR NO KEY UPDATE;
     IF NOT FOUND THEN
         RETURN 'no_such_bucket';
     END IF;
-    IF p_public AND (coalesce(v_block, 0) & 4 <> 0
-                     OR coalesce((SELECT value FROM settings WHERE name = 'block-public-policy'), '0') <> '0') THEN
+    PERFORM 1 FROM accounts WHERE id = v_account FOR SHARE;
+    IF p_public AND (coalesce((SELECT public_access_block FROM buckets WHERE name = p_bucket), 0) & 4 <> 0
+                     OR coalesce((SELECT public_access_block FROM accounts WHERE id = v_account), 0) & 4 <> 0) THEN
         RETURN 'blocked';
     END IF;
     UPDATE buckets SET policy = p_policy WHERE name = p_bucket;
@@ -1626,6 +1637,18 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_set_public_access_block(p_bucket text, 
 RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE buckets SET public_access_block = p_block WHERE name = p_bucket;
+    RETURN FOUND;
+END
+$$;
+
+-- T41: S3 Control's PutPublicAccessBlock and DeletePublicAccessBlock: sets
+-- (or, with NULL, removes) the account's public access block. A plain UPDATE
+-- of the account's row, which is A(a) exclusive (I12), and holds nothing
+-- else. Returns whether the account exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_account_public_access_block(p_account text, p_block smallint)
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE accounts SET public_access_block = p_block WHERE id = p_account;
     RETURN FOUND;
 END
 $$;

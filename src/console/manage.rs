@@ -91,7 +91,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(get_bucket_access))
         .routes(routes!(put_bucket_policy, delete_bucket_policy))
         .routes(routes!(put_public_access_block, delete_public_access_block))
-        .routes(routes!(get_public_access))
+        .routes(routes!(get_account_block, put_account_block, delete_account_block))
         .routes(routes!(upload, delete_object))
         .routes(routes!(set_versioning))
         .routes(routes!(set_bucket_tags))
@@ -817,6 +817,9 @@ pub(super) struct BucketSummary {
     public: bool,
     /// Its public access block, if it has one.
     public_access_block: Option<crate::s3::buckets::public_access::Block>,
+    /// Its account's public access block, if it has one, which applies to
+    /// the bucket as well.
+    account_public_access_block: Option<crate::s3::buckets::public_access::Block>,
     /// Whether it has Object Lock enabled (see `s3::object_lock`).
     object_lock: bool,
 }
@@ -901,10 +904,14 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
-    // Each bucket's policy (whether it's public), and its block.
-    let mut access: HashMap<String, (bool, Option<crate::s3::buckets::public_access::Block>)> = HashMap::new();
+    // Each bucket's policy (whether it's public), its block and its
+    // account's.
+    type Blocks = (Option<crate::s3::buckets::public_access::Block>, Option<crate::s3::buckets::public_access::Block>);
+    let mut access: HashMap<String, (bool, Blocks)> = HashMap::new();
     let mut locked: HashSet<String> = HashSet::new();
-    for row in client.query_cached("SELECT name, policy, public_access_block, object_lock FROM buckets", &[]).await? {
+    let query = "SELECT b.name, b.policy, b.public_access_block, b.object_lock, a.public_access_block
+                 FROM buckets b JOIN accounts a ON a.id = b.account_id";
+    for row in client.query_cached(query, &[]).await? {
         let name: String = row.get(0);
         if row.get::<_, bool>(3) {
             locked.insert(name.clone());
@@ -915,8 +922,8 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
                 .is_public(),
             None => false,
         };
-        let block = row.get::<_, Option<i16>>(2).map(crate::s3::buckets::public_access::Block::from_bits);
-        access.insert(name, (public, block));
+        let block = |i| row.get::<_, Option<i16>>(i).map(crate::s3::buckets::public_access::Block::from_bits);
+        access.insert(name, (public, (block(2), block(4))));
     }
     Ok(buckets
         .into_iter()
@@ -930,7 +937,8 @@ pub(super) async fn buckets(app: &App) -> anyhow::Result<Vec<BucketSummary>> {
                 default_kms_key: defaults.remove(&b.name),
                 tags: tags.remove(&b.name).as_deref().map(tag_list).unwrap_or_default(),
                 public: access.get(&b.name).is_some_and(|(public, _)| *public),
-                public_access_block: access.remove(&b.name).and_then(|(_, block)| block),
+                public_access_block: access.get(&b.name).and_then(|(_, (block, _))| *block),
+                account_public_access_block: access.remove(&b.name).and_then(|(_, (_, block))| block),
                 object_lock: locked.contains(&b.name),
                 name: b.name,
                 account: b.account,
@@ -1013,9 +1021,9 @@ struct BucketAccess {
     public: bool,
     /// Its public access block; `null` if it has none.
     public_access_block: Option<crate::s3::buckets::public_access::Block>,
-    /// The cluster's (only its policy flags count), which applies to every
-    /// bucket as well.
-    cluster: crate::s3::buckets::public_access::Block,
+    /// Its account's public access block, if it has one, which applies to
+    /// the bucket as well.
+    account_public_access_block: Option<crate::s3::buckets::public_access::Block>,
     /// The bucket's account's users whose own policies (inline and
     /// attached) give them access to the whole bucket, and what.
     users: Vec<UserAccess>,
@@ -1109,6 +1117,7 @@ async fn get_bucket_access(
     let public_access_block = public_access::get(&app, &bucket).await?.ok_or_else(no_bucket)?;
     // Its account's users, if the actor may see them.
     let owner: String = client.query_one_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await?.get(0);
+    let account_public_access_block = public_access::account(&client, &owner).await?;
     let users = match owner == actor.account() && actor.allows(&app, "iam:ListUsers", On::Users(owner.clone())).await? {
         true => who_has_access(&client, &owner, std::slice::from_ref(&bucket))
             .await?
@@ -1119,7 +1128,7 @@ async fn get_bucket_access(
             .collect(),
         false => Vec::new(),
     };
-    Ok(Json(BucketAccess { policy, public, public_access_block, cluster: public_access::cluster(&client).await?, users }))
+    Ok(Json(BucketAccess { policy, public, public_access_block, account_public_access_block, users }))
 }
 
 /// Sets a bucket's policy, as PutBucketPolicy does: checked as S3 checks
@@ -1192,7 +1201,7 @@ async fn put_public_access_block(
     }
 }
 
-/// Removes a bucket's public access block: only the cluster's applies.
+/// Removes a bucket's public access block: only its account's applies.
 #[utoipa::path(delete, path = "/buckets/{bucket}/public-access-block", params(("bucket" = String, Path)), responses(
     (status = 204, description = "Removed"),
     (status = "4XX", body = ErrorBody),
@@ -1211,14 +1220,51 @@ async fn delete_public_access_block(
     }
 }
 
-/// The cluster's public access block: its settings `block-public-policy`
-/// and `restrict-public-buckets` (set with `PUT /settings/{name}`).
-#[utoipa::path(get, path = "/public-access", responses(
-    (status = 200, body = crate::s3::buckets::public_access::Block),
+/// The actor's account's public access block, as S3 Control's
+/// GetPublicAccessBlock gets it: `null` if it has none.
+#[utoipa::path(get, path = "/account/public-access-block", responses(
+    (status = 200, body = Option<crate::s3::buckets::public_access::Block>),
+    (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn get_public_access(State(app): AppState) -> Result<Json<crate::s3::buckets::public_access::Block>> {
-    Ok(Json(crate::s3::buckets::public_access::cluster(&app.pool.get().await?).await?))
+async fn get_account_block(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+) -> Result<Json<Option<crate::s3::buckets::public_access::Block>>> {
+    actor.check(&app, "s3:GetAccountPublicAccessBlock", On::Account).await?;
+    Ok(Json(crate::s3::buckets::public_access::account(&app.pool.get().await?, actor.account()).await?))
+}
+
+/// Sets the actor's account's public access block, which every one of its
+/// buckets gets too, as S3 Control's PutPublicAccessBlock does.
+#[utoipa::path(put, path = "/account/public-access-block",
+    request_body = crate::s3::buckets::public_access::Block, responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn put_account_block(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<crate::s3::buckets::public_access::Block>,
+) -> Result<StatusCode> {
+    actor.check(&app, "s3:PutAccountPublicAccessBlock", On::Account).await?;
+    crate::s3::buckets::public_access::set_account(&app, actor.account(), Some(body)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes the actor's account's public access block: only its buckets'
+/// own apply.
+#[utoipa::path(delete, path = "/account/public-access-block", responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_account_block(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<StatusCode> {
+    // DeletePublicAccessBlock is authorized as its put, in S3.
+    actor.check(&app, "s3:PutAccountPublicAccessBlock", On::Account).await?;
+    crate::s3::buckets::public_access::set_account(&app, actor.account(), None).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ─── Objects ─────────────────────────────────────────────────────────────────
@@ -3185,8 +3231,8 @@ mod e2e {
         assert_eq!(body["configuration"], Value::Null);
     }
 
-    /// A bucket's policy and public access block, as its account's admin
-    /// edits them, and the cluster's block, as a superadmin sets it.
+    /// A bucket's policy and public access block, and its account's block,
+    /// as the account's admin edits them (and a superadmin can't).
     #[tokio::test]
     async fn edits_bucket_access() {
         let Some(app) = node().await else { return };
@@ -3201,7 +3247,7 @@ mod e2e {
         let (_, first) = admin.send("GET", &access, None).await;
         assert_eq!((&first["policy"], &first["public"]), (&Value::Null, &Value::Bool(false)));
         assert_eq!(first["public_access_block"], all);
-        assert_eq!(first["cluster"]["block_public_policy"], false);
+        assert_eq!(first["account_public_access_block"], Value::Null);
 
         let document = format!(
             r#"{{"Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
@@ -3226,19 +3272,25 @@ mod e2e {
         let (_, listed) = admin.send("GET", "/api/buckets", None).await;
         assert_eq!(listed[0]["public"], true);
 
-        // The cluster's block: the operator's.
-        let setting = || "/api/settings/block-public-policy";
-        let on = |value: i64| Some(json!({ "value": value }));
-        assert_eq!(admin.send("PUT", setting(), on(1)).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(ops.send("PUT", setting(), on(1)).await.0, StatusCode::OK);
-        assert_eq!(admin.send("GET", &access, None).await.1["cluster"]["block_public_policy"], true);
+        // The account's block: its own, not the operator's.
+        let account = "/api/account/public-access-block";
+        let policies = json!({
+            "block_public_acls": false, "ignore_public_acls": false,
+            "block_public_policy": true, "restrict_public_buckets": false,
+        });
+        assert_eq!(admin.send("GET", account, None).await, (StatusCode::OK, Value::Null));
+        assert_eq!(ops.send("PUT", account, Some(policies.clone())).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(ops.send("PUT", "/api/settings/block-public-policy", Some(json!({ "value": 1 }))).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(admin.send("PUT", account, Some(policies.clone())).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("GET", account, None).await.1, policies);
+        assert_eq!(admin.send("GET", &access, None).await.1["account_public_access_block"], policies);
+        let (_, listed) = admin.send("GET", "/api/buckets", None).await;
+        assert_eq!(listed[0]["account_public_access_block"], policies);
         assert_eq!(admin.send("DELETE", &policy, None).await.0, StatusCode::NO_CONTENT);
         assert_eq!(admin.send("PUT", &policy, public()).await.0, StatusCode::FORBIDDEN);
-        for browser in [&mut admin, &mut ops] {
-            let (_, block) = browser.send("GET", "/api/public-access", None).await;
-            assert_eq!(block["block_public_policy"], true);
-        }
-        assert_eq!(ops.send("PUT", setting(), on(2)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(admin.send("DELETE", account, None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("GET", account, None).await.1, Value::Null);
+        assert_eq!(admin.send("PUT", &policy, public()).await.0, StatusCode::NO_CONTENT);
 
         assert_eq!(admin.send("DELETE", &block, None).await.0, StatusCode::NO_CONTENT);
         assert_eq!(admin.send("GET", &access, None).await.1["public_access_block"], Value::Null);
@@ -3578,20 +3630,16 @@ struct SettingChanged {
 }
 
 /// The settings that the console changes this way: those of how blobs are
-/// stored, and repaired, and the cluster's public access block.
+/// stored, and repaired.
 const REDUNDANCY: &[&crate::settings::Setting] = &[
     &crate::settings::DATA_SHARDS,
     &crate::settings::PARITY_SHARDS,
     &crate::settings::REPAIR_AFTER,
-    &crate::settings::BLOCK_PUBLIC_POLICY,
-    &crate::settings::RESTRICT_PUBLIC_BUCKETS,
 ];
 
 /// Sets one of the redundancy settings (`data-shards`, `parity-shards`,
-/// `repair-after`), or of the cluster's public access block
-/// (`block-public-policy`, `restrict-public-buckets`: 0 or 1), for the whole
-/// cluster, as `cairn config set` does. The node answering goes by it right
-/// away, the others within a heartbeat (the public access block's, at once).
+/// `repair-after`) for the whole cluster, as `cairn config set` does. The
+/// node answering goes by it right away, the others within a heartbeat.
 #[utoipa::path(put, path = "/settings/{name}", params(("name" = String, Path)),
     request_body = NewSetting, responses(
         (status = 200, body = SettingChanged),

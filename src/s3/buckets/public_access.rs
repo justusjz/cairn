@@ -1,19 +1,25 @@
 //! Block Public Access: a bucket's public access block
 //! (GetPublicAccessBlock, PutPublicAccessBlock, DeletePublicAccessBlock,
-//! `?publicAccessBlock`), and the cluster's (the settings
-//! `block-public-policy` and `restrict-public-buckets`, S3's account-level
-//! block), which count together: a flag is on if either has it.
+//! `?publicAccessBlock`), and its account's (S3 Control's operations of the
+//! same names, on `/v20180820/configuration/publicAccessBlock`), which count
+//! together: a flag is on if either has it.
 //!
 //! - `BlockPublicPolicy`: a public bucket policy (`Policy::is_public`) is
 //!   refused when it's set (`policy`).
-//! - `RestrictPublicBuckets`: a bucket's public policy allows anonymous
-//!   requests nothing (`access`); the cluster's users keep what it allows
-//!   them, as an account's do in S3.
+//! - `RestrictPublicBuckets`: a bucket's public policy allows nothing to
+//!   anyone outside the bucket's account, anonymous requests included
+//!   (`access`); its own account's users keep what it allows them, as in S3.
 //! - `BlockPublicAcls`, `IgnorePublicAcls`: kept and told, as S3 does; Cairn
 //!   refuses every ACL but `private` anyway (`acl`), so both always hold.
 //!
 //! New buckets have all four, as S3's do since 2023; the buckets made before
-//! there were blocks have none.
+//! there were blocks have none. New accounts have none, as AWS's.
+//!
+//! An account's block is its own to set (`s3:PutAccountPublicAccessBlock`),
+//! by its root and whom its policies allow: not the operator's, which is to
+//! Cairn's tenants as AWS is to its accounts. S3 Control's clients name the
+//! account in the request's host too (`<account>.<endpoint>`), so they're
+//! told apart by the path and the `x-amz-account-id` header (`is_control`).
 
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
@@ -79,7 +85,7 @@ impl Block {
         Some(Block::from_bits(bits))
     }
 
-    fn xml(self) -> String {
+    fn xml(self, xmlns: &str) -> String {
         let flags: String = self
             .flags()
             .iter()
@@ -88,7 +94,7 @@ impl Block {
             .collect();
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-             <PublicAccessBlockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{flags}\
+             <PublicAccessBlockConfiguration xmlns=\"{xmlns}\">{flags}\
              </PublicAccessBlockConfiguration>"
         )
     }
@@ -121,16 +127,31 @@ pub async fn set(app: &App, bucket: &str, block: Option<Block>) -> anyhow::Resul
         .get(0))
 }
 
-/// The cluster's own flags, the settings (see the module's doc): its
-/// `block-public-policy` and `restrict-public-buckets`.
-pub async fn cluster<C: deadpool_postgres::GenericClient>(client: &C) -> anyhow::Result<Block> {
-    use crate::settings::{BLOCK_PUBLIC_POLICY, RESTRICT_PUBLIC_BUCKETS};
-    Ok(Block {
-        block_public_policy: BLOCK_PUBLIC_POLICY.get(client).await? != 0,
-        restrict_public_buckets: RESTRICT_PUBLIC_BUCKETS.get(client).await? != 0,
-        ..Block::default()
-    })
+/// An account's public access block (none, if it has none).
+pub async fn account<C: deadpool_postgres::GenericClient>(client: &C, account: &str) -> anyhow::Result<Option<Block>> {
+    let row = client
+        .query_opt_cached("SELECT public_access_block FROM accounts WHERE id = $1", &[&account])
+        .await?;
+    Ok(row.and_then(|row| row.get::<_, Option<i16>>(0)).map(Block::from_bits))
 }
+
+/// Sets (`None`: removes) an account's public access block (T41). Whether
+/// the account exists.
+pub async fn set_account(app: &App, account: &str, block: Option<Block>) -> anyhow::Result<bool> {
+    Ok(app
+        .pool
+        .get()
+        .await?
+        .query_one_cached(
+            "SELECT pg_temp.cairn_set_account_public_access_block($1, $2)",
+            &[&account, &block.map(Block::bits)],
+        )
+        .await?
+        .get(0))
+}
+
+const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+const CONTROL_XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
     format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
@@ -140,12 +161,8 @@ fn no_such_bucket() -> Response<Full<Bytes>> {
 pub async fn get_public_access_block(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(match get(app, bucket).await? {
         None => no_such_bucket(),
-        Some(None) => format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchPublicAccessBlockConfiguration",
-            "The public access block configuration was not found",
-        ),
-        Some(Some(block)) => xml_ok(block.xml()),
+        Some(None) => no_such_block(),
+        Some(Some(block)) => xml_ok(block.xml(S3_XMLNS)),
     })
 }
 
@@ -153,11 +170,7 @@ pub async fn get_public_access_block(app: &App, bucket: &str) -> anyhow::Result<
 /// 200, as in S3.
 pub async fn put_public_access_block(app: &App, bucket: &str, body: Bytes) -> anyhow::Result<Response<Full<Bytes>>> {
     let Some(block) = Block::parse(&body) else {
-        return Ok(format_s3_error(
-            StatusCode::BAD_REQUEST,
-            "MalformedXML",
-            "The XML you provided was not well-formed or did not validate against our published schema",
-        ));
+        return Ok(malformed());
     };
     Ok(match set(app, bucket, Some(block)).await? {
         true => Response::new(Full::new(Bytes::new())),
@@ -170,6 +183,76 @@ pub async fn delete_public_access_block(app: &App, bucket: &str) -> anyhow::Resu
     Ok(match set(app, bucket, None).await? {
         true => Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap(),
         false => no_such_bucket(),
+    })
+}
+
+fn no_such_block() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::NOT_FOUND,
+        "NoSuchPublicAccessBlockConfiguration",
+        "The public access block configuration was not found",
+    )
+}
+
+fn malformed() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::BAD_REQUEST,
+        "MalformedXML",
+        "The XML you provided was not well-formed or did not validate against our published schema",
+    )
+}
+
+/// S3 Control's path for an account's public access block.
+pub const CONTROL_PATH: &str = "/v20180820/configuration/publicAccessBlock";
+
+/// Whether a request to `path` (as sent, whatever its host) with `headers`
+/// is S3 Control's, on an account's public access block: S3 Control's
+/// requests name their account in `x-amz-account-id`, which S3's don't
+/// send. (Without it, the path is a key `configuration/publicAccessBlock`
+/// in a bucket `v20180820`.)
+pub fn is_control(path: &str, headers: &hyper::HeaderMap) -> bool {
+    path == CONTROL_PATH && headers.contains_key("x-amz-account-id")
+}
+
+/// What an S3 Control request on an account's block is: its operation and
+/// the action it needs (deleting it is its `Put` action, as in S3).
+pub fn control_operation(method: &hyper::Method) -> Option<(&'static str, &'static str)> {
+    match *method {
+        hyper::Method::GET => Some(("GetPublicAccessBlock", "s3:GetAccountPublicAccessBlock")),
+        hyper::Method::PUT => Some(("PutPublicAccessBlock", "s3:PutAccountPublicAccessBlock")),
+        hyper::Method::DELETE => Some(("DeletePublicAccessBlock", "s3:PutAccountPublicAccessBlock")),
+        _ => None,
+    }
+}
+
+/// S3 Control's GetPublicAccessBlock, PutPublicAccessBlock (`body`: its
+/// document) or DeletePublicAccessBlock on `account`'s block, which the
+/// request is allowed. Put and Delete answer 200, as their model says
+/// (botocore's `s3control`: no other response code).
+pub async fn control(
+    app: &App,
+    method: &hyper::Method,
+    account: &str,
+    body: Option<Bytes>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let empty = || Response::new(Full::new(Bytes::new()));
+    Ok(match (method, body) {
+        (&hyper::Method::GET, _) => match self::account(&app.pool.get().await?, account).await? {
+            Some(block) => xml_ok(block.xml(CONTROL_XMLNS)),
+            None => no_such_block(),
+        },
+        (&hyper::Method::PUT, Some(body)) => match Block::parse(&body) {
+            Some(block) => {
+                set_account(app, account, Some(block)).await?;
+                empty()
+            }
+            None => malformed(),
+        },
+        (&hyper::Method::DELETE, _) => {
+            set_account(app, account, None).await?;
+            empty()
+        }
+        _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
     })
 }
 
@@ -190,7 +273,7 @@ mod tests {
             assert_eq!(Block::parse(doc(bad).as_bytes()), None, "{bad}");
         }
         assert_eq!(Block::parse(b"<Other/>"), None);
-        let xml = Block::from_bits(15).xml();
+        let xml = Block::from_bits(15).xml(CONTROL_XMLNS);
         assert_eq!(Block::parse(xml.as_bytes()), Some(Block::from_bits(15)));
         assert!(xml.contains("<BlockPublicAcls>true</BlockPublicAcls><IgnorePublicAcls>true</IgnorePublicAcls>"));
     }

@@ -247,6 +247,30 @@ async fn cors_waits_only_for_bucket_changes() {
     assert!(!missing);
 }
 
+/// I12: a public policy waits for a change of its account's public access
+/// block (A), and then finds it blocks public policies.
+#[tokio::test]
+async fn a_public_policy_waits_for_its_accounts_block() {
+    let Some(app) = node().await else { return };
+    let account = crate::roles::account(&connection(&app).await).await.unwrap();
+    let public = format!(
+        r#"{{"Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
+    );
+    let set = "SELECT pg_temp.cairn_set_policy($1, $2, true)";
+    connection(&app).await.query_one("SELECT pg_temp.cairn_set_public_access_block($1, NULL)", &[&BUCKET]).await.unwrap();
+    let mut held = connection(&app).await;
+    let tx = held.transaction().await.unwrap();
+    let block = "SELECT pg_temp.cairn_set_account_public_access_block($1, 4::smallint)";
+    assert!(tx.query_one(block, &[&account]).await.unwrap().get::<_, bool>(0));
+    let app2 = app.clone();
+    let setting = tokio::spawn(async move {
+        connection(&app2).await.query_one(set, &[&BUCKET, &public]).await.unwrap().get::<_, String>(0)
+    });
+    assert_waits(&setting).await;
+    tx.commit().await.unwrap();
+    assert_eq!(setting.await.unwrap(), "blocked");
+}
+
 /// I10: a user's second access key, made but not committed, holds the
 /// user's row: a third waits for it, and then finds two.
 #[tokio::test]

@@ -18,6 +18,112 @@
     }
   ],
   "paths": {
+    "/account/public-access-block": {
+      "get": {
+        "summary": "The actor's account's public access block, as S3 Control's\nGetPublicAccessBlock gets it: `null` if it has none.",
+        "operationId": "get_account_block",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Block"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets the actor's account's public access block, which every one of its\nbuckets gets too, as S3 Control's PutPublicAccessBlock does.",
+        "operationId": "put_account_block",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Block"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes the actor's account's public access block: only its buckets'\nown apply.",
+        "operationId": "delete_account_block",
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/accounts": {
       "get": {
         "operationId": "list_accounts",
@@ -1029,7 +1135,7 @@
         }
       },
       "delete": {
-        "summary": "Removes a bucket's public access block: only the cluster's applies.",
+        "summary": "Removes a bucket's public access block: only its account's applies.",
         "operationId": "delete_public_access_block",
         "parameters": [
           {
@@ -2537,32 +2643,6 @@
         }
       }
     },
-    "/public-access": {
-      "get": {
-        "summary": "The cluster's public access block: its settings `block-public-policy`\nand `restrict-public-buckets` (set with `PUT /settings/{name}`).",
-        "operationId": "get_public_access",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Block"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/roles": {
       "get": {
         "operationId": "list_roles",
@@ -3216,7 +3296,7 @@
     },
     "/settings/{name}": {
       "put": {
-        "summary": "Sets one of the redundancy settings (`data-shards`, `parity-shards`,\n`repair-after`), or of the cluster's public access block\n(`block-public-policy`, `restrict-public-buckets`: 0 or 1), for the whole\ncluster, as `cairn config set` does. The node answering goes by it right\naway, the others within a heartbeat (the public access block's, at once).",
+        "summary": "Sets one of the redundancy settings (`data-shards`, `parity-shards`,\n`repair-after`) for the whole cluster, as `cairn config set` does. The\nnode answering goes by it right away, the others within a heartbeat.",
         "operationId": "set_setting",
         "parameters": [
           {
@@ -3631,13 +3711,19 @@
         "description": "Who may get at a bucket, besides its users' grants and policies: its\npolicy, and its public access block (see `s3::buckets::public_access`).",
         "required": [
           "public",
-          "cluster",
           "users"
         ],
         "properties": {
-          "cluster": {
-            "$ref": "#/components/schemas/Block",
-            "description": "The cluster's (only its policy flags count), which applies to every\nbucket as well."
+          "account_public_access_block": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Block",
+                "description": "Its account's public access block, if it has one, which applies to\nthe bucket as well."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "policy": {
             "type": [
@@ -3724,6 +3810,17 @@
           "account": {
             "type": "string",
             "description": "The account that owns it."
+          },
+          "account_public_access_block": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Block",
+                "description": "Its account's public access block, if it has one, which applies to\nthe bucket as well."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "bytes": {
             "type": "integer",

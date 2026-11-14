@@ -40,10 +40,12 @@ function objectUrl(bucket: string, key: string) {
 }
 
 /** Whether a bucket is open to anyone, as its policy, its public access
- * block and the cluster's say. */
-function PublicAccess(props: { bucket: Bucket; cluster: PublicAccessBlock }) {
-  const restricted = () => !!props.bucket.public_access_block?.restrict_public_buckets || props.cluster.restrict_public_buckets;
-  const blocked = () => !!props.bucket.public_access_block?.block_public_policy || props.cluster.block_public_policy;
+ * block and its account's say. */
+function PublicAccess(props: { bucket: Bucket }) {
+  const either = (key: "restrict_public_buckets" | "block_public_policy") =>
+    !!props.bucket.public_access_block?.[key] || !!props.bucket.account_public_access_block?.[key];
+  const restricted = () => either("restrict_public_buckets");
+  const blocked = () => either("block_public_policy");
   return (
     <Switch fallback={<span class="subtle">not blocked</span>}>
       <Match when={props.bucket.public && !restricted()}>
@@ -66,39 +68,53 @@ function PublicAccess(props: { bucket: Bucket; cluster: PublicAccessBlock }) {
   );
 }
 
-/** The cluster's public access block, which every bucket gets too: the
- * operator's to set (on the Accounts page). */
-export function ClusterBlock(props: { block: PublicAccessBlock; changed: () => void }) {
-  const set = async (name: string, on: boolean) => {
-    if (await act(() => api.setSetting(name, on ? 1 : 0), `${name} ${on ? "on" : "off"}`)) props.changed();
+const NO_BLOCK: PublicAccessBlock = {
+  block_public_acls: false,
+  ignore_public_acls: false,
+  block_public_policy: false,
+  restrict_public_buckets: false,
+};
+
+/** The account's public access block (S3 Control's), which every one of
+ * its buckets gets too, whatever its own says: shown to whom may read it,
+ * and changed by whom may set it. */
+function AccountBlock(props: { changed: () => void }) {
+  const block = poll(() => api.accountBlock(), 30000);
+  const set = async (key: keyof PublicAccessBlock, on: boolean) => {
+    const next = { ...(block.data() ?? NO_BLOCK), [key]: on };
+    const label = key === "block_public_policy" ? "Blocking public policies" : "Restricting public buckets";
+    if (await act(() => api.putAccountBlock(next), `${label} in every bucket: ${on ? "on" : "off"}`)) {
+      block.refresh();
+      props.changed();
+    }
   };
   return (
-    <div class="toolbar">
-      <span class="subtle">For every bucket:</span>
-      <label class="check" title="Refuse bucket policies that make a bucket public, whatever its own block says">
-        <input
-          type="checkbox"
-          checked={props.block.block_public_policy}
-          onChange={(e) => set("block-public-policy", e.currentTarget.checked)}
-        />
-        Block public policies
-      </label>
-      <label class="check" title="Let no public bucket policy allow unsigned requests anything">
-        <input
-          type="checkbox"
-          checked={props.block.restrict_public_buckets}
-          onChange={(e) => set("restrict-public-buckets", e.currentTarget.checked)}
-        />
-        Restrict public buckets
-      </label>
-    </div>
+    <Show when={!block.error() && block.data() !== undefined}>
+      <div class="toolbar">
+        <span class="subtle">For every bucket of this account:</span>
+        <label class="check" title="Refuse bucket policies that make a bucket public, whatever its own block says">
+          <input
+            type="checkbox"
+            checked={!!block.data()?.block_public_policy}
+            onChange={(e) => set("block_public_policy", e.currentTarget.checked)}
+          />
+          Block public policies
+        </label>
+        <label class="check" title="Let no public bucket policy allow anyone outside the account, unsigned requests included, anything">
+          <input
+            type="checkbox"
+            checked={!!block.data()?.restrict_public_buckets}
+            onChange={(e) => set("restrict_public_buckets", e.currentTarget.checked)}
+          />
+          Restrict public buckets
+        </label>
+      </div>
+    </Show>
   );
 }
 
 export function BucketList() {
-  const data = poll(() => Promise.all([api.buckets(), api.publicAccess()]));
-  const buckets = { data: () => data.data()?.[0], error: data.error, refresh: data.refresh };
-  const cluster = () => data.data()?.[1];
+  const buckets = poll(() => api.buckets());
   const [name, setName] = createSignal("");
   const [objectLock, setObjectLock] = createSignal(false);
   const create = async (e: SubmitEvent) => {
@@ -134,6 +150,7 @@ export function BucketList() {
           </button>
         </form>
       </div>
+      <AccountBlock changed={buckets.refresh} />
       <Show when={buckets.data()} fallback={<Loading error={buckets.error()} />}>
         {(list) => (
           <Panel>
@@ -182,7 +199,7 @@ export function BucketList() {
                       </Show>
                     </td>
                     <td>
-                      <PublicAccess bucket={b} cluster={cluster()!} />
+                      <PublicAccess bucket={b} />
                     </td>
                     <td class="num">{num(b.objects)}</td>
                     <td class="num">{bytes(b.bytes)}</td>
@@ -454,7 +471,7 @@ const FLAGS: { key: keyof PublicAccessBlock; label: string; note: string }[] = [
   {
     key: "restrict_public_buckets",
     label: "Restrict public buckets",
-    note: "A public policy allows unsigned requests nothing; the cluster's users keep what it allows them.",
+    note: "A public policy allows nothing to anyone outside the bucket's account, unsigned requests included; the account's users keep what it allows them.",
   },
   { key: "block_public_acls", label: "Block public ACLs", note: "Kept for S3 clients: Cairn refuses every ACL but private anyway." },
   { key: "ignore_public_acls", label: "Ignore public ACLs", note: "Likewise." },
@@ -500,7 +517,7 @@ function AccessDialog(props: { bucket: string; onClose: () => void }) {
   };
   const saveBlock = () => run(() => api.putPublicAccessBlock(props.bucket, block()), `Saved the public access block of ${props.bucket}`);
   const removeBlock = () => {
-    if (!confirm(`Remove the public access block of "${props.bucket}"? Only the cluster's will apply.`)) return;
+    if (!confirm(`Remove the public access block of "${props.bucket}"? Only its account's will apply.`)) return;
     run(() => api.deletePublicAccessBlock(props.bucket), `Removed the public access block of ${props.bucket}`);
   };
   const savePolicy = () => run(() => api.putBucketPolicy(props.bucket, document()), `Saved the policy of ${props.bucket}`);
@@ -536,9 +553,12 @@ function AccessDialog(props: { bucket: string; onClose: () => void }) {
             </Table>
             <h3>Public access block</h3>
             <p class="subtle small">
-              <Show when={a().public_access_block} fallback="The bucket has no block of its own: only the cluster's applies.">
-                The bucket's own block. The cluster's applies as well
-                {a().cluster.block_public_policy || a().cluster.restrict_public_buckets ? " (it has some on)" : " (it has none on)"}.
+              <Show when={a().public_access_block} fallback="The bucket has no block of its own: only its account's applies.">
+                The bucket's own block. Its account's applies as well
+                {a().account_public_access_block?.block_public_policy || a().account_public_access_block?.restrict_public_buckets
+                  ? " (it has some on)"
+                  : " (it has none on)"}
+                .
               </Show>
             </p>
             <For each={FLAGS}>

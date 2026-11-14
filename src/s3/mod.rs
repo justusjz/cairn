@@ -198,6 +198,33 @@ async fn handle_request(
     // The secret the request's body (aws-chunked, trailers) is signed with;
     // none for an anonymous one, whose body can't be signed.
     let secret = principal.as_ref().map(|p| p.secret.clone()).unwrap_or_default();
+    // S3 Control's, on an account's public access block: the signer's own
+    // account's only, as an account's resources are (another's, or none, is
+    // a 403).
+    if public_access::is_control(req.uri().path(), req.headers()) {
+        use public_access::{control, control_operation};
+        let Some((_, action)) = control_operation(req.method()) else {
+            return Ok(box_response(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "")));
+        };
+        let named = req.headers().get("x-amz-account-id").and_then(|v| v.to_str().ok());
+        let Some(principal) = principal.as_ref().filter(|p| named == Some(p.account.as_str())) else {
+            return Ok(forbidden("AccessDenied", "Access Denied"));
+        };
+        access.load_all(&app, &[]).await?;
+        let check = actions::Check { action, on: actions::On::Account };
+        if let Some((check, verdict)) = access.first_denied(std::slice::from_ref(&check)) {
+            return Ok(box_response(access.denied(check, verdict)));
+        }
+        let method = req.method().clone();
+        let body = match method {
+            Method::PUT => match read_body(req, &secret, true).await? {
+                Ok(body) => Some(body),
+                Err(rejection) => return Ok(box_response(util::rejection_response(&rejection))),
+            },
+            _ => None,
+        };
+        return Ok(box_response(control(&app, &method, &principal.account, body).await?));
+    }
     // Every key, prefix, marker and delimiter must be well-formed, so check the
     // whole path and query once, before anything decodes them.
     let mut query_values =

@@ -135,7 +135,7 @@ pub async fn set(client: &Object, bucket: &str, policy: Option<&Checked>) -> any
 
 /// Why a public policy was refused.
 pub const BLOCKED: &str = "public policies are blocked by the BlockPublicPolicy block public access setting \
-                           (the bucket's, or the cluster's block-public-policy)";
+                           (the bucket's, or its account's)";
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
     format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
@@ -272,8 +272,8 @@ pub async fn run(
             match set(&client, &bucket, Some(&policy)).await? {
                 Set::Set => {}
                 Set::Blocked => anyhow::bail!(
-                    "{BLOCKED}: turn the bucket's off first (DeletePublicAccessBlock, or in the console), \
-                     or the cluster's (cairn config set block-public-policy 0)"
+                    "{BLOCKED}: turn it off first (DeletePublicAccessBlock, of the bucket or its account, \
+                     or in the console)"
                 ),
                 Set::NoSuchBucket => anyhow::bail!("no bucket named {bucket:?}"),
             }

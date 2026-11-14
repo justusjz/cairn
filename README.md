@@ -340,18 +340,27 @@ bucket's *Access and policy* in the console) has S3's four flags:
 `BlockPublicPolicy` refuses a bucket policy that makes the bucket public
 (one that allows everyone something, with no condition that limits it to
 fixed addresses, accounts or the like), and `RestrictPublicBuckets` makes a
-public policy allow anonymous requests nothing (the cluster's users keep what
-it allows them). `BlockPublicAcls` and `IgnorePublicAcls` are kept for S3
-clients; Cairn refuses every ACL but `private` anyway. **New buckets have all
-four on**, as S3's do, so making one public takes turning its block off first
+public policy allow nothing to anyone outside the bucket's account,
+anonymous requests included (the account's own users keep what it allows
+them). `BlockPublicAcls` and `IgnorePublicAcls` are kept for S3 clients;
+Cairn refuses every ACL but `private` anyway. **New buckets have all four
+on**, as S3's do, so making one public takes turning its block off first
 (`aws s3api delete-public-access-block`); buckets made before Cairn had
-blocks have none. The cluster has a block of its own, which every bucket gets
-too, whatever its own says: `cairn config set block-public-policy 1` and
-`cairn config set restrict-public-buckets 1` (or the switches on the
-console's Accounts page).
+blocks have none.
+
+Each account has a block of its own too, as in S3, which every one of its
+buckets gets, whatever their own says. A new account has none. Its root, and
+users allowed `s3:PutAccountPublicAccessBlock`, set it through S3 Control's
+API (`aws s3control`), or with the switches above the console's bucket list.
+It's the account's alone: the operator doesn't set it. S3 Control's clients
+put the account ID in front of the endpoint's host
+(`123456789012.s3.example.com`), so they need a host name that resolves for
+any subdomain, as virtual-hosted buckets do, not an IP address.
 
 ```sh
 aws s3api delete-public-access-block --bucket my-bucket   # then put the public policy above
+aws s3control put-public-access-block --account-id 123456789012 \
+    --public-access-block-configuration BlockPublicPolicy=true,RestrictPublicBuckets=true
 ```
 
 `aws:SourceIp` and `aws:SecureTransport` (and so policies that ask for an
