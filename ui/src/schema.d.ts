@@ -1290,23 +1290,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/users/{user}/secret": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Replaces a user's secret. */
-        post: operations["rotate_secret"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/users/{user}/tags": {
         parameters: {
             query?: never;
@@ -1656,11 +1639,6 @@ export interface components {
             name: string;
             /** @description Its path (`/`, or `/…/`); `/` if not given. */
             path?: string | null;
-            /**
-             * @description The access key's secret: at least 8 characters; one is generated if
-             *     not given. Implies `access_key`.
-             */
-            secret?: string | null;
             /** @description Its tags. */
             tags?: components["schemas"]["Tag"][];
         };
@@ -2239,10 +2217,6 @@ export interface components {
              * @description Object versions per hour, across the cluster; 0 pauses sweeps.
              */
             rate: number;
-        };
-        NewSecret: {
-            /** @description At least 8 characters; one is generated if not given. */
-            secret?: string | null;
         };
         /**
          * @description Sets the rate lifecycle sweeps go at, for the whole cluster.
@@ -6599,47 +6573,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    rotate_secret: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                user: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["NewSecret"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Secret"];
-                };
             };
             "4XX": {
                 headers: {

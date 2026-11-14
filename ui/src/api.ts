@@ -136,8 +136,6 @@ export const api = {
   /** Sets all of a user's tags. */
   setUserTags: (user: string, tags: Tag[]) =>
     ok(client.PUT("/users/{user}/tags", { params: userPath(user), body: { tags } })),
-  rotateSecret: (user: string) =>
-    ok(client.POST("/users/{user}/secret", { params: userPath(user), body: {} })),
   setAdmin: (user: string, admin: boolean) =>
     ok(client.PUT("/users/{user}/admin", { params: userPath(user), body: { admin } })),
   policies: () => ok(client.GET("/policies")),

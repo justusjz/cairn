@@ -105,7 +105,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(delete_user, update_user))
         .routes(routes!(set_boundary, delete_boundary))
         .routes(routes!(set_user_tags))
-        .routes(routes!(rotate_secret))
         .routes(routes!(set_admin))
         .routes(routes!(list_policies, create_policy))
         .routes(routes!(update_policy, delete_policy_managed))
@@ -2501,9 +2500,6 @@ struct CreateUser {
     /// gets none, and signs in to the console through its link.
     #[serde(default)]
     access_key: bool,
-    /// The access key's secret: at least 8 characters; one is generated if
-    /// not given. Implies `access_key`.
-    secret: Option<String>,
     #[serde(default)]
     admin: bool,
     /// Its path (`/`, or `/…/`); `/` if not given.
@@ -2567,8 +2563,7 @@ async fn create_user(
     if !tags.is_empty() {
         actor.check_with(&app, "iam:TagUser", new.on(), &asked).await?;
     }
-    let secret = body.secret.filter(|s| !s.is_empty());
-    let access_key = body.access_key || secret.is_some();
+    let access_key = body.access_key;
     if body.admin {
         let mut context = new.context("iam:AttachUserPolicy");
         context.extend(&key("iam:PolicyARN", &crate::managed::aws_arn(crate::managed::ADMINISTRATOR_ACCESS)));
@@ -2592,7 +2587,7 @@ async fn create_user(
         }
         anyhow::Ok(match access_key {
             true => {
-                let (key, secret) = users::create_key(&client, &account, &body.name, None, secret).await?;
+                let (key, secret) = users::create_key(&client, &account, &body.name, None, None).await?;
                 Some(Secret { name: key, secret })
             }
             false => None,
@@ -2645,34 +2640,6 @@ async fn identify_users(State(app): AppState, Extension(actor): Extension<Actor>
     }
     users::identify(&app).await.map_err(|e| ApiError::BadRequest(format!("{e:#}")))?;
     Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Deserialize, ToSchema)]
-struct NewSecret {
-    /// At least 8 characters; one is generated if not given.
-    secret: Option<String>,
-}
-
-/// Replaces a user's secret.
-#[utoipa::path(post, path = "/users/{user}/secret", params(("user" = String, Path)),
-    request_body = NewSecret, responses(
-        (status = 200, body = Secret),
-        (status = "4XX", body = ErrorBody),
-        (status = "5XX", body = ErrorBody),
-    ))]
-async fn rotate_secret(
-    State(app): AppState,
-    Extension(actor): Extension<Actor>,
-    Path(name): Path<String>,
-    Json(body): Json<NewSecret>,
-) -> Result<Json<Secret>> {
-    let account = check_user(&app, &actor, "iam:UpdateAccessKey", &name).await?;
-    let secret = match body.secret.filter(|s| !s.is_empty()) {
-        Some(s) => s,
-        None => users::generate_secret()?,
-    };
-    users::update(&app.pool.get().await?, &account, &name, None, Some(secret.clone())).await?;
-    Ok(Json(Secret { name, secret }))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -3728,6 +3695,14 @@ mod e2e {
         assert_eq!(key.len(), 20);
         assert_ne!(key, "ui-role");
         assert_eq!(created["access_key"]["secret"].as_str().unwrap().len(), 40);
+        // A key's secret never changes, as in IAM: there's no replacing it
+        // (a key is rotated by making another), nor choosing it.
+        let (status, _) = admin.send("POST", "/api/users/ui-role/secret", Some(json!({ "secret": "chosen-secret" }))).await;
+        assert!(status.is_client_error(), "{status}");
+        let new = json!({ "name": "ui-chosen", "access_key": true, "secret": "chosen-secret" });
+        let (status, created) = admin.send("POST", "/api/users", Some(new)).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_ne!(created["access_key"]["secret"], "chosen-secret");
         // A person: no key, and a console link, which lists them as one.
         let (status, created) = admin.send("POST", "/api/users", Some(json!({ "name": "ui-person" }))).await;
         assert_eq!((status, &created["access_key"]), (StatusCode::CREATED, &Value::Null));

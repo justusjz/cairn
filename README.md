@@ -786,8 +786,9 @@ passkeys and sign-in providers, and signing out.
   may do all of it; others what their policies say, as `iam:CreateAccessKey`
   on their own user, say): create and delete users, attach and detach
   managed policies (AdministratorAccess makes an admin), make, deactivate
-  and delete access keys (replacing the secret of a migrated role's, named
-  as the user, in place), write inline policies, which the server checks as IAM does,
+  and delete access keys (a key's secret never changes, as in IAM: rotate a
+  key by making a second one, moving its clients over, and deleting the
+  first), write inline policies, which the server checks as IAM does,
   and make enrollment links. People and service users are listed apart:
   both are IAM users, as in AWS, but a person signs in to the console (or
   has a link out to), with how, and when they last did; a service has only

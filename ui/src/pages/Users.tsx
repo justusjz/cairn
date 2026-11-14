@@ -415,7 +415,7 @@ function UserRow(props: {
           fallback={<Show when={!props.person}><div class="subtle">no access keys</div></Show>}
         >
           <For each={r().keys}>
-            {(k) => <KeyLine user={r().name} accessKey={k} changed={props.changed} showSecret={props.showSecret} />}
+            {(k) => <KeyLine user={r().name} accessKey={k} changed={props.changed} />}
           </For>
         </Show>
         <Show when={!props.person}>
@@ -494,14 +494,12 @@ function UserRow(props: {
 }
 
 /** One of a user's access keys: its ID and state, and what can be done
- * with it. The key named as the user (a migrated role's) can have its
- * secret replaced in place, as a role's could; others are rotated by making a new
- * key and deleting the old one. */
+ * with it. A key's secret never changes, as in IAM: a key is rotated by
+ * making a new one, moving its clients over, and deleting the old one. */
 function KeyLine(props: {
   user: string;
   accessKey: AccessKey;
   changed: () => void;
-  showSecret: (s: NewSecret) => void;
 }) {
   const k = () => props.accessKey;
   const setActive = async (active: boolean) => {
@@ -509,11 +507,6 @@ function KeyLine(props: {
       return;
     const msg = `${active ? "Activated" : "Deactivated"} access key ${k().id}`;
     if (await act(() => api.setKeyActive(props.user, k().id, active), msg)) props.changed();
-  };
-  const rotate = async () => {
-    if (!confirm(`Replace the secret of "${k().id}"? Clients using the old one stop working.`)) return;
-    const res = await act(() => api.rotateSecret(props.user));
-    if (res) props.showSecret({ id: res.value.name, secret: res.value.secret });
   };
   const remove = async () => {
     if (!confirm(`Delete access key "${k().id}"? Clients using it stop working.`)) return;
@@ -528,11 +521,6 @@ function KeyLine(props: {
         <Badge tone="warn">inactive</Badge>
       </Show>
       <div class="key-actions">
-        <Show when={k().id === props.user}>
-          <button class="small" onClick={rotate}>
-            Replace secret
-          </button>
-        </Show>
         <button class="small" onClick={() => setActive(!k().active)}>
           {k().active ? "Deactivate" : "Activate"}
         </button>

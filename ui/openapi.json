@@ -4442,61 +4442,6 @@
         }
       }
     },
-    "/users/{user}/secret": {
-      "post": {
-        "summary": "Replaces a user's secret.",
-        "operationId": "rotate_secret",
-        "parameters": [
-          {
-            "name": "user",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/NewSecret"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Secret"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/users/{user}/tags": {
       "put": {
         "summary": "Sets a user's tags, as IAM's TagUser and UntagUser would.",
@@ -5365,13 +5310,6 @@
               "null"
             ],
             "description": "Its path (`/`, or `/…/`); `/` if not given."
-          },
-          "secret": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The access key's secret: at least 8 characters; one is generated if\nnot given. Implies `access_key`."
           },
           "tags": {
             "type": "array",
@@ -6799,18 +6737,6 @@
             "type": "integer",
             "format": "int64",
             "description": "Object versions per hour, across the cluster; 0 pauses sweeps."
-          }
-        }
-      },
-      "NewSecret": {
-        "type": "object",
-        "properties": {
-          "secret": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "At least 8 characters; one is generated if not given."
           }
         }
       },
