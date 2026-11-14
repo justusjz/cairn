@@ -309,6 +309,11 @@ as_role() {
     aws --endpoint-url "http://${SERVER_HOST}:${SERVER_PORT}" "$@"
 }
 awss3() { as_role "$ACCESS_KEY" "$SECRET_KEY" "$@"; }
+# As temporary credentials (STS's): key, secret, session token.
+as_session() {
+    local key="$1" secret="$2" token="$3"; shift 3
+    AWS_SESSION_TOKEN="$token" as_role "$key" "$secret" "$@"
+}
 # aws-cli with virtual-hosted-style addressing: bucket.localhost:port/key.
 AWSCFG_VHOST="$WORK_DIR/awscfg-vhost"
 sed 's/addressing_style = path/addressing_style = virtual/' "$AWSCFG" >"$AWSCFG_VHOST"
@@ -2476,6 +2481,64 @@ iam_roles_ok() {
     echo "$out" | grep -q NoSuchEntity
 }
 
+# STS, as the AWS CLI calls it: a user assumes a role whose trust policy
+# names it, and its session lists a bucket as the role's policy allows, and
+# no more (a session policy narrows it); a tampered token is refused; the
+# user's own session (GetSessionToken) is it, but may not call IAM; a role
+# that doesn't trust it can't be assumed.
+sts_ok() {
+    local u="sts-$(date +%s)" r="sts-role-$(date +%s)" b="stsb-$(date +%s)" acct key id secret creds out \
+        trust="$WORK_DIR/sts-trust.json" doc="$WORK_DIR/sts-policy.json"
+    acct=$(awss3 sts get-caller-identity --query Account --output text 2>/dev/null) || return 1
+    awss3 iam create-user --user-name "$u" >/dev/null 2>&1 || return 1
+    key=$(awss3 iam create-access-key --user-name "$u" \
+        --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>/dev/null) || return 1
+    id=$(echo "$key" | cut -f1); secret=$(echo "$key" | cut -f2)
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::'"$acct"':user/'"$u"'"},"Action":"sts:AssumeRole"}]}' > "$trust"
+    awss3 iam create-role --role-name "$r" --assume-role-policy-document "file://$trust" >/dev/null 2>&1 || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket","s3:PutObject"],"Resource":["arn:aws:s3:::'"$b"'","arn:aws:s3:::'"$b"'/*"]}]}' > "$doc"
+    awss3 iam put-role-policy --role-name "$r" --policy-name s3 --policy-document "file://$doc" >/dev/null 2>&1 || return 1
+    creds=$(as_role "$id" "$secret" sts assume-role --role-arn "arn:aws:iam::$acct:role/$r" --role-session-name s1 \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>/dev/null) || return 1
+    set -- $creds
+    [ "$(as_session "$1" "$2" "$3" sts get-caller-identity --query Arn --output text 2>/dev/null)" \
+        = "arn:aws:sts::$acct:assumed-role/$r/s1" ] || return 1
+    as_session "$1" "$2" "$3" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    echo x | as_session "$1" "$2" "$3" s3 cp - "s3://$b/k" >/dev/null 2>&1 || return 1
+    out=$(as_session "$1" "$2" "$3" s3api get-object --bucket "$b" --key k /dev/null 2>&1) && return 1
+    echo "$out" | grep -q "assumed-role/$r/s1 is not authorized to perform: s3:GetObject" || return 1
+    out=$(as_session "$1" "$2" "${3%????}AAAA" s3api list-objects-v2 --bucket "$b" 2>&1) && return 1
+    echo "$out" | grep -q InvalidToken || return 1
+    out=$(as_role "$1" "$2" s3api list-objects-v2 --bucket "$b" 2>&1) && return 1
+    echo "$out" | grep -q InvalidAccessKeyId || return 1
+    # A session policy narrows the session to listing.
+    creds=$(as_role "$id" "$secret" sts assume-role --role-arn "arn:aws:iam::$acct:role/$r" --role-session-name s2 \
+        --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}' \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>/dev/null) || return 1
+    set -- $creds
+    as_session "$1" "$2" "$3" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    out=$(echo y | as_session "$1" "$2" "$3" s3 cp - "s3://$b/k2" 2>&1) && return 1
+    echo "$out" | grep -qi "no session policy allows" || return 1
+    # The user's own session.
+    creds=$(as_role "$id" "$secret" sts get-session-token \
+        --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text 2>/dev/null) || return 1
+    set -- $creds
+    [ "$(as_session "$1" "$2" "$3" sts get-caller-identity --query Arn --output text 2>/dev/null)" \
+        = "arn:aws:iam::$acct:user/$u" ] || return 1
+    out=$(as_session "$1" "$2" "$3" iam list-users 2>&1) && return 1
+    echo "$out" | grep -q InvalidClientTokenId || return 1
+    # Not trusted.
+    out=$(as_role reader readersecret sts assume-role --role-arn "arn:aws:iam::$acct:role/$r" --role-session-name s3 2>&1) && return 1
+    echo "$out" | grep -q 'not authorized to perform: sts:AssumeRole' || return 1
+    awss3 s3 rm "s3://$b/k" >/dev/null 2>&1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+    awss3 iam delete-role-policy --role-name "$r" --policy-name s3 >/dev/null 2>&1
+    awss3 iam delete-role --role-name "$r" >/dev/null 2>&1
+    awss3 iam delete-access-key --user-name "$u" --access-key-id "$id" >/dev/null 2>&1
+    awss3 iam delete-user --user-name "$u" >/dev/null 2>&1
+}
+
 # Managed policies over the IAM API, as the AWS CLI calls it: an account's
 # own (made, read back, attached, a new version, deleted once detached) and
 # Cairn's (AWS's ARNs), which allow what AWS's do and can't be changed.
@@ -2823,6 +2886,7 @@ run_test    "IAM API: managed policies"              iam_managed_ok
 run_test    "IAM API: boundaries, paths, tags"       iam_boundaries_ok
 run_test    "IAM API: policy versions and tags"      iam_versions_ok
 run_test    "IAM API: roles"                         iam_roles_ok
+run_test    "STS: assumed roles, session tokens"     sts_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok

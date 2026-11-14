@@ -396,6 +396,9 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     // long-term keys don't.
     ("aws:multifactorauthage", Support::Evaluated),
     ("aws:multifactorauthpresent", Support::Evaluated),
+    // Sessions' (temporary credentials': see `sessions`).
+    ("aws:sourceidentity", Support::Evaluated),
+    ("aws:tokenissuetime", Support::Evaluated),
     ("aws:calledvia", Support::Absent),
     ("aws:calledviafirst", Support::Absent),
     ("aws:calledvialast", Support::Absent),
@@ -411,13 +414,13 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     ("aws:resourceorgpaths", Support::Absent),
     ("aws:sourceaccount", Support::Absent),
     ("aws:sourcearn", Support::Absent),
-    ("aws:sourceidentity", Support::Absent),
+
     ("aws:sourceorgid", Support::Absent),
     ("aws:sourceorgpaths", Support::Absent),
     ("aws:sourcevpc", Support::Absent),
     ("aws:sourcevpcarn", Support::Absent),
     ("aws:sourcevpce", Support::Absent),
-    ("aws:tokenissuetime", Support::Absent),
+
     ("aws:vpcsourceip", Support::Absent),
     // A user's tags, and those IAM's requests set (see `iam`). Never on
     // S3's: a bucket's tags are its `aws:ResourceTag`s only with its ABAC

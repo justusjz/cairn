@@ -306,9 +306,11 @@ where
                 Ok(signature) => signature,
                 Err(rejection) => return Ok(rejection_response(&rejection)),
             };
-            let Some(principal) = Principal::load(&client, &signature.access_key).await? else {
-                return Ok(format_s3_error(StatusCode::FORBIDDEN, "InvalidAccessKeyId", "the access key ID does not exist"));
-            };
+            let principal =
+                match Principal::authenticate(&client, &app.sessions, &signature.access_key, signature.token.as_deref()).await? {
+                    Ok(principal) => principal,
+                    Err(unknown) => return Ok(crate::s3::util::unknown_credentials(unknown)),
+                };
             if let Err(rejection) = signature.verify(&principal.secret) {
                 return Ok(rejection_response(&rejection));
             }

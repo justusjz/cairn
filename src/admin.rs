@@ -51,6 +51,7 @@ pub enum Command {
     BucketPolicy(crate::s3::buckets::policy::BucketPolicyArgs),
     Config(crate::settings::ConfigArgs),
     Node(crate::nodes::NodeArgs),
+    Sessions(crate::sessions::SessionsArgs),
 }
 
 /// What a command printed, and how it failed, if it did.
@@ -93,6 +94,7 @@ pub async fn run(app: &Arc<App>, command: Command) -> Output {
         Command::BucketPolicy(args) => crate::s3::buckets::policy::run(app, args, &mut out).await,
         Command::Config(args) => crate::settings::run(app, args, &mut out).await,
         Command::Node(args) => crate::nodes::run(app, args, &mut out).await,
+        Command::Sessions(args) => crate::sessions::run(app, args, &mut out).await,
     };
     if let Err(e) = result {
         if !matches!(e.downcast_ref::<crate::users::Invalid>(), Some(_)) {

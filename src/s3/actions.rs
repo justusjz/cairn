@@ -52,6 +52,8 @@ pub enum On {
     /// The cluster, for Cairn's actions (`cairn:`), which operators'
     /// policies allow: the account's.
     Cluster,
+    /// Any other resource, by its ARN (STS's federated users, ...).
+    Arn(String),
 }
 
 /// The cluster's ARN, which `cairn:` actions are on: Cairn's own resource,
@@ -71,6 +73,7 @@ impl On {
             On::Roles(account, prefix) => format!("arn:aws:iam::{account}:role/{prefix}"),
             On::Policy(account, name) => format!("arn:aws:iam::{account}:policy/{name}"),
             On::Cluster => CLUSTER_ARN.to_owned(),
+            On::Arn(arn) => arn.clone(),
         }
     }
 

@@ -100,9 +100,12 @@ pub struct Origin<'a> {
 /// What a request may do: the policies that decide it, and its condition
 /// keys. Buckets' policies are loaded as checks need them.
 pub struct Access {
-    /// The user, by its account, name and ID; `None` if anonymous.
-    user: Option<(String, String, String)>,
+    /// Who makes the request; `None` if anonymous.
+    user: Option<Who_>,
     identity: Vec<Arc<Policy>>,
+    /// A session's policies, if they cap its principal's (see
+    /// `users::SessionOf`).
+    session: Option<Vec<Arc<Policy>>>,
     /// The user's permissions boundary, and its ARN.
     boundary: Option<(Arc<Policy>, String)>,
     /// The user's ARN (its path and all).
@@ -110,6 +113,51 @@ pub struct Access {
     pub context: Context,
     /// Each bucket loaded: whether it exists, and its policy (see `Loaded`).
     buckets: HashMap<String, Loaded>,
+}
+
+/// Who makes a request, as policies see it (an owned `policy::Principal`).
+enum Who_ {
+    User { account: String, name: String, id: String },
+    Session { account: String, role: String, id: String, session: String },
+    Federated { account: String, name: String },
+}
+
+impl Who_ {
+    fn of(principal: &Principal) -> Who_ {
+        use crate::sessions::Who as Session;
+        let account = principal.account.clone();
+        match principal.session.as_ref().map(|s| &s.session.who) {
+            Some(Session::Role { session, .. }) => Who_::Session {
+                account,
+                // By its path and name, as policies name roles.
+                role: format!("{}{}", principal.path.strip_prefix('/').unwrap_or(&principal.path), principal.name),
+                id: principal.id.to_string(),
+                session: session.clone(),
+            },
+            Some(Session::Federated { name, .. }) => Who_::Federated { account, name: name.clone() },
+            _ => Who_::User { account, name: principal.name.clone(), id: principal.id.to_string() },
+        }
+    }
+
+    fn as_policy(&self) -> Who<'_> {
+        match self {
+            Who_::User { account, name, id } => Who::User { account, name, id },
+            // A session's role by its name only, as session ARNs name it.
+            Who_::Session { account, role, id, session } => Who::Session { account, role: role_name(role), id, session },
+            Who_::Federated { account, name } => Who::Federated { account, name },
+        }
+    }
+
+    fn account(&self) -> &str {
+        match self {
+            Who_::User { account, .. } | Who_::Session { account, .. } | Who_::Federated { account, .. } => account,
+        }
+    }
+}
+
+/// A role's name, from its path and name.
+fn role_name(path_name: &str) -> &str {
+    path_name.rsplit('/').next().unwrap_or(path_name)
 }
 
 impl Access {
@@ -125,7 +173,15 @@ impl Access {
     ) -> anyhow::Result<Access> {
         let mut identity = Vec::new();
         let mut boundary = None;
+        let mut session = None;
         if let Some(principal) = principal {
+            if let Some(of) = principal.session.as_ref().filter(|of| of.restricted) {
+                let mut policies = Vec::new();
+                for document in &of.policies {
+                    policies.push(parsed(document, Kind::Identity, None)?);
+                }
+                session = Some(policies);
+            }
             if principal.admin {
                 identity.push(parsed(&actions::admin_policy(), Kind::Identity, None)?);
             }
@@ -137,9 +193,10 @@ impl Access {
             }
         }
         Ok(Access {
-            user: principal.map(|p| (p.account.clone(), p.name.clone(), p.id.to_string())),
+            user: principal.map(Who_::of),
             arn: principal.map(Principal::arn),
             identity,
+            session,
             boundary,
             context: context(principal, account, method, headers, query, origin),
             buckets: HashMap::new(),
@@ -202,10 +259,7 @@ impl Access {
     /// (see `iam`).
     pub fn verdict_with(&self, check: &Check, extra: &Context) -> Verdict {
         let resource = check.on.arn();
-        let principal = match &self.user {
-            Some((account, name, id)) => Who::User { account, name, id },
-            None => Who::Anonymous,
-        };
+        let principal = self.user.as_ref().map_or(Who::Anonymous, Who_::as_policy);
         let loaded = check.on.bucket().and_then(|b| self.buckets.get(b));
         // A restricted bucket's public policy is none to anyone outside its
         // account.
@@ -237,16 +291,36 @@ impl Access {
         let context = context.for_action(check.action);
         let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &context };
         let cross = match (&self.user, owner) {
-            (Some((account, _, _)), Some(owner)) => account != owner,
+            (Some(who), Some(owner)) => who.account() != owner,
             _ => false,
         };
         let boundary = self.boundary.as_ref().map(|(policy, _)| &**policy);
-        crate::policy::verdict_across(self.identity.iter().map(|p| &**p), boundary, bucket, &request, cross)
+        let session: Option<Vec<&Policy>> = self.session.as_ref().map(|policies| policies.iter().map(|p| &**p).collect());
+        let caps = crate::policy::Caps { boundary, session: session.as_deref() };
+        crate::policy::verdict_across(self.identity.iter().map(|p| &**p), caps, bucket, &request, cross)
+    }
+
+    /// Whether `trust` (a role's trust policy, its principals' IDs given)
+    /// lets the principal take `action` (`sts:AssumeRole`, ...) on the role
+    /// `role` (its ARN), with the condition keys `extra` too (see
+    /// `policy::trust_allows`).
+    pub fn trusted(&self, action: &str, role: &str, trust: &Policy, extra: &Context) -> bool {
+        let principal = self.user.as_ref().map_or(Who::Anonymous, Who_::as_policy);
+        let mut context = self.context.clone();
+        context.extend(extra);
+        if let Some(account) = self.account() {
+            context.set("aws:ResourceAccount", account);
+        }
+        let request = crate::policy::Request { principal, action, resource: role, context: &context };
+        let boundary = self.boundary.as_ref().map(|(policy, _)| &**policy);
+        let session: Option<Vec<&Policy>> = self.session.as_ref().map(|policies| policies.iter().map(|p| &**p).collect());
+        let caps = crate::policy::Caps { boundary, session: session.as_deref() };
+        crate::policy::trust_allows(self.identity.iter().map(|p| &**p), caps, trust, &request)
     }
 
     /// The account the principal acts in; `None` if anonymous.
     fn account(&self) -> Option<&str> {
-        self.user.as_ref().map(|(account, _, _)| account.as_str())
+        self.user.as_ref().map(Who_::account)
     }
 
     /// Whether `check` is one only its bucket's own account may make (on
@@ -357,15 +431,35 @@ fn context(
     }
     match principal {
         Some(principal) => {
-            context.set("aws:username", &principal.name);
-            context.set("aws:userid", principal.id.to_string());
-            context.set("aws:PrincipalArn", principal.arn());
+            use crate::sessions::Who as Session;
+            let session = principal.session.as_ref().map(|of| &of.session);
+            // A user's name, but a role session's or a federated user's
+            // (probed).
+            if !matches!(session.map(|s| &s.who), Some(Session::Role { .. } | Session::Federated { .. })) {
+                context.set("aws:username", &principal.name);
+            }
+            context.set("aws:userid", principal.unique_id());
+            context.set("aws:PrincipalArn", principal.principal_arn());
             for (key, value) in &principal.tags {
                 context.set(&format!("aws:PrincipalTag/{key}"), value);
             }
             context.set("aws:PrincipalAccount", &principal.account);
-            context.set("aws:PrincipalType", "User");
+            let kind = match session.map(|s| &s.who) {
+                Some(Session::Role { .. }) => "AssumedRole",
+                Some(Session::Federated { .. }) => "FederatedUser",
+                _ => "User",
+            };
+            context.set("aws:PrincipalType", kind);
             context.set("aws:PrincipalIsAWSService", "false");
+            // A session's: when it was issued, its source identity, and no
+            // MFA (present, false: probed). Long-term keys carry none.
+            if let Some(session) = session {
+                context.set("aws:TokenIssueTime", crate::sessions::iso(session.issued));
+                if let Some(source) = &session.source_identity {
+                    context.set("aws:SourceIdentity", source);
+                }
+                context.set("aws:MultiFactorAuthPresent", "false");
+            }
         }
         None => {
             context.set("aws:userid", "anonymous");

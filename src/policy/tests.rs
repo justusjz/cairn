@@ -599,16 +599,16 @@ fn a_boundary_caps_identity_policies() {
     let get = Request { resource: &resource, ..request("") };
     let get_secret = Request { resource: &secret, ..request("") };
     let decide = |boundary: Option<&Policy>, bucket: Option<&Policy>, request: &Request, cross: bool| {
-        verdict_across([&s3_all], boundary, bucket, request, cross)
+        verdict_across([&s3_all], Caps { boundary, session: None }, bucket, request, cross)
     };
     assert_eq!(decide(None, None, &get, false), Verdict::Allow);
     assert_eq!(decide(Some(&list_only), None, &get, false), Verdict::OutsideBoundary);
     assert_eq!(decide(Some(&deny_secret), None, &get, false), Verdict::Allow);
     assert_eq!(decide(Some(&deny_secret), None, &get_secret, false), Verdict::BoundaryDeny);
     // Neither allows: it's the boundary that doesn't (probed).
-    assert_eq!(verdict_across([], Some(&list_only), None, &get, false), Verdict::OutsideBoundary);
+    assert_eq!(verdict_across([], Caps { boundary: Some(&list_only), session: None }, None, &get, false), Verdict::OutsideBoundary);
     // A boundary alone allows nothing.
-    assert_eq!(verdict_across([], Some(&s3_all), None, &get, false), Verdict::ImplicitDeny);
+    assert_eq!(verdict_across([], Caps { boundary: Some(&s3_all), session: None }, None, &get, false), Verdict::ImplicitDeny);
 
     let by_user = bucket_policy(
         r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/alice"},
@@ -623,7 +623,7 @@ fn a_boundary_caps_identity_policies() {
             "Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
     );
     assert_eq!(decide(Some(&list_only), Some(&by_user), &get, false), Verdict::Allow);
-    assert_eq!(verdict_across([], Some(&list_only), Some(&by_user), &get, false), Verdict::Allow);
+    assert_eq!(verdict_across([], Caps { boundary: Some(&list_only), session: None }, Some(&by_user), &get, false), Verdict::Allow);
     assert_eq!(decide(Some(&list_only), Some(&by_everyone), &get, false), Verdict::Allow);
     assert_eq!(decide(Some(&list_only), Some(&by_account), &get, false), Verdict::OutsideBoundary);
     assert_eq!(decide(Some(&deny_secret), Some(&by_user), &get_secret, false), Verdict::BoundaryDeny);
@@ -777,13 +777,108 @@ fn trust_policies_are_checked_as_iam_checks_them() {
         Kind::Trust,
     );
     assert_eq!(e.code, "NotImplemented");
-    // Roles and sessions are no bucket policy's principals (yet).
-    let e = refused(
-        &format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{ACCOUNT}:role/r"}},"Action":"s3:GetObject","Resource":"{}"}}]}}"#,
+    // Roles and sessions are bucket policies' principals too; wildcards
+    // aren't.
+    let principal = |who: &str| {
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{who}"}},"Action":"s3:GetObject","Resource":"{}"}}]}}"#,
             object("*")
+        )
+    };
+    let policy = Policy::parse(&principal(&format!("arn:aws:iam::{ACCOUNT}:role/team/r")), Kind::Bucket(BUCKET)).unwrap();
+    assert_eq!(policy.roles().collect::<Vec<_>>(), [(ACCOUNT, "team/r")]);
+    let policy = Policy::parse(&principal(&format!("arn:aws:sts::{ACCOUNT}:assumed-role/r/s")), Kind::Bucket(BUCKET)).unwrap();
+    assert_eq!(policy.sessions().collect::<Vec<_>>(), [(ACCOUNT, "r", "s")]);
+    let e = refused(&principal(&format!("arn:aws:iam::{ACCOUNT}:role/*")), Kind::Bucket(BUCKET));
+    assert_eq!(e.message, "Invalid principal in policy");
+}
+
+/// A role's session, as policies see it: its role `r` (ID `rid`).
+fn session(name: &str) -> Principal<'_> {
+    Principal::Session { account: ACCOUNT, role: "r", id: "rid", session: name }
+}
+
+/// Bucket policies naming a session allow past its caps; naming its role,
+/// within them; the reasons denied ones give (probed: `plans/roles.md`).
+#[test]
+fn sessions_are_capped_by_their_role_and_session_policies() {
+    let bucket = Policy::parse(
+        &format!(
+            r#"{{"Version":"2012-10-17","Statement":[
+                {{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{ACCOUNT}:role/team/r"}},"Action":"s3:GetObject","Resource":"{}"}},
+                {{"Effect":"Allow","Principal":{{"AWS":"arn:aws:sts::{ACCOUNT}:assumed-role/r/named"}},"Action":"s3:GetObject","Resource":"{}"}}]}}"#,
+            object("role/*"),
+            object("session/*")
         ),
         Kind::Bucket(BUCKET),
+    )
+    .unwrap()
+    .with_ids([(format!("arn:aws:iam::{ACCOUNT}:role/team/r"), "rid".to_owned())].into());
+    let list_only = identity_policy(&format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::{BUCKET}"}}]}}"#
+    ));
+    let read_all = identity_policy(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#);
+    let context = Context::default();
+    let decide = |who: Principal, key: &str, identity: &[&Policy], caps: Caps| {
+        let resource = object(key);
+        let request = Request { principal: who, action: "s3:GetObject", resource: &resource, context: &context };
+        verdict_across(identity.iter().copied(), caps, Some(&bucket), &request, false)
+    };
+    let none = Caps::default();
+    let session_list: [&Policy; 1] = [&list_only];
+    let capped_by_session = Caps { boundary: None, session: Some(&session_list) };
+    let bounded = Caps { boundary: Some(&list_only), session: None };
+    let no_session_policies: [&Policy; 0] = [];
+    let restricted = Caps { boundary: None, session: Some(&no_session_policies) };
+
+    // Naming the role: any of its sessions, within their caps.
+    assert_eq!(decide(session("any"), "role/k", &[], none), Verdict::Allow);
+    assert_eq!(decide(session("any"), "role/k", &[], capped_by_session), Verdict::OutsideSession);
+    assert_eq!(decide(session("any"), "role/k", &[], bounded), Verdict::OutsideBoundary);
+    // Naming the session: it alone, past its caps.
+    assert_eq!(decide(session("named"), "session/k", &[], capped_by_session), Verdict::Allow);
+    assert_eq!(decide(session("named"), "session/k", &[], bounded), Verdict::Allow);
+    assert_eq!(decide(session("other"), "session/k", &[], none), Verdict::ImplicitDeny);
+    // The role's own policies, within the caps; the reasons in order.
+    assert_eq!(decide(session("any"), "elsewhere", &[&read_all], none), Verdict::Allow);
+    assert_eq!(decide(session("any"), "elsewhere", &[&read_all], capped_by_session), Verdict::OutsideSession);
+    assert_eq!(decide(session("any"), "elsewhere", &[], capped_by_session), Verdict::ImplicitDeny);
+    assert_eq!(decide(session("any"), "elsewhere", &[&read_all], restricted), Verdict::OutsideSession);
+    assert_eq!(
+        decide(session("any"), "elsewhere", &[&read_all], Caps { boundary: Some(&list_only), session: Some(&session_list) }),
+        Verdict::OutsideBoundary
     );
-    assert_eq!(e.message, "Invalid principal in policy");
+    // A user is never the role's session.
+    assert_eq!(decide(user("r"), "role/k", &[], none), Verdict::ImplicitDeny);
+}
+
+/// A trust policy allows by naming the principal itself, or its account
+/// (with the principal's identity policies), never by identity policies
+/// alone (probed).
+#[test]
+fn trust_policies_decide_who_assumes_a_role() {
+    let trusting = |who: &str| {
+        Policy::parse(
+            &format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{who}"}},"Action":"sts:AssumeRole"}}]}}"#),
+            Kind::Trust,
+        )
+        .unwrap()
+        .with_ids([(format!("arn:aws:iam::{ACCOUNT}:user/alice"), "alice".to_owned())].into())
+    };
+    let may_assume = identity_policy(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole","Resource":"*"}]}"#);
+    let s3_only = identity_policy(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#);
+    let context = Context::default();
+    let role = format!("arn:aws:iam::{ACCOUNT}:role/r");
+    let request = Request { principal: user("alice"), action: "sts:AssumeRole", resource: &role, context: &context };
+    let decide = |trust: &Policy, identity: &[&Policy], caps: Caps| trust_allows(identity.iter().copied(), caps, trust, &request);
+    let alice = trusting(&format!("arn:aws:iam::{ACCOUNT}:user/alice"));
+    let account = trusting(&format!("arn:aws:iam::{ACCOUNT}:root"));
+    let other = trusting(&format!("arn:aws:iam::{ACCOUNT}:user/bob"));
+    assert!(decide(&alice, &[], Caps::default()));
+    // Past a boundary that doesn't allow it.
+    assert!(decide(&alice, &[], Caps { boundary: Some(&s3_only), session: None }));
+    assert!(!decide(&account, &[], Caps::default()));
+    assert!(decide(&account, &[&may_assume], Caps::default()));
+    assert!(!decide(&account, &[&may_assume], Caps { boundary: Some(&s3_only), session: None }));
+    assert!(!decide(&other, &[&may_assume], Caps::default()));
 }

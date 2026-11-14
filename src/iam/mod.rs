@@ -21,6 +21,7 @@
 //! (NotImplemented).
 
 mod roles;
+mod sts;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -219,7 +220,17 @@ async fn respond(
     let query = parts.uri.query().unwrap_or("");
     let client = app.pool.get().await?;
     let invalid_token = || error(StatusCode::FORBIDDEN, "InvalidClientTokenId", "The security token included in the request is invalid.");
-    let principal = Principal::load(&client, &signed.access_key).await?.ok_or_else(invalid_token)?;
+    let principal = match Principal::authenticate(&client, &app.sessions, &signed.access_key, signed.token.as_deref()).await? {
+        Ok(principal) => principal,
+        Err(users::Unknown::Expired) => {
+            return Err(error(StatusCode::FORBIDDEN, "ExpiredToken", "The security token included in the request is expired"));
+        }
+        // A token that isn't one: without the period (probed).
+        Err(users::Unknown::Token) => {
+            return Err(error(StatusCode::FORBIDDEN, "InvalidClientTokenId", "The security token included in the request is invalid"));
+        }
+        Err(users::Unknown::Key) => return Err(invalid_token()),
+    };
     crate::auth::verify_sigv4_with_body(parts.method.as_str(), parts.uri.path(), query, &parts.headers, &principal.secret, &body)
         .map_err(|r| error(r.status, if r.code == "SignatureDoesNotMatch" { "SignatureDoesNotMatch" } else { "AccessDenied" }, r.message))?;
     let mut params = HashMap::new();
@@ -233,13 +244,18 @@ async fn respond(
     let origin = Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: Some(signed), form: false };
     let mut access = Access::new(Some(&principal), &principal.account, &parts.method, &parts.headers, "", &origin)?;
     let mut iam = Iam { app, client: &client, principal: &principal, access: &mut access };
+    // A user's own session, or a federated user's, may not call IAM at all
+    // (probed: as AWS's without MFA).
+    let restricted = principal.session.is_some() && !principal.is_role_session();
+    if signed.service == "iam" && restricted {
+        return Err(error(StatusCode::FORBIDDEN, "InvalidClientTokenId", "The security token included in the request is invalid"));
+    }
     let inner = match (signed.service.as_str(), action.as_str()) {
-        ("sts", "GetCallerIdentity") => Some(format!(
-            "<Arn>{}</Arn><UserId>{}</UserId><Account>{}</Account>",
-            xml_escape(&principal.arn()),
-            user_id(principal.id),
-            principal.account
-        )),
+        ("sts", "GetCallerIdentity") => iam.get_caller_identity(),
+        ("sts", "AssumeRole") => iam.assume_role(&params).await?,
+        ("sts", "GetSessionToken") => iam.get_session_token(&params).await?,
+        ("sts", "GetFederationToken") => iam.get_federation_token(&params).await?,
+        ("sts", "GetAccessKeyInfo") => iam.get_access_key_info(&params).await?,
         ("sts", other) => return Err(error(StatusCode::BAD_REQUEST, "InvalidAction", format!("Cairn's STS has no action {other}"))),
         (_, "GetUser") => iam.get_user(&params).await?,
         (_, "ListUsers") => iam.list_users(&params).await?,
@@ -418,6 +434,11 @@ fn validation_errors(errors: &[String]) -> String {
     format!("{} validation error{s} detected: {}", errors.len(), errors.join("; "))
 }
 
+/// The members of a list a request gives (`<name>.member.N`).
+fn request_keys_named(params: &Params, name: &str) -> Vec<String> {
+    (1..).map_while(|n| params.get(&format!("{name}.member.{n}")).map(str::to_owned)).collect()
+}
+
 /// The keys a request names (`TagKeys.member.N`).
 fn request_keys(params: &Params) -> Result<Vec<String>> {
     let keys: Vec<String> = (1..).map_while(|n| params.get(&format!("TagKeys.member.{n}")).map(str::to_owned)).collect();
@@ -513,7 +534,12 @@ impl Iam<'_> {
     /// `action` on it (with its condition keys, and `extra`), and one of its
     /// account. `missing`: what a user that isn't there is.
     async fn target(&mut self, params: &Params, action: &'static str, extra: Context, missing: fn(&str) -> Error) -> Result<Target> {
-        let name = params.get("UserName").unwrap_or(&self.principal.name).to_owned();
+        // A role's session is a user of its session's name, to IAM (probed).
+        let own = match self.principal.session.as_ref().map(|s| &s.session.who) {
+            Some(crate::sessions::Who::Role { session, .. }) => session.as_str(),
+            _ => self.principal.name.as_str(),
+        };
+        let name = params.get("UserName").unwrap_or(own).to_owned();
         let target = Target::load(self.client, self.account(), &name).await?;
         let (on, mut context) = match &target {
             Some(target) => (target.on(), target.context(action)),

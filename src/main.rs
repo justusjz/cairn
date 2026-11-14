@@ -54,6 +54,7 @@ mod policy;
 mod roles;
 mod s3;
 mod scrub;
+mod sessions;
 mod settings;
 mod shards;
 mod store;
@@ -94,6 +95,9 @@ pub struct App {
     domain: Option<String>,
     /// The KMS SSE-KMS keeps its keys in, if there's one (see `s3::sse`).
     kms: Option<Arc<kms::Kms>>,
+    /// The keys temporary credentials' tokens are sealed with (see
+    /// `sessions`), as this node last read them.
+    sessions: sessions::Keys,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -178,6 +182,8 @@ enum Command {
     Config(settings::ConfigArgs),
     /// List the cluster's nodes, or remove one.
     Node(nodes::NodeArgs),
+    /// Temporary credentials (STS's sessions): end all of them.
+    Sessions(sessions::SessionsArgs),
 }
 
 // Every flag can also be set through the environment variable named in its
@@ -288,6 +294,7 @@ fn remote_command(command: Command) -> anyhow::Result<(admin::Remote, admin::Com
         }
         Command::Config(args) => (args.remote.clone(), admin::Command::Config(args)),
         Command::Node(args) => (args.remote.clone(), admin::Command::Node(args)),
+        Command::Sessions(args) => (args.remote.clone(), admin::Command::Sessions(args)),
     })
 }
 
@@ -355,6 +362,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         trusted_proxies: args.trusted_proxies.clone(),
         domain: args.domain,
         kms,
+        sessions: sessions::Keys::default(),
         #[cfg(test)]
         pack_hook: None,
     });
@@ -463,6 +471,9 @@ async fn maintain(app: Arc<App>) {
                     }
                     if let Err(e) = console::oidc::reap(&client).await {
                         eprintln!("console: reaping expired sign-ins: {e:#}");
+                    }
+                    if let Err(e) = app.sessions.rotate(&client, false).await {
+                        eprintln!("sessions: rotating the keys: {e:#}");
                     }
                 }
                 Err(e) => eprintln!("console: reaping expired sessions: {e:#}"),

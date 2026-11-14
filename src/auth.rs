@@ -267,6 +267,9 @@ pub struct Signed {
     pub presigned: bool,
     /// When it was signed (`X-Amz-Date`), as SigV4 writes it.
     pub date: Option<String>,
+    /// The session token of temporary credentials (`X-Amz-Security-Token`,
+    /// a header, or a presigned URL's query parameter).
+    pub token: Option<String>,
 }
 
 /// The signature a request claims to have (not checked), or `None` for an
@@ -281,12 +284,17 @@ pub fn signed(headers: &HeaderMap, query: &str) -> Option<Signed> {
         false => headers.get("x-amz-date").and_then(|v| v.to_str().ok()).map(str::to_owned),
         true => query_value(query, "X-Amz-Date"),
     };
+    let token = match presigned {
+        false => headers.get("x-amz-security-token").and_then(|v| v.to_str().ok()).map(str::to_owned),
+        true => query_value(query, "X-Amz-Security-Token"),
+    };
     Some(Signed {
         access_key: authorization.access_key,
         service: authorization.service,
         region: authorization.region,
         presigned,
         date,
+        token,
     })
 }
 
@@ -670,6 +678,8 @@ pub struct PostSignature {
     /// The `policy` field, base64, as sent: what's signed.
     policy: String,
     signature: String,
+    /// The session token of temporary credentials (`x-amz-security-token`).
+    pub token: Option<String>,
 }
 
 impl PostSignature {
@@ -683,6 +693,7 @@ impl PostSignature {
             region: self.region.clone(),
             presigned: false,
             date: None,
+            token: self.token.clone(),
         }
     }
 
@@ -724,6 +735,7 @@ impl PostSignature {
             service: service.to_owned(),
             policy: policy.to_owned(),
             signature: signature.to_owned(),
+            token: field("x-amz-security-token").map(str::to_owned),
         })
     }
 

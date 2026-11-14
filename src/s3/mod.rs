@@ -156,9 +156,12 @@ async fn handle_request(
     }
     let principal = match &signed {
         Some(signed) => {
-            let Some(principal) = Principal::load(&app.pool.get().await?, &signed.access_key).await? else {
-                return Ok(forbidden("InvalidAccessKeyId", "the access key ID does not exist"));
+            let client = app.pool.get().await?;
+            let principal = match Principal::authenticate(&client, &app.sessions, &signed.access_key, signed.token.as_deref()).await? {
+                Ok(principal) => principal,
+                Err(unknown) => return Ok(box_response(util::unknown_credentials(unknown))),
             };
+            drop(client);
             // Against the path the client signed, which isn't the route's if
             // the bucket was in its host.
             if let Err(rejection) = crate::auth::verify_sigv4(

@@ -534,3 +534,52 @@ pub async fn of_policy(client: &Object, account: &str, arn: &str) -> anyhow::Res
         .await?;
     Ok((pairs(attached), pairs(bounded)))
 }
+
+/// Role `id` as its sessions' principal (see `users::Principal`): its
+/// policies (inline, then attached), tags and boundary, with no secret yet
+/// (the session's). `None` if it's gone.
+pub async fn principal(client: &Object, id: Uuid) -> anyhow::Result<Option<crate::users::Principal>> {
+    let row = client
+        .query_opt_cached(
+            &format!(
+                "SELECT r.id, r.name, r.account_id, r.path,
+                        ARRAY(SELECT document FROM iam_role_policies WHERE role_id = r.id ORDER BY name),
+                        ARRAY(SELECT m.document FROM iam_role_attached_policies x
+                              JOIN managed_policies m ON m.id = x.policy_id WHERE x.role_id = r.id ORDER BY m.name),
+                        ARRAY(SELECT x.aws_policy FROM iam_role_attached_policies x
+                              WHERE x.role_id = r.id AND x.aws_policy IS NOT NULL ORDER BY x.aws_policy),
+                        ARRAY(SELECT t.key FROM iam_role_tags t WHERE t.role_id = r.id ORDER BY t.seq),
+                        ARRAY(SELECT t.value FROM iam_role_tags t WHERE t.role_id = r.id ORDER BY t.seq),
+                        {BOUNDARY_ARN},
+                        (SELECT m.document FROM managed_policies m WHERE m.id = r.boundary_policy_id),
+                        r.boundary_aws
+                 FROM iam_roles r WHERE r.id = $1"
+            ),
+            &[&id],
+        )
+        .await?;
+    Ok(row.map(|r| {
+        let mut policies: Vec<String> = r.get(4);
+        policies.extend(r.get::<_, Vec<String>>(5));
+        let aws: Vec<String> = r.get(6);
+        policies.extend(aws.iter().filter_map(|name| managed::aws(name)).map(|p| p.document.to_owned()));
+        let boundary = r.get::<_, Option<String>>(9).map(|arn| {
+            let document = r
+                .get::<_, Option<String>>(10)
+                .or_else(|| r.get::<_, Option<String>>(11).and_then(|name| managed::aws(&name)).map(|p| p.document.to_owned()))
+                // One of Cairn's that this Cairn doesn't know: it allows
+                // nothing, rather than everything.
+                .unwrap_or_else(|| r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}"#.to_owned());
+            crate::users::Boundary { arn, document }
+        });
+        crate::users::Principal::of_role(
+            r.get(0),
+            r.get(1),
+            r.get(2),
+            r.get(3),
+            policies,
+            crate::users::tags_of(r.get(7), r.get(8)),
+            boundary,
+        )
+    }))
+}

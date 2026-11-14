@@ -151,7 +151,8 @@ fn valid_segment(segment: &str) -> bool {
         && segment.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
-/// Who Cairn asks the KMS as: a user, or itself (for SSE-S3).
+/// Who Cairn asks the KMS as: a user or a role (by its ID; a role's
+/// sessions ask as it), or itself (for SSE-S3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Identity {
     User(Uuid),

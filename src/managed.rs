@@ -188,6 +188,16 @@ pub async fn boundary(client: &Object, account: &str, arn: &str) -> anyhow::Resu
     }
 }
 
+/// The document of the managed policy `arn` (Cairn's, or `account`'s own),
+/// as it is now (its default version); `None` if there's none.
+pub async fn document(client: &Object, account: &str, arn: &str) -> anyhow::Result<Option<String>> {
+    Ok(match named(arn, account) {
+        Ok(Named::Aws(p)) => Some(p.document.to_owned()),
+        Ok(Named::Own { path, name }) => own(client, account, &path, &name).await.ok().map(|p| p.document),
+        Err(_) => None,
+    })
+}
+
 /// Checks `document` as a managed policy's.
 pub fn check_document(document: &str) -> anyhow::Result<()> {
     crate::policy::Policy::parse(document, crate::policy::Kind::Identity).map_err(|e| Refused::Malformed(e.message))?;

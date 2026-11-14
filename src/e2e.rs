@@ -127,6 +127,7 @@ async fn node_on(
         trusted_proxies: Vec::new(),
         domain: None,
         kms: None,
+        sessions: Default::default(),
         pack_hook: hook,
     })
 }

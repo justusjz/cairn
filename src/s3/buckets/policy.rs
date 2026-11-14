@@ -75,6 +75,28 @@ pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<
             return invalid_principal();
         }
     }
+    // A role likewise; a session by its role's name (its ARN has no path).
+    for (account, role) in policy.roles() {
+        let exists = client
+            .query_opt_cached(
+                "SELECT 1 FROM iam_roles WHERE substring(path FROM 2) || name = $1 AND account_id = $2",
+                &[&role, &account],
+            )
+            .await?
+            .is_some();
+        if !exists {
+            return invalid_principal();
+        }
+    }
+    for (account, role, _) in policy.sessions() {
+        let exists = client
+            .query_opt_cached("SELECT 1 FROM iam_roles WHERE name = $1 AND account_id = $2", &[&role, &account])
+            .await?
+            .is_some();
+        if !exists {
+            return invalid_principal();
+        }
+    }
     Ok(Ok(Checked { normalized: policy.normalized().to_owned(), public: policy.is_public() }))
 }
 
@@ -95,13 +117,16 @@ pub async fn shown(client: &Object, bucket: &str) -> anyhow::Result<Option<Optio
     let row = client
         .query_opt_cached(
             "SELECT b.policy,
-                    (SELECT coalesce(jsonb_object_agg(p.key, coalesce(
-                                'arn:aws:iam::' || r.account_id || ':user/' || substring(r.path FROM 2) || r.name,
-                                p.value)), '{}'::jsonb)
+                    (SELECT coalesce(jsonb_object_agg(p.key, coalesce(n.arn, p.value)), '{}'::jsonb)
                      FROM jsonb_each_text(b.policy_principals) p
-                     LEFT JOIN users r ON r.id::text = p.value
-                     WHERE r.id IS NULL
-                        OR p.key <> 'arn:aws:iam::' || r.account_id || ':user/' || substring(r.path FROM 2) || r.name)::text
+                     LEFT JOIN LATERAL (
+                         SELECT 'arn:aws:iam::' || u.account_id || ':user/' || substring(u.path FROM 2) || u.name AS arn
+                         FROM users u WHERE u.id::text = p.value
+                         UNION ALL
+                         SELECT 'arn:aws:iam::' || r.account_id || ':role/' || substring(r.path FROM 2) || r.name
+                         FROM iam_roles r WHERE r.id::text = p.value
+                     ) n ON true
+                     WHERE n.arn IS NULL OR p.key <> n.arn)::text
              FROM buckets b WHERE b.name = $1",
             &[&bucket],
         )

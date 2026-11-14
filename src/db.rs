@@ -229,6 +229,7 @@ const MIGRATIONS: &[&str] = &[
     NO_ROOT,
     USERS_RENAMED,
     IAM_ROLES,
+    SESSIONS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2322,6 +2323,41 @@ CREATE TRIGGER iam_role_tags_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNC
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER iam_role_tags_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_role_tags
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+"#;
+/// Migration 49: role sessions (see `sessions`, `plans/roles.md`). The keys
+/// temporary credentials' tokens are sealed with: the cluster's, made by
+/// the maintenance pass, a new one every day, each kept as long as a
+/// session it sealed may last. And bucket policies name roles, kept by
+/// their IDs as users are (`PRINCIPAL_IDS`).
+const SESSIONS: &str = r#"
+CREATE TABLE session_keys (
+    id         integer PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    key        bytea NOT NULL CHECK (length(key) = 32),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER session_keys_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON session_keys
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE OR REPLACE FUNCTION cairn_policy_principals() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.policy_principals := CASE WHEN NEW.policy IS NOT NULL THEN (
+        SELECT coalesce(jsonb_object_agg(p.arn, coalesce(u.id, r.id)::text), '{}'::jsonb)
+        FROM (
+            SELECT DISTINCT a #>> '{}' AS arn
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].Principal.AWS[*]') a
+            UNION
+            SELECT a #>> '{}'
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].NotPrincipal.AWS[*]') a
+        ) p
+        LEFT JOIN users u ON u.account_id = substring(p.arn FROM '^arn:aws:iam::([0-9]{12}):user/')
+                         AND substring(u.path FROM 2) || u.name = substring(p.arn FROM '^arn:aws:iam::[0-9]{12}:user/(.+)$')
+        LEFT JOIN iam_roles r ON r.account_id = substring(p.arn FROM '^arn:aws:iam::([0-9]{12}):role/')
+                             AND substring(r.path FROM 2) || r.name = substring(p.arn FROM '^arn:aws:iam::[0-9]{12}:role/(.+)$')
+        WHERE u.id IS NOT NULL OR r.id IS NOT NULL
+    ) END;
+    RETURN NEW;
+END
+$$;
 "#;
 #[cfg(test)]
 mod tests {

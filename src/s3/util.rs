@@ -149,6 +149,23 @@ pub fn format_s3_error(status: StatusCode, code: &str, message: &str) -> Respons
 }
 
 /// The S3 error for a request refused for what it claims about itself.
+/// S3's answer to credentials that aren't anyone's (probed; an expired
+/// token's: AWS's documented one).
+pub fn unknown_credentials(unknown: crate::users::Unknown) -> Response<Full<Bytes>> {
+    use crate::users::Unknown;
+    match unknown {
+        Unknown::Key => format_s3_error(
+            StatusCode::FORBIDDEN,
+            "InvalidAccessKeyId",
+            "The AWS Access Key Id you provided does not exist in our records.",
+        ),
+        Unknown::Token => {
+            format_s3_error(StatusCode::BAD_REQUEST, "InvalidToken", "The provided token is malformed or otherwise invalid.")
+        }
+        Unknown::Expired => format_s3_error(StatusCode::BAD_REQUEST, "ExpiredToken", "The provided token has expired."),
+    }
+}
+
 pub fn rejection_response(rejection: &Rejection) -> Response<Full<Bytes>> {
     error_document(rejection.status, rejection.code, &rejection.message, &rejection.details)
 }

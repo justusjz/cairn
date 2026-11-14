@@ -94,6 +94,22 @@ pub enum Principal<'a> {
     /// A user of `account` (its 12-digit ID), by its name and its ID
     /// (which a bucket policy names it by: see `Policy::with_ids`).
     User { account: &'a str, name: &'a str, id: &'a str },
+    /// A role's session: its role, by its name and ID (which a policy names
+    /// it by, as a user), and the session's name.
+    Session { account: &'a str, role: &'a str, id: &'a str, session: &'a str },
+    /// A federated user (GetFederationToken's), by its name.
+    Federated { account: &'a str, name: &'a str },
+}
+
+/// How a statement is about a principal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reach {
+    /// By naming it (or everyone): a resource policy's Allow so is the
+    /// principal's, uncapped by its boundary or session policies.
+    Direct,
+    /// By naming the role a session is of: what it allows is capped by the
+    /// role's boundary and the session's policies (probed).
+    Role,
 }
 
 /// One check of a request: whether `principal` may do `action` (`s3:...`) to
@@ -129,6 +145,11 @@ pub enum Verdict {
     /// Its permissions boundary doesn't allow it (and no bucket policy
     /// allows it by itself).
     OutsideBoundary,
+    /// A statement of a session policy denies it.
+    SessionDeny,
+    /// No session policy allows it (and no bucket policy allows it by
+    /// itself).
+    OutsideSession,
 }
 
 impl Verdict {
@@ -142,6 +163,8 @@ impl Verdict {
                 format!("with an explicit deny in a permissions boundary: {}", boundary.unwrap_or_default())
             }
             Verdict::OutsideBoundary => format!("because no permissions boundary allows the {action} action"),
+            Verdict::SessionDeny => "with an explicit deny in a session policy".to_owned(),
+            Verdict::OutsideSession => format!("because no session policy allows the {action} action"),
             _ => format!("because no identity-based policy allows the {action} action"),
         }
     }
@@ -157,24 +180,38 @@ pub fn verdict<'p>(
     bucket: Option<&'p Policy>,
     request: &Request,
 ) -> Verdict {
-    verdict_across(identity, None, bucket, request, false)
+    verdict_across(identity, Caps::default(), bucket, request, false)
 }
 
-/// As `verdict`, for a user whose permissions boundary is `boundary`, and a
-/// resource of another account than the principal's (`cross`), when those
-/// are so. A boundary caps what the identity policies allow: they allow
-/// only what it allows too, and a Deny in it denies. Within the account, a
-/// bucket policy's Allow (which, there, is always one naming the user
-/// itself, or everyone: see `Principals::about`) isn't capped by it
-/// (probed). Across accounts, an identity policy's Allow alone isn't
-/// enough, nor the bucket's alone: both must allow it, as in AWS.
+/// What caps a principal's identity policies, besides themselves.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Caps<'p> {
+    /// Its permissions boundary.
+    pub boundary: Option<&'p Policy>,
+    /// A session's policies, if it has any (or must: a federated user's,
+    /// which with none may do nothing): they allow only what one of them
+    /// allows too.
+    pub session: Option<&'p [&'p Policy]>,
+}
+
+/// As `verdict`, for a principal whose identity policies `caps` caps (a
+/// permissions boundary, a session's policies), and a resource of another
+/// account than the principal's (`cross`), when those are so. A cap allows
+/// the identity policies only what it allows too, and a Deny in it denies.
+/// Within the account, a bucket policy's Allow that names the principal
+/// itself (a user, a session), or everyone, isn't capped (probed); one that
+/// names the role a session is of is, by the role's boundary and the
+/// session's policies (probed). Across accounts, an identity policy's Allow
+/// alone isn't enough, nor the bucket's alone: both must allow it, as in
+/// AWS.
 pub fn verdict_across<'p>(
     identity: impl IntoIterator<Item = &'p Policy>,
-    boundary: Option<&'p Policy>,
+    caps: Caps<'p>,
     bucket: Option<&'p Policy>,
     request: &Request,
     cross: bool,
 ) -> Verdict {
+    let boundary = caps.boundary;
     let mut identity_allows = false;
     let anonymous = request.principal == Principal::Anonymous;
     for policy in identity.into_iter().filter(|_| !anonymous) {
@@ -189,21 +226,80 @@ pub fn verdict_across<'p>(
         Some(Decision::Allow) | None => true,
         Some(Decision::NotApplicable) => false,
     };
-    let bucket_allows = match bucket.map(|policy| policy.evaluate_across(request, cross)) {
-        Some(Decision::Deny) => return Verdict::ExplicitDeny { identity: false },
-        Some(Decision::Allow) => true,
-        _ => false,
+    let mut session_allows = true;
+    if let Some(policies) = caps.session.filter(|_| !anonymous) {
+        session_allows = false;
+        for policy in policies {
+            match policy.evaluate(request) {
+                Decision::Deny => return Verdict::SessionDeny,
+                Decision::Allow => session_allows = true,
+                Decision::NotApplicable => {}
+            }
+        }
+    }
+    let (bucket_allows, bucket_direct) = match bucket.map(|policy| policy.evaluate_reach(request, cross)) {
+        Some((Decision::Deny, _)) => return Verdict::ExplicitDeny { identity: false },
+        Some((Decision::Allow, direct)) => (true, direct),
+        _ => (false, false),
     };
+    let capped = boundary_allows && session_allows;
     let allowed = match cross && !anonymous {
-        true => identity_allows && boundary_allows && bucket_allows,
-        false => identity_allows && boundary_allows || bucket_allows,
+        true => identity_allows && capped && bucket_allows,
+        false => identity_allows && capped || bucket_direct || bucket_allows && capped,
     };
     // A boundary that doesn't allow it is why, whether or not an identity
-    // policy does (probed).
+    // policy does; then the identity policies, then the session's (probed).
+    // Allowed by the bucket's policy through the role, only the caps are.
     match allowed {
         true => Verdict::Allow,
         false if !boundary_allows => Verdict::OutsideBoundary,
+        false if !identity_allows && !bucket_allows => Verdict::ImplicitDeny,
+        false if !session_allows => Verdict::OutsideSession,
         false => Verdict::ImplicitDeny,
+    }
+}
+
+/// Whether a role's trust policy lets `request`'s principal assume it (or
+/// tag its session, ...), with the principal's identity policies (capped by
+/// `caps`): a Deny anywhere denies; else the trust policy must allow it, by
+/// naming the principal itself (or everyone), or by naming its account,
+/// which leaves it to the identity policies (probed: a trust policy naming
+/// someone else allows nothing, whatever the identity policies say).
+pub fn trust_allows<'p>(
+    identity: impl IntoIterator<Item = &'p Policy>,
+    caps: Caps<'p>,
+    trust: &Policy,
+    request: &Request,
+) -> bool {
+    let mut identity_allows = false;
+    for policy in identity {
+        match policy.evaluate(request) {
+            Decision::Deny => return false,
+            Decision::Allow => identity_allows = true,
+            Decision::NotApplicable => {}
+        }
+    }
+    let boundary_allows = match caps.boundary.map(|policy| policy.evaluate(request)) {
+        Some(Decision::Deny) => return false,
+        Some(Decision::Allow) | None => true,
+        Some(Decision::NotApplicable) => false,
+    };
+    let mut session_allows = true;
+    if let Some(policies) = caps.session {
+        session_allows = false;
+        for policy in policies {
+            match policy.evaluate(request) {
+                Decision::Deny => return false,
+                Decision::Allow => session_allows = true,
+                Decision::NotApplicable => {}
+            }
+        }
+    }
+    match trust.evaluate_trust(request) {
+        (Decision::Deny, _) => false,
+        (Decision::Allow, true) => true,
+        (Decision::Allow, false) => identity_allows && boundary_allows && session_allows,
+        (Decision::NotApplicable, _) => false,
     }
 }
 
@@ -282,12 +378,10 @@ struct Principals {
     users: Vec<(String, String)>,
     /// Accounts (an ID, or its root ARN).
     accounts: Vec<String>,
-    /// Roles, by their account, and path and name, as users (trust
-    /// policies').
+    /// Roles, by their account, and path and name, as users.
     roles: Vec<(String, String)>,
     /// Role sessions, by their account, role name and session name
-    /// (`arn:aws:sts::<account>:assumed-role/<role>/<session>`; trust
-    /// policies').
+    /// (`arn:aws:sts::<account>:assumed-role/<role>/<session>`).
     sessions: Vec<(String, String, String)>,
 }
 
@@ -295,9 +389,29 @@ impl Principals {
     /// Whether the statement is about `principal`. A user it names is the
     /// one that had the name when the policy was set (`ids`), as in S3: not
     /// one made with the name later.
-    fn about(&self, principal: Principal, allow: bool, ids: &HashMap<String, String>, cross: bool) -> bool {
+    fn about(&self, principal: Principal, allow: bool, ids: &HashMap<String, String>, cross: bool) -> Option<Reach> {
+        let direct = |yes: bool| yes.then_some(Reach::Direct);
+        let whole = |account: &str| self.accounts.iter().any(|a| a == account);
         match principal {
-            Principal::Anonymous => self.everyone != self.not,
+            Principal::Anonymous => direct(self.everyone != self.not),
+            Principal::Session { account, role, id, session } => {
+                let named = self.sessions.iter().any(|(a, r, s)| a == account && r == role && s == session);
+                let by_role = self.roles.iter().any(|(a, n)| a == account && ids.get(&role_arn(a, n)).is_some_and(|named| named == id));
+                if self.not {
+                    return direct(!(self.everyone || named || by_role));
+                }
+                if self.everyone || named {
+                    Some(Reach::Direct)
+                } else if by_role {
+                    Some(Reach::Role)
+                } else {
+                    direct(whole(account) && (!allow || cross))
+                }
+            }
+            Principal::Federated { account, .. } => match self.not {
+                true => direct(!self.everyone),
+                false => direct(self.everyone || (whole(account) && (!allow || cross))),
+            },
             Principal::User { account, id, .. } => {
                 // By its ID: the user the ARN named when the policy was
                 // set, renamed or moved since or not (probed), and not one
@@ -305,18 +419,18 @@ impl Principals {
                 let user = self.users.iter().any(|(a, n)| {
                     a == account && ids.get(&user_arn(a, n)).is_some_and(|named| named == id)
                 });
-                let whole = self.accounts.iter().any(|a| a == account);
+                let whole = whole(account);
                 if self.not {
                     // NotPrincipal leaves out the users it names (as S3 does,
                     // probed), not an account's users for naming the account.
-                    !(self.everyone || user)
+                    direct(!(self.everyone || user))
                 } else {
                     // An account allows nothing by itself: it leaves it to the
                     // account's identity policies. It does deny all of the
                     // account's users (probed). For a request from another
                     // account than the bucket's (`cross`), naming the account
                     // is the bucket's side of what both sides must allow.
-                    self.everyone || user || (whole && (!allow || cross))
+                    direct(self.everyone || user || (whole && (!allow || cross)))
                 }
             }
         }
@@ -330,18 +444,19 @@ impl Matches {
 }
 
 impl Statement {
-    fn applies(&self, request: &Request, variables: bool, ids: &HashMap<String, String>, cross: bool) -> bool {
-        if let Some(principals) = &self.principals
-            && !principals.about(request.principal, self.allow, ids, cross)
-        {
-            return false;
-        }
+    /// Whether it applies to `request`, and how it's about its principal.
+    fn applies(&self, request: &Request, variables: bool, ids: &HashMap<String, String>, cross: bool) -> Option<Reach> {
+        let reach = match &self.principals {
+            Some(principals) => principals.about(request.principal, self.allow, ids, cross)?,
+            None => Reach::Direct,
+        };
         let syntax = Syntax { wildcards: true, variables: None };
         let action_matches = |p: &str| Pattern::new(p, syntax).is_some_and(|p| p.matches(request.action, true));
         let vars = variables.then_some(request.context);
-        self.actions.any(action_matches)
+        let applies = self.actions.any(action_matches)
             && self.resources.any(|p| arn_matches(p, request.resource, vars))
-            && self.conditions.iter().all(|c| c.holds(request.context, variables))
+            && self.conditions.iter().all(|c| c.holds(request.context, variables));
+        applies.then_some(reach)
     }
 }
 
@@ -354,15 +469,34 @@ impl Policy {
     /// As `evaluate`, for a request from another account than the
     /// resource's (`cross`), when it's so.
     pub fn evaluate_across(&self, request: &Request, cross: bool) -> Decision {
-        let applying = self.statements.iter().filter(|s| s.applies(request, self.variables, &self.ids, cross));
+        self.evaluate_reach(request, cross).0
+    }
+
+    /// As `evaluate_across`, and whether an Allow names the principal itself
+    /// (or everyone), not only the role a session is of (see `Reach`).
+    fn evaluate_reach(&self, request: &Request, cross: bool) -> (Decision, bool) {
         let mut decision = Decision::NotApplicable;
-        for statement in applying {
+        let mut direct = false;
+        for statement in &self.statements {
+            let Some(reach) = statement.applies(request, self.variables, &self.ids, cross) else { continue };
             if !statement.allow {
-                return Decision::Deny;
+                return (Decision::Deny, false);
             }
             decision = Decision::Allow;
+            direct |= reach == Reach::Direct;
         }
-        decision
+        (decision, direct)
+    }
+
+    /// What it says about `request` as a role's trust policy: whether it
+    /// denies it, allows it by naming the principal itself (or everyone),
+    /// or allows it by naming the principal's account, which leaves the
+    /// rest to the principal's identity policies (see `sts`).
+    pub fn evaluate_trust(&self, request: &Request) -> (Decision, bool) {
+        // Naming the account is an Allow too, as across accounts.
+        let (decision, _) = self.evaluate_reach(request, true);
+        let (_, direct) = self.evaluate_reach(request, false);
+        (decision, direct)
     }
 
     /// The policy, naming by `ids` (ARN → ID) the users it names: as they
@@ -783,6 +917,11 @@ pub fn user_arn(account: &str, name: &str) -> String {
     format!("arn:aws:iam::{account}:user/{name}")
 }
 
+/// A role's ARN, by its path and name.
+pub fn role_arn(account: &str, name: &str) -> String {
+    format!("arn:aws:iam::{account}:role/{name}")
+}
+
 fn is_account(id: &str) -> bool {
     id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit())
 }
@@ -829,8 +968,8 @@ fn parse_principals(
                     }
                     let shown = id.clone();
                     let invalid = || invalid_one("AWS", &shown);
-                    // A role's session (trust policies').
-                    if let Some(rest) = id.strip_prefix("arn:aws:sts::").filter(|_| trust) {
+                    // A role's session.
+                    if let Some(rest) = id.strip_prefix("arn:aws:sts::") {
                         let (account, what) = rest.split_once(':').ok_or_else(invalid)?;
                         let session = what.strip_prefix("assumed-role/").and_then(|s| s.split_once('/'));
                         match session {
@@ -857,7 +996,7 @@ fn parse_principals(
                         if let Some(name) = rename(id) {
                             *id = name;
                         }
-                    } else if let Some(role) = named("role/").filter(|_| trust) {
+                    } else if let Some(role) = named("role/") {
                         principals.roles.push((account.to_owned(), role.to_owned()));
                         if let Some(name) = rename(id) {
                             *id = name;

@@ -88,6 +88,10 @@ pub struct Principal {
     pub tags: Vec<(String, String)>,
     /// Its permissions boundary, which caps what its policies allow.
     pub boundary: Option<Boundary>,
+    /// The session its temporary credentials are, if they are (see
+    /// `sessions`): then `id`, `name`, `path`, policies, tags and boundary
+    /// are its role's (or user's), and its tags the session's too.
+    pub session: Option<SessionOf>,
     /// Grants, for tests of what they allowed before they were bucket
     /// policies (`s3::authorize`); grants are statements of buckets'
     /// policies now (see `grants`).
@@ -136,10 +140,144 @@ pub fn tags_of(keys: Vec<String>, values: Vec<String>) -> Vec<(String, String)> 
     keys.into_iter().zip(values).collect()
 }
 
+/// A principal's session (temporary credentials).
+#[derive(Clone, Debug)]
+pub struct SessionOf {
+    /// What its token says.
+    pub session: crate::sessions::Session,
+    /// Its session policies' documents: the inline one, then the managed
+    /// ones it names (as they are now). With `restricted`, these cap the
+    /// principal's policies, even none of them (nothing, then).
+    pub policies: Vec<String>,
+    pub restricted: bool,
+}
+
+/// Why a request's credentials aren't anyone's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unknown {
+    /// No such access key: none at all, a temporary one without its token,
+    /// another's token, or a session whose role or user is gone.
+    Key,
+    /// A token that isn't one of ours, or with a long-term key.
+    Token,
+    /// A session past its expiry.
+    Expired,
+}
+
 impl Principal {
-    /// Its ARN.
+    /// Its ARN: a role session's (`arn:aws:sts::…:assumed-role/<role>/<session>`)
+    /// or a federated user's, else the user's.
     pub fn arn(&self) -> String {
-        user_arn(&self.account, &self.path, &self.name)
+        use crate::sessions::Who;
+        match self.session.as_ref().map(|s| &s.session.who) {
+            Some(Who::Role { session, .. }) => format!("arn:aws:sts::{}:assumed-role/{}/{session}", self.account, self.name),
+            Some(Who::Federated { name, .. }) => format!("arn:aws:sts::{}:federated-user/{name}", self.account),
+            _ => user_arn(&self.account, &self.path, &self.name),
+        }
+    }
+
+    /// Whose a role's session's is: its role's ARN, as `aws:PrincipalArn`
+    /// has it (probed); else as `arn`.
+    pub fn principal_arn(&self) -> String {
+        match self.session.as_ref().map(|s| &s.session.who) {
+            Some(crate::sessions::Who::Role { .. }) => crate::roles::role_arn(&self.account, &self.path, &self.name),
+            _ => self.arn(),
+        }
+    }
+
+    /// Its unique ID, as `aws:userid` and GetCallerIdentity have it
+    /// (probed): a user's `AIDA…`, a role session's `AROA…:<session>`, a
+    /// federated user's `<account>:<name>`.
+    pub fn unique_id(&self) -> String {
+        use crate::sessions::Who;
+        match self.session.as_ref().map(|s| &s.session.who) {
+            Some(Who::Role { session, .. }) => format!("{}:{session}", crate::roles::unique_id(self.id)),
+            Some(Who::Federated { name, .. }) => format!("{}:{name}", self.account),
+            _ => unique_id("AIDA", self.id),
+        }
+    }
+
+    /// A role's sessions' principal, without its session yet (see
+    /// `roles::principal`).
+    pub fn of_role(
+        id: uuid::Uuid,
+        name: String,
+        account: String,
+        path: String,
+        policies: Vec<String>,
+        tags: Vec<(String, String)>,
+        boundary: Option<Boundary>,
+    ) -> Principal {
+        Principal {
+            id,
+            name,
+            account,
+            secret: String::new(),
+            admin: false,
+            policies,
+            path,
+            tags,
+            boundary,
+            session: None,
+            #[cfg(test)]
+            read: HashSet::new(),
+            #[cfg(test)]
+            write: HashSet::new(),
+            #[cfg(test)]
+            delete_version: HashSet::new(),
+        }
+    }
+
+    /// Whether it's a role's session.
+    pub fn is_role_session(&self) -> bool {
+        matches!(self.session.as_ref().map(|s| &s.session.who), Some(crate::sessions::Who::Role { .. }))
+    }
+
+    /// Who signed with `access_key` (and, temporary credentials, `token`):
+    /// a user by its long-term key, or a session by its token (see
+    /// `sessions`); or why that's no one.
+    pub async fn authenticate(
+        client: &Object,
+        keys: &crate::sessions::Keys,
+        access_key: &str,
+        token: Option<&str>,
+    ) -> anyhow::Result<Result<Self, Unknown>> {
+        use crate::sessions::{Bad, Who};
+        if !crate::sessions::is_temporary(access_key) {
+            if token.is_some() {
+                return Ok(Err(Unknown::Token));
+            }
+            return Ok(Self::load(client, access_key).await?.ok_or(Unknown::Key));
+        }
+        let Some(token) = token else { return Ok(Err(Unknown::Key)) };
+        let session = match keys.open(client, token).await? {
+            Ok(session) => session,
+            Err(Bad::Malformed) => return Ok(Err(Unknown::Token)),
+            Err(Bad::Expired) => return Ok(Err(Unknown::Expired)),
+        };
+        if session.key_id != access_key {
+            return Ok(Err(Unknown::Key));
+        }
+        let principal = match &session.who {
+            Who::Role { id, .. } => crate::roles::principal(client, *id).await?,
+            Who::User { id } | Who::Federated { id, .. } => Self::load_user(client, *id).await?,
+        };
+        let Some(mut principal) = principal else { return Ok(Err(Unknown::Key)) };
+        principal.secret = session.secret.clone();
+        // The session's tags win over its role's (or user's) of the same
+        // key, regardless of case (probed).
+        principal.tags.retain(|(key, _)| !session.tags.iter().any(|(k, _)| k.eq_ignore_ascii_case(key)));
+        principal.tags.extend(session.tags.iter().cloned());
+        let mut policies: Vec<String> = session.policy.iter().cloned().collect();
+        for arn in &session.policy_arns {
+            if let Some(document) = crate::managed::document(client, &principal.account, arn).await? {
+                policies.push(document);
+            }
+        }
+        // A federated user without session policies may do nothing.
+        let restricted = matches!(session.who, Who::Federated { .. }) || session.policy.is_some() || !session.policy_arns.is_empty();
+        principal.session = Some(SessionOf { session, policies, restricted });
+        Ok(Ok(principal))
     }
 
     /// Loads the user whose active access key `access_key` is, or `None` if
@@ -202,6 +340,7 @@ impl Principal {
             id: r.get(2),
             name: r.get(3),
             account: r.get(4),
+            session: None,
             #[cfg(test)]
             read: HashSet::new(),
             #[cfg(test)]
@@ -247,6 +386,7 @@ impl Principal {
             path: "/".to_owned(),
             tags: Vec::new(),
             boundary: None,
+            session: None,
         }
     }
 
@@ -1183,6 +1323,25 @@ pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
             .get()
             .await?
             .execute_cached("UPDATE users SET kms_entity_id = $2 WHERE id = $1", &[&user, &entity])
+            .await?;
+    }
+    // Roles likewise: their sessions ask the KMS as them (their IDs never
+    // are a user's: both are random UUIDs).
+    let roles: Vec<uuid::Uuid> = app
+        .pool
+        .get()
+        .await?
+        .query_cached("SELECT id FROM iam_roles WHERE kms_entity_id IS NULL ORDER BY created_at", &[])
+        .await?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    for role in roles {
+        let entity = kms.identify(crate::kms::Identity::User(role)).await.map_err(|e| anyhow::anyhow!("role {role}: {e}"))?;
+        app.pool
+            .get()
+            .await?
+            .execute_cached("UPDATE iam_roles SET kms_entity_id = $2 WHERE id = $1", &[&role, &entity])
             .await?;
     }
     Ok(())
