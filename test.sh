@@ -1334,14 +1334,12 @@ tagging_roles_ok() {
 # Bucket sub-resource stubs: location/versioning/accelerate/request payment/
 # logging/notification succeed (200, empty or default config);
 # website/replication are "not configured" (the client errors on 404),
-# and so are CORS, tags and lifecycle, until they're set. The policy holds
-# the bucket's grants (see `grants`), and nothing else.
+# and so are CORS, tags, lifecycle and the policy, until they're set (grants
+# are managed policies of their users, not the bucket's: see `grants`).
 subresource_stubs_ok() {
     awss3 s3api get-bucket-location --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     awss3 s3api get-bucket-versioning --bucket "$BUCKET" >/dev/null 2>&1 || return 1
-    [ "$(awss3 s3api get-bucket-policy --bucket "$BUCKET" --query Policy --output text 2>/dev/null \
-        | python3 -c 'import json,sys; print(all(s["Sid"].startswith("CairnGrant") for s in json.load(sys.stdin)["Statement"]))')" \
-        = True ] || return 1
+    awss3 s3api get-bucket-policy --bucket "$BUCKET" 2>&1 | grep -q NoSuchBucketPolicy || return 1
     ! awss3 s3api get-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-lifecycle-configuration --bucket "$BUCKET" >/dev/null 2>&1 || return 1
@@ -1578,13 +1576,11 @@ post_object_ok() {
 # Operations Cairn doesn't implement are refused (501), not run as the plain
 # PUT/DELETE/GET they'd otherwise route to: the object and the bucket survive.
 unsupported_subresources_refused() {
-    local path="/${BUCKET}/small.txt" xml="$WORK_DIR/legal-hold.xml"
-    printf '<LegalHold><Status>ON</Status></LegalHold>' >"$xml"
-    local hash; hash=$(sha256sum "$xml" | cut -d' ' -f1)
-    [ "$(scurl PUT "$path?legal-hold" "$hash" "$xml")" = 501 ] || return 1
-    [ "$(scurl PUT "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    local path="/${BUCKET}/small.txt"
+    [ "$(scurl PUT "$path?renameObject" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl POST "$path?restore" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
-    [ "$(scurl GET "$path?legal-hold" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl GET "$path?torrent" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "/${BUCKET}?website" "$EMPTY_SHA256" -)" = 501 ] || return 1
     check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
 }
@@ -2244,9 +2240,8 @@ bucket_policy_ok() {
         awss3 s3api put-object --bucket "$b" --key "$key" --body "$WORK_DIR/pub.txt" >/dev/null 2>&1 || return 1
     done
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/a.txt")" = 403 ] || return 1
-    # The grants are the bucket's policy, so far.
-    awss3 s3api get-bucket-policy --bucket "$b" --query Policy --output text 2>/dev/null \
-        | grep -q '"Sid":"CairnGrantWrite"' || return 1
+    # The writer's grant is its own managed policy: the bucket has none.
+    awss3 s3api get-bucket-policy --bucket "$b" 2>&1 | grep -q NoSuchBucketPolicy || return 1
     printf '%s' '{"Version":"2012-10-17","Statement":[
  {"Sid":"PublicRead","Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/pub/*"},
  {"Sid":"Drop","Effect":"Allow","Principal":"*","Action":"s3:PutObject","Resource":"arn:aws:s3:::'"$b"'/drop/*"},
@@ -2264,8 +2259,7 @@ bucket_policy_ok() {
     awss3 s3api delete-public-access-block --bucket "$b" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-public-access-block --bucket "$b" >/dev/null 2>&1 || return 1
     awss3 s3api put-bucket-policy --bucket "$b" --policy "file://$doc" >/dev/null 2>&1 || return 1
-    # Grants are statements of the bucket's policy, which that replaced.
-    cairn_role grant writer "$b" write >/dev/null 2>&1 || return 1
+    # An account principal reads back as its root's ARN, as in S3.
     awss3 s3api get-bucket-policy --bucket "$b" --query Policy --output text 2>/dev/null \
         | grep -qF "\"Principal\":{\"AWS\":\"arn:aws:iam::$account:root\"}" || return 1
     [ "$(awss3 s3api get-bucket-policy-status --bucket "$b" --query PolicyStatus.IsPublic --output text 2>/dev/null)" = True ] \
@@ -2492,8 +2486,10 @@ resume_upload_ok() {
     "${w[@]}" s3api delete-object --bucket "$OBUCKET" --key "$key" >/dev/null 2>&1
 }
 
-# Grants follow the bucket's lifecycle: granting on a missing bucket fails, and
-# deleting a bucket drops its grants, so re-creating it doesn't revive them.
+# Grants and the bucket's lifecycle: granting on a missing bucket fails. A
+# grant is a managed policy of the user's (see `grants`), which outlives the
+# bucket, as an IAM policy does in AWS: a bucket made again under the same
+# name is the user's again, until the grant is revoked.
 grants_follow_bucket_ok() {
     local a=(as_role bucketadmin adminsecret) b="life-$(date +%s)"
     ! cairn_role grant writer "$b" read >/dev/null 2>&1 || return 1
@@ -2502,6 +2498,8 @@ grants_follow_bucket_ok() {
     as_role writer writersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
     "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1 || return 1
     "${a[@]}" s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    as_role writer writersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    cairn_role revoke writer "$b" read >/dev/null 2>&1 || return 1
     ! as_role writer writersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
     "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
