@@ -226,6 +226,7 @@ const MIGRATIONS: &[&str] = &[
     POLICY_TAGS,
     POLICY_VERSIONS,
     SINGLE_ACCOUNT,
+    NO_ROOT,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2028,6 +2029,38 @@ END $$;
 
 -- One account (and the operator's, empty, for older nodes).
 CREATE UNIQUE INDEX accounts_one ON accounts (operator) WHERE NOT operator;
+"#;
+/// Migration 46: no root (see `plans/single-account.md`): the account's
+/// root, which identity policies didn't restrict, goes; the command line on
+/// a node is the way out of what policies lock. A login that was the root
+/// becomes an admin user, `root` (`root-2`, ...), so it keeps its way in.
+/// Roots' enrollment links go, and no identity or link is a root's again.
+const NO_ROOT: &str = r#"
+DO $$
+DECLARE
+    v_root record;
+    v_name text;
+    v_n integer;
+    v_role uuid;
+BEGIN
+    FOR v_root IN SELECT login_id, account_id FROM login_identities WHERE role_id IS NULL LOOP
+        v_name := 'root';
+        v_n := 1;
+        WHILE EXISTS (SELECT 1 FROM roles WHERE account_id = v_root.account_id AND lower(name) = v_name) LOOP
+            v_n := v_n + 1;
+            v_name := 'root-' || v_n;
+        END LOOP;
+        INSERT INTO roles (name, secret, admin, account_id)
+        VALUES (v_name, 'unusable:' || gen_random_uuid() || gen_random_uuid(), true, v_root.account_id)
+        RETURNING id INTO v_role;
+        UPDATE login_identities SET role_id = v_role
+        WHERE login_id = v_root.login_id AND account_id = v_root.account_id;
+    END LOOP;
+END $$;
+DELETE FROM console_enrollments WHERE role_id IS NULL;
+DROP INDEX login_identities_root;
+ALTER TABLE login_identities ALTER COLUMN role_id SET NOT NULL;
+ALTER TABLE console_enrollments ALTER COLUMN role_id SET NOT NULL;
 "#;
 #[cfg(test)]
 mod tests {

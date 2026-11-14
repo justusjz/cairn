@@ -328,19 +328,19 @@ bucket and policy belongs to; `cairn account show` shows it. Teams are kept
 apart by IAM, as within an AWS account: users' paths (`/team-a/`),
 permissions boundaries, and policies that give each team its own buckets,
 down to the names it may create (`s3:CreateBucket` on
-`arn:aws:s3:::team-a-*`). The account has a **root**, the account itself
-(`arn:aws:iam::<account>:root`), which signs in to the [console](#console)
-only (no access keys): it may do anything but what its buckets' policies
-deny it, and it may always get, set and delete those policies, as AWS's root
-may, so a policy that denies everyone can't lock its bucket for good. `cairn
-account enroll` makes its enrollment link (its first, or one for a root that
-lost its passkeys).
+`arn:aws:s3:::team-a-*`). There's no root user, which no policy restricts:
+the way out of policies that lock people out is the command line on a node
+(`cairn user update <name> --admin`, `cairn user detach`, `cairn user
+unbound`, `cairn bucket-policy delete`), which reaches the database anyway.
+In a bucket policy, `arn:aws:iam::<account>:root` (or the account's ID)
+still means what it does in AWS: the account, whose users' own policies
+then decide.
 
 **Operators** run the cluster: they're users whose policies allow Cairn's
 own actions, `cairn:` ones (`cairn:GetCluster`, `cairn:PutSetting`,
 `cairn:RemoveNode`, …), on the cluster. `AdministratorAccess` (`*`) includes
 them; Cairn's managed policy `CairnOperatorAccess` allows them and nothing
-else (the cluster, without the data). The root may do them too.
+else (the cluster, without the data).
 
 A console session signed in with a passkey has
 `aws:MultiFactorAuthPresent` (`true`) and `aws:MultiFactorAuthAge` (seconds
@@ -383,8 +383,8 @@ on**, as S3's do, so making one public takes turning its block off first
 blocks have none.
 
 Each account has a block of its own too, as in S3, which every one of its
-buckets gets, whatever their own says. A new account has none. Its root, and
-users allowed `s3:PutAccountPublicAccessBlock`, set it through S3 Control's
+buckets gets, whatever their own says. A new account has none. Users allowed
+`s3:PutAccountPublicAccessBlock` set it through S3 Control's
 API (`aws s3control`), or with the switches above the console's bucket list.
 It's the account's alone: the operator doesn't set it. S3 Control's clients
 put the account ID in front of the endpoint's host
@@ -432,6 +432,8 @@ Manage users with `cairn user <command>`:
 | `delete <name>` | Delete a user, with its keys and policies. |
 | `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket of the account: attaches its managed policy `<bucket>-<permission>`, made the first time. |
 | `revoke <name> <bucket> [read\|write\|delete-version]...` | Revoke permissions on a bucket (detaches those policies); all of them if none are listed. |
+| `attach <name> <arn>` / `detach <name> <arn>` | Attach or detach a managed policy, Cairn's (`arn:aws:iam::aws:policy/CairnOperatorAccess`) or the account's. |
+| `unbound <name>` | Take a user's permissions boundary off, whatever its policies say. |
 | `key create <name> [--id <ID>] [--secret <S>]` | Make the user another access key (at most two). Prints its ID and secret. |
 | `key activate\|deactivate\|delete <ID>` | Let a key sign requests, stop it, or delete it. |
 | `policy put <name> <policy> <file>` | Set an inline policy (JSON; `-` reads stdin). A user's policies hold at most 2048 characters together, as in IAM. |
@@ -476,9 +478,9 @@ provider calls as it starts. The AWS CLI refuses access key IDs shorter than
 as it.
 
 A bucket policy can deny everyone everything, its admins too, as in S3. The
-operator, on a node's peer endpoint, can always remove it, as an AWS
-account's root user can: `cairn bucket-policy delete <bucket>` (or `get`, or
-`put <bucket> <file>`).
+command line on a node can always remove it, as an AWS account's root user
+can: `cairn bucket-policy delete <bucket>` (or `get`, or `put <bucket>
+<file>`).
 
 Secrets are stored in plaintext in the `access_keys` table: SigV4 is an HMAC scheme,
 so verifying a signature needs the secret itself. Restrict access to the
@@ -535,23 +537,22 @@ passwords, and access keys are for S3, never for the console.
 cairn serve ... --listen-console 0.0.0.0:9480 --console-url https://console.example.com
 ```
 
-The first person comes from the command line: the account's root, or an
-admin, with a link to enroll a passkey with. Everyone after that can be made
-in the console.
+The first person comes from the command line: an admin, with a link to
+enroll a passkey with. Everyone after that can be made in the console.
 
 ```sh
-cairn account enroll                          # the root, on a node that serves the console
-cairn user create ada --admin && cairn user enroll ada   # or an admin
+cairn user create ada --admin
+cairn user enroll ada     # on a node that serves the console
 ```
 
 A **login** (a person, with passkeys or identities at OIDC providers) acts
-as one identity: a user, or the account's root. An enrollment link is for an
-identity: opened signed out, it makes a new login.
+as a user. An enrollment link is for a user: opened signed out, it makes a
+new login.
 
 The console acts as its identity: it allows exactly what that identity's S3,
 IAM and `cairn:` requests would be allowed, by the same policies (the user's
 attached and inline policies, and the bucket's policy; an explicit Deny
-wins), and denies with S3's messages. The root may do anything, as in AWS.
+wins), and denies with S3's messages.
 
 The menu at the top right is the person's: who the session acts as, its
 passkeys and sign-in providers, and signing out.
@@ -614,8 +615,6 @@ users). Whichever node answers shows the whole cluster:
   and the [lifecycle](#lifecycle-rules) sweeps: each bucket's, how long a
   round of them takes, and the rate they go at, which can be changed there.
 - **Sign-in:** the OIDC providers people may sign in at.
-- **Users** shows them the root's enrollment link too (to recover the
-  account, `cairn:RecoverAccount`).
 
 Request metrics are kept in memory by each node, so they start over when it
 restarts; everything else is read from the database.
@@ -630,8 +629,7 @@ restarts; everything else is read from the database.
   secure). Passkeys are bound to the console URL's host, so changing it
   makes everyone enroll again.
 - **Enrollment.** An identity gets a first passkey through a one-time link,
-  valid 24 hours: `cairn user enroll <name>` (`cairn
-  account enroll` for the account's root), or the Users page. Once signed in, people add more passkeys (at most 8; a second one,
+  valid 24 hours: `cairn user enroll <name>`, or the Users page. Once signed in, people add more passkeys (at most 8; a second one,
   on another device, keeps them from being locked out) and remove them, but
   never their last. A lost passkey takes a new link.
 - **Sessions** last 12 hours at most, and end after an hour unused. They're a
@@ -769,7 +767,7 @@ marker on top, as ever. The modes are S3's:
   asking to (`x-amz-bypass-governance-retention: true`, aws-cli's
   `--bypass-governance-retention`).
 - **`COMPLIANCE`:** no one can, until the date has passed: not an admin,
-  not the account's root, not an operator, not even with access to the
+  not an operator, not even with access to the
   database, whose triggers refuse it too. The retention can only be
   lengthened. The bucket can't be deleted while it has versions.
 

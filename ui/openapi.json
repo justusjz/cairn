@@ -124,41 +124,6 @@
         }
       }
     },
-    "/account/root-enrollment": {
-      "post": {
-        "summary": "Makes the account's root a one-time link to the console (24 hours): its\nfirst, or one to recover the account, if the root lost its passkeys. It\nreplaces the root's last.",
-        "operationId": "create_root_enrollment",
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EnrollmentLink"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/buckets": {
       "get": {
         "operationId": "list_buckets",
@@ -4718,10 +4683,11 @@
       },
       "IdentitySummary": {
         "type": "object",
-        "description": "An identity of the login.",
+        "description": "Who the login is: a user of the account.",
         "required": [
           "account_id",
           "account",
+          "user",
           "arn",
           "admin"
         ],
@@ -4734,18 +4700,15 @@
           },
           "admin": {
             "type": "boolean",
-            "description": "Whether the user has `AdministratorAccess` (a root may do anything in\nits account anyway)."
+            "description": "Whether the user has `AdministratorAccess`."
           },
           "arn": {
             "type": "string",
-            "description": "The identity's ARN, which policies name it by."
+            "description": "The user's ARN, which policies name it by."
           },
           "user": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The user's name; `null`: the account's root."
+            "type": "string",
+            "description": "The user's name."
           }
         }
       },
@@ -5447,7 +5410,7 @@
       },
       "Me": {
         "type": "object",
-        "description": "The signed-in login: who it acts as now, its identities, its passkeys.",
+        "description": "The signed-in login: who it acts as, its passkeys.",
         "required": [
           "name",
           "identity",

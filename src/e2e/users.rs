@@ -319,7 +319,8 @@ async fn operators_are_users_with_cairn_actions() {
 /// `db::SINGLE_ACCOUNT`): a superadmin with no identity in the account moves
 /// into it, as an admin; one whose login is in it already goes, making that
 /// user admin; the operator's root becomes the account's, which had none.
-/// Empty accounts go.
+/// Empty accounts go. Then migration 46 (`db::NO_ROOT`) makes the root an
+/// admin user, `root`.
 #[tokio::test]
 async fn the_operators_join_the_account() {
     let Some(pool) = super::fresh_database_through(44).await else { return };
@@ -361,7 +362,10 @@ async fn the_operators_join_the_account() {
         .iter()
         .map(|r| (r.get(0), r.get(1), r.get(2)))
         .collect();
-    assert_eq!(users, [("ada".to_owned(), true, account.clone()), ("sam".to_owned(), true, account.clone())]);
+    assert_eq!(
+        users,
+        [("ada".to_owned(), true, account.clone()), ("root".to_owned(), true, account.clone()), ("sam".to_owned(), true, account.clone())]
+    );
     let identities: Vec<(String, String, Option<String>)> = client
         .query(
             "SELECT l.name, i.account_id, r.name FROM login_identities i JOIN logins l ON l.id = i.login_id
@@ -377,10 +381,54 @@ async fn the_operators_join_the_account() {
         identities,
         [
             ("ada".to_owned(), account.clone(), Some("ada".to_owned())),
-            ("olga".to_owned(), account.clone(), None),
+            ("olga".to_owned(), account.clone(), Some("root".to_owned())),
             ("sam".to_owned(), account.clone(), Some("sam".to_owned())),
         ]
     );
+}
+
+/// Migration 46 makes the root's login an admin user, `root`, or `root-2`
+/// if there's a `root` already; the root's enrollment links go, and no
+/// identity or link may be a root's any more.
+#[tokio::test]
+async fn the_roots_login_becomes_an_admin() {
+    let Some(pool) = super::fresh_database_through(45).await else { return };
+    let mut client = pool.get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute(
+        "SET LOCAL cairn.users = '5';
+         INSERT INTO roles (name, secret, admin, account_id)
+             SELECT 'Root', 'secret123', false, id FROM accounts WHERE NOT operator;
+         INSERT INTO logins (id, name) VALUES ('00000000-0000-4000-8000-000000000001', 'rita');
+         INSERT INTO login_identities (login_id, account_id, role_id)
+             SELECT '00000000-0000-4000-8000-000000000001', id, NULL FROM accounts WHERE NOT operator;
+         INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
+             SELECT '\\x00', NULL, id, now() + interval '1 day' FROM accounts WHERE NOT operator;",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    crate::db::init(&pool, usize::MAX).await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT r.name, r.admin FROM login_identities i JOIN roles r ON r.id = i.role_id
+             WHERE i.login_id = '00000000-0000-4000-8000-000000000001'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!((row.get::<_, String>(0), row.get::<_, bool>(1)), ("root-2".to_owned(), true));
+    let links: i64 = client.query_one("SELECT count(*) FROM console_enrollments", &[]).await.unwrap().get(0);
+    assert_eq!(links, 0);
+    let err = client
+        .execute(
+            "INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
+             SELECT '\\x01', NULL, id, now() FROM accounts WHERE NOT operator",
+            &[],
+        )
+        .await
+        .unwrap_err();
+    assert!(format!("{err:?}").contains("not-null") || format!("{err:?}").contains("NotNull"), "{err:?}");
 }
 
 /// Migration 45 is refused while two accounts have users or buckets, or

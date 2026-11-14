@@ -229,15 +229,9 @@ async fn session_user(
     query: String,
     peer: Option<std::net::IpAddr>,
 ) -> Result<Option<actor::User>, ApiError> {
-    let subject = match &session.identity.user {
-        Some(user) => match Principal::load_user(client, user.id).await? {
-            Some(principal) => actor::Subject::User(principal),
-            None => return Ok(None),
-        },
-        None => actor::Subject::Root,
-    };
+    let Some(principal) = Principal::load_user(client, session.identity.user.id).await? else { return Ok(None) };
     let account = session.identity.account_id.clone();
-    Ok(Some(actor::User { subject, account, method, headers, query, peer, mfa_age: session.mfa_age }))
+    Ok(Some(actor::User { principal, account, method, headers, query, peer, mfa_age: session.mfa_age }))
 }
 
 /// A file of the console's UI, or else its page.
@@ -462,7 +456,7 @@ mod e2e {
         let token = store::create_enrollment(&client, &crate::roles::account(&client).await.unwrap(), "ada").await.unwrap();
         let (status, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
         assert_eq!(status, StatusCode::OK, "{ceremony}");
-        assert_eq!(ceremony["identity"], "ada @ default");
+        assert_eq!(ceremony["identity"], "ada");
         assert_eq!(ceremony["options"]["rp"]["id"], "console.example.com");
         assert_eq!(ceremony["options"]["authenticatorSelection"]["userVerification"], "required");
         let mut laptop = Authenticator::p256();
@@ -470,7 +464,7 @@ mod e2e {
         body["token"] = json!(token);
         let (status, me) = browser.send("POST", "/api/enroll", Some(body.clone())).await;
         assert_eq!(status, StatusCode::OK, "{me}");
-        assert_eq!(me["name"], "ada @ default");
+        assert_eq!(me["name"], "ada");
         assert_eq!(me["identity"]["user"], "ada");
         assert!(me["identity"]["arn"].as_str().unwrap().ends_with(":user/ada"));
         assert_eq!(me["passkeys"][0]["name"], "Laptop");
@@ -799,41 +793,27 @@ mod e2e {
         assert_eq!(status, StatusCode::BAD_REQUEST, "names are unique regardless of case");
     }
 
-    /// The account's root, through its own enrollment link: it may do
-    /// anything but what its bucket policies deny, and may always remove a
-    /// policy that denies it. Deleting a user ends the sessions acting as it.
+    /// A bucket policy that denies everyone denies its admins too, as in
+    /// AWS (there's no root): the command line on a node takes it off.
+    /// Deleting a user ends the sessions acting as it.
     #[tokio::test]
-    async fn the_root_may_always_remove_a_policy_that_denies_it() {
+    async fn a_policy_that_denies_everyone_takes_the_command_line() {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let client = app.pool.get().await.unwrap();
-        let mut root = enrolled(&console, &store::create_root_enrollment(&client).await.unwrap()).await;
-        let (status, me) = root.send("GET", "/api/me", None).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        assert_eq!(me["identity"]["user"], Value::Null);
-        assert!(me["identity"]["arn"].as_str().unwrap().ends_with(":root"));
-        // It runs the cluster, too.
-        assert_eq!(me["cluster"], true);
-        // A new link replaces the last; another user's is refused to a
-        // login in the account already.
-        roles::create(&client, "other", None, false).await.unwrap();
-        let account = crate::roles::account(&client).await.unwrap();
-        let other = store::create_enrollment(&client, &account, "other").await.unwrap();
-        let (status, err) = root.send("POST", "/api/enroll/link", Some(json!({ "token": other }))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
-
-        assert_eq!(root.send("POST", "/api/buckets", Some(json!({ "name": "root-data" }))).await.0, StatusCode::CREATED);
-        let deny = r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::root-data","arn:aws:s3:::root-data/*"]}]}"#;
-        let (status, err) = root.send("PUT", "/api/buckets/root-data/policy", Some(json!({ "document": deny }))).await;
+        let mut admin = signed_in(&console, "boss", true).await;
+        assert_eq!(admin.send("POST", "/api/buckets", Some(json!({ "name": "locked-data" }))).await.0, StatusCode::CREATED);
+        let deny = r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::locked-data","arn:aws:s3:::locked-data/*"]}]}"#;
+        let (status, err) = admin.send("PUT", "/api/buckets/locked-data/policy", Some(json!({ "document": deny }))).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
-        let (status, err) = root.send("GET", "/api/buckets/root-data/objects", None).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-        assert!(err["error"].as_str().unwrap().contains(":root is not authorized"), "{err}");
-        assert_eq!(root.send("DELETE", "/api/buckets/root-data/policy", None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(root.send("GET", "/api/buckets/root-data/objects", None).await.0, StatusCode::OK);
+        assert_eq!(admin.send("GET", "/api/buckets/locked-data/objects", None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("DELETE", "/api/buckets/locked-data/policy", None).await.0, StatusCode::FORBIDDEN);
+        let gone = crate::s3::buckets::policy::set(&client, "locked-data", None).await;
+        assert!(gone.is_ok());
+        assert_eq!(admin.send("GET", "/api/buckets/locked-data/objects", None).await.0, StatusCode::OK);
         // An account that doesn't exist is no principal.
-        let policy = r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"999999999999"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::root-data/*"}]}"#;
-        let (status, err) = root.send("PUT", "/api/buckets/root-data/policy", Some(json!({ "document": policy }))).await;
+        let policy = r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"999999999999"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::locked-data/*"}]}"#;
+        let (status, err) = admin.send("PUT", "/api/buckets/locked-data/policy", Some(json!({ "document": policy }))).await;
         assert_eq!((status, err["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Invalid principal in policy")));
 
         let mut dora = signed_in(&console, "dora", false).await;
@@ -867,10 +847,6 @@ mod e2e {
         }
         assert_eq!(user.send("PUT", "/api/lifecycle/rate", Some(json!({ "rate": 5 }))).await.0, StatusCode::FORBIDDEN);
         assert_eq!(ops.send("PUT", "/api/lifecycle/rate", Some(json!({ "rate": 5 }))).await.0, StatusCode::NO_CONTENT);
-        let (status, link) = ops.send("POST", "/api/account/root-enrollment", None).await;
-        assert_eq!(status, StatusCode::CREATED, "{link}");
-        assert!(link["path"].as_str().unwrap().starts_with("/enroll#"));
-        assert_eq!(user.send("POST", "/api/account/root-enrollment", None).await.0, StatusCode::FORBIDDEN);
 
         // `CairnOperatorAccess` is none of the data, nor of the users.
         let (_, buckets) = ops.send("GET", "/api/buckets", None).await;

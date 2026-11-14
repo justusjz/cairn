@@ -4,9 +4,8 @@
 //! kept as their SHA-256 only, so the database can't sign anyone in.
 //!
 //! A login is a person: its passkeys sign it in, and it's linked to an
-//! identity, a user of the account, or the account's root (one: Cairn has
-//! one account; see `plans/single-account.md`); an identity belongs to at
-//! most one login. A session acts as its login's identity.
+//! identity, a user of the account (see `plans/single-account.md`); a user
+//! belongs to at most one login. A session acts as its login's user.
 
 use std::time::Duration;
 
@@ -56,44 +55,34 @@ pub struct User {
     pub path: String,
 }
 
-/// An identity: who a session acts as in an account.
+/// An identity: who a session acts as, a user of the account.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Identity {
     pub account_id: String,
     pub account: String,
-    /// The user; `None`: the account's root.
-    pub user: Option<User>,
+    pub user: User,
 }
 
 impl Identity {
     /// Its ARN.
     pub fn arn(&self) -> String {
-        match &self.user {
-            Some(user) => crate::roles::user_arn(&self.account_id, &user.path, &user.name),
-            None => format!("arn:aws:iam::{}:root", self.account_id),
-        }
+        crate::roles::user_arn(&self.account_id, &self.user.path, &self.user.name)
     }
 
-    /// How it's named to people: `user @ account`, or `root @ account`.
+    /// How it's named to people: the user's name.
     pub fn label(&self) -> String {
-        let who = self.user.as_ref().map_or("root", |u| u.name.as_str());
-        format!("{who} @ {}", self.account)
+        self.user.name.clone()
     }
 }
 
 /// The columns an identity is read from, as `identity_of` takes them, from
-/// `a` (accounts) and `r` (roles, left joined).
-const IDENTITY: &str = "a.id, a.name, r.id, r.name, r.admin, coalesce(r.path, '/')";
+/// `a` (accounts) and `r` (roles).
+const IDENTITY: &str = "a.id, a.name, r.id, r.name, r.admin, r.path";
 /// How many columns `IDENTITY` has.
 const IDENTITY_COLUMNS: usize = 6;
 
 fn identity_of(row: &tokio_postgres::Row, at: usize) -> Identity {
-    let user = row.get::<_, Option<Uuid>>(at + 2).map(|id| User {
-        id,
-        name: row.get(at + 3),
-        admin: row.get(at + 4),
-        path: row.get(at + 5),
-    });
+    let user = User { id: row.get(at + 2), name: row.get(at + 3), admin: row.get(at + 4), path: row.get(at + 5) };
     Identity { account_id: row.get(at), account: row.get(at + 1), user }
 }
 
@@ -167,30 +156,14 @@ pub async fn console_access(client: &Object, account: &str) -> anyhow::Result<st
         .collect())
 }
 
-/// Makes an enrollment link's token for the account's root, which replaces
-/// any it had: to recover the account, if its root lost its passkeys.
-pub async fn create_root_enrollment(client: &Object) -> anyhow::Result<String> {
-    let (token, hash) = token()?;
-    client
-        .execute_cached(
-            "WITH a AS (SELECT id FROM accounts WHERE NOT operator),
-                  d AS (DELETE FROM console_enrollments e USING a WHERE e.account_id = a.id AND e.role_id IS NULL)
-             INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
-             SELECT $1, NULL, a.id, now() + make_interval(secs => $2) FROM a",
-            &[&hash, &secs(ENROLLMENT_TTL)],
-        )
-        .await?;
-    Ok(token)
-}
-
 /// The identity enrollment link `token` is for, while it works.
 pub async fn enrollment(client: &Object, token: &str) -> anyhow::Result<Option<Identity>> {
     let row = client
         .query_opt_cached(
             &format!(
                 "SELECT {IDENTITY} FROM console_enrollments e
-                 JOIN accounts a ON a.id = e.account_id LEFT JOIN roles r ON r.id = e.role_id
-                 WHERE e.token_hash = $1 AND e.expires_at > now() AND (e.role_id IS NULL OR r.id IS NOT NULL)"
+                 JOIN accounts a ON a.id = e.account_id JOIN roles r ON r.id = e.role_id
+                 WHERE e.token_hash = $1 AND e.expires_at > now()"
             ),
             &[&hash(token)],
         )
@@ -368,7 +341,7 @@ pub async fn identities(client: &Object, login: Uuid) -> anyhow::Result<Vec<Iden
         .query_cached(
             &format!(
                 "SELECT {IDENTITY} FROM login_identities i
-                 JOIN accounts a ON a.id = i.account_id LEFT JOIN roles r ON r.id = i.role_id
+                 JOIN accounts a ON a.id = i.account_id JOIN roles r ON r.id = i.role_id
                  WHERE i.login_id = $1 ORDER BY a.name"
             ),
             &[&login],
@@ -433,7 +406,7 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
                  FROM console_sessions s
                  JOIN logins l ON l.id = s.login_id
                  JOIN login_identities i ON i.login_id = s.login_id AND i.account_id = s.account_id
-                 JOIN accounts a ON a.id = i.account_id LEFT JOIN roles r ON r.id = i.role_id
+                 JOIN accounts a ON a.id = i.account_id JOIN roles r ON r.id = i.role_id
                  WHERE s.token_hash = $1 AND s.expires_at > now()
                    AND s.last_seen_at > now() - make_interval(secs => $2)"
             ),

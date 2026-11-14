@@ -90,7 +90,6 @@ async fn blocks_public_policies_and_restricts_public_buckets() {
 /// Who asks, in `may`.
 enum Asker<'a> {
     User(&'a crate::roles::Principal),
-    Root(&'a str),
     Anonymous,
 }
 
@@ -105,7 +104,6 @@ async fn may(app: &App, asker: Asker<'_>, action: &'static str, on: On) -> (bool
     let mut access = match asker {
         // As the S3 API makes it: in the cluster's first account.
         Asker::User(principal) => access::Access::new(Some(principal), &default, &method, &headers, "", &origin).unwrap(),
-        Asker::Root(account) => access::Access::root(account, &method, &headers, "", &origin),
         Asker::Anonymous => access::Access::new(None, &default, &method, &headers, "", &origin).unwrap(),
     };
     let check = Check { action, on };
@@ -114,8 +112,8 @@ async fn may(app: &App, asker: Asker<'_>, action: &'static str, on: On) -> (bool
 }
 
 /// A restricted bucket's public policy allows anonymous requests nothing,
-/// and the account's users still what it allows them. Its root may always
-/// get, set and delete it, whatever it says.
+/// and the account's users still what it allows them; what it denies, it
+/// denies them.
 #[tokio::test]
 async fn restricted_buckets_allow_the_public_nothing() {
     let Some(app) = node().await else { return };
@@ -140,7 +138,6 @@ async fn restricted_buckets_allow_the_public_nothing() {
     assert_eq!(may(&app, Asker::Anonymous, "s3:GetObject", object()).await, (true, false));
     for action in ["s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"] {
         assert_eq!(may(&app, Asker::User(&ada), action, of_bucket()).await, (false, false), "{action}");
-        assert_eq!(may(&app, Asker::Root(&account), action, of_bucket()).await, (true, false), "{action}");
     }
 
     let restrict = Block { restrict_public_buckets: true, ..Block::default() };

@@ -121,9 +121,9 @@ const CLUSTER_NAV: [string, string][] = [
 /** ... and last: how people sign in. */
 const OPERATOR_NAV: [string, string][] = [["/sign-in", "Sign-in"]];
 
-/** The user's name, or `root`. */
+/** The user's name. */
 function label(i: Identity): string {
-  return i.user ?? "root";
+  return i.user;
 }
 
 /** The person signed in: who the session acts as, their own sign-in
@@ -380,7 +380,7 @@ function Home() {
             <Table count={1} columns={["As", "ARN"]}>
               <tr>
                 <td>
-                  {m.identity.user ?? "root"}{" "}
+                  {m.identity.user}{" "}
                   <Show when={m.identity.admin}>
                     <Badge tone="accent">admin</Badge>
                   </Show>{" "}
@@ -392,8 +392,8 @@ function Home() {
               </tr>
             </Table>
             <p class="subtle small">
-              Policies name you by the ARN. As a user, what you may do here is what your policies allow; as the
-              account's root, anything but what its buckets' policies deny. You're an operator if your policies allow
+              Policies name you by the ARN: what you may do here is what your policies allow, and what buckets'
+              policies don't deny you. You're an operator if your policies allow
               you the cluster's actions (<span class="mono">cairn:*</span>). Signed in with a passkey, your session
               counts as multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span>); at a provider, it
               doesn't.

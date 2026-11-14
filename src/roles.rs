@@ -318,6 +318,14 @@ enum RoleCommand {
         #[arg(value_enum)]
         permissions: Vec<Permission>,
     },
+    /// Attach a managed policy to a user, by its ARN: Cairn's
+    /// (`arn:aws:iam::aws:policy/CairnOperatorAccess`, say) or the account's.
+    Attach { name: String, arn: String },
+    /// Detach a managed policy from a user (one that denies it, say).
+    Detach { name: String, arn: String },
+    /// Take a user's permissions boundary off, whatever its policies say:
+    /// the way out of a boundary that locks an admin out.
+    Unbound { name: String },
 }
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
@@ -478,6 +486,12 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
             bucket,
             permissions,
         } => revoke(&client, account_id, &name, &bucket, &permissions).await?,
+        RoleCommand::Attach { name, arn } => crate::managed::attach(&client, account_id, &name, &arn, true).await?,
+        RoleCommand::Detach { name, arn } => crate::managed::attach(&client, account_id, &name, &arn, false).await?,
+        RoleCommand::Unbound { name } => {
+            let id = id_of(&client, account_id, &name).await?;
+            set_boundary(&client, account_id, id, None).await?;
+        }
     }
     Ok(())
 }

@@ -1,5 +1,5 @@
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type AccessKey, type Cluster, type ConsoleAccess, type ManagedPolicy, type Tag, type User, api, isOperator } from "../api";
+import { type AccessKey, type Cluster, type ConsoleAccess, type ManagedPolicy, type Tag, type User, api } from "../api";
 import { Badge, Loading, Panel, SecretDialog, Table, act, poll, toast } from "../components/ui";
 import { ago, date, pretty } from "../format";
 import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
@@ -19,8 +19,7 @@ const isPerson = (u: User) => !!u.console;
  * (as in AWS); what tells them apart is how they get in: people sign in to
  * the console through a link, services sign requests with access keys.
  * Operators are users too, whose policies allow them `cairn:` actions
- * (`CairnOperatorAccess`, or `AdministratorAccess`); they may also make the
- * account's root a link, to recover the account. */
+ * (`CairnOperatorAccess`, or `AdministratorAccess`). */
 export default function Users() {
   // Every few seconds: a new user's identity in the KMS comes a moment later.
   const data = poll(() => Promise.all([api.roles(), api.buckets(), api.policies()]), 5000);
@@ -35,10 +34,6 @@ export default function Users() {
   const [path, setPath] = createSignal("");
   const [boundary, setBoundary] = createSignal("");
 
-  const rootLink = async () => {
-    const res = await act(() => api.rootEnrollment());
-    if (res) setEnrollment({ user: "root", ...res.value });
-  };
   const create = async (e: SubmitEvent) => {
     e.preventDefault();
     const n = name().trim();
@@ -82,14 +77,6 @@ export default function Users() {
     <>
       <div class="page-head">
         <h1>Users</h1>
-        <Show when={isOperator()}>
-          <button
-            title="A one-time link for the account's root, which may do anything, to set up a passkey: to recover the account"
-            onClick={rootLink}
-          >
-            Root link
-          </button>
-        </Show>
       </div>
       <Panel title="New user">
         <form class="form-row" onSubmit={create}>

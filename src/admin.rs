@@ -220,8 +220,22 @@ mod e2e {
         assert!(out.stdout.starts_with("/enroll#"), "{}", out.stdout);
         assert!(out.stderr.contains("serves no console"), "{}", out.stderr);
         let out = cairn(&app, &["account", "show"]).await;
-        assert!(out.stdout.starts_with("account ") && out.stdout.contains("root not enrolled"), "{}", out.stdout);
-        assert!(cairn(&app, &["account", "enroll"]).await.stdout.starts_with("/enroll#"));
+        assert!(out.stdout.starts_with("account ") && out.stdout.contains(" users, "), "{}", out.stdout);
+        // What undoes policies that lock people out: attach and detach,
+        // and taking a boundary off.
+        let ops = "arn:aws:iam::aws:policy/CairnOperatorAccess";
+        assert_eq!(cairn(&app, &["user", "attach", "cli-ada", ops]).await.error, None);
+        let account = crate::roles::account(&app.pool.get().await.unwrap()).await.unwrap();
+        let client = app.pool.get().await.unwrap();
+        let names = |a: Vec<crate::managed::Attached>| a.into_iter().map(|a| a.name).collect::<Vec<_>>();
+        assert!(names(crate::managed::attached(&client, &account, "cli-ada").await.unwrap()).contains(&"CairnOperatorAccess".to_owned()));
+        assert_eq!(cairn(&app, &["user", "detach", "cli-ada", ops]).await.error, None);
+        assert!(!names(crate::managed::attached(&client, &account, "cli-ada").await.unwrap()).contains(&"CairnOperatorAccess".to_owned()));
+        let id = crate::roles::id_of(&client, &account, "cli-ada").await.unwrap();
+        let bound = crate::roles::BoundaryRef::Aws("AmazonS3ReadOnlyAccess");
+        crate::roles::set_boundary(&client, &account, id, Some(&bound)).await.unwrap();
+        assert_eq!(cairn(&app, &["user", "unbound", "cli-ada"]).await.error, None);
+        assert!(crate::roles::Principal::load_user(&client, id).await.unwrap().unwrap().boundary.is_none());
 
         // Documents are read where the CLI runs, and sent along.
         let file = std::env::temp_dir().join(format!("cairn-policy-{}.json", uuid::Uuid::new_v4()));

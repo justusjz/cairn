@@ -100,8 +100,6 @@ pub struct Origin<'a> {
 pub struct Access {
     /// The user, by its account, name and ID; `None` if anonymous.
     user: Option<(String, String, String)>,
-    /// An account's root (by its account) acts, rather than a user.
-    root: Option<String>,
     identity: Vec<Arc<Policy>>,
     /// The user's permissions boundary, and its ARN.
     boundary: Option<(Arc<Policy>, String)>,
@@ -137,7 +135,6 @@ impl Access {
             }
         }
         Ok(Access {
-            root: None,
             user: principal.map(|p| (p.account.clone(), p.name.clone(), p.id.to_string())),
             arn: principal.map(Principal::arn),
             identity,
@@ -145,26 +142,6 @@ impl Access {
             context: context(principal, account, method, headers, query, origin),
             buckets: HashMap::new(),
         })
-    }
-
-    /// The access of `account`'s root (see `policy::root_verdict`), for a
-    /// request (the console's) with `headers` and `query`, from `origin`.
-    pub fn root(account: &str, method: &Method, headers: &HeaderMap, query: &str, origin: &Origin) -> Access {
-        let mut context = context(None, account, method, headers, query, origin);
-        context.set("aws:userid", account);
-        context.set("aws:PrincipalArn", format!("arn:aws:iam::{account}:root"));
-        context.set("aws:PrincipalAccount", account);
-        context.set("aws:PrincipalType", "Account");
-        context.set("aws:PrincipalIsAWSService", "false");
-        Access {
-            user: None,
-            root: Some(account.to_owned()),
-            identity: Vec::new(),
-            boundary: None,
-            arn: None,
-            context,
-            buckets: HashMap::new(),
-        }
     }
 
     /// The ARN of the user's permissions boundary, if it has one.
@@ -223,10 +200,9 @@ impl Access {
     /// (see `iam`).
     pub fn verdict_with(&self, check: &Check, extra: &Context) -> Verdict {
         let resource = check.on.arn();
-        let principal = match (&self.user, &self.root) {
-            (Some((account, name, id)), _) => Who::User { account, name, id },
-            (None, Some(account)) => Who::Root { account },
-            (None, None) => Who::Anonymous,
+        let principal = match &self.user {
+            Some((account, name, id)) => Who::User { account, name, id },
+            None => Who::Anonymous,
         };
         let loaded = check.on.bucket().and_then(|b| self.buckets.get(b));
         // A restricted bucket's public policy is none to anyone outside its
@@ -258,9 +234,6 @@ impl Access {
         // Only the `s3:` keys this action takes (see `Context::for_action`).
         let context = context.for_action(check.action);
         let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &context };
-        if let Some(account) = &self.root {
-            return crate::policy::root_verdict(bucket, &request, owner.is_none_or(|owner| owner == account));
-        }
         let cross = match (&self.user, owner) {
             (Some((account, _, _)), Some(owner)) => account != owner,
             _ => false,
@@ -271,10 +244,7 @@ impl Access {
 
     /// The account the principal acts in; `None` if anonymous.
     fn account(&self) -> Option<&str> {
-        match (&self.user, &self.root) {
-            (Some((account, _, _)), _) => Some(account),
-            (None, root) => root.as_deref(),
-        }
+        self.user.as_ref().map(|(account, _, _)| account.as_str())
     }
 
     /// Whether `check` is one only its bucket's own account may make (on

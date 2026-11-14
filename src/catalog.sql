@@ -1884,8 +1884,8 @@ BEGIN
 END
 $$;
 
--- Links the identity of enrollment `p_enrollment` (an account's user, or
--- its root) to login `p_login`, which holds L(l) exclusively, using the
+-- Links the identity of enrollment `p_enrollment` (a user of the account)
+-- to login `p_login`, which holds L(l) exclusively, using the
 -- enrollment up: moved from the login it was linked to, if any (its passkeys
 -- lost, say). The enrollment's row is locked first (E), so that it's used
 -- once. Returns 'linked', 'no_enrollment' (used, expired, or its user gone)

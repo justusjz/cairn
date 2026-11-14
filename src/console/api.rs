@@ -380,17 +380,16 @@ async fn enroll_link(State(console): ConsoleState, signed: Signed, Json(body): J
 
 // ─── The signed-in login ─────────────────────────────────────────────────────
 
-/// An identity of the login.
+/// Who the login is: a user of the account.
 #[derive(Serialize, ToSchema)]
 struct IdentitySummary {
     account_id: String,
     account: String,
-    /// The user's name; `null`: the account's root.
-    user: Option<String>,
-    /// The identity's ARN, which policies name it by.
+    /// The user's name.
+    user: String,
+    /// The user's ARN, which policies name it by.
     arn: String,
-    /// Whether the user has `AdministratorAccess` (a root may do anything in
-    /// its account anyway).
+    /// Whether the user has `AdministratorAccess`.
     admin: bool,
 }
 
@@ -399,14 +398,14 @@ impl IdentitySummary {
         IdentitySummary {
             account_id: identity.account_id.clone(),
             account: identity.account.clone(),
-            user: identity.user.as_ref().map(|u| u.name.clone()),
+            user: identity.user.name.clone(),
             arn: identity.arn(),
-            admin: identity.user.as_ref().is_some_and(|u| u.admin),
+            admin: identity.user.admin,
         }
     }
 }
 
-/// The signed-in login: who it acts as now, its identities, its passkeys.
+/// The signed-in login: who it acts as, its passkeys.
 #[derive(Serialize, ToSchema)]
 struct Me {
     /// The login's name.

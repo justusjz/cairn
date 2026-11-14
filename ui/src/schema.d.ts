@@ -32,27 +32,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/account/root-enrollment": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Makes the account's root a one-time link to the console (24 hours): its
-         *     first, or one to recover the account, if the root lost its passkeys. It
-         *     replaces the root's last.
-         */
-        post: operations["create_root_enrollment"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/buckets": {
         parameters: {
             query?: never;
@@ -1553,19 +1532,16 @@ export interface components {
             /** Format: int64 */
             pending: number;
         };
-        /** @description An identity of the login. */
+        /** @description Who the login is: a user of the account. */
         IdentitySummary: {
             account: string;
             account_id: string;
-            /**
-             * @description Whether the user has `AdministratorAccess` (a root may do anything in
-             *     its account anyway).
-             */
+            /** @description Whether the user has `AdministratorAccess`. */
             admin: boolean;
-            /** @description The identity's ARN, which policies name it by. */
+            /** @description The user's ARN, which policies name it by. */
             arn: string;
-            /** @description The user's name; `null`: the account's root. */
-            user?: string | null;
+            /** @description The user's name. */
+            user: string;
         };
         /**
          * @description What the scrubber found (see `scrub`): damaged and missing copies, and the
@@ -1861,7 +1837,7 @@ export interface components {
              */
             sweep_shard: number;
         };
-        /** @description The signed-in login: who it acts as now, its identities, its passkeys. */
+        /** @description The signed-in login: who it acts as, its passkeys. */
         Me: {
             /**
              * @description Whether it may see the cluster (`cairn:GetCluster`): it's an
@@ -2572,41 +2548,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    create_root_enrollment: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["EnrollmentLink"];
-                };
             };
             "4XX": {
                 headers: {

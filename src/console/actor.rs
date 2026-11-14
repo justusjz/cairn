@@ -27,23 +27,14 @@ use crate::{
 };
 
 /// Who a request acts as (a request extension, which `as_user` sets): a
-/// console session's identity, a user or an account's root, under the
-/// policies that apply to it.
+/// console session's user, under the policies that apply to it.
 #[derive(Clone)]
 pub(crate) struct Actor(pub Arc<User>);
 
-/// Who a console session acts as.
-pub(crate) enum Subject {
-    /// A user of an account, under its policies.
-    User(Principal),
-    /// An account's root (see `policy::root_verdict`).
-    Root,
-}
-
-/// A console session's identity, and what its request's condition keys are
+/// A console session's user, and what its request's condition keys are
 /// made of.
 pub(crate) struct User {
-    pub subject: Subject,
+    pub principal: Principal,
     /// Its account.
     pub account: String,
     pub method: Method,
@@ -58,21 +49,14 @@ pub(crate) struct User {
 impl User {
     /// Its ARN.
     fn arn(&self) -> String {
-        match &self.subject {
-            Subject::User(principal) => principal.arn(),
-            Subject::Root => format!("arn:aws:iam::{}:root", self.account),
-        }
+        self.principal.arn()
     }
 }
 
 impl Actor {
-    /// The user's ID, which the KMS knows it by (`None` for a root, which
-    /// has no identity in the KMS).
+    /// The user's ID, which the KMS knows it by.
     pub fn kms_role(&self) -> Option<uuid::Uuid> {
-        match &self.0.subject {
-            Subject::User(principal) => Some(principal.id),
-            Subject::Root => None,
-        }
+        Some(self.0.principal.id)
     }
 
     /// The account the session acts in (its ID).
@@ -81,14 +65,14 @@ impl Actor {
     }
 
     /// Which of `buckets` (name, owning account) are listed to the actor, as
-    /// ListBuckets lists them: to those allowed `s3:ListAllMyBuckets` (and a
-    /// root), their account's; else those whose policies name the user.
+    /// ListBuckets lists them: to those allowed `s3:ListAllMyBuckets`, their
+    /// account's; else those whose policies name the user.
     pub async fn listed(&self, app: &Arc<App>, buckets: &[(&str, &str)]) -> Result<Vec<bool>, ApiError> {
         let user = &self.0;
         if self.allows(app, "s3:ListAllMyBuckets", On::Account).await? {
             return Ok(buckets.iter().map(|(_, account)| *account == user.account).collect());
         }
-        let Subject::User(principal) = &user.subject else { return Ok(vec![false; buckets.len()]) };
+        let principal = &user.principal;
         let mut visible = crate::grants::visible(&app.pool.get().await?, principal.id).await?;
         let own: Vec<&str> = buckets.iter().filter(|(_, account)| *account == user.account).map(|(name, _)| *name).collect();
         visible.extend(crate::s3::access::listable(principal, &own)?);
@@ -105,12 +89,7 @@ impl Actor {
     async fn access(&self, app: &Arc<App>, checks: &[Check]) -> Result<Access, ApiError> {
         let user = &self.0;
         let origin = Origin { peer: user.peer, trusted_proxies: &app.trusted_proxies, signed: None, form: false };
-        let mut access = match &user.subject {
-            Subject::User(principal) => {
-                Access::new(Some(principal), &user.account, &user.method, &user.headers, &user.query, &origin)?
-            }
-            Subject::Root => Access::root(&user.account, &user.method, &user.headers, &user.query, &origin),
-        };
+        let mut access = Access::new(Some(&user.principal), &user.account, &user.method, &user.headers, &user.query, &origin)?;
         match user.mfa_age {
             Some(age) => {
                 access.context.set("aws:MultiFactorAuthPresent", "true");

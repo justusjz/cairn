@@ -166,7 +166,7 @@ enum Command {
     /// Manage users: their S3 access keys, bucket permissions and policies.
     #[command(alias = "role")]
     User(roles::RoleArgs),
-    /// List or make accounts, and their roots' console enrollment links.
+    /// Show the account (Cairn has one).
     Account(accounts::AccountArgs),
     /// Configure the OpenID Connect providers people may sign in to the
     /// console at.

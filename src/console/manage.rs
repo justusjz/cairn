@@ -78,7 +78,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_setting))
         .routes(routes!(remove_node))
         .routes(routes!(keep_node))
-        .routes(routes!(create_root_enrollment))
         .routes(routes!(list_oidc_providers))
         .routes(routes!(set_oidc_provider, delete_oidc_provider))
         // Accounts' buckets and objects (`s3:`), and users (`iam:`).
@@ -1787,24 +1786,6 @@ async fn set_versioning(
         StatusCode::OK => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),
     }
-}
-
-// ─── The account ─────────────────────────────────────────────────────────────
-
-/// Makes the account's root a one-time link to the console (24 hours): its
-/// first, or one to recover the account, if the root lost its passkeys. It
-/// replaces the root's last.
-#[utoipa::path(post, path = "/account/root-enrollment", responses(
-    (status = 201, body = EnrollmentLink),
-    (status = "4XX", body = ErrorBody),
-    (status = "5XX", body = ErrorBody),
-))]
-async fn create_root_enrollment(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<(StatusCode, Json<EnrollmentLink>)> {
-    actor.check(&app, "cairn:RecoverAccount", On::Cluster).await?;
-    let token = crate::console::store::create_root_enrollment(&app.pool.get().await?).await?;
-    let path = format!("/enroll#{token}");
-    let url = app.console.origin.as_ref().map(|origin| format!("{origin}{path}"));
-    Ok((StatusCode::CREATED, Json(EnrollmentLink { url, path })))
 }
 
 // ─── OIDC providers ──────────────────────────────────────────────────────────
