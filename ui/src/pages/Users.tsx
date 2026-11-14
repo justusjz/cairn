@@ -15,14 +15,13 @@ type Enrollment = { user: string; url?: string | null; path: string };
 /** A person: someone who signs in to the console (or was sent a link to). */
 const isPerson = (u: User) => !!u.console;
 
-export default function Users() {
-  return <Show when={isOperator()} fallback={<TenantUsers />}>{<Superadmins />}</Show>;
-}
-
-/** An account's users, people and services apart. Both are IAM users alike
+/** The account's users, people and services apart. Both are IAM users alike
  * (as in AWS); what tells them apart is how they get in: people sign in to
- * the console through a link, services sign requests with access keys. */
-function TenantUsers() {
+ * the console through a link, services sign requests with access keys.
+ * Operators are users too, whose policies allow them `cairn:` actions
+ * (`CairnOperatorAccess`, or `AdministratorAccess`); they may also make the
+ * account's root a link, to recover the account. */
+export default function Users() {
   // Every few seconds: a new user's identity in the KMS comes a moment later.
   const data = poll(() => Promise.all([api.roles(), api.buckets(), api.policies()]), 5000);
   const [secret, setSecret] = createSignal<NewSecret>();
@@ -36,6 +35,10 @@ function TenantUsers() {
   const [path, setPath] = createSignal("");
   const [boundary, setBoundary] = createSignal("");
 
+  const rootLink = async () => {
+    const res = await act(() => api.rootEnrollment());
+    if (res) setEnrollment({ user: "root", ...res.value });
+  };
   const create = async (e: SubmitEvent) => {
     e.preventDefault();
     const n = name().trim();
@@ -79,6 +82,14 @@ function TenantUsers() {
     <>
       <div class="page-head">
         <h1>Users</h1>
+        <Show when={isOperator()}>
+          <button
+            title="A one-time link for the account's root, which may do anything, to set up a passkey: to recover the account"
+            onClick={rootLink}
+          >
+            Root link
+          </button>
+        </Show>
       </div>
       <Panel title="New user">
         <form class="form-row" onSubmit={create}>
@@ -215,87 +226,6 @@ function SignInCell(props: { access: ConsoleAccess }) {
         {a().last_sign_in ? `signed in ${ago(a().last_sign_in!)}` : "never signed in"}
       </div>
     </Show>
-  );
-}
-
-/** The operator account's users: the superadmins, each by being one. They
- * have no access keys, admin flag or policies, and act only in the console. */
-function Superadmins() {
-  const data = poll(() => api.roles(), 5000);
-  const [enrollment, setEnrollment] = createSignal<Enrollment>();
-  const [name, setName] = createSignal("");
-  const link = async (user: string) => {
-    const res = await act(() => api.createEnrollment(user));
-    if (res) setEnrollment({ user, ...res.value });
-  };
-  const create = async (e: SubmitEvent) => {
-    e.preventDefault();
-    const n = name().trim();
-    if (!(await act(() => api.createRole(n), `Added superadmin ${n}`))) return;
-    setName("");
-    data.refresh();
-    await link(n);
-  };
-  const remove = async (user: string) => {
-    if (!confirm(`Remove superadmin "${user}"? Their sessions as a superadmin end.`)) return;
-    if (await act(() => api.deleteRole(user), `Removed ${user}`)) data.refresh();
-  };
-  return (
-    <>
-      <div class="page-head">
-        <h1>Superadmins</h1>
-        <form class="form-row" onSubmit={create}>
-          <input
-            type="text"
-            placeholder="name"
-            aria-label="Name"
-            autocomplete="off"
-            value={name()}
-            onInput={(e) => setName(e.currentTarget.value)}
-          />
-          <button class="primary" type="submit">
-            Add superadmin
-          </button>
-        </form>
-      </div>
-      <p class="subtle small">
-        Everyone in the operator account is a superadmin: they run the cluster and its accounts, and nothing in any
-        tenant's. There are no permissions to set here, and no access keys: superadmins act only in the console, which
-        asks for a fresh passkey to switch to this account. A new superadmin gets a one-time link to sign in.
-      </p>
-      <Show when={data.data()} fallback={<Loading error={data.error()} />}>
-        {(users) => (
-          <Panel>
-            <Table count={users().length} empty="No superadmins." columns={["Name", "Sign-in", "Added", ""]}>
-              <For each={users()}>
-                {(u) => (
-                  <tr>
-                    <td class="mono">{u.name}</td>
-                    <td>
-                      <Show when={u.console} fallback={<span class="subtle">no link sent</span>}>
-                        {(c) => <SignInCell access={c()} />}
-                      </Show>
-                    </td>
-                    <td>{date(u.created_at)}</td>
-                    <td class="actions">
-                      <button class="small" title="A one-time link to set up a passkey for the console" onClick={() => link(u.name)}>
-                        Console link
-                      </button>
-                      <button class="small danger" onClick={() => remove(u.name)}>
-                        Remove
-                      </button>
-                    </td>
-                  </tr>
-                )}
-              </For>
-            </Table>
-          </Panel>
-        )}
-      </Show>
-      <Show when={enrollment()}>
-        {(e) => <EnrollmentDialog {...e()} onClose={() => setEnrollment(undefined)} />}
-      </Show>
-    </>
   );
 }
 

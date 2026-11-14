@@ -81,10 +81,6 @@ async fn blocks_public_policies_and_restricts_public_buckets() {
     assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::FORBIDDEN);
     assert!(public_access::set_account(&app, &account, None).await.unwrap());
     assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::NO_CONTENT);
-    // Another account's block is no matter.
-    let acme = crate::accounts::create(&client, "acme").await.unwrap();
-    assert!(public_access::set_account(&app, &acme, Some(Block::from_bits(15))).await.unwrap());
-    assert!(anyone_reads(&app, &bucket).await);
 
     // The e2e bucket was made with the column's default, as an older Cairn
     // would make one.
@@ -117,78 +113,38 @@ async fn may(app: &App, asker: Asker<'_>, action: &'static str, on: On) -> (bool
     (access.allows(&check), access.foreign(&check))
 }
 
-/// Another account gets nothing of a restricted bucket's public policy,
-/// not even what it allows that account by name; the bucket's own account
-/// still does (as in S3). And no other account may get, set or delete the
-/// bucket's policy, whatever the policy allows it.
+/// A restricted bucket's public policy allows anonymous requests nothing,
+/// and the account's users still what it allows them. Its root may always
+/// get, set and delete it, whatever it says.
 #[tokio::test]
-async fn other_accounts_get_nothing_of_restricted_buckets_nor_their_policies() {
+async fn restricted_buckets_allow_the_public_nothing() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
     let account = crate::roles::account(&client).await.unwrap();
-    let acme = crate::accounts::create(&client, "acme").await.unwrap();
     let bucket = format!("pab-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     assert!(matches!(create::create(&app, &bucket, &account, false).await.unwrap(), create::Creation::Created));
     assert!(public_access::set(&app, &bucket, None).await.unwrap());
     let policy = format!(
         r#"{{"Statement":[
             {{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}},
-            {{"Effect":"Allow","Principal":{{"AWS":"{acme}"}},"Action":"s3:*","Resource":["arn:aws:s3:::{bucket}","arn:aws:s3:::{bucket}/*"]}}
+            {{"Effect":"Deny","Principal":"*","Action":"s3:*Policy","Resource":"arn:aws:s3:::{bucket}"}}
         ]}}"#
     );
     assert_eq!(put_bucket_policy(&app, &bucket, Bytes::from(policy)).await.unwrap().status(), StatusCode::NO_CONTENT);
-    // acme's eve may do anything, as far as acme is concerned; ada, of the
-    // bucket's account, nothing but what the bucket's policy allows.
-    let (eve, _) = crate::roles::create_for(&client, &acme, "eve", None, true).await.unwrap();
     let (ada, _) = crate::roles::create_for(&client, &account, "ada", None, false).await.unwrap();
-    let eve = crate::roles::Principal::load(&client, &eve).await.unwrap().unwrap();
     let ada = crate::roles::Principal::load(&client, &ada).await.unwrap().unwrap();
     let object = || On::Object(bucket.clone(), "k".to_owned());
     let of_bucket = || On::Bucket(bucket.clone());
 
-    // Not restricted: the policy allows each what it says.
-    assert_eq!(may(&app, Asker::User(&eve), "s3:GetObject", object()).await, (true, false));
-    assert_eq!(may(&app, Asker::User(&eve), "s3:PutObject", object()).await, (true, false));
-    assert_eq!(may(&app, Asker::Root(&acme), "s3:PutObject", object()).await, (true, false));
     assert_eq!(may(&app, Asker::User(&ada), "s3:GetObject", object()).await, (true, false));
     assert_eq!(may(&app, Asker::Anonymous, "s3:GetObject", object()).await, (true, false));
-    // But the policy is the bucket's account's alone.
     for action in ["s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"] {
-        assert_eq!(may(&app, Asker::User(&eve), action, of_bucket()).await, (true, true), "{action}");
-        assert_eq!(may(&app, Asker::Root(&acme), action, of_bucket()).await, (true, true), "{action}");
+        assert_eq!(may(&app, Asker::User(&ada), action, of_bucket()).await, (false, false), "{action}");
         assert_eq!(may(&app, Asker::Root(&account), action, of_bucket()).await, (true, false), "{action}");
     }
-    // Other things on the bucket another account may be allowed, as in S3.
-    assert_eq!(may(&app, Asker::User(&eve), "s3:PutBucketPublicAccessBlock", of_bucket()).await, (true, false));
 
-    // Restricted: only the bucket's account gets anything of the policy.
     let restrict = Block { restrict_public_buckets: true, ..Block::default() };
     assert!(public_access::set(&app, &bucket, Some(restrict)).await.unwrap());
-    assert_eq!(may(&app, Asker::User(&eve), "s3:GetObject", object()).await.0, false);
-    assert_eq!(may(&app, Asker::User(&eve), "s3:PutObject", object()).await.0, false);
-    assert_eq!(may(&app, Asker::Root(&acme), "s3:GetObject", object()).await.0, false);
     assert_eq!(may(&app, Asker::Anonymous, "s3:GetObject", object()).await.0, false);
     assert_eq!(may(&app, Asker::User(&ada), "s3:GetObject", object()).await.0, true);
-}
-
-/// `aws:ResourceAccount` is the account of the resource checked: a
-/// bucket's owner's, not the cluster's first account's, nor the user's.
-#[tokio::test]
-async fn the_resource_account_is_the_buckets() {
-    let Some(app) = node().await else { return };
-    let client = app.pool.get().await.unwrap();
-    let acme = crate::accounts::create(&client, "acme").await.unwrap();
-    let theirs = format!("ra-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    assert!(matches!(create::create(&app, &theirs, &acme, false).await.unwrap(), create::Creation::Created));
-    // eve may do anything, but only in acme's own resources.
-    let (eve, _) = crate::roles::create_for(&client, &acme, "eve", None, false).await.unwrap();
-    let mut eve = crate::roles::Principal::load(&client, &eve).await.unwrap().unwrap();
-    eve.policies.push(format!(
-        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:*","Resource":"*",
-            "Condition":{{"StringEquals":{{"aws:ResourceAccount":"{acme}"}}}}}}]}}"#
-    ));
-    let object = |bucket: &str| On::Object(bucket.to_owned(), "k".to_owned());
-    assert_eq!(may(&app, Asker::User(&eve), "s3:GetObject", object(&theirs)).await.0, true);
-    // Not in the default account's bucket (whose policy allows her nothing).
-    assert_eq!(may(&app, Asker::User(&eve), "s3:GetObject", object(BUCKET)).await.0, false);
 }

@@ -349,7 +349,7 @@ button.chip.policy:hover { border-color: var(--accent); }
 /* The console. */
 .signin { max-width: 520px; margin: 48px auto; }
 .signin .primary { margin: 8px 0; }
-/* The person signed in: their identities, sign-in settings and signing out. */
+/* The person signed in: who they are, sign-in settings and signing out. */
 .user-menu { position: relative; margin-left: auto; flex-shrink: 0; }
 .user-button { border-color: transparent; background: none; padding: 4px 8px; max-width: 46vw; }
 .user-button > .mono { overflow: hidden; text-overflow: ellipsis; }

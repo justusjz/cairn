@@ -42,8 +42,8 @@ pub enum On {
     /// A managed policy of an account (by its ID; `aws`: Cairn's), by its
     /// path (without its leading `/`) and name, for IAM's actions on it.
     Policy(String, String),
-    /// The cluster, for the operator's actions (`cairn:`): the operator
-    /// account's.
+    /// The cluster, for Cairn's actions (`cairn:`), which operators'
+    /// policies allow: the account's.
     Cluster,
 }
 

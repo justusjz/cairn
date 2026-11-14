@@ -32,24 +32,7 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/accounts": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_accounts"];
-        put?: never;
-        /** Makes a tenant account. Its root signs in through an enrollment link. */
-        post: operations["create_account"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/accounts/{account}/enrollment": {
+    "/account/root-enrollment": {
         parameters: {
             query?: never;
             header?: never;
@@ -59,9 +42,9 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Makes an account's root a one-time link to the console (24 hours): a new
-         *     account's first, or one to recover it, if its root lost its passkeys.
-         *     It replaces the root's last.
+         * Makes the account's root a one-time link to the console (24 hours): its
+         *     first, or one to recover the account, if the root lost its passkeys. It
+         *     replaces the root's last.
          */
         post: operations["create_root_enrollment"];
         delete?: never;
@@ -445,8 +428,7 @@ export interface paths {
         put?: never;
         /**
          * Adds an enrollment link's identity to the signed-in login (using the
-         *     link up), and acts as it, unless it's the operator account's, which
-         *     takes a fresh passkey assertion first (`/switch`).
+         *     link up).
          */
         post: operations["enroll_link"];
         delete?: never;
@@ -553,10 +535,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /**
-         * Signs in with a passkey, as the login's identity in its first account
-         *     (by name; the operator account last).
-         */
+        /** Signs in with a passkey, as the login's identity. */
         post: operations["login"];
         delete?: never;
         options?: never;
@@ -1152,23 +1131,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/switch": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Acts as the login's identity in another account. */
-        post: operations["switch"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
 }
 export type webhooks = Record<string, never>;
 export interface components {
@@ -1178,26 +1140,6 @@ export interface components {
             /** Format: double */
             created_at: number;
             id: string;
-        };
-        /** @description An account (see `accounts`). */
-        AccountSummary: {
-            /** Format: int64 */
-            buckets: number;
-            /**
-             * Format: int64
-             * @description Bytes in its buckets' current versions.
-             */
-            bytes: number;
-            /** Format: double */
-            created_at: number;
-            id: string;
-            name: string;
-            /** @description Whether it's the operator account (the superadmins'). */
-            operator: boolean;
-            /** @description Whether its root has signed in to the console (has a login). */
-            root_enrolled: boolean;
-            /** Format: int64 */
-            users: number;
         };
         AdminFlag: {
             admin: boolean;
@@ -1622,8 +1564,6 @@ export interface components {
             admin: boolean;
             /** @description The identity's ARN, which policies name it by. */
             arn: string;
-            /** @description Whether it's the operator account's (the superadmins'). */
-            operator: boolean;
             /** @description The user's name; `null`: the account's root. */
             user?: string | null;
         };
@@ -1924,14 +1864,17 @@ export interface components {
         /** @description The signed-in login: who it acts as now, its identities, its passkeys. */
         Me: {
             /**
-             * @description Whether its passkey was used (or it signed in at its provider)
-             *     within five minutes: acting as the operator takes that.
+             * @description Whether it may see the cluster (`cairn:GetCluster`): it's an
+             *     operator, and the console shows it the cluster's pages.
              */
-            fresh: boolean;
-            /** @description Every identity of the login, the operator account's last. */
-            identities: components["schemas"]["IdentitySummary"][];
+            cluster: boolean;
             /** @description Who the session acts as. */
             identity: components["schemas"]["IdentitySummary"];
+            /**
+             * @description Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`;
+             *     else at an OIDC provider).
+             */
+            mfa: boolean;
             /** @description The login's name. */
             name: string;
             /** @description Its identities at OIDC providers, which sign it in too. */
@@ -1951,9 +1894,6 @@ export interface components {
             requests: components["schemas"]["RequestsReport"];
             /** Format: double */
             started_at: number;
-        };
-        NewAccount: {
-            name: string;
         };
         NewBucket: {
             name: string;
@@ -2184,11 +2124,7 @@ export interface components {
             url: string;
         };
         OidcStart: {
-            account_id?: string | null;
-            /**
-             * @description `login`, `enroll` (with `token`), `link` or `reauth` (with
-             *     `account_id`), the latter two signed in.
-             */
+            /** @description `login`, `enroll` (with `token`), or `link` (signed in). */
             purpose: string;
             token?: string | null;
         };
@@ -2494,17 +2430,6 @@ export interface components {
             /** Format: double */
             started: number;
         };
-        Switch: {
-            /** @description The account (its ID) to act in. */
-            account_id: string;
-            /**
-             * @description A fresh assertion, for the operator account, if the session's
-             *     passkey wasn't used within five minutes (`Me.fresh`): its challenge
-             *     (from `/login/options`) and the browser's response.
-             */
-            challenge_id?: string | null;
-            credential?: components["schemas"]["Assertion"] | null;
-        };
         /**
          * @description A tag of a bucket, an object version (see `s3::tags`) or a user (whose
          *     keys are unique regardless of case).
@@ -2666,86 +2591,11 @@ export interface operations {
             };
         };
     };
-    list_accounts: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AccountSummary"][];
-                };
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    create_account: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["NewAccount"];
-            };
-        };
-        responses: {
-            /** @description Created */
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
     create_root_enrollment: {
         parameters: {
             query?: never;
             header?: never;
-            path: {
-                account: string;
-            };
+            path?: never;
             cookie?: never;
         };
         requestBody?: never;
@@ -5705,45 +5555,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Storage"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    switch: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["Switch"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Me"];
-                };
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "5XX": {

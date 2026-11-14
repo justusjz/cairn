@@ -64,11 +64,11 @@ type AppState = State<Arc<App>>;
 
 /// The routes, which the console serves as its session's identity (see
 /// `actor`): every handler checks what it does as its S3 operation's
-/// actions, IAM's, or the operator's (`cairn:`, on the cluster, which only
-/// the operator account's identities may be allowed).
+/// actions, IAM's, or Cairn's (`cairn:`, on the cluster, which operators'
+/// policies allow).
 pub(super) fn router() -> OpenApiRouter<Arc<App>> {
     OpenApiRouter::new()
-        // The cluster's: the operator account's (`cairn:` actions).
+        // The cluster's (`cairn:` actions).
         .routes(routes!(get_cluster))
         .routes(routes!(get_storage))
         .routes(routes!(get_integrity))
@@ -78,7 +78,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_setting))
         .routes(routes!(remove_node))
         .routes(routes!(keep_node))
-        .routes(routes!(list_accounts, create_account))
         .routes(routes!(create_root_enrollment))
         .routes(routes!(list_oidc_providers))
         .routes(routes!(set_oidc_provider, delete_oidc_provider))
@@ -982,14 +981,13 @@ async fn create_bucket(State(app): AppState, Extension(actor): Extension<Actor>,
         actor.check(&app, "s3:PutBucketObjectLockConfiguration", On::Bucket(body.name.clone())).await?;
         actor.check(&app, "s3:PutBucketVersioning", On::Bucket(body.name.clone())).await?;
     }
-    // The console's user's account's; the operator's, the first tenant's.
+    // The console's user's account's.
     match create::create(&app, &body.name, actor.account(), body.object_lock).await? {
         create::Creation::Created => Ok(StatusCode::CREATED),
         create::Creation::Exists | create::Creation::OwnedByOther => Err(ApiError::Conflict(format!(
             "a bucket named {:?} already exists",
             body.name
         ))),
-        create::Creation::Operator => Err(ApiError::Forbidden("the operator account owns no buckets".into())),
         create::Creation::InvalidName => Err(ApiError::BadRequest(
             "a bucket name has 3 to 63 lowercase letters, digits, dots and hyphens, \
              and starts and ends with a letter or digit"
@@ -1612,7 +1610,7 @@ async fn download(
         &Preconditions::default(),
         None,
         // As the user, whom the KMS lets open SSE-KMS objects with keys
-        // it may use; the operator has no identity there, so it can't (see
+        // it may use; a root has no identity there, so it can't (see
         // `s3::sse`).
         actor.kms_role(),
         false,
@@ -1791,99 +1789,19 @@ async fn set_versioning(
     }
 }
 
-// ─── Accounts ────────────────────────────────────────────────────────────────
+// ─── The account ─────────────────────────────────────────────────────────────
 
-/// An account (see `accounts`).
-#[derive(Serialize, ToSchema)]
-struct AccountSummary {
-    id: String,
-    name: String,
-    /// Whether it's the operator account (the superadmins').
-    operator: bool,
-    users: i64,
-    buckets: i64,
-    /// Bytes in its buckets' current versions.
-    bytes: i64,
-    /// Whether its root has signed in to the console (has a login).
-    root_enrolled: bool,
-    created_at: f64,
-}
-
-#[utoipa::path(get, path = "/accounts", responses(
-    (status = 200, body = Vec<AccountSummary>),
-    (status = "4XX", body = ErrorBody),
-    (status = "5XX", body = ErrorBody),
-))]
-async fn list_accounts(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<AccountSummary>>> {
-    actor.check(&app, "cairn:ListAccounts", On::Cluster).await?;
-    let rows = app
-        .pool
-        .get()
-        .await?
-        .query_cached(
-            "SELECT a.id, a.name, a.operator,
-                    (SELECT count(*) FROM roles r WHERE r.account_id = a.id),
-                    (SELECT count(*) FROM buckets b WHERE b.account_id = a.id),
-                    (SELECT coalesce(sum(o.size), 0)::bigint FROM objects o JOIN buckets b ON b.name = o.bucket
-                     WHERE b.account_id = a.id AND o.is_latest AND NOT o.is_delete_marker),
-                    EXISTS (SELECT 1 FROM login_identities i WHERE i.account_id = a.id AND i.role_id IS NULL),
-                    extract(epoch FROM a.created_at)::float8
-             FROM accounts a ORDER BY a.operator, a.name",
-            &[],
-        )
-        .await?;
-    Ok(Json(
-        rows.iter()
-            .map(|r| AccountSummary {
-                id: r.get(0),
-                name: r.get(1),
-                operator: r.get(2),
-                users: r.get(3),
-                buckets: r.get(4),
-                bytes: r.get(5),
-                root_enrolled: r.get(6),
-                created_at: r.get(7),
-            })
-            .collect(),
-    ))
-}
-
-#[derive(Deserialize, ToSchema)]
-struct NewAccount {
-    name: String,
-}
-
-/// Makes a tenant account. Its root signs in through an enrollment link.
-#[utoipa::path(post, path = "/accounts", request_body = NewAccount, responses(
-    (status = 201, description = "Created"),
-    (status = "4XX", body = ErrorBody),
-    (status = "5XX", body = ErrorBody),
-))]
-async fn create_account(
-    State(app): AppState,
-    Extension(actor): Extension<Actor>,
-    Json(body): Json<NewAccount>,
-) -> Result<StatusCode> {
-    actor.check(&app, "cairn:CreateAccount", On::Cluster).await?;
-    crate::accounts::create(&app.pool.get().await?, &body.name).await?;
-    Ok(StatusCode::CREATED)
-}
-
-/// Makes an account's root a one-time link to the console (24 hours): a new
-/// account's first, or one to recover it, if its root lost its passkeys.
-/// It replaces the root's last.
-#[utoipa::path(post, path = "/accounts/{account}/enrollment", params(("account" = String, Path)), responses(
+/// Makes the account's root a one-time link to the console (24 hours): its
+/// first, or one to recover the account, if the root lost its passkeys. It
+/// replaces the root's last.
+#[utoipa::path(post, path = "/account/root-enrollment", responses(
     (status = 201, body = EnrollmentLink),
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn create_root_enrollment(
-    State(app): AppState,
-    Extension(actor): Extension<Actor>,
-    Path(account): Path<String>,
-) -> Result<(StatusCode, Json<EnrollmentLink>)> {
+async fn create_root_enrollment(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<(StatusCode, Json<EnrollmentLink>)> {
     actor.check(&app, "cairn:RecoverAccount", On::Cluster).await?;
-    let token = crate::console::store::create_root_enrollment(&app.pool.get().await?, &account).await?;
+    let token = crate::console::store::create_root_enrollment(&app.pool.get().await?).await?;
     let path = format!("/enroll#{token}");
     let url = app.console.origin.as_ref().map(|origin| format!("{origin}{path}"));
     Ok((StatusCode::CREATED, Json(EnrollmentLink { url, path })))
@@ -2603,9 +2521,6 @@ async fn create_role(
     }
     let secret = body.secret.filter(|s| !s.is_empty());
     let access_key = body.access_key || secret.is_some();
-    if roles::is_operator(&client, &account).await? && (access_key || body.admin || boundary_arn.is_some()) {
-        roles::refuse_operator(&client, &account, "access keys, admin flag or permissions boundary").await?;
-    }
     if body.admin {
         let mut context = new.context("iam:AttachUserPolicy");
         context.extend(&key("iam:PolicyARN", &crate::managed::aws_arn(crate::managed::ADMINISTRATOR_ACCESS)));
@@ -3634,9 +3549,10 @@ mod e2e {
         let rules = json!({"rules": [{"enabled": true, "filter": {}, "expiration": {"days": 1}}]});
         assert_eq!(admin.send("PUT", "/api/buckets/nope/lifecycle", Some(rules)).await.0, StatusCode::NOT_FOUND);
 
-        // The rate, for the cluster: the operator's.
+        // The rate, for the cluster: its operators' (`cairn:`).
         let rate = |rate: i64| Some(json!({ "rate": rate }));
-        assert_eq!(admin.send("PUT", "/api/lifecycle/rate", rate(5)).await.0, StatusCode::FORBIDDEN);
+        let mut user = signed_in(&console, "lifecycle-user", false).await;
+        assert_eq!(user.send("PUT", "/api/lifecycle/rate", rate(5)).await.0, StatusCode::FORBIDDEN);
         assert_eq!(ops.send("PUT", "/api/lifecycle/rate", rate(5)).await.0, StatusCode::NO_CONTENT);
         assert_eq!(crate::settings::LIFECYCLE_RATE.get(&app.pool.get().await.unwrap()).await.unwrap(), 5);
         assert_eq!(ops.send("PUT", "/api/lifecycle/rate", rate(-1)).await.0, StatusCode::BAD_REQUEST);
@@ -3770,7 +3686,7 @@ mod e2e {
         // Managed policies: Cairn's (AWS's), and the account's own.
         let (_, policies) = admin.send("GET", "/api/policies", None).await;
         let names: Vec<_> = policies.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["AdministratorAccess", "AmazonS3FullAccess", "AmazonS3ReadOnlyAccess"]);
+        assert_eq!(names, ["AdministratorAccess", "AmazonS3FullAccess", "AmazonS3ReadOnlyAccess", "CairnOperatorAccess"]);
         let read = format!(
             r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:Get*","s3:List*"],"Resource":["arn:aws:s3:::{BUCKET}","arn:aws:s3:::{BUCKET}/*"]}}]}}"#
         );

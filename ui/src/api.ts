@@ -24,7 +24,6 @@ export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
 export type User = Schemas["RoleSummary"];
 export type ConsoleAccess = Schemas["ConsoleAccess"];
-export type Account = Schemas["AccountSummary"];
 export type OidcProvider = Schemas["OidcProvider"];
 export type CorsConfiguration = Schemas["Configuration"];
 export type AccessKey = Schemas["AccessKey"];
@@ -50,9 +49,9 @@ const client = createClient<paths>({
 
 const [operatorMode, setOperatorModeSignal] = createSignal(false);
 
-/** Whether the session acts as the operator account (a superadmin): then
- * the pages show what's the operator's (the cluster, its KMS); the console
- * sets it as it switches. (A signal: pages follow it.) */
+/** Whether the session's identity is an operator (its policies allow it
+ * `cairn:GetCluster`): then the pages show what's the cluster's (its KMS,
+ * the root's link). (A signal: pages follow it.) */
 export function setOperatorMode(operator: boolean) {
   setOperatorModeSignal(operator);
 }
@@ -158,10 +157,7 @@ export const api = {
     body: { label: string; issuer: string; client_id: string; client_secret: string | null; scopes: string | null },
   ) => ok(client.PUT("/oidc-providers/{name}", { params: { path: { name } }, body })),
   deleteOidcProvider: (name: string) => ok(client.DELETE("/oidc-providers/{name}", { params: { path: { name } } })),
-  accounts: () => ok(client.GET("/accounts")),
-  createAccount: (name: string) => ok(client.POST("/accounts", { body: { name } })),
-  rootEnrollment: (account: string) =>
-    ok(client.POST("/accounts/{account}/enrollment", { params: { path: { account } } })),
+  rootEnrollment: () => ok(client.POST("/account/root-enrollment")),
   createEnrollment: (role: string) =>
     ok(client.POST("/roles/{role}/enrollment", { params: rolePath(role) })),
   createKey: (role: string) => ok(client.POST("/roles/{role}/keys", { params: rolePath(role) })),

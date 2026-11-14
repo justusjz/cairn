@@ -45,18 +45,11 @@ export const api = {
   enroll: (token: string, challenge_id: string, name: string, credential: Registration) =>
     ok(client.POST("/enroll", { body: { token, challenge_id, name, credential } })),
   enrollLink: (token: string) => ok(client.POST("/enroll/link", { body: { token } })),
-  switchTo: (account_id: string, challenge_id?: string, credential?: Assertion) =>
-    ok(client.POST("/switch", { body: { account_id, challenge_id: challenge_id ?? null, credential: credential ?? null } })),
   loginOptions: () => ok(client.POST("/login/options")),
   oidcProviders: () => ok(client.GET("/oidc/providers")),
   /** Starts a sign-in at an OIDC provider: the URL to send the browser to. */
-  oidcStart: (provider: string, purpose: "login" | "enroll" | "link" | "reauth", extra: { token?: string; account_id?: string } = {}) =>
-    ok(
-      client.POST("/oidc/{provider}/start", {
-        params: { path: { provider } },
-        body: { purpose, token: extra.token ?? null, account_id: extra.account_id ?? null },
-      }),
-    ),
+  oidcStart: (provider: string, purpose: "login" | "enroll" | "link", extra: { token?: string } = {}) =>
+    ok(client.POST("/oidc/{provider}/start", { params: { path: { provider } }, body: { purpose, token: extra.token ?? null } })),
   oidcUnlink: (provider: string) => ok(client.DELETE("/oidc/{provider}", { params: { path: { provider } } })),
   login: (challenge_id: string, credential: Assertion) => ok(client.POST("/login", { body: { challenge_id, credential } })),
   logout: () => ok(client.POST("/logout")),

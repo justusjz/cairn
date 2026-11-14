@@ -2226,7 +2226,7 @@ cairn_bucket_policy() { (cd "$SCRIPT_DIR" && cargo run -q -- bucket-policy "$@")
 # else: a missing key there is a 403, as the policy doesn't allow listing),
 # and a user's (allowed what it has no grant for, denied what its grant would
 # allow, with S3's messages). One that denies everyone, its admins too, the
-# superadmin can still remove.
+# command line (`cairn bucket-policy delete`) can still remove.
 bucket_policy_ok() {
     local b="pol-$(date +%s)" doc="$WORK_DIR/policy.json" deny="$WORK_DIR/deny-all.json" out arn account url
     url="http://${SERVER_HOST}:${SERVER_PORT}/$b"

@@ -3,10 +3,10 @@
 //! sessions. Tokens (links' and sessions') are random, handed out once, and
 //! kept as their SHA-256 only, so the database can't sign anyone in.
 //!
-//! A login is a person: its passkeys sign it in, and it's linked to at most
-//! one identity per account, a user of the account, or the account's root;
-//! an identity belongs to at most one login. A session acts as one of its
-//! login's identities at a time, which it can switch.
+//! A login is a person: its passkeys sign it in, and it's linked to an
+//! identity, a user of the account, or the account's root (one: Cairn has
+//! one account; see `plans/single-account.md`); an identity belongs to at
+//! most one login. A session acts as its login's identity.
 
 use std::time::Duration;
 
@@ -25,9 +25,6 @@ pub const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 /// How long a session lasts at most, and unused.
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 pub const SESSION_IDLE: Duration = Duration::from_secs(3600);
-/// How recently a session's passkey must have been used to act as the
-/// operator account (a fresh assertion, else).
-pub const OPERATOR_FRESHNESS: Duration = Duration::from_secs(5 * 60);
 /// The most passkeys a login may have, as IAM's MFA devices (I10).
 pub const MAX_PASSKEYS: i32 = 8;
 
@@ -64,8 +61,6 @@ pub struct User {
 pub struct Identity {
     pub account_id: String,
     pub account: String,
-    /// Whether it's the operator account (see `plans/policies.md`).
-    pub operator: bool,
     /// The user; `None`: the account's root.
     pub user: Option<User>,
 }
@@ -88,16 +83,18 @@ impl Identity {
 
 /// The columns an identity is read from, as `identity_of` takes them, from
 /// `a` (accounts) and `r` (roles, left joined).
-const IDENTITY: &str = "a.id, a.name, a.operator, r.id, r.name, r.admin, coalesce(r.path, '/')";
+const IDENTITY: &str = "a.id, a.name, r.id, r.name, r.admin, coalesce(r.path, '/')";
+/// How many columns `IDENTITY` has.
+const IDENTITY_COLUMNS: usize = 6;
 
 fn identity_of(row: &tokio_postgres::Row, at: usize) -> Identity {
-    let user = row.get::<_, Option<Uuid>>(at + 3).map(|id| User {
+    let user = row.get::<_, Option<Uuid>>(at + 2).map(|id| User {
         id,
-        name: row.get(at + 4),
-        admin: row.get(at + 5),
-        path: row.get(at + 6),
+        name: row.get(at + 3),
+        admin: row.get(at + 4),
+        path: row.get(at + 5),
     });
-    Identity { account_id: row.get(at), account: row.get(at + 1), operator: row.get(at + 2), user }
+    Identity { account_id: row.get(at), account: row.get(at + 1), user }
 }
 
 /// Makes an enrollment link's token for user `user` of account `account`
@@ -170,23 +167,19 @@ pub async fn console_access(client: &Object, account: &str) -> anyhow::Result<st
         .collect())
 }
 
-/// Makes an enrollment link's token for the root of the account named
-/// `account`, which replaces any it had: a new account's first, or its
-/// recovery, if its passkeys are lost.
-pub async fn create_root_enrollment(client: &Object, account: &str) -> anyhow::Result<String> {
+/// Makes an enrollment link's token for the account's root, which replaces
+/// any it had: to recover the account, if its root lost its passkeys.
+pub async fn create_root_enrollment(client: &Object) -> anyhow::Result<String> {
     let (token, hash) = token()?;
-    let made = client
+    client
         .execute_cached(
-            "WITH a AS (SELECT id FROM accounts WHERE name = $1),
+            "WITH a AS (SELECT id FROM accounts WHERE NOT operator),
                   d AS (DELETE FROM console_enrollments e USING a WHERE e.account_id = a.id AND e.role_id IS NULL)
              INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
-             SELECT $2, NULL, a.id, now() + make_interval(secs => $3) FROM a",
-            &[&account, &hash, &secs(ENROLLMENT_TTL)],
+             SELECT $1, NULL, a.id, now() + make_interval(secs => $2) FROM a",
+            &[&hash, &secs(ENROLLMENT_TTL)],
         )
         .await?;
-    if made == 0 {
-        return Err(Invalid(format!("no account named {account:?}")).into());
-    }
     Ok(token)
 }
 
@@ -376,7 +369,7 @@ pub async fn identities(client: &Object, login: Uuid) -> anyhow::Result<Vec<Iden
             &format!(
                 "SELECT {IDENTITY} FROM login_identities i
                  JOIN accounts a ON a.id = i.account_id LEFT JOIN roles r ON r.id = i.role_id
-                 WHERE i.login_id = $1 ORDER BY a.operator, a.name"
+                 WHERE i.login_id = $1 ORDER BY a.name"
             ),
             &[&login],
         )
@@ -423,8 +416,9 @@ pub struct Session {
     pub credential_id: Option<Vec<u8>>,
     /// The OIDC provider it was signed in at, if it was.
     pub oidc_provider: Option<String>,
-    /// Whether its passkey was used within `OPERATOR_FRESHNESS`.
-    pub fresh: bool,
+    /// Seconds since it was signed in with its passkey (`None`: it was
+    /// signed in at a provider): `aws:MultiFactorAuthAge` (see `actor`).
+    pub mfa_age: Option<i64>,
 }
 
 /// The session of `token`, while it lasts; it was used just now (noted at
@@ -434,7 +428,7 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
         .query_opt_cached(
             &format!(
                 "SELECT {IDENTITY}, s.login_id, l.name, s.credential_id,
-                        s.verified_at > now() - make_interval(secs => $3),
+                        greatest(0, extract(epoch FROM now() - s.verified_at))::bigint,
                         s.last_seen_at < now() - interval '1 minute', s.oidc_provider
                  FROM console_sessions s
                  JOIN logins l ON l.id = s.login_id
@@ -443,45 +437,25 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
                  WHERE s.token_hash = $1 AND s.expires_at > now()
                    AND s.last_seen_at > now() - make_interval(secs => $2)"
             ),
-            &[&hash(token), &secs(SESSION_IDLE), &secs(OPERATOR_FRESHNESS)],
+            &[&hash(token), &secs(SESSION_IDLE)],
         )
         .await?;
     let Some(row) = row else { return Ok(None) };
-    if row.get::<_, bool>(11) {
+    let at = IDENTITY_COLUMNS;
+    if row.get::<_, bool>(at + 4) {
         client
             .execute_cached("UPDATE console_sessions SET last_seen_at = now() WHERE token_hash = $1", &[&hash(token)])
             .await?;
     }
+    let credential_id: Option<Vec<u8>> = row.get(at + 2);
     Ok(Some(Session {
         identity: identity_of(&row, 0),
-        login: row.get(7),
-        login_name: row.get(8),
-        credential_id: row.get(9),
-        fresh: row.get(10),
-        oidc_provider: row.get(12),
+        login: row.get(at),
+        login_name: row.get(at + 1),
+        mfa_age: credential_id.is_some().then(|| row.get(at + 3)),
+        credential_id,
+        oidc_provider: row.get(at + 5),
     }))
-}
-
-/// Has session `token` act as its login's identity in account `account` (by
-/// ID); `verified`: its login just signed in again (a passkey's assertion,
-/// or at its provider), which acting as the operator account needs. Whether
-/// the login has an identity there.
-pub async fn switch(client: &Object, token: &str, account: &str, verified: bool) -> anyhow::Result<bool> {
-    switch_hashed(client, &hash(token), account, verified).await
-}
-
-/// As `switch`, for the session whose token hashes to `token_hash`.
-pub async fn switch_hashed(client: &Object, token_hash: &[u8], account: &str, verified: bool) -> anyhow::Result<bool> {
-    let updated = client
-        .execute_cached(
-            "UPDATE console_sessions s
-             SET account_id = $2, verified_at = CASE WHEN $3 THEN now() ELSE s.verified_at END
-             WHERE s.token_hash = $1
-               AND EXISTS (SELECT 1 FROM login_identities i WHERE i.login_id = s.login_id AND i.account_id = $2)",
-            &[&token_hash, &account, &verified],
-        )
-        .await?;
-    Ok(updated == 1)
 }
 
 pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {

@@ -1,8 +1,9 @@
 //! The console: Cairn's web UI, with a sign-in of its own (passkeys, or an
 //! OIDC provider), on its own listener (`--listen-console`) and origin
-//! (`--console-url`). An account's people manage its buckets, objects and
-//! users there; the operator account's (superadmins) watch and run the
-//! cluster. See `plans/console.md`.
+//! (`--console-url`). People manage the account's buckets, objects and
+//! users there, and its operators (whose policies allow `cairn:` actions)
+//! watch and run the cluster. See `plans/console.md`,
+//! `plans/single-account.md`.
 //!
 //! Not on the S3 port: objects are served from the S3 origin with whatever
 //! `Content-Type` they were given, so an HTML object there could run script
@@ -215,11 +216,28 @@ async fn user_of(
     let token = session_token(&headers).ok_or_else(unauthorized)?;
     let client = console.app.pool.get().await?;
     let session = store::session(&client, &token).await?.ok_or_else(unauthorized)?;
+    session_user(&client, &session, method, headers, query, peer).await?.ok_or_else(unauthorized)
+}
+
+/// Who `session` acts as, for a request (`method`, `headers`, `query`, from
+/// `peer`); `None` if its user is gone.
+async fn session_user(
+    client: &deadpool_postgres::Object,
+    session: &store::Session,
+    method: Method,
+    headers: HeaderMap,
+    query: String,
+    peer: Option<std::net::IpAddr>,
+) -> Result<Option<actor::User>, ApiError> {
     let subject = match &session.identity.user {
-        Some(user) => actor::Subject::User(Principal::load_user(&client, user.id).await?.ok_or_else(unauthorized)?),
+        Some(user) => match Principal::load_user(client, user.id).await? {
+            Some(principal) => actor::Subject::User(principal),
+            None => return Ok(None),
+        },
         None => actor::Subject::Root,
     };
-    Ok(actor::User { subject, account: session.identity.account_id, method, headers, query, peer })
+    let account = session.identity.account_id.clone();
+    Ok(Some(actor::User { subject, account, method, headers, query, peer, mfa_age: session.mfa_age }))
 }
 
 /// A file of the console's UI, or else its page.
@@ -525,37 +543,33 @@ mod e2e {
         assert_eq!(store::reap(&client).await.unwrap(), 0);
     }
 
-    /// The ID of the account named `name`.
-    async fn account_id(client: &deadpool_postgres::Object, name: &str) -> String {
-        client.query_one("SELECT id FROM accounts WHERE name = $1", &[&name]).await.unwrap().get(0)
-    }
-
     /// The console of node `app`.
     pub(super) fn console_of(app: &Arc<App>) -> Arc<Console> {
         Arc::new(Console { app: app.clone(), party: party() })
     }
 
-    /// A browser signed in as a new superadmin `name` (a user of the
-    /// operator account).
+    /// A browser signed in as a new operator `name`: a user with
+    /// `CairnOperatorAccess` (the cluster, nothing of the data).
     pub(super) async fn superadmin(console: &Arc<Console>, name: &str) -> Browser {
-        signed_in_to(console, Some("operator"), name, true).await
+        let browser = signed_in(console, name, false).await;
+        let client = console.app.pool.get().await.unwrap();
+        let account = crate::roles::account(&client).await.unwrap();
+        let arn = crate::managed::aws_arn("CairnOperatorAccess");
+        crate::managed::attach(&client, &account, name, &arn, true).await.unwrap();
+        browser
     }
 
     /// A browser signed in as a new user `name` (with a passkey of its own).
     pub(super) async fn signed_in(console: &Arc<Console>, name: &str, admin: bool) -> Browser {
-        signed_in_to(console, None, name, admin).await
+        let client = console.app.pool.get().await.unwrap();
+        roles::create(&client, name, None, admin).await.unwrap();
+        let account = crate::roles::account(&client).await.unwrap();
+        let token = store::create_enrollment(&client, &account, name).await.unwrap();
+        enrolled(console, &token).await
     }
 
-    /// A browser signed in as a new user `name` of `account` (by name;
-    /// `None`: the first tenant account).
-    async fn signed_in_to(console: &Arc<Console>, account: Option<&str>, name: &str, admin: bool) -> Browser {
-        let client = console.app.pool.get().await.unwrap();
-        roles::create_in(&client, account, name, None, admin).await.unwrap();
-        let account = match account {
-            Some(account) => account_id(&client, account).await,
-            None => crate::roles::account(&client).await.unwrap(),
-        };
-        let token = store::create_enrollment(&client, &account, name).await.unwrap();
+    /// A browser that enrolled with link `token`, with a passkey of its own.
+    async fn enrolled(console: &Arc<Console>, token: &str) -> Browser {
         let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let (_, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
         let mut body = registration(&mut Authenticator::ed25519(), &ceremony, "Key");
@@ -639,7 +653,7 @@ mod e2e {
         assert_eq!(listing["entries"][0]["size"], 5);
         let (status, info) = reader.send("GET", &format!("/api/buckets/{bucket}/object?key=dir%2Fhello.txt"), None).await;
         assert_eq!(status, StatusCode::OK, "{info}");
-        // Not where it's stored: that's the operator's.
+        // Not where it's stored: that's the cluster's (`cairn:`).
         assert_eq!(info["versions"][0]["parts"], Value::Null);
         let req = Request::builder()
             .uri(format!("/api/buckets/{bucket}/download?key=dir%2Fhello.txt"))
@@ -675,8 +689,9 @@ mod e2e {
         let ours = buckets.as_array().unwrap().iter().find(|b| b["name"] == bucket).unwrap();
         assert_eq!(ours["versioning"], "enabled");
 
-        // The cluster is the operator account's, not a tenant admin's.
-        assert_eq!(admin.send("GET", "/api/cluster", None).await.0, StatusCode::FORBIDDEN);
+        // The cluster is its operators': `AdministratorAccess` is everything.
+        assert_eq!(admin.send("GET", "/api/cluster", None).await.0, StatusCode::OK);
+        assert_eq!(writer.send("GET", "/api/cluster", None).await.0, StatusCode::FORBIDDEN);
 
         // Users, as IAM's actions: the admin (AdministratorAccess) manages
         // its account's; a user without IAM permissions may do none of it.
@@ -699,15 +714,9 @@ mod e2e {
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
         assert_eq!(writer.send("POST", "/api/roles/writer/keys", None).await.0, StatusCode::CREATED);
         assert_eq!(writer.send("POST", "/api/roles/reader/keys", None).await.0, StatusCode::FORBIDDEN);
-        // Another account's users are none of its business.
-        let client = app.pool.get().await.unwrap();
-        crate::accounts::create(&client, "other").await.unwrap();
-        roles::create_in(&client, Some("other"), "stranger", None, false).await.unwrap();
         let (status, err) = admin.send("DELETE", "/api/roles/stranger", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(err["error"], "no user named \"stranger\"");
-        let (_, users) = admin.send("GET", "/api/roles", None).await;
-        assert!(!users.as_array().unwrap().iter().any(|u| u["name"] == "stranger"));
     }
 
     /// A delegated admin, as AWS's guide has it: the console makes and
@@ -790,239 +799,117 @@ mod e2e {
         assert_eq!(status, StatusCode::BAD_REQUEST, "names are unique regardless of case");
     }
 
-    /// One login (one passkey) acts in several accounts: as a user of one,
-    /// the root of another, and a superadmin of the operator account, which
-    /// takes a fresh passkey to switch into. Each account's buckets are its
-    /// own: an admin of one may do nothing in another's; its root may do
-    /// anything in its own but what its bucket policies deny, and may always
-    /// remove a policy that denies it.
+    /// The account's root, through its own enrollment link: it may do
+    /// anything but what its bucket policies deny, and may always remove a
+    /// policy that denies it. Deleting a user ends the sessions acting as it.
     #[tokio::test]
-    async fn one_login_acts_in_several_accounts() {
+    async fn the_root_may_always_remove_a_policy_that_denies_it() {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let client = app.pool.get().await.unwrap();
-        crate::accounts::create(&client, "acme").await.unwrap();
-        roles::create(&client, "dora", None, true).await.unwrap();
-        roles::create_in(&client, Some("acme"), "dora-acme", None, false).await.unwrap();
-        roles::create_in(&client, Some("operator"), "dora-ops", None, false).await.unwrap();
-
-        // A new login, through the default account's link.
-        let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
-        let mut key = Authenticator::p256();
-        let token = store::create_enrollment(&client, &crate::roles::account(&client).await.unwrap(), "dora").await.unwrap();
-        let (_, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
-        let mut body = registration(&mut key, &ceremony, "Laptop");
-        body["token"] = json!(token);
-        let (status, me) = browser.send("POST", "/api/enroll", Some(body)).await;
+        let mut root = enrolled(&console, &store::create_root_enrollment(&client).await.unwrap()).await;
+        let (status, me) = root.send("GET", "/api/me", None).await;
         assert_eq!(status, StatusCode::OK, "{me}");
-
-        // Acme's root, and acme's user: links added to the same login.
-        let root = store::create_root_enrollment(&client, "acme").await.unwrap();
-        let (status, me) = browser.send("POST", "/api/enroll/link", Some(json!({ "token": root }))).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        assert_eq!((me["identity"]["account"].as_str(), &me["identity"]["user"]), (Some("acme"), &Value::Null));
+        assert_eq!(me["identity"]["user"], Value::Null);
         assert!(me["identity"]["arn"].as_str().unwrap().ends_with(":root"));
-        // One identity per account: not acme's user as well.
-        let user = store::create_enrollment(&client, &account_id(&client, "acme").await, "dora-acme").await.unwrap();
-        let (status, err) = browser.send("POST", "/api/enroll/link", Some(json!({ "token": user }))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(err["error"].as_str().unwrap().contains("as someone else"), "{err}");
+        // It runs the cluster, too.
+        assert_eq!(me["cluster"], true);
+        // A new link replaces the last; another user's is refused to a
+        // login in the account already.
+        roles::create(&client, "other", None, false).await.unwrap();
+        let account = crate::roles::account(&client).await.unwrap();
+        let other = store::create_enrollment(&client, &account, "other").await.unwrap();
+        let (status, err) = root.send("POST", "/api/enroll/link", Some(json!({ "token": other }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
 
-        // Acme's root makes a bucket, which is acme's.
-        assert_eq!(browser.send("POST", "/api/buckets", Some(json!({ "name": "acme-data" }))).await.0, StatusCode::CREATED);
-        let path = "/api/buckets/acme-data/object?key=a.txt";
-        assert_eq!(browser.upload(path, b"acme").await, StatusCode::NO_CONTENT);
-        let (_, buckets) = browser.send("GET", "/api/buckets", None).await;
-        let names: Vec<_> = buckets.as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["acme-data"]);
-
-        // As the default account's admin: its buckets, not acme's, whose
-        // objects it may not touch either (another account's).
-        let default_id: String = me["identities"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|i| i["account"] == "default")
-            .unwrap()["account_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let (status, me) = browser.send("POST", "/api/switch", Some(json!({ "account_id": default_id }))).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        assert_eq!(me["identity"]["user"], "dora");
-        let (_, buckets) = browser.send("GET", "/api/buckets", None).await;
-        let names: Vec<_> = buckets.as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap()).collect();
-        assert!(!names.contains(&"acme-data"), "{names:?}");
-        assert_eq!(browser.send("GET", "/api/buckets/acme-data/objects", None).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(browser.upload(path, b"intruder").await, StatusCode::FORBIDDEN);
-        // Nor take its name.
-        assert_eq!(browser.send("POST", "/api/buckets", Some(json!({ "name": "acme-data" }))).await.0, StatusCode::CONFLICT);
-
-        // Back as acme's root: a policy that denies everyone everything.
-        let acme_id = me["identities"].as_array().unwrap().iter().find(|i| i["account"] == "acme").unwrap()["account_id"].clone();
-        assert_eq!(browser.send("POST", "/api/switch", Some(json!({ "account_id": acme_id }))).await.0, StatusCode::OK);
-        let deny = r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::acme-data","arn:aws:s3:::acme-data/*"]}]}"#;
-        let (status, err) = browser.send("PUT", "/api/buckets/acme-data/policy", Some(json!({ "document": deny }))).await;
+        assert_eq!(root.send("POST", "/api/buckets", Some(json!({ "name": "root-data" }))).await.0, StatusCode::CREATED);
+        let deny = r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::root-data","arn:aws:s3:::root-data/*"]}]}"#;
+        let (status, err) = root.send("PUT", "/api/buckets/root-data/policy", Some(json!({ "document": deny }))).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
-        let (status, err) = browser.send("GET", "/api/buckets/acme-data/objects", None).await;
+        let (status, err) = root.send("GET", "/api/buckets/root-data/objects", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(err["error"].as_str().unwrap().contains(":root is not authorized"), "{err}");
-        // But it can always remove the policy.
-        assert_eq!(browser.send("DELETE", "/api/buckets/acme-data/policy", None).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(browser.send("GET", "/api/buckets/acme-data/objects", None).await.0, StatusCode::OK);
+        assert_eq!(root.send("DELETE", "/api/buckets/root-data/policy", None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(root.send("GET", "/api/buckets/root-data/objects", None).await.0, StatusCode::OK);
+        // An account that doesn't exist is no principal.
+        let policy = r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"999999999999"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::root-data/*"}]}"#;
+        let (status, err) = root.send("PUT", "/api/buckets/root-data/policy", Some(json!({ "document": policy }))).await;
+        assert_eq!((status, err["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Invalid principal in policy")));
 
-        // The operator account: linked, then switched into only with a fresh
-        // passkey assertion.
-        let ops = store::create_enrollment(&client, &account_id(&client, "operator").await, "dora-ops").await.unwrap();
-        let (status, me) = browser.send("POST", "/api/enroll/link", Some(json!({ "token": ops }))).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        let ops_id = me["identities"].as_array().unwrap().iter().find(|i| i["operator"] == true).unwrap()["account_id"].clone();
-        assert_eq!(browser.send("POST", "/api/switch", Some(json!({ "account_id": acme_id }))).await.0, StatusCode::OK);
-        client.execute("UPDATE console_sessions SET verified_at = now() - interval '1 hour'", &[]).await.unwrap();
-        let (status, err) = browser.send("POST", "/api/switch", Some(json!({ "account_id": ops_id }))).await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{err}");
-        let (_, ceremony) = browser.send("POST", "/api/login/options", None).await;
-        let (client_data, auth_data, sig) = key.assert(&challenge_of(&ceremony));
-        let body = json!({
-            "account_id": ops_id,
-            "challenge_id": ceremony["challenge_id"],
-            "credential": {
-                "id": URL_SAFE_NO_PAD.encode(&key.credential_id),
-                "client_data_json": URL_SAFE_NO_PAD.encode(client_data),
-                "authenticator_data": URL_SAFE_NO_PAD.encode(auth_data),
-                "signature": URL_SAFE_NO_PAD.encode(sig),
-            },
-        });
-        let (status, me) = browser.send("POST", "/api/switch", Some(body)).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        assert_eq!(me["identity"]["operator"], true);
-        // It owns no buckets, and makes none.
-        let (_, buckets) = browser.send("GET", "/api/buckets", None).await;
-        assert_eq!(buckets, json!([]));
-        assert_eq!(browser.send("POST", "/api/buckets", Some(json!({ "name": "ops-data" }))).await.0, StatusCode::FORBIDDEN);
-
-        // Deleting a user unlinks it, and ends the sessions acting as it.
-        roles::delete(&client, &account_id(&client, "operator").await, "dora-ops").await.unwrap();
-        assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
-        let (status, me) = sign_in(&mut browser, &mut key).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        assert_eq!(me["identities"].as_array().unwrap().len(), 2);
+        let mut dora = signed_in(&console, "dora", false).await;
+        assert_eq!(dora.send("GET", "/api/me", None).await.0, StatusCode::OK);
+        roles::delete(&client, &crate::roles::account(&client).await.unwrap(), "dora").await.unwrap();
+        assert_eq!(dora.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
     }
 
-    /// The cluster is the operator account's: its admins (superadmins) see
-    /// and run it, make accounts, and manage each other, but see no
-    /// tenant's objects; a tenant's admin may do none of it.
+    /// The cluster is its operators': users whose policies allow `cairn:`
+    /// actions. `CairnOperatorAccess` runs it, and sees none of the data;
+    /// `AdministratorAccess` is everything; a user without either sees none
+    /// of it. Each is told whether it may (`Me.cluster`).
     #[tokio::test]
-    async fn superadmins_run_the_cluster_and_nothing_else() {
+    async fn operators_run_the_cluster() {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
         let console = Arc::new(Console { app: app.clone(), party: party() });
-        let client = app.pool.get().await.unwrap();
         let bucket = crate::e2e::BUCKET;
-        crate::e2e::put(&app, "secret.txt", b"tenant data".to_vec()).await;
-        let mut tenant = signed_in(&console, "tenant-admin", true).await;
-        roles::create_in(&client, Some("operator"), "super", None, true).await.unwrap();
-        let token = store::create_enrollment(&client, &account_id(&client, "operator").await, "super").await.unwrap();
-        let mut ops = Browser { console: console.clone(), cookie: None, origin: party().origin };
-        let (_, ceremony) = ops.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
-        let mut body = registration(&mut Authenticator::ed25519(), &ceremony, "Key");
-        body["token"] = json!(token);
-        let (status, me) = ops.send("POST", "/api/enroll", Some(body)).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        assert_eq!(me["identity"]["operator"], true);
+        crate::e2e::put(&app, "secret.txt", b"data".to_vec()).await;
+        let mut ops = superadmin(&console, "ops").await;
+        let mut admin = signed_in(&console, "admin", true).await;
+        let mut user = signed_in(&console, "user", false).await;
+        assert_eq!(ops.send("GET", "/api/me", None).await.1["cluster"], true);
+        assert_eq!(admin.send("GET", "/api/me", None).await.1["cluster"], true);
+        assert_eq!(user.send("GET", "/api/me", None).await.1["cluster"], false);
 
-        // The cluster.
-        for path in ["/api/cluster", "/api/storage", "/api/integrity", "/api/lifecycle", "/api/accounts"] {
+        for path in ["/api/cluster", "/api/storage", "/api/integrity", "/api/lifecycle"] {
             assert_eq!(ops.send("GET", path, None).await.0, StatusCode::OK, "{path}");
-            let (status, err) = tenant.send("GET", path, None).await;
+            assert_eq!(admin.send("GET", path, None).await.0, StatusCode::OK, "{path}");
+            let (status, err) = user.send("GET", path, None).await;
             assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {err}");
         }
-        let (status, err) = tenant.send("PUT", "/api/lifecycle/rate", Some(json!({ "rate": 5 }))).await;
-        assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+        assert_eq!(user.send("PUT", "/api/lifecycle/rate", Some(json!({ "rate": 5 }))).await.0, StatusCode::FORBIDDEN);
         assert_eq!(ops.send("PUT", "/api/lifecycle/rate", Some(json!({ "rate": 5 }))).await.0, StatusCode::NO_CONTENT);
-
-        // Accounts: made, and their roots' links.
-        assert_eq!(ops.send("POST", "/api/accounts", Some(json!({ "name": "newco" }))).await.0, StatusCode::CREATED);
-        assert_eq!(tenant.send("POST", "/api/accounts", Some(json!({ "name": "evilco" }))).await.0, StatusCode::FORBIDDEN);
-        let (status, link) = ops.send("POST", "/api/accounts/newco/enrollment", None).await;
+        let (status, link) = ops.send("POST", "/api/account/root-enrollment", None).await;
         assert_eq!(status, StatusCode::CREATED, "{link}");
         assert!(link["path"].as_str().unwrap().starts_with("/enroll#"));
-        let (_, accounts) = ops.send("GET", "/api/accounts", None).await;
-        let names: Vec<_> = accounts.as_array().unwrap().iter().map(|a| a["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["default", "newco", "operator"]);
+        assert_eq!(user.send("POST", "/api/account/root-enrollment", None).await.0, StatusCode::FORBIDDEN);
 
-        // Superadmins manage superadmins, and only them.
-        let (_, users) = ops.send("GET", "/api/roles", None).await;
-        let names: Vec<_> = users.as_array().unwrap().iter().map(|u| u["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["super"]);
-        // ... who are superadmins by being members: no keys, flags or policies.
-        for refused in [json!({ "name": "super-x", "admin": true }), json!({ "name": "super-y", "access_key": true })] {
-            assert_eq!(ops.send("POST", "/api/roles", Some(refused)).await.0, StatusCode::BAD_REQUEST);
-        }
-        assert_eq!(ops.send("POST", "/api/roles", Some(json!({ "name": "super-2" }))).await.0, StatusCode::CREATED);
-        assert_eq!(ops.send("POST", "/api/roles/super-2/keys", None).await.0, StatusCode::BAD_REQUEST);
-        let policy = json!({ "document": r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"# });
-        assert_eq!(ops.send("PUT", "/api/roles/super-2/policies/all", Some(policy)).await.0, StatusCode::BAD_REQUEST);
-        let (_, users) = ops.send("GET", "/api/roles", None).await;
-        assert!(users.as_array().unwrap().iter().all(|u| u["keys"] == json!([]) && u["admin"] == true), "{users}");
-        assert_eq!(users[0]["console"]["enrolled"], true);
-        // A tenant's admin, whatever its policies say, isn't one.
-        let all = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"cairn:*","Resource":"*"}]}"#;
-        roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "tenant-admin", "cairn", all).await.unwrap();
-        assert_eq!(tenant.send("GET", "/api/cluster", None).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(ops.send("DELETE", "/api/roles/tenant-admin", None).await.0, StatusCode::BAD_REQUEST);
-
-        // No tenant's buckets, nor their objects.
+        // `CairnOperatorAccess` is none of the data, nor of the users.
         let (_, buckets) = ops.send("GET", "/api/buckets", None).await;
         assert_eq!(buckets, json!([]));
-        let path = format!("/api/buckets/{bucket}/objects");
-        assert_eq!(ops.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
-        let path = format!("/api/buckets/{bucket}/object?key=secret.txt");
-        assert_eq!(ops.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(ops.send("GET", &format!("/api/buckets/{bucket}/objects"), None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(ops.send("GET", "/api/roles", None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("GET", &format!("/api/buckets/{bucket}/objects"), None).await.0, StatusCode::OK);
     }
 
-    /// Cross-account access, as in AWS: a bucket's policy may name another
-    /// account's users (or the account), who then may do what both that
-    /// policy and their own policies allow, and nothing that only one does.
+    /// A console session signed in with a passkey has
+    /// `aws:MultiFactorAuthPresent` (and its age): AWS's guard against keys
+    /// alone allows it what it denies those.
     #[tokio::test]
-    async fn another_accounts_users_need_both_sides_to_allow() {
+    async fn passkey_sessions_have_mfa() {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let client = app.pool.get().await.unwrap();
-        let bucket = crate::e2e::BUCKET;
-        crate::e2e::put(&app, "shared.txt", b"shared".to_vec()).await;
-        let acme = crate::accounts::create(&client, "acme").await.unwrap();
-        let mut eve = signed_in_to(&console, Some("acme"), "eve", false).await;
-        let mut owner = signed_in(&console, "owner", true).await;
-        let path = format!("/api/buckets/{bucket}/object?key=shared.txt");
-
-        // The bucket's policy names eve; her own policies don't allow it.
-        let policy = format!(
-            r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{acme}:user/eve"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
-        );
-        let (status, err) = owner.send("PUT", &format!("/api/buckets/{bucket}/policy"), Some(json!({ "document": policy }))).await;
-        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
-        assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
-        // Her own policy allows it, as well: now she may.
-        let own = format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#);
-        roles::put_policy(&client, &acme, "eve", "read-shared", &own).await.unwrap();
-        assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::OK);
-        // But only what both allow: not listing it.
-        assert_eq!(eve.send("GET", &format!("/api/buckets/{bucket}/objects"), None).await.0, StatusCode::FORBIDDEN);
-        // Naming the account leaves it to the account's own policies, too.
-        let policy = format!(
-            r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{acme}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
-        );
-        let (status, err) = owner.send("PUT", &format!("/api/buckets/{bucket}/policy"), Some(json!({ "document": policy }))).await;
-        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
-        assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::OK);
-        roles::delete_policy(&client, &acme, "eve", "read-shared").await.unwrap();
-        assert_eq!(eve.send("GET", &path, None).await.0, StatusCode::FORBIDDEN);
-        // An account that doesn't exist is no principal.
-        let policy = format!(
-            r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"999999999999"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
-        );
-        let (status, err) = owner.send("PUT", &format!("/api/buckets/{bucket}/policy"), Some(json!({ "document": policy }))).await;
-        assert_eq!((status, err["error"].as_str()), (StatusCode::BAD_REQUEST, Some("Invalid principal in policy")));
+        let account = crate::roles::account(&client).await.unwrap();
+        let mut ops = signed_in(&console, "guarded", false).await;
+        let guarded = r#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"cairn:*","Resource":"*"},
+            {"Effect":"Deny","Action":"cairn:*","Resource":"*","Condition":{"BoolIfExists":{"aws:MultiFactorAuthPresent":"false"}}},
+            {"Effect":"Deny","Action":"cairn:PutSetting","Resource":"*","Condition":{"NumericGreaterThan":{"aws:MultiFactorAuthAge":"600"}}}
+        ]}"#;
+        roles::put_policy(&client, &account, "guarded", "guarded", guarded).await.unwrap();
+        let (_, me) = ops.send("GET", "/api/me", None).await;
+        assert_eq!((&me["mfa"], &me["cluster"]), (&json!(true), &json!(true)));
+        assert_eq!(ops.send("GET", "/api/cluster", None).await.0, StatusCode::OK);
+        // Its age is since it signed in.
+        client.execute("UPDATE console_sessions SET verified_at = now() - interval '1 hour'", &[]).await.unwrap();
+        assert_eq!(ops.send("GET", "/api/cluster", None).await.0, StatusCode::OK);
+        let rate = Some(json!({ "rate": 5 }));
+        assert_eq!(ops.send("PUT", "/api/lifecycle/rate", rate).await.0, StatusCode::FORBIDDEN);
+        // Its access keys have neither: the guard denies them.
+        let user = Principal::load_user(&client, crate::roles::id_of(&client, &account, "guarded").await.unwrap()).await.unwrap().unwrap();
+        let origin = crate::s3::access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+        let access = crate::s3::access::Access::new(Some(&user), &account, &Method::GET, &HeaderMap::new(), "", &origin).unwrap();
+        let check = crate::s3::actions::Check { action: "cairn:GetCluster", on: crate::s3::actions::On::Cluster };
+        assert!(!access.allows(&check));
     }
 
     impl Browser {
@@ -1050,11 +937,11 @@ mod e2e {
         }
     }
 
-    /// Signing in at an OIDC provider: configured by a superadmin, used to
+    /// Signing in at an OIDC provider: configured by an operator, used to
     /// enroll through a link (a new login), to sign in, linked to a login
-    /// that has a passkey, unlinked but not as the last way in, and to sign
-    /// in again before acting as the operator. Tokens that aren't right are
-    /// refused, and an identity linked to no login signs no one in.
+    /// that has a passkey, and unlinked but not as the last way in. Its
+    /// sessions have no MFA. Tokens that aren't right are refused, and an
+    /// identity linked to no login signs no one in.
     #[tokio::test]
     async fn signs_in_at_any_oidc_provider() {
         use super::oidc::mock::{CLIENT_ID, CLIENT_SECRET, Mock};
@@ -1063,14 +950,14 @@ mod e2e {
         let client = app.pool.get().await.unwrap();
         let mock = Mock::start().await;
 
-        // A superadmin configures it (checked against its discovery).
-        let mut ops = signed_in_to(&console, Some("operator"), "op", true).await;
+        // An operator configures it (checked against its discovery).
+        let mut ops = superadmin(&console, "op").await;
         let config = json!({ "label": "Company SSO", "issuer": mock.issuer, "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET });
         let (status, err) = ops.send("PUT", "/api/oidc-providers/mock", Some(config)).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
         let bad = json!({ "label": "x", "issuer": "https://127.0.0.1:1", "client_id": "c" });
         assert_eq!(ops.send("PUT", "/api/oidc-providers/broken", Some(bad)).await.0, StatusCode::BAD_REQUEST);
-        let mut tenant = signed_in(&console, "tenant", true).await;
+        let mut tenant = signed_in(&console, "tenant", false).await;
         let config = json!({ "label": "x", "issuer": mock.issuer, "client_id": "c" });
         assert_eq!(tenant.send("PUT", "/api/oidc-providers/sneaky", Some(config)).await.0, StatusCode::FORBIDDEN);
         let (_, buttons) = Browser { console: console.clone(), cookie: None, origin: party().origin }
@@ -1100,6 +987,7 @@ mod e2e {
         assert_eq!(status, StatusCode::OK, "{me}");
         assert_eq!(me["identity"]["user"], "sam");
         assert_eq!(me["signed_in_at"], "mock");
+        assert_eq!(me["mfa"], false);
         assert_eq!(me["oidc"], json!([{ "provider": "mock", "label": "Company SSO", "email": "sam@example.com" }]));
         // A state is used once.
         assert!(sam.come_back(&state, &code).await.1.starts_with("/login?error="));
@@ -1138,27 +1026,6 @@ mod e2e {
         let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
         assert!(tenant.come_back(&state, &code).await.1.starts_with("/account?error="));
         assert_eq!(tenant.send("DELETE", "/api/oidc/mock", None).await.0, StatusCode::NO_CONTENT);
-
-        // Signing in again at the provider, to act as the operator.
-        let link = store::create_enrollment(&client, &account_id(&client, "operator").await, "op").await.unwrap();
-        roles::create_in(&client, Some("operator"), "sam-ops", None, true).await.unwrap();
-        let ops_link = store::create_enrollment(&client, &account_id(&client, "operator").await, "sam-ops").await.unwrap();
-        let _ = link;
-        assert_eq!(sam.send("POST", "/api/enroll/link", Some(json!({ "token": ops_link }))).await.0, StatusCode::OK);
-        let (_, me) = sam.send("GET", "/api/me", None).await;
-        let ops_id = me["identities"].as_array().unwrap().iter().find(|i| i["operator"] == true).unwrap()["account_id"].clone();
-        let default_id = me["identities"].as_array().unwrap().iter().find(|i| i["operator"] == false).unwrap()["account_id"].clone();
-        assert_eq!(sam.send("POST", "/api/switch", Some(json!({ "account_id": default_id }))).await.0, StatusCode::OK);
-        client.execute("UPDATE console_sessions SET verified_at = now() - interval '1 hour'", &[]).await.unwrap();
-        assert_eq!(sam.send("POST", "/api/switch", Some(json!({ "account_id": ops_id }))).await.0, StatusCode::UNAUTHORIZED);
-        let url = sam.start_oidc(json!({ "purpose": "reauth", "account_id": ops_id })).await;
-        assert!(url.contains("prompt=login"), "{url}");
-        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
-        let saved = sam.cookie.clone();
-        assert_eq!(sam.come_back(&state, &code).await.1, "/");
-        sam.cookie = saved;
-        let (_, me) = sam.send("GET", "/api/me", None).await;
-        assert_eq!(me["identity"]["operator"], true, "{me}");
     }
 
     /// Bucket and object tags and CORS, set as S3 sets them (and checked as

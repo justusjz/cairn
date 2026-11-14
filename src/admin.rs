@@ -219,11 +219,9 @@ mod e2e {
         let out = cairn(&app, &["user", "enroll", "cli-ada"]).await;
         assert!(out.stdout.starts_with("/enroll#"), "{}", out.stdout);
         assert!(out.stderr.contains("serves no console"), "{}", out.stderr);
-        let out = cairn(&app, &["account", "create", "cli-co"]).await;
-        assert!(out.stdout.starts_with("account cli-co: "), "{}", out.stdout);
-        let out = cairn(&app, &["user", "--account", "cli-co", "create", "cli-ada"]).await;
-        assert_eq!(out.error, None, "names are the account's");
-        assert!(cairn(&app, &["account", "enroll", "cli-co"]).await.stdout.starts_with("/enroll#"));
+        let out = cairn(&app, &["account", "show"]).await;
+        assert!(out.stdout.starts_with("account ") && out.stdout.contains("root not enrolled"), "{}", out.stdout);
+        assert!(cairn(&app, &["account", "enroll"]).await.stdout.starts_with("/enroll#"));
 
         // Documents are read where the CLI runs, and sent along.
         let file = std::env::temp_dir().join(format!("cairn-policy-{}.json", uuid::Uuid::new_v4()));

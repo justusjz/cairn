@@ -15,9 +15,8 @@
 //! New buckets have all four, as S3's do since 2023; the buckets made before
 //! there were blocks have none. New accounts have none, as AWS's.
 //!
-//! An account's block is its own to set (`s3:PutAccountPublicAccessBlock`),
-//! by its root and whom its policies allow: not the operator's, which is to
-//! Cairn's tenants as AWS is to its accounts. S3 Control's clients name the
+//! The account's block is set (`s3:PutAccountPublicAccessBlock`) by its
+//! root and whom its policies allow. S3 Control's clients name the
 //! account in the request's host too (`<account>.<endpoint>`), so they're
 //! told apart by the path and the `x-amz-account-id` header (`is_control`).
 

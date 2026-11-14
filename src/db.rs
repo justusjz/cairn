@@ -8,6 +8,12 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_ATTEMPTS: u32 = 60;
 
 pub async fn connect(url: &str) -> anyhow::Result<Pool> {
+    connect_through(url, MIGRATIONS.len()).await
+}
+
+/// As `connect`, with the schema migrated up to step `last` only (for tests
+/// of a migration, which set up what it migrates first).
+pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Pool> {
     let conf = tokio_postgres::Config::from_str(url)?;
     let mgr = Manager::from_config(
         conf,
@@ -30,7 +36,7 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match init(&pool).await {
+        match init(&pool, last).await {
             Ok(()) => return Ok(pool),
             Err(e) if attempt >= MAX_ATTEMPTS => return Err(e),
             Err(e) => {
@@ -49,9 +55,9 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
 pub(crate) const PROTOCOL: &str = "6";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
-/// gate (`cairn_require_users`, last raised by `POLICY_VERSIONS`) requires of
+/// gate (`cairn_require_users`, last raised by `SINGLE_ACCOUNT`) requires of
 /// every session that changes users, their keys or policies.
-pub(crate) const USERS_GATE: &str = "4";
+pub(crate) const USERS_GATE: &str = "5";
 
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
@@ -219,12 +225,13 @@ const MIGRATIONS: &[&str] = &[
     BOUNDARIES,
     POLICY_TAGS,
     POLICY_VERSIONS,
+    SINGLE_ACCOUNT,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
 /// the schema untouched. Refuses to run against a database migrated by a newer
 /// Cairn, whose schema this binary doesn't understand.
-async fn init(pool: &Pool) -> anyhow::Result<()> {
+pub(crate) async fn init(pool: &Pool, last: usize) -> anyhow::Result<()> {
     let mut client = pool.get().await?;
     let tx = client.transaction().await?;
     tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK])
@@ -247,7 +254,7 @@ async fn init(pool: &Pool) -> anyhow::Result<()> {
              upgrade Cairn"
         );
     }
-    for (version, sql) in (1..).zip(MIGRATIONS).skip(current as usize) {
+    for (version, sql) in (1..).zip(MIGRATIONS).take(last).skip(current as usize) {
         // Each step runs as the lock protocol of its own time, which the
         // gate (`PROTOCOL_GATE`) requires: on a fresh database, a step that
         // writes a gated table runs before the gate is raised to this
@@ -1916,6 +1923,111 @@ CREATE TRIGGER managed_policy_versions_users BEFORE INSERT OR UPDATE OR DELETE O
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
 CREATE TRIGGER managed_policy_versions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON managed_policy_versions
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+/// Migration 45: one account (see `plans/single-account.md`). Refused while
+/// more than one account but the operator's has users or buckets. The
+/// others go; the operator account's users move into the one, as admins
+/// (they could manage everything before), but those whose logins are in it
+/// already, which go, making the user they're in it as admin. The
+/// operator account's root becomes the account's (if it has none), else a
+/// user `operator` (`-2`, ...). The operator account's row stays, empty:
+/// older nodes read its ID once, to decide `cairn:` by (to no one now), and
+/// so keep serving S3 until they're upgraded; they may change no users
+/// (`cairn.users` 5), and a second account can't be made.
+const SINGLE_ACCOUNT: &str = r#"
+-- The gate is raised first (see `init`).
+CREATE OR REPLACE FUNCTION cairn_require_users() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.users', true) IS DISTINCT FROM '5' THEN
+        RAISE EXCEPTION 'this Cairn is too old to change users or accounts: Cairn has one account now; upgrade it'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER accounts_users BEFORE INSERT OR DELETE OR TRUNCATE ON accounts
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+
+DO $$
+DECLARE
+    v_used text;
+    v_account text;
+    v_ops text;
+    v_member record;
+    v_held boolean;
+    v_held_role uuid;
+    v_root uuid;
+    v_name text;
+    v_n integer := 1;
+    v_role uuid;
+BEGIN
+    SELECT string_agg(name, ', ' ORDER BY name) INTO v_used FROM accounts a
+    WHERE NOT operator AND (EXISTS (SELECT 1 FROM roles r WHERE r.account_id = a.id)
+                            OR EXISTS (SELECT 1 FROM buckets b WHERE b.account_id = a.id));
+    IF v_used LIKE '%,%' THEN
+        RAISE EXCEPTION 'Cairn has one account now, but these have users or buckets: %. Delete the users and buckets of all but one, with the Cairn you have, before upgrading', v_used
+            USING ERRCODE = 'check_violation';
+    END IF;
+    SELECT id INTO v_account FROM accounts a WHERE NOT operator
+    ORDER BY EXISTS (SELECT 1 FROM roles r WHERE r.account_id = a.id)
+             OR EXISTS (SELECT 1 FROM buckets b WHERE b.account_id = a.id) DESC, created_at, id
+    LIMIT 1;
+    SELECT id INTO v_ops FROM accounts WHERE operator;
+    DELETE FROM oidc_flows WHERE account_id IS NOT NULL AND account_id <> v_account;
+    DELETE FROM accounts WHERE NOT operator AND id <> v_account;
+
+    -- Sign-ins as the operator account.
+    DELETE FROM console_sessions WHERE account_id = v_ops;
+    DELETE FROM console_enrollments WHERE account_id = v_ops;
+
+    -- Its users: superadmins, admins now.
+    FOR v_member IN
+        SELECT r.id, r.name, i.login_id FROM roles r LEFT JOIN login_identities i ON i.role_id = r.id
+        WHERE r.account_id = v_ops ORDER BY r.name
+    LOOP
+        v_held := false;
+        SELECT true, role_id INTO v_held, v_held_role FROM login_identities
+        WHERE login_id = v_member.login_id AND account_id = v_account;
+        IF coalesce(v_held, false) THEN
+            UPDATE roles SET admin = true WHERE id = v_held_role;
+            DELETE FROM roles WHERE id = v_member.id;
+        ELSIF EXISTS (SELECT 1 FROM roles WHERE account_id = v_account AND lower(name) = lower(v_member.name)) THEN
+            RAISE EXCEPTION 'the operator account''s user % has the name of another user: Cairn has one account now; delete or rename one of them, with the Cairn you have, before upgrading', v_member.name
+                USING ERRCODE = 'unique_violation';
+        ELSE
+            UPDATE login_identities SET account_id = v_account WHERE role_id = v_member.id;
+            UPDATE roles SET account_id = v_account, admin = true WHERE id = v_member.id;
+        END IF;
+    END LOOP;
+
+    -- Its root.
+    SELECT login_id INTO v_root FROM login_identities WHERE account_id = v_ops AND role_id IS NULL;
+    IF v_root IS NOT NULL THEN
+        v_held := false;
+        SELECT true, role_id INTO v_held, v_held_role FROM login_identities
+        WHERE login_id = v_root AND account_id = v_account;
+        IF coalesce(v_held, false) THEN
+            UPDATE roles SET admin = true WHERE id = v_held_role;
+            DELETE FROM login_identities WHERE login_id = v_root AND account_id = v_ops;
+        ELSIF NOT EXISTS (SELECT 1 FROM login_identities WHERE account_id = v_account AND role_id IS NULL) THEN
+            UPDATE login_identities SET account_id = v_account WHERE login_id = v_root AND account_id = v_ops;
+        ELSE
+            v_name := 'operator';
+            WHILE EXISTS (SELECT 1 FROM roles WHERE account_id = v_account AND lower(name) = v_name) LOOP
+                v_n := v_n + 1;
+                v_name := 'operator-' || v_n;
+            END LOOP;
+            INSERT INTO roles (name, secret, admin, account_id)
+            VALUES (v_name, 'unusable:' || gen_random_uuid() || gen_random_uuid(), true, v_account)
+            RETURNING id INTO v_role;
+            UPDATE login_identities SET account_id = v_account, role_id = v_role
+            WHERE login_id = v_root AND account_id = v_ops;
+        END IF;
+    END IF;
+END $$;
+
+-- One account (and the operator's, empty, for older nodes).
+CREATE UNIQUE INDEX accounts_one ON accounts (operator) WHERE NOT operator;
 "#;
 #[cfg(test)]
 mod tests {

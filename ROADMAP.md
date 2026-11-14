@@ -53,12 +53,13 @@ Done:
 - **CI.** Running the test suites (`db-test.sh`, `test.sh`, `ha-test.sh`) on
   every change.
 
-- **Console, accounts and IAM.** Implemented: a web UI with passkey and
-  OIDC sign-in on a listener of its own, which replaced the dashboard;
-  accounts as tenants, with an operator account of superadmins; IAM
-  policies, inline and managed (Cairn's with AWS's names, and accounts'
-  own), bucket policies across accounts, and the IAM API. Open:
-  permissions boundaries, groups, and quotas per account.
+- **Console and IAM.** Implemented: a web UI with passkey and OIDC sign-in
+  on a listener of its own, which replaced the dashboard; one account,
+  whose operators are users with `cairn:` policies; IAM policies, inline
+  and managed (Cairn's with AWS's names, and the account's own), bucket
+  policies, permissions boundaries, paths and tags, and the IAM API. Open:
+  policy templates (a team, a service user, the MFA guard), groups, tag
+  conditions, and STS with roles (`AssumeRoleWithWebIdentity`).
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes

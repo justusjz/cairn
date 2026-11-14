@@ -45,7 +45,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
         .routes(routes!(enroll_options))
         .routes(routes!(enroll))
         .routes(routes!(enroll_link))
-        .routes(routes!(switch))
         .routes(routes!(login_options))
         .routes(routes!(login))
         .routes(routes!(logout))
@@ -309,16 +308,22 @@ async fn enroll(State(console): ConsoleState, Json(body): Json<Enroll>) -> Resul
     let credential = registered(&console, &challenge, &p.credential)?;
     let login = new_login_id(&challenge);
     let account = store::new_login(&client, login, &identity.label(), &body.token, &new_passkey(&credential, name)).await?;
-    signed_in(&client, login, &account, store::Way::Passkey(&credential.id)).await
+    signed_in(&console, &client, login, &account, store::Way::Passkey(&credential.id)).await
 }
 
 /// Starts a session for `login`, signed in `way` (just now), as its
 /// identity in `account`: the response with its cookie, and who's signed
 /// in.
-async fn signed_in(client: &deadpool_postgres::Object, login: Uuid, account: &str, way: store::Way<'_>) -> Result<Response> {
+async fn signed_in(
+    console: &Console,
+    client: &deadpool_postgres::Object,
+    login: Uuid,
+    account: &str,
+    way: store::Way<'_>,
+) -> Result<Response> {
     let token = store::create_session(client, login, account, way).await?;
     let session = store::session(client, &token).await?.ok_or_else(|| anyhow::anyhow!("a new session is gone"))?;
-    let me = me_of(client, &session).await?;
+    let me = me_of(console, client, &session).await?;
     Ok(([(header::SET_COOKIE, session_cookie(&token))], Json(me)).into_response())
 }
 
@@ -328,8 +333,7 @@ struct Login {
     credential: Assertion,
 }
 
-/// Signs in with a passkey, as the login's identity in its first account
-/// (by name; the operator account last).
+/// Signs in with a passkey, as the login's identity.
 #[utoipa::path(post, path = "/login", request_body = Login, responses(
     (status = 200, body = Me, description = "Signed in; the session's cookie is set"),
     (status = "4XX", body = ErrorBody),
@@ -345,7 +349,7 @@ async fn login(State(console): ConsoleState, Json(body): Json<Login>) -> Result<
             "this login isn't in any account (anymore): ask an administrator for an enrollment link".into(),
         ));
     };
-    signed_in(&client, login, &first.account_id, store::Way::Passkey(&credential)).await
+    signed_in(&console, &client, login, &first.account_id, store::Way::Passkey(&credential)).await
 }
 
 /// Signs out: ends the session.
@@ -361,8 +365,7 @@ async fn logout(State(console): ConsoleState, headers: HeaderMap) -> Result<Resp
 }
 
 /// Adds an enrollment link's identity to the signed-in login (using the
-/// link up), and acts as it, unless it's the operator account's, which
-/// takes a fresh passkey assertion first (`/switch`).
+/// link up).
 #[utoipa::path(post, path = "/enroll/link", request_body = Enrollment, responses(
     (status = 200, body = Me),
     (status = "4XX", body = ErrorBody),
@@ -370,56 +373,9 @@ async fn logout(State(console): ConsoleState, headers: HeaderMap) -> Result<Resp
 ))]
 async fn enroll_link(State(console): ConsoleState, signed: Signed, Json(body): Json<Enrollment>) -> Result<Json<Me>> {
     let client = console.app.pool.get().await?;
-    let account = store::enroll(&client, signed.session.login, &body.token).await?;
-    let identities = store::identities(&client, signed.session.login).await?;
-    let operator = identities.iter().any(|i| i.account_id == account && i.operator);
-    if !operator || signed.session.fresh {
-        store::switch(&client, &signed.token, &account, false).await?;
-    }
+    store::enroll(&client, signed.session.login, &body.token).await?;
     let session = store::session(&client, &signed.token).await?.ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
-    Ok(Json(me_of(&client, &session).await?))
-}
-
-#[derive(Deserialize, ToSchema)]
-struct Switch {
-    /// The account (its ID) to act in.
-    account_id: String,
-    /// A fresh assertion, for the operator account, if the session's
-    /// passkey wasn't used within five minutes (`Me.fresh`): its challenge
-    /// (from `/login/options`) and the browser's response.
-    challenge_id: Option<String>,
-    credential: Option<Assertion>,
-}
-
-/// Acts as the login's identity in another account.
-#[utoipa::path(post, path = "/switch", request_body = Switch, responses(
-    (status = 200, body = Me),
-    (status = "4XX", body = ErrorBody),
-    (status = "5XX", body = ErrorBody),
-))]
-async fn switch(State(console): ConsoleState, signed: Signed, Json(body): Json<Switch>) -> Result<Json<Me>> {
-    let client = console.app.pool.get().await?;
-    let identities = store::identities(&client, signed.session.login).await?;
-    let Some(target) = identities.iter().find(|i| i.account_id == body.account_id) else {
-        return Err(ApiError::NotFound("you're not in that account".into()));
-    };
-    let verified = match (&body.challenge_id, &body.credential) {
-        (Some(id), Some(credential)) => {
-            let (challenge, _) = take_challenge(&client, id, store::Purpose::Login).await?;
-            let (login, _) = asserted(&console, &client, &challenge, credential).await?;
-            if login != signed.session.login {
-                return Err(ApiError::BadRequest("that passkey is another login's".into()));
-            }
-            true
-        }
-        _ => false,
-    };
-    if target.operator && !verified && !signed.session.fresh {
-        return Err(ApiError::Unauthorized("confirm with your passkey to act as the operator".into()));
-    }
-    store::switch(&client, &signed.token, &body.account_id, verified).await?;
-    let session = store::session(&client, &signed.token).await?.ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
-    Ok(Json(me_of(&client, &session).await?))
+    Ok(Json(me_of(&console, &client, &session).await?))
 }
 
 // ─── The signed-in login ─────────────────────────────────────────────────────
@@ -429,8 +385,6 @@ async fn switch(State(console): ConsoleState, signed: Signed, Json(body): Json<S
 struct IdentitySummary {
     account_id: String,
     account: String,
-    /// Whether it's the operator account's (the superadmins').
-    operator: bool,
     /// The user's name; `null`: the account's root.
     user: Option<String>,
     /// The identity's ARN, which policies name it by.
@@ -445,7 +399,6 @@ impl IdentitySummary {
         IdentitySummary {
             account_id: identity.account_id.clone(),
             account: identity.account.clone(),
-            operator: identity.operator,
             user: identity.user.as_ref().map(|u| u.name.clone()),
             arn: identity.arn(),
             admin: identity.user.as_ref().is_some_and(|u| u.admin),
@@ -460,11 +413,12 @@ struct Me {
     name: String,
     /// Who the session acts as.
     identity: IdentitySummary,
-    /// Every identity of the login, the operator account's last.
-    identities: Vec<IdentitySummary>,
-    /// Whether its passkey was used (or it signed in at its provider)
-    /// within five minutes: acting as the operator takes that.
-    fresh: bool,
+    /// Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`;
+    /// else at an OIDC provider).
+    mfa: bool,
+    /// Whether it may see the cluster (`cairn:GetCluster`): it's an
+    /// operator, and the console shows it the cluster's pages.
+    cluster: bool,
     passkeys: Vec<PasskeySummary>,
     /// Its identities at OIDC providers, which sign it in too.
     oidc: Vec<LinkedProvider>,
@@ -492,8 +446,16 @@ struct PasskeySummary {
     current: bool,
 }
 
-async fn me_of(client: &deadpool_postgres::Object, session: &store::Session) -> Result<Me> {
-    let identities = store::identities(client, session.login).await?;
+async fn me_of(console: &Console, client: &deadpool_postgres::Object, session: &store::Session) -> Result<Me> {
+    // As a page of the console would ask it.
+    let user = super::session_user(client, session, axum::http::Method::GET, HeaderMap::new(), String::new(), None).await?;
+    let cluster = match user {
+        Some(user) => {
+            let actor = super::Actor(Arc::new(user));
+            actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?
+        }
+        None => false,
+    };
     let passkeys = store::passkeys(client, session.login).await?;
     let oidc = super::oidc::linked(client, session.login).await?;
     Ok(Me {
@@ -501,8 +463,8 @@ async fn me_of(client: &deadpool_postgres::Object, session: &store::Session) -> 
         signed_in_at: session.oidc_provider.clone(),
         name: session.login_name.clone(),
         identity: IdentitySummary::of(&session.identity),
-        identities: identities.iter().map(IdentitySummary::of).collect(),
-        fresh: session.fresh,
+        mfa: session.mfa_age.is_some(),
+        cluster,
         passkeys: passkeys
             .into_iter()
             .map(|p| PasskeySummary {
@@ -524,7 +486,7 @@ async fn me_of(client: &deadpool_postgres::Object, session: &store::Session) -> 
 ))]
 async fn me(State(console): ConsoleState, signed: Signed) -> Result<Json<Me>> {
     let client = console.app.pool.get().await?;
-    Ok(Json(me_of(&client, &signed.session).await?))
+    Ok(Json(me_of(&console, &client, &signed.session).await?))
 }
 
 /// Adds a passkey to the signed-in login.
@@ -608,11 +570,9 @@ pub(super) fn redirect_uri(console: &Console) -> String {
 
 #[derive(Deserialize, ToSchema)]
 struct OidcStart {
-    /// `login`, `enroll` (with `token`), `link` or `reauth` (with
-    /// `account_id`), the latter two signed in.
+    /// `login`, `enroll` (with `token`), or `link` (signed in).
     purpose: String,
     token: Option<String>,
-    account_id: Option<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -654,16 +614,6 @@ async fn oidc_start(
             (Purpose::Enroll, Carried { enrollment: Some(token), ..Default::default() })
         }
         "link" => (Purpose::Link, Carried { login: Some(signed_in()?.login), ..Default::default() }),
-        "reauth" => {
-            let account = body.account_id.as_deref().ok_or_else(|| ApiError::BadRequest("the account is missing".into()))?;
-            let carried = Carried {
-                login: Some(signed_in()?.login),
-                account: Some(account),
-                session: token.as_deref(),
-                ..Default::default()
-            };
-            (Purpose::Reauth, carried)
-        }
         other => return Err(ApiError::BadRequest(format!("no purpose {other:?}"))),
     };
     let url = super::oidc::start(&client, &provider, &redirect_uri(&console), purpose, carried)
@@ -759,19 +709,6 @@ async fn oidc_callback(State(console): ConsoleState, Query(answer): Query<OidcAn
                 Ok(()) => Ok(redirect("/account", None)),
                 Err(e) => Ok(failed("/account", &to_text(e)?)),
             }
-        }
-        Purpose::Reauth => {
-            let login = super::oidc::login_of(&client, provider, &done.subject, done.email.as_deref()).await?;
-            if login.is_none() || login != done.login {
-                return Ok(failed("/account", "that identity doesn't sign in this login"));
-            }
-            let (Some(session), Some(account)) = (&done.session, &done.account) else {
-                return Ok(failed("/login", "sign in again"));
-            };
-            if !store::switch_hashed(&client, session, account, true).await? {
-                return Ok(failed("/account", "you're not in that account"));
-            }
-            Ok(redirect("/", None))
         }
     }
 }

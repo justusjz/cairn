@@ -206,8 +206,6 @@ pub enum Purpose {
     Enroll,
     /// Linking the identity to a signed-in login.
     Link,
-    /// Signing in again, to act as the operator account.
-    Reauth,
 }
 
 impl Purpose {
@@ -216,26 +214,21 @@ impl Purpose {
             Purpose::Login => "login",
             Purpose::Enroll => "enroll",
             Purpose::Link => "link",
-            Purpose::Reauth => "reauth",
         }
     }
 
     fn of(s: &str) -> Option<Purpose> {
-        [Purpose::Login, Purpose::Enroll, Purpose::Link, Purpose::Reauth].into_iter().find(|p| p.as_str() == s)
+        [Purpose::Login, Purpose::Enroll, Purpose::Link].into_iter().find(|p| p.as_str() == s)
     }
 }
 
 /// What a sign-in in progress carries to its end.
 #[derive(Default)]
 pub struct Carried<'a> {
-    /// The signed-in login (to link to, or sign in again).
+    /// The signed-in login (to link to).
     pub login: Option<Uuid>,
     /// The enrollment link's token.
     pub enrollment: Option<&'a str>,
-    /// The account to act in, after signing in again.
-    pub account: Option<&'a str>,
-    /// The session to switch, after signing in again (its token).
-    pub session: Option<&'a str>,
 }
 
 /// The provider named `name`.
@@ -288,8 +281,8 @@ pub async fn start(
     let challenge = b64(digest::digest(&digest::SHA256, verifier.as_bytes()).as_ref());
     client
         .execute_cached(
-            "INSERT INTO oidc_flows (state_hash, provider, nonce, verifier, purpose, login_id, enrollment, account_id, session, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now() + make_interval(secs => $10))",
+            "INSERT INTO oidc_flows (state_hash, provider, nonce, verifier, purpose, login_id, enrollment, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8))",
             &[
                 &store::hash(&state),
                 &provider.name,
@@ -298,13 +291,11 @@ pub async fn start(
                 &purpose.as_str(),
                 &carried.login,
                 &carried.enrollment.map(store::hash),
-                &carried.account,
-                &carried.session.map(store::hash),
                 &FLOW_TTL.as_secs_f64(),
             ],
         )
         .await?;
-    let mut url = format!(
+    let url = format!(
         "{}{}response_type=code&client_id={}&redirect_uri={}&scope={}&state={state}&nonce={nonce}\
          &code_challenge={challenge}&code_challenge_method=S256",
         found.authorization_endpoint,
@@ -313,10 +304,6 @@ pub async fn start(
         encode(redirect_uri),
         encode(&provider.scopes),
     );
-    // Signing in again means signing in again, at the provider too.
-    if purpose == Purpose::Reauth {
-        url.push_str("&prompt=login&max_age=0");
-    }
     Ok(url)
 }
 
@@ -329,11 +316,9 @@ pub struct Finished {
     pub subject: String,
     pub email: Option<String>,
     pub name: Option<String>,
-    /// What was carried (as hashes, but the login and account).
+    /// What was carried (the enrollment link's token as its hash).
     pub login: Option<Uuid>,
     pub enrollment: Option<Vec<u8>>,
-    pub account: Option<String>,
-    pub session: Option<Vec<u8>>,
 }
 
 /// Why a sign-in at a provider didn't work, for the person to read.
@@ -350,7 +335,7 @@ pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str
     let row = client
         .query_opt_cached(
             "DELETE FROM oidc_flows WHERE state_hash = $1 AND expires_at > now()
-             RETURNING provider, nonce, verifier, purpose, login_id, enrollment, account_id, session",
+             RETURNING provider, nonce, verifier, purpose, login_id, enrollment",
             &[&store::hash(state)],
         )
         .await?;
@@ -362,7 +347,11 @@ pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str
         return Ok(failed("that sign-in provider is no longer configured"));
     };
     let (nonce, verifier): (String, String) = (row.get(1), row.get(2));
-    let purpose = Purpose::of(row.get(3)).expect("the column's check");
+    // (A sign-in again as the operator account, which there's none of
+    // now, started before an upgrade, is none of these.)
+    let Some(purpose) = Purpose::of(row.get(3)) else {
+        return Ok(failed("this sign-in is of a kind there's no more of; sign in again"));
+    };
     let found = discovery(&provider).await?;
     let token = match redeem(&provider, &found, redirect_uri, code, &verifier).await? {
         Ok(token) => token,
@@ -386,8 +375,6 @@ pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str
         name,
         login: row.get(4),
         enrollment: row.get(5),
-        account: row.get(6),
-        session: row.get(7),
     }))
 }
 

@@ -1,5 +1,5 @@
 // The OpenID Connect providers people may sign in to the console at, for
-// superadmins: any provider that follows the standard, by its issuer URL
+// operators: any provider that follows the standard, by its issuer URL
 // and a client registered with it (see `src/console/oidc.rs`).
 
 import { For, Show, createSignal } from "solid-js";

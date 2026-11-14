@@ -9,9 +9,9 @@
 //! and it may have inline identity policies of its own (see `policy`). Admin
 //! does not imply object access; that always needs a grant (or a policy).
 //!
-//! The operator account's users are none of that: each is a superadmin by
-//! being one, with no access keys, admin flag, grants or policies (see
-//! `refuse_operator`), and acts only in the console.
+//! The cluster's operators are users too, whose policies allow them `cairn:`
+//! actions (`AdministratorAccess`, `CairnOperatorAccess`; see
+//! `plans/single-account.md`).
 //!
 //! Everything lives in Postgres, so every node sees a change immediately. The
 //! `cairn user …` subcommands (`cairn role …`, as before) manage it directly
@@ -134,11 +134,8 @@ impl Principal {
     /// Loads the user whose active access key `access_key` is, or `None` if
     /// there's none.
     pub async fn load(client: &Object, access_key: &str) -> anyhow::Result<Option<Self>> {
-        // Never one of the operator account's: it has none (migration 39),
-        // and signs nothing.
         Self::load_where(client, "FROM access_keys k JOIN roles r ON r.id = k.role_id
-             JOIN accounts a ON a.id = r.account_id
-             WHERE k.access_key_id = $1 AND k.active AND NOT a.operator", "k.secret", &access_key).await
+             WHERE k.access_key_id = $1 AND k.active", "k.secret", &access_key).await
     }
 
     /// Loads user `id` itself, as the console acts as it (no secret: it
@@ -251,10 +248,6 @@ pub struct RoleArgs {
     #[command(flatten)]
     #[serde(skip)]
     pub remote: crate::admin::Remote,
-    /// The account (by name) whose users these are: user names are unique
-    /// in an account. The first tenant account (`default`) if not given.
-    #[arg(long, global = true)]
-    account: Option<String>,
     #[command(subcommand)]
     command: RoleCommand,
 }
@@ -262,8 +255,7 @@ pub struct RoleArgs {
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum RoleCommand {
     /// Create a user, with an access key of a random ID. Prints the key's
-    /// ID and secret; a random secret is generated unless given. In the operator
-    /// account: a superadmin, who gets no key (see `cairn user enroll`).
+    /// ID and secret; a random secret is generated unless given.
     Create {
         /// The user's name.
         name: String,
@@ -380,15 +372,7 @@ impl RoleArgs {
 /// `admin`).
 pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
-    // The account's ID.
-    let account_id = match &args.account {
-        Some(name) => client
-            .query_opt_cached("SELECT id FROM accounts WHERE name = $1", &[name])
-            .await?
-            .map(|row| row.get::<_, String>(0))
-            .ok_or_else(|| invalid(format!("no account named {name:?}")))?,
-        None => account(&client).await?,
-    };
+    let account_id = account(&client).await?;
     let account_id = account_id.as_str();
     match args.command {
         RoleCommand::Create {
@@ -397,15 +381,6 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
             secret,
             admin,
         } => {
-            if is_operator(&client, account_id).await? {
-                if id.is_some() || secret.is_some() || admin {
-                    refuse_operator(&client, account_id, "access keys or admin flag").await?;
-                }
-                create_without_key(&client, account_id, &name).await?;
-                let account = args.account.as_deref().unwrap_or("operator");
-                outln!(out, "superadmin {name}: make its console link with `cairn user enroll --account {account} {name}`");
-                return Ok(());
-            }
             let generated = secret.is_none();
             let key = match id {
                 Some(id) => {
@@ -567,7 +542,7 @@ pub fn generate_secret() -> anyhow::Result<String> {
     Ok(URL_SAFE_NO_PAD.encode(bytes))
 }
 
-/// Creates a user of the first tenant account, with an access key named as
+/// Creates a user of the account, with an access key named as
 /// it (as a migrated role's, which tests sign with by the user's name), of
 /// `secret` or else a generated one, and returns its secret.
 #[cfg(test)]
@@ -577,47 +552,15 @@ pub async fn create(
     secret: Option<String>,
     admin: bool,
 ) -> anyhow::Result<String> {
-    Ok(create_in(client, None, name, secret, admin).await?.1)
-}
-
-#[cfg(test)]
-/// Creates a user of the account named `account` (`None`: the first tenant
-/// account), as `create`.
-pub async fn create_in(
-    client: &Object,
-    account: Option<&str>,
-    name: &str,
-    secret: Option<String>,
-    admin: bool,
-) -> anyhow::Result<(String, String)> {
-    let account_id = match account {
-        Some(account) => client
-            .query_opt_cached("SELECT id FROM accounts WHERE name = $1", &[&account])
-            .await?
-            .map(|row| row.get::<_, String>(0))
-            .ok_or_else(|| invalid(format!("no account named {account:?}")))?,
-        None => self::account(client).await?,
-    };
-    // The operator account's users have no keys: its ID is the name.
-    if is_operator(client, &account_id).await? {
-        create_without_key(client, &account_id, name).await?;
-        return Ok((name.to_owned(), String::new()));
-    }
-    create_with_key(client, &account_id, name, name.to_owned(), secret, admin).await
+    let account_id = self::account(client).await?;
+    Ok(create_with_key(client, &account_id, name, name.to_owned(), secret, admin).await?.1)
 }
 
 /// Creates a user of the account `account_id` without access keys, as
-/// IAM's CreateUser does: it gets them with `create_key`. (`roles.secret`,
-/// which older Cairns read, is none that can be guessed.) A user of the
-/// operator account is a superadmin, by being one, and never gets keys;
-/// it's marked admin for older nodes (see `db`, migration 39).
-pub async fn create_without_key(client: &Object, account_id: &str, name: &str) -> anyhow::Result<()> {
-    create_user(client, account_id, name, "/", None).await
-}
-
-/// Creates a user of the account `account_id`, as `create_without_key`, at
-/// `path` (checked: see `check_path`), with the permissions boundary
-/// `boundary`. Names are unique in an account regardless of case, as IAM's.
+/// IAM's CreateUser does (it gets them with `create_key`; `roles.secret`,
+/// which older Cairns read, is none that can be guessed), at `path`
+/// (checked: see `check_path`), with the permissions boundary `boundary`.
+/// Names are unique in an account regardless of case, as IAM's.
 pub async fn create_user(
     client: &Object,
     account_id: &str,
@@ -626,14 +569,11 @@ pub async fn create_user(
     boundary: Option<&BoundaryRef>,
 ) -> anyhow::Result<()> {
     validate_name(name)?;
-    if boundary.is_some() {
-        refuse_operator(client, account_id, "permissions boundaries").await?;
-    }
     let (own, aws) = BoundaryRef::columns(boundary);
     let inserted = client
         .execute_cached(
             "INSERT INTO roles (name, secret, admin, account_id, path, boundary_policy_id, boundary_aws)
-             SELECT $1, 'unusable:' || gen_random_uuid() || gen_random_uuid(), a.operator, a.id, $3, $4, $5
+             SELECT $1, 'unusable:' || gen_random_uuid() || gen_random_uuid(), false, a.id, $3, $4, $5
              FROM accounts a WHERE a.id = $2
              ON CONFLICT DO NOTHING",
             &[&name, &account_id, &path, &own, &aws],
@@ -669,9 +609,6 @@ impl BoundaryRef {
 /// R(r)), whose trigger keeps the inline policy older Cairns read in its
 /// place (`db::BOUNDARIES`). Whether there's such a user.
 pub async fn set_boundary(client: &Object, account_id: &str, id: uuid::Uuid, boundary: Option<&BoundaryRef>) -> anyhow::Result<bool> {
-    if boundary.is_some() {
-        refuse_operator(client, account_id, "permissions boundaries").await?;
-    }
     let (own, aws) = BoundaryRef::columns(boundary);
     let updated = client
         .execute_cached(
@@ -923,7 +860,6 @@ async fn create_with_key(
     admin: bool,
 ) -> anyhow::Result<(String, String)> {
     validate_name(name)?;
-    refuse_operator(client, account_id, "access keys").await?;
     let secret = match secret {
         Some(s) => {
             validate_secret(&s)?;
@@ -957,55 +893,20 @@ async fn create_with_key(
     }
 }
 
-/// The ID of the first tenant account (`default`; see `accounts`), which
-/// users and buckets belong to unless said otherwise, while there are no
-/// other tenants; it never changes, so it's read once.
+/// The account's ID (see `accounts`): Cairn has one, which every user,
+/// bucket and policy belongs to. It never changes, so it's read once.
 pub async fn account(client: &Object) -> anyhow::Result<String> {
     static ACCOUNT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if let Some(account) = ACCOUNT.get() {
         return Ok(account.clone());
     }
-    let account: String = client
-        .query_one_cached("SELECT id FROM accounts WHERE NOT operator ORDER BY created_at, id LIMIT 1", &[])
-        .await?
-        .get(0);
+    // (The operator account's row, which older nodes read, is empty.)
+    let account: String = client.query_one_cached("SELECT id FROM accounts WHERE NOT operator", &[]).await?.get(0);
     // Each test's database has an account of its own.
     if !cfg!(test) {
         let _ = ACCOUNT.set(account.clone());
     }
     Ok(account)
-}
-
-/// The operator account's ID (see `accounts`), which never changes, so it's
-/// read once.
-pub async fn operator_account(client: &Object) -> anyhow::Result<String> {
-    static ACCOUNT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    if let Some(account) = ACCOUNT.get() {
-        return Ok(account.clone());
-    }
-    let account: String = client.query_one_cached("SELECT id FROM accounts WHERE operator", &[]).await?.get(0);
-    // Each test's database has an account of its own.
-    if !cfg!(test) {
-        let _ = ACCOUNT.set(account.clone());
-    }
-    Ok(account)
-}
-
-/// Whether `account` (its ID) is the operator account.
-pub async fn is_operator(client: &Object, account: &str) -> anyhow::Result<bool> {
-    Ok(account == operator_account(client).await?)
-}
-
-/// Refuses the operator account's users `what` (access keys, policies, an
-/// admin flag): they're superadmins by being its users, and act only in
-/// the console, so the IAM that tenants' users have is none of theirs.
-pub async fn refuse_operator(client: &Object, account: &str, what: &str) -> anyhow::Result<()> {
-    if is_operator(client, account).await? {
-        return Err(invalid(format!(
-            "the operator account's users are superadmins by being its users, and have no {what}"
-        )));
-    }
-    Ok(())
 }
 
 /// The most access keys a user may have, as in IAM.
@@ -1037,7 +938,6 @@ pub async fn create_key(
     id: Option<String>,
     secret: Option<String>,
 ) -> anyhow::Result<(String, String)> {
-    refuse_operator(client, account, "access keys").await?;
     let id = match id {
         Some(id) => {
             validate_name(&id)?;
@@ -1128,7 +1028,6 @@ fn validate_policy_name(name: &str) -> anyhow::Result<()> {
 /// identity policy (see `policy`), and the user's policies stay within
 /// IAM's size.
 pub async fn put_policy(client: &Object, account: &str, user: &str, name: &str, document: &str) -> anyhow::Result<()> {
-    refuse_operator(client, account, "policies").await?;
     validate_policy_name(name)?;
     crate::policy::Policy::parse(document, crate::policy::Kind::Identity)
         .map_err(|e| invalid(format!("{}: {}", e.code, e.message)))?;
@@ -1189,7 +1088,6 @@ pub async fn update(
             "nothing to update; pass --admin, --secret, or --rotate-secret",
         ));
     }
-    refuse_operator(client, account, "admin flag or access keys").await?;
     if let Some(s) = &secret {
         validate_secret(s)?;
     }
@@ -1311,8 +1209,8 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                     ARRAY(SELECT extract(epoch FROM k.created_at)::float8 FROM access_keys k
                           WHERE k.role_id = r.id ORDER BY k.created_at, k.access_key_id),
                     ARRAY(SELECT p.name FROM role_policies p WHERE p.role_id = r.id AND p.name NOT LIKE 'cairn:%' ORDER BY p.name),
-                    a.id, r.path, {TAG_KEYS}, {TAG_VALUES}, {BOUNDARY_ARN}
-             FROM roles r JOIN accounts a ON a.id = r.account_id ORDER BY a.operator, a.name, r.name"),
+                    r.account_id, r.path, {TAG_KEYS}, {TAG_VALUES}, {BOUNDARY_ARN}
+             FROM roles r ORDER BY r.name"),
             &[],
         )
         .await?;

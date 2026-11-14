@@ -391,14 +391,17 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     ("aws:userid", Support::Evaluated),
     ("aws:username", Support::Evaluated),
     ("aws:viaawsservice", Support::Evaluated),
+    // Console sessions': signed in with a passkey, or at an OIDC provider
+    // (see `console::actor`); access keys never carry them, as AWS's
+    // long-term keys don't.
+    ("aws:multifactorauthage", Support::Evaluated),
+    ("aws:multifactorauthpresent", Support::Evaluated),
     ("aws:calledvia", Support::Absent),
     ("aws:calledviafirst", Support::Absent),
     ("aws:calledvialast", Support::Absent),
     ("aws:ec2instancesourceprivateipv4", Support::Absent),
     ("aws:ec2instancesourcevpc", Support::Absent),
     ("aws:federatedprovider", Support::Absent),
-    ("aws:multifactorauthage", Support::Absent),
-    ("aws:multifactorauthpresent", Support::Absent),
     ("aws:principalorgid", Support::Absent),
     ("aws:principalorgpaths", Support::Absent),
     ("aws:principalservicename", Support::Absent),

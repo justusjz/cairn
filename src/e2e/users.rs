@@ -265,88 +265,155 @@ async fn old_grants_move_into_managed_policies() {
     assert_eq!(left, 0);
 }
 
-/// There's an operator account besides the first tenant account; it owns
-/// no buckets, and users and buckets are the tenant's unless said otherwise.
+/// Cairn has one account (see `plans/single-account.md`): it owns every user
+/// and bucket, and no second one can be made, even by an older node. The
+/// operator account's row, which older nodes read, is left empty.
 #[tokio::test]
-async fn the_operator_account_owns_no_buckets() {
+async fn there_is_one_account() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let accounts = client.query("SELECT name, operator FROM accounts ORDER BY operator", &[]).await.unwrap();
-    let accounts: Vec<(String, bool)> = accounts.iter().map(|r| (r.get(0), r.get(1))).collect();
-    assert_eq!(accounts, [("default".to_owned(), false), ("operator".to_owned(), true)]);
-    let owner: String =
-        client.query_one("SELECT a.name FROM buckets b JOIN accounts a ON a.id = b.account_id WHERE b.name = $1", &[&BUCKET]).await.unwrap().get(0);
-    assert_eq!(owner, "default");
-    let refused = client
-        .execute("UPDATE buckets SET account_id = (SELECT id FROM accounts WHERE operator) WHERE name = $1", &[&BUCKET])
-        .await
-        .unwrap_err();
-    assert!(refused.to_string().contains("owns no buckets") || format!("{refused:?}").contains("owns no buckets"), "{refused:?}");
-    // Its users are superadmins by being its users: no access keys, admin
-    // flag or policies, and so nothing that signs requests.
-    let operator = roles::operator_account(&client).await.unwrap();
-    roles::create_without_key(&client, &operator, "superadmin").await.unwrap();
-    let refused = |e: anyhow::Error| assert!(e.to_string().contains("superadmins"), "{e}");
-    refused(roles::create_key(&client, &operator, "superadmin", Some("superadmin".into()), None).await.unwrap_err());
-    refused(roles::create_for(&client, &operator, "another", None, false).await.unwrap_err());
-    refused(roles::update(&client, &operator, "superadmin", Some(false), None).await.unwrap_err());
-    let policy = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
-    refused(roles::put_policy(&client, &operator, "superadmin", "all", policy).await.unwrap_err());
-    // Nor straight into the database (as an older node would).
-    let id = roles::id_of(&client, &operator, "superadmin").await.unwrap();
-    let err = client
-        .execute("INSERT INTO access_keys (access_key_id, role_id, secret) VALUES ('sneaky', $1, 'secret123')", &[&id])
-        .await
-        .unwrap_err();
-    assert!(format!("{err:?}").contains("superadmins"), "{err:?}");
-    // It's marked admin, for older nodes, which decide by that.
-    let admin: bool = client.query_one("SELECT admin FROM roles WHERE id = $1", &[&id]).await.unwrap().get(0);
-    assert!(admin);
-    assert!(Principal::load(&client, "superadmin").await.unwrap().is_none());
+    let account = roles::account(&client).await.unwrap();
+    let owner: String = client.query_one("SELECT account_id FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
+    assert_eq!(owner, account);
+    let err = client.execute("INSERT INTO accounts (id, name) VALUES ('000000000042', 'acme')", &[]).await.unwrap_err();
+    assert!(format!("{err:?}").contains("accounts_one"), "{err:?}");
+    let mut session = app.pool.get().await.unwrap();
+    let tx = session.transaction().await.unwrap();
+    tx.batch_execute("SET LOCAL cairn.users = '4'").await.unwrap();
+    let err = tx.batch_execute("INSERT INTO accounts (id, name) VALUES ('000000000042', 'acme')").await.unwrap_err();
+    assert!(format!("{err:?}").contains("too old to change users"), "{err:?}");
 }
 
-/// User names are unique in their account, as in IAM: two accounts each
-/// have an `ada`, with keys of their own; a grant, a policy and a bucket
-/// policy name one of them, never the other.
+/// Operators are users whose policies allow `cairn:` actions: Cairn's
+/// `CairnOperatorAccess` allows those and nothing else; `AdministratorAccess`
+/// everything.
 #[tokio::test]
-async fn accounts_have_users_of_the_same_name() {
+async fn operators_are_users_with_cairn_actions() {
+    use crate::s3::{access::{Access, Origin}, actions::{Check, On}};
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let default = roles::account(&client).await.unwrap();
-    let acme = crate::accounts::create(&client, "acme").await.unwrap();
-    let (first, _) = roles::create_for(&client, &default, "ada", None, false).await.unwrap();
-    let (second, _) = roles::create_for(&client, &acme, "ada", None, false).await.unwrap();
-    assert_ne!(first, second);
-    assert!(first != "ada" && second != "ada");
-    assert_eq!(Principal::load(&client, &first).await.unwrap().unwrap().account, default);
-    assert_eq!(Principal::load(&client, &second).await.unwrap().unwrap().account, acme);
-    // But not twice in one account.
-    assert!(roles::create_for(&client, &acme, "ada", None, false).await.is_err());
+    let account = roles::account(&client).await.unwrap();
+    roles::create(&client, "ops", None, false).await.unwrap();
+    roles::create(&client, "boss", None, true).await.unwrap();
+    roles::create(&client, "nobody", None, false).await.unwrap();
+    crate::managed::attach(&client, &account, "ops", "arn:aws:iam::aws:policy/CairnOperatorAccess", true).await.unwrap();
+    let may = async |user: &str, action: &'static str, on: On| {
+        let principal = Principal::load(&client, user).await.unwrap().unwrap();
+        let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+        let mut access = Access::new(Some(&principal), &account, &hyper::Method::GET, &hyper::HeaderMap::new(), "", &origin).unwrap();
+        let check = Check { action, on };
+        access.load_all(&app, std::slice::from_ref(&check)).await.unwrap();
+        access.allows(&check)
+    };
+    let object = || On::Object(BUCKET.to_owned(), "k".to_owned());
+    assert!(may("ops", "cairn:GetCluster", On::Cluster).await);
+    assert!(may("ops", "cairn:PutSetting", On::Cluster).await);
+    assert!(!may("ops", "s3:GetObject", object()).await);
+    assert!(!may("ops", "iam:CreateUser", On::user(&account, "/", "x")).await);
+    assert!(may("boss", "cairn:PutSetting", On::Cluster).await);
+    assert!(may("boss", "s3:GetObject", object()).await);
+    assert!(!may("nobody", "cairn:GetCluster", On::Cluster).await);
+}
 
-    // A grant is the bucket's account's ada's.
-    roles::grant(&client, &default, "ada", BUCKET, &[roles::Permission::Read]).await.unwrap();
-    assert!(roles::grant(&client, &acme, "ada", BUCKET, &[roles::Permission::Read]).await.is_err());
-    assert_eq!(attached(&client, &default, "ada").await, [format!("{BUCKET}-read")]);
-    assert!(attached(&client, &acme, "ada").await.is_empty());
-    let ours = Principal::load(&client, &first).await.unwrap().unwrap();
-    let theirs = Principal::load(&client, &second).await.unwrap().unwrap();
-    assert!(crate::s3::access::listable(&ours, &[BUCKET]).unwrap().contains(BUCKET));
-    assert!(crate::s3::access::listable(&theirs, &[BUCKET]).unwrap().is_empty());
+/// Migration 45 makes the operator account's people the account's (see
+/// `db::SINGLE_ACCOUNT`): a superadmin with no identity in the account moves
+/// into it, as an admin; one whose login is in it already goes, making that
+/// user admin; the operator's root becomes the account's, which had none.
+/// Empty accounts go.
+#[tokio::test]
+async fn the_operators_join_the_account() {
+    let Some(pool) = super::fresh_database_through(44).await else { return };
+    let mut client = pool.get().await.unwrap();
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute(
+        "SET LOCAL cairn.users = '4';
+         INSERT INTO accounts (id, name) VALUES ('000000000042', 'spare');
+         INSERT INTO roles (name, secret, admin, account_id)
+             SELECT 'ada', 'secret123', false, id FROM accounts WHERE name = 'default';
+         INSERT INTO roles (name, secret, admin, account_id)
+             SELECT n, 'unusable:x', true, id FROM accounts, (VALUES ('sam'), ('ada-ops')) v(n) WHERE operator;
+         INSERT INTO logins (id, name) VALUES
+             ('00000000-0000-4000-8000-000000000001', 'sam'),
+             ('00000000-0000-4000-8000-000000000002', 'ada'),
+             ('00000000-0000-4000-8000-000000000003', 'olga');
+         INSERT INTO login_identities (login_id, account_id, role_id)
+             SELECT '00000000-0000-4000-8000-000000000001', r.account_id, r.id FROM roles r WHERE r.name = 'sam';
+         INSERT INTO login_identities (login_id, account_id, role_id)
+             SELECT '00000000-0000-4000-8000-000000000002', r.account_id, r.id FROM roles r WHERE r.name IN ('ada', 'ada-ops');
+         INSERT INTO login_identities (login_id, account_id, role_id)
+             SELECT '00000000-0000-4000-8000-000000000003', id, NULL FROM accounts WHERE operator;",
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    crate::db::init(&pool, usize::MAX).await.unwrap();
 
-    // A bucket policy naming acme's ada binds acme's.
-    let policy = format!(
-        r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{acme}:user/ada"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
+    let account = roles::account(&client).await.unwrap();
+    let names: Vec<String> = client.query("SELECT name FROM accounts WHERE NOT operator", &[]).await.unwrap().iter().map(|r| r.get(0)).collect();
+    assert_eq!(names, ["default"]);
+    let operators: i64 =
+        client.query_one("SELECT count(*) FROM roles r JOIN accounts a ON a.id = r.account_id WHERE a.operator", &[]).await.unwrap().get(0);
+    assert_eq!(operators, 0);
+    let users: Vec<(String, bool, String)> = client
+        .query("SELECT name, admin, account_id FROM roles ORDER BY name", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(users, [("ada".to_owned(), true, account.clone()), ("sam".to_owned(), true, account.clone())]);
+    let identities: Vec<(String, String, Option<String>)> = client
+        .query(
+            "SELECT l.name, i.account_id, r.name FROM login_identities i JOIN logins l ON l.id = i.login_id
+             LEFT JOIN roles r ON r.id = i.role_id ORDER BY l.name",
+            &[],
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1), r.get(2)))
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            ("ada".to_owned(), account.clone(), Some("ada".to_owned())),
+            ("olga".to_owned(), account.clone(), None),
+            ("sam".to_owned(), account.clone(), Some("sam".to_owned())),
+        ]
     );
-    let set = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, policy.into()).await.unwrap();
-    assert_eq!(set.status(), hyper::StatusCode::NO_CONTENT);
-    let ids: String =
-        client.query_one("SELECT policy_principals::text FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
-    assert!(ids.contains(&theirs.id.to_string()) && !ids.contains(&ours.id.to_string()), "{ids}");
+}
 
-    // Deleting one leaves the other.
-    roles::delete(&client, &acme, "ada").await.unwrap();
-    assert!(Principal::load(&client, &first).await.unwrap().is_some());
-    assert!(Principal::load(&client, &second).await.unwrap().is_none());
+/// Migration 45 is refused while two accounts have users or buckets, or
+/// a superadmin has a user's name, and changes nothing then.
+#[tokio::test]
+async fn one_account_is_refused_while_two_are_used() {
+    for (setup, refusal) in [
+        (
+            "INSERT INTO accounts (id, name) VALUES ('000000000042', 'acme');
+             INSERT INTO roles (name, secret, admin, account_id) VALUES ('eve', 'secret123', false, '000000000042');
+             INSERT INTO roles (name, secret, admin, account_id)
+                 SELECT 'ada', 'secret123', false, id FROM accounts WHERE name = 'default';",
+            "these have users or buckets: acme, default",
+        ),
+        (
+            "INSERT INTO roles (name, secret, admin, account_id)
+                 SELECT 'ada', 'secret123', false, id FROM accounts WHERE name = 'default';
+             INSERT INTO roles (name, secret, admin, account_id)
+                 SELECT 'Ada', 'unusable:x', true, id FROM accounts WHERE operator;",
+            "user Ada has the name of another user",
+        ),
+    ] {
+        let Some(pool) = super::fresh_database_through(44).await else { return };
+        let mut client = pool.get().await.unwrap();
+        let tx = client.transaction().await.unwrap();
+        tx.batch_execute("SET LOCAL cairn.users = '4'").await.unwrap();
+        tx.batch_execute(setup).await.unwrap();
+        tx.commit().await.unwrap();
+        let err = crate::db::init(&pool, usize::MAX).await.unwrap_err();
+        assert!(format!("{err:?}").contains(refusal), "{err:?}");
+        let version: i32 = client.query_one("SELECT max(version) FROM schema_migrations", &[]).await.unwrap().get(0);
+        assert_eq!(version, 44);
+    }
 }
 
 /// A user with a permissions boundary is capped by it here; to older Cairns,

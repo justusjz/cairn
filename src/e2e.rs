@@ -74,6 +74,12 @@ pub async fn node_replicating(
 /// A pool of connections to a fresh database. `None` if there's no database
 /// to test against.
 async fn fresh_database() -> Option<Pool> {
+    fresh_database_through(usize::MAX).await
+}
+
+/// As `fresh_database`, with the schema migrated up to step `last` only
+/// (see `db::connect_through`).
+pub async fn fresh_database_through(last: usize) -> Option<Pool> {
     let Ok(url) = std::env::var("CAIRN_TEST_DATABASE") else {
         eprintln!("skipped: set CAIRN_TEST_DATABASE to run the end-to-end tests");
         return None;
@@ -86,7 +92,7 @@ async fn fresh_database() -> Option<Pool> {
         .await
         .unwrap();
     let (server, _) = url.rsplit_once('/').expect("the URL names a database");
-    Some(crate::db::connect(&format!("{server}/{name}")).await.unwrap())
+    Some(crate::db::connect_through(&format!("{server}/{name}"), last).await.unwrap())
 }
 
 /// A node with a data dir of its own, registered in the database of `pool`

@@ -5,7 +5,8 @@
 //!   (`arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess`), and say what AWS's
 //!   say, so that policies and tools written for AWS work unchanged. They
 //!   can't be changed. AdministratorAccess is kept as a user's admin flag
-//!   (which older nodes read); the others as attachments.
+//!   (which older nodes read); the others as attachments. One is Cairn's
+//!   own: `CairnOperatorAccess`, the cluster's `cairn:` actions.
 //! - **An account's own** (`arn:aws:iam::<account>:policy/<name>`), which its
 //!   admins make, change and delete. IAM keeps up to five versions of one;
 //!   Cairn keeps the default, numbered as IAM numbers versions (`v1`, ...).
@@ -49,6 +50,13 @@ pub const AWS_POLICIES: &[AwsPolicy] = &[
         name: "AmazonS3ReadOnlyAccess",
         description: "Provides read only access to all buckets via the AWS Management Console.",
         document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*","s3:Describe*","s3-object-lambda:Get*","s3-object-lambda:List*"],"Resource":"*"}]}"#,
+    },
+    // Cairn's own, not AWS's: running the cluster, without the data (see
+    // `plans/single-account.md`). AdministratorAccess (`*`) includes it.
+    AwsPolicy {
+        name: "CairnOperatorAccess",
+        description: "Provides full access to the Cairn cluster's settings, nodes and health, but not to buckets or users.",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"cairn:*","Resource":"*"}]}"#,
     },
 ];
 
@@ -291,7 +299,6 @@ pub async fn create_tagged(
     if description.len() > MAX_DESCRIPTION {
         return refused(Refused::Invalid(format!("a policy's description is at most {MAX_DESCRIPTION} characters")));
     }
-    crate::roles::refuse_operator(client, account, "managed policies").await?;
     let made = client
         .execute_cached(
             "INSERT INTO managed_policies (account_id, name, document, description, path) VALUES ($1, $2, $3, $4, $5)
@@ -556,7 +563,6 @@ pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attac
         .await
         .map_err(|_| Refused::NoSuch(format!("The user with name {user} cannot be found.")))?;
     if attach {
-        crate::roles::refuse_operator(client, account, "policies").await?;
         let count: i64 = client
             .query_one_cached(
                 "SELECT (SELECT count(*) FROM role_attached_policies WHERE role_id = $1)

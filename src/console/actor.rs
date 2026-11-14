@@ -3,8 +3,12 @@
 //! would be: each call is checked as its operation's actions, by the same
 //! policies (the user's grants, admin flag and inline policies, and the
 //! bucket's), as `s3::access` decides them. The cluster's own calls are
-//! checked as the operator's actions (`cairn:`), which only the operator
-//! account's identities may be allowed.
+//! checked as Cairn's actions (`cairn:`), which operators' policies allow
+//! (see `plans/single-account.md`).
+//!
+//! A session signed in with a passkey has `aws:MultiFactorAuthPresent` (and
+//! `aws:MultiFactorAuthAge`, since it was); one signed in at an OIDC
+//! provider has it `false`, as AWS's federated sessions without MFA.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -46,6 +50,9 @@ pub(crate) struct User {
     pub headers: HeaderMap,
     pub query: String,
     pub peer: Option<IpAddr>,
+    /// Seconds since the session was signed in with a passkey; `None`:
+    /// it was signed in at an OIDC provider.
+    pub mfa_age: Option<i64>,
 }
 
 impl User {
@@ -104,6 +111,13 @@ impl Actor {
             }
             Subject::Root => Access::root(&user.account, &user.method, &user.headers, &user.query, &origin),
         };
+        match user.mfa_age {
+            Some(age) => {
+                access.context.set("aws:MultiFactorAuthPresent", "true");
+                access.context.set("aws:MultiFactorAuthAge", age.to_string());
+            }
+            None => access.context.set("aws:MultiFactorAuthPresent", "false"),
+        }
         access.load_all(app, checks).await?;
         Ok(access)
     }

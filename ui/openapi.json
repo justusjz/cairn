@@ -124,94 +124,10 @@
         }
       }
     },
-    "/accounts": {
-      "get": {
-        "operationId": "list_accounts",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/AccountSummary"
-                  }
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      },
+    "/account/root-enrollment": {
       "post": {
-        "summary": "Makes a tenant account. Its root signs in through an enrollment link.",
-        "operationId": "create_account",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/NewAccount"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "description": "Created"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/accounts/{account}/enrollment": {
-      "post": {
-        "summary": "Makes an account's root a one-time link to the console (24 hours): a new\naccount's first, or one to recover it, if its root lost its passkeys.\nIt replaces the root's last.",
+        "summary": "Makes the account's root a one-time link to the console (24 hours): its\nfirst, or one to recover the account, if the root lost its passkeys. It\nreplaces the root's last.",
         "operationId": "create_root_enrollment",
-        "parameters": [
-          {
-            "name": "account",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
         "responses": {
           "201": {
             "content": {
@@ -1605,7 +1521,7 @@
     },
     "/enroll/link": {
       "post": {
-        "summary": "Adds an enrollment link's identity to the signed-in login (using the\nlink up), and acts as it, unless it's the operator account's, which\ntakes a fresh passkey assertion first (`/switch`).",
+        "summary": "Adds an enrollment link's identity to the signed-in login (using the\nlink up).",
         "operationId": "enroll_link",
         "requestBody": {
           "content": {
@@ -1821,7 +1737,7 @@
     },
     "/login": {
       "post": {
-        "summary": "Signs in with a passkey, as the login's identity in its first account\n(by name; the operator account last).",
+        "summary": "Signs in with a passkey, as the login's identity.",
         "operationId": "login",
         "requestBody": {
           "content": {
@@ -3749,51 +3665,6 @@
           }
         }
       }
-    },
-    "/switch": {
-      "post": {
-        "summary": "Acts as the login's identity in another account.",
-        "operationId": "switch",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Switch"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Me"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
     }
   },
   "components": {
@@ -3815,53 +3686,6 @@
           },
           "id": {
             "type": "string"
-          }
-        }
-      },
-      "AccountSummary": {
-        "type": "object",
-        "description": "An account (see `accounts`).",
-        "required": [
-          "id",
-          "name",
-          "operator",
-          "users",
-          "buckets",
-          "bytes",
-          "root_enrolled",
-          "created_at"
-        ],
-        "properties": {
-          "buckets": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "bytes": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Bytes in its buckets' current versions."
-          },
-          "created_at": {
-            "type": "number",
-            "format": "double"
-          },
-          "id": {
-            "type": "string"
-          },
-          "name": {
-            "type": "string"
-          },
-          "operator": {
-            "type": "boolean",
-            "description": "Whether it's the operator account (the superadmins')."
-          },
-          "root_enrolled": {
-            "type": "boolean",
-            "description": "Whether its root has signed in to the console (has a login)."
-          },
-          "users": {
-            "type": "integer",
-            "format": "int64"
           }
         }
       },
@@ -4898,7 +4722,6 @@
         "required": [
           "account_id",
           "account",
-          "operator",
           "arn",
           "admin"
         ],
@@ -4916,10 +4739,6 @@
           "arn": {
             "type": "string",
             "description": "The identity's ARN, which policies name it by."
-          },
-          "operator": {
-            "type": "boolean",
-            "description": "Whether it's the operator account's (the superadmins')."
           },
           "user": {
             "type": [
@@ -5632,26 +5451,23 @@
         "required": [
           "name",
           "identity",
-          "identities",
-          "fresh",
+          "mfa",
+          "cluster",
           "passkeys",
           "oidc"
         ],
         "properties": {
-          "fresh": {
+          "cluster": {
             "type": "boolean",
-            "description": "Whether its passkey was used (or it signed in at its provider)\nwithin five minutes: acting as the operator takes that."
-          },
-          "identities": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/IdentitySummary"
-            },
-            "description": "Every identity of the login, the operator account's last."
+            "description": "Whether it may see the cluster (`cairn:GetCluster`): it's an\noperator, and the console shows it the cluster's pages."
           },
           "identity": {
             "$ref": "#/components/schemas/IdentitySummary",
             "description": "Who the session acts as."
+          },
+          "mfa": {
+            "type": "boolean",
+            "description": "Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`;\nelse at an OIDC provider)."
           },
           "name": {
             "type": "string",
@@ -5703,17 +5519,6 @@
           "started_at": {
             "type": "number",
             "format": "double"
-          }
-        }
-      },
-      "NewAccount": {
-        "type": "object",
-        "required": [
-          "name"
-        ],
-        "properties": {
-          "name": {
-            "type": "string"
           }
         }
       },
@@ -6294,15 +6099,9 @@
           "purpose"
         ],
         "properties": {
-          "account_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
           "purpose": {
             "type": "string",
-            "description": "`login`, `enroll` (with `token`), `link` or `reauth` (with\n`account_id`), the latter two signed in."
+            "description": "`login`, `enroll` (with `token`), or `link` (signed in)."
           },
           "token": {
             "type": [
@@ -7106,35 +6905,6 @@
           "started": {
             "type": "number",
             "format": "double"
-          }
-        }
-      },
-      "Switch": {
-        "type": "object",
-        "required": [
-          "account_id"
-        ],
-        "properties": {
-          "account_id": {
-            "type": "string",
-            "description": "The account (its ID) to act in."
-          },
-          "challenge_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A fresh assertion, for the operator account, if the session's\npasskey wasn't used within five minutes (`Me.fresh`): its challenge\n(from `/login/options`) and the browser's response."
-          },
-          "credential": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/Assertion"
-              },
-              {
-                "type": "null"
-              }
-            ]
           }
         }
       },

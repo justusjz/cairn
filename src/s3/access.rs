@@ -102,8 +102,6 @@ pub struct Access {
     user: Option<(String, String, String)>,
     /// An account's root (by its account) acts, rather than a user.
     root: Option<String>,
-    /// The operator account, whose the cluster is (loaded for checks on it).
-    operator: Option<String>,
     identity: Vec<Arc<Policy>>,
     /// The user's permissions boundary, and its ARN.
     boundary: Option<(Arc<Policy>, String)>,
@@ -140,7 +138,6 @@ impl Access {
         }
         Ok(Access {
             root: None,
-            operator: None,
             user: principal.map(|p| (p.account.clone(), p.name.clone(), p.id.to_string())),
             arn: principal.map(Principal::arn),
             identity,
@@ -162,7 +159,6 @@ impl Access {
         Access {
             user: None,
             root: Some(account.to_owned()),
-            operator: None,
             identity: Vec::new(),
             boundary: None,
             arn: None,
@@ -213,11 +209,6 @@ impl Access {
         for bucket in checks.iter().filter_map(|c| c.on.bucket()) {
             self.load(app, bucket).await?;
         }
-        // Which account is the operator's, to tell its users (superadmins)
-        // from tenants'. (Read once per process; see `operator_account`.)
-        if self.operator.is_none() {
-            self.operator = Some(crate::roles::operator_account(&app.pool.get().await?).await?);
-        }
         Ok(())
     }
 
@@ -231,22 +222,6 @@ impl Access {
     /// resource (a user's tags, say) and of what an IAM request asks for
     /// (see `iam`).
     pub fn verdict_with(&self, check: &Check, extra: &Context) -> Verdict {
-        // The cluster, and the operator account's own users, are its
-        // members' (superadmins'), by being its members: no policy grants
-        // or denies them. And nothing else is: the operator account owns no
-        // buckets, and its users take no part in tenants' IAM.
-        let operator = self.operator.as_deref().filter(|operator| self.account() == Some(*operator));
-        match (&check.on, operator) {
-            (On::Cluster, Some(_)) => return Verdict::Allow,
-            (On::Cluster, None) => return Verdict::ImplicitDeny,
-            (On::User(account, _) | On::Users(account, _), Some(operator))
-                if account == operator && check.action.starts_with("iam:") =>
-            {
-                return Verdict::Allow;
-            }
-            (_, Some(_)) => return Verdict::ImplicitDeny,
-            (_, None) => {}
-        }
         let resource = check.on.arn();
         let principal = match (&self.user, &self.root) {
             (Some((account, name, id)), _) => Who::User { account, name, id },
@@ -266,9 +241,9 @@ impl Access {
             On::User(account, _) | On::Users(account, _) => Some(account.as_str()),
             // Cairn's (AWS's) policies are no account's: as the principal's own.
             On::Policy(account, _) if account != "aws" => Some(account.as_str()),
-            // The operator account's (an unknown one, if it wasn't loaded:
-            // no one's).
-            On::Cluster => Some(self.operator.as_deref().unwrap_or("")),
+            // The account's, whose operators' policies allow them `cairn:`
+            // actions (see `plans/single-account.md`); never anonymously.
+            On::Cluster => Some(self.account().unwrap_or("")),
             _ => loaded.and_then(|loaded| loaded.account.as_deref()).filter(|_| check.action != "s3:CreateBucket"),
         };
         // `aws:ResourceAccount` is that account (else the principal's own;

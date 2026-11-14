@@ -1,8 +1,8 @@
 // The console (see `src/console/`): signing in, with a passkey or at an
 // OIDC provider, a first passkey through an enrollment link, one's own
-// passkeys and identities, and the pages of what the signed-in identity
-// manages: a tenant's buckets, objects and users, or a superadmin's
-// cluster, accounts and superadmins.
+// passkeys, and the pages of what the signed-in identity manages: the
+// account's buckets, objects, users and policies, and, for its operators
+// (whose policies allow `cairn:` actions), the cluster.
 
 import { A, Navigate, Route, Router, type RouteSectionProps, useNavigate } from "@solidjs/router";
 import { For, Show, createEffect, createResource, createRoot, createSignal, onCleanup } from "solid-js";
@@ -10,7 +10,6 @@ import { render } from "solid-js/web";
 import { Badge, Loading, Panel, Table, Toasts, act, poll, toast } from "./components/ui";
 import { ago, date } from "./format";
 import { api as manage, setOperatorMode } from "./api";
-import Accounts from "./pages/Accounts";
 import { BucketBrowser, BucketList, ObjectPage } from "./pages/Buckets";
 import Integrity from "./pages/Integrity";
 import Jobs from "./pages/Jobs";
@@ -34,8 +33,8 @@ const [me, { refetch: refreshMe, mutate: setMe }] = createResource<Me | null>(as
   }
 });
 
-// The shared pages show the operator's parts (the KMS) to a superadmin.
-createRoot(() => createEffect(() => setOperatorMode(me()?.identity.operator ?? false)));
+// The shared pages show the cluster's parts (the KMS) to its operators.
+createRoot(() => createEffect(() => setOperatorMode(me()?.cluster ?? false)));
 
 function Brand() {
   return (
@@ -84,7 +83,7 @@ function Layout(props: RouteSectionProps) {
         <nav>
           <Show when={me()}>
             {(m) => (
-              <For each={m().identity.operator ? OPERATOR_NAV : TENANT_NAV}>
+              <For each={m().cluster ? [...CLUSTER_NAV, ...ACCOUNT_NAV, ...OPERATOR_NAV] : ACCOUNT_NAV}>
                 {([href, label]) => (
                   <A href={href} end={href === "/"} activeClass="active">
                     {label}
@@ -103,63 +102,33 @@ function Layout(props: RouteSectionProps) {
   );
 }
 
-/** What a tenant's identity sees: its account's buckets and users. */
-const TENANT_NAV: [string, string][] = [
+/** What everyone sees: the account's buckets, users and policies (each page
+ * shows what the identity's policies let it see). */
+const ACCOUNT_NAV: [string, string][] = [
   ["/buckets", "Buckets"],
   ["/users", "Users"],
   ["/policies", "Policies"],
 ];
 
-/** What the operator account's sees: the cluster, the accounts, and the
- * superadmins; no buckets, which are tenants'. */
-const OPERATOR_NAV: [string, string][] = [
+/** What the cluster's operators see first: the cluster. */
+const CLUSTER_NAV: [string, string][] = [
   ["/", "Overview"],
   ["/storage", "Storage"],
   ["/integrity", "Integrity"],
   ["/jobs", "Jobs"],
-  ["/accounts", "Accounts"],
-  ["/sign-in", "Sign-in"],
-  ["/users", "Superadmins"],
 ];
 
-/** `user @ account`, or `root @ account`. */
+/** ... and last: how people sign in. */
+const OPERATOR_NAV: [string, string][] = [["/sign-in", "Sign-in"]];
+
+/** The user's name, or `root`. */
 function label(i: Identity): string {
-  return `${i.user ?? "root"} @ ${i.account}`;
+  return i.user ?? "root";
 }
 
-/** Switches the session to the login's identity in another account: the
- * operator account's takes a fresh passkey assertion, if the session's
- * passkey wasn't used within five minutes. */
-async function switchTo(target: Identity) {
-  try {
-    let next: Me;
-    try {
-      next = await api.switchTo(target.account_id);
-    } catch (e) {
-      if (!(e instanceof ApiError && e.status === 401 && target.operator)) throw e;
-      // Without passkeys, signing in again at the login's provider.
-      const m = me();
-      if (m && !m.passkeys.length && m.oidc.length) {
-        const { url } = await api.oidcStart(m.oidc[0].provider, "reauth", { account_id: target.account_id });
-        location.assign(url);
-        return;
-      }
-      const ceremony = await api.loginOptions();
-      const credential = await authenticate(ceremony.options);
-      next = await api.switchTo(target.account_id, ceremony.challenge_id, credential);
-    }
-    setMe(next);
-    toast(`Now ${label(next.identity)}`);
-  } catch (e) {
-    toast(explain(e), true);
-  }
-}
-
-/** The person signed in, not the account: who the session acts as, the
- * login's other identities to switch to, their own sign-in settings, and
- * signing out. */
+/** The person signed in: who the session acts as, their own sign-in
+ * settings, and signing out. */
 function UserMenu(props: { me: Me; logout: () => void }) {
-  const navigate = useNavigate();
   const [open, setOpen] = createSignal(false);
   let menu!: HTMLDivElement;
   const close = (e: MouseEvent) => {
@@ -179,12 +148,6 @@ function UserMenu(props: { me: Me; logout: () => void }) {
     document.removeEventListener("click", close);
     document.removeEventListener("keydown", key);
   });
-  const change = async (target: Identity) => {
-    setOpen(false);
-    if (target.account_id === props.me.identity.account_id) return;
-    await switchTo(target);
-    navigate("/");
-  };
   return (
     <div class="user-menu" ref={menu}>
       <button class="user-button" aria-haspopup="menu" aria-expanded={open()} onClick={() => setOpen(!open())}>
@@ -192,7 +155,7 @@ function UserMenu(props: { me: Me; logout: () => void }) {
           {props.me.name.slice(0, 1).toUpperCase()}
         </span>
         <span class="mono">{label(props.me.identity)}</span>
-        <Show when={props.me.identity.operator}>
+        <Show when={props.me.cluster}>
           <Badge tone="warn">operator</Badge>
         </Show>
         <span aria-hidden="true">▾</span>
@@ -202,28 +165,6 @@ function UserMenu(props: { me: Me; logout: () => void }) {
           <div class="menu-head">
             Signed in as <strong>{props.me.name}</strong>
           </div>
-          <Show when={props.me.identities.length > 1}>
-            <div class="menu-label">Switch to</div>
-          </Show>
-          <For each={props.me.identities}>
-            {(i) => (
-              <button
-                role="menuitemradio"
-                aria-checked={i.account_id === props.me.identity.account_id}
-                class="menu-item"
-                onClick={() => change(i)}
-              >
-                <span class="check-mark">{i.account_id === props.me.identity.account_id ? "✓" : ""}</span>
-                <span class="mono">{label(i)}</span>
-                <Show when={i.operator}>
-                  <Badge tone="warn">operator</Badge>
-                </Show>
-                <Show when={i.admin && !i.operator}>
-                  <Badge tone="accent">admin</Badge>
-                </Show>
-              </button>
-            )}
-          </For>
           <hr />
           <A role="menuitem" class="menu-item" href="/account" onClick={() => setOpen(false)}>
             Passkeys and sign-in
@@ -414,11 +355,11 @@ function Guarded(page: () => import("solid-js").JSX.Element) {
   return () => <SignedIn>{() => page()}</SignedIn>;
 }
 
-/** The start: the cluster's overview to the operator account, a tenant's
- * buckets to anyone else. */
+/** The start: the cluster's overview to its operators, the buckets to
+ * anyone else. */
 function Start() {
   return (
-    <Show when={me()?.identity.operator} fallback={<Navigate href="/buckets" />}>
+    <Show when={me()?.cluster} fallback={<Navigate href="/buckets" />}>
       <Overview />
     </Show>
   );
@@ -435,36 +376,27 @@ function Home() {
           </div>
           <Passkeys passkeys={m.passkeys} others={m.oidc.length} />
           <Providers me={m} />
-          <Panel title="Your identities" note="switch between them in the menu at the top">
-            <Table count={m.identities.length} columns={["Account", "As", "ARN"]}>
-              <For each={m.identities}>
-                {(i) => (
-                  <tr>
-                    <td>
-                      {i.account}{" "}
-                      <Show when={i.operator}>
-                        <Badge tone="warn">operator</Badge>
-                      </Show>{" "}
-                      <Show when={i.account_id === m.identity.account_id}>
-                        <Badge tone="ok">current</Badge>
-                      </Show>
-                    </td>
-                    <td>
-                      {i.user ?? "root"}{" "}
-                      <Show when={i.admin && !i.operator}>
-                        <Badge tone="accent">admin</Badge>
-                      </Show>
-                    </td>
-                    <td class="mono small">{i.arn}</td>
-                  </tr>
-                )}
-              </For>
+          <Panel title="Who you are">
+            <Table count={1} columns={["As", "ARN"]}>
+              <tr>
+                <td>
+                  {m.identity.user ?? "root"}{" "}
+                  <Show when={m.identity.admin}>
+                    <Badge tone="accent">admin</Badge>
+                  </Show>{" "}
+                  <Show when={m.cluster}>
+                    <Badge tone="warn">operator</Badge>
+                  </Show>
+                </td>
+                <td class="mono small">{m.identity.arn}</td>
+              </tr>
             </Table>
             <p class="subtle small">
-              One login, with these passkeys and providers, for each account you're in. Policies name you by the ARN.
-              As a user, what you may do here is what your policies allow; as an account's root, anything in the
-              account but what its buckets' policies deny; in the operator account, you're a superadmin. Switching to
-              the operator account asks for your passkey again.
+              Policies name you by the ARN. As a user, what you may do here is what your policies allow; as the
+              account's root, anything but what its buckets' policies deny. You're an operator if your policies allow
+              you the cluster's actions (<span class="mono">cairn:*</span>). Signed in with a passkey, your session
+              counts as multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span>); at a provider, it
+              doesn't.
             </p>
           </Panel>
         </>
@@ -618,7 +550,6 @@ render(
       <Route path="/storage" component={Guarded(Storage)} />
       <Route path="/integrity" component={Guarded(Integrity)} />
       <Route path="/jobs" component={Guarded(Jobs)} />
-      <Route path="/accounts" component={Guarded(Accounts)} />
       <Route path="/sign-in" component={Guarded(SignIn)} />
       <Route path="/users" component={Guarded(Users)} />
       <Route path="/policies" component={Guarded(Policies)} />

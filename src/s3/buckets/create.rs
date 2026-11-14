@@ -10,8 +10,6 @@ pub enum Creation {
     Exists,
     /// There is one of another account (names are global, as in S3).
     OwnedByOther,
-    /// The account is the operator's, which owns no buckets.
-    Operator,
     /// The name isn't a valid bucket name.
     InvalidName,
 }
@@ -50,13 +48,6 @@ pub async fn create(app: &App, name: &str, account: &str, object_lock: bool) -> 
         return Ok(Creation::InvalidName);
     }
     let client = app.pool.get().await?;
-    let operator: bool = client
-        .query_opt_cached("SELECT operator FROM accounts WHERE id = $1", &[&account])
-        .await?
-        .is_some_and(|row| row.get(0));
-    if operator {
-        return Ok(Creation::Operator);
-    }
     let inserted = client
         .execute_cached(
             "INSERT INTO buckets (name, account_id, object_lock, versioning)
@@ -99,9 +90,6 @@ pub async fn create_bucket(
                 "The requested bucket name is not available. The bucket namespace is shared by all users of the system. \
                  Please select a different name and try again.",
             ));
-        }
-        Creation::Operator => {
-            return Ok(format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "the operator account owns no buckets"));
         }
         Creation::Created | Creation::Exists => {}
     }
