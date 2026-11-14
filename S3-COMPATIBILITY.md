@@ -112,7 +112,7 @@ Cairn has a single account (see [§24](#24-cairn-specific-concepts)): all bucket
 | Path-style (`host/bucket/key`) | ✅ Always. |
 | Virtual-hosted-style (`bucket.domain/key`) | ✅ With `--domain <name>`. Only **one** domain can be configured. The bucket is everything in the host before `.<domain>`, dots included (`my.bucket.s3.example.com` is bucket `my.bucket`). Matching ignores case, a port and a trailing dot. IPv6 literal hosts are always path-style. |
 | Website endpoints | ✅ With `--website-domain <name>`: `bucket.<website-domain>`. |
-| Custom (CNAME) domains | 🟡 With `--domain` set, **any host that is not the domain, a subdomain of it, an IP literal or `localhost` is the website of the bucket named by the whole host**. A client that reaches the S3 API under another host name gets website answers, not S3 API answers. |
+| Custom domains | ✅ With `--domain` set, any host that is not the domain, a subdomain of it, an IP literal or `localhost` is the website of the bucket named by the whole host, served over HTTPS when the proxy gets certificates on demand ([§16](#16-static-website-hosting)). So clients must reach the S3 API by the domain, an IP address or `localhost`, not by another name. (S3 only serves custom domains over HTTP, or over HTTPS through CloudFront.) |
 | Dual-stack, FIPS, accelerate, access-point and region-specific endpoints | ❌ No special handling. |
 
 The signature is always checked against the path the client sent, so virtual-hosted requests verify correctly even though they are routed as `/bucket/key`. The proxy must pass `Host` through unchanged.
@@ -1781,7 +1781,7 @@ The most significant differences, for quick reference. Each is described in its 
 - **Scope:** the region and service in the credential scope aren't validated.
 - **Error codes:** `AuthorizationHeaderMalformed` is never returned. Signature and skew errors have no detail elements.
 - **Canonicalization:** the canonical query string uses the wire encoding as-is.
-- **Host names:** with `--domain`, unknown host names are website custom domains. Only one `--domain` is possible.
+- **Host names:** only one `--domain` is possible.
 
 **Buckets and listings**
 - **CreateBucket:** for the caller's own existing bucket it answers `200`, never `BucketAlreadyOwnedByYou`. `LocationConstraint` is ignored.
