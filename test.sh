@@ -250,9 +250,8 @@ exec 3>&- 3<&- 2>/dev/null
 
 # ─── 2b. Roles ───────────────────────────────────────────────────────────────
 # Managed with `cairn role`, which runs on the node (its peer endpoint, at the
-# default 127.0.0.1:9431). testkey is an admin (AdministratorAccess); since
-# grants need an existing bucket, it's granted read/write on each test bucket
-# right after creating it (mb_granted). The others exercise permission
+# default 127.0.0.1:9431). testkey is an admin (AdministratorAccess), which
+# allows it everything without grants. The others exercise permission
 # checks: reader can only read $BUCKET, writer can only use $OBUCKET (both
 # granted once those exist), and bucketadmin is an admin that holds no grants.
 cairn_role() { (cd "$SCRIPT_DIR" && cargo run -q -- role "$@"); }
@@ -464,11 +463,10 @@ scurl_get() {
     curl -fsS "${args[@]}" "$url"
 }
 
-# mb_granted <bucket> — creates a bucket as testkey, then grants testkey
-# read/write on it: admin alone allows no object access.
-mb_granted() {
-    s3 mb "s3://$1" >/dev/null 2>&1 || return 1
-    cairn_role grant "$ACCESS_KEY" "$1" read write
+# make_bucket <bucket> — creates a bucket as testkey, an admin
+# (AdministratorAccess), which allows it everything in its buckets.
+make_bucket() {
+    s3 mb "s3://$1" >/dev/null 2>&1
 }
 
 # ─── 4. Test fixtures ────────────────────────────────────────────────────────
@@ -545,7 +543,6 @@ vhost_ok() {
     for b in vhost-test vhost.dotted-test; do
         awsvhost --debug s3api create-bucket --bucket "$b" 2>&1 \
             | grep -q "https\?://${b}\.localhost:${SERVER_PORT}/" || return 1
-        cairn_role grant "$ACCESS_KEY" "$b" read write >/dev/null 2>&1 || return 1
         awsvhost s3api head-bucket --bucket "$b" >/dev/null 2>&1 || return 1
         awsvhost s3api put-object --bucket "$b" --key dir/small.txt --body "$SMALL" >/dev/null 2>&1 || return 1
         awsvhost s3api copy-object --bucket "$b" --key copy.txt \
@@ -1204,7 +1201,7 @@ list_v2_common_prefixes() {  # list_v2_common_prefixes <prefix> <max-keys>
 }
 
 setup_pagination() {
-    mb_granted "$PBUCKET" >/dev/null 2>&1 || return 1
+    make_bucket "$PBUCKET" >/dev/null 2>&1 || return 1
     local k
     for k in flat/obj0 flat/obj1 flat/obj2 flat/obj3 flat/obj4 \
              tree/d1/x tree/d1/y tree/d2/x; do
@@ -1646,7 +1643,7 @@ batch_delete_ok() {
 # throwaway bucket so it's independent of the main fixtures.
 delete_nonempty_bucket_rejected() {
     local nb="$NBUCKET"
-    mb_granted "$nb" >/dev/null 2>&1 || return 1
+    make_bucket "$nb" >/dev/null 2>&1 || return 1
     s3 put "$SMALL" "s3://${nb}/keep.txt" >/dev/null 2>&1 || return 1
     [ "$(scurl DELETE "/${nb}" "$EMPTY_SHA256" -)" = 409 ] || return 1
     check_roundtrip "$SMALL" "s3://${nb}/keep.txt" || return 1
@@ -1741,8 +1738,7 @@ vdel() {
 # (admin-only), so writer, holding read/write, can't; the admin enables it and
 # it reads back. testkey also gets delete-version here, for the tests below.
 versioning_enable_ok() {
-    mb_granted "$VBUCKET" || return 1
-    cairn_role grant "$ACCESS_KEY" "$VBUCKET" delete-version >/dev/null 2>&1 || return 1
+    make_bucket "$VBUCKET" || return 1
     cairn_role grant writer "$VBUCKET" read write >/dev/null 2>&1 || return 1
     [ "$(awss3 s3api get-bucket-versioning --bucket "$VBUCKET" \
         --query Status --output text 2>/dev/null)" = "None" ] || return 1
@@ -1974,8 +1970,7 @@ unversioned_no_version_id_ok() {
 # but a delete marker can't be deleted until the marker is removed too.
 versioned_bucket_not_empty_ok() {
     local b="dmonly-$(date +%s)" v marker
-    mb_granted "$b" || return 1
-    cairn_role grant "$ACCESS_KEY" "$b" delete-version >/dev/null 2>&1 || return 1
+    make_bucket "$b" || return 1
     awss3 s3api put-bucket-versioning --bucket "$b" \
         --versioning-configuration Status=Enabled >/dev/null 2>&1 || return 1
     v=$(awss3 s3api put-object --bucket "$b" --key k --body "$SMALL" \
@@ -2075,8 +2070,7 @@ pack_consolidates_ok() {
     # A part that isn't the last is at least 5 MiB.
     head -c $((5 * 1024 * 1024)) /dev/urandom >"$dir/p1"
     awss3 s3 cp --recursive "$dir/up" "s3://${BUCKET}/pack/" >/dev/null 2>&1 || return 1
-    mb_granted "$PACK_VBUCKET" >/dev/null 2>&1 || return 1
-    cairn_role grant "$ACCESS_KEY" "$PACK_VBUCKET" delete-version >/dev/null 2>&1 || return 1
+    make_bucket "$PACK_VBUCKET" >/dev/null 2>&1 || return 1
     awss3 s3api put-bucket-versioning --bucket "$PACK_VBUCKET" \
         --versioning-configuration Status=Enabled >/dev/null 2>&1 || return 1
     v1=$(awss3 s3api put-object --bucket "$PACK_VBUCKET" --key k --body "$dir/v1" \
@@ -2244,7 +2238,6 @@ bucket_policy_ok() {
     account=$(echo "$arn" | cut -d: -f5)
     [ -n "$account" ] || return 1
     awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
-    cairn_role grant "$ACCESS_KEY" "$b" read write >/dev/null 2>&1 || return 1
     cairn_role grant writer "$b" write >/dev/null 2>&1 || return 1
     printf 'public' > "$WORK_DIR/pub.txt"
     for key in pub/a.txt private.txt; do
@@ -2473,7 +2466,7 @@ cross_bucket_denied_ok() {
 
 # Second bucket for the cross-bucket tests, and the grants for reader/writer.
 setup_role_buckets() {
-    mb_granted "$OBUCKET" || return 1
+    make_bucket "$OBUCKET" || return 1
     cairn_role grant writer "$OBUCKET" read write || return 1
     cairn_role grant reader "$BUCKET" read
 }
@@ -2531,7 +2524,7 @@ revoke_takes_effect_ok() {
 }
 
 # ─── 5. The tests ────────────────────────────────────────────────────────────
-run_test    "Create bucket"                         mb_granted "$BUCKET"
+run_test    "Create bucket"                         make_bucket "$BUCKET"
 run_test    "Bucket appears in bucket list"         list_contains "" "s3://${BUCKET}"
 run_test    "HEAD existing bucket"                  awss3 s3api head-bucket --bucket "${BUCKET}"
 expect_fail "HEAD missing bucket fails"             awss3 s3api head-bucket --bucket "${BUCKET}-nope"
