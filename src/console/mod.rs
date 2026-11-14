@@ -45,6 +45,7 @@ pub mod cbor;
 mod iam;
 mod limit;
 mod manage;
+mod templates;
 pub mod oidc;
 pub mod store;
 pub(crate) mod web;
@@ -564,7 +565,7 @@ mod e2e {
     }
 
     /// A browser that enrolled with link `token`, with a passkey of its own.
-    async fn enrolled(console: &Arc<Console>, token: &str) -> Browser {
+    pub(super) async fn enrolled(console: &Arc<Console>, token: &str) -> Browser {
         let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let (_, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
         let mut body = registration(&mut Authenticator::ed25519(), &ceremony, "Key");

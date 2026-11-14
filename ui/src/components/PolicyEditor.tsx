@@ -1,27 +1,19 @@
-// A policy document's editor: the JSON, and a template that writes the
-// statements for a bucket at a level of access, readably, as one would by
-// hand. Used for managed policies (the Policies page) and users' inline
-// ones alike.
+// A policy document's editor: the JSON, and the bucket-access template
+// (`src/templates.rs`, as the server writes it: what grants allow) adding a
+// statement for a bucket, or the buckets a pattern names, at a level of
+// access. Used for managed policies (the Policies page) and users' and
+// roles' inline ones alike.
 
 import { For, Show, createSignal } from "solid-js";
+import { type Level, api } from "../api";
 
-/** What each level allows, on a bucket and every object in it. */
-export const LEVELS: { id: string; label: string; actions: string | string[] }[] = [
-  { id: "read", label: "Read", actions: ["s3:Get*", "s3:List*"] },
-  {
-    id: "read-write",
-    label: "Read and write",
-    actions: [
-      "s3:Get*",
-      "s3:List*",
-      "s3:PutObject",
-      "s3:PutObjectTagging",
-      "s3:DeleteObject",
-      "s3:DeleteObjectTagging",
-      "s3:AbortMultipartUpload",
-    ],
-  },
-  { id: "full", label: "Full (s3:*)", actions: "s3:*" },
+/** The levels of access to offer, as the bucket-access template's. */
+export const LEVELS: { id: string; label: string; levels: Level[] }[] = [
+  { id: "read", label: "Read", levels: ["read"] },
+  { id: "read-write", label: "Read and write", levels: ["read", "write"] },
+  { id: "read-write-delete", label: "Read, write and delete versions", levels: ["read", "write", "delete-version"] },
+  { id: "manage", label: "Manage (configuration, policy, deleting it)", levels: ["manage"] },
+  { id: "all", label: "Everything", levels: ["read", "write", "delete-version", "manage"] },
 ];
 
 /** An empty identity policy. */
@@ -30,16 +22,14 @@ export const EMPTY = `{
   "Statement": []
 }`;
 
-/** `document` with a statement allowing `level` on `bucket` added. */
-export function withStatement(document: string, bucket: string, level: string): string {
+/** `document` with a statement allowing `level` (a `LEVELS` ID) on
+ * `buckets` added: the bucket-access template's. */
+export async function withStatement(document: string, buckets: string, level: string): Promise<string> {
   const doc = JSON.parse(document.trim() || EMPTY);
   const statements = Array.isArray(doc.Statement) ? doc.Statement : doc.Statement ? [doc.Statement] : [];
   const l = LEVELS.find((x) => x.id === level)!;
-  statements.push({
-    Effect: "Allow",
-    Action: l.actions,
-    Resource: [`arn:aws:s3:::${bucket}`, `arn:aws:s3:::${bucket}/*`],
-  });
+  const made = await api.previewTemplate({ template: "bucket-access", buckets, levels: l.levels });
+  statements.push(...JSON.parse(made[0].document).Statement);
   doc.Version ??= "2012-10-17";
   doc.Statement = statements;
   return JSON.stringify(doc, null, 2);
@@ -56,12 +46,18 @@ export function PolicyEditor(props: {
   const [bucket, setBucket] = createSignal(props.buckets[0] ?? "");
   const [level, setLevel] = createSignal("read");
   const [error, setError] = createSignal<string>();
-  const add = () => {
+  const add = async () => {
     try {
-      props.setDocument(withStatement(props.document, bucket().trim(), level()));
-      setError(undefined);
+      JSON.parse(props.document.trim() || EMPTY);
     } catch {
       setError("The document isn't valid JSON yet: fix it first, or clear it.");
+      return;
+    }
+    try {
+      props.setDocument(await withStatement(props.document, bucket().trim(), level()));
+      setError(undefined);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
     }
   };
   return (
@@ -77,7 +73,7 @@ export function PolicyEditor(props: {
             type="text"
             list="policy-buckets"
             aria-label="Bucket"
-            placeholder="bucket"
+            placeholder="bucket, or team-*"
             value={bucket()}
             onInput={(e) => setBucket(e.currentTarget.value)}
           />
@@ -102,7 +98,8 @@ export function PolicyEditor(props: {
       <p class="subtle small">
         IAM's policy language, as an identity policy: no Principal; Resource names buckets (
         <span class="mono">arn:aws:s3:::bucket</span>) and objects (<span class="mono">arn:aws:s3:::bucket/key</span>).
-        The template adds a statement for a whole bucket; narrow it to a prefix (
+        The template (the bucket-access template's, what grants allow) adds a statement for a whole bucket, or the
+        buckets a pattern names; narrow it to a prefix (
         <span class="mono">arn:aws:s3:::bucket/logs/*</span>) by hand.
       </p>
     </>

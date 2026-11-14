@@ -301,6 +301,7 @@ pub async fn get(client: &Object, account: &str, name: &str) -> anyhow::Result<M
 
 /// Makes the account's managed policy `name`, at `path`. Names are unique
 /// in an account whatever their paths (probed).
+#[cfg(test)]
 pub async fn create(client: &Object, account: &str, name: &str, path: &str, document: &str, description: &str) -> anyhow::Result<Managed> {
     create_tagged(client, account, name, path, document, description, &[]).await
 }

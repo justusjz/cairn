@@ -38,6 +38,10 @@ export type LifecycleRule = Schemas["LifecycleRule"];
 export type BucketAccess = Schemas["BucketAccess"];
 export type PublicAccessBlock = Schemas["Block"];
 export type Tag = Schemas["Tag"];
+export type Template = Schemas["Template"];
+export type TemplateUse = Schemas["Use"];
+export type MadePolicy = Schemas["MadePolicy"];
+export type Level = Schemas["Level"];
 export type Role = Schemas["RoleSummary"];
 export type IdentityProvider = Schemas["IdentityProvider"];
 
@@ -139,6 +143,12 @@ export const api = {
   setAdmin: (user: string, admin: boolean) =>
     ok(client.PUT("/users/{user}/admin", { params: userPath(user), body: { admin } })),
   policies: () => ok(client.GET("/policies")),
+  /** The policy templates there are (see `src/templates.rs`). */
+  templates: () => ok(client.GET("/templates")),
+  /** What a template would make, used so: nothing is made. */
+  previewTemplate: (use: TemplateUse) => ok(client.POST("/templates/preview", { body: use })),
+  /** Makes a template's policies: all of them, or none. */
+  useTemplate: (use: TemplateUse) => ok(client.POST("/templates", { body: use })),
   createPolicy: (name: string, document: string, description: string, path?: string, tags: Tag[] = []) =>
     ok(client.POST("/policies", { body: { name, document, description, path: path || null, tags } })),
   policyVersions: (name: string) => ok(client.GET("/policies/{name}/versions", { params: { path: { name } } })),

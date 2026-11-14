@@ -101,6 +101,14 @@ impl Actor {
         Ok(access)
     }
 
+    /// Whether each of `checks`, with its condition keys (a resource's tags,
+    /// say: see `Access::verdict_with`), is allowed.
+    pub async fn allows_each(&self, app: &Arc<App>, checks: &[(Check, Context)]) -> Result<Vec<bool>, ApiError> {
+        let plain: Vec<Check> = checks.iter().map(|(c, _)| c.clone()).collect();
+        let access = self.access(app, &plain).await?;
+        Ok(checks.iter().map(|(c, extra)| access.verdict_with(c, extra) == Verdict::Allow).collect())
+    }
+
     /// Whether `action` on `on` is allowed.
     pub async fn allows(&self, app: &Arc<App>, action: &'static str, on: On) -> Result<bool, ApiError> {
         Ok(self.verdicts(app, &[Check { action, on }]).await?[0] == Verdict::Allow)

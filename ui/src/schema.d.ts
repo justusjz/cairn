@@ -1124,6 +1124,44 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The templates there are. */
+        get: operations["list_templates"];
+        put?: never;
+        /**
+         * Makes a template's policies, as IAM's CreatePolicy (with their tags,
+         *     TagPolicy too) would: all of them, or none.
+         */
+        post: operations["use_template"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/templates/preview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** What a template would make, used so: nothing is made. */
+        post: operations["preview_template"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/users": {
         parameters: {
             query?: never;
@@ -1928,6 +1966,11 @@ export interface components {
             /** Format: double */
             started: number;
         };
+        /**
+         * @description What the bucket-access template may allow on a bucket.
+         * @enum {string}
+         */
+        Level: "read" | "write" | "delete-version" | "manage";
         /** @description How lifecycle sweeps are going (see `lifecycle`). */
         Lifecycle: {
             buckets: components["schemas"]["LifecycleBucket"][];
@@ -2088,6 +2131,15 @@ export interface components {
             upload_id?: string | null;
             /** @description The version; none for a part of an upload in progress. */
             version_id?: string | null;
+        };
+        /** @description A managed policy a template makes. */
+        MadePolicy: {
+            arn: string;
+            description: string;
+            document: string;
+            name: string;
+            path: string;
+            tags: components["schemas"]["Tag"][];
         };
         MaintenanceReport: {
             /** @description The most recent things a pass did or failed at, oldest first. */
@@ -2718,8 +2770,62 @@ export interface components {
             key: string;
             value: string;
         };
+        /** @description A template, as the console lists them. */
+        Template: {
+            description: string;
+            /** @description Its ID, as a use names it (`template`). */
+            id: string;
+            title: string;
+            /**
+             * Format: int32
+             * @description Its version, which changes when what it makes does.
+             */
+            version: number;
+        };
         UploadStarted: {
             upload_id: string;
+        };
+        /** @description What a template is used with. */
+        Use: {
+            /**
+             * @description The names of its buckets start with this (default: the team's
+             *     name, lowercase, and `-`).
+             */
+            bucket_prefix?: string | null;
+            /**
+             * @description Whether the team sees every bucket's name
+             *     (`s3:ListAllMyBuckets`, which can't be limited to some).
+             */
+            list_all_buckets?: boolean;
+            /**
+             * @description Whether its admins see every managed policy's name and path
+             *     (`iam:ListPolicies`, which can't be limited to some).
+             */
+            list_policies?: boolean;
+            /**
+             * @description The team's name: its path is `/<team>/`, its policies'
+             *     names start with it.
+             */
+            team: string;
+            /** @enum {string} */
+            template: "team";
+        } | {
+            /** @description A bucket's name, or a pattern (`*` for any characters). */
+            buckets: string;
+            levels: components["schemas"]["Level"][];
+            /** @description The policy's name (default: from the buckets and levels). */
+            name?: string | null;
+            /** @description Its path (default `/`). */
+            path?: string | null;
+            /** @enum {string} */
+            template: "bucket-access";
+        } | {
+            /** @description The policy's name (default `RequireMFA`). */
+            name?: string | null;
+            /** @description Its path (default `/`). */
+            path?: string | null;
+            /** @enum {string} */
+            template: "mfa-guard";
         };
         /** @description What a user's policies allow it on a whole bucket. */
         UserAccess: {
@@ -5979,6 +6085,103 @@ export interface operations {
                 };
             };
             "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_templates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Template"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    use_template: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Use"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MadePolicy"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    preview_template: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Use"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MadePolicy"][];
+                };
+            };
+            "4XX": {
                 headers: {
                     [name: string]: unknown;
                 };

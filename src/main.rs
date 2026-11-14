@@ -60,6 +60,7 @@ mod sessions;
 mod settings;
 mod shards;
 mod store;
+mod templates;
 mod users;
 mod writing;
 

@@ -2275,13 +2275,12 @@ reader_permissions_ok() {
     ! "${r[@]}" s3api list-objects-v2 --bucket "$OBUCKET" >/dev/null 2>&1
 }
 
-# ListBuckets shows a non-admin only the buckets it holds a grant on; an admin
-# sees them all.
-list_buckets_filtered_ok() {
-    local names
-    names=$(as_role reader readersecret s3api list-buckets \
-        --query 'Buckets[].Name' --output text 2>/dev/null) || return 1
-    [ "$names" = "$BUCKET" ] || return 1
+# ListBuckets, as S3's: AccessDenied without s3:ListAllMyBuckets (a user with
+# a grant on one bucket); an admin sees them all.
+list_buckets_denied_ok() {
+    local err
+    err=$(as_role reader readersecret s3api list-buckets 2>&1 >/dev/null) && return 1
+    echo "$err" | grep -q "s3:ListAllMyBuckets" || return 1
     awss3 s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null \
         | tr '\t' '\n' | grep -qx "$OBUCKET"
 }
@@ -2943,7 +2942,7 @@ run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets
 run_test    "Read-only role can read, not write"    reader_permissions_ok
 run_test    "Tags: read with read, changed with write" tagging_roles_ok
-run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
+run_test    "ListBuckets needs ListAllMyBuckets"    list_buckets_denied_ok
 run_test    "Admin has AdministratorAccess"          admin_scope_ok
 run_test    "IAM API: users, keys, inline policies"  iam_api_ok
 run_test    "IAM API: managed policies"              iam_managed_ok

@@ -3713,6 +3713,120 @@
         }
       }
     },
+    "/templates": {
+      "get": {
+        "summary": "The templates there are.",
+        "operationId": "list_templates",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Template"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a template's policies, as IAM's CreatePolicy (with their tags,\nTagPolicy too) would: all of them, or none.",
+        "operationId": "use_template",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Use"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MadePolicy"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/templates/preview": {
+      "post": {
+        "summary": "What a template would make, used so: nothing is made.",
+        "operationId": "preview_template",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Use"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/MadePolicy"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/users": {
       "get": {
         "operationId": "list_users",
@@ -6019,6 +6133,16 @@
           }
         }
       },
+      "Level": {
+        "type": "string",
+        "description": "What the bucket-access template may allow on a bucket.",
+        "enum": [
+          "read",
+          "write",
+          "delete-version",
+          "manage"
+        ]
+      },
       "Lifecycle": {
         "type": "object",
         "description": "How lifecycle sweeps are going (see `lifecycle`).",
@@ -6422,6 +6546,41 @@
               "null"
             ],
             "description": "The version; none for a part of an upload in progress."
+          }
+        }
+      },
+      "MadePolicy": {
+        "type": "object",
+        "description": "A managed policy a template makes.",
+        "required": [
+          "arn",
+          "path",
+          "name",
+          "description",
+          "document",
+          "tags"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "document": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            }
           }
         }
       },
@@ -8039,6 +8198,34 @@
           }
         }
       },
+      "Template": {
+        "type": "object",
+        "description": "A template, as the console lists them.",
+        "required": [
+          "id",
+          "title",
+          "description",
+          "version"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "Its ID, as a use names it (`template`)."
+          },
+          "title": {
+            "type": "string"
+          },
+          "version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Its version, which changes when what it makes does.",
+            "minimum": 0
+          }
+        }
+      },
       "UploadStarted": {
         "type": "object",
         "required": [
@@ -8049,6 +8236,113 @@
             "type": "string"
           }
         }
+      },
+      "Use": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "team",
+              "template"
+            ],
+            "properties": {
+              "bucket_prefix": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The names of its buckets start with this (default: the team's\nname, lowercase, and `-`)."
+              },
+              "list_all_buckets": {
+                "type": "boolean",
+                "description": "Whether the team sees every bucket's name\n(`s3:ListAllMyBuckets`, which can't be limited to some)."
+              },
+              "list_policies": {
+                "type": "boolean",
+                "description": "Whether its admins see every managed policy's name and path\n(`iam:ListPolicies`, which can't be limited to some)."
+              },
+              "team": {
+                "type": "string",
+                "description": "The team's name: its path is `/<team>/`, its policies'\nnames start with it."
+              },
+              "template": {
+                "type": "string",
+                "enum": [
+                  "team"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "buckets",
+              "levels",
+              "template"
+            ],
+            "properties": {
+              "buckets": {
+                "type": "string",
+                "description": "A bucket's name, or a pattern (`*` for any characters)."
+              },
+              "levels": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Level"
+                }
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The policy's name (default: from the buckets and levels)."
+              },
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Its path (default `/`)."
+              },
+              "template": {
+                "type": "string",
+                "enum": [
+                  "bucket-access"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "template"
+            ],
+            "properties": {
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The policy's name (default `RequireMFA`)."
+              },
+              "path": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Its path (default `/`)."
+              },
+              "template": {
+                "type": "string",
+                "enum": [
+                  "mfa-guard"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a template is used with."
       },
       "UserAccess": {
         "type": "object",

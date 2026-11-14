@@ -211,48 +211,72 @@ pub const GRANTS_PATH: &str = "/cairn/grants/";
 
 /// The managed policy a grant of `permission` on `bucket` is: the name it
 /// gets (unless the account has a policy of that name already: names are
-/// unique in an account, whatever their paths), and its document.
+/// unique in an account, whatever their paths), and its document: the
+/// bucket-access template's (see `templates`).
 pub fn policy_for(bucket: &str, permission: Permission) -> (String, String) {
     let name = format!("{bucket}-{}", permission.as_str());
-    let document = json!({
-        "Version": "2012-10-17",
-        "Statement": [{
-            "Effect": "Allow",
-            "Action": crate::s3::actions::grant_actions(permission),
-            "Resource": [format!("arn:aws:s3:::{bucket}"), format!("arn:aws:s3:::{bucket}/*")],
-        }],
-    });
-    (name, document.to_string())
+    (name, crate::templates::bucket_access_document(bucket, &[permission.into()]))
 }
 
-/// The account's policy for a grant of `document`: one at `GRANTS_PATH`
-/// whose default version is it (the oldest, if there are several); its ARN.
-async fn find(client: &Object, account: &str, document: &str) -> anyhow::Result<Option<String>> {
+/// The tags of a grant's policy, by which it's found: the template's, and
+/// the bucket and permission. Its document isn't how: it grows with the
+/// bucket configurations Cairn knows (which a grant may read).
+fn tags_for(bucket: &str, permission: Permission) -> Vec<(String, String)> {
+    let template = crate::templates::TEMPLATES.iter().find(|t| t.id == "bucket-access").expect("a template");
+    vec![
+        (crate::templates::TEMPLATE_TAG.to_owned(), template.id.to_owned()),
+        (crate::templates::VERSION_TAG.to_owned(), template.version.to_string()),
+        (BUCKET_TAG.to_owned(), bucket.to_owned()),
+        (PERMISSION_TAG.to_owned(), permission.as_str().to_owned()),
+    ]
+}
+
+/// The tags naming a grant's bucket and permission.
+const BUCKET_TAG: &str = "cairn:grant-bucket";
+const PERMISSION_TAG: &str = "cairn:grant-permission";
+
+/// The account's policy for a grant of `permission` on `bucket`: one at
+/// `GRANTS_PATH` tagged so (the oldest, if there are several), its document
+/// brought up to date if it's older; its ARN.
+async fn find(client: &Object, account: &str, bucket: &str, permission: Permission) -> anyhow::Result<Option<String>> {
     let row = client
         .query_opt_cached(
-            "SELECT name FROM managed_policies WHERE account_id = $1 AND path = $2 AND document = $3
-             ORDER BY created_at, name LIMIT 1",
-            &[&account, &GRANTS_PATH, &document],
+            "SELECT m.name, m.document FROM managed_policies m
+             WHERE m.account_id = $1 AND m.path = $2
+               AND EXISTS (SELECT 1 FROM managed_policy_tags t WHERE t.policy_id = m.id AND t.key = $3 AND t.value = $4)
+               AND EXISTS (SELECT 1 FROM managed_policy_tags t WHERE t.policy_id = m.id AND t.key = $5 AND t.value = $6)
+             ORDER BY m.created_at, m.name LIMIT 1",
+            &[&account, &GRANTS_PATH, &BUCKET_TAG, &bucket, &PERMISSION_TAG, &permission.as_str()],
         )
         .await?;
-    Ok(row.map(|r| crate::managed::arn(account, GRANTS_PATH, r.get(0))))
+    let Some(row) = row else { return Ok(None) };
+    let (name, document): (String, String) = (row.get(0), row.get(1));
+    let (_, current) = policy_for(bucket, permission);
+    if document != current {
+        crate::managed::update(client, account, &name, &current).await?;
+    }
+    Ok(Some(crate::managed::arn(account, GRANTS_PATH, &name)))
 }
 
 /// The ARNs of the policies grants of `permission` on `bucket` were before
 /// they were at `GRANTS_PATH`: at `/`, named `<bucket>-<permission>` (or,
-/// that being taken, `…-grant`), and still of the grant's document. They
-/// stay where they are; granting again doesn't attach another, and
-/// revoking detaches them.
+/// that being taken, `…-grant`), with the description grants had. (Only the
+/// account's admins may make policies at `/`.) They stay where they are;
+/// granting again doesn't attach another, and revoking detaches them.
 async fn earlier(client: &Object, account: &str, bucket: &str, permission: Permission) -> anyhow::Result<Vec<String>> {
-    let (name, document) = policy_for(bucket, permission);
+    let (name, _) = policy_for(bucket, permission);
     let rows = client
         .query_cached(
             "SELECT name FROM managed_policies
-             WHERE account_id = $1 AND path = '/' AND name = ANY($2) AND document = $3 ORDER BY name",
-            &[&account, &vec![name.clone(), format!("{name}-grant")], &document],
+             WHERE account_id = $1 AND path = '/' AND name = ANY($2) AND description = $3 ORDER BY name",
+            &[&account, &vec![name.clone(), format!("{name}-grant")], &description(bucket, permission)],
         )
         .await?;
     Ok(rows.iter().map(|r| crate::managed::arn(account, "/", r.get(0))).collect())
+}
+
+fn description(bucket: &str, permission: Permission) -> String {
+    format!("{} on bucket {bucket} (a grant)", permission.as_str())
 }
 
 /// The ARN of the account's policy for a grant of `permission` on
@@ -260,9 +284,8 @@ async fn earlier(client: &Object, account: &str, bucket: &str, permission: Permi
 async fn grant_policy(client: &Object, account: &str, bucket: &str, permission: Permission) -> anyhow::Result<String> {
     use crate::managed::{self, Refused};
     let (name, document) = policy_for(bucket, permission);
-    let description = format!("{} on bucket {bucket} (a grant)", permission.as_str());
     for attempt in 0..ATTEMPTS {
-        if let Some(arn) = find(client, account, &document).await? {
+        if let Some(arn) = find(client, account, bucket, permission).await? {
             return Ok(arn);
         }
         // Its name, or, that being taken (by another node's grant meanwhile,
@@ -271,7 +294,8 @@ async fn grant_policy(client: &Object, account: &str, bucket: &str, permission: 
             0 => name.clone(),
             _ => format!("{name}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
         };
-        match managed::create(client, account, &name, GRANTS_PATH, &document, &description).await {
+        let tags = tags_for(bucket, permission);
+        match managed::create_tagged(client, account, &name, GRANTS_PATH, &document, &description(bucket, permission), &tags).await {
             Ok(policy) => return Ok(policy.arn(account)),
             Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => continue,
             Err(e) => return Err(e),
@@ -303,8 +327,7 @@ pub async fn change(client: &Object, account: &str, user: &str, bucket: &str, pe
             managed::attach(client, account, user, &arn, true).await?;
             continue;
         }
-        let (_, document) = policy_for(bucket, *permission);
-        let current = find(client, account, &document).await?;
+        let current = find(client, account, bucket, *permission).await?;
         for arn in current.iter().chain(&earlier).filter(|arn| attached.contains(arn)) {
             match managed::attach(client, account, user, arn, false).await {
                 Ok(()) => {}
@@ -387,3 +410,25 @@ mod tests {
         assert_eq!(changed(p.as_deref(), "b", &[(ALICE.into(), Permission::Read, true)]).unwrap(), p);
     }
 }
+
+#[cfg(test)]
+mod documents {
+    use super::*;
+
+    /// A grant's document is the bucket-access template's for its one level,
+    /// and still what grants allowed (the actions of each, in order: a
+    /// configuration Cairn learns adds its read to all three).
+    #[test]
+    fn grants_are_the_bucket_access_template() {
+        let reads = "\"s3:GetBucketVersioning\",\"s3:GetEncryptionConfiguration\",\"s3:GetLifecycleConfiguration\",\"s3:GetBucketCORS\",\"s3:GetBucketTagging\",\"s3:GetBucketPublicAccessBlock\",\"s3:GetBucketAcl\",\"s3:GetBucketOwnershipControls\",\"s3:GetBucketLocation\",\"s3:GetBucketObjectLockConfiguration\",\"s3:GetBucketWebsite\",\"s3:GetReplicationConfiguration\",\"s3:GetAccelerateConfiguration\",\"s3:GetBucketRequestPayment\",\"s3:GetBucketLogging\",\"s3:GetBucketNotification\"";
+        let document = |actions: &str| {
+            format!(r#"{{"Statement":[{{"Action":[{actions},{reads}],"Effect":"Allow","Resource":["arn:aws:s3:::b","arn:aws:s3:::b/*"]}}],"Version":"2012-10-17"}}"#)
+        };
+        let read = "\"s3:GetObject\",\"s3:GetObjectVersion\",\"s3:GetObjectAttributes\",\"s3:GetObjectVersionAttributes\",\"s3:GetObjectTagging\",\"s3:GetObjectVersionTagging\",\"s3:GetObjectAcl\",\"s3:GetObjectVersionAcl\",\"s3:GetObjectRetention\",\"s3:GetObjectLegalHold\",\"s3:ListBucket\",\"s3:ListBucketVersions\",\"s3:ListBucketMultipartUploads\",\"s3:ListMultipartUploadParts\"";
+        let write = "\"s3:PutObject\",\"s3:PutObjectTagging\",\"s3:PutObjectVersionTagging\",\"s3:DeleteObject\",\"s3:DeleteObjectTagging\",\"s3:DeleteObjectVersionTagging\",\"s3:PutObjectAcl\",\"s3:PutObjectVersionAcl\",\"s3:AbortMultipartUpload\",\"s3:ListBucketMultipartUploads\",\"s3:ListMultipartUploadParts\"";
+        assert_eq!(policy_for("b", Permission::Read), ("b-read".to_owned(), document(read)));
+        assert_eq!(policy_for("b", Permission::Write), ("b-write".to_owned(), document(write)));
+        assert_eq!(policy_for("b", Permission::DeleteVersion), ("b-delete-version".to_owned(), document("\"s3:DeleteObjectVersion\"")));
+    }
+}
+

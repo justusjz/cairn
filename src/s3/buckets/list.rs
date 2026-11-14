@@ -49,15 +49,14 @@ pub async fn buckets(app: &App) -> anyhow::Result<Vec<BucketInfo>> {
 /// The most buckets a page of ListBuckets lists, as in S3.
 const MAX_BUCKETS: i64 = 10_000;
 
-/// ListBuckets: `GET /`. Lists the buckets the role can see: every bucket for an
-/// admin, otherwise only those it holds a grant on. As in S3, by name, those
-/// starting with `prefix`, paginated by `max-buckets` and an opaque
-/// `continuation-token` (all of them, without `max-buckets`).
+/// ListBuckets: `GET /`, for a principal allowed `s3:ListAllMyBuckets`: the
+/// buckets of its account. As in S3, by name, those starting with `prefix`,
+/// paginated by `max-buckets` and an opaque `continuation-token` (all of
+/// them, without `max-buckets`).
 pub async fn list_buckets(
     app: &App,
     principal: &Principal,
     query: &str,
-    all: bool,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let invalid =
         |message: &str| format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message);
@@ -74,22 +73,10 @@ pub async fn list_buckets(
         },
     };
     let prefix = query_param(query, "prefix").unwrap_or_default();
-    // Those its account owns, to whom `s3:ListAllMyBuckets` is allowed, as
-    // in S3; else those whose policies name the user (as MinIO lists them).
     let all_buckets = buckets(app).await?;
-    let visible = match all {
-        true => Default::default(),
-        false => {
-            let mut visible = crate::grants::visible(&app.pool.get().await?, principal.id).await?;
-            let own: Vec<&str> =
-                all_buckets.iter().filter(|b| b.account == principal.account).map(|b| b.name.as_str()).collect();
-            visible.extend(crate::s3::access::listable(principal, &own)?);
-            visible
-        }
-    };
     let mut listed: Vec<BucketInfo> = all_buckets
         .into_iter()
-        .filter(|b| if all { b.account == principal.account } else { visible.contains(&b.name) })
+        .filter(|b| b.account == principal.account)
         .filter(|b| b.name.starts_with(&prefix))
         .filter(|b| after.as_ref().is_none_or(|after| b.name > *after))
         .take(max + 1)

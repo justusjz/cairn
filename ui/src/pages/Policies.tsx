@@ -9,6 +9,7 @@ import { type ManagedPolicy, type Tag, api } from "../api";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
 import { ago, pretty } from "../format";
+import { TemplateDialog } from "./Templates";
 
 /** Whether anyone has the policy: attached, or as a boundary. */
 const used = (p: ManagedPolicy) => p.users.length + p.bounds.length + p.roles.length + p.role_bounds.length > 0;
@@ -16,6 +17,7 @@ const used = (p: ManagedPolicy) => p.users.length + p.bounds.length + p.roles.le
 export default function Policies() {
   const data = poll(() => Promise.all([api.policies(), api.buckets()]), 10000);
   const [open, setOpen] = createSignal<{ policy?: ManagedPolicy }>();
+  const [fromTemplate, setFromTemplate] = createSignal(false);
   const remove = async (p: ManagedPolicy) => {
     if (!confirm(`Delete policy "${p.name}"?`)) return;
     if (await act(() => api.deleteManagedPolicy(p.name), `Deleted ${p.name}`)) data.refresh();
@@ -25,15 +27,19 @@ export default function Policies() {
     <>
       <div class="page-head">
         <h1>Policies</h1>
-        <button class="primary" onClick={() => setOpen({})}>
-          New policy
-        </button>
+        <div class="buttons">
+          <button onClick={() => setFromTemplate(true)}>From a template</button>
+          <button class="primary" onClick={() => setOpen({})}>
+            New policy
+          </button>
+        </div>
       </div>
       <p class="subtle small">
         Managed policies are documents of their own, attached to any number of users and roles (on the Users and Roles
         pages): what a user, or a role's session, may do is what its attached and inline policies allow, and its
         buckets' policies, where they name it; a Deny wins over any Allow. Cairn's own have AWS's names and say what AWS's do, so policies and tools written for AWS
-        work as they are.
+        work as they are. Templates make policies for common setups: above all a team sharing the account, whose admins
+        manage its users, roles, policies and buckets and can't get past them.
       </p>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
         {(d) => (
@@ -116,6 +122,9 @@ export default function Policies() {
           </Panel>
         )}
       </Show>
+      <Show when={fromTemplate()}>
+        <TemplateDialog onClose={() => setFromTemplate(false)} changed={data.refresh} />
+      </Show>
       <Show when={open()}>
         {(o) => (
           <ManagedPolicyDialog
@@ -163,8 +172,6 @@ function ManagedPolicyDialog(props: {
   };
   const setTag = (i: number, change: Partial<Tag>) => setTags(tags().map((t, j) => (j === i ? { ...t, ...change } : t)));
   const wantedTags = () => tags().filter((t) => t.key.trim()).map((t) => ({ key: t.key.trim(), value: t.value }));
-  const [delegateBoundary, setDelegateBoundary] = createSignal("");
-  const [delegatePath, setDelegatePath] = createSignal("/team/");
   onMount(() => dialog.showModal());
   const save = async (e: SubmitEvent) => {
     e.preventDefault();
@@ -218,38 +225,6 @@ function ManagedPolicyDialog(props: {
             value={path()}
             onInput={(e) => setPath(e.currentTarget.value)}
           />
-          <div class="form-row template">
-            <span class="small">Delegated admin:</span>
-            <select
-              aria-label="Their users' permissions boundary"
-              value={delegateBoundary()}
-              onChange={(e) => setDelegateBoundary(e.currentTarget.value)}
-            >
-              <option value="">their users' boundary…</option>
-              <For each={props.policies}>{(b) => <option value={b.arn}>{b.name}</option>}</For>
-            </select>
-            <input
-              type="text"
-              aria-label="Their users' path"
-              title="The path their users are made under, and the only users they may manage"
-              value={delegatePath()}
-              onInput={(e) => setDelegatePath(e.currentTarget.value)}
-            />
-            <button
-              type="button"
-              class="small"
-              disabled={!delegateBoundary() || !delegatePath().startsWith("/") || !delegatePath().endsWith("/")}
-              onClick={() => setDocument(delegatedAdmin(delegateBoundary(), delegatePath()))}
-            >
-              Write
-            </button>
-          </div>
-          <p class="subtle small">
-            A delegated admin manages users under a path, and makes them only with a permissions boundary, so they can never
-            give anyone more than the boundary allows; they can't change the boundary or take it off. Give them this policy,
-            and a boundary of their own that allows what it does (the same, if it allows managing those users), so that
-            they can't give themselves more either.
-          </p>
         </Show>
         <input
           type="text"
@@ -341,75 +316,3 @@ function ManagedPolicyDialog(props: {
   );
 }
 
-/** A delegated admin's policy (as AWS's guide has it): users under `path`
- * may be made and given policies only with the permissions boundary
- * `boundary`, managed otherwise (their keys, console links, tags), but not
- * moved elsewhere; and the boundary can't be changed, nor taken off anyone.
- * (CreateAccessKey and CreateLoginProfile take no boundary: the path is
- * what keeps them to those users.) */
-function delegatedAdmin(boundary: string, path: string): string {
-  const users = `arn:aws:iam::*:user${path}*`;
-  return JSON.stringify(
-    {
-      Version: "2012-10-17",
-      Statement: [
-        {
-          Sid: "MakeAndChangeUsersOnlyWithTheBoundary",
-          Effect: "Allow",
-          Action: [
-            "iam:CreateUser",
-            "iam:PutUserPermissionsBoundary",
-            "iam:PutUserPolicy",
-            "iam:DeleteUserPolicy",
-            "iam:AttachUserPolicy",
-            "iam:DetachUserPolicy",
-          ],
-          Resource: users,
-          Condition: { StringEquals: { "iam:PermissionsBoundary": boundary } },
-        },
-        {
-          Sid: "ManageTheirUsers",
-          Effect: "Allow",
-          Action: [
-            "iam:GetUser",
-            "iam:ListUsers",
-            "iam:UpdateUser",
-            "iam:DeleteUser",
-            "iam:TagUser",
-            "iam:UntagUser",
-            "iam:ListUserTags",
-            "iam:CreateAccessKey",
-            "iam:ListAccessKeys",
-            "iam:UpdateAccessKey",
-            "iam:DeleteAccessKey",
-            "iam:CreateLoginProfile",
-            "iam:ListUserPolicies",
-            "iam:GetUserPolicy",
-            "iam:ListAttachedUserPolicies",
-          ],
-          Resource: users,
-        },
-        {
-          Sid: "SeePolicies",
-          Effect: "Allow",
-          Action: ["iam:ListPolicies", "iam:GetPolicy", "iam:GetPolicyVersion", "iam:ListEntitiesForPolicy"],
-          Resource: "*",
-        },
-        {
-          Sid: "NoChangingTheBoundary",
-          Effect: "Deny",
-          Action: ["iam:CreatePolicyVersion", "iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion"],
-          Resource: boundary,
-        },
-        {
-          Sid: "NoTakingBoundariesOff",
-          Effect: "Deny",
-          Action: "iam:DeleteUserPermissionsBoundary",
-          Resource: "*",
-        },
-      ],
-    },
-    null,
-    2,
-  );
-}

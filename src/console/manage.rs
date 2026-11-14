@@ -118,6 +118,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_key, delete_key))
         .routes(routes!(get_policy, put_policy, delete_policy))
         .merge(super::iam::router())
+        .merge(super::templates::router())
 }
 
 // ─── Cluster ─────────────────────────────────────────────────────────────────
@@ -2831,7 +2832,10 @@ struct PolicySummary {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<PolicySummary>>> {
-    actor.check(&app, "iam:ListPolicies", On::Account).await?;
+    // All of them, to whom `iam:ListPolicies` is allowed; else those it may
+    // `iam:GetPolicy` (a team's admin, say: see `templates`), unlike IAM,
+    // which has no way to list only some.
+    let all = actor.allows(&app, "iam:ListPolicies", On::Account).await?;
     let client = app.pool.get().await?;
     let account = actor.account();
     let attached = crate::managed::attached_all(&client, account).await?;
@@ -2898,7 +2902,52 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
             tags: p.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
         });
     }
-    Ok(Json(policies))
+    // Each policy's users and roles, to whom `iam:ListEntitiesForPolicy` on
+    // it is allowed (as IAM shows them).
+    let checks: Vec<(Check, Context)> = policies
+        .iter()
+        .flat_map(|p| {
+            let on = policy_on(account, &p.arn);
+            let mut context = Context::default();
+            for tag in &p.tags {
+                context.set(&format!("aws:ResourceTag/{}", tag.key), &tag.value);
+            }
+            [
+                (Check { action: "iam:GetPolicy", on: on.clone() }, context.clone()),
+                (Check { action: "iam:ListEntitiesForPolicy", on }, context),
+            ]
+        })
+        .collect();
+    let allowed = actor.allows_each(&app, &checks).await?;
+    let mut shown = Vec::new();
+    for (policy, allowed) in policies.into_iter().zip(allowed.chunks(2)) {
+        let (get, entities) = (allowed[0], allowed[1]);
+        if !all && !get {
+            continue;
+        }
+        let mut policy = policy;
+        if !entities {
+            policy.users.clear();
+            policy.bounds.clear();
+            policy.roles.clear();
+            policy.role_bounds.clear();
+        }
+        shown.push(policy);
+    }
+    if !all && shown.is_empty() {
+        actor.check(&app, "iam:ListPolicies", On::Account).await?;
+    }
+    Ok(Json(shown))
+}
+
+/// What IAM's actions on the managed policy `arn` (the account's, or
+/// Cairn's) are checked against.
+fn policy_on(account: &str, arn: &str) -> On {
+    match crate::managed::named(arn, account) {
+        Ok(crate::managed::Named::Own { path, name }) => On::policy(account, &path, &name),
+        Ok(crate::managed::Named::Aws(p)) => On::policy("aws", "/", p.name),
+        Err(_) => On::Account,
+    }
 }
 
 #[derive(Deserialize, ToSchema)]

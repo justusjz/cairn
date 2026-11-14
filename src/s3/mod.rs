@@ -250,11 +250,16 @@ async fn handle_request(
     let path = route.path.trim_start_matches('/');
     if path.is_empty() {
         let resp = match (req.method(), &principal) {
-            // ListBuckets: every bucket, to whom `s3:ListAllMyBuckets` is
-            // allowed; else those of the user's grants (as MinIO lists them).
+            // ListBuckets: every bucket of the account, to whom
+            // `s3:ListAllMyBuckets` is allowed; else AccessDenied, as in S3.
+            // (The console lists a user the buckets it may use instead: see
+            // `console::actor::Actor::listed`.)
             (&hyper::Method::GET, Some(principal)) => {
-                let all = access.allows(&actions::Check { action: "s3:ListAllMyBuckets", on: actions::On::Account });
-                list_buckets(&app, principal, req.uri().query().unwrap_or(""), all).await?
+                let check = actions::Check { action: "s3:ListAllMyBuckets", on: actions::On::Account };
+                match access.verdict(&check) {
+                    crate::policy::Verdict::Allow => list_buckets(&app, principal, req.uri().query().unwrap_or("")).await?,
+                    verdict => access.denied(&check, verdict),
+                }
             }
             (&hyper::Method::GET, None) => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
             _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),

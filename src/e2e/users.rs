@@ -328,7 +328,19 @@ async fn grants_trust_only_their_own_path() {
     users::create(&client, "gus", None, false).await.unwrap();
     let account = users::account(&client).await.unwrap();
     let (name, document) = crate::grants::policy_for(BUCKET, users::Permission::Read);
-    crate::managed::create(&client, &account, &name, "/team-a/", &document, "").await.unwrap();
+    // Tagged as a grant's, too.
+    let tags: Vec<(String, String)> = [
+        ("cairn:template", "bucket-access"),
+        ("cairn:template-version", "1"),
+        ("cairn:grant-bucket", BUCKET),
+        ("cairn:grant-permission", "read"),
+    ]
+    .iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    crate::managed::create_tagged(&client, &account, &name, "/team-a/", &document, "read on bucket bucket (a grant)", &tags)
+        .await
+        .unwrap();
     users::grant(&client, &account, "gus", BUCKET, &[users::Permission::Read]).await.unwrap();
     let arns = attached_arns(&client, &account, "gus").await;
     assert_eq!(arns.len(), 1, "{arns:?}");
@@ -337,9 +349,19 @@ async fn grants_trust_only_their_own_path() {
     users::grant(&client, &account, "gus", BUCKET, &[users::Permission::Read]).await.unwrap();
     assert_eq!(attached_arns(&client, &account, "gus").await, arns);
 
-    // A grant from before, at `/`.
+    // Its document grew (a configuration Cairn learned since): brought up
+    // to date when it's found.
+    let read = crate::managed::get(&client, &account, arns[0].rsplit('/').next().unwrap()).await.unwrap();
+    let older = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"}]}"#;
+    crate::managed::update(&client, &account, &read.name, older).await.unwrap();
+    users::grant(&client, &account, "gus", BUCKET, &[users::Permission::Read]).await.unwrap();
+    assert_eq!(attached_arns(&client, &account, "gus").await, arns);
+    assert_eq!(crate::managed::get(&client, &account, &read.name).await.unwrap().document, document);
+
+    // A grant from before, at `/`, as grants described their policies; one
+    // that isn't described so isn't one.
     let (old, document) = crate::grants::policy_for(BUCKET, users::Permission::Write);
-    crate::managed::create(&client, &account, &old, "/", &document, "").await.unwrap();
+    crate::managed::create(&client, &account, &old, "/", &document, &format!("write on bucket {BUCKET} (a grant)")).await.unwrap();
     let earlier = format!("arn:aws:iam::{account}:policy/{old}");
     crate::managed::attach(&client, &account, "gus", &earlier, true).await.unwrap();
     users::grant(&client, &account, "gus", BUCKET, &[users::Permission::Write]).await.unwrap();

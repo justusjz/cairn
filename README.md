@@ -385,8 +385,9 @@ allows; else it's denied. They are:
   users: a policy that allows `iam:CreateUser` and the like only under a path
   of theirs and with a boundary (the condition key `iam:PermissionsBoundary`),
   and denies changing that policy or taking boundaries off, lets them make
-  users who can never do more than the boundary (the console's Policies page
-  writes such a "delegated admin" policy). Older Cairns know no boundaries:
+  users who can never do more than the boundary (the [team
+  template](#teams-and-policy-templates) makes such policies, done right).
+  Older Cairns know no boundaries:
   to them, a user with one has an inline policy that denies it everything,
   and they can't change users, keys or policies at all; upgrade every node.
 - each bucket's **bucket policy**, set with PutBucketPolicy (by an admin), as
@@ -480,11 +481,13 @@ address, or for HTTPS) take the client's address and protocol from
 `--trusted-proxy`; otherwise, the connection's own address counts, and it's
 not HTTPS (Cairn speaks only HTTP).
 
-A user sees in ListBuckets the buckets its policies let it list
-(`s3:ListBucket`), and those whose policies name it (or all of its account's,
-if a policy allows it `s3:ListAllMyBuckets`, as admin does). A bucket must
-exist before you can grant access to it, so the setup order is: an admin
-creates the bucket (with any S3 client), then you grant users access.
+ListBuckets lists every bucket of the account, to a user whose policies
+allow it `s3:ListAllMyBuckets` (as AdministratorAccess does); to anyone
+else it's AccessDenied, as in S3, which has no way to list only some
+buckets. The console's bucket list is friendlier: without
+`s3:ListAllMyBuckets` it shows the buckets the user's policies let it list
+(`s3:ListBucket`), and those whose policies name it, so teams sharing the
+account needn't see each other's bucket names.
 Policies name buckets by name, and outlive them, as in AWS: a bucket deleted
 and made again under the same name is open to whoever's policies name it.
 
@@ -609,6 +612,51 @@ on its key takes it.
 > Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,
 > since it is part of the signature.
+
+### Teams and policy templates
+
+One Cairn account can be shared by teams (tenants) that mustn't reach each
+other's data, users or policies. IAM can do that, with paths, permissions
+boundaries and conditions, but it's easy to get wrong; Cairn's **policy
+templates** write the policies for it, and the console's Policies page
+makes them (*From a template*: the documents are shown first). A template
+makes ordinary managed policies, tagged `cairn:template` and
+`cairn:template-version`, as IAM's CreatePolicy by whoever uses it, so it
+allows nothing by itself: a team's admin may use templates within its team,
+and nothing outside it. Their documents work as they are with `aws iam
+create-policy` too.
+
+- **Team** (the account's admins make it): for team `T` with bucket prefix
+  `p-` (default: `t-`, the name in lowercase), three policies at
+  `/cairn/teams/T/`, where the team can't change them:
+  - `T-boundary`, the permissions boundary of everything the team has:
+    `s3:*` on the buckets `p-*` (making them too), `iam:*` on the users,
+    roles and policies at `/T/`, reading Cairn's policies and the team's,
+    `sts:AssumeRole` on the team's roles; and the guardrails: no user or
+    role made or bounded without `T-boundary`, no permissions given to or
+    taken from one that hasn't it, no boundary taken off. The guardrails
+    are in the boundary, so a member the team's admin gave
+    AdministratorAccess has them too.
+  - `T-admin`, for the team's admins: the same, so it holds for an admin
+    without the boundary too. Attach it to a user or a role at `/T/`, and
+    give that `T-boundary` as its permissions boundary.
+  - `T-member`: reading and writing the team's buckets, and one's own
+    access keys.
+
+  Opt-ins: `s3:ListAllMyBuckets` (ListBuckets lists every bucket of the
+  account, as in S3: there's no listing only some) and `iam:ListPolicies`
+  (likewise every policy). Without them, the console still lists a team's
+  buckets and policies to it. What stays outside IAM: bucket names are one
+  namespace (a team learns that a name is taken), a team's bucket policy may
+  name anyone (and make a bucket public, unless the account's
+  [public access block](#users-and-permissions) stops it), and SSE-KMS keys
+  are granted in OpenBao.
+- **Bucket access**: reading, writing, deleting versions for good, and
+  managing (configuration, policy, deleting it) a bucket, or the buckets a
+  pattern names (`logs-*`). A grant is one level of it on one bucket.
+- **MFA guard**: denies `iam:*` and `cairn:*` without MFA: to console
+  sessions signed in at an OIDC provider, and to access keys, which never
+  carry MFA, as in AWS.
 
 ## Roles and temporary credentials
 
@@ -824,8 +872,13 @@ passkeys and sign-in providers, and signing out.
   trust it, and delete it.
 - **Policies:** the account's managed policies and Cairn's, which users and
   roles have each attached, and making, changing (a new version) and
-  deleting the account's own. The editor has a template: pick a bucket and a level (read, read and
-  write, or `s3:*`), and it adds the statement, as one would write it.
+  deleting the account's own. *From a template* makes policies from one of
+  the [templates](#teams-and-policy-templates), shown before they're made.
+  The editor adds the bucket-access template's statement for a bucket (or a
+  pattern of them) at a level: read, read and write, and so on. To whom
+  `iam:ListPolicies` isn't allowed (a team's admin, say), the page lists
+  the policies it may read (`iam:GetPolicy`); a policy's users and roles
+  show to whom `iam:ListEntitiesForPolicy` on it is allowed.
   A bucket's *Access and policy* shows which of the account's users its
   policies give access to the whole bucket, and what, besides its bucket
   policy and public access block.

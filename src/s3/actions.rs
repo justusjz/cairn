@@ -190,6 +190,23 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
     ("notification", ("GetBucketNotificationConfiguration", "s3:GetBucketNotification"), None),
 ];
 
+/// What managing a bucket takes (the `manage` level of the bucket-access
+/// template, see `templates`): reading and changing all of its
+/// configuration, its policy too, and deleting it (empty).
+pub fn manage_actions() -> Vec<&'static str> {
+    let mut actions: Vec<&'static str> = Vec::new();
+    for (_, (_, read), write) in CONFIGURATION {
+        actions.push(read);
+        if let Some((_, set, _, delete)) = write {
+            actions.extend([*set, *delete].into_iter().filter(|a| !a.is_empty()));
+        }
+    }
+    actions.push("s3:DeleteBucket");
+    let mut seen = std::collections::HashSet::new();
+    actions.retain(|a| seen.insert(*a));
+    actions
+}
+
 /// The actions that read a bucket's configuration, which anyone the bucket
 /// is visible to may (see the built-in policies). Not its policy, which
 /// names who may do what, nor whether that makes it public.
