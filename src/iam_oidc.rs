@@ -114,6 +114,12 @@ impl Provider {
         Ok(row.as_ref().map(Provider::of))
     }
 
+    /// Provider `id`, if there's one.
+    pub async fn load_id(client: &Object, id: Uuid) -> anyhow::Result<Option<Provider>> {
+        let row = client.query_opt_cached(&format!("SELECT {COLUMNS} FROM iam_oidc_providers p WHERE p.id = $1"), &[&id]).await?;
+        Ok(row.as_ref().map(Provider::of))
+    }
+
     /// The provider `arn` names, if it's one of `account`'s.
     pub async fn load_arn(client: &Object, account: &str, arn: &str) -> anyhow::Result<Option<Provider>> {
         match url_of_arn(arn, account) {
@@ -154,6 +160,33 @@ impl Provider {
 /// How IAM's issuers may be reached now (see `settings::OIDC_PRIVATE_ISSUERS`).
 pub async fn private_allowed(client: &Object) -> anyhow::Result<bool> {
     Ok(crate::settings::OIDC_PRIVATE_ISSUERS.get(client).await? == 1)
+}
+
+/// Why a new provider's issuer can't be used.
+pub enum Unusable {
+    /// Its URL can't be fetched as IAM's issuers are (not HTTPS, or not at
+    /// a public address).
+    Url(String),
+    /// Its discovery document or keys couldn't be had.
+    Unreachable(String),
+}
+
+/// Checks that the issuer at `url` (as `url_of` gives it) can be used, as
+/// IAM checks a new provider's (it fetches the issuer to find a thumbprint
+/// when none is given): its discovery document and keys, reached as IAM's
+/// issuers are now, trusting `thumbprints`.
+pub async fn check_new(client: &Object, url: &str, thumbprints: &[String]) -> anyhow::Result<Result<(), Unusable>> {
+    let reach = Reach {
+        public_only: !private_allowed(client).await?,
+        thumbprints: thumbprints.iter().filter_map(|t| check_thumbprint(t).ok()).collect(),
+    };
+    let issuer = format!("https://{url}");
+    if let Err(e) = crate::oidc::check_url(&issuer, &reach) {
+        return Ok(Err(Unusable::Url(e.0)));
+    }
+    Ok(crate::oidc::check_issuer(&issuer, &reach)
+        .await
+        .map_err(|e| Unusable::Unreachable(format!("Could not connect to the OpenID Connect provider at {issuer}: {e:#}"))))
 }
 
 /// NoSuchEntity for the provider `arn`.

@@ -470,9 +470,14 @@ decides (CreatePolicyVersion, with SetAsDefault or not; SetDefaultPolicyVersion
 rolls back; GetPolicyVersion, ListPolicyVersions, DeletePolicyVersion but of
 the default), and a policy with more than one can't be deleted. The console's
 edit makes a new default version, deleting the oldest that isn't the default
-if there are five already, as Terraform does. Groups and roles are NotImplemented. STS's
-`GetCallerIdentity` answers too (signed for `sts`), which Terraform's AWS
-provider calls as it starts. The AWS CLI refuses access key IDs shorter than
+if there are five already, as Terraform does. [Roles](#roles-and-temporary-credentials)
+are there too (CreateRole, GetRole, ListRoles, UpdateRole,
+UpdateRoleDescription, UpdateAssumeRolePolicy, DeleteRole, and their
+policies, boundaries and tags, as users'), and OpenID Connect providers
+(CreateOpenIDConnectProvider and the rest). Groups are NotImplemented. STS
+answers on the same endpoint (requests signed for `sts`): GetCallerIdentity,
+which Terraform's AWS provider calls as it starts, and the actions that issue
+temporary credentials. The AWS CLI refuses access key IDs shorter than
 16 characters as parameters (`--access-key-id`): the keys Cairn makes are
 20, as IAM's, but a role migrated from before access keys keeps its key named
 as it.
@@ -523,6 +528,151 @@ on its key takes it.
 > Cairn speaks plain HTTP. To expose it publicly, put a TLS-terminating reverse
 > proxy in front of it. The proxy must pass the `Host` header through unchanged,
 > since it is part of the signature.
+
+## Roles and temporary credentials
+
+A **role** is an identity no one signs as with keys of its own: whoever its
+**trust policy** lets in *assumes* it, and gets **temporary credentials**
+(an access key ID starting `ASIA`, a secret and a session token) that act
+as the role, with its policies, until they expire. That's how a program
+gets access without a long-lived secret, and how people switch to more
+access only when they need it. Roles are made with the console's Roles page,
+or the IAM API (`aws iam create-role`, Terraform's `aws_iam_role`). A role
+has a path, a description, tags, inline and managed policies and a
+permissions boundary, as a user has, and a longest session it allows (1 to
+12 hours; `--max-session-duration`). Its ARN is
+`arn:aws:iam::<account>:role/<path…/name>`.
+
+A trust policy is a policy whose statements name who may assume the role:
+
+- `{"AWS": "arn:aws:iam::<account>:user/ada"}`, a user (or a role, for
+  chaining): it may, whatever its own policies say;
+- `{"AWS": "arn:aws:iam::<account>:root"}`, the account: then the users'
+  own policies decide (they need `sts:AssumeRole` on the role), as in AWS;
+- `{"Federated": "arn:aws:iam::<account>:oidc-provider/<url>"}`, the web
+  identities of an [OpenID Connect provider](#web-identities) (CI jobs,
+  Kubernetes service accounts).
+
+Its conditions see `sts:ExternalId`, `sts:RoleSessionName`,
+`sts:SourceIdentity`, `sts:TransitiveTagKeys`, session tags
+(`aws:RequestTag/…`), and a web identity's claims. Statements allowing
+`sts:TagSession` and `sts:SetSourceIdentity` let a session have tags or a
+source identity.
+
+**STS** is on the S3 endpoint, as IAM is: point the AWS CLI's or SDKs' STS
+endpoint at Cairn (`aws sts --endpoint-url ...`, `AWS_ENDPOINT_URL_STS`, or
+`endpoint_url` in a profile). It has:
+
+- **AssumeRole**: a role's credentials, for 15 minutes up to the role's
+  longest session (an hour by default; an hour at most when a role's session
+  assumes another, *chaining*), with an optional session policy (`Policy`,
+  `PolicyArns`) that narrows what the session may do, session tags, an
+  external ID and a source identity, as in AWS. AWS CLI profiles with
+  `role_arn` and `source_profile`, and Terraform's `assume_role`, use it.
+- **AssumeRoleWithWebIdentity**: the same, for an OIDC provider's ID token,
+  and unsigned: the token is the authentication. See
+  [web identities](#web-identities).
+- **GetSessionToken**: a user's own credentials, for 15 minutes to 36 hours
+  (12 by default). They may call STS's AssumeRole and GetCallerIdentity but
+  not IAM, as AWS's without MFA.
+- **GetFederationToken**: credentials of a *federated user* (a name of your
+  choosing, `arn:aws:sts::<account>:federated-user/<name>`), which may do what
+  both the calling user's policies and the session policy given allow.
+- **GetCallerIdentity**, **GetAccessKeyInfo**.
+
+```sh
+aws iam create-role --role-name deployer --assume-role-policy-document \
+    '{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+      "Principal": {"AWS": "arn:aws:iam::123456789012:user/ada"}}]}'
+aws iam attach-role-policy --role-name deployer --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess
+aws sts assume-role --role-arn arn:aws:iam::123456789012:role/deployer --role-session-name ada
+```
+
+A session may do what its role's policies allow, capped by the role's
+boundary and the session policy; a bucket policy that names the session
+(`arn:aws:sts::<account>:assumed-role/<role>/<session>`) allows it beyond
+both, one that names the role doesn't (probed). Its requests carry
+`aws:PrincipalType` `AssumedRole`, `aws:userid` `AROA…:<session>`,
+`aws:PrincipalArn` (the role's ARN), `aws:TokenIssueTime`,
+`aws:SourceIdentity`, `aws:PrincipalTag/…` (the role's tags and the
+session's, which win) and, for a web identity's, `aws:FederatedProvider`.
+The role's policies are read on every request, so a change applies to its
+sessions at once. A session using SSE-KMS acts as its role in OpenBao: roles
+get identities there as users do.
+
+A session's token holds everything about it, sealed (XChaCha20-Poly1305)
+with a key of the cluster's, so issuing one writes nothing and any node
+checks it. The keys are in the database; a new one is made every day, and
+old ones are dropped once no session they sealed can still be valid. To end
+a role's sessions before they expire, do as AWS does: deny them by
+`aws:TokenIssueTime` (the console's *Revoke sessions* writes AWS's
+`AWSRevokeOlderSessions` inline policy, which denies everything to sessions
+issued before now). Deleting a role ends its sessions too (a role made again
+with its name doesn't revive them). `cairn sessions revoke-all` is the
+break-glass: it drops the keys, so every temporary credential stops working,
+on every node within a minute. A node older than roles refuses `ASIA` keys,
+so upgrade every node before relying on sessions.
+
+### Web identities
+
+A program that has an **ID token** of an OpenID Connect issuer (a GitHub
+Actions job, a GitLab CI job, a Kubernetes service account, your own
+Keycloak's clients) can assume a role with it, without any secret stored in
+Cairn or the program: STS's AssumeRoleWithWebIdentity, which AWS's SDKs and
+CLI call by themselves given `AWS_ROLE_ARN` and
+`AWS_WEB_IDENTITY_TOKEN_FILE`.
+
+First, the issuer is made an **OIDC provider** of the account (on the Roles
+page, or `aws iam create-open-id-connect-provider`, Terraform's
+`aws_iam_openid_connect_provider`), with the client IDs its tokens may be
+for (their audience; AWS's tools ask for `sts.amazonaws.com`). These are
+IAM's providers, apart from the [console's sign-in
+providers](#signing-in): an issuer may be both, configured in each place.
+Then a role trusts it, naming the subjects that may assume it, by the
+token's claims `<url>:sub`, `<url>:aud` and `<url>:amr`:
+
+```sh
+aws iam create-open-id-connect-provider --url https://token.actions.githubusercontent.com \
+    --client-id-list sts.amazonaws.com
+aws iam create-role --role-name ci --assume-role-policy-document '{"Version": "2012-10-17",
+  "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRoleWithWebIdentity",
+    "Principal": {"Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"},
+    "Condition": {"StringEquals": {"token.actions.githubusercontent.com:aud": "sts.amazonaws.com"},
+                  "StringLike": {"token.actions.githubusercontent.com:sub": "repo:my-org/my-repo:*"}}}]}'
+```
+
+Always condition on the subject: without it, every identity the issuer
+vouches for (every repository on GitHub, say) may assume the role.
+
+Cairn takes a token only if its issuer (`iss`) is one of the account's
+providers, checked before Cairn fetches anything; its signature is by the
+keys of the issuer's discovery document (RS256–512, PS256–512, ES256, ES384,
+EdDSA; never `none` or HMAC); its audience is one of the provider's client
+IDs; and it hasn't expired. It's refused with STS's errors
+(`InvalidIdentityToken`, `ExpiredTokenException`, `IDPCommunicationError`).
+A token may carry session tags (`https://aws.amazon.com/tags`) and a source
+identity (`https://aws.amazon.com/source_identity`), as AWS takes them, which
+need `sts:TagSession` and `sts:SetSourceIdentity` in the trust policy.
+
+**Where issuers may be.** Any IAM user allowed
+`iam:CreateOpenIDConnectProvider` picks an issuer's URL, which Cairn then
+fetches from, so by default issuers are reached over HTTPS at **public
+addresses only**: not loopback, private ranges, link-local (cloud metadata
+services), shared or unique-local ones, whatever the name resolves to. An
+issuer inside the cluster's network (a Kubernetes API server's) needs the
+operator to allow it, for the whole cluster:
+
+```sh
+cairn config set oidc-private-issuers 1
+```
+
+**Thumbprints.** An issuer's HTTPS certificate is checked against the public
+roots. One of a private CA is trusted if the provider has the SHA-1 of a
+certificate the server presents (its own, or a CA's in its chain) among its
+`ThumbprintList` (up to five; `openssl x509 -fingerprint -sha1`): that
+certificate becomes the anchor the chain is verified to, name and expiry
+included. AWS no longer uses thumbprints; in Cairn they're what lets a
+self-hosted issuer with its own CA work.
 
 ## Console
 
@@ -581,9 +731,18 @@ passkeys and sign-in providers, and signing out.
   has a link out to), with how, and when they last did; a service has only
   access keys. A new person gets a console link and no access key; a new
   service, an access key.
-- **Policies:** the account's managed policies and Cairn's, who has each
-  attached, and making, changing (a new version) and deleting the account's
-  own. The editor has a template: pick a bucket and a level (read, read and
+- **Roles:** [roles](#roles-and-temporary-credentials), with who their
+  trust policies let in, as IAM's actions allow: make one (the trust
+  policy's templates write statements for the account, a user or role, or a
+  provider's web identities with an audience and a subject), change its
+  trust policy, description, longest session, boundary and tags, attach and
+  write policies, revoke its sessions, and delete it. And the account's
+  [OpenID Connect providers](#web-identities): add one (checked against its
+  issuer), change its client IDs, thumbprints and tags, see which roles
+  trust it, and delete it.
+- **Policies:** the account's managed policies and Cairn's, which users and
+  roles have each attached, and making, changing (a new version) and
+  deleting the account's own. The editor has a template: pick a bucket and a level (read, read and
   write, or `s3:*`), and it adds the statement, as one would write it.
   A bucket's *Access and policy* shows which of the account's users its
   policies give access to the whole bucket, and what, besides its bucket

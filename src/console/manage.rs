@@ -59,8 +59,8 @@ const PAGE: i64 = 200;
 /// How many versions of a key are shown.
 const MAX_VERSIONS: i64 = 200;
 
-type Result<T> = std::result::Result<T, ApiError>;
-type AppState = State<Arc<App>>;
+pub(super) type Result<T> = std::result::Result<T, ApiError>;
+pub(super) type AppState = State<Arc<App>>;
 
 /// The routes, which the console serves as its session's identity (see
 /// `actor`): every handler checks what it does as its S3 operation's
@@ -117,6 +117,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(create_key))
         .routes(routes!(set_key, delete_key))
         .routes(routes!(get_policy, put_policy, delete_policy))
+        .merge(super::iam::router())
 }
 
 // ─── Cluster ─────────────────────────────────────────────────────────────────
@@ -833,8 +834,8 @@ pub(super) struct BucketSummary {
 /// keys are unique regardless of case).
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
 pub(super) struct Tag {
-    key: String,
-    value: String,
+    pub(super) key: String,
+    pub(super) value: String,
 }
 
 /// Tags as the console shows them, from their stored form.
@@ -2295,7 +2296,7 @@ async fn check_user_with(app: &Arc<App>, actor: &Actor, action: &'static str, na
 }
 
 /// The condition key `key` set to `value`.
-fn key(key: &str, value: &str) -> Context {
+pub(super) fn key(key: &str, value: &str) -> Context {
     let mut context = Context::default();
     context.set(key, value);
     context
@@ -2356,9 +2357,9 @@ struct AccessKey {
 }
 
 #[derive(Serialize, ToSchema)]
-struct AttachedPolicy {
-    name: String,
-    arn: String,
+pub(super) struct AttachedPolicy {
+    pub(super) name: String,
+    pub(super) arn: String,
 }
 
 #[utoipa::path(get, path = "/users", responses(
@@ -2646,9 +2647,9 @@ async fn update_user(
 }
 
 #[derive(Deserialize, ToSchema)]
-struct BoundaryArn {
+pub(super) struct BoundaryArn {
     /// A managed policy's ARN: the account's own, or one of Cairn's.
-    arn: String,
+    pub(super) arn: String,
 }
 
 /// Sets a user's permissions boundary, as IAM's
@@ -2783,6 +2784,10 @@ struct PolicySummary {
     path: String,
     /// The account's users whose permissions boundary it is.
     bounds: Vec<String>,
+    /// The account's roles it's attached to.
+    roles: Vec<String>,
+    /// The account's roles whose permissions boundary it is.
+    role_bounds: Vec<String>,
     /// Its tags (keys case-sensitive), oldest first.
     tags: Vec<Tag>,
 }
@@ -2823,25 +2828,26 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
         users.sort();
         users
     };
-    let mut policies: Vec<PolicySummary> = crate::managed::AWS_POLICIES
-        .iter()
-        .map(|p| {
-            let arn = crate::managed::aws_arn(p.name);
-            PolicySummary {
-                users: users_of(&arn),
-                name: p.name.to_owned(),
-                arn,
-                aws: true,
-                description: p.description.to_owned(),
-                document: p.document.to_owned(),
-                version: 1,
-                updated_at: None,
-                path: "/".to_owned(),
-                bounds: aws_bounds.remove(p.name).unwrap_or_default(),
-                tags: Vec::new(),
-            }
-        })
-        .collect();
+    let mut policies: Vec<PolicySummary> = Vec::new();
+    for p in crate::managed::AWS_POLICIES {
+        let arn = crate::managed::aws_arn(p.name);
+        let (roles, role_bounds) = crate::roles::of_policy(&client, account, &arn).await?;
+        policies.push(PolicySummary {
+            users: users_of(&arn),
+            name: p.name.to_owned(),
+            arn,
+            aws: true,
+            description: p.description.to_owned(),
+            document: p.document.to_owned(),
+            version: 1,
+            updated_at: None,
+            path: "/".to_owned(),
+            bounds: aws_bounds.remove(p.name).unwrap_or_default(),
+            roles: roles.into_iter().map(|(_, name)| name).collect(),
+            role_bounds: role_bounds.into_iter().map(|(_, name)| name).collect(),
+            tags: Vec::new(),
+        });
+    }
     for p in crate::managed::list(&client, account).await? {
         policies.push(PolicySummary {
             arn: p.arn(account),
@@ -2854,6 +2860,8 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
             users: p.users,
             path: p.path,
             bounds: p.bounds,
+            roles: p.roles,
+            role_bounds: p.role_bounds,
             tags: p.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
         });
     }
@@ -3079,8 +3087,8 @@ async fn delete_policy_managed(State(app): AppState, Extension(actor): Extension
 
 #[derive(Deserialize, ToSchema, IntoParams)]
 #[into_params(parameter_in = Query)]
-struct PolicyArn {
-    arn: String,
+pub(super) struct PolicyArn {
+    pub(super) arn: String,
 }
 
 /// Attaches a managed policy to a user.
@@ -3218,8 +3226,8 @@ async fn delete_key(
 
 /// An inline policy: a JSON document in IAM's policy language.
 #[derive(Serialize, Deserialize, ToSchema)]
-struct PolicyDocument {
-    document: String,
+pub(super) struct PolicyDocument {
+    pub(super) document: String,
 }
 
 /// One of the user's inline policies, as it was set.
@@ -3942,16 +3950,19 @@ struct SettingChanged {
 }
 
 /// The settings that the console changes this way: those of how blobs are
-/// stored, and repaired.
+/// stored, and repaired, and whether IAM's OIDC providers may be at
+/// private addresses.
 const REDUNDANCY: &[&crate::settings::Setting] = &[
     &crate::settings::DATA_SHARDS,
     &crate::settings::PARITY_SHARDS,
     &crate::settings::REPAIR_AFTER,
+    &crate::settings::OIDC_PRIVATE_ISSUERS,
 ];
 
-/// Sets one of the redundancy settings (`data-shards`, `parity-shards`,
-/// `repair-after`) for the whole cluster, as `cairn config set` does. The
-/// node answering goes by it right away, the others within a heartbeat.
+/// Sets one of the cluster's settings (`data-shards`, `parity-shards`,
+/// `repair-after`, `oidc-private-issuers`) for the whole cluster, as
+/// `cairn config set` does. The node answering goes by it right away, the
+/// others within a heartbeat.
 #[utoipa::path(put, path = "/settings/{name}", params(("name" = String, Path)),
     request_body = NewSetting, responses(
         (status = 200, body = SettingChanged),

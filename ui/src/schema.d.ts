@@ -432,6 +432,52 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/identity-providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_identity_providers"];
+        put?: never;
+        /**
+         * Adds a provider, as IAM's CreateOpenIDConnectProvider: after checking
+         *     its issuer can be reached (its discovery document and keys).
+         */
+        post: operations["create_identity_provider"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/identity-providers/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Changes a provider's client IDs, thumbprints and tags, as IAM's
+         *     Add/RemoveClientIDToOpenIDConnectProvider,
+         *     UpdateOpenIDConnectProviderThumbprint and Tag/UntagOpenIDConnectProvider
+         *     would.
+         */
+        put: operations["update_identity_provider"];
+        post?: never;
+        /**
+         * Deletes a provider: its web identities assume no role any more (the
+         *     trust policies naming it stay, and match no one).
+         */
+        delete: operations["delete_identity_provider"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/integrity": {
         parameters: {
             query?: never;
@@ -873,6 +919,152 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/roles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_roles"];
+        put?: never;
+        /** Makes a role, as IAM's CreateRole. */
+        post: operations["create_role"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Deletes a role, unless it has policies left, as IAM's DeleteRole. */
+        delete: operations["delete_role"];
+        options?: never;
+        head?: never;
+        /** Changes a role's description or longest session, as IAM's UpdateRole. */
+        patch: operations["update_role"];
+        trace?: never;
+    };
+    "/roles/{role}/attached": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Attaches a managed policy to a role. */
+        post: operations["attach_role_policy"];
+        /** Detaches a managed policy from a role. */
+        delete: operations["detach_role_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/boundary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a role's permissions boundary. */
+        put: operations["set_role_boundary"];
+        post?: never;
+        /** Removes a role's permissions boundary. */
+        delete: operations["delete_role_boundary"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/policies/{policy}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One of the role's inline policies. */
+        get: operations["get_role_policy"];
+        /** Sets one of the role's inline policies, if it's a valid identity policy. */
+        put: operations["put_role_policy"];
+        post?: never;
+        /** Deletes one of the role's inline policies. */
+        delete: operations["delete_role_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/revoke-sessions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Revokes the role's sessions issued until now, as AWS's console does: an
+         *     inline policy `AWSRevokeOlderSessions` that denies everything to
+         *     sessions whose token was issued before now (`aws:TokenIssueTime`). New
+         *     sessions aren't affected; doing it again moves the time.
+         */
+        post: operations["revoke_sessions"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a role's tags, as IAM's TagRole and UntagRole would. */
+        put: operations["set_role_tags"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/trust": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a role's trust policy, as IAM's UpdateAssumeRolePolicy. */
+        put: operations["set_trust"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings/{name}": {
         parameters: {
             query?: never;
@@ -882,9 +1074,10 @@ export interface paths {
         };
         get?: never;
         /**
-         * Sets one of the redundancy settings (`data-shards`, `parity-shards`,
-         *     `repair-after`) for the whole cluster, as `cairn config set` does. The
-         *     node answering goes by it right away, the others within a heartbeat.
+         * Sets one of the cluster's settings (`data-shards`, `parity-shards`,
+         *     `repair-after`, `oidc-private-issuers`) for the whole cluster, as
+         *     `cairn config set` does. The node answering goes by it right away, the
+         *     others within a heartbeat.
          */
         put: operations["set_setting"];
         post?: never;
@@ -1400,6 +1593,22 @@ export interface components {
              */
             nodes: components["schemas"]["NodeCoverage"][];
         };
+        CreateRole: {
+            /** @description Its permissions boundary: a managed policy's ARN. */
+            boundary?: string | null;
+            description?: string;
+            /**
+             * Format: int32
+             * @description Its longest session, in seconds (3600 to 43200); 3600 if not given.
+             */
+            max_session_duration?: number | null;
+            name: string;
+            /** @description Its path (`/`, or `/…/`); `/` if not given. */
+            path?: string | null;
+            tags?: components["schemas"]["Tag"][];
+            /** @description Who may assume it: a trust policy. */
+            trust: string;
+        };
         CreateUser: {
             /**
              * @description Whether it gets an access key (a service's), of a random ID; a person
@@ -1551,6 +1760,47 @@ export interface components {
             files: number;
             /** Format: int64 */
             pending: number;
+        };
+        /**
+         * @description An OpenID Connect provider whose ID tokens STS takes for roles that
+         *     trust it (AssumeRoleWithWebIdentity).
+         */
+        IdentityProvider: {
+            arn: string;
+            /** @description The audiences its tokens may be for. */
+            client_ids: string[];
+            /** @description When it was made (ISO 8601). */
+            created: string;
+            id: string;
+            /** @description The account's roles whose trust policies name it. */
+            roles: string[];
+            tags: components["schemas"]["Tag"][];
+            /**
+             * @description SHA-1s of certificates its server is trusted by, besides the public
+             *     roots.
+             */
+            thumbprints: string[];
+            /** @description Its issuer's URL without `https://`, as its ARN has it. */
+            url: string;
+        };
+        IdentityProviderChange: {
+            /**
+             * @description All of its client IDs: those it has that aren't here are removed,
+             *     the rest added.
+             */
+            client_ids: string[];
+            /** @description All of its tags. */
+            tags: components["schemas"]["Tag"][];
+            /** @description All of its thumbprints. */
+            thumbprints: string[];
+        };
+        IdentityProviders: {
+            /**
+             * @description Whether providers may be at private addresses (the cluster's
+             *     `oidc-private-issuers` setting).
+             */
+            private_issuers: boolean;
+            providers: components["schemas"]["IdentityProvider"][];
         };
         /** @description Who the login is: a user of the account. */
         IdentitySummary: {
@@ -1899,6 +2149,18 @@ export interface components {
              */
             object_lock?: boolean;
         };
+        NewIdentityProvider: {
+            /** @description The audiences its tokens may be for (`sts.amazonaws.com`, say). */
+            client_ids?: string[];
+            tags?: components["schemas"]["Tag"][];
+            /**
+             * @description SHA-1s (40 hex digits) of certificates to trust its server by: for
+             *     an issuer whose certificate isn't of a public CA.
+             */
+            thumbprints?: string[];
+            /** @description The issuer's URL (`https://…`), as its tokens' `iss` names it. */
+            url: string;
+        };
         /** @description A new access key, whose secret is shown only this once. */
         NewKey: {
             id: string;
@@ -2202,6 +2464,10 @@ export interface components {
             name: string;
             /** @description Its path (`/`, or `/…/`). */
             path: string;
+            /** @description The account's roles whose permissions boundary it is. */
+            role_bounds: string[];
+            /** @description The account's roles it's attached to. */
+            roles: string[];
             /** @description Its tags (keys case-sensitive), oldest first. */
             tags: components["schemas"]["Tag"][];
             /** Format: double */
@@ -2276,6 +2542,52 @@ export interface components {
              * @description How many seconds a slot of `history` covers.
              */
             slot_secs: number;
+        };
+        RoleChange: {
+            description?: string | null;
+            /**
+             * Format: int32
+             * @description Its longest session, in seconds (3600 to 43200).
+             */
+            max_session_duration?: number | null;
+        };
+        /**
+         * @description A role: an identity no one signs as with keys of its own, but assumes
+         *     (STS's AssumeRole, AssumeRoleWithWebIdentity), as its trust policy
+         *     allows, for temporary credentials.
+         */
+        RoleSummary: {
+            arn: string;
+            /** @description Its attached managed policies. */
+            attached: components["schemas"]["AttachedPolicy"][];
+            /** @description Its permissions boundary's ARN. */
+            boundary?: string | null;
+            /** @description When it was made (ISO 8601). */
+            created: string;
+            description: string;
+            /** @description Its unique ID (`AROA…`), which never changes or comes back. */
+            id: string;
+            /**
+             * Format: int32
+             * @description The longest session it allows, in seconds.
+             */
+            max_session_duration: number;
+            name: string;
+            /** @description Its path (`/`, or `/…/`). */
+            path: string;
+            /** @description The names of its inline policies. */
+            policies: string[];
+            /** @description Its tags, oldest first. */
+            tags: components["schemas"]["Tag"][];
+            /** @description Its trust policy: who may assume it (as GetRole shows it). */
+            trust: string;
+        };
+        RoleTags: {
+            /**
+             * @description All of its tags: those it has of other keys go (UntagRole), the
+             *     rest are set (TagRole).
+             */
+            tags: components["schemas"]["Tag"][];
         };
         Rule: {
             /** @description `ExposeHeader`s: the response headers a page may read. */
@@ -3722,6 +4034,155 @@ export interface operations {
             };
         };
     };
+    list_identity_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityProviders"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_identity_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewIdentityProvider"];
+            };
+        };
+        responses: {
+            /** @description Added */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_identity_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IdentityProviderChange"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_identity_provider: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_integrity: {
         parameters: {
             query?: never;
@@ -4731,6 +5192,541 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_roles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RoleSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateRole"];
+            };
+        };
+        responses: {
+            /** @description Made */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RoleChange"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    attach_role_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyArn"];
+            };
+        };
+        responses: {
+            /** @description Attached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    detach_role_policy: {
+        parameters: {
+            query: {
+                arn: string;
+            };
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Detached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_role_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BoundaryArn"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_role_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_role_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+                policy: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDocument"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_role_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+                policy: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyDocument"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_role_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+                policy: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    revoke_sessions: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_role_tags: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RoleTags"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_trust: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyDocument"];
+            };
+        };
+        responses: {
+            /** @description Set */
             204: {
                 headers: {
                     [name: string]: unknown;

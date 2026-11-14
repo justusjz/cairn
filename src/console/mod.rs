@@ -42,6 +42,7 @@ use crate::{App, users::Principal};
 pub(crate) mod actor;
 mod api;
 pub mod cbor;
+mod iam;
 mod limit;
 mod manage;
 pub mod oidc;

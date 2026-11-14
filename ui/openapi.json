@@ -1573,6 +1573,163 @@
         }
       }
     },
+    "/identity-providers": {
+      "get": {
+        "operationId": "list_identity_providers",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityProviders"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Adds a provider, as IAM's CreateOpenIDConnectProvider: after checking\nits issuer can be reached (its discovery document and keys).",
+        "operationId": "create_identity_provider",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewIdentityProvider"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Added"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/identity-providers/{id}": {
+      "put": {
+        "summary": "Changes a provider's client IDs, thumbprints and tags, as IAM's\nAdd/RemoveClientIDToOpenIDConnectProvider,\nUpdateOpenIDConnectProviderThumbprint and Tag/UntagOpenIDConnectProvider\nwould.",
+        "operationId": "update_identity_provider",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IdentityProviderChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a provider: its web identities assume no role any more (the\ntrust policies naming it stay, and match no one).",
+        "operationId": "delete_identity_provider",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/integrity": {
       "get": {
         "operationId": "get_integrity",
@@ -2718,9 +2875,639 @@
         }
       }
     },
+    "/roles": {
+      "get": {
+        "operationId": "list_roles",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/RoleSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a role, as IAM's CreateRole.",
+        "operationId": "create_role",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateRole"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role}": {
+      "delete": {
+        "summary": "Deletes a role, unless it has policies left, as IAM's DeleteRole.",
+        "operationId": "delete_role",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Changes a role's description or longest session, as IAM's UpdateRole.",
+        "operationId": "update_role",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoleChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role}/attached": {
+      "post": {
+        "summary": "Attaches a managed policy to a role.",
+        "operationId": "attach_role_policy",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyArn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Attached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Detaches a managed policy from a role.",
+        "operationId": "detach_role_policy",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "arn",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Detached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role}/boundary": {
+      "put": {
+        "summary": "Sets a role's permissions boundary.",
+        "operationId": "set_role_boundary",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BoundaryArn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a role's permissions boundary.",
+        "operationId": "delete_role_boundary",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role}/policies/{policy}": {
+      "get": {
+        "summary": "One of the role's inline policies.",
+        "operationId": "get_role_policy",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDocument"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets one of the role's inline policies, if it's a valid identity policy.",
+        "operationId": "put_role_policy",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyDocument"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes one of the role's inline policies.",
+        "operationId": "delete_role_policy",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role}/revoke-sessions": {
+      "post": {
+        "summary": "Revokes the role's sessions issued until now, as AWS's console does: an\ninline policy `AWSRevokeOlderSessions` that denies everything to\nsessions whose token was issued before now (`aws:TokenIssueTime`). New\nsessions aren't affected; doing it again moves the time.",
+        "operationId": "revoke_sessions",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Revoked"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role}/tags": {
+      "put": {
+        "summary": "Sets a role's tags, as IAM's TagRole and UntagRole would.",
+        "operationId": "set_role_tags",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoleTags"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role}/trust": {
+      "put": {
+        "summary": "Sets a role's trust policy, as IAM's UpdateAssumeRolePolicy.",
+        "operationId": "set_trust",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyDocument"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/settings/{name}": {
       "put": {
-        "summary": "Sets one of the redundancy settings (`data-shards`, `parity-shards`,\n`repair-after`) for the whole cluster, as `cairn config set` does. The\nnode answering goes by it right away, the others within a heartbeat.",
+        "summary": "Sets one of the cluster's settings (`data-shards`, `parity-shards`,\n`repair-after`, `oidc-private-issuers`) for the whole cluster, as\n`cairn config set` does. The node answering goes by it right away, the\nothers within a heartbeat.",
         "operationId": "set_setting",
         "parameters": [
           {
@@ -4335,6 +5122,53 @@
           }
         }
       },
+      "CreateRole": {
+        "type": "object",
+        "required": [
+          "name",
+          "trust"
+        ],
+        "properties": {
+          "boundary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its permissions boundary: a managed policy's ARN."
+          },
+          "description": {
+            "type": "string"
+          },
+          "max_session_duration": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Its longest session, in seconds (3600 to 43200); 3600 if not given."
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its path (`/`, or `/…/`); `/` if not given."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            }
+          },
+          "trust": {
+            "type": "string",
+            "description": "Who may assume it: a trust policy."
+          }
+        }
+      },
       "CreateUser": {
         "type": "object",
         "required": [
@@ -4724,6 +5558,113 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "IdentityProvider": {
+        "type": "object",
+        "description": "An OpenID Connect provider whose ID tokens STS takes for roles that\ntrust it (AssumeRoleWithWebIdentity).",
+        "required": [
+          "id",
+          "arn",
+          "url",
+          "client_ids",
+          "thumbprints",
+          "created",
+          "tags",
+          "roles"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "client_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The audiences its tokens may be for."
+          },
+          "created": {
+            "type": "string",
+            "description": "When it was made (ISO 8601)."
+          },
+          "id": {
+            "type": "string"
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The account's roles whose trust policies name it."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            }
+          },
+          "thumbprints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "SHA-1s of certificates its server is trusted by, besides the public\nroots."
+          },
+          "url": {
+            "type": "string",
+            "description": "Its issuer's URL without `https://`, as its ARN has it."
+          }
+        }
+      },
+      "IdentityProviderChange": {
+        "type": "object",
+        "required": [
+          "client_ids",
+          "thumbprints",
+          "tags"
+        ],
+        "properties": {
+          "client_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "All of its client IDs: those it has that aren't here are removed,\nthe rest added."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "All of its tags."
+          },
+          "thumbprints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "All of its thumbprints."
+          }
+        }
+      },
+      "IdentityProviders": {
+        "type": "object",
+        "required": [
+          "providers",
+          "private_issuers"
+        ],
+        "properties": {
+          "private_issuers": {
+            "type": "boolean",
+            "description": "Whether providers may be at private addresses (the cluster's\n`oidc-private-issuers` setting)."
+          },
+          "providers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IdentityProvider"
+            }
           }
         }
       },
@@ -5546,6 +6487,38 @@
           }
         }
       },
+      "NewIdentityProvider": {
+        "type": "object",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "client_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The audiences its tokens may be for (`sts.amazonaws.com`, say)."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            }
+          },
+          "thumbprints": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "SHA-1s (40 hex digits) of certificates to trust its server by: for\nan issuer whose certificate isn't of a public CA."
+          },
+          "url": {
+            "type": "string",
+            "description": "The issuer's URL (`https://…`), as its tokens' `iss` names it."
+          }
+        }
+      },
       "NewKey": {
         "type": "object",
         "description": "A new access key, whose secret is shown only this once.",
@@ -6311,6 +7284,8 @@
           "users",
           "path",
           "bounds",
+          "roles",
+          "role_bounds",
           "tags"
         ],
         "properties": {
@@ -6340,6 +7315,20 @@
           "path": {
             "type": "string",
             "description": "Its path (`/`, or `/…/`)."
+          },
+          "role_bounds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The account's roles whose permissions boundary it is."
+          },
+          "roles": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The account's roles it's attached to."
           },
           "tags": {
             "type": "array",
@@ -6508,6 +7497,117 @@
             "format": "int64",
             "description": "How many seconds a slot of `history` covers.",
             "minimum": 0
+          }
+        }
+      },
+      "RoleChange": {
+        "type": "object",
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "max_session_duration": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Its longest session, in seconds (3600 to 43200)."
+          }
+        }
+      },
+      "RoleSummary": {
+        "type": "object",
+        "description": "A role: an identity no one signs as with keys of its own, but assumes\n(STS's AssumeRole, AssumeRoleWithWebIdentity), as its trust policy\nallows, for temporary credentials.",
+        "required": [
+          "name",
+          "id",
+          "arn",
+          "path",
+          "description",
+          "max_session_duration",
+          "created",
+          "trust",
+          "tags",
+          "attached",
+          "policies"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "attached": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachedPolicy"
+            },
+            "description": "Its attached managed policies."
+          },
+          "boundary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its permissions boundary's ARN."
+          },
+          "created": {
+            "type": "string",
+            "description": "When it was made (ISO 8601)."
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "description": "Its unique ID (`AROA…`), which never changes or comes back."
+          },
+          "max_session_duration": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The longest session it allows, in seconds."
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "Its path (`/`, or `/…/`)."
+          },
+          "policies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The names of its inline policies."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags, oldest first."
+          },
+          "trust": {
+            "type": "string",
+            "description": "Its trust policy: who may assume it (as GetRole shows it)."
+          }
+        }
+      },
+      "RoleTags": {
+        "type": "object",
+        "required": [
+          "tags"
+        ],
+        "properties": {
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "All of its tags: those it has of other keys go (UntagRole), the\nrest are set (TagRole)."
           }
         }
       },

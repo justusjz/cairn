@@ -1,7 +1,7 @@
 // The console (see `src/console/`): signing in, with a passkey or at an
 // OIDC provider, a first passkey through an enrollment link, one's own
 // passkeys, and the pages of what the signed-in identity manages: the
-// account's buckets, objects, users and policies, and, for its operators
+// account's buckets, objects, users, roles and policies, and, for its operators
 // (whose policies allow `cairn:` actions), the cluster.
 
 import { A, Navigate, Route, Router, type RouteSectionProps, useNavigate } from "@solidjs/router";
@@ -16,6 +16,7 @@ import Jobs from "./pages/Jobs";
 import Lifecycle from "./pages/Lifecycle";
 import Overview from "./pages/Overview";
 import Policies from "./pages/Policies";
+import Roles from "./pages/Roles";
 import Storage from "./pages/Storage";
 import SignIn from "./pages/SignIn";
 import Users from "./pages/Users";
@@ -107,6 +108,7 @@ function Layout(props: RouteSectionProps) {
 const ACCOUNT_NAV: [string, string][] = [
   ["/buckets", "Buckets"],
   ["/users", "Users"],
+  ["/roles", "Roles"],
   ["/policies", "Policies"],
 ];
 
@@ -552,6 +554,7 @@ render(
       <Route path="/jobs" component={Guarded(Jobs)} />
       <Route path="/sign-in" component={Guarded(SignIn)} />
       <Route path="/users" component={Guarded(Users)} />
+      <Route path="/roles" component={Guarded(Roles)} />
       <Route path="/policies" component={Guarded(Policies)} />
       <Route path="/account" component={Home} />
       <Route path="/buckets" component={Guarded(BucketList)} />

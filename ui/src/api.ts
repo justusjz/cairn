@@ -36,6 +36,8 @@ export type LifecycleRule = Schemas["LifecycleRule"];
 export type BucketAccess = Schemas["BucketAccess"];
 export type PublicAccessBlock = Schemas["Block"];
 export type Tag = Schemas["Tag"];
+export type Role = Schemas["RoleSummary"];
+export type IdentityProvider = Schemas["IdentityProvider"];
 
 /** Where the API is (also in the spec's `servers`). */
 const BASE = "/api";
@@ -84,6 +86,8 @@ async function ok<T>(
 const bucketPath = (bucket: string) => ({ path: { bucket } });
 /** A user's path. */
 const userPath = (user: string) => ({ path: { user } });
+/** A role's path. */
+const rolePath = (role: string) => ({ path: { role } });
 
 export const api = {
   cluster: () => ok(client.GET("/cluster")),
@@ -171,6 +175,58 @@ export const api = {
   deletePolicy: (user: string, policy: string) =>
     ok(client.DELETE("/users/{user}/policies/{policy}", { params: { path: { user, policy } } })),
   identifyUsers: () => ok(client.POST("/kms/identify")),
+  roles: () => ok(client.GET("/roles")),
+  createRole: (body: {
+    name: string;
+    trust: string;
+    path?: string;
+    description?: string;
+    maxSessionDuration?: number;
+    boundary?: string;
+    tags?: Tag[];
+  }) =>
+    ok(
+      client.POST("/roles", {
+        body: {
+          name: body.name,
+          trust: body.trust,
+          path: body.path || null,
+          description: body.description ?? "",
+          max_session_duration: body.maxSessionDuration ?? null,
+          boundary: body.boundary || null,
+          tags: body.tags ?? [],
+        },
+      }),
+    ),
+  updateRole: (role: string, change: { description?: string; maxSessionDuration?: number }) =>
+    ok(
+      client.PATCH("/roles/{role}", {
+        params: rolePath(role),
+        body: { description: change.description ?? null, max_session_duration: change.maxSessionDuration ?? null },
+      }),
+    ),
+  deleteRole: (role: string) => ok(client.DELETE("/roles/{role}", { params: rolePath(role) })),
+  setTrust: (role: string, document: string) => ok(client.PUT("/roles/{role}/trust", { params: rolePath(role), body: { document } })),
+  setRoleBoundary: (role: string, arn: string) => ok(client.PUT("/roles/{role}/boundary", { params: rolePath(role), body: { arn } })),
+  deleteRoleBoundary: (role: string) => ok(client.DELETE("/roles/{role}/boundary", { params: rolePath(role) })),
+  setRoleTags: (role: string, tags: Tag[]) => ok(client.PUT("/roles/{role}/tags", { params: rolePath(role), body: { tags } })),
+  attachToRole: (role: string, arn: string) => ok(client.POST("/roles/{role}/attached", { params: rolePath(role), body: { arn } })),
+  detachFromRole: (role: string, arn: string) =>
+    ok(client.DELETE("/roles/{role}/attached", { params: { path: { role }, query: { arn } } })),
+  rolePolicy: (role: string, policy: string) =>
+    ok(client.GET("/roles/{role}/policies/{policy}", { params: { path: { role, policy } } })),
+  putRolePolicy: (role: string, policy: string, document: string) =>
+    ok(client.PUT("/roles/{role}/policies/{policy}", { params: { path: { role, policy } }, body: { document } })),
+  deleteRolePolicy: (role: string, policy: string) =>
+    ok(client.DELETE("/roles/{role}/policies/{policy}", { params: { path: { role, policy } } })),
+  /** Revokes the role's sessions issued until now (AWSRevokeOlderSessions). */
+  revokeSessions: (role: string) => ok(client.POST("/roles/{role}/revoke-sessions", { params: rolePath(role) })),
+  identityProviders: () => ok(client.GET("/identity-providers")),
+  createIdentityProvider: (body: { url: string; client_ids: string[]; thumbprints: string[]; tags: Tag[] }) =>
+    ok(client.POST("/identity-providers", { body })),
+  updateIdentityProvider: (id: string, body: { client_ids: string[]; thumbprints: string[]; tags: Tag[] }) =>
+    ok(client.PUT("/identity-providers/{id}", { params: { path: { id } }, body })),
+  deleteIdentityProvider: (id: string) => ok(client.DELETE("/identity-providers/{id}", { params: { path: { id } } })),
   lifecycle: () => ok(client.GET("/lifecycle")),
   bucketLifecycle: (bucket: string) => ok(client.GET("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),
   setBucketLifecycle: (bucket: string, configuration: LifecycleConfiguration) =>

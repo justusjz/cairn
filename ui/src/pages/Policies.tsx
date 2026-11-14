@@ -1,13 +1,17 @@
 // An account's managed policies (see `src/managed.rs`): Cairn's, which have
 // AWS's names and say what AWS's do, and the account's own, which are
-// attached to users on the Users page. Making, changing (a new version) and
-// deleting (once nothing has it attached) the account's own.
+// attached to users and roles on the Users and Roles pages. Making,
+// changing (a new version) and deleting (once nothing has it attached) the
+// account's own.
 
 import { For, Show, createResource, createSignal, onMount } from "solid-js";
 import { type ManagedPolicy, type Tag, api } from "../api";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
 import { ago, pretty } from "../format";
+
+/** Whether anyone has the policy: attached, or as a boundary. */
+const used = (p: ManagedPolicy) => p.users.length + p.bounds.length + p.roles.length + p.role_bounds.length > 0;
 
 export default function Policies() {
   const data = poll(() => Promise.all([api.policies(), api.buckets()]), 10000);
@@ -26,9 +30,9 @@ export default function Policies() {
         </button>
       </div>
       <p class="subtle small">
-        Managed policies are documents of their own, attached to any number of users (on the Users page): what a user
-        may do is what its attached and inline policies allow, and its buckets' policies, where they name it; a Deny
-        wins over any Allow. Cairn's own have AWS's names and say what AWS's do, so policies and tools written for AWS
+        Managed policies are documents of their own, attached to any number of users and roles (on the Users and Roles
+        pages): what a user, or a role's session, may do is what its attached and inline policies allow, and its
+        buckets' policies, where they name it; a Deny wins over any Allow. Cairn's own have AWS's names and say what AWS's do, so policies and tools written for AWS
         work as they are.
       </p>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
@@ -62,12 +66,21 @@ export default function Policies() {
                     </td>
                     <td class="small">{p.description || <span class="subtle">–</span>}</td>
                     <td>
-                      <Show when={p.users.length} fallback={<Show when={!p.bounds.length}><span class="subtle">no one</span></Show>}>
-                        <For each={p.users}>{(u) => <span class="chip mono">{u}</span>}</For>
+                      <Show when={!used(p)}>
+                        <span class="subtle">no one</span>
                       </Show>
-                      <Show when={p.bounds.length}>
-                        <div class="small" title="Users whose permissions boundary it is: it caps what their policies allow">
+                      <For each={p.users}>{(u) => <span class="chip mono">{u}</span>}</For>
+                      <For each={p.roles}>
+                        {(r) => (
+                          <span class="chip mono" title="A role">
+                            role {r}
+                          </span>
+                        )}
+                      </For>
+                      <Show when={p.bounds.length || p.role_bounds.length}>
+                        <div class="small" title="Users and roles whose permissions boundary it is: it caps what their policies allow">
                           boundary of <For each={p.bounds}>{(u) => <span class="chip mono">{u}</span>}</For>
+                          <For each={p.role_bounds}>{(r) => <span class="chip mono">role {r}</span>}</For>
                         </div>
                       </Show>
                     </td>
@@ -82,12 +95,12 @@ export default function Policies() {
                       <Show when={!p.aws}>
                         <button
                           class="small danger"
-                          disabled={p.users.length > 0 || p.bounds.length > 0}
+                          disabled={used(p)}
                           title={
-                            p.users.length
-                              ? "Detach it from its users first"
-                              : p.bounds.length
-                                ? "It's users' permissions boundary: take it off them first"
+                            p.users.length || p.roles.length
+                              ? "Detach it from its users and roles first"
+                              : used(p)
+                                ? "It's a permissions boundary: take it off its users and roles first"
                                 : ""
                           }
                           onClick={() => remove(p)}
@@ -306,9 +319,10 @@ function ManagedPolicyDialog(props: {
             five already, deletes the oldest that isn't the default, as Terraform does).
           </p>
         </Show>
-        <Show when={p && !p.aws && p.users.length}>
+        <Show when={p && !p.aws && (p.users.length || p.roles.length)}>
           <p class="subtle small">
-            Saving makes a new version, which applies to everyone it's attached to at once: {p!.users.join(", ")}.
+            Saving makes a new version, which applies to everyone it's attached to at once:{" "}
+            {[...p!.users, ...p!.roles.map((r) => `role ${r}`)].join(", ")}.
           </p>
         </Show>
         <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>

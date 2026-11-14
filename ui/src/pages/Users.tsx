@@ -731,11 +731,11 @@ function DetailsDialog(props: { user: User; policies: ManagedPolicy[]; onClose: 
           <span class="mono">{props.user.name}</span>
         </h2>
         <p class="subtle small mono">{props.user.arn}</p>
-        <label>
+        <label class="field">
           Name
           <input type="text" autocomplete="off" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
         </label>
-        <label>
+        <label class="field">
           Path
           <input type="text" autocomplete="off" value={path()} onInput={(e) => setPath(e.currentTarget.value)} />
         </label>
@@ -743,7 +743,7 @@ function DetailsDialog(props: { user: User; policies: ManagedPolicy[]; onClose: 
           Renaming or moving a user changes its ARN: policies that name it by its ARN (but buckets' policies, which keep
           naming it) need changing too.
         </p>
-        <label>
+        <label class="field">
           Permissions boundary
           <select value={boundary()} onChange={(e) => setBoundary(e.currentTarget.value)}>
             <option value="">None</option>

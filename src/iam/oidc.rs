@@ -121,21 +121,11 @@ impl Iam<'_> {
         if Provider::load(self.client, self.account(), &url).await?.is_some() {
             return Err(error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("Provider with url https://{url} already exists.")));
         }
-        // Its issuer must be there (as IAM fetches it to find a thumbprint
-        // when none is given), and reachable as IAM's issuers are.
-        let private = iam_oidc::private_allowed(self.client).await?;
-        let reach = crate::oidc::Reach {
-            public_only: !private,
-            thumbprints: thumbprints.iter().filter_map(|t| iam_oidc::check_thumbprint(t).ok()).collect(),
-        };
-        let issuer = format!("https://{url}");
-        crate::oidc::check_url(&issuer, &reach).map_err(|e| invalid(e.0))?;
-        if let Err(e) = crate::oidc::check_issuer(&issuer, &reach).await {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "OpenIdIdpCommunicationError",
-                format!("Could not connect to the OpenID Connect provider at {issuer}: {e:#}"),
-            ));
+        // Its issuer must be there, and reachable as IAM's issuers are.
+        match iam_oidc::check_new(self.client, &url, &thumbprints).await? {
+            Ok(()) => {}
+            Err(iam_oidc::Unusable::Url(e)) => return Err(invalid(e)),
+            Err(iam_oidc::Unusable::Unreachable(e)) => return Err(error(StatusCode::BAD_REQUEST, "OpenIdIdpCommunicationError", e)),
         }
         let tags = tags.unwrap_or_default();
         let new = iam_oidc::New { url: &url, client_ids: &client_ids, thumbprints: &thumbprints, tags: &tags };
