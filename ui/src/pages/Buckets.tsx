@@ -1,7 +1,7 @@
 import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { For, Match, Show, Switch, createEffect, createSignal, on, onMount } from "solid-js";
 import { type Bucket, type BucketAccess, type Entry, type PublicAccessBlock, api, downloadUrl } from "../api";
-import { CorsDialog, TagsDialog } from "../components/Editors";
+import { CorsDialog, TagsDialog, WebsiteDialog } from "../components/Editors";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { bytes, date, num, pretty } from "../format";
 
@@ -272,7 +272,7 @@ export function BucketBrowser() {
   // The bucket's versioning state, for its switch.
   const [versioning, setVersioning] = createSignal<string>();
   const [bucketTags, setBucketTags] = createSignal<{ key: string; value: string }[]>([]);
-  const [editing, setEditing] = createSignal<"tags" | "cors">();
+  const [editing, setEditing] = createSignal<"tags" | "cors" | "website">();
   const loadVersioning = async () => {
     try {
       const b = (await api.buckets()).find((b) => b.name === bucket());
@@ -349,6 +349,7 @@ export function BucketBrowser() {
         <button onClick={() => setAccess(true)}>Access and policy</button>
         <button onClick={() => setEditing("tags")}>Tags{bucketTags().length ? ` (${bucketTags().length})` : ""}</button>
         <button onClick={() => setEditing("cors")}>CORS</button>
+        <button onClick={() => setEditing("website")}>Website</button>
         <Show when={versioning()}>
           {(v) => (
             <button onClick={toggleVersioning} title={`Versioning is ${v()}`}>
@@ -387,6 +388,9 @@ export function BucketBrowser() {
       </Show>
       <Show when={editing() === "cors"}>
         <CorsDialog bucket={bucket()} onClose={() => setEditing(undefined)} />
+      </Show>
+      <Show when={editing() === "website"}>
+        <WebsiteDialog bucket={bucket()} onClose={() => setEditing(undefined)} />
       </Show>
       <Show when={loaded()} fallback={<Loading error={error()} />}>
         <Panel>

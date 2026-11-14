@@ -219,8 +219,20 @@ async fn default_encryption_waits_only_for_bucket_changes() {
 /// exclusive); and there's none for a missing bucket.
 #[tokio::test]
 async fn cors_waits_only_for_bucket_changes() {
+    waits_only_for_bucket_changes("SELECT pg_temp.cairn_set_cors($1, '{\"rules\":[]}')").await;
+}
+
+/// T54: setting a bucket's website configuration, likewise.
+#[tokio::test]
+async fn website_waits_only_for_bucket_changes() {
+    waits_only_for_bucket_changes("SELECT pg_temp.cairn_set_website($1, '{\"index_document\":\"index.html\"}')").await;
+}
+
+/// That `set` (a statement setting a bucket's configuration by a plain
+/// UPDATE of its row) doesn't wait for writes, but waits for changes of the
+/// versioning state, and finds no missing bucket.
+async fn waits_only_for_bucket_changes(set: &'static str) {
     let Some(app) = node().await else { return };
-    let set = "SELECT pg_temp.cairn_set_cors($1, '{\"rules\":[]}')";
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
     tx.query_one("SELECT pg_temp.cairn_lock_bucket($1)", &[&BUCKET]).await.unwrap();

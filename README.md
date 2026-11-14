@@ -113,6 +113,8 @@ command line wins. The other commands read `CAIRN_PEER_URL` as well.
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
 | `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. |
+| `--website-domain <NAME>` | `CAIRN_WEBSITE_DOMAIN` | none | The domain buckets' [websites](#websites) are reached at, e.g. `s3-website.example.com`: `bucket.s3-website.example.com` is the bucket's website, on the S3 API's port and on `--listen-website`. |
+| `--listen-website <ADDR>` | `CAIRN_LISTEN_WEBSITE` | off | Bind address for buckets' [websites](#websites) alone: every request to it is one to a website, of the bucket its host names (a subdomain of `--website-domain`, or else the whole host, for a custom domain). |
 | `--listen-console <ADDR>` | `CAIRN_LISTEN_CONSOLE` | off | Bind address for the [console](#console), Cairn's web UI, which people sign in to with passkeys or OIDC. Requires `--console-url`. |
 | `--console-url <URL>` | `CAIRN_CONSOLE_URL` | none | The URL the console is reached at, as browsers see it, e.g. `https://console.example.com`: an origin of its own (not the S3 API's), over HTTPS, or on `localhost`. Passkeys are bound to its host. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
@@ -1105,6 +1107,68 @@ anonymous and allowed by the bucket's policy.
 
 There's no CORS setting for the whole cluster, only these, per bucket, as in
 S3.
+
+## Websites
+
+A bucket can be served as a static website, as S3's static website hosting
+serves one: PutBucketWebsite, GetBucketWebsite and DeleteBucketWebsite
+(`s3:PutBucketWebsite`, `s3:GetBucketWebsite`, `s3:DeleteBucketWebsite`), and
+a website endpoint that serves its pages. The console has a Website dialog on
+each bucket's page, too.
+
+```sh
+aws s3 website s3://my-site --index-document index.html --error-document 404.html
+aws s3api get-bucket-website --bucket my-site
+aws s3api delete-bucket-website --bucket my-site
+```
+
+The website endpoint is a host of its own, as S3's
+(`bucket.s3-website-<region>.amazonaws.com`) is: with
+`--website-domain s3-website.example.com`, a request to
+`my-site.s3-website.example.com` is one to `my-site`'s website, on the S3
+API's port. Requests to any other host go to the S3 API as before, so the
+website domain must not be the API's (`--domain`); it may be a subdomain of
+it. A node with `--listen-website` also serves websites alone on a port of
+their own, where a host that isn't a subdomain of the website domain names
+the bucket by all of itself, as on S3: point `www.example.com` (a `CNAME`) at
+Cairn, and the bucket `www.example.com` is served there. Websites are served
+over whatever the proxy in front of Cairn does (S3's are plain HTTP).
+
+What a website serves, as S3's website endpoints do:
+
+- **Only what anyone may read.** Requests to a website are never signed, so
+  they're anonymous: a page is served if the bucket's policy allows
+  `s3:GetObject` to `"*"`, and no public access block restricts it (a new
+  bucket blocks public policies until its block is removed: see
+  [Users and permissions](#users-and-permissions)). A page that isn't there is a 403, not a 404, unless the policy
+  allows `s3:ListBucket` to anyone too.
+- **Index documents.** The root, and any key ending in `/`, is served its
+  index document: `docs/` serves `docs/index.html`, with the configuration's
+  `index.html`. A request for `docs`, if there's no such object but there is
+  `docs/index.html`, is redirected to `docs/` (302).
+- **Error documents.** A 4XX (a page that isn't there, or isn't public) is
+  answered with the error document, with the error's status. Without one, or
+  if it can't be served either, it's S3's HTML error page, which says what
+  went wrong (and why the error document couldn't be served); its
+  `x-amz-error-code` and `x-amz-error-message` headers say so too, for a HEAD.
+- **Redirects.** An object with a website redirect location
+  (`--website-redirect-location` on upload: `/other/page.html` or a URL) is a
+  301 there. Routing rules (`RoutingRules`, up to 50) redirect the requests
+  they match, by key prefix before anything's served
+  (`KeyPrefixEquals`), or by the error a request got (`HttpErrorCodeReturnedEquals`),
+  to another host, protocol or key (`ReplaceKeyWith`, or
+  `ReplaceKeyPrefixWith` in place of the condition's prefix), with a status
+  of choice (301 by default). `RedirectAllRequestsTo` redirects every request
+  to the same path on another host, and can't be combined with the rest.
+  Redirects that keep the request's host and protocol take them from its
+  `Host` and `X-Forwarded-Proto`.
+- **Only GET and HEAD**, with ranges and conditional requests, and CORS: a
+  browser's preflight is answered by the bucket's [CORS](#cors) rules, as on
+  its S3 API. Any other method is a 405.
+
+The configuration's rules and their errors are AWS's, as documented; they
+haven't been probed against S3 yet. Neither has whether S3 keeps a request's
+query string through a redirect: Cairn doesn't.
 
 ## Limits
 

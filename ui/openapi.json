@@ -1412,6 +1412,134 @@
         }
       }
     },
+    "/buckets/{bucket}/website": {
+      "get": {
+        "operationId": "get_bucket_website",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketWebsite"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets a bucket's website configuration, checked as PutBucketWebsite\nchecks it.",
+        "operationId": "put_bucket_website",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Website"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a bucket's website configuration: its website serves nothing.",
+        "operationId": "delete_bucket_website",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/cluster": {
       "get": {
         "summary": "The nodes, each with the metrics it reports, if it's live.",
@@ -4858,6 +4986,23 @@
           }
         }
       },
+      "BucketWebsite": {
+        "type": "object",
+        "description": "A bucket's website configuration.",
+        "properties": {
+          "configuration": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Website",
+                "description": "`null` if it has none."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "Ceremony": {
         "type": "object",
         "description": "A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:\n`PublicKeyCredentialCreationOptionsJSON` or `…RequestOptionsJSON`), and\nthe ID of its challenge, to send back with the response.",
@@ -4993,6 +5138,28 @@
             "minimum": 0
           }
         }
+      },
+      "Condition": {
+        "type": "object",
+        "properties": {
+          "http_error_code_returned_equals": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "`HttpErrorCodeReturnedEquals`: the requests that would get this\nerror (a 4XX or 5XX), only once they have.",
+            "minimum": 0
+          },
+          "key_prefix_equals": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`KeyPrefixEquals`: the requests for keys starting with it."
+          }
+        },
+        "additionalProperties": false
       },
       "Configuration": {
         "type": "object",
@@ -7417,6 +7584,69 @@
           }
         }
       },
+      "Redirect": {
+        "type": "object",
+        "properties": {
+          "host_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The host redirected to; the request's own, if none."
+          },
+          "http_redirect_code": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "The redirect's status, a 3XX but 300; 301, if none.",
+            "minimum": 0
+          },
+          "protocol": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`http` or `https`; the request's own, if none."
+          },
+          "replace_key_prefix_with": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What replaces the prefix the condition names (all of a key, if it\nnames none)."
+          },
+          "replace_key_with": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What replaces the key. Not with `replace_key_prefix_with`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "RedirectAll": {
+        "type": "object",
+        "description": "Where every request is redirected to.",
+        "required": [
+          "host_name"
+        ],
+        "properties": {
+          "host_name": {
+            "type": "string"
+          },
+          "protocol": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`http` or `https`; the request's own, if none."
+          }
+        },
+        "additionalProperties": false
+      },
       "Registration": {
         "type": "object",
         "description": "What `navigator.credentials.create()` gave the page (its parts, in\nbase64url).",
@@ -7610,6 +7840,29 @@
             "description": "All of its tags: those it has of other keys go (UntagRole), the\nrest are set (TagRole)."
           }
         }
+      },
+      "RoutingRule": {
+        "type": "object",
+        "required": [
+          "redirect"
+        ],
+        "properties": {
+          "condition": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Condition",
+                "description": "What requests the rule redirects; all, if none."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "redirect": {
+            "$ref": "#/components/schemas/Redirect"
+          }
+        },
+        "additionalProperties": false
       },
       "Rule": {
         "type": "object",
@@ -8092,6 +8345,45 @@
           "enabled",
           "suspended"
         ]
+      },
+      "Website": {
+        "type": "object",
+        "description": "A bucket's website configuration.",
+        "properties": {
+          "error_document": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`ErrorDocument`'s `Key`: the object served (with the error's status)\nfor a 4XX error."
+          },
+          "index_document": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`IndexDocument`'s `Suffix`: what a request for a \"directory\" (the\nroot, or a key ending in `/`) is served, appended to its key."
+          },
+          "redirect_all_requests_to": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/RedirectAll",
+                "description": "`RedirectAllRequestsTo`: every request is redirected there; nothing\nelse may be set then."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "routing_rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/RoutingRule"
+            },
+            "description": "`RoutingRules`: the first one whose condition a request meets\nredirects it."
+          }
+        },
+        "additionalProperties": false
       }
     }
   }

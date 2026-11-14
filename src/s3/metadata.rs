@@ -21,8 +21,8 @@ const STORED: &[&str] = &[
     REDIRECT,
 ];
 
-/// Where a website serving the object would redirect to instead. Cairn
-/// serves no websites, but stores and returns it, as S3 does (probed).
+/// Where the bucket's website redirects a request for the object to (see
+/// `s3::website`). Stored and returned like the others, as S3 does (probed).
 const REDIRECT: &str = "x-amz-website-redirect-location";
 
 const USER_PREFIX: &str = "x-amz-meta-";
@@ -156,6 +156,11 @@ impl Overrides {
     }
 }
 
+/// The website redirect location the stored `metadata` has, if any.
+pub fn redirect_location(metadata: &str) -> Option<&str> {
+    metadata.lines().find_map(|line| line.strip_prefix(REDIRECT)?.strip_prefix(": "))
+}
+
 /// Adds the stored `metadata`'s headers to a response.
 pub fn apply(mut builder: Builder, metadata: &str) -> Builder {
     for line in metadata.lines() {
@@ -251,6 +256,9 @@ mod tests {
 
     #[test]
     fn keeps_a_website_redirect_location_that_is_one() {
+        let stored = from_request(&headers(&[("x-amz-meta-a", "b"), (REDIRECT, "/elsewhere")])).unwrap();
+        assert_eq!(redirect_location(&stored), Some("/elsewhere"));
+        assert_eq!(redirect_location("x-amz-meta-a: b\n"), None);
         for location in ["/other", "http://example.com/x", "https://example.com/"] {
             let got = from_request(&headers(&[("x-amz-website-redirect-location", location)])).unwrap();
             assert_eq!(got, format!("x-amz-website-redirect-location: {location}\n"));

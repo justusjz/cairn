@@ -40,6 +40,7 @@ mod post_object;
 mod public_access;
 mod roles;
 mod users;
+mod website;
 mod tagging;
 
 /// The bucket every test node has.
@@ -126,6 +127,7 @@ async fn node_on(
         allow_sse_c_over_http: false,
         trusted_proxies: Vec::new(),
         domain: None,
+        website_domain: None,
         kms: None,
         sessions: Default::default(),
         pack_hook: hook,

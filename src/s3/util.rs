@@ -81,12 +81,6 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
              <VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"></VersioningConfiguration>"
                 .to_string(),
         ))
-    } else if present("website") {
-        Some(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchWebsiteConfiguration",
-            "The specified bucket does not have a website configuration",
-        ))
     } else if present("replication") {
         Some(format_s3_error(
             StatusCode::NOT_FOUND,
@@ -328,7 +322,7 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
         ],
         // PutBucketVersioning, PutBucketEncryption,
         // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketTagging,
-        // PutBucketPolicy, PutBucketAcl (`acl`).
+        // PutBucketPolicy, PutBucketAcl (`acl`), PutBucketWebsite.
         (true, &Method::PUT) => &[
             "versioning",
             "encryption",
@@ -339,11 +333,14 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "acl",
             "publicAccessBlock",
             "object-lock",
+            "website",
         ],
         (true, &Method::POST) => &["delete"],
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
-        // DeleteBucketTagging, DeleteBucketPolicy.
-        (true, &Method::DELETE) => &["encryption", "lifecycle", "cors", "tagging", "policy", "publicAccessBlock"],
+        // DeleteBucketTagging, DeleteBucketPolicy, DeleteBucketWebsite.
+        (true, &Method::DELETE) => {
+            &["encryption", "lifecycle", "cors", "tagging", "policy", "publicAccessBlock", "website"]
+        }
         // GetObjectAcl (stubbed), ListParts, GetObjectTagging, a part of
         // the object, GetObjectAttributes.
         (false, &Method::GET) => &["acl", "uploadId", "tagging", "partNumber", "attributes", "retention", "legal-hold"],
@@ -583,6 +580,8 @@ mod tests {
             (Method::PUT, true, "acl"),
             (Method::GET, true, "ownershipControls"),
             (Method::GET, true, "website"),
+            (Method::PUT, true, "website"),
+            (Method::DELETE, true, "website"),
             (Method::PUT, true, "cors"),
             (Method::DELETE, true, "cors"),
             (Method::PUT, false, "tagging"),
@@ -605,7 +604,6 @@ mod tests {
         for (method, bucket_level, query) in [
             (Method::DELETE, false, "retention&versionId=null"),
             (Method::POST, false, "restore"),
-            (Method::DELETE, true, "website"),
             (Method::GET, true, "inventory"),
             (Method::GET, true, "prefix=a&%69nventory"),
         ] {

@@ -26,6 +26,8 @@ export type User = Schemas["UserSummary"];
 export type ConsoleAccess = Schemas["ConsoleAccess"];
 export type OidcProvider = Schemas["OidcProvider"];
 export type CorsConfiguration = Schemas["Configuration"];
+export type WebsiteConfiguration = Schemas["Website"];
+export type RoutingRule = Schemas["RoutingRule"];
 export type AccessKey = Schemas["AccessKey"];
 export type ManagedPolicy = Schemas["PolicySummary"];
 export type UserAccess = Schemas["UserAccess"];
@@ -278,6 +280,10 @@ export const api = {
   putBucketCors: (bucket: string, configuration: CorsConfiguration) =>
     ok(client.PUT("/buckets/{bucket}/cors", { params: bucketPath(bucket), body: configuration })),
   deleteBucketCors: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/cors", { params: bucketPath(bucket) })),
+  bucketWebsite: (bucket: string) => ok(client.GET("/buckets/{bucket}/website", { params: bucketPath(bucket) })),
+  putBucketWebsite: (bucket: string, configuration: WebsiteConfiguration) =>
+    ok(client.PUT("/buckets/{bucket}/website", { params: bucketPath(bucket), body: configuration })),
+  deleteBucketWebsite: (bucket: string) => ok(client.DELETE("/buckets/{bucket}/website", { params: bucketPath(bucket) })),
   setVersioning: (bucket: string, status: "Enabled" | "Suspended") =>
     ok(client.PUT("/buckets/{bucket}/versioning", { params: bucketPath(bucket), body: { status } })),
 };

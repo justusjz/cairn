@@ -8,6 +8,14 @@
 //! Both are routed alike: a virtual-hosted request is turned into the path a
 //! path-style one would have (see `Route`). Only its signature is checked
 //! against the path it came with, which is the one its client signed.
+//!
+//! A bucket's website (see `s3::website`) is reached at hosts of its own, as
+//! S3's website endpoints are: with `--website-domain` set, a request to a
+//! subdomain of it is one to its bucket's website. A listener of the
+//! websites' own (`--listen-website`) takes every request as one, to the
+//! bucket its host names: a subdomain of the website domain, or else all of
+//! the host, as S3's website endpoints take a host that isn't theirs (a
+//! custom domain, whose bucket has its name: `www.example.com`).
 
 use hyper::{HeaderMap, header};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -25,25 +33,46 @@ pub struct Route {
     pub path: String,
     /// Whether the bucket was in the request's host, not its path.
     pub virtual_host: bool,
+    /// Whether it's a request to the bucket's website (see `s3::website`).
+    pub website: bool,
 }
 
 impl Route {
-    /// The route of a request to `path` with `headers`, under `domain` (see
-    /// `parse_domain`), if there's one.
-    pub fn of(domain: Option<&str>, headers: &HeaderMap, path: &str) -> Route {
+    /// The route of a request to `path` with `headers`, under `domain` and
+    /// `website_domain` (see `parse_domain`), if there are any.
+    pub fn of(domain: Option<&str>, website_domain: Option<&str>, headers: &HeaderMap, path: &str) -> Route {
         let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+        // The websites' first: their domain may be a subdomain of the API's.
+        if let Some(bucket) = website_domain.zip(host).and_then(|(domain, host)| bucket_of(domain, host)) {
+            return Route { path: in_bucket(&bucket, path), virtual_host: true, website: true };
+        }
         match domain.zip(host).and_then(|(domain, host)| bucket_of(domain, host)) {
-            Some(bucket) => Route {
-                path: format!(
-                    "/{}/{}",
-                    utf8_percent_encode(&bucket, BUCKET_ESCAPES),
-                    path.strip_prefix('/').unwrap_or(path)
-                ),
-                virtual_host: true,
-            },
-            None => Route { path: path.to_owned(), virtual_host: false },
+            Some(bucket) => Route { path: in_bucket(&bucket, path), virtual_host: true, website: false },
+            None => Route { path: path.to_owned(), virtual_host: false, website: false },
         }
     }
+
+    /// The route of a request to `path` with `headers` on the websites'
+    /// own listener: to the website of the bucket its host names, a
+    /// subdomain of `website_domain`, or else the whole host (no bucket, if
+    /// it has none, or it's an IPv6 address).
+    pub fn website(website_domain: Option<&str>, headers: &HeaderMap, path: &str) -> Route {
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+        let bucket = match website_domain.and_then(|domain| bucket_of(domain, host)) {
+            Some(bucket) => bucket,
+            None if host.starts_with('[') => String::new(),
+            None => {
+                let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
+                name.trim_end_matches('.').to_ascii_lowercase()
+            }
+        };
+        Route { path: in_bucket(&bucket, path), virtual_host: true, website: true }
+    }
+}
+
+/// The path-style path of `path` (a request's) in `bucket`.
+fn in_bucket(bucket: &str, path: &str) -> String {
+    format!("/{}/{}", utf8_percent_encode(bucket, BUCKET_ESCAPES), path.strip_prefix('/').unwrap_or(path))
 }
 
 /// The bucket `host` (a `Host` header, maybe with a port) names, if it's a
@@ -78,7 +107,8 @@ mod tests {
     fn route(domain: Option<&str>, host: &str, path: &str) -> (String, bool) {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, host.parse().unwrap());
-        let route = Route::of(domain, &headers, path);
+        let route = Route::of(domain, None, &headers, path);
+        assert!(!route.website);
         (route.path, route.virtual_host)
     }
 
@@ -117,7 +147,35 @@ mod tests {
         // Without a domain, every request is.
         assert_eq!(route(None, "b.s3.example.com", "/b/k"), path("/b/k"));
         // So is one without a host.
-        assert_eq!(Route::of(d, &HeaderMap::new(), "/b/k"), Route { path: "/b/k".to_owned(), virtual_host: false });
+        let none = Route { path: "/b/k".to_owned(), virtual_host: false, website: false };
+        assert_eq!(Route::of(d, Some("s3-website.example.com"), &HeaderMap::new(), "/b/k"), none);
+    }
+
+    fn headers(host: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, host.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn websites() {
+        let (d, w) = (Some("s3.example.com"), Some("s3-website.example.com"));
+        let website = |path: &str| Route { path: path.to_owned(), virtual_host: true, website: true };
+        assert_eq!(Route::of(d, w, &headers("b.s3-website.example.com"), "/a/k"), website("/b/a/k"));
+        assert_eq!(Route::of(d, w, &headers("My.Site.S3-Website.Example.com:80"), "/"), website("/my.site/"));
+        // A website domain under the API's is the websites'.
+        let w = Some("web.s3.example.com");
+        assert_eq!(Route::of(d, w, &headers("b.web.s3.example.com"), "/k"), website("/b/k"));
+        assert!(!Route::of(d, w, &headers("b.s3.example.com"), "/k").website);
+        assert!(!Route::of(d, w, &headers("web.s3.example.com"), "/b/k").website);
+
+        // The websites' own listener: any host is a bucket's.
+        let w = Some("s3-website.example.com");
+        assert_eq!(Route::website(w, &headers("b.s3-website.example.com:8080"), "/k"), website("/b/k"));
+        assert_eq!(Route::website(w, &headers("WWW.Example.com."), "/"), website("/www.example.com/"));
+        assert_eq!(Route::website(None, &headers("www.example.com:8080"), "/a"), website("/www.example.com/a"));
+        assert_eq!(Route::website(w, &headers("[::1]:8080"), "/k"), website("//k"));
+        assert_eq!(Route::website(w, &HeaderMap::new(), "/k"), website("//k"));
     }
 
     #[test]

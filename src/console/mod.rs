@@ -1005,10 +1005,10 @@ mod e2e {
         assert_eq!(tenant.send("DELETE", "/api/oidc/mock", None).await.0, StatusCode::NO_CONTENT);
     }
 
-    /// Bucket and object tags and CORS, set as S3 sets them (and checked as
-    /// it checks them), by whom S3's actions allow.
+    /// Bucket and object tags, CORS and websites, set as S3 sets them (and
+    /// checked as it checks them), by whom S3's actions allow.
     #[tokio::test]
-    async fn edits_tags_and_cors() {
+    async fn edits_tags_cors_and_websites() {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let client = app.pool.get().await.unwrap();
@@ -1050,6 +1050,26 @@ mod e2e {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
         assert_eq!(reader.send("DELETE", &path, None).await.0, StatusCode::FORBIDDEN);
         assert_eq!(admin.send("DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
+
+        let path = format!("/api/buckets/{bucket}/website");
+        let (_, website) = admin.send("GET", &path, None).await;
+        assert_eq!(website["configuration"], Value::Null);
+        let site = json!({
+            "index_document": "index.html",
+            "error_document": "404.html",
+            "routing_rules": [{ "condition": { "key_prefix_equals": "docs/" }, "redirect": { "replace_key_prefix_with": "documents/" } }],
+        });
+        assert_eq!(reader.send("PUT", &path, Some(site.clone())).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("PUT", &path, Some(site.clone())).await.0, StatusCode::NO_CONTENT);
+        let (_, website) = reader.send("GET", &path, None).await;
+        assert_eq!(website["configuration"], site);
+        let bad = json!({ "error_document": "404.html" });
+        let (status, err) = admin.send("PUT", &path, Some(bad)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{err}");
+        assert_eq!(reader.send("DELETE", &path, None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
+        let (_, website) = admin.send("GET", &path, None).await;
+        assert_eq!(website["configuration"], Value::Null);
     }
 
     impl Browser {
