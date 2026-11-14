@@ -164,7 +164,7 @@ export function Loading(props: { error?: string }) {
   );
 }
 
-/** A modal showing a role's new secret, which is shown only this once. */
+/** A modal showing a user's new secret, which is shown only this once. */
 /** A new secret access key, with the ID clients sign as (`id`), shown once. */
 export function SecretDialog(props: { id: string; secret: string; onClose: () => void }) {
   let dialog!: HTMLDialogElement;

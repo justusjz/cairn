@@ -19,7 +19,7 @@ use crate::{
     auth::Signed,
     db::Cached,
     policy::{Context, Kind, Network, Policy, Principal as Who, Verdict},
-    roles::Principal,
+    users::Principal,
     s3::{
         actions::{self, Check, On},
         util::{format_s3_error, query_param},

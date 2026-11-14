@@ -51,12 +51,12 @@ mod nodes;
 mod packer;
 mod payload;
 mod policy;
-mod roles;
 mod s3;
 mod scrub;
 mod settings;
 mod shards;
 mod store;
+mod users;
 mod writing;
 
 pub struct App {
@@ -165,7 +165,7 @@ enum Command {
     Serve(ServeArgs),
     /// Manage users: their S3 access keys, bucket permissions and policies.
     #[command(alias = "role")]
-    User(roles::RoleArgs),
+    User(users::UserArgs),
     /// Show the account (Cairn has one).
     Account(accounts::AccountArgs),
     /// Configure the OpenID Connect providers people may sign in to the
@@ -363,11 +363,11 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(apply_lifecycles(app.clone()));
     tokio::spawn(scrub::run(app.clone()));
     tokio::spawn(mover::run(app.clone()));
-    // The roles' identities in the KMS, now rather than in a minute.
+    // The users' identities in the KMS, now rather than in a minute.
     let identifying = app.clone();
     tokio::spawn(async move {
-        if let Err(e) = roles::identify(&identifying).await {
-            eprintln!("kms: identifying roles: {e:#}");
+        if let Err(e) = users::identify(&identifying).await {
+            eprintln!("kms: identifying users: {e:#}");
         }
     });
 
@@ -452,8 +452,8 @@ async fn maintain(app: Arc<App>) {
         // than ending maintenance on this node.
         let pass = tokio::spawn(async move {
             let app = task_app;
-            if let Err(e) = roles::identify(&app).await {
-                eprintln!("kms: identifying roles: {e:#}");
+            if let Err(e) = users::identify(&app).await {
+                eprintln!("kms: identifying users: {e:#}");
             }
             match app.pool.get().await {
                 Ok(client) => {

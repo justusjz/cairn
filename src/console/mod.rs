@@ -37,7 +37,7 @@ use std::net::SocketAddr;
 
 use axum::extract::ConnectInfo;
 
-use crate::{App, roles::Principal};
+use crate::{App, users::Principal};
 
 pub(crate) mod actor;
 mod api;
@@ -331,7 +331,7 @@ mod e2e {
 
     use super::webauthn::tests::{Authenticator, party};
     use super::*;
-    use crate::roles;
+    use crate::users;
 
     /// The console's spec, as the UI's types are generated from it.
     /// `CAIRN_UPDATE_OPENAPI=1 cargo test openapi` updates it.
@@ -445,7 +445,7 @@ mod e2e {
     async fn enrolls_signs_in_and_manages_passkeys() {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
         let client = app.pool.get().await.unwrap();
-        roles::create(&client, "ada", None, true).await.unwrap();
+        users::create(&client, "ada", None, true).await.unwrap();
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
 
@@ -453,7 +453,7 @@ mod e2e {
         assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
 
         // The link.
-        let token = store::create_enrollment(&client, &crate::roles::account(&client).await.unwrap(), "ada").await.unwrap();
+        let token = store::create_enrollment(&client, &crate::users::account(&client).await.unwrap(), "ada").await.unwrap();
         let (status, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
         assert_eq!(status, StatusCode::OK, "{ceremony}");
         assert_eq!(ceremony["identity"], "ada");
@@ -532,7 +532,7 @@ mod e2e {
         laptop.counter = 20;
         let (status, _) = sign_in(&mut browser, &mut laptop).await;
         assert_eq!(status, StatusCode::OK);
-        roles::delete(&client, &crate::roles::account(&client).await.unwrap(), "ada").await.unwrap();
+        users::delete(&client, &crate::users::account(&client).await.unwrap(), "ada").await.unwrap();
         assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
         assert_eq!(store::reap(&client).await.unwrap(), 0);
     }
@@ -547,7 +547,7 @@ mod e2e {
     pub(super) async fn superadmin(console: &Arc<Console>, name: &str) -> Browser {
         let browser = signed_in(console, name, false).await;
         let client = console.app.pool.get().await.unwrap();
-        let account = crate::roles::account(&client).await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
         let arn = crate::managed::aws_arn("CairnOperatorAccess");
         crate::managed::attach(&client, &account, name, &arn, true).await.unwrap();
         browser
@@ -556,8 +556,8 @@ mod e2e {
     /// A browser signed in as a new user `name` (with a passkey of its own).
     pub(super) async fn signed_in(console: &Arc<Console>, name: &str, admin: bool) -> Browser {
         let client = console.app.pool.get().await.unwrap();
-        roles::create(&client, name, None, admin).await.unwrap();
-        let account = crate::roles::account(&client).await.unwrap();
+        users::create(&client, name, None, admin).await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
         let token = store::create_enrollment(&client, &account, name).await.unwrap();
         enrolled(console, &token).await
     }
@@ -623,13 +623,13 @@ mod e2e {
             err["error"].as_str().unwrap(),
             format!(
                 "User: arn:aws:iam::{}:user/none is not authorized to perform: s3:ListBucket on resource: \"arn:aws:s3:::{bucket}\" because no identity-based policy allows the s3:ListBucket action",
-                roles::account(&client).await.unwrap()
+                users::account(&client).await.unwrap()
             )
         );
 
         // A reader sees only its bucket, lists and downloads, but can't write.
         let mut reader = signed_in(&console, "reader", false).await;
-        roles::grant(&client, &crate::roles::account(&client).await.unwrap(), "reader", bucket, &[roles::Permission::Read]).await.unwrap();
+        users::grant(&client, &crate::users::account(&client).await.unwrap(), "reader", bucket, &[users::Permission::Read]).await.unwrap();
         let (_, buckets) = reader.send("GET", "/api/buckets", None).await;
         let names: Vec<_> = buckets.as_array().unwrap().iter().map(|b| b["name"].as_str().unwrap()).collect();
         assert_eq!(names, [bucket]);
@@ -638,7 +638,7 @@ mod e2e {
 
         // A writer uploads; the reader then lists and reads it.
         let mut writer = signed_in(&console, "writer", false).await;
-        roles::grant(&client, &crate::roles::account(&client).await.unwrap(), "writer", bucket, &[roles::Permission::Write]).await.unwrap();
+        users::grant(&client, &crate::users::account(&client).await.unwrap(), "writer", bucket, &[users::Permission::Write]).await.unwrap();
         let path = format!("/api/buckets/{bucket}/object?key=dir%2Fhello.txt");
         assert_eq!(writer.upload(&path, b"hello").await, StatusCode::NO_CONTENT);
         let (status, listing) = reader.send("GET", &format!("/api/buckets/{bucket}/objects?prefix=dir%2F"), None).await;
@@ -661,7 +661,7 @@ mod e2e {
         assert_eq!(&resp.into_body().collect().await.unwrap().to_bytes()[..], b"hello");
 
         // A bucket policy's Deny wins over the writer's grant.
-        let account = roles::account(&client).await.unwrap();
+        let account = users::account(&client).await.unwrap();
         let deny = format!(
             r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":{{"AWS":"arn:aws:iam::{account}:user/writer"}},"Action":"s3:DeleteObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
         );
@@ -689,26 +689,26 @@ mod e2e {
 
         // Users, as IAM's actions: the admin (AdministratorAccess) manages
         // its account's; a user without IAM permissions may do none of it.
-        let (status, err) = writer.send("GET", "/api/roles", None).await;
+        let (status, err) = writer.send("GET", "/api/users", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(err["error"].as_str().unwrap().contains("iam:ListUsers"), "{err}");
         let new_user = json!({ "name": "made-in-console", "admin": false });
-        assert_eq!(writer.send("POST", "/api/roles", Some(new_user.clone())).await.0, StatusCode::FORBIDDEN);
-        let (status, made) = admin.send("POST", "/api/roles", Some(new_user)).await;
+        assert_eq!(writer.send("POST", "/api/users", Some(new_user.clone())).await.0, StatusCode::FORBIDDEN);
+        let (status, made) = admin.send("POST", "/api/users", Some(new_user)).await;
         assert_eq!(status, StatusCode::CREATED, "{made}");
-        let (_, users) = admin.send("GET", "/api/roles", None).await;
+        let (_, users) = admin.send("GET", "/api/users", None).await;
         let names: Vec<_> = users.as_array().unwrap().iter().map(|u| u["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"made-in-console") && names.contains(&"writer"), "{names:?}");
-        let (status, _) = admin.send("POST", "/api/roles/made-in-console/keys", None).await;
+        let (status, _) = admin.send("POST", "/api/users/made-in-console/keys", None).await;
         assert_eq!(status, StatusCode::CREATED);
         // An inline policy may give a user IAM permissions on itself only,
         // as AWS's self-service policies do.
         let own = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:CreateAccessKey","iam:ListUsers"],"Resource":"arn:aws:iam::*:user/${aws:username}"}]}"#;
-        let (status, err) = admin.send("PUT", "/api/roles/writer/policies/self", Some(json!({ "document": own }))).await;
+        let (status, err) = admin.send("PUT", "/api/users/writer/policies/self", Some(json!({ "document": own }))).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
-        assert_eq!(writer.send("POST", "/api/roles/writer/keys", None).await.0, StatusCode::CREATED);
-        assert_eq!(writer.send("POST", "/api/roles/reader/keys", None).await.0, StatusCode::FORBIDDEN);
-        let (status, err) = admin.send("DELETE", "/api/roles/stranger", None).await;
+        assert_eq!(writer.send("POST", "/api/users/writer/keys", None).await.0, StatusCode::CREATED);
+        assert_eq!(writer.send("POST", "/api/users/reader/keys", None).await.0, StatusCode::FORBIDDEN);
+        let (status, err) = admin.send("DELETE", "/api/users/stranger", None).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(err["error"], "no user named \"stranger\"");
     }
@@ -723,7 +723,7 @@ mod e2e {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let client = app.pool.get().await.unwrap();
-        let account = crate::roles::account(&client).await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
         let mut admin = signed_in(&console, "root-ish", true).await;
         let mut boss = signed_in(&console, "boss", false).await;
 
@@ -741,16 +741,16 @@ mod e2e {
             { "Effect": "Deny", "Action": "iam:DeleteUserPermissionsBoundary", "Resource": "*" },
         ]});
         let (status, err) = admin
-            .send("PUT", "/api/roles/boss/policies/delegated", Some(json!({ "document": delegated.to_string() })))
+            .send("PUT", "/api/users/boss/policies/delegated", Some(json!({ "document": delegated.to_string() })))
             .await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
-        let (status, err) = admin.send("PATCH", "/api/roles/boss", Some(json!({ "path": "/team/" }))).await;
+        let (status, err) = admin.send("PATCH", "/api/users/boss", Some(json!({ "path": "/team/" }))).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
-        let (status, err) = admin.send("PUT", "/api/roles/boss/boundary", Some(json!({ "arn": arn }))).await;
+        let (status, err) = admin.send("PUT", "/api/users/boss/boundary", Some(json!({ "arn": arn }))).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
 
         // It lists the users under its path (itself), not the others.
-        let (status, listed) = boss.send("GET", "/api/roles", None).await;
+        let (status, listed) = boss.send("GET", "/api/users", None).await;
         assert_eq!(status, StatusCode::OK, "{listed}");
         let names: Vec<_> = listed.as_array().unwrap().iter().map(|u| u["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["boss"]);
@@ -761,14 +761,14 @@ mod e2e {
         let new = |name: &str, path: &str, boundary: Option<&str>| {
             json!({ "name": name, "path": path, "boundary": boundary, "tags": [{ "key": "team", "value": "a" }] })
         };
-        let (status, err) = boss.send("POST", "/api/roles", Some(new("made", "/team/", None))).await;
+        let (status, err) = boss.send("POST", "/api/users", Some(new("made", "/team/", None))).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
         assert!(err["error"].as_str().unwrap().contains("iam:CreateUser"), "{err}");
-        let (status, _) = boss.send("POST", "/api/roles", Some(new("made", "/", Some(&arn)))).await;
+        let (status, _) = boss.send("POST", "/api/users", Some(new("made", "/", Some(&arn)))).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
-        let (status, err) = boss.send("POST", "/api/roles", Some(new("made", "/team/", Some(&arn)))).await;
+        let (status, err) = boss.send("POST", "/api/users", Some(new("made", "/team/", Some(&arn)))).await;
         assert_eq!(status, StatusCode::CREATED, "{err}");
-        let (status, err) = boss.send("DELETE", "/api/roles/made/boundary", None).await;
+        let (status, err) = boss.send("DELETE", "/api/users/made/boundary", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
         assert!(err["error"].as_str().unwrap().contains("explicit deny in an identity-based policy"), "{err}");
         // Its own s3 permissions are its boundary's at most: none.
@@ -777,9 +777,9 @@ mod e2e {
 
         // The admin sees it all, and changes tags; the boundary stays until
         // it's taken off, and can't be deleted till then.
-        let (status, err) = admin.send("PUT", "/api/roles/made/tags", Some(json!({ "tags": [{ "key": "Team", "value": "b" }] }))).await;
+        let (status, err) = admin.send("PUT", "/api/users/made/tags", Some(json!({ "tags": [{ "key": "Team", "value": "b" }] }))).await;
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
-        let (_, listed) = admin.send("GET", "/api/roles", None).await;
+        let (_, listed) = admin.send("GET", "/api/users", None).await;
         let made = listed.as_array().unwrap().iter().find(|u| u["name"] == "made").unwrap();
         assert_eq!(made["path"], "/team/");
         assert_eq!(made["boundary"], arn);
@@ -789,7 +789,7 @@ mod e2e {
         assert_eq!(p["bounds"], json!(["boss", "made"]));
         let (status, _) = admin.send("DELETE", "/api/policies/bound", None).await;
         assert_eq!(status, StatusCode::CONFLICT);
-        let (status, _) = admin.send("PATCH", "/api/roles/made", Some(json!({ "name": "BOSS" }))).await;
+        let (status, _) = admin.send("PATCH", "/api/users/made", Some(json!({ "name": "BOSS" }))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "names are unique regardless of case");
     }
 
@@ -818,7 +818,7 @@ mod e2e {
 
         let mut dora = signed_in(&console, "dora", false).await;
         assert_eq!(dora.send("GET", "/api/me", None).await.0, StatusCode::OK);
-        roles::delete(&client, &crate::roles::account(&client).await.unwrap(), "dora").await.unwrap();
+        users::delete(&client, &crate::users::account(&client).await.unwrap(), "dora").await.unwrap();
         assert_eq!(dora.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
     }
 
@@ -852,7 +852,7 @@ mod e2e {
         let (_, buckets) = ops.send("GET", "/api/buckets", None).await;
         assert_eq!(buckets, json!([]));
         assert_eq!(ops.send("GET", &format!("/api/buckets/{bucket}/objects"), None).await.0, StatusCode::FORBIDDEN);
-        assert_eq!(ops.send("GET", "/api/roles", None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(ops.send("GET", "/api/users", None).await.0, StatusCode::FORBIDDEN);
         assert_eq!(admin.send("GET", &format!("/api/buckets/{bucket}/objects"), None).await.0, StatusCode::OK);
     }
 
@@ -864,14 +864,14 @@ mod e2e {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let client = app.pool.get().await.unwrap();
-        let account = crate::roles::account(&client).await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
         let mut ops = signed_in(&console, "guarded", false).await;
         let guarded = r#"{"Version":"2012-10-17","Statement":[
             {"Effect":"Allow","Action":"cairn:*","Resource":"*"},
             {"Effect":"Deny","Action":"cairn:*","Resource":"*","Condition":{"BoolIfExists":{"aws:MultiFactorAuthPresent":"false"}}},
             {"Effect":"Deny","Action":"cairn:PutSetting","Resource":"*","Condition":{"NumericGreaterThan":{"aws:MultiFactorAuthAge":"600"}}}
         ]}"#;
-        roles::put_policy(&client, &account, "guarded", "guarded", guarded).await.unwrap();
+        users::put_policy(&client, &account, "guarded", "guarded", guarded).await.unwrap();
         let (_, me) = ops.send("GET", "/api/me", None).await;
         assert_eq!((&me["mfa"], &me["cluster"]), (&json!(true), &json!(true)));
         assert_eq!(ops.send("GET", "/api/cluster", None).await.0, StatusCode::OK);
@@ -881,7 +881,7 @@ mod e2e {
         let rate = Some(json!({ "rate": 5 }));
         assert_eq!(ops.send("PUT", "/api/lifecycle/rate", rate).await.0, StatusCode::FORBIDDEN);
         // Its access keys have neither: the guard denies them.
-        let user = Principal::load_user(&client, crate::roles::id_of(&client, &account, "guarded").await.unwrap()).await.unwrap().unwrap();
+        let user = Principal::load_user(&client, crate::users::id_of(&client, &account, "guarded").await.unwrap()).await.unwrap().unwrap();
         let origin = crate::s3::access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
         let access = crate::s3::access::Access::new(Some(&user), &account, &Method::GET, &HeaderMap::new(), "", &origin).unwrap();
         let check = crate::s3::actions::Check { action: "cairn:GetCluster", on: crate::s3::actions::On::Cluster };
@@ -952,8 +952,8 @@ mod e2e {
         assert!(stranger.cookie.is_none());
 
         // Enrolling through a link: a new login, signed in at the provider.
-        roles::create(&client, "sam", None, false).await.unwrap();
-        let token = store::create_enrollment(&client, &crate::roles::account(&client).await.unwrap(), "sam").await.unwrap();
+        users::create(&client, "sam", None, false).await.unwrap();
+        let token = store::create_enrollment(&client, &crate::users::account(&client).await.unwrap(), "sam").await.unwrap();
         let mut sam = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let url = sam.start_oidc(json!({ "purpose": "enroll", "token": token })).await;
         let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
@@ -1015,7 +1015,7 @@ mod e2e {
         crate::e2e::put(&app, "t.txt", b"t".to_vec()).await;
         let mut admin = signed_in(&console, "admin", true).await;
         let mut reader = signed_in(&console, "reader", false).await;
-        roles::grant(&client, &crate::roles::account(&client).await.unwrap(), "reader", bucket, &[roles::Permission::Read]).await.unwrap();
+        users::grant(&client, &crate::users::account(&client).await.unwrap(), "reader", bucket, &[users::Permission::Read]).await.unwrap();
 
         let tags = json!({ "tags": [{ "key": "team", "value": "a" }, { "key": "cost", "value": "1" }] });
         let path = format!("/api/buckets/{bucket}/tags");
@@ -1080,8 +1080,8 @@ mod e2e {
         let client = app.pool.get().await.unwrap();
         let bucket = crate::e2e::BUCKET;
         let mut writer = signed_in(&console, "w", false).await;
-        let account = crate::roles::account(&client).await.unwrap();
-        roles::grant(&client, &account, "w", bucket, &[roles::Permission::Write, roles::Permission::Read]).await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
+        users::grant(&client, &account, "w", bucket, &[users::Permission::Write, users::Permission::Read]).await.unwrap();
 
         let start = |key: &str| json!({ "key": key, "content_type": "application/x-test" });
         let (status, started) = writer.send("POST", &format!("/api/buckets/{bucket}/uploads"), Some(start("big.bin"))).await;

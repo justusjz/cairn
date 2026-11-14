@@ -11,26 +11,26 @@
 //! only with the same. Not `encrypt`, which creates a key that doesn't exist
 //! yet if the token may, so that a mistyped key name would make a new key.
 //!
-//! Cairn calls them as the S3 role that made the request, so that the KMS
-//! decides which roles may use which keys: key owners grant them in OpenBao.
-//! Each Cairn role has an OpenBao identity (an entity) of its own, which
+//! Cairn calls them as the S3 user that made the request, so that the KMS
+//! decides which users may use which keys: key owners grant them in OpenBao.
+//! Each Cairn user has an OpenBao identity (an entity) of its own, which
 //! Cairn logs in as through a JWT auth mount of its own: a JWT that it signs
-//! with its private key (Ed25519), naming the role by its ID. OpenBao trusts
-//! Cairn to name the right role, as AWS KMS trusts S3; it can't check that
+//! with its private key (Ed25519), naming the user by its ID. OpenBao trusts
+//! Cairn to name the right user, as AWS KMS trusts S3; it can't check that
 //! itself, since only Cairn can tell who signed an S3 request.
 //!
 //! That mount must be Cairn's alone, map no claims to groups or metadata
 //! (`groups_claim`, `claim_mappings`: Cairn would choose them), and give its
 //! tokens no policy but `default`, and Cairn's aliases must never be attached
 //! to another entity: then Cairn can use exactly what key owners granted its
-//! roles, and nothing else in OpenBao.
+//! users, and nothing else in OpenBao.
 //!
-//! A role's token is kept until two thirds of its TTL have passed. OpenBao
+//! A user's token is kept until two thirds of its TTL have passed. OpenBao
 //! applies grants and revocations to tokens already issued, so that doesn't
 //! delay them.
 //!
 //! For SSE-S3, Cairn uses one key (`--kms-sse-s3-key`) as itself: its own
-//! identity, with the subject `cairn` (roles' are UUIDs), which the KMS's
+//! identity, with the subject `cairn` (users' are UUIDs), which the KMS's
 //! admin grants that key. As S3's bucket keys do, a node reuses a data key
 //! from it for an hour of writes, and keeps the data keys it opened for an
 //! hour after their last use: so the KMS sees a few calls an hour, not one a
@@ -91,7 +91,7 @@ pub struct KmsArgs {
     /// for SSE-KMS are refused (501).
     #[arg(long, env = "CAIRN_KMS_ADDRESS")]
     pub kms_address: Option<String>,
-    /// PEM file of the Ed25519 private key Cairn signs its roles' logins to
+    /// PEM file of the Ed25519 private key Cairn signs its users' logins to
     /// the KMS with. The same on every node; the KMS's JWT auth mount for
     /// Cairn trusts its public key.
     #[arg(long, env = "CAIRN_KMS_JWT_KEY")]
@@ -151,18 +151,18 @@ fn valid_segment(segment: &str) -> bool {
         && segment.bytes().all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
-/// Who Cairn asks the KMS as: a role, or itself (for SSE-S3).
+/// Who Cairn asks the KMS as: a user, or itself (for SSE-S3).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Identity {
-    Role(Uuid),
+    User(Uuid),
     Cairn,
 }
 
 impl Identity {
-    /// The subject of its JWTs: the role's ID, or `cairn`.
+    /// The subject of its JWTs: the user's ID, or `cairn`.
     pub fn subject(self) -> String {
         match self {
-            Identity::Role(role) => role.to_string(),
+            Identity::User(user) => user.to_string(),
             Identity::Cairn => "cairn".to_owned(),
         }
     }
@@ -179,11 +179,11 @@ struct Token {
 pub enum KmsError {
     /// There's no key of that name.
     NoSuchKey,
-    /// The KMS refused the role the key (no policy grants it).
+    /// The KMS refused the user the key (no policy grants it).
     Denied,
     /// The KMS couldn't be reached, or failed.
     Unavailable(anyhow::Error),
-    /// The KMS refused Cairn's login as a role: its setup for Cairn is
+    /// The KMS refused Cairn's login as a user: its setup for Cairn is
     /// wrong. What's likely wrong.
     LoginRefused(String),
     /// The KMS refused the request otherwise: say, a ciphertext that isn't
@@ -195,7 +195,7 @@ impl std::fmt::Display for KmsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KmsError::NoSuchKey => write!(f, "the KMS has no such key"),
-            KmsError::Denied => write!(f, "the KMS refused the role the key"),
+            KmsError::Denied => write!(f, "the KMS refused the user the key"),
             KmsError::Unavailable(e) => write!(f, "the KMS is unavailable: {e:#}"),
             KmsError::LoginRefused(why) => write!(f, "the KMS refused Cairn's login: {why}"),
             KmsError::Failed(message) => write!(f, "the KMS refused the request: {message}"),
@@ -218,8 +218,8 @@ pub struct Kms {
     signer: ring::signature::Ed25519KeyPair,
     auth_mount: String,
     auth_role: String,
-    /// Each role's token, by role ID, each behind a lock of its own, so that
-    /// one role's login doesn't hold up another's calls.
+    /// Each user's token, by user ID, each behind a lock of its own, so that
+    /// one user's login doesn't hold up another's calls.
     tokens: std::sync::Mutex<HashMap<Identity, Arc<Mutex<Option<Token>>>>>,
     /// How this node's logins went, for the console.
     logins: std::sync::Mutex<Logins>,
@@ -250,7 +250,7 @@ pub struct Logins {
     pub last_success: Option<f64>,
 }
 
-/// A login to the KMS as a role.
+/// A login to the KMS as a user.
 #[derive(Clone)]
 pub struct Login {
     /// When, in seconds since the Unix epoch.

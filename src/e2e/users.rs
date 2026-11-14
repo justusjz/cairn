@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::{BUCKET, node_with};
 use crate::{
     App, packer,
-    roles::{self, Principal},
+    users::{self, Principal},
 };
 
 async fn node() -> Option<Arc<App>> {
@@ -23,50 +23,50 @@ async fn legacy_secret(app: &App, user: &str) -> String {
 async fn a_user_signs_with_any_of_its_active_keys() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let secret = roles::create(&client, "alice", None, false).await.unwrap();
+    let secret = users::create(&client, "alice", None, false).await.unwrap();
     let principal = Principal::load(&client, "alice").await.unwrap().unwrap();
     assert_eq!((principal.name.as_str(), principal.secret.as_str()), ("alice", secret.as_str()));
-    assert_eq!(principal.account, roles::account(&client).await.unwrap());
+    assert_eq!(principal.account, users::account(&client).await.unwrap());
     assert_eq!(principal.account.len(), 12);
 
-    let (id, second) = roles::create_key(&client, &crate::roles::account(&client).await.unwrap(), "alice", None, None).await.unwrap();
+    let (id, second) = users::create_key(&client, &crate::users::account(&client).await.unwrap(), "alice", None, None).await.unwrap();
     assert_eq!(id.len(), 20);
     assert_eq!(Principal::load(&client, &id).await.unwrap().unwrap().secret, second);
     // At most two, as in IAM.
-    let third = roles::create_key(&client, &crate::roles::account(&client).await.unwrap(), "alice", None, None).await.unwrap_err();
+    let third = users::create_key(&client, &crate::users::account(&client).await.unwrap(), "alice", None, None).await.unwrap_err();
     assert!(third.to_string().contains("2 access keys"), "{third}");
-    assert!(roles::create_key(&client, &crate::roles::account(&client).await.unwrap(), "nobody", None, None).await.unwrap_err().to_string().contains("no user"));
+    assert!(users::create_key(&client, &crate::users::account(&client).await.unwrap(), "nobody", None, None).await.unwrap_err().to_string().contains("no user"));
 
-    roles::set_key_active(&client, None, &id, false).await.unwrap();
+    users::set_key_active(&client, None, &id, false).await.unwrap();
     assert!(Principal::load(&client, &id).await.unwrap().is_none());
-    roles::set_key_active(&client, None, &id, true).await.unwrap();
+    users::set_key_active(&client, None, &id, true).await.unwrap();
     assert!(Principal::load(&client, &id).await.unwrap().is_some());
     // Only the user's own, when the user is named (as the console does).
-    roles::create(&client, "mallory", None, false).await.unwrap();
-    assert!(roles::set_key_active(&client, Some((&crate::roles::account(&client).await.unwrap(), "mallory")), &id, false).await.is_err());
-    assert!(roles::delete_key(&client, Some((&crate::roles::account(&client).await.unwrap(), "mallory")), &id).await.is_err());
+    users::create(&client, "mallory", None, false).await.unwrap();
+    assert!(users::set_key_active(&client, Some((&crate::users::account(&client).await.unwrap(), "mallory")), &id, false).await.is_err());
+    assert!(users::delete_key(&client, Some((&crate::users::account(&client).await.unwrap(), "mallory")), &id).await.is_err());
     assert!(Principal::load(&client, &id).await.unwrap().is_some());
-    roles::delete_key(&client, Some((&crate::roles::account(&client).await.unwrap(), "alice")), &id).await.unwrap();
+    users::delete_key(&client, Some((&crate::users::account(&client).await.unwrap(), "alice")), &id).await.unwrap();
     assert!(Principal::load(&client, &id).await.unwrap().is_none());
-    assert!(roles::delete_key(&client, None, &id).await.is_err());
+    assert!(users::delete_key(&client, None, &id).await.is_err());
 
     // A new user's key is of a random ID, as IAM's, not its name; older
     // Cairns, which know only keys named as users, get no usable secret.
-    roles::create_key(&client, &crate::roles::account(&client).await.unwrap(), "alice", Some("shared".to_owned()), None).await.unwrap();
-    let account = crate::roles::account(&client).await.unwrap();
-    let (key, secret) = roles::create_for(&client, &account, "shared", None, false).await.unwrap();
+    users::create_key(&client, &crate::users::account(&client).await.unwrap(), "alice", Some("shared".to_owned()), None).await.unwrap();
+    let account = crate::users::account(&client).await.unwrap();
+    let (key, secret) = users::create_for(&client, &account, "shared", None, false).await.unwrap();
     assert_ne!(key, "shared");
     assert_eq!(key.len(), 20);
     assert_eq!(Principal::load(&client, &key).await.unwrap().unwrap().secret, secret);
     assert!(legacy_secret(&app, "shared").await.starts_with("unusable:"));
-    roles::delete(&client, &account, "shared").await.unwrap();
+    users::delete(&client, &account, "shared").await.unwrap();
 
-    let listed = roles::list(&client).await.unwrap();
+    let listed = users::list(&client).await.unwrap();
     let alice = listed.iter().find(|u| u.name == "alice").unwrap();
     assert_eq!(alice.keys.iter().map(|k| k.id.as_str()).collect::<Vec<_>>(), ["alice", "shared"]);
 
     // Deleting the user deletes its keys.
-    roles::delete(&client, &crate::roles::account(&client).await.unwrap(), "alice").await.unwrap();
+    users::delete(&client, &crate::users::account(&client).await.unwrap(), "alice").await.unwrap();
     assert!(Principal::load(&client, "shared").await.unwrap().is_none());
 }
 
@@ -77,20 +77,20 @@ async fn a_user_signs_with_any_of_its_active_keys() {
 async fn older_cairns_see_the_first_keys_secret_and_cant_change_users() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let secret = roles::create(&client, "bob", None, false).await.unwrap();
+    let secret = users::create(&client, "bob", None, false).await.unwrap();
     assert_eq!(legacy_secret(&app, "bob").await, secret);
-    let rotated = roles::generate_secret().unwrap();
-    roles::update(&client, &crate::roles::account(&client).await.unwrap(), "bob", None, Some(rotated.clone())).await.unwrap();
+    let rotated = users::generate_secret().unwrap();
+    users::update(&client, &crate::users::account(&client).await.unwrap(), "bob", None, Some(rotated.clone())).await.unwrap();
     assert_eq!(legacy_secret(&app, "bob").await, rotated);
     assert_eq!(Principal::load(&client, "bob").await.unwrap().unwrap().secret, rotated);
-    roles::set_key_active(&client, None, "bob", false).await.unwrap();
+    users::set_key_active(&client, None, "bob", false).await.unwrap();
     assert!(legacy_secret(&app, "bob").await.starts_with("unusable:"));
-    roles::set_key_active(&client, None, "bob", true).await.unwrap();
+    users::set_key_active(&client, None, "bob", true).await.unwrap();
     assert_eq!(legacy_secret(&app, "bob").await, rotated);
-    roles::delete_key(&client, None, "bob").await.unwrap();
+    users::delete_key(&client, None, "bob").await.unwrap();
     assert!(legacy_secret(&app, "bob").await.starts_with("unusable:"));
     // Without its first key, the user's other keys are rotated as keys.
-    let err = roles::update(&client, &crate::roles::account(&client).await.unwrap(), "bob", None, Some(rotated)).await.unwrap_err();
+    let err = users::update(&client, &crate::users::account(&client).await.unwrap(), "bob", None, Some(rotated)).await.unwrap_err();
     assert!(err.to_string().contains("no access key named as the user"), "{err}");
 
     // A session that doesn't declare `cairn.users` (an older Cairn's).
@@ -117,14 +117,14 @@ async fn older_cairns_see_the_first_keys_secret_and_cant_change_users() {
 async fn older_cairns_read_users_by_their_old_names() {
     let Some(app) = node().await else { return };
     let mut client = app.pool.get().await.unwrap();
-    let secret = roles::create(&client, "olaf", None, false).await.unwrap();
-    let account = crate::roles::account(&client).await.unwrap();
-    roles::put_policy(&client, &account, "olaf", "own", r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#)
+    let secret = users::create(&client, "olaf", None, false).await.unwrap();
+    let account = crate::users::account(&client).await.unwrap();
+    users::put_policy(&client, &account, "olaf", "own", r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#)
         .await
         .unwrap();
     crate::managed::attach(&client, &account, "olaf", "arn:aws:iam::aws:policy/CairnOperatorAccess", true).await.unwrap();
-    let id = crate::roles::id_of(&client, &account, "olaf").await.unwrap();
-    roles::tag(&client, id, &[("team".to_owned(), "a".to_owned())]).await.unwrap();
+    let id = crate::users::id_of(&client, &account, "olaf").await.unwrap();
+    users::tag(&client, id, &[("team".to_owned(), "a".to_owned())]).await.unwrap();
     // Cairn 0.6's query, but for its columns that came later.
     let row = client
         .query_one(
@@ -154,34 +154,34 @@ async fn older_cairns_read_users_by_their_old_names() {
 async fn inline_policies_are_checked_and_kept_as_given() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    roles::create(&client, "carol", None, false).await.unwrap();
+    users::create(&client, "carol", None, false).await.unwrap();
     let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject",
         "Resource":"arn:aws:s3:::bucket/home/${aws:username}/*"}]}"#;
-    roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home", document).await.unwrap();
-    assert_eq!(roles::get_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home").await.unwrap(), document);
+    users::put_policy(&client, &crate::users::account(&client).await.unwrap(), "carol", "home", document).await.unwrap();
+    assert_eq!(users::get_policy(&client, &crate::users::account(&client).await.unwrap(), "carol", "home").await.unwrap(), document);
     assert_eq!(Principal::load(&client, "carol").await.unwrap().unwrap().policies, [document]);
-    let listed = roles::list(&client).await.unwrap();
+    let listed = users::list(&client).await.unwrap();
     assert_eq!(listed.iter().find(|u| u.name == "carol").unwrap().policies, ["home"]);
 
     // Not an identity policy: refused, as IAM refuses it.
     let principal = r#"{"Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"*"}]}"#;
-    let err = roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "p", principal).await.unwrap_err();
+    let err = users::put_policy(&client, &crate::users::account(&client).await.unwrap(), "carol", "p", principal).await.unwrap_err();
     assert!(err.to_string().contains("principal"), "{err}");
-    assert!(roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "bad name", document).await.is_err());
-    assert!(roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "nobody", "home", document).await.is_err());
+    assert!(users::put_policy(&client, &crate::users::account(&client).await.unwrap(), "carol", "bad name", document).await.is_err());
+    assert!(users::put_policy(&client, &crate::users::account(&client).await.unwrap(), "nobody", "home", document).await.is_err());
     // At most 2048 characters together, whitespace aside.
     let big = format!(
         r#"{{"Statement":[{{"Sid":"{}","Effect":"Allow","Action":"s3:GetObject","Resource":"*"}}]}}"#,
         "x".repeat(1900)
     );
-    let err = roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "big", &big).await.unwrap_err();
+    let err = users::put_policy(&client, &crate::users::account(&client).await.unwrap(), "carol", "big", &big).await.unwrap_err();
     assert!(err.to_string().contains("2048"), "{err}");
     // Replacing a policy counts it once.
-    roles::put_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home", &big).await.unwrap();
+    users::put_policy(&client, &crate::users::account(&client).await.unwrap(), "carol", "home", &big).await.unwrap();
 
-    roles::delete_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home").await.unwrap();
-    assert!(roles::get_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home").await.is_err());
-    assert!(roles::delete_policy(&client, &crate::roles::account(&client).await.unwrap(), "carol", "home").await.is_err());
+    users::delete_policy(&client, &crate::users::account(&client).await.unwrap(), "carol", "home").await.unwrap();
+    assert!(users::get_policy(&client, &crate::users::account(&client).await.unwrap(), "carol", "home").await.is_err());
+    assert!(users::delete_policy(&client, &crate::users::account(&client).await.unwrap(), "carol", "home").await.is_err());
 }
 
 /// A bucket policy names a user as the one that had the name when it was
@@ -194,8 +194,8 @@ async fn bucket_policies_name_users_as_they_were() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
     let name = format!("bob-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    roles::create(&client, &name, None, false).await.unwrap();
-    let account = roles::account(&client).await.unwrap();
+    users::create(&client, &name, None, false).await.unwrap();
+    let account = users::account(&client).await.unwrap();
     let arn = format!("arn:aws:iam::{account}:user/{name}");
     let document = format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{arn}"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
@@ -227,8 +227,8 @@ async fn bucket_policies_name_users_as_they_were() {
     };
     assert!(shown(app.clone()).await.contains(&format!("\"AWS\":\"{arn}\"")));
 
-    roles::delete(&client, &crate::roles::account(&client).await.unwrap(), &name).await.unwrap();
-    roles::create(&client, &name, None, false).await.unwrap();
+    users::delete(&client, &crate::users::account(&client).await.unwrap(), &name).await.unwrap();
+    users::create(&client, &name, None, false).await.unwrap();
     let second = Principal::load(&client, &name).await.unwrap().unwrap();
     assert!(!allowed(second).await);
     assert!(shown(app.clone()).await.contains(&format!("\"AWS\":\"{first_id}\"")));
@@ -252,8 +252,8 @@ async fn attached(client: &deadpool_postgres::Object, account: &str, user: &str)
 async fn old_grants_move_into_managed_policies() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    roles::create(&client, "olga", None, false).await.unwrap();
-    let account = roles::account(&client).await.unwrap();
+    users::create(&client, "olga", None, false).await.unwrap();
+    let account = users::account(&client).await.unwrap();
     let mine = format!(
         r#"{{"Statement":[{{"Sid":"Mine","Effect":"Deny","Principal":"*","Action":"s3:DeleteBucket","Resource":"arn:aws:s3:::{BUCKET}"}}]}}"#
     );
@@ -295,11 +295,11 @@ async fn old_grants_move_into_managed_policies() {
     assert!(crate::s3::access::listable(&principal, &[BUCKET]).unwrap().contains(BUCKET));
 
     // Revoked (detached), and gone with the user.
-    roles::revoke(&client, &account, "olga", BUCKET, &[roles::Permission::Write]).await.unwrap();
+    users::revoke(&client, &account, "olga", BUCKET, &[users::Permission::Write]).await.unwrap();
     assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read")]);
-    roles::grant(&client, &account, "olga", BUCKET, &[roles::Permission::Write]).await.unwrap();
+    users::grant(&client, &account, "olga", BUCKET, &[users::Permission::Write]).await.unwrap();
     assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read"), format!("{BUCKET}-write-grant")]);
-    roles::delete(&client, &account, "olga").await.unwrap();
+    users::delete(&client, &account, "olga").await.unwrap();
     let left: i64 = client.query_one("SELECT count(*) FROM user_attached_policies", &[]).await.unwrap().get(0);
     assert_eq!(left, 0);
 }
@@ -311,7 +311,7 @@ async fn old_grants_move_into_managed_policies() {
 async fn there_is_one_account() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let account = roles::account(&client).await.unwrap();
+    let account = users::account(&client).await.unwrap();
     let owner: String = client.query_one("SELECT account_id FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
     assert_eq!(owner, account);
     let err = client.execute("INSERT INTO accounts (id, name) VALUES ('000000000042', 'acme')", &[]).await.unwrap_err();
@@ -331,10 +331,10 @@ async fn operators_are_users_with_cairn_actions() {
     use crate::s3::{access::{Access, Origin}, actions::{Check, On}};
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let account = roles::account(&client).await.unwrap();
-    roles::create(&client, "ops", None, false).await.unwrap();
-    roles::create(&client, "boss", None, true).await.unwrap();
-    roles::create(&client, "nobody", None, false).await.unwrap();
+    let account = users::account(&client).await.unwrap();
+    users::create(&client, "ops", None, false).await.unwrap();
+    users::create(&client, "boss", None, true).await.unwrap();
+    users::create(&client, "nobody", None, false).await.unwrap();
     crate::managed::attach(&client, &account, "ops", "arn:aws:iam::aws:policy/CairnOperatorAccess", true).await.unwrap();
     let may = async |user: &str, action: &'static str, on: On| {
         let principal = Principal::load(&client, user).await.unwrap().unwrap();
@@ -388,7 +388,7 @@ async fn the_operators_join_the_account() {
     tx.commit().await.unwrap();
     crate::db::init(&pool, usize::MAX).await.unwrap();
 
-    let account = roles::account(&client).await.unwrap();
+    let account = users::account(&client).await.unwrap();
     let names: Vec<String> = client.query("SELECT name FROM accounts WHERE NOT operator", &[]).await.unwrap().iter().map(|r| r.get(0)).collect();
     assert_eq!(names, ["default"]);
     let operators: i64 =
@@ -511,14 +511,14 @@ async fn one_account_is_refused_while_two_are_used() {
 async fn older_cairns_deny_bounded_users_everything() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let account = roles::account(&client).await.unwrap();
-    roles::create(&client, "bounded", None, false).await.unwrap();
+    let account = users::account(&client).await.unwrap();
+    users::create(&client, "bounded", None, false).await.unwrap();
     let all = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
-    roles::put_policy(&client, &account, "bounded", "all", all).await.unwrap();
+    users::put_policy(&client, &account, "bounded", "all", all).await.unwrap();
     let list = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
     let bound = crate::managed::create(&client, &account, "bound", "/bounds/", list, "").await.unwrap();
-    let id = roles::id_of(&client, &account, "bounded").await.unwrap();
-    assert!(roles::set_boundary(&client, &account, id, Some(&roles::BoundaryRef::Own(bound.id))).await.unwrap());
+    let id = users::id_of(&client, &account, "bounded").await.unwrap();
+    assert!(users::set_boundary(&client, &account, id, Some(&users::BoundaryRef::Own(bound.id))).await.unwrap());
 
     // Here: its policies, and its boundary, by its ARN (path and all).
     let principal = Principal::load(&client, "bounded").await.unwrap().unwrap();
@@ -526,12 +526,12 @@ async fn older_cairns_deny_bounded_users_everything() {
     let boundary = principal.boundary.as_ref().unwrap();
     assert_eq!(boundary.arn, format!("arn:aws:iam::{account}:policy/bounds/bound"));
     assert_eq!(boundary.document, list);
-    let listed = roles::list(&client).await.unwrap();
+    let listed = users::list(&client).await.unwrap();
     let user = listed.iter().find(|u| u.name == "bounded").unwrap();
     assert_eq!(user.policies, ["all"]);
     assert_eq!(user.boundary.as_deref(), Some(boundary.arn.as_str()));
-    assert!(roles::get_policy(&client, &account, "bounded", "cairn:boundary").await.is_err());
-    assert!(roles::delete_policy(&client, &account, "bounded", "cairn:boundary").await.is_err());
+    assert!(users::get_policy(&client, &account, "bounded", "cairn:boundary").await.is_err());
+    assert!(users::delete_policy(&client, &account, "bounded", "cairn:boundary").await.is_err());
 
     // What an older Cairn reads: every inline policy, a Deny-all among them.
     let older: Vec<String> = client
@@ -561,7 +561,7 @@ async fn older_cairns_deny_bounded_users_everything() {
     }
 
     // Without its boundary, the Deny-all goes too.
-    assert!(roles::set_boundary(&client, &account, id, None).await.unwrap());
+    assert!(users::set_boundary(&client, &account, id, None).await.unwrap());
     assert!(Principal::load(&client, "bounded").await.unwrap().unwrap().boundary.is_none());
     let count: i64 = client.query_one("SELECT count(*) FROM role_policies WHERE role_id = $1", &[&id]).await.unwrap().get(0);
     assert_eq!(count, 1);
@@ -574,30 +574,30 @@ async fn older_cairns_deny_bounded_users_everything() {
 async fn names_and_tag_keys_are_unique_regardless_of_case() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let account = roles::account(&client).await.unwrap();
-    roles::create_user(&client, &account, "Ada", "/team/", None).await.unwrap();
-    let err = roles::create_user(&client, &account, "ada", "/", None).await.unwrap_err();
+    let account = users::account(&client).await.unwrap();
+    users::create_user(&client, &account, "Ada", "/team/", None).await.unwrap();
+    let err = users::create_user(&client, &account, "ada", "/", None).await.unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err}");
-    roles::create_user(&client, &account, "bob", "/", None).await.unwrap();
-    let ada = roles::id_of(&client, &account, "Ada").await.unwrap();
-    let err = roles::rename(&client, &account, ada, "BOB", "/").await.unwrap_err();
+    users::create_user(&client, &account, "bob", "/", None).await.unwrap();
+    let ada = users::id_of(&client, &account, "Ada").await.unwrap();
+    let err = users::rename(&client, &account, ada, "BOB", "/").await.unwrap_err();
     assert!(err.to_string().contains("already exists"), "{err}");
-    roles::rename(&client, &account, ada, "ADA", "/elsewhere/").await.unwrap();
-    let user = roles::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
+    users::rename(&client, &account, ada, "ADA", "/elsewhere/").await.unwrap();
+    let user = users::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
     assert_eq!(user.arn(), format!("arn:aws:iam::{account}:user/elsewhere/ADA"));
 
     let tags = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
-    roles::tag(&client, ada, &tags(&[("team", "a"), ("env", "dev")])).await.unwrap();
-    roles::tag(&client, ada, &tags(&[("Team", "b")])).await.unwrap();
-    let user = roles::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
+    users::tag(&client, ada, &tags(&[("team", "a"), ("env", "dev")])).await.unwrap();
+    users::tag(&client, ada, &tags(&[("Team", "b")])).await.unwrap();
+    let user = users::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
     assert_eq!(user.tags, tags(&[("Team", "b"), ("env", "dev")]));
     assert_eq!(user.context("iam:GetUser").get("aws:ResourceTag/team"), Some(&["b".to_owned()][..]));
     let many: Vec<(String, String)> = (0..49).map(|i| (format!("k{i}"), String::new())).collect();
-    let err = roles::tag(&client, ada, &many).await.unwrap_err();
-    assert!(err.downcast_ref::<roles::TooManyTags>().is_some(), "{err}");
-    roles::tag(&client, ada, &many[..48]).await.unwrap();
-    roles::untag(&client, ada, &["TEAM".to_owned(), "nope".to_owned()]).await.unwrap();
-    let user = roles::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
+    let err = users::tag(&client, ada, &many).await.unwrap_err();
+    assert!(err.downcast_ref::<users::TooManyTags>().is_some(), "{err}");
+    users::tag(&client, ada, &many[..48]).await.unwrap();
+    users::untag(&client, ada, &["TEAM".to_owned(), "nope".to_owned()]).await.unwrap();
+    let user = users::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
     assert_eq!(user.tags.len(), 49);
 }
 
@@ -607,7 +607,7 @@ async fn names_and_tag_keys_are_unique_regardless_of_case() {
 async fn policies_tag_keys_are_case_sensitive() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let account = roles::account(&client).await.unwrap();
+    let account = users::account(&client).await.unwrap();
     let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
     let tags = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
     let policy = crate::managed::create_tagged(&client, &account, "p", "/", document, "", &tags(&[("team", "a")])).await.unwrap();
@@ -632,11 +632,11 @@ async fn policies_tag_keys_are_case_sensitive() {
 async fn policies_keep_five_versions_and_the_default_decides() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let account = roles::account(&client).await.unwrap();
+    let account = users::account(&client).await.unwrap();
     let doc = |action: &str| format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"{action}","Resource":"*"}}]}}"#);
     let policy = crate::managed::create(&client, &account, "p", "/", &doc("s3:ListBucket"), "").await.unwrap();
     let arn = policy.arn(&account);
-    roles::create(&client, "vera", None, false).await.unwrap();
+    users::create(&client, "vera", None, false).await.unwrap();
     crate::managed::attach(&client, &account, "vera", &arn, true).await.unwrap();
     let decides = async || Principal::load(&client, "vera").await.unwrap().unwrap().policies;
     assert_eq!(decides().await, [doc("s3:ListBucket")]);

@@ -15,7 +15,7 @@ use ring::digest;
 use uuid::Uuid;
 
 use crate::db::Cached;
-use crate::roles::Invalid;
+use crate::users::Invalid;
 
 /// How long an enrollment link works.
 pub const ENROLLMENT_TTL: Duration = Duration::from_secs(24 * 3600);
@@ -66,7 +66,7 @@ pub struct Identity {
 impl Identity {
     /// Its ARN.
     pub fn arn(&self) -> String {
-        crate::roles::user_arn(&self.account_id, &self.user.path, &self.user.name)
+        crate::users::user_arn(&self.account_id, &self.user.path, &self.user.name)
     }
 
     /// How it's named to people: the user's name.

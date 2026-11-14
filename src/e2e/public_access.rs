@@ -32,7 +32,7 @@ fn public_read(bucket: &str) -> Bytes {
 
 /// Whether an anonymous request may read `bucket`'s `k`.
 async fn anyone_reads(app: &App, bucket: &str) -> bool {
-    let account = crate::roles::account(&app.pool.get().await.unwrap()).await.unwrap();
+    let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
     let origin = access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
     let headers = hyper::HeaderMap::new();
     let mut access = access::Access::new(None, &account, &hyper::Method::GET, &headers, "", &origin).unwrap();
@@ -47,7 +47,7 @@ async fn anyone_reads(app: &App, bucket: &str) -> bool {
 async fn blocks_public_policies_and_restricts_public_buckets() {
     let Some(app) = node().await else { return };
     let bucket = format!("pab-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
-    let account = crate::roles::account(&app.pool.get().await.unwrap()).await.unwrap();
+    let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
     assert!(matches!(create::create(&app, &bucket, &account, false).await.unwrap(), create::Creation::Created));
     assert_eq!(public_access::get(&app, &bucket).await.unwrap(), Some(Some(Block::from_bits(15))));
     assert_eq!(put_bucket_policy(&app, &bucket, public_read(&bucket)).await.unwrap().status(), StatusCode::FORBIDDEN);
@@ -89,7 +89,7 @@ async fn blocks_public_policies_and_restricts_public_buckets() {
 
 /// Who asks, in `may`.
 enum Asker<'a> {
-    User(&'a crate::roles::Principal),
+    User(&'a crate::users::Principal),
     Anonymous,
 }
 
@@ -100,7 +100,7 @@ async fn may(app: &App, asker: Asker<'_>, action: &'static str, on: On) -> (bool
     let origin = access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
     let headers = hyper::HeaderMap::new();
     let method = hyper::Method::GET;
-    let default = crate::roles::account(&app.pool.get().await.unwrap()).await.unwrap();
+    let default = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
     let mut access = match asker {
         // As the S3 API makes it: in the cluster's first account.
         Asker::User(principal) => access::Access::new(Some(principal), &default, &method, &headers, "", &origin).unwrap(),
@@ -118,7 +118,7 @@ async fn may(app: &App, asker: Asker<'_>, action: &'static str, on: On) -> (bool
 async fn restricted_buckets_allow_the_public_nothing() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
-    let account = crate::roles::account(&client).await.unwrap();
+    let account = crate::users::account(&client).await.unwrap();
     let bucket = format!("pab-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
     assert!(matches!(create::create(&app, &bucket, &account, false).await.unwrap(), create::Creation::Created));
     assert!(public_access::set(&app, &bucket, None).await.unwrap());
@@ -129,8 +129,8 @@ async fn restricted_buckets_allow_the_public_nothing() {
         ]}}"#
     );
     assert_eq!(put_bucket_policy(&app, &bucket, Bytes::from(policy)).await.unwrap().status(), StatusCode::NO_CONTENT);
-    let (ada, _) = crate::roles::create_for(&client, &account, "ada", None, false).await.unwrap();
-    let ada = crate::roles::Principal::load(&client, &ada).await.unwrap().unwrap();
+    let (ada, _) = crate::users::create_for(&client, &account, "ada", None, false).await.unwrap();
+    let ada = crate::users::Principal::load(&client, &ada).await.unwrap().unwrap();
     let object = || On::Object(bucket.clone(), "k".to_owned());
     let of_bucket = || On::Bucket(bucket.clone());
 

@@ -201,7 +201,7 @@ pub async fn put_bucket_encryption(
         let set = set(app, bucket, Some("AES256"), None, default.bucket_key).await?;
         return Ok(if set { ok() } else { no_such_bucket() });
     };
-    match kms.generate(Identity::Role(role), key_id, b"cairn: a bucket's default key").await {
+    match kms.generate(Identity::User(role), key_id, b"cairn: a bucket's default key").await {
         Ok(_) | Err(KmsError::Denied) => {}
         Err(KmsError::NoSuchKey) => {
             return Ok(format_s3_error(StatusCode::BAD_REQUEST, "KMS.NotFoundException", "Invalid keyId"));

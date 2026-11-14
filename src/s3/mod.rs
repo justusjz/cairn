@@ -8,7 +8,7 @@ use crate::{
     auth::Rejection,
     body::{ResBody, box_response},
     payload::{self, Payload},
-    roles::Principal,
+    users::Principal,
     s3::{
         buckets::{
             cors::{self, delete_bucket_cors, get_bucket_cors, put_bucket_cors},
@@ -180,7 +180,7 @@ async fn handle_request(
         }
         None => None,
     };
-    let account = crate::roles::account(&app.pool.get().await?).await?;
+    let account = crate::users::account(&app.pool.get().await?).await?;
     let origin = access::Origin {
         peer: Some(peer),
         trusted_proxies: &app.trusted_proxies,
@@ -1235,7 +1235,7 @@ pub(crate) fn authorize(
     query: &str,
     copy_source: Option<&str>,
 ) -> bool {
-    use crate::{roles::Permission, s3::objects::copy::parse_copy_source};
+    use crate::{users::Permission, s3::objects::copy::parse_copy_source};
     if key.is_empty() {
         return match *method {
             Method::PUT | Method::DELETE => principal.admin,

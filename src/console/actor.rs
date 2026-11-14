@@ -19,7 +19,7 @@ use super::web::ApiError;
 use crate::{
     App,
     policy::{Context, Verdict},
-    roles::Principal,
+    users::Principal,
     s3::{
         access::{Access, Origin},
         actions::{Check, On},

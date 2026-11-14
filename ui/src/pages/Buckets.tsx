@@ -205,7 +205,7 @@ export function BucketList() {
                     <td class="num">{bytes(b.bytes)}</td>
                     <td class="num">{b.versions > b.objects ? `${num(b.versions - b.objects)} · ${bytes(b.version_bytes - b.bytes)}` : "–"}</td>
                     <td class="num">{num(b.uploads)}</td>
-                    <td class="num">{num(b.roles)}</td>
+                    <td class="num">{num(b.users)}</td>
                     <td>
                       <TagList tags={b.tags} />
                     </td>

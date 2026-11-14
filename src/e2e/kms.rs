@@ -443,8 +443,8 @@ const ALL: &[&str] = &["transit/cairn-test", "transit/cairn-other", "team-transi
 async fn role(app: &Arc<App>, name: &str, keys: &[&str]) -> Uuid {
     let name = format!("{name}-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let client = app.pool.get().await.unwrap();
-    crate::roles::create(&client, &name, None, false).await.unwrap();
-    crate::roles::identify(app).await.unwrap();
+    crate::users::create(&client, &name, None, false).await.unwrap();
+    crate::users::identify(app).await.unwrap();
     let row = client.query_one("SELECT id, kms_entity_id FROM users WHERE name = $1", &[&name]).await.unwrap();
     let (id, entity): (Uuid, Option<String>) = (row.get(0), row.get(1));
     assert!(entity.is_some(), "identify gives every role its entity");
@@ -504,7 +504,7 @@ async fn roles_use_the_keys_openbao_lets_them() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(app.kms.as_ref().unwrap().identify(Identity::Role(bob)).await.unwrap(), entity);
+    assert_eq!(app.kms.as_ref().unwrap().identify(Identity::User(bob)).await.unwrap(), entity);
 
     let plain = data(1000);
     put_kms(&app, alice, "k", plain.clone(), &kms(None, &[])).await.unwrap();
@@ -552,7 +552,7 @@ async fn the_kms_tells_how_it_is() {
     let r = role(&app, "alice", &[]).await;
     let logins = kms.logins();
     let last = logins.last.unwrap();
-    assert_eq!((last.who, last.error.is_none()), (Identity::Role(r), true));
+    assert_eq!((last.who, last.error.is_none()), (Identity::User(r), true));
     assert_eq!(logins.last_success, Some(last.at));
 
     // The wrong mount, the wrong role: refused, saying what's wrong.
@@ -570,7 +570,7 @@ async fn the_kms_tells_how_it_is() {
         })
         .unwrap()
         .unwrap();
-        let e = misconfigured.identify(Identity::Role(r)).await.unwrap_err();
+        let e = misconfigured.identify(Identity::User(r)).await.unwrap_err();
         assert!(matches!(e, crate::kms::KmsError::LoginRefused(_)) && e.to_string().contains(why), "{e}");
         assert!(misconfigured.logins().last.unwrap().error.unwrap().contains(why));
         assert!(misconfigured.logins().last_success.is_none());

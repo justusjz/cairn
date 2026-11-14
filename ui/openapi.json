@@ -1600,11 +1600,11 @@
     },
     "/kms/identify": {
       "post": {
-        "summary": "Logs in to the KMS as each role without an identity there yet, from this\nnode, now rather than at its next maintenance pass. Fails with what went\nwrong.",
-        "operationId": "identify_roles",
+        "summary": "Logs in to the KMS as each user without an identity there yet, from this\nnode, now rather than at its next maintenance pass. Fails with what went\nwrong.",
+        "operationId": "identify_users",
         "responses": {
           "204": {
-            "description": "Every role has its identity in the KMS"
+            "description": "Every user has its identity in the KMS"
           },
           "4XX": {
             "content": {
@@ -2718,839 +2718,6 @@
         }
       }
     },
-    "/roles": {
-      "get": {
-        "operationId": "list_roles",
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/RoleSummary"
-                  }
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      },
-      "post": {
-        "operationId": "create_role",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/NewRole"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NewUser"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}": {
-      "delete": {
-        "operationId": "delete_role",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Deleted, with its grants"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      },
-      "patch": {
-        "summary": "Renames or moves a user, as IAM's UpdateUser: allowed on it, and on\nwhere it goes (its new ARN; moved only, its new path: see `iam`).",
-        "operationId": "update_role",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RoleChange"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Changed"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}/admin": {
-      "put": {
-        "summary": "Makes a role an admin, or not.",
-        "operationId": "set_admin",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AdminFlag"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Changed"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}/attached": {
-      "post": {
-        "summary": "Attaches a managed policy to a user.",
-        "operationId": "attach_policy",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PolicyArn"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Attached"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "summary": "Detaches a managed policy from a user.",
-        "operationId": "detach_policy",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "arn",
-            "in": "query",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Detached"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}/boundary": {
-      "put": {
-        "summary": "Sets a user's permissions boundary, as IAM's\nPutUserPermissionsBoundary (decided by the boundary asked for).",
-        "operationId": "set_boundary",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/BoundaryArn"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Set"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "summary": "Removes a user's permissions boundary.",
-        "operationId": "delete_boundary",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Removed"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}/enrollment": {
-      "post": {
-        "summary": "Makes a role an enrollment link for the console, replacing its last.",
-        "operationId": "create_enrollment",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EnrollmentLink"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}/keys": {
-      "post": {
-        "summary": "Makes a new access key for a role, with a random ID and secret; a role\nhas at most two.",
-        "operationId": "create_key",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NewKey"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}/keys/{key}": {
-      "put": {
-        "summary": "Lets one of the role's access keys sign requests, or stops it.",
-        "operationId": "set_key",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "key",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/KeyState"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Changed"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "summary": "Deletes one of the role's access keys.",
-        "operationId": "delete_key",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "key",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Deleted"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}/policies/{policy}": {
-      "get": {
-        "summary": "One of the role's inline policies, as it was set.",
-        "operationId": "get_policy",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "policy",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/PolicyDocument"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      },
-      "put": {
-        "summary": "Sets one of the role's inline policies, if it's a valid identity policy.",
-        "operationId": "put_policy",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "policy",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/PolicyDocument"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Set"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      },
-      "delete": {
-        "summary": "Deletes one of the role's inline policies.",
-        "operationId": "delete_policy",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "policy",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Deleted"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}/secret": {
-      "post": {
-        "summary": "Replaces a role's secret.",
-        "operationId": "rotate_secret",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/NewSecret"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Secret"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/roles/{role}/tags": {
-      "put": {
-        "summary": "Sets a user's tags, as IAM's TagUser and UntagUser would.",
-        "operationId": "set_role_tags",
-        "parameters": [
-          {
-            "name": "role",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/RoleTags"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Set"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/settings/{name}": {
       "put": {
         "summary": "Sets one of the redundancy settings (`data-shards`, `parity-shards`,\n`repair-after`) for the whole cluster, as `cairn config set` does. The\nnode answering goes by it right away, the others within a heartbeat.",
@@ -3615,6 +2782,839 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/Storage"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users": {
+      "get": {
+        "operationId": "list_users",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/UserSummary"
+                  }
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "operationId": "create_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateUser"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewUser"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}": {
+      "delete": {
+        "operationId": "delete_user",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted, with its grants"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "patch": {
+        "summary": "Renames or moves a user, as IAM's UpdateUser: allowed on it, and on\nwhere it goes (its new ARN; moved only, its new path: see `iam`).",
+        "operationId": "update_user",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}/admin": {
+      "put": {
+        "summary": "Makes a user an admin, or not.",
+        "operationId": "set_admin",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AdminFlag"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}/attached": {
+      "post": {
+        "summary": "Attaches a managed policy to a user.",
+        "operationId": "attach_policy",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyArn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Attached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Detaches a managed policy from a user.",
+        "operationId": "detach_policy",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "arn",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Detached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}/boundary": {
+      "put": {
+        "summary": "Sets a user's permissions boundary, as IAM's\nPutUserPermissionsBoundary (decided by the boundary asked for).",
+        "operationId": "set_boundary",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BoundaryArn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a user's permissions boundary.",
+        "operationId": "delete_boundary",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}/enrollment": {
+      "post": {
+        "summary": "Makes a user an enrollment link for the console, replacing its last.",
+        "operationId": "create_enrollment",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnrollmentLink"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}/keys": {
+      "post": {
+        "summary": "Makes a new access key for a user, with a random ID and secret; a user\nhas at most two.",
+        "operationId": "create_key",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewKey"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}/keys/{key}": {
+      "put": {
+        "summary": "Lets one of the user's access keys sign requests, or stops it.",
+        "operationId": "set_key",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeyState"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes one of the user's access keys.",
+        "operationId": "delete_key",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}/policies/{policy}": {
+      "get": {
+        "summary": "One of the user's inline policies, as it was set.",
+        "operationId": "get_policy",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDocument"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets one of the user's inline policies, if it's a valid identity policy.",
+        "operationId": "put_policy",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyDocument"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes one of the user's inline policies.",
+        "operationId": "delete_policy",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "policy",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}/secret": {
+      "post": {
+        "summary": "Replaces a user's secret.",
+        "operationId": "rotate_secret",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSecret"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Secret"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/users/{user}/tags": {
+      "put": {
+        "summary": "Sets a user's tags, as IAM's TagUser and UntagUser would.",
+        "operationId": "set_user_tags",
+        "parameters": [
+          {
+            "name": "user",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserTags"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
                 }
               }
             }
@@ -3978,7 +3978,7 @@
           "versions",
           "version_bytes",
           "uploads",
-          "roles",
+          "users",
           "tags",
           "public",
           "object_lock"
@@ -4041,11 +4041,6 @@
               }
             ]
           },
-          "roles": {
-            "type": "integer",
-            "format": "int64",
-            "description": "The account's users whose policies give them access to the whole\nbucket (see `who_has_access`)."
-          },
           "tags": {
             "type": "array",
             "items": {
@@ -4056,6 +4051,11 @@
           "uploads": {
             "type": "integer",
             "format": "int64"
+          },
+          "users": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The account's users whose policies give them access to the whole\nbucket (see `who_has_access`)."
           },
           "version_bytes": {
             "type": "integer",
@@ -4335,6 +4335,52 @@
           }
         }
       },
+      "CreateUser": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "access_key": {
+            "type": "boolean",
+            "description": "Whether it gets an access key (a service's), of a random ID; a person\ngets none, and signs in to the console through its link."
+          },
+          "admin": {
+            "type": "boolean"
+          },
+          "boundary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its permissions boundary: a managed policy's ARN."
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its path (`/`, or `/…/`); `/` if not given."
+          },
+          "secret": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The access key's secret: at least 8 characters; one is generated if\nnot given. Implies `access_key`."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags."
+          }
+        }
+      },
       "DefaultVersion": {
         "type": "object",
         "required": [
@@ -4455,7 +4501,7 @@
       },
       "EnrollmentLink": {
         "type": "object",
-        "description": "A one-time link for a role to register its first passkey for the\nconsole, valid 24 hours.",
+        "description": "A one-time link for a user to register its first passkey for the\nconsole, valid 24 hours.",
         "required": [
           "path"
         ],
@@ -5616,52 +5662,6 @@
           }
         }
       },
-      "NewRole": {
-        "type": "object",
-        "required": [
-          "name"
-        ],
-        "properties": {
-          "access_key": {
-            "type": "boolean",
-            "description": "Whether it gets an access key (a service's), of a random ID; a person\ngets none, and signs in to the console through its link."
-          },
-          "admin": {
-            "type": "boolean"
-          },
-          "boundary": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Its permissions boundary: a managed policy's ARN."
-          },
-          "name": {
-            "type": "string"
-          },
-          "path": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Its path (`/`, or `/…/`); `/` if not given."
-          },
-          "secret": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The access key's secret: at least 8 characters; one is generated if\nnot given. Implies `access_key`."
-          },
-          "tags": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Tag"
-            },
-            "description": "Its tags."
-          }
-        }
-      },
       "NewSecret": {
         "type": "object",
         "properties": {
@@ -6511,133 +6511,6 @@
           }
         }
       },
-      "RoleChange": {
-        "type": "object",
-        "properties": {
-          "name": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Its new name (unique in the account regardless of case)."
-          },
-          "path": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Its new path (`/`, or `/…/`)."
-          }
-        }
-      },
-      "RoleSummary": {
-        "type": "object",
-        "description": "A role, never with its secret.",
-        "required": [
-          "name",
-          "id",
-          "admin",
-          "created_at",
-          "attached",
-          "keys",
-          "policies",
-          "path",
-          "arn",
-          "tags"
-        ],
-        "properties": {
-          "admin": {
-            "type": "boolean"
-          },
-          "arn": {
-            "type": "string",
-            "description": "Its ARN."
-          },
-          "attached": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AttachedPolicy"
-            },
-            "description": "Its attached managed policies (AdministratorAccess, if it's an admin)."
-          },
-          "boundary": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Its permissions boundary's ARN, which caps what its policies allow."
-          },
-          "console": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ConsoleAccess",
-                "description": "How it signs in to the console, if it does (a person's); `None`:\nit doesn't, and no link for it is out (a service's)."
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "created_at": {
-            "type": "number",
-            "format": "double"
-          },
-          "id": {
-            "type": "string",
-            "description": "Its ID, which never changes or comes back: its name (alias) in the\nKMS's auth mount for Cairn."
-          },
-          "keys": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/AccessKey"
-            },
-            "description": "Its access keys, oldest first (never their secrets)."
-          },
-          "kms_entity_id": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Its identity (entity) in the KMS, which key owners grant keys to;\nnone until Cairn has logged in as it, or without a KMS."
-          },
-          "name": {
-            "type": "string"
-          },
-          "path": {
-            "type": "string",
-            "description": "Its path (`/`, or `/…/`), which its ARN has before its name."
-          },
-          "policies": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "The names of its inline policies."
-          },
-          "tags": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Tag"
-            },
-            "description": "Its tags, newest first."
-          }
-        }
-      },
-      "RoleTags": {
-        "type": "object",
-        "required": [
-          "tags"
-        ],
-        "properties": {
-          "tags": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/Tag"
-            },
-            "description": "All of its tags: those it has of other keys go (UntagUser), the\nrest are set (TagUser)."
-          }
-        }
-      },
       "Rule": {
         "type": "object",
         "required": [
@@ -6736,7 +6609,7 @@
       },
       "Secret": {
         "type": "object",
-        "description": "A role's secret, which is shown only this once.",
+        "description": "A user's secret, which is shown only this once.",
         "required": [
           "name",
           "secret"
@@ -6915,6 +6788,133 @@
           },
           "user": {
             "type": "string"
+          }
+        }
+      },
+      "UserChange": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its new name (unique in the account regardless of case)."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its new path (`/`, or `/…/`)."
+          }
+        }
+      },
+      "UserSummary": {
+        "type": "object",
+        "description": "A user, never with its secret.",
+        "required": [
+          "name",
+          "id",
+          "admin",
+          "created_at",
+          "attached",
+          "keys",
+          "policies",
+          "path",
+          "arn",
+          "tags"
+        ],
+        "properties": {
+          "admin": {
+            "type": "boolean"
+          },
+          "arn": {
+            "type": "string",
+            "description": "Its ARN."
+          },
+          "attached": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachedPolicy"
+            },
+            "description": "Its attached managed policies (AdministratorAccess, if it's an admin)."
+          },
+          "boundary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its permissions boundary's ARN, which caps what its policies allow."
+          },
+          "console": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ConsoleAccess",
+                "description": "How it signs in to the console, if it does (a person's); `None`:\nit doesn't, and no link for it is out (a service's)."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "id": {
+            "type": "string",
+            "description": "Its ID, which never changes or comes back: its name (alias) in the\nKMS's auth mount for Cairn."
+          },
+          "keys": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AccessKey"
+            },
+            "description": "Its access keys, oldest first (never their secrets)."
+          },
+          "kms_entity_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its identity (entity) in the KMS, which key owners grant keys to;\nnone until Cairn has logged in as it, or without a KMS."
+          },
+          "name": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "Its path (`/`, or `/…/`), which its ARN has before its name."
+          },
+          "policies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The names of its inline policies."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags, newest first."
+          }
+        }
+      },
+      "UserTags": {
+        "type": "object",
+        "required": [
+          "tags"
+        ],
+        "properties": {
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "All of its tags: those it has of other keys go (UntagUser), the\nrest are set (TagUser)."
           }
         }
       },

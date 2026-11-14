@@ -1629,7 +1629,7 @@ ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_sse_c_key
 
 /// Migration 39: the operator account's users are members, not IAM users:
 /// each is a superadmin, by being one, with no access keys, inline
-/// policies or grants (see `roles::refuse_operator`). Their keys and
+/// policies or grants (see `users::refuse_operator`). Their keys and
 /// policies go, and triggers keep new ones out. They're all marked admin,
 /// so that an older node, which decides `cairn:` actions by
 /// `AdministratorAccess`, lets each of them do what this one does.

@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use crate::{
     db::Cached,
     policy::{Kind, Policy},
-    roles::{Invalid, Permission},
+    users::{Invalid, Permission},
 };
 
 /// How often a change is tried again, if the policy changed meanwhile.

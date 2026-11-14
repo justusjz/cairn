@@ -84,7 +84,7 @@ fn bad_digest(algorithm: Algorithm) -> Rejection {
 
 impl Payload {
     /// What the request's headers claim about its body, or why they're
-    /// refused before any of it is read. `secret` is the role's, to verify a
+    /// refused before any of it is read. `secret` is the user's, to verify a
     /// signed streaming body with. `checksum_headers` says whether an
     /// `x-amz-checksum-*` header is one of the body: for most requests, but
     /// not CompleteMultipartUpload, where it's the object's.

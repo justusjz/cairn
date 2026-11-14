@@ -14,7 +14,7 @@
 //!   canonical JSON. So a data key only opens for an object of the name it
 //!   was made for. A client may name that entry itself, but only as the
 //!   object's own ARN, as S3 has it (see `for_object`). The KMS
-//!   is asked as the role that made the request, so it decides which roles
+//!   is asked as the user that made the request, so it decides which users
 //!   may use which keys (see `kms`); a request of no role (an account's root's,
 //!   in the console) may use none.
 //!
@@ -565,7 +565,7 @@ async fn open_envelope(
     };
     let key_id = envelope.key_id()?;
     let ad = associated_data(envelope.context.as_deref(), bucket, key);
-    let data_key = match kms.decrypt(Identity::Role(role), &key_id, &envelope.data_key, &ad).await {
+    let data_key = match kms.decrypt(Identity::User(role), &key_id, &envelope.data_key, &ad).await {
         Ok(data_key) => data_key,
         Err(e) => return kms_refusal(e, &key_id, role).map(Err),
     };
@@ -627,7 +627,7 @@ pub async fn reseal(
     let key_id = &request.key_id;
     let context = request.context.as_ref().map(|c| serde_json::to_string(c).unwrap());
     let ad = associated_data(context.as_deref(), bucket, key);
-    let data_key = match kms.generate(Identity::Role(role), key_id, &ad).await {
+    let data_key = match kms.generate(Identity::User(role), key_id, &ad).await {
         Ok(data_key) => data_key,
         Err(e) => return kms_refusal(e, key_id, role).map(Err),
     };
@@ -647,7 +647,7 @@ impl Envelope {
 }
 
 /// The 403 for a request that would need a KMS key without a role to ask
-/// the KMS for it as: an account's root's, in the console. The KMS decides which roles may use
+/// the KMS for it as: an account's root's, in the console. The KMS decides which users may use
 /// a key, so a request of none may use none.
 fn no_role() -> Response<Full<Bytes>> {
     format_s3_error(

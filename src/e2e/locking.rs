@@ -252,7 +252,7 @@ async fn cors_waits_only_for_bucket_changes() {
 #[tokio::test]
 async fn a_public_policy_waits_for_its_accounts_block() {
     let Some(app) = node().await else { return };
-    let account = crate::roles::account(&connection(&app).await).await.unwrap();
+    let account = crate::users::account(&connection(&app).await).await.unwrap();
     let public = format!(
         r#"{{"Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
     );
@@ -276,7 +276,7 @@ async fn a_public_policy_waits_for_its_accounts_block() {
 #[tokio::test]
 async fn a_users_keys_are_counted_after_its_row_is_held() {
     let Some(app) = node().await else { return };
-    crate::roles::create(&connection(&app).await, "u", None, false).await.unwrap();
+    crate::users::create(&connection(&app).await, "u", None, false).await.unwrap();
     let make = "SELECT pg_temp.cairn_create_key((SELECT id FROM users WHERE name = 'u'), $1, 'secretsecret', 2)";
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
@@ -298,7 +298,7 @@ async fn a_users_keys_are_counted_after_its_row_is_held() {
 #[tokio::test]
 async fn a_users_tags_are_counted_after_its_row_is_held() {
     let Some(app) = node().await else { return };
-    crate::roles::create(&connection(&app).await, "u", None, false).await.unwrap();
+    crate::users::create(&connection(&app).await, "u", None, false).await.unwrap();
     let tag = "SELECT pg_temp.cairn_tag_user((SELECT id FROM users WHERE name = 'u'), $1, $2, 50)";
     let keys = |from: usize| (from..from + 30).map(|i| format!("k{i}")).collect::<Vec<_>>();
     let values = vec![String::new(); 30];
@@ -324,7 +324,7 @@ async fn a_users_tags_are_counted_after_its_row_is_held() {
 async fn a_policys_tags_are_counted_after_its_row_is_held() {
     let Some(app) = node().await else { return };
     let client = connection(&app).await;
-    let account = crate::roles::account(&client).await.unwrap();
+    let account = crate::users::account(&client).await.unwrap();
     let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
     crate::managed::create(&client, &account, "p", "/", document, "").await.unwrap();
     let tag = "SELECT pg_temp.cairn_tag_policy((SELECT id FROM managed_policies WHERE name = 'p'), $1, $2, 50)";
@@ -351,7 +351,7 @@ async fn a_policys_tags_are_counted_after_its_row_is_held() {
 async fn a_policys_versions_are_counted_after_its_row_is_held() {
     let Some(app) = node().await else { return };
     let client = connection(&app).await;
-    let account = crate::roles::account(&client).await.unwrap();
+    let account = crate::users::account(&client).await.unwrap();
     let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
     let policy = crate::managed::create(&client, &account, "p", "/", document, "").await.unwrap();
     for _ in 0..3 {

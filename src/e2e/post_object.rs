@@ -22,7 +22,7 @@ use uuid::Uuid;
 use super::{BUCKET, assert_files, customer_key, get, get_sealed, kms_node, node_with};
 use crate::{
     App, packer,
-    roles::Permission,
+    users::Permission,
     s3::{conditional::Preconditions, objects::get::get_object, objects::post::post_object},
 };
 
@@ -35,12 +35,12 @@ async fn node() -> Option<Arc<App>> {
 async fn role(app: &App, write: bool) -> (String, String) {
     let name = format!("poster-{}", &Uuid::new_v4().simple().to_string()[..8]);
     let client = app.pool.get().await.unwrap();
-    let secret = crate::roles::create(&client, &name, None, false).await.unwrap();
+    let secret = crate::users::create(&client, &name, None, false).await.unwrap();
     let permissions = match write {
         true => &[Permission::Write][..],
         false => &[Permission::Read][..],
     };
-    crate::roles::grant(&client, &crate::roles::account(&client).await.unwrap(), &name, BUCKET, permissions).await.unwrap();
+    crate::users::grant(&client, &crate::users::account(&client).await.unwrap(), &name, BUCKET, permissions).await.unwrap();
     (name, secret)
 }
 
@@ -486,7 +486,7 @@ async fn bucket_policies_see_forms_as_posted() {
     // replaces, as any other: so the signer's is made again after it.
     let regrant = || async {
         let client = app.pool.get().await.unwrap();
-        crate::roles::grant(&client, &crate::roles::account(&client).await.unwrap(), &signer.0, BUCKET, &[Permission::Write]).await.unwrap();
+        crate::users::grant(&client, &crate::users::account(&client).await.unwrap(), &signer.0, BUCKET, &[Permission::Write]).await.unwrap();
     };
     let set = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, deny("POST")).await.unwrap();
     assert_eq!(set.status(), StatusCode::NO_CONTENT);

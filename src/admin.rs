@@ -45,7 +45,7 @@ pub struct Remote {
 /// A command, as the CLI sends it.
 #[derive(Serialize, Deserialize, Debug)]
 pub enum Command {
-    User(crate::roles::RoleArgs),
+    User(crate::users::UserArgs),
     Account(crate::accounts::AccountArgs),
     Oidc(crate::console::oidc::OidcArgs),
     BucketPolicy(crate::s3::buckets::policy::BucketPolicyArgs),
@@ -87,7 +87,7 @@ pub(crate) use outln;
 pub async fn run(app: &Arc<App>, command: Command) -> Output {
     let mut out = Output::default();
     let result = match command {
-        Command::User(args) => crate::roles::run(app, args, &mut out).await,
+        Command::User(args) => crate::users::run(app, args, &mut out).await,
         Command::Account(args) => crate::accounts::run(app, args, &mut out).await,
         Command::Oidc(args) => crate::console::oidc::run(app, args, &mut out).await,
         Command::BucketPolicy(args) => crate::s3::buckets::policy::run(app, args, &mut out).await,
@@ -95,7 +95,7 @@ pub async fn run(app: &Arc<App>, command: Command) -> Output {
         Command::Node(args) => crate::nodes::run(app, args, &mut out).await,
     };
     if let Err(e) = result {
-        if !matches!(e.downcast_ref::<crate::roles::Invalid>(), Some(_)) {
+        if !matches!(e.downcast_ref::<crate::users::Invalid>(), Some(_)) {
             eprintln!("admin: command failed: {e:#}");
         }
         out.error = Some(format!("{e:#}"));
@@ -225,17 +225,17 @@ mod e2e {
         // and taking a boundary off.
         let ops = "arn:aws:iam::aws:policy/CairnOperatorAccess";
         assert_eq!(cairn(&app, &["user", "attach", "cli-ada", ops]).await.error, None);
-        let account = crate::roles::account(&app.pool.get().await.unwrap()).await.unwrap();
+        let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
         let client = app.pool.get().await.unwrap();
         let names = |a: Vec<crate::managed::Attached>| a.into_iter().map(|a| a.name).collect::<Vec<_>>();
         assert!(names(crate::managed::attached(&client, &account, "cli-ada").await.unwrap()).contains(&"CairnOperatorAccess".to_owned()));
         assert_eq!(cairn(&app, &["user", "detach", "cli-ada", ops]).await.error, None);
         assert!(!names(crate::managed::attached(&client, &account, "cli-ada").await.unwrap()).contains(&"CairnOperatorAccess".to_owned()));
-        let id = crate::roles::id_of(&client, &account, "cli-ada").await.unwrap();
-        let bound = crate::roles::BoundaryRef::Aws("AmazonS3ReadOnlyAccess");
-        crate::roles::set_boundary(&client, &account, id, Some(&bound)).await.unwrap();
+        let id = crate::users::id_of(&client, &account, "cli-ada").await.unwrap();
+        let bound = crate::users::BoundaryRef::Aws("AmazonS3ReadOnlyAccess");
+        crate::users::set_boundary(&client, &account, id, Some(&bound)).await.unwrap();
         assert_eq!(cairn(&app, &["user", "unbound", "cli-ada"]).await.error, None);
-        assert!(crate::roles::Principal::load_user(&client, id).await.unwrap().unwrap().boundary.is_none());
+        assert!(crate::users::Principal::load_user(&client, id).await.unwrap().unwrap().boundary.is_none());
 
         // Documents are read where the CLI runs, and sent along.
         let file = std::env::temp_dir().join(format!("cairn-policy-{}.json", uuid::Uuid::new_v4()));

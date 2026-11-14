@@ -22,7 +22,7 @@ export type LostObject = Schemas["LostObject"];
 export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
-export type User = Schemas["RoleSummary"];
+export type User = Schemas["UserSummary"];
 export type ConsoleAccess = Schemas["ConsoleAccess"];
 export type OidcProvider = Schemas["OidcProvider"];
 export type CorsConfiguration = Schemas["Configuration"];
@@ -83,7 +83,7 @@ async function ok<T>(
 
 const bucketPath = (bucket: string) => ({ path: { bucket } });
 /** A user's path. */
-const rolePath = (role: string) => ({ path: { role } });
+const userPath = (user: string) => ({ path: { user } });
 
 export const api = {
   cluster: () => ok(client.GET("/cluster")),
@@ -101,15 +101,15 @@ export const api = {
     ),
   object: (bucket: string, key: string) =>
     ok(client.GET("/buckets/{bucket}/object", { params: { ...bucketPath(bucket), query: { key } } })),
-  roles: () => ok(client.GET("/roles")),
+  users: () => ok(client.GET("/users")),
   /** A person (no access key: they sign in through a console link), or a
    * service (`accessKey`: one, named as it, whose secret comes back once). */
-  createRole: (
+  createUser: (
     name: string,
     opts: { accessKey?: boolean; admin?: boolean; path?: string; boundary?: string; tags?: Tag[] } = {},
   ) =>
     ok(
-      client.POST("/roles", {
+      client.POST("/users", {
         body: {
           name,
           access_key: opts.accessKey ?? false,
@@ -120,20 +120,20 @@ export const api = {
         },
       }),
     ),
-  deleteRole: (role: string) => ok(client.DELETE("/roles/{role}", { params: rolePath(role) })),
+  deleteUser: (user: string) => ok(client.DELETE("/users/{user}", { params: userPath(user) })),
   /** Renames or moves a user (IAM's UpdateUser). */
-  updateRole: (role: string, change: { name?: string; path?: string }) =>
-    ok(client.PATCH("/roles/{role}", { params: rolePath(role), body: { name: change.name ?? null, path: change.path ?? null } })),
-  setBoundary: (role: string, arn: string) =>
-    ok(client.PUT("/roles/{role}/boundary", { params: rolePath(role), body: { arn } })),
-  deleteBoundary: (role: string) => ok(client.DELETE("/roles/{role}/boundary", { params: rolePath(role) })),
+  updateUser: (user: string, change: { name?: string; path?: string }) =>
+    ok(client.PATCH("/users/{user}", { params: userPath(user), body: { name: change.name ?? null, path: change.path ?? null } })),
+  setBoundary: (user: string, arn: string) =>
+    ok(client.PUT("/users/{user}/boundary", { params: userPath(user), body: { arn } })),
+  deleteBoundary: (user: string) => ok(client.DELETE("/users/{user}/boundary", { params: userPath(user) })),
   /** Sets all of a user's tags. */
-  setRoleTags: (role: string, tags: Tag[]) =>
-    ok(client.PUT("/roles/{role}/tags", { params: rolePath(role), body: { tags } })),
-  rotateSecret: (role: string) =>
-    ok(client.POST("/roles/{role}/secret", { params: rolePath(role), body: {} })),
-  setAdmin: (role: string, admin: boolean) =>
-    ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
+  setUserTags: (user: string, tags: Tag[]) =>
+    ok(client.PUT("/users/{user}/tags", { params: userPath(user), body: { tags } })),
+  rotateSecret: (user: string) =>
+    ok(client.POST("/users/{user}/secret", { params: userPath(user), body: {} })),
+  setAdmin: (user: string, admin: boolean) =>
+    ok(client.PUT("/users/{user}/admin", { params: userPath(user), body: { admin } })),
   policies: () => ok(client.GET("/policies")),
   createPolicy: (name: string, document: string, description: string, path?: string, tags: Tag[] = []) =>
     ok(client.POST("/policies", { body: { name, document, description, path: path || null, tags } })),
@@ -148,29 +148,29 @@ export const api = {
   updatePolicy: (name: string, change: { document?: string; description?: string }) =>
     ok(client.PUT("/policies/{name}", { params: { path: { name } }, body: change })),
   deleteManagedPolicy: (name: string) => ok(client.DELETE("/policies/{name}", { params: { path: { name } } })),
-  attach: (role: string, arn: string) => ok(client.POST("/roles/{role}/attached", { params: rolePath(role), body: { arn } })),
-  detach: (role: string, arn: string) =>
-    ok(client.DELETE("/roles/{role}/attached", { params: { path: { role }, query: { arn } } })),
+  attach: (user: string, arn: string) => ok(client.POST("/users/{user}/attached", { params: userPath(user), body: { arn } })),
+  detach: (user: string, arn: string) =>
+    ok(client.DELETE("/users/{user}/attached", { params: { path: { user }, query: { arn } } })),
   oidcConfig: () => ok(client.GET("/oidc-providers")),
   setOidcProvider: (
     name: string,
     body: { label: string; issuer: string; client_id: string; client_secret: string | null; scopes: string | null },
   ) => ok(client.PUT("/oidc-providers/{name}", { params: { path: { name } }, body })),
   deleteOidcProvider: (name: string) => ok(client.DELETE("/oidc-providers/{name}", { params: { path: { name } } })),
-  createEnrollment: (role: string) =>
-    ok(client.POST("/roles/{role}/enrollment", { params: rolePath(role) })),
-  createKey: (role: string) => ok(client.POST("/roles/{role}/keys", { params: rolePath(role) })),
-  setKeyActive: (role: string, key: string, active: boolean) =>
-    ok(client.PUT("/roles/{role}/keys/{key}", { params: { path: { role, key } }, body: { active } })),
-  deleteKey: (role: string, key: string) =>
-    ok(client.DELETE("/roles/{role}/keys/{key}", { params: { path: { role, key } } })),
-  policy: (role: string, policy: string) =>
-    ok(client.GET("/roles/{role}/policies/{policy}", { params: { path: { role, policy } } })),
-  putPolicy: (role: string, policy: string, document: string) =>
-    ok(client.PUT("/roles/{role}/policies/{policy}", { params: { path: { role, policy } }, body: { document } })),
-  deletePolicy: (role: string, policy: string) =>
-    ok(client.DELETE("/roles/{role}/policies/{policy}", { params: { path: { role, policy } } })),
-  identifyRoles: () => ok(client.POST("/kms/identify")),
+  createEnrollment: (user: string) =>
+    ok(client.POST("/users/{user}/enrollment", { params: userPath(user) })),
+  createKey: (user: string) => ok(client.POST("/users/{user}/keys", { params: userPath(user) })),
+  setKeyActive: (user: string, key: string, active: boolean) =>
+    ok(client.PUT("/users/{user}/keys/{key}", { params: { path: { user, key } }, body: { active } })),
+  deleteKey: (user: string, key: string) =>
+    ok(client.DELETE("/users/{user}/keys/{key}", { params: { path: { user, key } } })),
+  policy: (user: string, policy: string) =>
+    ok(client.GET("/users/{user}/policies/{policy}", { params: { path: { user, policy } } })),
+  putPolicy: (user: string, policy: string, document: string) =>
+    ok(client.PUT("/users/{user}/policies/{policy}", { params: { path: { user, policy } }, body: { document } })),
+  deletePolicy: (user: string, policy: string) =>
+    ok(client.DELETE("/users/{user}/policies/{policy}", { params: { path: { user, policy } } })),
+  identifyUsers: () => ok(client.POST("/kms/identify")),
   lifecycle: () => ok(client.GET("/lifecycle")),
   bucketLifecycle: (bucket: string) => ok(client.GET("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),
   setBucketLifecycle: (bucket: string, configuration: LifecycleConfiguration) =>

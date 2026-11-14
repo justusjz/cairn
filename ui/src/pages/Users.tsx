@@ -22,7 +22,7 @@ const isPerson = (u: User) => !!u.console;
  * (`CairnOperatorAccess`, or `AdministratorAccess`). */
 export default function Users() {
   // Every few seconds: a new user's identity in the KMS comes a moment later.
-  const data = poll(() => Promise.all([api.roles(), api.buckets(), api.policies()]), 5000);
+  const data = poll(() => Promise.all([api.users(), api.buckets(), api.policies()]), 5000);
   const [secret, setSecret] = createSignal<NewSecret>();
   const [editing, setEditing] = createSignal<{ user: string; policy?: string }>();
   const [attaching, setAttaching] = createSignal<User>();
@@ -39,7 +39,7 @@ export default function Users() {
     const n = name().trim();
     const service = kind() === "service";
     const res = await act(
-      () => api.createRole(n, { accessKey: service, admin: admin(), path: path().trim(), boundary: boundary() }),
+      () => api.createUser(n, { accessKey: service, admin: admin(), path: path().trim(), boundary: boundary() }),
       `Created ${n}`,
     );
     if (!res) return;
@@ -232,7 +232,7 @@ export function KmsPanel(props: { cluster: Cluster; refresh: () => void }) {
     }
   };
   const identify = async () => {
-    await act(() => api.identifyRoles(), "Every user has its identity in OpenBao");
+    await act(() => api.identifyUsers(), "Every user has its identity in OpenBao");
     props.refresh();
   };
   return (
@@ -359,7 +359,7 @@ function UserRow(props: {
   const remove = async () => {
     if (!confirm(`Delete user "${r().name}", with its access keys and policies? Clients using it stop working.`))
       return;
-    if (await act(() => api.deleteRole(r().name), `Deleted user ${r().name}`)) props.changed();
+    if (await act(() => api.deleteUser(r().name), `Deleted user ${r().name}`)) props.changed();
   };
 
   return (
@@ -708,7 +708,7 @@ function DetailsDialog(props: { user: User; policies: ManagedPolicy[]; onClose: 
     let user = props.user.name;
     if (name().trim() !== user || path().trim() !== props.user.path) {
       const change = { name: name().trim() !== user ? name().trim() : undefined, path: path().trim() || "/" };
-      if (!(await act(() => api.updateRole(user, change), `Changed ${user}`))) return;
+      if (!(await act(() => api.updateUser(user, change), `Changed ${user}`))) return;
       user = change.name ?? user;
     }
     if (boundary() !== (props.user.boundary ?? "")) {
@@ -719,7 +719,7 @@ function DetailsDialog(props: { user: User; policies: ManagedPolicy[]; onClose: 
     }
     const wanted = tags().filter((t) => t.key.trim()).map((t) => ({ key: t.key.trim(), value: t.value }));
     if (JSON.stringify(wanted) !== JSON.stringify(props.user.tags)) {
-      if (!(await act(() => api.setRoleTags(user, wanted), `Set ${user}'s tags`))) return;
+      if (!(await act(() => api.setUserTags(user, wanted), `Set ${user}'s tags`))) return;
     }
     props.changed();
     dialog.close();

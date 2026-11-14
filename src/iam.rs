@@ -33,7 +33,7 @@ use crate::{
     managed::{self, Named},
     db::Cached,
     policy::{Context, Verdict},
-    roles::{self, Principal, Target},
+    users::{self, Principal, Target},
     s3::{
         access::{Access, Origin},
         actions::{Check, On},
@@ -88,11 +88,11 @@ impl From<anyhow::Error> for Error {
             Ok(Refused::Validation(m)) => return validation(m),
             Err(e) => e,
         };
-        let e = match e.downcast::<roles::TooManyTags>() {
+        let e = match e.downcast::<users::TooManyTags>() {
             Ok(too_many) => return error(StatusCode::CONFLICT, "LimitExceeded", too_many.to_string()),
             Err(e) => e,
         };
-        match e.downcast::<roles::Invalid>() {
+        match e.downcast::<users::Invalid>() {
             Ok(invalid) => self::invalid(invalid.0),
             Err(e) => {
                 eprintln!("iam: request failed: {e:#}");
@@ -368,7 +368,7 @@ fn request_tags(params: &Params, required: bool, of: Tagged) -> Result<Option<Ve
     Ok(Some(tags))
 }
 
-use roles::MAX_TAGS;
+use users::MAX_TAGS;
 
 /// What's wrong with a tag's key or value (`text`), as IAM's validation
 /// errors say it (`at`: where, and "Member must"): its length (`min` to
@@ -382,7 +382,7 @@ fn tag_errors(text: &str, at: &str, min: usize, max: usize) -> Vec<String> {
     if length > max {
         errors.push(format!("{at} have length less than or equal to {max}"));
     }
-    let fine = roles::tag_char;
+    let fine = users::tag_char;
     let pattern = if min > 0 { "+" } else { "*" };
     if (min > 0 && text.is_empty()) || !text.chars().all(fine) {
         errors.push(format!("{at} satisfy regular expression pattern: [\\p{{L}}\\p{{Z}}\\p{{N}}_.:/=+\\-@]{pattern}"));
@@ -418,7 +418,7 @@ fn request_keys(params: &Params) -> Result<Vec<String>> {
     Ok(keys)
 }
 
-use roles::request_tags_context as tags_context;
+use users::request_tags_context as tags_context;
 
 /// Tags as IAM writes them, in `element`.
 fn tags_xml(element: &str, tags: &[(String, String)]) -> String {
@@ -447,7 +447,7 @@ fn requested_boundary(params: &Params) -> Result<Option<String>> {
 /// A path a request gives as `param` (`Path`, ...), checked; `/` if none.
 fn requested_path(params: &Params, param: &str) -> Result<String> {
     let path = params.get(param).unwrap_or("/");
-    roles::check_path(path, &lower_first(param), false).map_err(validation)?;
+    users::check_path(path, &lower_first(param), false).map_err(validation)?;
     Ok(path.to_owned())
 }
 
@@ -539,7 +539,7 @@ impl Iam<'_> {
 
     async fn list_users(&mut self, params: &Params) -> Result<Option<String>> {
         let prefix = params.get("PathPrefix").unwrap_or("/").to_owned();
-        roles::check_path(&prefix, "pathPrefix", true).map_err(validation)?;
+        users::check_path(&prefix, "pathPrefix", true).map_err(validation)?;
         self.check("iam:ListUsers", On::users(self.account(), &prefix)).await?;
         let max = max_items(params)?;
         let after = params.get("Marker").unwrap_or("");
@@ -595,8 +595,8 @@ impl Iam<'_> {
         if exists {
             return Err(error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists.")));
         }
-        roles::create_user(self.client, self.account(), &name, &path, boundary.as_ref()).await.map_err(|e| {
-            match e.downcast::<roles::Invalid>() {
+        users::create_user(self.client, self.account(), &name, &path, boundary.as_ref()).await.map_err(|e| {
+            match e.downcast::<users::Invalid>() {
                 Ok(invalid) if invalid.0.contains("already") => {
                     error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists."))
                 }
@@ -606,7 +606,7 @@ impl Iam<'_> {
         })?;
         let user = Target::load(self.client, self.account(), &name).await?.ok_or_else(|| no_such_user(&name))?;
         if let Some(tags) = &tags {
-            roles::tag(self.client, user.id, tags).await?;
+            users::tag(self.client, user.id, tags).await?;
         }
         let user = Target::load(self.client, self.account(), &name).await?.ok_or_else(|| no_such_user(&name))?;
         Ok(Some(format!("<User>{}</User>", Self::user_xml(&user, true))))
@@ -644,7 +644,7 @@ impl Iam<'_> {
             }
         }
         let name = new_name.unwrap_or_else(|| user.name.clone());
-        roles::rename(self.client, self.account(), user.id, &name, &path).await.map_err(|e| match e.downcast::<roles::Invalid>() {
+        users::rename(self.client, self.account(), user.id, &name, &path).await.map_err(|e| match e.downcast::<users::Invalid>() {
             Ok(i) if i.0.contains("already") => {
                 error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists."))
             }
@@ -675,7 +675,7 @@ impl Iam<'_> {
         if user.admin || count("SELECT count(*) FROM user_attached_policies WHERE user_id = $1").await? > 0 {
             return Err(conflict("detach all policies"));
         }
-        roles::delete(self.client, self.account(), &user.name).await?;
+        users::delete(self.client, self.account(), &user.name).await?;
         Ok(None)
     }
 
@@ -691,7 +691,7 @@ impl Iam<'_> {
         let not_found = |name: &str| error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("User {name} was not found."));
         let user = self.target(params, "iam:PutUserPermissionsBoundary", extra, not_found).await?;
         let boundary = managed::boundary(self.client, self.account(), &arn).await?;
-        if !roles::set_boundary(self.client, self.account(), user.id, Some(&boundary)).await? {
+        if !users::set_boundary(self.client, self.account(), user.id, Some(&boundary)).await? {
             return Err(not_found(&user.name));
         }
         Ok(None)
@@ -704,7 +704,7 @@ impl Iam<'_> {
         if user.boundary.is_none() {
             return Err(error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Principal {} does not have scope", user_id(user.id))));
         }
-        roles::set_boundary(self.client, self.account(), user.id, None).await?;
+        users::set_boundary(self.client, self.account(), user.id, None).await?;
         Ok(None)
     }
 
@@ -712,7 +712,7 @@ impl Iam<'_> {
         params.required("UserName")?;
         let tags = request_tags(params, true, Tagged::User)?.unwrap_or_default();
         let user = self.target(params, "iam:TagUser", tags_context(&tags), no_such_user).await?;
-        roles::tag(self.client, user.id, &tags).await?;
+        users::tag(self.client, user.id, &tags).await?;
         Ok(None)
     }
 
@@ -722,7 +722,7 @@ impl Iam<'_> {
         let mut extra = Context::default();
         extra.set_all("aws:TagKeys", keys.clone());
         let user = self.target(params, "iam:UntagUser", extra, no_such_user).await?;
-        roles::untag(self.client, user.id, &keys).await?;
+        users::untag(self.client, user.id, &keys).await?;
         Ok(None)
     }
 
@@ -746,8 +746,8 @@ impl Iam<'_> {
 
     async fn create_access_key(&mut self, params: &Params) -> Result<Option<String>> {
         let user = self.user(params, "iam:CreateAccessKey").await?;
-        let (id, secret) = roles::create_key(self.client, self.account(), &user.name, None, None).await.map_err(|e| {
-            match e.downcast::<roles::Invalid>() {
+        let (id, secret) = users::create_key(self.client, self.account(), &user.name, None, None).await.map_err(|e| {
+            match e.downcast::<users::Invalid>() {
                 Ok(i) if i.0.contains("access keys already") => error(
                     StatusCode::CONFLICT,
                     "LimitExceeded",
@@ -823,14 +823,14 @@ impl Iam<'_> {
             }
         };
         let id = self.key_of(params, &user).await?;
-        roles::set_key_active(self.client, Some((self.account(), &user.name)), &id, active).await?;
+        users::set_key_active(self.client, Some((self.account(), &user.name)), &id, active).await?;
         Ok(None)
     }
 
     async fn delete_access_key(&mut self, params: &Params) -> Result<Option<String>> {
         let user = self.user(params, "iam:DeleteAccessKey").await?;
         let id = self.key_of(params, &user).await?;
-        roles::delete_key(self.client, Some((self.account(), &user.name)), &id).await?;
+        users::delete_key(self.client, Some((self.account(), &user.name)), &id).await?;
         Ok(None)
     }
 
@@ -839,7 +839,7 @@ impl Iam<'_> {
         let user = self.user(params, "iam:PutUserPolicy").await?;
         let name = params.required("PolicyName")?;
         let document = params.required("PolicyDocument")?;
-        roles::put_policy(self.client, self.account(), &user.name, name, document).await.map_err(|e| match e.downcast::<roles::Invalid>() {
+        users::put_policy(self.client, self.account(), &user.name, name, document).await.map_err(|e| match e.downcast::<users::Invalid>() {
             Ok(i) if i.0.starts_with("Malformed") || i.0.contains("Policy") && i.0.contains(':') => {
                 let message = i.0.split_once(": ").map_or(i.0.as_str(), |(_, m)| m).to_owned();
                 error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", message)
@@ -859,7 +859,7 @@ impl Iam<'_> {
         params.required("UserName")?;
         let user = self.user(params, "iam:GetUserPolicy").await?;
         let name = params.required("PolicyName")?;
-        let document = roles::get_policy(self.client, self.account(), &user.name, name).await.map_err(|_| {
+        let document = users::get_policy(self.client, self.account(), &user.name, name).await.map_err(|_| {
             error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The user policy with name {name} cannot be found."))
         })?;
         // URL-encoded, as IAM gives policy documents (RFC 3986).
@@ -890,7 +890,7 @@ impl Iam<'_> {
         params.required("UserName")?;
         let user = self.user(params, "iam:DeleteUserPolicy").await?;
         let name = params.required("PolicyName")?;
-        roles::delete_policy(self.client, self.account(), &user.name, name).await.map_err(|_| {
+        users::delete_policy(self.client, self.account(), &user.name, name).await.map_err(|_| {
             error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("The user policy with name {name} cannot be found."))
         })?;
         Ok(None)
@@ -1026,7 +1026,7 @@ impl Iam<'_> {
                     created: row.get(5),
                     updated: row.get(6),
                     aws: false,
-                    tags: roles::tags_of(row.get(8), row.get(9)),
+                    tags: users::tags_of(row.get(8), row.get(9)),
                     uuid: Some(row.get(0)),
                 }
             }
@@ -1157,7 +1157,7 @@ impl Iam<'_> {
         }
         let only_attached = params.get("OnlyAttached") == Some("true");
         let prefix = params.get("PathPrefix").unwrap_or("/").to_owned();
-        roles::check_path(&prefix, "pathPrefix", true).map_err(validation)?;
+        users::check_path(&prefix, "pathPrefix", true).map_err(validation)?;
         let mut policies = Vec::new();
         if scope != "Local" {
             for p in managed::AWS_POLICIES {

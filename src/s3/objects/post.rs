@@ -37,7 +37,7 @@ use crate::{
     App,
     auth::PostSignature,
     payload::Payload,
-    roles::Principal,
+    users::Principal,
     s3::{
         access, acl, actions,
         buckets::encryption::default_request,
@@ -325,7 +325,7 @@ where
             Some((signature, principal, policy))
         }
     };
-    let account = crate::roles::account(&client).await?;
+    let account = crate::users::account(&client).await?;
     drop(client);
     let key = match field(&fields, "key") {
         Some(key) if !key.is_empty() => key.to_owned(),

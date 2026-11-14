@@ -318,8 +318,8 @@ pub fn delete(version: bool) -> &'static str {
 /// any of them. A `read` grant may read versions' Object Lock, but no grant
 /// may set one (only the bucket's default retention applies to a writer's
 /// writes), nor bypass one.
-pub fn grant_actions(permission: crate::roles::Permission) -> Vec<&'static str> {
-    use crate::roles::Permission;
+pub fn grant_actions(permission: crate::users::Permission) -> Vec<&'static str> {
+    use crate::users::Permission;
     let mut actions: Vec<&str> = match permission {
         Permission::Read => vec![
             "s3:GetObject",
@@ -359,7 +359,7 @@ pub fn grant_actions(permission: crate::roles::Permission) -> Vec<&'static str> 
 /// A grant of `permission` on `bucket`, as an identity policy (for tests:
 /// grants are statements of their buckets' policies, see `grants`).
 #[cfg(test)]
-pub fn grant_policy(permission: crate::roles::Permission, bucket: &str) -> String {
+pub fn grant_policy(permission: crate::users::Permission, bucket: &str) -> String {
     let actions = grant_actions(permission).iter().map(|a| format!("\"{a}\"")).collect::<Vec<_>>().join(",");
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[\
@@ -381,7 +381,7 @@ mod tests {
         Context, Kind, Policy, Principal, Request, Verdict, verdict,
         s3_actions::{ACTIONS, Applies},
     };
-    use crate::roles::Permission;
+    use crate::users::Permission;
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -560,7 +560,7 @@ mod tests {
                 }
             }
             let admin = mask & (1 << 6) != 0;
-            let principal = crate::roles::Principal::for_test(admin, &grants);
+            let principal = crate::users::Principal::for_test(admin, &grants);
             let policies = policies(&grants, admin);
             for (method, bucket, key, query, headers) in requests() {
                 // ListBuckets and DeleteObjects decide per bucket and key.

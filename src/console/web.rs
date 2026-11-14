@@ -97,7 +97,7 @@ pub(crate) struct ErrorBody {
 impl<E: Into<anyhow::Error>> From<E> for ApiError {
     fn from(e: E) -> Self {
         let e = e.into();
-        let e = match e.downcast::<crate::roles::Invalid>() {
+        let e = match e.downcast::<crate::users::Invalid>() {
             Ok(invalid) => return ApiError::BadRequest(invalid.0),
             Err(e) => e,
         };

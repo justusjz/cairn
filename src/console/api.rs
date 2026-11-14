@@ -669,7 +669,7 @@ async fn oidc_callback(State(console): ConsoleState, Query(answer): Query<OidcAn
         }
     };
     let provider = done.provider.name.as_str();
-    let to_text = |e: anyhow::Error| match e.downcast::<crate::roles::Invalid>() {
+    let to_text = |e: anyhow::Error| match e.downcast::<crate::users::Invalid>() {
         Ok(invalid) => Ok(invalid.0),
         Err(e) => Err(e),
     };

@@ -458,11 +458,11 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Logs in to the KMS as each role without an identity there yet, from this
+         * Logs in to the KMS as each user without an identity there yet, from this
          *     node, now rather than at its next maintenance pass. Fails with what went
          *     wrong.
          */
-        post: operations["identify_roles"];
+        post: operations["identify_users"];
         delete?: never;
         options?: never;
         head?: never;
@@ -873,206 +873,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/roles": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_roles"];
-        put?: never;
-        post: operations["create_role"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        delete: operations["delete_role"];
-        options?: never;
-        head?: never;
-        /**
-         * Renames or moves a user, as IAM's UpdateUser: allowed on it, and on
-         *     where it goes (its new ARN; moved only, its new path: see `iam`).
-         */
-        patch: operations["update_role"];
-        trace?: never;
-    };
-    "/roles/{role}/admin": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        /** Makes a role an admin, or not. */
-        put: operations["set_admin"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}/attached": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Attaches a managed policy to a user. */
-        post: operations["attach_policy"];
-        /** Detaches a managed policy from a user. */
-        delete: operations["detach_policy"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}/boundary": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        /**
-         * Sets a user's permissions boundary, as IAM's
-         *     PutUserPermissionsBoundary (decided by the boundary asked for).
-         */
-        put: operations["set_boundary"];
-        post?: never;
-        /** Removes a user's permissions boundary. */
-        delete: operations["delete_boundary"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}/enrollment": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Makes a role an enrollment link for the console, replacing its last. */
-        post: operations["create_enrollment"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}/keys": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Makes a new access key for a role, with a random ID and secret; a role
-         *     has at most two.
-         */
-        post: operations["create_key"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}/keys/{key}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        /** Lets one of the role's access keys sign requests, or stops it. */
-        put: operations["set_key"];
-        post?: never;
-        /** Deletes one of the role's access keys. */
-        delete: operations["delete_key"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}/policies/{policy}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** One of the role's inline policies, as it was set. */
-        get: operations["get_policy"];
-        /** Sets one of the role's inline policies, if it's a valid identity policy. */
-        put: operations["put_policy"];
-        post?: never;
-        /** Deletes one of the role's inline policies. */
-        delete: operations["delete_policy"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}/secret": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Replaces a role's secret. */
-        post: operations["rotate_secret"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/roles/{role}/tags": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        /** Sets a user's tags, as IAM's TagUser and UntagUser would. */
-        put: operations["set_role_tags"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/settings/{name}": {
         parameters: {
             query?: never;
@@ -1103,6 +903,206 @@ export interface paths {
         };
         get: operations["get_storage"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_users"];
+        put?: never;
+        post: operations["create_user"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{user}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["delete_user"];
+        options?: never;
+        head?: never;
+        /**
+         * Renames or moves a user, as IAM's UpdateUser: allowed on it, and on
+         *     where it goes (its new ARN; moved only, its new path: see `iam`).
+         */
+        patch: operations["update_user"];
+        trace?: never;
+    };
+    "/users/{user}/admin": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Makes a user an admin, or not. */
+        put: operations["set_admin"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{user}/attached": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Attaches a managed policy to a user. */
+        post: operations["attach_policy"];
+        /** Detaches a managed policy from a user. */
+        delete: operations["detach_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{user}/boundary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a user's permissions boundary, as IAM's
+         *     PutUserPermissionsBoundary (decided by the boundary asked for).
+         */
+        put: operations["set_boundary"];
+        post?: never;
+        /** Removes a user's permissions boundary. */
+        delete: operations["delete_boundary"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{user}/enrollment": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Makes a user an enrollment link for the console, replacing its last. */
+        post: operations["create_enrollment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{user}/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Makes a new access key for a user, with a random ID and secret; a user
+         *     has at most two.
+         */
+        post: operations["create_key"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{user}/keys/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Lets one of the user's access keys sign requests, or stops it. */
+        put: operations["set_key"];
+        post?: never;
+        /** Deletes one of the user's access keys. */
+        delete: operations["delete_key"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{user}/policies/{policy}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** One of the user's inline policies, as it was set. */
+        get: operations["get_policy"];
+        /** Sets one of the user's inline policies, if it's a valid identity policy. */
+        put: operations["put_policy"];
+        post?: never;
+        /** Deletes one of the user's inline policies. */
+        delete: operations["delete_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{user}/secret": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Replaces a user's secret. */
+        post: operations["rotate_secret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/users/{user}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a user's tags, as IAM's TagUser and UntagUser would. */
+        put: operations["set_user_tags"];
         post?: never;
         delete?: never;
         options?: never;
@@ -1274,16 +1274,16 @@ export interface components {
             /** @description Whether its policy makes it public (GetBucketPolicyStatus). */
             public: boolean;
             public_access_block?: components["schemas"]["Block"] | null;
+            /** @description Its tags (PutBucketTagging), sorted by key. */
+            tags: components["schemas"]["Tag"][];
+            /** Format: int64 */
+            uploads: number;
             /**
              * Format: int64
              * @description The account's users whose policies give them access to the whole
              *     bucket (see `who_has_access`).
              */
-            roles: number;
-            /** @description Its tags (PutBucketTagging), sorted by key. */
-            tags: components["schemas"]["Tag"][];
-            /** Format: int64 */
-            uploads: number;
+            users: number;
             /** Format: int64 */
             version_bytes: number;
             versioning: components["schemas"]["Versioning"];
@@ -1400,6 +1400,26 @@ export interface components {
              */
             nodes: components["schemas"]["NodeCoverage"][];
         };
+        CreateUser: {
+            /**
+             * @description Whether it gets an access key (a service's), of a random ID; a person
+             *     gets none, and signs in to the console through its link.
+             */
+            access_key?: boolean;
+            admin?: boolean;
+            /** @description Its permissions boundary: a managed policy's ARN. */
+            boundary?: string | null;
+            name: string;
+            /** @description Its path (`/`, or `/…/`); `/` if not given. */
+            path?: string | null;
+            /**
+             * @description The access key's secret: at least 8 characters; one is generated if
+             *     not given. Implies `access_key`.
+             */
+            secret?: string | null;
+            /** @description Its tags. */
+            tags?: components["schemas"]["Tag"][];
+        };
         DefaultVersion: {
             /** Format: int32 */
             version: number;
@@ -1450,7 +1470,7 @@ export interface components {
             token: string;
         };
         /**
-         * @description A one-time link for a role to register its first passkey for the
+         * @description A one-time link for a user to register its first passkey for the
          *     console, valid 24 hours.
          */
         EnrollmentLink: {
@@ -1923,26 +1943,6 @@ export interface components {
              */
             rate: number;
         };
-        NewRole: {
-            /**
-             * @description Whether it gets an access key (a service's), of a random ID; a person
-             *     gets none, and signs in to the console through its link.
-             */
-            access_key?: boolean;
-            admin?: boolean;
-            /** @description Its permissions boundary: a managed policy's ARN. */
-            boundary?: string | null;
-            name: string;
-            /** @description Its path (`/`, or `/…/`); `/` if not given. */
-            path?: string | null;
-            /**
-             * @description The access key's secret: at least 8 characters; one is generated if
-             *     not given. Implies `access_key`.
-             */
-            secret?: string | null;
-            /** @description Its tags. */
-            tags?: components["schemas"]["Tag"][];
-        };
         NewSecret: {
             /** @description At least 8 characters; one is generated if not given. */
             secret?: string | null;
@@ -2277,51 +2277,6 @@ export interface components {
              */
             slot_secs: number;
         };
-        RoleChange: {
-            /** @description Its new name (unique in the account regardless of case). */
-            name?: string | null;
-            /** @description Its new path (`/`, or `/…/`). */
-            path?: string | null;
-        };
-        /** @description A role, never with its secret. */
-        RoleSummary: {
-            admin: boolean;
-            /** @description Its ARN. */
-            arn: string;
-            /** @description Its attached managed policies (AdministratorAccess, if it's an admin). */
-            attached: components["schemas"]["AttachedPolicy"][];
-            /** @description Its permissions boundary's ARN, which caps what its policies allow. */
-            boundary?: string | null;
-            console?: components["schemas"]["ConsoleAccess"] | null;
-            /** Format: double */
-            created_at: number;
-            /**
-             * @description Its ID, which never changes or comes back: its name (alias) in the
-             *     KMS's auth mount for Cairn.
-             */
-            id: string;
-            /** @description Its access keys, oldest first (never their secrets). */
-            keys: components["schemas"]["AccessKey"][];
-            /**
-             * @description Its identity (entity) in the KMS, which key owners grant keys to;
-             *     none until Cairn has logged in as it, or without a KMS.
-             */
-            kms_entity_id?: string | null;
-            name: string;
-            /** @description Its path (`/`, or `/…/`), which its ARN has before its name. */
-            path: string;
-            /** @description The names of its inline policies. */
-            policies: string[];
-            /** @description Its tags, newest first. */
-            tags: components["schemas"]["Tag"][];
-        };
-        RoleTags: {
-            /**
-             * @description All of its tags: those it has of other keys go (UntagUser), the
-             *     rest are set (TagUser).
-             */
-            tags: components["schemas"]["Tag"][];
-        };
         Rule: {
             /** @description `ExposeHeader`s: the response headers a page may read. */
             expose?: string[];
@@ -2358,7 +2313,7 @@ export interface components {
             /** Format: int64 */
             repaired: number;
         };
-        /** @description A role's secret, which is shown only this once. */
+        /** @description A user's secret, which is shown only this once. */
         Secret: {
             name: string;
             secret: string;
@@ -2425,6 +2380,51 @@ export interface components {
              */
             levels: string[];
             user: string;
+        };
+        UserChange: {
+            /** @description Its new name (unique in the account regardless of case). */
+            name?: string | null;
+            /** @description Its new path (`/`, or `/…/`). */
+            path?: string | null;
+        };
+        /** @description A user, never with its secret. */
+        UserSummary: {
+            admin: boolean;
+            /** @description Its ARN. */
+            arn: string;
+            /** @description Its attached managed policies (AdministratorAccess, if it's an admin). */
+            attached: components["schemas"]["AttachedPolicy"][];
+            /** @description Its permissions boundary's ARN, which caps what its policies allow. */
+            boundary?: string | null;
+            console?: components["schemas"]["ConsoleAccess"] | null;
+            /** Format: double */
+            created_at: number;
+            /**
+             * @description Its ID, which never changes or comes back: its name (alias) in the
+             *     KMS's auth mount for Cairn.
+             */
+            id: string;
+            /** @description Its access keys, oldest first (never their secrets). */
+            keys: components["schemas"]["AccessKey"][];
+            /**
+             * @description Its identity (entity) in the KMS, which key owners grant keys to;
+             *     none until Cairn has logged in as it, or without a KMS.
+             */
+            kms_entity_id?: string | null;
+            name: string;
+            /** @description Its path (`/`, or `/…/`), which its ARN has before its name. */
+            path: string;
+            /** @description The names of its inline policies. */
+            policies: string[];
+            /** @description Its tags, newest first. */
+            tags: components["schemas"]["Tag"][];
+        };
+        UserTags: {
+            /**
+             * @description All of its tags: those it has of other keys go (UntagUser), the
+             *     rest are set (TagUser).
+             */
+            tags: components["schemas"]["Tag"][];
         };
         VersionInfo: {
             content_type?: string | null;
@@ -3749,7 +3749,7 @@ export interface operations {
             };
         };
     };
-    identify_roles: {
+    identify_users: {
         parameters: {
             query?: never;
             header?: never;
@@ -3758,7 +3758,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Every role has its identity in the KMS */
+            /** @description Every user has its identity in the KMS */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -4755,691 +4755,6 @@ export interface operations {
             };
         };
     };
-    list_roles: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RoleSummary"][];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    create_role: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["NewRole"];
-            };
-        };
-        responses: {
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["NewUser"];
-                };
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    delete_role: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Deleted, with its grants */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    update_role: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RoleChange"];
-            };
-        };
-        responses: {
-            /** @description Changed */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    set_admin: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AdminFlag"];
-            };
-        };
-        responses: {
-            /** @description Changed */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    attach_policy: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PolicyArn"];
-            };
-        };
-        responses: {
-            /** @description Attached */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    detach_policy: {
-        parameters: {
-            query: {
-                arn: string;
-            };
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Detached */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    set_boundary: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["BoundaryArn"];
-            };
-        };
-        responses: {
-            /** @description Set */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    delete_boundary: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Removed */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    create_enrollment: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["EnrollmentLink"];
-                };
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    create_key: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["NewKey"];
-                };
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    set_key: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-                key: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["KeyState"];
-            };
-        };
-        responses: {
-            /** @description Changed */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    delete_key: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-                key: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Deleted */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    get_policy: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-                policy: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["PolicyDocument"];
-                };
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    put_policy: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-                policy: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["PolicyDocument"];
-            };
-        };
-        responses: {
-            /** @description Set */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    delete_policy: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-                policy: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Deleted */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    rotate_secret: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["NewSecret"];
-            };
-        };
-        responses: {
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Secret"];
-                };
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    set_role_tags: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                role: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["RoleTags"];
-            };
-        };
-        responses: {
-            /** @description Set */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
     set_setting: {
         parameters: {
             query?: never;
@@ -5496,6 +4811,691 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Storage"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_users: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UserSummary"][];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateUser"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewUser"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted, with its grants */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UserChange"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_admin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminFlag"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    attach_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyArn"];
+            };
+        };
+        responses: {
+            /** @description Attached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    detach_policy: {
+        parameters: {
+            query: {
+                arn: string;
+            };
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Detached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BoundaryArn"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_enrollment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnrollmentLink"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewKey"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["KeyState"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+                policy: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDocument"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+                policy: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyDocument"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+                policy: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    rotate_secret: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSecret"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Secret"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_user_tags: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                user: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UserTags"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "5XX": {

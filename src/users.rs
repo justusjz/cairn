@@ -1,4 +1,5 @@
-//! Users (called roles before; still the `roles` table): who may make S3
+//! Users (called roles before; the `users` table, `roles` before migration
+//! 47): who may make S3
 //! requests, with which access keys, and what each may do.
 //!
 //! A user has a name (its ARN is `arn:aws:iam::<account>:user/<name>`), up to
@@ -29,7 +30,8 @@ use serde::{Deserialize, Serialize};
 use crate::admin::outln;
 use crate::db::Cached;
 
-/// A bucket-level permission a role can be granted.
+/// A bucket-level permission a user could be granted (grants are managed
+/// policies now, see `grants`).
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, ValueEnum, serde::Serialize, serde::Deserialize, utoipa::ToSchema,
 )]
@@ -210,14 +212,14 @@ impl Principal {
         }
     }
 
-    /// Whether a role with these grants could learn that `bucket` exists,
+    /// Whether a user with these grants could learn that `bucket` exists,
     /// before there were policies (see `s3::authorize`).
     #[cfg(test)]
     pub fn can_see(&self, bucket: &str) -> bool {
         self.admin || self.read.contains(bucket) || self.write.contains(bucket) || self.delete_version.contains(bucket)
     }
 
-    /// A role with these grants, for tests.
+    /// A user with these grants, for tests.
     #[cfg(test)]
     pub fn for_test(admin: bool, grants: &[(Permission, &str)]) -> Principal {
         let on = |wanted: Permission| {
@@ -244,16 +246,16 @@ impl Principal {
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 #[derive(Args, Debug, Serialize, Deserialize)]
-pub struct RoleArgs {
+pub struct UserArgs {
     #[command(flatten)]
     #[serde(skip)]
     pub remote: crate::admin::Remote,
     #[command(subcommand)]
-    command: RoleCommand,
+    command: UserCommand,
 }
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
-enum RoleCommand {
+enum UserCommand {
     /// Create a user, with an access key of a random ID. Prints the key's
     /// ID and secret; a random secret is generated unless given.
     Create {
@@ -366,10 +368,10 @@ enum PolicyCommand {
     Delete { user: String, name: String },
 }
 
-impl RoleArgs {
+impl UserArgs {
     /// Reads what the command takes from files, where the CLI runs.
     pub fn prepare(&mut self) -> anyhow::Result<()> {
-        if let RoleCommand::Policy(PolicyCommand::Put { file, document, .. }) = &mut self.command {
+        if let UserCommand::Policy(PolicyCommand::Put { file, document, .. }) = &mut self.command {
             *document = crate::admin::read_document(file)?;
         }
         Ok(())
@@ -378,12 +380,12 @@ impl RoleArgs {
 
 /// `cairn user …` (or `cairn role …`): user management, on a node (see
 /// `admin`).
-pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
+pub async fn run(app: &std::sync::Arc<crate::App>, args: UserArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     let account_id = account(&client).await?;
     let account_id = account_id.as_str();
     match args.command {
-        RoleCommand::Create {
+        UserCommand::Create {
             name,
             id,
             secret,
@@ -408,11 +410,11 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
             let identifying = app.clone();
             tokio::spawn(async move {
                 if let Err(e) = identify(&identifying).await {
-                    eprintln!("kms: identifying roles: {e:#}");
+                    eprintln!("kms: identifying users: {e:#}");
                 }
             });
         }
-        RoleCommand::Update {
+        UserCommand::Update {
             name,
             admin,
             rotate_secret,
@@ -427,39 +429,39 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
                 outln!(out, "secret key: {s}");
             }
         }
-        RoleCommand::Delete { name } => delete(&client, account_id, &name).await?,
-        RoleCommand::List => {
-            for role in list(&client).await?.into_iter().filter(|r| r.account_id == account_id) {
-                let admin = if role.admin { " (admin)" } else { "" };
-                outln!(out, "{}{admin}", role.name);
-                outln!(out, "  {}", user_arn(account_id, &role.path, &role.name));
-                if let Some(boundary) = &role.boundary {
+        UserCommand::Delete { name } => delete(&client, account_id, &name).await?,
+        UserCommand::List => {
+            for user in list(&client).await?.into_iter().filter(|r| r.account_id == account_id) {
+                let admin = if user.admin { " (admin)" } else { "" };
+                outln!(out, "{}{admin}", user.name);
+                outln!(out, "  {}", user_arn(account_id, &user.path, &user.name));
+                if let Some(boundary) = &user.boundary {
                     outln!(out, "  boundary {boundary}");
                 }
-                for (key, value) in &role.tags {
+                for (key, value) in &user.tags {
                     outln!(out, "  tag {key}={value}");
                 }
-                outln!(out, "  id {}", role.id);
-                if let Some(entity) = role.kms_entity_id {
+                outln!(out, "  id {}", user.id);
+                if let Some(entity) = user.kms_entity_id {
                     outln!(out, "  KMS entity {entity}");
                 }
-                for key in role.keys {
+                for key in user.keys {
                     let state = if key.active { "" } else { " (inactive)" };
                     outln!(out, "  key {}{state}", key.id);
                 }
-                for policy in crate::managed::attached(&client, account_id, &role.name).await? {
+                for policy in crate::managed::attached(&client, account_id, &user.name).await? {
                     outln!(out, "  attached {}", policy.arn);
                 }
-                for policy in role.policies {
+                for policy in user.policies {
                     outln!(out, "  policy {policy}");
                 }
             }
         }
-        RoleCommand::Enroll { name } => {
+        UserCommand::Enroll { name } => {
             let token = crate::console::store::create_enrollment(&client, account_id, &name).await?;
             enrollment_link(app, &token, out);
         }
-        RoleCommand::Key(command) => match command {
+        UserCommand::Key(command) => match command {
             KeyCommand::Create { user, id, secret } => {
                 let (id, secret) = create_key(&client, account_id, &user, id, secret).await?;
                 outln!(out, "access key: {id}");
@@ -469,26 +471,26 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
             KeyCommand::Activate { id } => set_key_active(&client, None, &id, true).await?,
             KeyCommand::Deactivate { id } => set_key_active(&client, None, &id, false).await?,
         },
-        RoleCommand::Policy(command) => match command {
+        UserCommand::Policy(command) => match command {
             PolicyCommand::Put { user, name, document, .. } => {
                 put_policy(&client, account_id, &user, &name, &document).await?;
             }
             PolicyCommand::Get { user, name } => outln!(out, "{}", get_policy(&client, account_id, &user, &name).await?),
             PolicyCommand::Delete { user, name } => delete_policy(&client, account_id, &user, &name).await?,
         },
-        RoleCommand::Grant {
+        UserCommand::Grant {
             name,
             bucket,
             permissions,
         } => grant(&client, account_id, &name, &bucket, &permissions).await?,
-        RoleCommand::Revoke {
+        UserCommand::Revoke {
             name,
             bucket,
             permissions,
         } => revoke(&client, account_id, &name, &bucket, &permissions).await?,
-        RoleCommand::Attach { name, arn } => crate::managed::attach(&client, account_id, &name, &arn, true).await?,
-        RoleCommand::Detach { name, arn } => crate::managed::attach(&client, account_id, &name, &arn, false).await?,
-        RoleCommand::Unbound { name } => {
+        UserCommand::Attach { name, arn } => crate::managed::attach(&client, account_id, &name, &arn, true).await?,
+        UserCommand::Detach { name, arn } => crate::managed::attach(&client, account_id, &name, &arn, false).await?,
+        UserCommand::Unbound { name } => {
             let id = id_of(&client, account_id, &name).await?;
             set_boundary(&client, account_id, id, None).await?;
         }
@@ -508,8 +510,8 @@ pub(crate) fn enrollment_link(app: &crate::App, token: &str, out: &mut crate::ad
     }
 }
 
-/// A request to change roles that can't be carried out as asked: a bad name, an
-/// unknown role, and the like. Its message is meant for whoever asked.
+/// A request to change users that can't be carried out as asked: a bad name, an
+/// unknown user, and the like. Its message is meant for whoever asked.
 #[derive(Debug)]
 pub struct Invalid(pub String);
 
@@ -534,7 +536,7 @@ fn validate_name(name: &str) -> anyhow::Result<()> {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
     {
         return Err(invalid(
-            "role name must be non-empty and use only A-Z, a-z, 0-9, '-', '_', '.'",
+            "user name must be non-empty and use only A-Z, a-z, 0-9, '-', '_', '.'",
         ));
     }
     Ok(())
@@ -571,7 +573,7 @@ pub async fn create(
 }
 
 /// Creates a user of the account `account_id` without access keys, as
-/// IAM's CreateUser does (it gets them with `create_key`; `roles.secret`,
+/// IAM's CreateUser does (it gets them with `create_key`; `users.secret`,
 /// which older Cairns read, is none that can be guessed), at `path`
 /// (checked: see `check_path`), with the permissions boundary `boundary`.
 /// Names are unique in an account regardless of case, as IAM's.
@@ -608,7 +610,7 @@ pub enum BoundaryRef {
 }
 
 impl BoundaryRef {
-    /// `roles.boundary_policy_id` and `roles.boundary_aws` for `boundary`.
+    /// `users.boundary_policy_id` and `users.boundary_aws` for `boundary`.
     pub fn columns(boundary: Option<&BoundaryRef>) -> (Option<uuid::Uuid>, Option<&'static str>) {
         match boundary {
             Some(BoundaryRef::Own(id)) => (Some(*id), None),
@@ -881,7 +883,7 @@ async fn create_with_key(
         }
         None => generate_secret()?,
     };
-    // One statement: the user and its key, or neither. (`roles.secret` is
+    // One statement: the user and its key, or neither. (`users.secret` is
     // what older Cairns authenticate with, as the key named as the user:
     // the key's secret if it's that one, else none that can be guessed;
     // the key's trigger keeps it.)
@@ -966,11 +968,11 @@ pub async fn create_key(
         }
         None => generate_secret()?,
     };
-    let role = id_of(client, account, user).await?;
+    let id_of_user = id_of(client, account, user).await?;
     // At most two (I10: `cairn_create_key` counts them under the user's
     // row, held exclusively).
     let status = client
-        .query_one_cached("SELECT pg_temp.cairn_create_key($1, $2, $3, $4)", &[&role, &id, &secret, &MAX_KEYS])
+        .query_one_cached("SELECT pg_temp.cairn_create_key($1, $2, $3, $4)", &[&id_of_user, &id, &secret, &MAX_KEYS])
         .await?;
     match status.get::<_, &str>(0) {
         "created" => Ok((id, secret)),
@@ -1048,9 +1050,9 @@ pub async fn put_policy(client: &Object, account: &str, user: &str, name: &str, 
     // Within IAM's size (I10: `cairn_put_policy` sizes them under the
     // user's row, held exclusively).
     let max = MAX_POLICIES as i32;
-    let role = id_of(client, account, user).await?;
+    let id = id_of(client, account, user).await?;
     let status = client
-        .query_one_cached("SELECT pg_temp.cairn_put_policy($1, $2, $3, $4)", &[&role, &name, &document, &max])
+        .query_one_cached("SELECT pg_temp.cairn_put_policy($1, $2, $3, $4)", &[&id, &name, &document, &max])
         .await?;
     match status.get::<_, &str>(0) {
         "set" => Ok(()),
@@ -1089,7 +1091,7 @@ pub async fn delete_policy(client: &Object, account: &str, user: &str, name: &st
     Ok(())
 }
 
-/// Changes a role's admin flag and/or secret.
+/// Changes a user's admin flag and/or secret.
 pub async fn update(
     client: &Object,
     account: &str,
@@ -1131,11 +1133,11 @@ pub async fn update(
     Ok(())
 }
 
-/// Deletes a role and all its grants.
+/// Deletes a user, its access keys and policies.
 pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Result<()> {
-    let role = id_of(client, account, name).await?;
+    let id = id_of(client, account, name).await?;
     let deleted: bool = client
-        .query_one_cached("SELECT pg_temp.cairn_delete_user($1)", &[&role])
+        .query_one_cached("SELECT pg_temp.cairn_delete_user($1)", &[&id])
         .await?
         .get(0);
     if !deleted {
@@ -1144,10 +1146,10 @@ pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Resul
     Ok(())
 }
 
-/// Logs in to the KMS once as each role that has no identity (entity) there
+/// Logs in to the KMS once as each user that has no identity (entity) there
 /// yet, so that OpenBao makes it, and keeps its ID (see `kms`): then key
-/// owners can grant the role keys before it uses any. Likewise as Cairn
-/// itself, for SSE-S3, once on each node. A role the KMS can't
+/// owners can grant the user keys before it uses any. Likewise as Cairn
+/// itself, for SSE-S3, once on each node. A user the KMS can't
 /// be asked about now is tried again in the next maintenance pass.
 pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
     let Some(kms) = &app.kms else { return Ok(()) };
@@ -1157,21 +1159,21 @@ pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
         eprintln!("kms: Cairn's own identity (for SSE-S3) is the entity {entity}");
     }
     let client = app.pool.get().await?;
-    let roles: Vec<uuid::Uuid> = client
+    let users: Vec<uuid::Uuid> = client
         .query_cached("SELECT id FROM users WHERE kms_entity_id IS NULL ORDER BY created_at", &[])
         .await?
         .iter()
         .map(|row| row.get(0))
         .collect();
     drop(client);
-    for role in roles {
-        let entity = kms.identify(crate::kms::Identity::Role(role)).await.map_err(|e| anyhow::anyhow!("role {role}: {e}"))?;
+    for user in users {
+        let entity = kms.identify(crate::kms::Identity::User(user)).await.map_err(|e| anyhow::anyhow!("user {user}: {e}"))?;
         // A plain write of one row's own column: no invariant of the lock
         // protocol (see `catalog.sql`) involves it.
         app.pool
             .get()
             .await?
-            .execute_cached("UPDATE users SET kms_entity_id = $2 WHERE id = $1", &[&role, &entity])
+            .execute_cached("UPDATE users SET kms_entity_id = $2 WHERE id = $1", &[&user, &entity])
             .await?;
     }
     Ok(())
@@ -1186,7 +1188,7 @@ pub struct KeyInfo {
 }
 
 /// A user as listed: never with its secrets.
-pub struct RoleInfo {
+pub struct UserInfo {
     pub name: String,
     /// Its account's ID.
     pub account_id: String,
@@ -1209,8 +1211,8 @@ pub struct RoleInfo {
     pub boundary: Option<String>,
 }
 
-/// Every role, by name.
-pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
+/// Every user, by name.
+pub async fn list(client: &Object) -> anyhow::Result<Vec<UserInfo>> {
     let rows = client
         .query_cached(
             &format!("SELECT r.name, r.admin, extract(epoch FROM r.created_at)::float8,
@@ -1230,7 +1232,7 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
         .await?;
     rows.iter()
         .map(|r| {
-            Ok(RoleInfo {
+            Ok(UserInfo {
                 name: r.get(0),
                 admin: r.get(1),
                 created_at: r.get(2),

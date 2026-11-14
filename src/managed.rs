@@ -12,7 +12,7 @@
 //!   Cairn keeps the default, numbered as IAM numbers versions (`v1`, ...).
 //!
 //! A user's attached policies count as its identity policies, alongside its
-//! inline ones (see `roles::Principal`, `s3::access`). Limits are IAM's: a
+//! inline ones (see `users::Principal`, `s3::access`). Limits are IAM's: a
 //! document of at most 6,144 characters (but whitespace), and at most 10
 //! policies attached to a user.
 
@@ -170,16 +170,16 @@ pub async fn own(client: &Object, account: &str, path: &str, name: &str) -> anyh
 
 /// The permissions boundary `arn` names, for a user of `account`, as IAM
 /// refuses one (probed): a managed policy, the account's own or Cairn's.
-pub async fn boundary(client: &Object, account: &str, arn: &str) -> anyhow::Result<crate::roles::BoundaryRef> {
+pub async fn boundary(client: &Object, account: &str, arn: &str) -> anyhow::Result<crate::users::BoundaryRef> {
     let scope = || Refused::NoSuch(format!("Scope ARN: {arn} does not exist or is not attachable."));
     let policy = arn.strip_prefix("arn:aws:iam::").and_then(|rest| rest.split_once(":policy/"));
     if policy.is_none_or(|(owner, _)| owner != "aws" && !(owner.len() == 12 && owner.bytes().all(|b| b.is_ascii_digit()))) {
         return refused(Refused::Invalid(format!("ARN {arn} is not valid.")));
     }
     match named(arn, account).map_err(|_| scope())? {
-        Named::Aws(p) => Ok(crate::roles::BoundaryRef::Aws(p.name)),
+        Named::Aws(p) => Ok(crate::users::BoundaryRef::Aws(p.name)),
         Named::Own { path, name } => match own(client, account, &path, &name).await {
-            Ok(policy) => Ok(crate::roles::BoundaryRef::Own(policy.id)),
+            Ok(policy) => Ok(crate::users::BoundaryRef::Own(policy.id)),
             Err(_) => refused(scope()),
         },
     }
@@ -194,9 +194,9 @@ pub fn check_document(document: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Checks a policy's path (see `roles::check_path`).
+/// Checks a policy's path (see `users::check_path`).
 fn check_path(path: &str) -> anyhow::Result<()> {
-    crate::roles::check_path(path, "path", false).map_err(|m| Refused::Validation(m).into())
+    crate::users::check_path(path, "path", false).map_err(|m| Refused::Validation(m).into())
 }
 
 fn check_name(name: &str) -> anyhow::Result<()> {
@@ -254,7 +254,7 @@ fn managed_of(row: &tokio_postgres::Row) -> Managed {
         users: row.get(6),
         path: row.get(7),
         bounds: row.get(8),
-        tags: crate::roles::tags_of(row.get(9), row.get(10)),
+        tags: crate::users::tags_of(row.get(9), row.get(10)),
     }
 }
 
@@ -318,18 +318,18 @@ pub async fn create_tagged(
 }
 
 /// Why `tags` can't be a policy's (the console's; the IAM API says it as
-/// IAM does: see `iam`): as a user's (`roles::check_tags`), but that keys are
+/// IAM does: see `iam`): as a user's (`users::check_tags`), but that keys are
 /// case-sensitive (probed).
 pub fn check_tags(tags: &[(String, String)]) -> Result<(), String> {
-    if tags.len() > crate::roles::MAX_TAGS {
-        return Err(format!("a policy has at most {} tags", crate::roles::MAX_TAGS));
+    if tags.len() > crate::users::MAX_TAGS {
+        return Err(format!("a policy has at most {} tags", crate::users::MAX_TAGS));
     }
     let mut seen = std::collections::HashSet::new();
     for (key, value) in tags {
         if !(1..=128).contains(&key.chars().count()) || value.chars().count() > 256 {
             return Err("a tag's key is 1 to 128 characters, its value at most 256".to_owned());
         }
-        if !key.chars().all(crate::roles::tag_char) || !value.chars().all(crate::roles::tag_char) {
+        if !key.chars().all(crate::users::tag_char) || !value.chars().all(crate::users::tag_char) {
             return Err("tags hold letters, digits, spaces and _.:/=+-@".to_owned());
         }
         if key.to_ascii_lowercase().starts_with("aws:") {
@@ -347,14 +347,14 @@ pub fn check_tags(tags: &[(String, String)]) -> Result<(), String> {
 pub async fn tag(client: &Object, id: Uuid, tags: &[(String, String)]) -> anyhow::Result<()> {
     let keys: Vec<&str> = tags.iter().map(|(k, _)| k.as_str()).collect();
     let values: Vec<&str> = tags.iter().map(|(_, v)| v.as_str()).collect();
-    let max = crate::roles::MAX_TAGS as i32;
+    let max = crate::users::MAX_TAGS as i32;
     let status: String = client
         .query_one_cached("SELECT pg_temp.cairn_tag_policy($1, $2, $3, $4)", &[&id, &keys, &values, &max])
         .await?
         .get(0);
     match status.as_str() {
         "tagged" => Ok(()),
-        "too_many" => Err(crate::roles::TooManyTags.into()),
+        "too_many" => Err(crate::users::TooManyTags.into()),
         _ => refused(Refused::NoSuch("no such policy".into())),
     }
 }
@@ -551,7 +551,7 @@ pub async fn attached_all(client: &Object, account: &str) -> anyhow::Result<Hash
 
 /// The managed policies attached to user `user` of `account`.
 pub async fn attached(client: &Object, account: &str, user: &str) -> anyhow::Result<Vec<Attached>> {
-    let id = crate::roles::id_of(client, account, user).await?;
+    let id = crate::users::id_of(client, account, user).await?;
     Ok(attached_all(client, account).await?.remove(&id).unwrap_or_default())
 }
 
@@ -559,7 +559,7 @@ pub async fn attached(client: &Object, account: &str, user: &str) -> anyhow::Res
 /// `account`.
 pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attach: bool) -> anyhow::Result<()> {
     let policy = named(arn, account)?;
-    let role = crate::roles::id_of(client, account, user)
+    let role = crate::users::id_of(client, account, user)
         .await
         .map_err(|_| Refused::NoSuch(format!("The user with name {user} cannot be found.")))?;
     if attach {

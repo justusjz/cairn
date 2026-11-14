@@ -35,7 +35,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use super::store;
-use crate::{db::Cached, roles::Invalid};
+use crate::{db::Cached, users::Invalid};
 
 /// How long a sign-in at a provider may take.
 pub const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
