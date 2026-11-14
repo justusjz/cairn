@@ -454,7 +454,8 @@ enum UserCommand {
     #[command(subcommand)]
     Policy(PolicyCommand),
     /// Grant permissions on an existing bucket of the account: attaches the
-    /// account's managed policy `<bucket>-<permission>`, made if needed.
+    /// account's managed policy `/cairn/grants/<bucket>-<permission>`, made
+    /// if needed.
     Grant {
         name: String,
         bucket: String,

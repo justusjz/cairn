@@ -339,8 +339,11 @@ allows; else it's denied. They are:
   the console's Policies page or the IAM API: a document of up to 6,144
   characters (but whitespace); a user has at most 10 attached, as in IAM.
   **Grants** are the simple way to make them: `cairn user grant` attaches
-  the account's policy `<bucket>-<permission>` (making it, the first time),
-  which allows:
+  the account's policy `/cairn/grants/<bucket>-<permission>` (making it,
+  the first time; with a suffix if another policy has the name). Only
+  policies at that path are taken for grants: IAM decides who may change a
+  policy by its path, so one made elsewhere could be changed after a grant
+  attached it. A grant allows:
   - **`read`** on a bucket: GetObject, HeadObject, GetObjectAttributes,
     HeadBucket, ListObjects, reading an object's [tags](#tags) and its
     [Object Lock](#object-lock), and being the source of a
@@ -492,7 +495,7 @@ Manage users with `cairn user <command>`:
 | `create <name> [--admin] [--id <ID>] [--secret <S>]` | Create a user, with an access key of a random 20-char ID (or `--id`). Prints the ID, and a generated 40-char secret unless `--secret` is given (min. 8 chars). |
 | `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret of the key named as the user, which only roles migrated from before access keys have (`--rotate-secret` prints the new one); other keys are rotated with `key create` and `key delete`. |
 | `delete <name>` | Delete a user, with its keys and policies. |
-| `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket of the account: attaches its managed policy `<bucket>-<permission>`, made the first time. |
+| `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket of the account: attaches its managed policy `/cairn/grants/<bucket>-<permission>`, made the first time. |
 | `revoke <name> <bucket> [read\|write\|delete-version]...` | Revoke permissions on a bucket (detaches those policies); all of them if none are listed. |
 | `attach <name> <arn>` / `detach <name> <arn>` | Attach or detach a managed policy, Cairn's (`arn:aws:iam::aws:policy/CairnOperatorAccess`) or the account's. |
 | `unbound <name>` | Take a user's permissions boundary off, whatever its policies say. |

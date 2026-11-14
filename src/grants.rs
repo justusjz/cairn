@@ -1,10 +1,11 @@
 //! Grants: a user's `read`, `write` or `delete-version` on a bucket, as
-//! managed policies (see `managed`): `<bucket>-read`, `<bucket>-write` and
-//! `<bucket>-delete-version`, of the bucket's account, each allowing what
-//! its permission does on the bucket and its objects, attached to the
-//! users granted it. `cairn user grant` and `revoke` attach and detach them,
-//! making them as needed; they're ordinary policies, which IAM tools see
-//! and the console edits as any other.
+//! managed policies (see `managed`) at `GRANTS_PATH`: `<bucket>-read`,
+//! `<bucket>-write` and `<bucket>-delete-version` (with a suffix, if the
+//! name is taken), each allowing what its permission does on the bucket and
+//! its objects, attached to the users granted it. `cairn user grant` and
+//! `revoke` (deprecated: the IAM API and the console's templates replace
+//! them) attach and detach them, making them as needed; they're ordinary
+//! policies, which IAM tools see and the console edits as any other.
 //!
 //! Grants used to be statements of the bucket's policy,
 //! `CairnGrant<Permission>`, naming the users granted it, and before that
@@ -199,10 +200,19 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
     Ok(moved)
 }
 
-/// The managed policy a grant of `permission` on `bucket` is: the names it
-/// may have (the first, unless an account's own policy of another
-/// document has it), and its document.
-pub fn policy_for(bucket: &str, permission: Permission) -> ([String; 2], String) {
+/// Where grants' managed policies are: a path of Cairn's own. IAM decides
+/// who may change a policy by its path, and no template gives anyone
+/// `policy/cairn/*`, so a grant's policy is only the account's admins' to
+/// change (who may do anything anyway). A policy elsewhere, of any name, is
+/// never taken for a grant's: anyone allowed to make policies under their
+/// own path could make one in advance, have it attached by a grant, and
+/// change it later.
+pub const GRANTS_PATH: &str = "/cairn/grants/";
+
+/// The managed policy a grant of `permission` on `bucket` is: the name it
+/// gets (unless the account has a policy of that name already: names are
+/// unique in an account, whatever their paths), and its document.
+pub fn policy_for(bucket: &str, permission: Permission) -> (String, String) {
     let name = format!("{bucket}-{}", permission.as_str());
     let document = json!({
         "Version": "2012-10-17",
@@ -212,63 +222,96 @@ pub fn policy_for(bucket: &str, permission: Permission) -> ([String; 2], String)
             "Resource": [format!("arn:aws:s3:::{bucket}"), format!("arn:aws:s3:::{bucket}/*")],
         }],
     });
-    ([name.clone(), format!("{name}-grant")], document.to_string())
+    (name, document.to_string())
 }
 
-/// The name of the account's managed policy for a grant of `permission` on
-/// `bucket`, made if there's none (`make`); `None` if there's none.
-async fn grant_policy(client: &Object, account: &str, bucket: &str, permission: Permission, make: bool) -> anyhow::Result<Option<String>> {
+/// The account's policy for a grant of `document`: one at `GRANTS_PATH`
+/// whose default version is it (the oldest, if there are several); its ARN.
+async fn find(client: &Object, account: &str, document: &str) -> anyhow::Result<Option<String>> {
+    let row = client
+        .query_opt_cached(
+            "SELECT name FROM managed_policies WHERE account_id = $1 AND path = $2 AND document = $3
+             ORDER BY created_at, name LIMIT 1",
+            &[&account, &GRANTS_PATH, &document],
+        )
+        .await?;
+    Ok(row.map(|r| crate::managed::arn(account, GRANTS_PATH, r.get(0))))
+}
+
+/// The ARNs of the policies grants of `permission` on `bucket` were before
+/// they were at `GRANTS_PATH`: at `/`, named `<bucket>-<permission>` (or,
+/// that being taken, `…-grant`), and still of the grant's document. They
+/// stay where they are; granting again doesn't attach another, and
+/// revoking detaches them.
+async fn earlier(client: &Object, account: &str, bucket: &str, permission: Permission) -> anyhow::Result<Vec<String>> {
+    let (name, document) = policy_for(bucket, permission);
+    let rows = client
+        .query_cached(
+            "SELECT name FROM managed_policies
+             WHERE account_id = $1 AND path = '/' AND name = ANY($2) AND document = $3 ORDER BY name",
+            &[&account, &vec![name.clone(), format!("{name}-grant")], &document],
+        )
+        .await?;
+    Ok(rows.iter().map(|r| crate::managed::arn(account, "/", r.get(0))).collect())
+}
+
+/// The ARN of the account's policy for a grant of `permission` on
+/// `bucket` (see `find`), made if there's none.
+async fn grant_policy(client: &Object, account: &str, bucket: &str, permission: Permission) -> anyhow::Result<String> {
     use crate::managed::{self, Refused};
-    let (names, document) = policy_for(bucket, permission);
-    for name in names {
-        match managed::get(client, account, &name).await {
-            Ok(policy) if policy.document == document => return Ok(Some(name)),
-            // Another policy of that name: the next one.
-            Ok(_) => continue,
-            Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::NoSuch(_))) => {
-                if !make {
-                    continue;
-                }
-                let description = format!("{} on bucket {bucket} (a grant)", permission.as_str());
-                match managed::create(client, account, &name, "/", &document, &description).await {
-                    Ok(_) => return Ok(Some(name)),
-                    // Made meanwhile (by another node): as it is now.
-                    Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => {
-                        if managed::get(client, account, &name).await?.document == document {
-                            return Ok(Some(name));
-                        }
-                    }
-                    Err(e) => return Err(e),
-                }
-            }
+    let (name, document) = policy_for(bucket, permission);
+    let description = format!("{} on bucket {bucket} (a grant)", permission.as_str());
+    for attempt in 0..ATTEMPTS {
+        if let Some(arn) = find(client, account, &document).await? {
+            return Ok(arn);
+        }
+        // Its name, or, that being taken (by another node's grant meanwhile,
+        // or any policy anywhere), the name and a random suffix.
+        let name = match attempt {
+            0 => name.clone(),
+            _ => format!("{name}-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]),
+        };
+        match managed::create(client, account, &name, GRANTS_PATH, &document, &description).await {
+            Ok(policy) => return Ok(policy.arn(account)),
+            Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => continue,
             Err(e) => return Err(e),
         }
     }
-    if make {
-        return Err(Invalid(format!("the account has policies named {bucket}-{} already, of other documents", permission.as_str())).into());
-    }
-    Ok(None)
+    Err(crate::Contended(format!("making the policy of a grant on bucket {bucket:?}")).into())
 }
 
 /// Grants (`grant`) or revokes `permissions` on `bucket` to user `user` of
-/// `account`: attaches or detaches their managed policies. The bucket must
-/// be the account's (another account's users are named by its policy
-/// itself, for cross-account access).
+/// `account`: attaches or detaches their managed policies (see
+/// `grant_policy`, `earlier`). The bucket must be the account's.
 pub async fn change(client: &Object, account: &str, user: &str, bucket: &str, permissions: &[Permission], grant: bool) -> anyhow::Result<()> {
+    use crate::managed::{self, Refused};
     let Some(row) = client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await? else {
         return Err(Invalid(format!("no bucket named {bucket:?}; create it first")).into());
     };
     if row.get::<_, String>(0) != account {
         return Err(Invalid(format!("{bucket:?} is another account's bucket")).into());
     }
+    let attached: Vec<String> = managed::attached(client, account, user).await?.into_iter().map(|a| a.arn).collect();
     for permission in permissions {
-        let Some(name) = grant_policy(client, account, bucket, *permission, grant).await? else { continue };
-        let arn = crate::managed::get(client, account, &name).await?.arn(account);
-        match crate::managed::attach(client, account, user, &arn, grant).await {
-            Ok(()) => {}
-            // Revoking what wasn't granted.
-            Err(e) if !grant && matches!(e.downcast_ref::<crate::managed::Refused>(), Some(crate::managed::Refused::NoSuch(_))) => {}
-            Err(e) => return Err(e),
+        let earlier = earlier(client, account, bucket, *permission).await?;
+        if grant {
+            // Granted before grants were at `GRANTS_PATH`: it is.
+            if earlier.iter().any(|arn| attached.contains(arn)) {
+                continue;
+            }
+            let arn = grant_policy(client, account, bucket, *permission).await?;
+            managed::attach(client, account, user, &arn, true).await?;
+            continue;
+        }
+        let (_, document) = policy_for(bucket, *permission);
+        let current = find(client, account, &document).await?;
+        for arn in current.iter().chain(&earlier).filter(|arn| attached.contains(arn)) {
+            match managed::attach(client, account, user, arn, false).await {
+                Ok(()) => {}
+                // Detached meanwhile.
+                Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::NoSuch(_))) => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     Ok(())

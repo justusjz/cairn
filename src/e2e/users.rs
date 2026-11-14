@@ -245,6 +245,11 @@ async fn attached(client: &deadpool_postgres::Object, account: &str, user: &str)
     crate::managed::attached(client, account, user).await.unwrap().into_iter().map(|a| a.name).collect()
 }
 
+/// The ARNs of the managed policies attached to `user` of `account`.
+async fn attached_arns(client: &deadpool_postgres::Object, account: &str, user: &str) -> Vec<String> {
+    crate::managed::attached(client, account, user).await.unwrap().into_iter().map(|a| a.arn).collect()
+}
+
 /// Grants from before they were managed policies (rows of `role_grants`,
 /// then statements of buckets' policies) move into managed policies, once,
 /// and allow what they did; the bucket policy's other statements stay.
@@ -273,12 +278,18 @@ async fn old_grants_move_into_managed_policies() {
     let policy: String =
         client.query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
     assert!(policy.contains(&format!("arn:aws:iam::{account}:user/olga")), "{policy}");
-    // One the account has already, of another document, keeps its name.
+    // One the account has already, of another document, keeps its name:
+    // the grant's gets a suffix.
     let other = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
     crate::managed::create(&client, &account, &format!("{BUCKET}-write"), "/", other, "").await.unwrap();
     assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 2);
     assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 0);
-    assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read"), format!("{BUCKET}-write-grant")]);
+    let names = attached(&client, &account, "olga").await;
+    assert_eq!(names.len(), 2, "{names:?}");
+    assert_eq!(names[0], format!("{BUCKET}-read"));
+    assert!(names[1].starts_with(&format!("{BUCKET}-write-")), "{names:?}");
+    let grants = format!("arn:aws:iam::{account}:policy/cairn/grants/");
+    assert!(attached_arns(&client, &account, "olga").await.iter().all(|arn| arn.starts_with(&grants)));
     let policy: String =
         client.query_one("SELECT policy FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
     assert!(policy.contains(r#""Sid":"Mine""#), "{policy}");
@@ -298,10 +309,52 @@ async fn old_grants_move_into_managed_policies() {
     users::revoke(&client, &account, "olga", BUCKET, &[users::Permission::Write]).await.unwrap();
     assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read")]);
     users::grant(&client, &account, "olga", BUCKET, &[users::Permission::Write]).await.unwrap();
-    assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read"), format!("{BUCKET}-write-grant")]);
+    assert_eq!(attached(&client, &account, "olga").await, names);
     users::delete(&client, &account, "olga").await.unwrap();
     let left: i64 = client.query_one("SELECT count(*) FROM user_attached_policies", &[]).await.unwrap().get(0);
     assert_eq!(left, 0);
+}
+
+/// A grant's policy is at `grants::GRANTS_PATH`, which only the account's
+/// admins may change: one of the same name and document elsewhere (made in
+/// advance by someone allowed policies under their own path, to change it
+/// once a grant attached it) is never taken for it. Grants made before they
+/// were there are found: granted again, they aren't attached twice; revoked,
+/// they're detached.
+#[tokio::test]
+async fn grants_trust_only_their_own_path() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    users::create(&client, "gus", None, false).await.unwrap();
+    let account = users::account(&client).await.unwrap();
+    let (name, document) = crate::grants::policy_for(BUCKET, users::Permission::Read);
+    crate::managed::create(&client, &account, &name, "/team-a/", &document, "").await.unwrap();
+    users::grant(&client, &account, "gus", BUCKET, &[users::Permission::Read]).await.unwrap();
+    let arns = attached_arns(&client, &account, "gus").await;
+    assert_eq!(arns.len(), 1, "{arns:?}");
+    assert!(arns[0].starts_with(&format!("arn:aws:iam::{account}:policy/cairn/grants/{name}-")), "{arns:?}");
+    // Once.
+    users::grant(&client, &account, "gus", BUCKET, &[users::Permission::Read]).await.unwrap();
+    assert_eq!(attached_arns(&client, &account, "gus").await, arns);
+
+    // A grant from before, at `/`.
+    let (old, document) = crate::grants::policy_for(BUCKET, users::Permission::Write);
+    crate::managed::create(&client, &account, &old, "/", &document, "").await.unwrap();
+    let earlier = format!("arn:aws:iam::{account}:policy/{old}");
+    crate::managed::attach(&client, &account, "gus", &earlier, true).await.unwrap();
+    users::grant(&client, &account, "gus", BUCKET, &[users::Permission::Write]).await.unwrap();
+    let mut now = attached_arns(&client, &account, "gus").await;
+    now.sort();
+    let mut expected = vec![arns[0].clone(), earlier.clone()];
+    expected.sort();
+    assert_eq!(now, expected);
+    users::revoke(&client, &account, "gus", BUCKET, &[users::Permission::Read, users::Permission::Write]).await.unwrap();
+    assert!(attached(&client, &account, "gus").await.is_empty());
+    // Granted now, it's at the path.
+    users::grant(&client, &account, "gus", BUCKET, &[users::Permission::Write]).await.unwrap();
+    let arns = attached_arns(&client, &account, "gus").await;
+    assert_eq!(arns.len(), 1, "{arns:?}");
+    assert!(arns[0].starts_with(&format!("arn:aws:iam::{account}:policy/cairn/grants/")), "{arns:?}");
 }
 
 /// Cairn has one account (see `plans/single-account.md`): it owns every user
