@@ -9,3 +9,4 @@ pub mod policy;
 pub mod public_access;
 pub mod tagging;
 pub mod versioning;
+pub mod website;

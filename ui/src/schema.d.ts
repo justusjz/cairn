@@ -359,6 +359,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/buckets/{bucket}/website": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_bucket_website"];
+        /**
+         * Sets a bucket's website configuration, checked as PutBucketWebsite
+         *     checks it.
+         */
+        put: operations["put_bucket_website"];
+        post?: never;
+        /** Removes a bucket's website configuration: its website serves nothing. */
+        delete: operations["delete_bucket_website"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/cluster": {
         parameters: {
             query?: never;
@@ -1486,6 +1507,10 @@ export interface components {
              */
             versions: number;
         };
+        /** @description A bucket's website configuration. */
+        BucketWebsite: {
+            configuration?: components["schemas"]["Website"] | null;
+        };
         /**
          * @description A ceremony's options, for `navigator.credentials` (WebAuthn's JSON form:
          *     `PublicKeyCredentialCreationOptionsJSON` or `…RequestOptionsJSON`), and
@@ -1536,6 +1561,16 @@ export interface components {
             etag: string;
             /** Format: int32 */
             number: number;
+        };
+        Condition: {
+            /**
+             * Format: int32
+             * @description `HttpErrorCodeReturnedEquals`: the requests that would get this
+             *     error (a 4XX or 5XX), only once they have.
+             */
+            http_error_code_returned_equals?: number | null;
+            /** @description `KeyPrefixEquals`: the requests for keys starting with it. */
+            key_prefix_equals?: string | null;
         };
         /** @description A bucket's CORS configuration. */
         Configuration: {
@@ -2505,6 +2540,30 @@ export interface components {
             label: string;
             name: string;
         };
+        Redirect: {
+            /** @description The host redirected to; the request's own, if none. */
+            host_name?: string | null;
+            /**
+             * Format: int32
+             * @description The redirect's status, a 3XX but 300; 301, if none.
+             */
+            http_redirect_code?: number | null;
+            /** @description `http` or `https`; the request's own, if none. */
+            protocol?: string | null;
+            /**
+             * @description What replaces the prefix the condition names (all of a key, if it
+             *     names none).
+             */
+            replace_key_prefix_with?: string | null;
+            /** @description What replaces the key. Not with `replace_key_prefix_with`. */
+            replace_key_with?: string | null;
+        };
+        /** @description Where every request is redirected to. */
+        RedirectAll: {
+            host_name: string;
+            /** @description `http` or `https`; the request's own, if none. */
+            protocol?: string | null;
+        };
         /**
          * @description What `navigator.credentials.create()` gave the page (its parts, in
          *     base64url).
@@ -2588,6 +2647,10 @@ export interface components {
              *     rest are set (TagRole).
              */
             tags: components["schemas"]["Tag"][];
+        };
+        RoutingRule: {
+            condition?: components["schemas"]["Condition"] | null;
+            redirect: components["schemas"]["Redirect"];
         };
         Rule: {
             /** @description `ExposeHeader`s: the response headers a page may read. */
@@ -2763,6 +2826,25 @@ export interface components {
          * @enum {string}
          */
         Versioning: "unversioned" | "enabled" | "suspended";
+        /** @description A bucket's website configuration. */
+        Website: {
+            /**
+             * @description `ErrorDocument`'s `Key`: the object served (with the error's status)
+             *     for a 4XX error.
+             */
+            error_document?: string | null;
+            /**
+             * @description `IndexDocument`'s `Suffix`: what a request for a "directory" (the
+             *     root, or a key ending in `/`) is served, appended to its key.
+             */
+            index_document?: string | null;
+            redirect_all_requests_to?: components["schemas"]["RedirectAll"] | null;
+            /**
+             * @description `RoutingRules`: the first one whose condition a request meets
+             *     redirects it.
+             */
+            routing_rules?: components["schemas"]["RoutingRule"][];
+        };
     };
     responses: never;
     parameters: never;
@@ -3865,6 +3947,119 @@ export interface operations {
         };
         responses: {
             /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_bucket_website: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketWebsite"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_bucket_website: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Website"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_bucket_website: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
             204: {
                 headers: {
                     [name: string]: unknown;

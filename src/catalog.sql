@@ -1629,6 +1629,17 @@ BEGIN
 END
 $$;
 
+-- T54: PutBucketWebsite and DeleteBucketWebsite: sets (or, with NULL,
+-- removes) the bucket's website configuration. A plain UPDATE of the
+-- bucket's row, as T21's. Returns whether the bucket exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_website(p_bucket text, p_config text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE buckets SET website = p_config WHERE name = p_bucket;
+    RETURN FOUND;
+END
+$$;
+
 -- T27: PutBucketPolicy and DeleteBucketPolicy: sets (or, with NULL, removes)
 -- the bucket's policy, unless it's public (`p_public`) and the bucket's
 -- public access block, or its account's, blocks public policies ('blocked')

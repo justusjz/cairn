@@ -16,7 +16,8 @@
 //!   checked where it's asked for (see `s3::object_lock`);
 //! - a copy needs the source's read, on the source;
 //! - HeadBucket is `s3:ListBucket`;
-//! - deleting a bucket's configuration is its `Put` action.
+//! - deleting a bucket's configuration is its `Put` action, but for its
+//!   policy and its website, which have `Delete` actions of their own.
 //!
 //! Not checked here: DeleteObjects checks each key on its own (`delete`),
 //! and POST Object its form's key (`objects::post`).
@@ -177,7 +178,11 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
         ("GetObjectLockConfiguration", "s3:GetBucketObjectLockConfiguration"),
         Some(("PutObjectLockConfiguration", "s3:PutBucketObjectLockConfiguration", "", "")),
     ),
-    ("website", ("GetBucketWebsite", "s3:GetBucketWebsite"), None),
+    (
+        "website",
+        ("GetBucketWebsite", "s3:GetBucketWebsite"),
+        Some(("PutBucketWebsite", "s3:PutBucketWebsite", "DeleteBucketWebsite", "s3:DeleteBucketWebsite")),
+    ),
     ("replication", ("GetBucketReplication", "s3:GetReplicationConfiguration"), None),
     ("accelerate", ("GetBucketAccelerateConfiguration", "s3:GetAccelerateConfiguration"), None),
     ("requestPayment", ("GetBucketRequestPayment", "s3:GetBucketRequestPayment"), None),
@@ -523,6 +528,11 @@ mod tests {
         );
         assert_eq!(actions(Method::HEAD, "", "", &[]), [("s3:ListBucket", "arn:aws:s3:::b".to_owned())]);
         assert_eq!(actions(Method::DELETE, "", "cors", &[]), [("s3:PutBucketCORS", "arn:aws:s3:::b".to_owned())]);
+        assert_eq!(actions(Method::PUT, "", "website", &[]), [("s3:PutBucketWebsite", "arn:aws:s3:::b".to_owned())]);
+        assert_eq!(
+            actions(Method::DELETE, "", "website", &[]),
+            [("s3:DeleteBucketWebsite", "arn:aws:s3:::b".to_owned())]
+        );
         assert!(operation(&Method::DELETE, "b", "", "versioning", &HeaderMap::new()).is_none());
         assert!(operation(&Method::PATCH, "b", "k", "", &HeaderMap::new()).is_none());
     }

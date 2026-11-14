@@ -100,6 +100,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(abort_upload))
         .routes(routes!(set_object_tags))
         .routes(routes!(get_bucket_cors, put_bucket_cors, delete_bucket_cors))
+        .routes(routes!(get_bucket_website, put_bucket_website, delete_bucket_website))
         .routes(routes!(list_users, create_user))
         .routes(routes!(delete_user, update_user))
         .routes(routes!(set_boundary, delete_boundary))
@@ -2260,6 +2261,71 @@ async fn delete_bucket_cors(
     // DeleteBucketCors is authorized as its put, in S3.
     actor.check(&app, "s3:PutBucketCORS", On::Bucket(bucket.clone())).await?;
     let resp = crate::s3::buckets::cors::delete_bucket_cors(&app, &bucket).await?;
+    match resp.status() {
+        s if s.is_success() => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
+}
+
+/// A bucket's website configuration.
+#[derive(Serialize, ToSchema)]
+struct BucketWebsite {
+    /// `null` if it has none.
+    configuration: Option<crate::s3::buckets::website::Website>,
+}
+
+#[utoipa::path(get, path = "/buckets/{bucket}/website", params(("bucket" = String, Path)), responses(
+    (status = 200, body = BucketWebsite),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn get_bucket_website(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<Json<BucketWebsite>> {
+    actor.check(&app, "s3:GetBucketWebsite", On::Bucket(bucket.clone())).await?;
+    let configuration = crate::s3::buckets::website::load(&app, &bucket)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no bucket named {bucket:?}")))?;
+    Ok(Json(BucketWebsite { configuration }))
+}
+
+/// Sets a bucket's website configuration, checked as PutBucketWebsite
+/// checks it.
+#[utoipa::path(put, path = "/buckets/{bucket}/website", params(("bucket" = String, Path)),
+    request_body = crate::s3::buckets::website::Website, responses(
+        (status = 204, description = "Set"),
+        (status = "4XX", body = ErrorBody),
+        (status = "5XX", body = ErrorBody),
+    ))]
+async fn put_bucket_website(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+    Json(body): Json<crate::s3::buckets::website::Website>,
+) -> Result<StatusCode> {
+    actor.check(&app, "s3:PutBucketWebsite", On::Bucket(bucket.clone())).await?;
+    let resp = crate::s3::buckets::website::put_bucket_website(&app, &bucket, body.to_xml().into()).await?;
+    match resp.status() {
+        s if s.is_success() => Ok(StatusCode::NO_CONTENT),
+        _ => Err(s3_error(resp).await),
+    }
+}
+
+/// Removes a bucket's website configuration: its website serves nothing.
+#[utoipa::path(delete, path = "/buckets/{bucket}/website", params(("bucket" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_bucket_website(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(bucket): Path<String>,
+) -> Result<StatusCode> {
+    actor.check(&app, "s3:DeleteBucketWebsite", On::Bucket(bucket.clone())).await?;
+    let resp = crate::s3::buckets::website::delete_bucket_website(&app, &bucket).await?;
     match resp.status() {
         s if s.is_success() => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),

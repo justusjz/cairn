@@ -231,6 +231,7 @@ const MIGRATIONS: &[&str] = &[
     IAM_ROLES,
     SESSIONS,
     IAM_OIDC_PROVIDERS,
+    BUCKET_WEBSITE,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2413,6 +2414,14 @@ CREATE TRIGGER iam_oidc_provider_tags_protocol BEFORE INSERT OR UPDATE OR DELETE
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER iam_oidc_provider_tags_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_oidc_provider_tags
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+"#;
+/// Migration 51: a bucket's website configuration (see
+/// `s3::buckets::website`), as PutBucketWebsite sets it, as JSON; NULL if it
+/// has none. As CORS's (migration 26): no new lock protocol, as it's set by
+/// a plain UPDATE of the bucket's row (T54), and a Cairn that doesn't know
+/// it serves no websites.
+const BUCKET_WEBSITE: &str = r#"
+ALTER TABLE buckets ADD COLUMN website text;
 "#;
 #[cfg(test)]
 mod tests {

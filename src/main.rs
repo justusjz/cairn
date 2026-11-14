@@ -95,6 +95,9 @@ pub struct App {
     /// `--domain`: the domain buckets are subdomains of, for virtual-hosted
     /// requests (see `s3::hosting`).
     domain: Option<String>,
+    /// `--website-domain`: the domain buckets' websites are subdomains of
+    /// (see `s3::hosting`, `s3::website`).
+    website_domain: Option<String>,
     /// The KMS SSE-KMS keeps its keys in, if there's one (see `s3::sse`).
     kms: Option<Arc<kms::Kms>>,
     /// The keys temporary credentials' tokens are sealed with (see
@@ -235,6 +238,14 @@ struct ServeArgs {
     /// must pass `Host` on as the client sent it.
     #[arg(long, env = "CAIRN_DOMAIN", value_parser = s3::hosting::parse_domain)]
     domain: Option<String>,
+    /// The domain buckets' websites are reached at, e.g.
+    /// s3-website.example.com: a request to bucket.s3-website.example.com/key
+    /// is one to the bucket's website (see PutBucketWebsite), as to S3's
+    /// website endpoints. (With --domain set, so is a request to any host
+    /// that isn't the S3 API's: a custom domain, whose bucket has its name.)
+    /// The proxy in front must pass `Host` on as the client sent it.
+    #[arg(long, env = "CAIRN_WEBSITE_DOMAIN", value_parser = s3::hosting::parse_domain)]
+    website_domain: Option<String>,
     /// How many bytes per second the scrubber reads, checking this node's
     /// data against its checksums: e.g. 25MiB (the default), 100MB. 0 turns
     /// it off.
@@ -363,6 +374,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         allow_sse_c_over_http: args.allow_sse_c_over_http,
         trusted_proxies: args.trusted_proxies.clone(),
         domain: args.domain,
+        website_domain: args.website_domain,
         kms,
         sessions: sessions::Keys::default(),
         #[cfg(test)]
@@ -609,8 +621,9 @@ impl std::fmt::Display for Contended {
 
 impl std::error::Error for Contended {}
 
-/// Serves the S3 API, counting every request in the node's metrics, until
-/// `shutdown` resolves; then waits for the requests in flight to finish.
+/// Serves the S3 API (and buckets' websites, see `s3::hosting`), counting
+/// every request in the node's metrics, until `shutdown` resolves; then
+/// waits for the requests in flight to finish.
 async fn serve_client(
     addr: SocketAddr,
     max_connections: usize,
@@ -625,7 +638,12 @@ async fn serve_client(
             async move {
                 let req = req.map(listen::ClientBody::new);
                 // Where the request goes, wherever it names its bucket.
-                let route = s3::hosting::Route::of(app.domain.as_deref(), req.headers(), req.uri().path());
+                let route = s3::hosting::Route::of(
+                    app.domain.as_deref(),
+                    app.website_domain.as_deref(),
+                    req.headers(),
+                    req.uri().path(),
+                );
                 let what = format!("{} {}", req.method(), route.path);
                 let started = std::time::Instant::now();
                 let in_flight = app.metrics.begin();

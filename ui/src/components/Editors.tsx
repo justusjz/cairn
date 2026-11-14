@@ -1,9 +1,9 @@
-// Dialogs for a bucket's or an object version's tags, and a bucket's CORS
-// rules: what PutBucketTagging, PutObjectTagging and PutBucketCors set,
-// checked by the server as S3 checks them.
+// Dialogs for a bucket's or an object version's tags, a bucket's CORS rules
+// and its website: what PutBucketTagging, PutObjectTagging, PutBucketCors
+// and PutBucketWebsite set, checked by the server as S3 checks them.
 
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type CorsConfiguration, api } from "../api";
+import { type CorsConfiguration, type RoutingRule, type WebsiteConfiguration, api } from "../api";
 import { act } from "./ui";
 
 type Tag = { key: string; value: string };
@@ -108,6 +108,145 @@ export function CorsDialog(props: { bucket: string; onClose: () => void }) {
           <Show when={had()}>
             <button type="button" class="danger" onClick={remove}>
               Remove
+            </button>
+          </Show>
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit">
+            Save
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+/** An example routing rule, shown while there are none. */
+const RULES_EXAMPLE = `[
+  {
+    "condition": { "key_prefix_equals": "docs/" },
+    "redirect": { "replace_key_prefix_with": "documents/" }
+  }
+]`;
+
+/** Edits a bucket's website: its index and error documents and routing
+ * rules (as JSON, S3's RoutingRule elements by these names: condition
+ * with key_prefix_equals and http_error_code_returned_equals, redirect
+ * with host_name, protocol, http_redirect_code, replace_key_prefix_with
+ * and replace_key_with), or a host every request is redirected to. */
+export function WebsiteDialog(props: { bucket: string; onClose: () => void }) {
+  let dialog!: HTMLDialogElement;
+  const [had, setHad] = createSignal(false);
+  const [error, setError] = createSignal<string>();
+  const [mode, setMode] = createSignal<"serve" | "redirect">("serve");
+  const [index, setIndex] = createSignal("index.html");
+  const [errorDocument, setErrorDocument] = createSignal("");
+  const [rules, setRules] = createSignal("");
+  const [host, setHost] = createSignal("");
+  const [protocol, setProtocol] = createSignal("");
+  onMount(async () => {
+    dialog.showModal();
+    try {
+      const c = (await api.bucketWebsite(props.bucket)).configuration;
+      if (!c) return;
+      setHad(true);
+      if (c.redirect_all_requests_to) {
+        setMode("redirect");
+        setHost(c.redirect_all_requests_to.host_name);
+        setProtocol(c.redirect_all_requests_to.protocol ?? "");
+      } else {
+        setIndex(c.index_document ?? "");
+        setErrorDocument(c.error_document ?? "");
+        if (c.routing_rules?.length) setRules(JSON.stringify(c.routing_rules, null, 2));
+      }
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  });
+  const save = async (e: SubmitEvent) => {
+    e.preventDefault();
+    setError(undefined);
+    let configuration: WebsiteConfiguration;
+    if (mode() === "redirect") {
+      configuration = { redirect_all_requests_to: { host_name: host().trim(), protocol: protocol() || undefined } };
+    } else {
+      let routing_rules: RoutingRule[] = [];
+      if (rules().trim()) {
+        try {
+          routing_rules = JSON.parse(rules());
+        } catch (e) {
+          setError(`The routing rules aren't JSON: ${(e as Error).message}`);
+          return;
+        }
+      }
+      configuration = { index_document: index(), error_document: errorDocument() || undefined, routing_rules };
+    }
+    if (await act(() => api.putBucketWebsite(props.bucket, configuration), `Saved the website of ${props.bucket}`)) dialog.close();
+  };
+  const remove = async () => {
+    if (!confirm(`Turn off the website of ${props.bucket}? Its website endpoint serves nothing then.`)) return;
+    if (await act(() => api.deleteBucketWebsite(props.bucket), `Turned off the website of ${props.bucket}`)) dialog.close();
+  };
+  return (
+    <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
+      <form onSubmit={save}>
+        <h2>
+          Website of <span class="mono">{props.bucket}</span>
+        </h2>
+        <p class="subtle small">
+          Served at the bucket's website endpoint, to anyone: only what the bucket's policy lets anyone read (
+          <span class="mono">s3:GetObject</span> for <span class="mono">"*"</span>) is served, and a missing page is a 403 unless anyone may
+          list the bucket too.
+        </p>
+        <label class="field">
+          The website
+          <select value={mode()} onChange={(e) => setMode(e.currentTarget.value as "serve" | "redirect")}>
+            <option value="serve">Serves the bucket's objects</option>
+            <option value="redirect">Redirects every request to another host</option>
+          </select>
+        </label>
+        <Show
+          when={mode() === "serve"}
+          fallback={
+            <>
+              <label class="field">
+                Host name
+                <input type="text" required placeholder="www.example.com" value={host()} onInput={(e) => setHost(e.currentTarget.value)} />
+              </label>
+              <label class="field">
+                Protocol
+                <select value={protocol()} onChange={(e) => setProtocol(e.currentTarget.value)}>
+                  <option value="">The request's</option>
+                  <option value="http">http</option>
+                  <option value="https">https</option>
+                </select>
+              </label>
+            </>
+          }
+        >
+          <label class="field">
+            Index document
+            <input type="text" required value={index()} onInput={(e) => setIndex(e.currentTarget.value)} />
+          </label>
+          <p class="subtle small">Served for the root and for any key ending in /, appended to it: docs/ serves docs/index.html.</p>
+          <label class="field">
+            Error document (optional)
+            <input type="text" placeholder="error.html" value={errorDocument()} onInput={(e) => setErrorDocument(e.currentTarget.value)} />
+          </label>
+          <label class="field">
+            Routing rules (optional, JSON)
+            <textarea class="policy" aria-label="Routing rules" spellcheck={false} placeholder={RULES_EXAMPLE} value={rules()} onInput={(e) => setRules(e.currentTarget.value)} />
+          </label>
+          <p class="subtle small">
+            The first rule whose condition a request meets redirects it: by its key's prefix, or by the error it got (a 4XX or 5XX status). Up to 50.
+          </p>
+        </Show>
+        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+        <div class="buttons">
+          <Show when={had()}>
+            <button type="button" class="danger" onClick={remove}>
+              Turn off
             </button>
           </Show>
           <button type="button" onClick={() => dialog.close()}>

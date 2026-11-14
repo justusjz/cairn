@@ -45,6 +45,8 @@ CARGO_ARGS+=(--allow-sse-c-over-http)
 # Virtual-hosted-style requests to bucket.localhost, which resolves to this
 # host without any DNS.
 CARGO_ARGS+=(--domain localhost)
+# Buckets' websites at bucket.web.localhost, likewise.
+CARGO_ARGS+=(--website-domain web.localhost)
 # SSE-KMS, with keys in OpenBao's Transit engine, used as each role (see
 # `kms`), logged in to with a throwaway key.
 CARGO_ARGS+=(--kms-address "http://127.0.0.1:${BAO_PORT}" --kms-jwt-key "$WORK_DIR/kms-jwt.pem"
@@ -64,7 +66,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=112
+TOTAL=113
 STEP=0
 PASS=0
 FAIL=0
@@ -1338,8 +1340,8 @@ tagging_roles_ok() {
 
 # Bucket sub-resource stubs: location/versioning/accelerate/request payment/
 # logging/notification succeed (200, empty or default config);
-# website/replication are "not configured" (the client errors on 404),
-# and so are CORS, tags, lifecycle and the policy, until they're set (grants
+# replication is "not configured" (the client errors on 404), and so are
+# CORS, tags, lifecycle, the website and the policy, until they're set (grants
 # are managed policies of their users, not the bucket's: see `grants`).
 subresource_stubs_ok() {
     awss3 s3api get-bucket-location --bucket "$BUCKET" >/dev/null 2>&1 || return 1
@@ -1405,6 +1407,67 @@ cors_ok() {
     awss3 s3api delete-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-bucket-cors --bucket "$BUCKET" >/dev/null 2>&1 || return 1
     s3 del "s3://${BUCKET}/cors/up.txt" >/dev/null 2>&1
+}
+
+# A website: its configuration is bucket management (admin-only) and reads
+# back; its pages (at bucket.web.localhost, or at a custom domain, the
+# bucket's name) are what anyone may read, with
+# index and error documents, redirects (an object's, routing rules', and a
+# "directory" without its slash), and S3's HTML error pages.
+website_ok() {
+    local b="web-$(date +%s)" site doc="$WORK_DIR/website.json" out
+    site="http://${b}.web.localhost:${SERVER_PORT}"
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    printf 'home' > "$WORK_DIR/home.html"
+    printf 'not here' > "$WORK_DIR/404.html"
+    for key in index.html docs/index.html; do
+        awss3 s3api put-object --bucket "$b" --key "$key" --body "$WORK_DIR/home.html" \
+            --content-type text/html >/dev/null 2>&1 || return 1
+    done
+    awss3 s3api put-object --bucket "$b" --key 404.html --body "$WORK_DIR/404.html" >/dev/null 2>&1 || return 1
+    awss3 s3api put-object --bucket "$b" --key old.html --website-redirect-location /docs/ >/dev/null 2>&1 || return 1
+    # No website yet.
+    out=$(curl -s "$site/")
+    echo "$out" | grep -q '<li>Code: NoSuchWebsiteConfiguration</li>' || return 1
+    printf '%s' '{"IndexDocument":{"Suffix":"index.html"},"ErrorDocument":{"Key":"404.html"},
+        "RoutingRules":[{"Condition":{"KeyPrefixEquals":"blog/"},"Redirect":{"ReplaceKeyPrefixWith":"docs/"}}]}' > "$doc"
+    ! as_role writer writersecret s3api put-bucket-website --bucket "$b" \
+        --website-configuration "file://$doc" >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-website --bucket "$b" --website-configuration "file://$doc" >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-website --bucket "$b" \
+        --query '[IndexDocument.Suffix,ErrorDocument.Key,RoutingRules[0].Redirect.ReplaceKeyPrefixWith]' \
+        --output text 2>/dev/null)" = "$(printf 'index.html\t404.html\tdocs/')" ] || return 1
+    awss3 s3api put-bucket-website --bucket "$b" \
+        --website-configuration '{"ErrorDocument":{"Key":"404.html"}}' 2>&1 | grep -q InvalidArgument || return 1
+    # Nothing's public yet: the error document, with a 403.
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$site/")" = 403 ] || return 1
+    awss3 s3api delete-public-access-block --bucket "$b" >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-policy --bucket "$b" --policy '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+        "Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::'"$b"'/*"}]}' >/dev/null 2>&1 || return 1
+    [ "$(curl -s "$site/")" = home ] || return 1
+    [ "$(curl -s "$site/docs/")" = home ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$site/docs")" = "302 $site/docs/" ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$site/old.html")" = "301 $site/docs/" ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code} %{redirect_url}' "$site/blog/a.html")" = "301 $site/docs/a.html" ] \
+        || return 1
+    # A missing page: a 403 (anyone may not list the bucket), with the
+    # error document.
+    [ "$(curl -s -w ' %{http_code}' "$site/missing.html")" = "not here 403" ] || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$site/index.html")" = 405 ] || return 1
+    # A custom domain: a host that isn't the S3 API's names its bucket by all
+    # of itself.
+    [ "$(curl -s -H "Host: $b" "http://${SERVER_HOST}:${SERVER_PORT}/docs/")" = home ] || return 1
+    # The S3 API is as it was, at its own hosts.
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "http://${b}.localhost:${SERVER_PORT}/index.html")" = 200 ] || return 1
+    awss3 s3api put-bucket-website --bucket "$b" \
+        --website-configuration '{"RedirectAllRequestsTo":{"HostName":"www.example.com","Protocol":"https"}}' \
+        >/dev/null 2>&1 || return 1
+    [ "$(curl -s -o /dev/null -w '%{redirect_url}' "$site/a/b.html")" = "https://www.example.com/a/b.html" ] || return 1
+    ! as_role writer writersecret s3api delete-bucket-website --bucket "$b" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket-website --bucket "$b" >/dev/null 2>&1 || return 1
+    ! awss3 s3api get-bucket-website --bucket "$b" >/dev/null 2>&1 || return 1
+    [ "$(curl -s -o /dev/null -w '%{http_code}' "$site/")" = 404 ] || return 1
+    awss3 s3 rb --force "s3://$b" >/dev/null 2>&1
 }
 
 # A lifecycle configuration is bucket management (admin-only): writer can't
@@ -1586,7 +1649,7 @@ unsupported_subresources_refused() {
     [ "$(scurl POST "$path?restore" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl DELETE "$path?retention" "$EMPTY_SHA256" -)" = 501 ] || return 1
     [ "$(scurl GET "$path?torrent" "$EMPTY_SHA256" -)" = 501 ] || return 1
-    [ "$(scurl DELETE "/${BUCKET}?website" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl DELETE "/${BUCKET}?replication" "$EMPTY_SHA256" -)" = 501 ] || return 1
     check_roundtrip "$SMALL" "s3://${BUCKET}/small.txt"
 }
 
@@ -2865,6 +2928,7 @@ run_test    "Packer compacts mostly-dead blobs"      pack_compacts_ok
 run_test    "Stubbed ACL (s3cmd info works)"        acl_ok
 run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "CORS configuration and preflights"     cors_ok
+run_test    "Bucket websites"                       website_ok
 run_test    "Object and bucket tags"                tagging_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
 run_test    "Parts, attributes and expected sizes"   parts_and_attributes_ok

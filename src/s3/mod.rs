@@ -21,6 +21,7 @@ use crate::{
             encryption::{default_request, delete_bucket_encryption, get_bucket_encryption, put_bucket_encryption},
             lifecycle::{delete_bucket_lifecycle, get_bucket_lifecycle, put_bucket_lifecycle},
             versioning::{get_bucket_versioning, put_bucket_versioning},
+            website::{delete_bucket_website, get_bucket_website, put_bucket_website},
         },
         conditional::Preconditions,
         multipart::{
@@ -50,6 +51,7 @@ use crate::{
 };
 
 pub(crate) mod buckets;
+pub(crate) mod certificates;
 pub(crate) mod checksums;
 pub(crate) mod access;
 pub(crate) mod acl;
@@ -66,6 +68,7 @@ pub(crate) mod objects;
 pub(crate) mod post_policy;
 pub(crate) mod util;
 pub(crate) mod versions;
+pub(crate) mod website;
 
 tokio::task_local! {
     /// The ID of the request being handled, which its error document names.
@@ -127,6 +130,11 @@ async fn handle_request(
     route: &Route,
     peer: std::net::IpAddr,
 ) -> anyhow::Result<Response<ResBody>> {
+    // A bucket's website: anonymous, whatever the request says (see
+    // `website`).
+    if route.website {
+        return website::serve(&app, req.method(), req.headers(), &route.path, peer).await;
+    }
     // A browser's CORS preflight, which is never signed (see `cors`).
     if req.method() == Method::OPTIONS {
         let path = route.path.trim_start_matches('/');
@@ -354,8 +362,8 @@ async fn handle_request(
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
         // Bucket sub-resource GETs: versioning, encryption, lifecycle, CORS,
-        // policy, tagging and Object Lock are real; the rest (acl, location,
-        // website, ...) are stubbed — Cairn implements none of
+        // policy, tagging, website and Object Lock are real; the rest (acl,
+        // location, ...) are stubbed — Cairn implements none of
         // them, so answer as S3 does for an unconfigured bucket before
         // falling through to a listing. Each goes where `operation` says,
         // which is what was authorized: a request naming two subresources
@@ -372,6 +380,9 @@ async fn handle_request(
             }
             if operation.name == "GetBucketCors" {
                 return Ok(box_response(get_bucket_cors(&app, &bucket).await?));
+            }
+            if operation.name == "GetBucketWebsite" {
+                return Ok(box_response(get_bucket_website(&app, &bucket).await?));
             }
             if operation.name == "GetBucketPolicyStatus" {
                 return Ok(box_response(policy::get_bucket_policy_status(&app, &bucket).await?));
@@ -541,6 +552,18 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
+            // PutBucketWebsite: PUT /{bucket}?website with a
+            // <WebsiteConfiguration> body, which must declare a checksum, as
+            // in S3.
+            hyper::Method::PUT if operation.name == "PutBucketWebsite" => {
+                if !payload::has_body_checksum(req.headers()) {
+                    return Ok(box_response(missing_checksum()));
+                }
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => put_bucket_website(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
             // PutBucketTagging: PUT /{bucket}?tagging with a <Tagging> body,
             // which must declare a checksum, as in S3.
             hyper::Method::PUT if operation.name == "PutBucketTagging" => {
@@ -628,6 +651,9 @@ async fn handle_request(
             }
             hyper::Method::DELETE if operation.name == "DeleteBucketCors" => {
                 delete_bucket_cors(&app, &bucket).await?
+            }
+            hyper::Method::DELETE if operation.name == "DeleteBucketWebsite" => {
+                delete_bucket_website(&app, &bucket).await?
             }
             hyper::Method::DELETE if operation.name == "DeletePublicAccessBlock" => {
                 public_access::delete_public_access_block(&app, &bucket).await?

@@ -1,0 +1,20 @@
+# Wildcard certificates for buckets and websites (see Caddyfile.wildcard),
+# by the DNS challenge, with a Caddy built with a DNS provider's module
+# (caddy/Dockerfile). Over compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.wildcard.yaml up -d --build
+#
+# or with COMPOSE_FILE=compose.yaml:compose.wildcard.yaml in .env.
+
+services:
+  caddy:
+    image: cairn-caddy-dns
+    build:
+      context: ./caddy
+    environment:
+      WEBSITE_DOMAIN: ${WEBSITE_DOMAIN}
+      # A token that may edit DNS records in the zones of S3_DOMAIN and
+      # WEBSITE_DOMAIN (Cloudflare: Zone / DNS / Edit).
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:?set CLOUDFLARE_API_TOKEN in .env}
+    volumes:
+      - ./Caddyfile.wildcard:/etc/caddy/Caddyfile:ro

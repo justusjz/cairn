@@ -57,6 +57,63 @@ docker exec cairn cairn user create admin --admin
 For a cluster, also set `CAIRN_PEER_URL` to an address the other nodes can
 reach this container at, and `CAIRN_REPLICATION_FACTOR`.
 
+### Docker Compose
+
+[`deploy/compose`](deploy/compose) runs Cairn on one host, ready to use:
+Postgres, Cairn, and [Caddy](https://caddyserver.com) in front of it, which
+serves the S3 API, the [console](#console) and buckets'
+[websites](#websites) over HTTPS, with certificates it gets from Let's
+Encrypt as they're needed. Only Caddy is published, on ports 80 and 443.
+
+1. Point DNS at the host, for the three domains in `.env` (the examples'
+   here):
+
+   | Record | For |
+   | --- | --- |
+   | `s3.example.com`, `*.s3.example.com` | The S3 API, and buckets virtual-hosted. |
+   | `console.example.com` | The console. |
+   | `*.s3-website.example.com` | Buckets' websites. |
+
+2. Configure it, and start it:
+
+   ```sh
+   cd deploy/compose
+   cp .env.example .env      # set the domains, and POSTGRES_PASSWORD
+   docker compose up -d
+   ```
+
+3. Make the first admin, and enroll a passkey for the console with the link
+   it prints:
+
+   ```sh
+   docker compose exec cairn cairn user create admin --admin
+   docker compose exec cairn cairn user enroll admin
+   ```
+
+Caddy gets a certificate for `s3.example.com` and `console.example.com` as
+it starts, and one for any other host the first time a client asks for it,
+if Cairn [serves something there](#https-for-websites-and-buckets); plain
+HTTP is redirected to HTTPS. Back up the `postgres` and `cairn` volumes: the
+database, and the data.
+
+**Wildcard certificates.** A certificate per bucket is fine for a few, but
+Let's Encrypt issues at most 50 a week per registered domain. With more
+buckets (or websites) than that, have Caddy get one wildcard certificate for
+`*.s3.example.com` and one for `*.s3-website.example.com`, by ACME's DNS
+challenge: `compose.wildcard.yaml` builds Caddy with a DNS provider's module
+(Cloudflare's; for another, see `caddy/Dockerfile`), and serves
+`Caddyfile.wildcard`. Set its two lines in `.env`, the token one that may
+edit DNS records in the domains' zones, and start it with `--build`:
+
+```sh
+# in .env
+COMPOSE_FILE=compose.yaml:compose.wildcard.yaml
+CLOUDFLARE_API_TOKEN=...
+```
+
+Custom domains, and buckets with dots in their names (which a wildcard
+covers one label of), still get certificates on demand.
+
 ## Running a single node
 
 The simplest deployment — one node, replication factor 1, no redundancy:
@@ -112,7 +169,8 @@ command line wins. The other commands read `CAIRN_PEER_URL` as well.
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
-| `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. |
+| `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. Any other host name (but IP addresses and `localhost`) is then a [website's](#websites) custom domain. |
+| `--website-domain <NAME>` | `CAIRN_WEBSITE_DOMAIN` | none | The domain buckets' [websites](#websites) are reached at, e.g. `s3-website.example.com`: `bucket.s3-website.example.com` is the bucket's website. |
 | `--listen-console <ADDR>` | `CAIRN_LISTEN_CONSOLE` | off | Bind address for the [console](#console), Cairn's web UI, which people sign in to with passkeys or OIDC. Requires `--console-url`. |
 | `--console-url <URL>` | `CAIRN_CONSOLE_URL` | none | The URL the console is reached at, as browsers see it, e.g. `https://console.example.com`: an origin of its own (not the S3 API's), over HTTPS, or on `localhost`. Passkeys are bound to its host. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
@@ -141,7 +199,10 @@ With `--domain s3.example.com`, they may also name it in the host, as
 `bucket.s3.example.com/key`, which some clients do by default. A request to
 any other host (the domain itself, an IP address) is still path-style, so both
 work side by side. As in S3, the bucket is all of the host before the domain,
-so `my.bucket.s3.example.com` is the bucket `my.bucket`.
+so `my.bucket.s3.example.com` is the bucket `my.bucket`. Any other host name
+is a [website's](#websites) custom domain then: clients that reach the S3 API
+by another name (`cairn.internal`, say) must use the domain, an IP address
+or `localhost` instead.
 
 Cairn only reads the `Host` header, which the proxy in front of it must pass on
 as the client sent it (the request's signature covers it, too). DNS and TLS
@@ -1105,6 +1166,129 @@ anonymous and allowed by the bucket's policy.
 
 There's no CORS setting for the whole cluster, only these, per bucket, as in
 S3.
+
+## Websites
+
+A bucket can be served as a static website, as S3's static website hosting
+serves one: PutBucketWebsite, GetBucketWebsite and DeleteBucketWebsite
+(`s3:PutBucketWebsite`, `s3:GetBucketWebsite`, `s3:DeleteBucketWebsite`), and
+a website endpoint that serves its pages. The console has a Website dialog on
+each bucket's page, too.
+
+```sh
+aws s3 website s3://my-site --index-document index.html --error-document 404.html
+aws s3api get-bucket-website --bucket my-site
+aws s3api delete-bucket-website --bucket my-site
+```
+
+Websites are served on the S3 API's port, at hosts of their own, which is
+how Cairn tells a website's request from the API's:
+
+- **At the website domain.** As S3's website endpoints
+  (`bucket.s3-website-<region>.amazonaws.com`): with
+  `--website-domain s3-website.example.com`, `my-site.s3-website.example.com`
+  is `my-site`'s website. It needs a wildcard DNS record,
+  `*.s3-website.example.com`, pointing at Cairn (or the proxy in front of
+  it). The website domain may be a subdomain of the API's, not the API's
+  itself.
+- **At a custom domain.** As on S3, a host that isn't one of the S3 API's
+  names a bucket by all of itself: create the bucket `www.example.com`, give
+  it a website, and point `www.example.com` at Cairn (a `CNAME` to, say,
+  `www.example.com.s3-website.example.com`), and it's served there. Cairn
+  knows the S3 API's hosts by `--domain`: the domain, its subdomains, IP
+  addresses and `localhost` are the API's; with `--domain` set, any other is
+  a custom domain. An apex domain (`example.com`) can't be a `CNAME`; give it
+  an `A` record, and, as on S3, a bucket `example.com` whose website
+  redirects every request to `www.example.com`.
+
+Nothing has to be set up per website in the proxy, as long as it passes on
+requests for any host to Cairn, with their `Host` as the client sent it (a
+catch-all, or default, server).
+
+### HTTPS for websites and buckets
+
+Websites are served over whatever the proxy in front of Cairn serves them
+over. S3's are plain HTTP (on AWS, CloudFront serves them over HTTPS); in
+Cairn, the proxy needs a certificate for each host: a website's, at the
+website domain or a custom domain, and a bucket's, virtual-hosted. A
+wildcard certificate covers the website domain's and the API's (but buckets
+with dots in their names), but no custom domain.
+
+So the proxy may get them as they're needed, as
+[Caddy's on-demand TLS](https://caddyserver.com/on-demand-tls) does: when a
+TLS handshake asks for a host it has no certificate for, it asks Cairn's peer
+endpoint whether to get one, at `/tls/ask?domain=<host>`. That answers 200
+for exactly the hosts Cairn serves something at, and 404 for any other:
+
+- the S3 API's domain (`--domain`);
+- `<bucket>.<domain>`, if the bucket exists;
+- `<bucket>.<website domain>`, and a custom domain, if the bucket has a
+  website configuration.
+
+That keeps anyone from having the proxy ask for certificates for names of
+their own, which would use up the CA's rate limits. The proxy has to reach
+the peer endpoint for it, by an IP address or the node's peer URL's host (as
+the CLI does). In Caddy's global options:
+
+```caddyfile
+{
+	on_demand_tls {
+		ask http://cairn:9431/tls/ask
+	}
+}
+
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy cairn:9000
+}
+```
+
+Caddy redirects plain HTTP to HTTPS by itself. A certificate is got the
+first time a host is asked for, which takes a few seconds. Let's Encrypt
+issues at most 50 certificates a week per registered domain, so a cluster
+with more buckets than that at the website domain (or virtual-hosted)
+should have Caddy get a wildcard certificate for each instead, by a DNS
+challenge, and on-demand ones only for the rest (custom domains, which are
+registered domains of their own). [`deploy/compose`](#docker-compose) has
+both configurations.
+
+What a website serves, as S3's website endpoints do:
+
+- **Only what anyone may read.** Requests to a website are never signed, so
+  they're anonymous: a page is served if the bucket's policy allows
+  `s3:GetObject` to `"*"`, and no public access block restricts it (a new
+  bucket blocks public policies until its block is removed: see
+  [Users and permissions](#users-and-permissions)). A page that isn't there is a 403, not a 404, unless the policy
+  allows `s3:ListBucket` to anyone too.
+- **Index documents.** The root, and any key ending in `/`, is served its
+  index document: `docs/` serves `docs/index.html`, with the configuration's
+  `index.html`. A request for `docs`, if there's no such object but there is
+  `docs/index.html`, is redirected to `docs/` (302).
+- **Error documents.** A 4XX (a page that isn't there, or isn't public) is
+  answered with the error document, with the error's status. Without one, or
+  if it can't be served either, it's S3's HTML error page, which says what
+  went wrong (and why the error document couldn't be served); its
+  `x-amz-error-code` and `x-amz-error-message` headers say so too, for a HEAD.
+- **Redirects.** An object with a website redirect location
+  (`--website-redirect-location` on upload: `/other/page.html` or a URL) is a
+  301 there. Routing rules (`RoutingRules`, up to 50) redirect the requests
+  they match, by key prefix before anything's served
+  (`KeyPrefixEquals`), or by the error a request got (`HttpErrorCodeReturnedEquals`),
+  to another host, protocol or key (`ReplaceKeyWith`, or
+  `ReplaceKeyPrefixWith` in place of the condition's prefix), with a status
+  of choice (301 by default). `RedirectAllRequestsTo` redirects every request
+  to the same path on another host, and can't be combined with the rest.
+  Redirects that keep the request's host and protocol take them from its
+  `Host` and `X-Forwarded-Proto`.
+- **Only GET and HEAD**, with ranges and conditional requests, and CORS: a
+  browser's preflight is answered by the bucket's [CORS](#cors) rules, as on
+  its S3 API. Any other method is a 405.
+
+The configuration's rules and their errors are AWS's, as documented; they
+haven't been probed against S3 yet. Neither has whether S3 keeps a request's
+query string through a redirect: Cairn doesn't.
 
 ## Limits
 
