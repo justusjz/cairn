@@ -112,9 +112,8 @@ command line wins. The other commands read `CAIRN_PEER_URL` as well.
 | `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
-| `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. |
-| `--website-domain <NAME>` | `CAIRN_WEBSITE_DOMAIN` | none | The domain buckets' [websites](#websites) are reached at, e.g. `s3-website.example.com`: `bucket.s3-website.example.com` is the bucket's website, on the S3 API's port and on `--listen-website`. |
-| `--listen-website <ADDR>` | `CAIRN_LISTEN_WEBSITE` | off | Bind address for buckets' [websites](#websites) alone: every request to it is one to a website, of the bucket its host names (a subdomain of `--website-domain`, or else the whole host, for a custom domain). |
+| `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. Any other host name (but IP addresses and `localhost`) is then a [website's](#websites) custom domain. |
+| `--website-domain <NAME>` | `CAIRN_WEBSITE_DOMAIN` | none | The domain buckets' [websites](#websites) are reached at, e.g. `s3-website.example.com`: `bucket.s3-website.example.com` is the bucket's website. |
 | `--listen-console <ADDR>` | `CAIRN_LISTEN_CONSOLE` | off | Bind address for the [console](#console), Cairn's web UI, which people sign in to with passkeys or OIDC. Requires `--console-url`. |
 | `--console-url <URL>` | `CAIRN_CONSOLE_URL` | none | The URL the console is reached at, as browsers see it, e.g. `https://console.example.com`: an origin of its own (not the S3 API's), over HTTPS, or on `localhost`. Passkeys are bound to its host. |
 | `--kms-address <URL>` | `CAIRN_KMS_ADDRESS` | none | OpenBao (or Vault) server holding the keys for [SSE-KMS](#sse-kms), e.g. `https://bao.internal:8200`. Without it, SSE-KMS is refused. |
@@ -143,7 +142,10 @@ With `--domain s3.example.com`, they may also name it in the host, as
 `bucket.s3.example.com/key`, which some clients do by default. A request to
 any other host (the domain itself, an IP address) is still path-style, so both
 work side by side. As in S3, the bucket is all of the host before the domain,
-so `my.bucket.s3.example.com` is the bucket `my.bucket`.
+so `my.bucket.s3.example.com` is the bucket `my.bucket`. Any other host name
+is a [website's](#websites) custom domain then: clients that reach the S3 API
+by another name (`cairn.internal`, say) must use the domain, an IP address
+or `localhost` instead.
 
 Cairn only reads the `Host` header, which the proxy in front of it must pass on
 as the client sent it (the request's signature covers it, too). DNS and TLS
@@ -1122,17 +1124,31 @@ aws s3api get-bucket-website --bucket my-site
 aws s3api delete-bucket-website --bucket my-site
 ```
 
-The website endpoint is a host of its own, as S3's
-(`bucket.s3-website-<region>.amazonaws.com`) is: with
-`--website-domain s3-website.example.com`, a request to
-`my-site.s3-website.example.com` is one to `my-site`'s website, on the S3
-API's port. Requests to any other host go to the S3 API as before, so the
-website domain must not be the API's (`--domain`); it may be a subdomain of
-it. A node with `--listen-website` also serves websites alone on a port of
-their own, where a host that isn't a subdomain of the website domain names
-the bucket by all of itself, as on S3: point `www.example.com` (a `CNAME`) at
-Cairn, and the bucket `www.example.com` is served there. Websites are served
-over whatever the proxy in front of Cairn does (S3's are plain HTTP).
+Websites are served on the S3 API's port, at hosts of their own, which is
+how Cairn tells a website's request from the API's:
+
+- **At the website domain.** As S3's website endpoints
+  (`bucket.s3-website-<region>.amazonaws.com`): with
+  `--website-domain s3-website.example.com`, `my-site.s3-website.example.com`
+  is `my-site`'s website. It needs a wildcard DNS record,
+  `*.s3-website.example.com`, pointing at Cairn (or the proxy in front of
+  it). The website domain may be a subdomain of the API's, not the API's
+  itself.
+- **At a custom domain.** As on S3, a host that isn't one of the S3 API's
+  names a bucket by all of itself: create the bucket `www.example.com`, give
+  it a website, and point `www.example.com` at Cairn (a `CNAME` to, say,
+  `www.example.com.s3-website.example.com`), and it's served there. Cairn
+  knows the S3 API's hosts by `--domain`: the domain, its subdomains, IP
+  addresses and `localhost` are the API's; with `--domain` set, any other is
+  a custom domain. An apex domain (`example.com`) can't be a `CNAME`; give it
+  an `A` record, and, as on S3, a bucket `example.com` whose website
+  redirects every request to `www.example.com`.
+
+Nothing has to be set up per website in the proxy, as long as it passes on
+requests for any host to Cairn, with their `Host` as the client sent it (a
+catch-all, or default, server). Websites are served over whatever the proxy
+serves them over: S3's are plain HTTP, and HTTPS for a custom domain takes a
+certificate for it, in the proxy (as on AWS, where CloudFront serves it).
 
 What a website serves, as S3's website endpoints do:
 

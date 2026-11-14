@@ -241,16 +241,11 @@ struct ServeArgs {
     /// The domain buckets' websites are reached at, e.g.
     /// s3-website.example.com: a request to bucket.s3-website.example.com/key
     /// is one to the bucket's website (see PutBucketWebsite), as to S3's
-    /// website endpoints, on the S3 API's port and on --listen-website. The
-    /// proxy in front must pass `Host` on as the client sent it.
+    /// website endpoints. (With --domain set, so is a request to any host
+    /// that isn't the S3 API's: a custom domain, whose bucket has its name.)
+    /// The proxy in front must pass `Host` on as the client sent it.
     #[arg(long, env = "CAIRN_WEBSITE_DOMAIN", value_parser = s3::hosting::parse_domain)]
     website_domain: Option<String>,
-    /// Bind address for buckets' websites alone: every request to it is one
-    /// to the website of the bucket its host names, a subdomain of
-    /// --website-domain, or else the whole host (a custom domain, whose
-    /// bucket has its name, e.g. www.example.com). Off unless set.
-    #[arg(long, env = "CAIRN_LISTEN_WEBSITE")]
-    listen_website: Option<String>,
     /// How many bytes per second the scrubber reads, checking this node's
     /// data against its checksums: e.g. 25MiB (the default), 100MB. 0 turns
     /// it off.
@@ -406,26 +401,14 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     // flight, and only after that does the peer endpoint, since those requests
     // may still be reading and writing replicas through it, ours included.
     // Whatever is cut off anyway is left for GC, as after a crash.
-    // The console and the websites' listener, if any, stop with the S3 API.
+    // The console, if any, stops with the S3 API.
     let (stop_peer, peer_stopped) = tokio::sync::oneshot::channel::<()>();
     let (stop_console, console_stopped) = tokio::sync::oneshot::channel::<()>();
-    let (stop_websites, websites_stopped) = tokio::sync::oneshot::channel::<()>();
     let client = async {
-        let result =
-            serve_client(listen_client_addr, args.max_connections, app.clone(), Serving::Api, shutdown_signal()).await;
+        let result = serve_client(listen_client_addr, args.max_connections, app.clone(), shutdown_signal()).await;
         let _ = stop_peer.send(());
         let _ = stop_console.send(());
-        let _ = stop_websites.send(());
         result
-    };
-    let websites = async {
-        let Some(addr) = &args.listen_website else { return Ok(()) };
-        let addr = SocketAddr::from_str(addr)?;
-        eprintln!("buckets' websites on {addr}");
-        let stopped = async {
-            let _ = websites_stopped.await;
-        };
-        serve_client(addr, args.max_connections, app.clone(), Serving::Websites, stopped).await
     };
     let peer = serve_peer(listen_peer_addr, app.clone(), async {
         let _ = peer_stopped.await;
@@ -453,7 +436,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         .await;
         anyhow::Ok(())
     };
-    tokio::try_join!(client, peer, console, websites)?;
+    tokio::try_join!(client, peer, console)?;
     eprintln!("shut down");
     Ok(())
 }
@@ -638,23 +621,13 @@ impl std::fmt::Display for Contended {
 
 impl std::error::Error for Contended {}
 
-/// What a listener of `serve_client` serves.
-#[derive(Clone, Copy)]
-enum Serving {
-    /// The S3 API, and buckets' websites at `--website-domain`.
-    Api,
-    /// Buckets' websites alone (`--listen-website`).
-    Websites,
-}
-
-/// Serves the S3 API (or buckets' websites alone), counting every request in
-/// the node's metrics, until `shutdown` resolves; then waits for the
-/// requests in flight to finish.
+/// Serves the S3 API (and buckets' websites, see `s3::hosting`), counting
+/// every request in the node's metrics, until `shutdown` resolves; then
+/// waits for the requests in flight to finish.
 async fn serve_client(
     addr: SocketAddr,
     max_connections: usize,
     app: Arc<App>,
-    serving: Serving,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
@@ -665,13 +638,12 @@ async fn serve_client(
             async move {
                 let req = req.map(listen::ClientBody::new);
                 // Where the request goes, wherever it names its bucket.
-                let website_domain = app.website_domain.as_deref();
-                let route = match serving {
-                    Serving::Api => {
-                        s3::hosting::Route::of(app.domain.as_deref(), website_domain, req.headers(), req.uri().path())
-                    }
-                    Serving::Websites => s3::hosting::Route::website(website_domain, req.headers(), req.uri().path()),
-                };
+                let route = s3::hosting::Route::of(
+                    app.domain.as_deref(),
+                    app.website_domain.as_deref(),
+                    req.headers(),
+                    req.uri().path(),
+                );
                 let what = format!("{} {}", req.method(), route.path);
                 let started = std::time::Instant::now();
                 let in_flight = app.metrics.begin();

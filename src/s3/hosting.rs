@@ -11,11 +11,12 @@
 //!
 //! A bucket's website (see `s3::website`) is reached at hosts of its own, as
 //! S3's website endpoints are: with `--website-domain` set, a request to a
-//! subdomain of it is one to its bucket's website. A listener of the
-//! websites' own (`--listen-website`) takes every request as one, to the
-//! bucket its host names: a subdomain of the website domain, or else all of
-//! the host, as S3's website endpoints take a host that isn't theirs (a
-//! custom domain, whose bucket has its name: `www.example.com`).
+//! subdomain of it is one to its bucket's website. And with `--domain` set,
+//! so that Cairn knows the S3 API's own hosts, a request to any other host
+//! name (not the domain, a subdomain of it, an IP address or `localhost`)
+//! is one to the website of the bucket named all of the host, as S3's
+//! website endpoints take a host that isn't theirs: a custom domain, whose
+//! bucket has its name (`www.example.com`), and whose DNS points at Cairn.
 
 use hyper::{HeaderMap, header};
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
@@ -46,28 +47,30 @@ impl Route {
         if let Some(bucket) = website_domain.zip(host).and_then(|(domain, host)| bucket_of(domain, host)) {
             return Route { path: in_bucket(&bucket, path), virtual_host: true, website: true };
         }
-        match domain.zip(host).and_then(|(domain, host)| bucket_of(domain, host)) {
-            Some(bucket) => Route { path: in_bucket(&bucket, path), virtual_host: true, website: false },
+        let Some((domain, host)) = domain.zip(host) else {
+            return Route { path: path.to_owned(), virtual_host: false, website: false };
+        };
+        if let Some(bucket) = bucket_of(domain, host) {
+            return Route { path: in_bucket(&bucket, path), virtual_host: true, website: false };
+        }
+        match custom_domain(domain, host) {
+            Some(bucket) => Route { path: in_bucket(&bucket, path), virtual_host: true, website: true },
             None => Route { path: path.to_owned(), virtual_host: false, website: false },
         }
     }
+}
 
-    /// The route of a request to `path` with `headers` on the websites'
-    /// own listener: to the website of the bucket its host names, a
-    /// subdomain of `website_domain`, or else the whole host (no bucket, if
-    /// it has none, or it's an IPv6 address).
-    pub fn website(website_domain: Option<&str>, headers: &HeaderMap, path: &str) -> Route {
-        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
-        let bucket = match website_domain.and_then(|domain| bucket_of(domain, host)) {
-            Some(bucket) => bucket,
-            None if host.starts_with('[') => String::new(),
-            None => {
-                let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
-                name.trim_end_matches('.').to_ascii_lowercase()
-            }
-        };
-        Route { path: in_bucket(&bucket, path), virtual_host: true, website: true }
+/// The bucket whose website `host` names as a custom domain, if it's not
+/// one of the S3 API's under `domain`: the domain itself, an IP address
+/// (which no bucket's name may look like, as in S3) or `localhost`.
+fn custom_domain(domain: &str, host: &str) -> Option<String> {
+    if host.starts_with('[') {
+        return None;
     }
+    let name = host.rsplit_once(':').map_or(host, |(name, _)| name);
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let api = name.is_empty() || name == domain || name == "localhost" || name.parse::<std::net::IpAddr>().is_ok();
+    (!api).then_some(name)
 }
 
 /// The path-style path of `path` (a request's) in `bucket`.
@@ -108,7 +111,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(header::HOST, host.parse().unwrap());
         let route = Route::of(domain, None, &headers, path);
-        assert!(!route.website);
+        assert!(!route.website, "{host}");
         (route.path, route.virtual_host)
     }
 
@@ -132,20 +135,14 @@ mod tests {
     fn path_style() {
         let d = Some("s3.example.com");
         let path = |path: &str| (path.to_owned(), false);
-        for host in [
-            "s3.example.com",
-            "s3.example.com:9000",
-            ".s3.example.com",
-            "bs3.example.com",
-            "b.s3.example.org",
-            "127.0.0.1:9000",
-            "[::1]:9000",
-            "localhost",
-        ] {
+        // The domain itself, IP addresses and localhost are the API's.
+        for host in ["s3.example.com", "s3.example.com:9000", "S3.Example.com.", "127.0.0.1:9000", "[::1]:9000", "localhost"] {
             assert_eq!(route(d, host, "/b/k"), path("/b/k"), "{host}");
         }
         // Without a domain, every request is.
-        assert_eq!(route(None, "b.s3.example.com", "/b/k"), path("/b/k"));
+        for host in ["b.s3.example.com", "www.example.com", "cairn.internal:9000"] {
+            assert_eq!(route(None, host, "/b/k"), path("/b/k"), "{host}");
+        }
         // So is one without a host.
         let none = Route { path: "/b/k".to_owned(), virtual_host: false, website: false };
         assert_eq!(Route::of(d, Some("s3-website.example.com"), &HeaderMap::new(), "/b/k"), none);
@@ -163,19 +160,19 @@ mod tests {
         let website = |path: &str| Route { path: path.to_owned(), virtual_host: true, website: true };
         assert_eq!(Route::of(d, w, &headers("b.s3-website.example.com"), "/a/k"), website("/b/a/k"));
         assert_eq!(Route::of(d, w, &headers("My.Site.S3-Website.Example.com:80"), "/"), website("/my.site/"));
+        // Without the API's domain too.
+        assert_eq!(Route::of(None, w, &headers("b.s3-website.example.com"), "/k"), website("/b/k"));
         // A website domain under the API's is the websites'.
-        let w = Some("web.s3.example.com");
-        assert_eq!(Route::of(d, w, &headers("b.web.s3.example.com"), "/k"), website("/b/k"));
-        assert!(!Route::of(d, w, &headers("b.s3.example.com"), "/k").website);
-        assert!(!Route::of(d, w, &headers("web.s3.example.com"), "/b/k").website);
+        let under = Some("web.s3.example.com");
+        assert_eq!(Route::of(d, under, &headers("b.web.s3.example.com"), "/k"), website("/b/k"));
+        assert!(!Route::of(d, under, &headers("b.s3.example.com"), "/k").website);
+        assert!(!Route::of(d, under, &headers("web.s3.example.com"), "/b/k").website);
 
-        // The websites' own listener: any host is a bucket's.
-        let w = Some("s3-website.example.com");
-        assert_eq!(Route::website(w, &headers("b.s3-website.example.com:8080"), "/k"), website("/b/k"));
-        assert_eq!(Route::website(w, &headers("WWW.Example.com."), "/"), website("/www.example.com/"));
-        assert_eq!(Route::website(None, &headers("www.example.com:8080"), "/a"), website("/www.example.com/a"));
-        assert_eq!(Route::website(w, &headers("[::1]:8080"), "/k"), website("//k"));
-        assert_eq!(Route::website(w, &HeaderMap::new(), "/k"), website("//k"));
+        // Any other host, once Cairn knows the API's: a custom domain, all
+        // of which is its bucket's name.
+        assert_eq!(Route::of(d, w, &headers("WWW.Example.com.:8080"), "/a"), website("/www.example.com/a"));
+        assert_eq!(Route::of(d, None, &headers("example.org"), "/"), website("/example.org/"));
+        assert_eq!(Route::of(d, w, &headers("cairn.internal:9000"), "/b/k"), website("/cairn.internal/b/k"));
     }
 
     #[test]

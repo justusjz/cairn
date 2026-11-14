@@ -1410,7 +1410,8 @@ cors_ok() {
 }
 
 # A website: its configuration is bucket management (admin-only) and reads
-# back; its pages (at bucket.web.localhost) are what anyone may read, with
+# back; its pages (at bucket.web.localhost, or at a custom domain, the
+# bucket's name) are what anyone may read, with
 # index and error documents, redirects (an object's, routing rules', and a
 # "directory" without its slash), and S3's HTML error pages.
 website_ok() {
@@ -1453,7 +1454,10 @@ website_ok() {
     # error document.
     [ "$(curl -s -w ' %{http_code}' "$site/missing.html")" = "not here 403" ] || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' -X PUT "$site/index.html")" = 405 ] || return 1
-    # The S3 API is as it was, at its own host.
+    # A custom domain: a host that isn't the S3 API's names its bucket by all
+    # of itself.
+    [ "$(curl -s -H "Host: $b" "http://${SERVER_HOST}:${SERVER_PORT}/docs/")" = home ] || return 1
+    # The S3 API is as it was, at its own hosts.
     [ "$(curl -s -o /dev/null -w '%{http_code}' "http://${b}.localhost:${SERVER_PORT}/index.html")" = 200 ] || return 1
     awss3 s3api put-bucket-website --bucket "$b" \
         --website-configuration '{"RedirectAllRequestsTo":{"HostName":"www.example.com","Protocol":"https"}}' \
