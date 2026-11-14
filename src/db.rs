@@ -217,6 +217,7 @@ const MIGRATIONS: &[&str] = &[
     MANAGED_POLICIES,
     ACCOUNT_PUBLIC_ACCESS_BLOCK,
     BOUNDARIES,
+    POLICY_TAGS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -1847,6 +1848,24 @@ CREATE TRIGGER role_tags_operator BEFORE INSERT OR UPDATE OF role_id ON role_tag
     FOR EACH ROW EXECUTE FUNCTION cairn_operator_members();
 "#;
 
+
+/// Migration 43: managed policies' tags, as IAM's (see `iam`,
+/// `plans/policy-tags-versions.md`): at most 50 (see catalog.sql's I10),
+/// whose keys, unlike users', are case-sensitive (probed). Older Cairns know
+/// none, and may change no policies (the users' gate, `BOUNDARIES`).
+const POLICY_TAGS: &str = r#"
+CREATE TABLE managed_policy_tags (
+    policy_id uuid NOT NULL REFERENCES managed_policies (id) ON DELETE CASCADE,
+    key       text NOT NULL CHECK (length(key) BETWEEN 1 AND 128),
+    value     text NOT NULL CHECK (length(value) <= 256),
+    seq       bigint GENERATED ALWAYS AS IDENTITY,
+    UNIQUE (policy_id, key)
+);
+CREATE TRIGGER managed_policy_tags_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON managed_policy_tags
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER managed_policy_tags_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON managed_policy_tags
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
 #[cfg(test)]
 mod tests {
     #[test]

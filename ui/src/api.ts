@@ -136,8 +136,11 @@ export const api = {
   setAdmin: (role: string, admin: boolean) =>
     ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
   policies: () => ok(client.GET("/policies")),
-  createPolicy: (name: string, document: string, description: string, path?: string) =>
-    ok(client.POST("/policies", { body: { name, document, description, path: path || null } })),
+  createPolicy: (name: string, document: string, description: string, path?: string, tags: Tag[] = []) =>
+    ok(client.POST("/policies", { body: { name, document, description, path: path || null, tags } })),
+  /** Sets all of a managed policy's tags. */
+  setPolicyTags: (name: string, tags: Tag[]) =>
+    ok(client.PUT("/policies/{name}/tags", { params: { path: { name } }, body: { tags } })),
   updatePolicy: (name: string, change: { document?: string; description?: string }) =>
     ok(client.PUT("/policies/{name}", { params: { path: { name } }, body: change })),
   deleteManagedPolicy: (name: string) => ok(client.DELETE("/policies/{name}", { params: { path: { name } } })),

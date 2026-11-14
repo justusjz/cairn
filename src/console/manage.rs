@@ -110,6 +110,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_admin))
         .routes(routes!(list_policies, create_policy))
         .routes(routes!(update_policy, delete_policy_managed))
+        .routes(routes!(set_policy_tags))
         .routes(routes!(attach_policy, detach_policy))
         .routes(routes!(create_enrollment))
         .routes(routes!(create_key))
@@ -2883,6 +2884,8 @@ struct PolicySummary {
     path: String,
     /// The account's users whose permissions boundary it is.
     bounds: Vec<String>,
+    /// Its tags (keys case-sensitive), oldest first.
+    tags: Vec<Tag>,
 }
 
 #[utoipa::path(get, path = "/policies", responses(
@@ -2936,6 +2939,7 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
                 updated_at: None,
                 path: "/".to_owned(),
                 bounds: aws_bounds.remove(p.name).unwrap_or_default(),
+                tags: Vec::new(),
             }
         })
         .collect();
@@ -2951,6 +2955,7 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
             users: p.users,
             path: p.path,
             bounds: p.bounds,
+            tags: p.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
         });
     }
     Ok(Json(policies))
@@ -2964,6 +2969,9 @@ struct NewPolicy {
     description: String,
     /// Its path (`/`, or `/…/`); `/` if not given.
     path: Option<String>,
+    /// Its tags (keys case-sensitive).
+    #[serde(default)]
+    tags: Vec<Tag>,
 }
 
 #[utoipa::path(post, path = "/policies", request_body = NewPolicy, responses(
@@ -2974,9 +2982,74 @@ struct NewPolicy {
 async fn create_policy(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewPolicy>) -> Result<StatusCode> {
     let account = actor.account().to_owned();
     let path = body.path.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| "/".to_owned());
-    actor.check(&app, "iam:CreatePolicy", On::policy(&account, &path, &body.name)).await?;
-    crate::managed::create(&app.pool.get().await?, &account, &body.name, &path, &body.document, &body.description).await?;
+    let tags: Vec<(String, String)> = body.tags.iter().map(|t| (t.key.clone(), t.value.clone())).collect();
+    crate::managed::check_tags(&tags).map_err(ApiError::BadRequest)?;
+    // With tags, as IAM's CreatePolicy, it takes TagPolicy too.
+    let asked = roles::request_tags_context(&tags);
+    actor.check_with(&app, "iam:CreatePolicy", On::policy(&account, &path, &body.name), &asked).await?;
+    if !tags.is_empty() {
+        actor.check_with(&app, "iam:TagPolicy", On::policy(&account, &path, &body.name), &asked).await?;
+    }
+    let client = app.pool.get().await?;
+    crate::managed::create_tagged(&client, &account, &body.name, &path, &body.document, &body.description, &tags).await?;
     Ok(StatusCode::CREATED)
+}
+
+/// The condition keys of IAM's actions on a managed policy: its tags, as
+/// `aws:ResourceTag/…`.
+fn policy_context(policy: &crate::managed::Managed) -> Context {
+    let mut context = Context::default();
+    for (key, value) in &policy.tags {
+        context.set(&format!("aws:ResourceTag/{key}"), value);
+    }
+    context
+}
+
+#[derive(Deserialize, ToSchema)]
+struct PolicyTags {
+    /// All of its tags (keys case-sensitive): those it has of other keys go
+    /// (UntagPolicy), the rest are set (TagPolicy).
+    tags: Vec<Tag>,
+}
+
+/// Sets a managed policy's tags, as IAM's TagPolicy and UntagPolicy would.
+#[utoipa::path(put, path = "/policies/{name}/tags", params(("name" = String, Path)), request_body = PolicyTags, responses(
+    (status = 204, description = "Set"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn set_policy_tags(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+    Json(body): Json<PolicyTags>,
+) -> Result<StatusCode> {
+    let tags: Vec<(String, String)> = body.tags.into_iter().map(|t| (t.key, t.value)).collect();
+    crate::managed::check_tags(&tags).map_err(ApiError::BadRequest)?;
+    let account = actor.account().to_owned();
+    let client = app.pool.get().await?;
+    let policy = crate::managed::get(&client, &account, &name).await?;
+    let on = || On::policy(&account, &policy.path, &policy.name);
+    let gone: Vec<String> =
+        policy.tags.iter().filter(|(k, _)| !tags.iter().any(|(key, _)| key == k)).map(|(k, _)| k.clone()).collect();
+    let changed: Vec<(String, String)> = tags.iter().filter(|t| !policy.tags.contains(t)).cloned().collect();
+    if !gone.is_empty() {
+        let mut context = policy_context(&policy);
+        context.set_all("aws:TagKeys", gone.clone());
+        actor.check_with(&app, "iam:UntagPolicy", on(), &context).await?;
+    }
+    if !changed.is_empty() {
+        let mut context = policy_context(&policy);
+        context.extend(&roles::request_tags_context(&changed));
+        actor.check_with(&app, "iam:TagPolicy", on(), &context).await?;
+    }
+    if !gone.is_empty() {
+        crate::managed::untag(&client, policy.id, &gone).await?;
+    }
+    if !changed.is_empty() {
+        crate::managed::tag(&client, policy.id, &changed).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -3000,8 +3073,8 @@ async fn update_policy(
 ) -> Result<StatusCode> {
     let account = actor.account().to_owned();
     let client = app.pool.get().await?;
-    let path = crate::managed::get(&client, &account, &name).await?.path;
-    actor.check(&app, "iam:CreatePolicyVersion", On::policy(&account, &path, &name)).await?;
+    let policy = crate::managed::get(&client, &account, &name).await?;
+    actor.check_with(&app, "iam:CreatePolicyVersion", On::policy(&account, &policy.path, &name), &policy_context(&policy)).await?;
     if let Some(document) = &body.document {
         crate::managed::update(&client, &account, &name, document).await?;
     }
@@ -3019,8 +3092,8 @@ async fn update_policy(
 async fn delete_policy_managed(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
     let account = actor.account().to_owned();
     let client = app.pool.get().await?;
-    let path = crate::managed::get(&client, &account, &name).await?.path;
-    actor.check(&app, "iam:DeletePolicy", On::policy(&account, &path, &name)).await?;
+    let policy = crate::managed::get(&client, &account, &name).await?;
+    actor.check_with(&app, "iam:DeletePolicy", On::policy(&account, &policy.path, &name), &policy_context(&policy)).await?;
     crate::managed::delete(&client, &account, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }

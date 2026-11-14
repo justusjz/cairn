@@ -16,7 +16,7 @@
 //! What's there: users, with paths, tags and permissions boundaries (see
 //! `plans/boundaries.md`, probed), access keys, inline policies, and managed
 //! policies (see `managed`): Cairn's, which have AWS's names, and an
-//! account's own, with paths (no tags), of which Cairn keeps one version,
+//! account's own, with paths and tags, of which Cairn keeps one version,
 //! the default. Groups and roles aren't (NotImplemented).
 
 use std::collections::HashMap;
@@ -268,6 +268,9 @@ async fn respond(
         (_, "DeletePolicyVersion") => iam.delete_policy_version(&params).await?,
         (_, "SetDefaultPolicyVersion") => iam.set_default_policy_version(&params).await?,
         (_, "ListEntitiesForPolicy") => iam.list_entities_for_policy(&params).await?,
+        (_, "TagPolicy") => iam.tag_policy(&params).await?,
+        (_, "UntagPolicy") => iam.untag_policy(&params).await?,
+        (_, "ListPolicyTags") => iam.list_policy_tags(&params).await?,
         (_, other) => {
             return Err(error(
                 StatusCode::NOT_IMPLEMENTED,
@@ -304,13 +307,25 @@ struct Iam<'a> {
 enum Shown {
     Arn,
     User(String),
+    /// A policy, by its ARN, or (one to make) its name.
+    Policy(String),
+}
+
+/// Whose tags a request sets, which IAM checks differently (probed).
+#[derive(Clone, Copy, PartialEq)]
+enum Tagged {
+    /// A user's: keys unique regardless of case.
+    User,
+    /// A policy's: keys case-sensitive.
+    Policy,
 }
 
 /// The tags a request sets (`Tags.member.N.Key` and `.Value`), checked as
 /// IAM checks them (probed): at most 50, keys of 1 to 128 characters, values
 /// of at most 256, of letters, digits, spaces and `_.:/=+-@`, no `aws:` keys,
-/// no key twice regardless of case. `None` if it sets none.
-fn request_tags(params: &Params, required: bool) -> Result<Option<Vec<(String, String)>>> {
+/// no key twice (a user's: regardless of case). `None` if it sets none; an
+/// error if it must (`required`: a TagUser or TagPolicy).
+fn request_tags(params: &Params, required: bool, of: Tagged) -> Result<Option<Vec<(String, String)>>> {
     let mut tags = Vec::new();
     for n in 1.. {
         let key = params.get(&format!("Tags.member.{n}.Key"));
@@ -321,10 +336,11 @@ fn request_tags(params: &Params, required: bool) -> Result<Option<Vec<(String, S
         tags.push((key.unwrap_or("").to_owned(), value.unwrap_or("").to_owned()));
     }
     if tags.is_empty() {
-        return match required {
-            true if params.has_list("Tags") => Err(invalid("Error occurred while validating input. ")),
-            true => params.required("Tags").map(|_| None),
-            false => Ok(None),
+        return match (required, of) {
+            (true, Tagged::Policy) => Err(invalid("The provided tag map must not be null/empty.")),
+            (true, Tagged::User) if params.has_list("Tags") => Err(invalid("Error occurred while validating input. ")),
+            (true, Tagged::User) => params.required("Tags").map(|_| None),
+            (false, _) => Ok(None),
         };
     }
     if tags.len() > MAX_TAGS {
@@ -345,7 +361,8 @@ fn request_tags(params: &Params, required: bool) -> Result<Option<Vec<(String, S
         return Err(invalid("Tag keys beginning with aws: are reserved for system use."));
     }
     let mut seen = std::collections::HashSet::new();
-    if !tags.iter().all(|(key, _)| seen.insert(key.to_lowercase())) {
+    let fold = |key: &str| if of == Tagged::User { key.to_lowercase() } else { key.to_owned() };
+    if !tags.iter().all(|(key, _)| seen.insert(fold(key))) {
         return Err(invalid("Duplicate tag keys found. Please note that Tag keys are case insensitive."));
     }
     Ok(Some(tags))
@@ -456,6 +473,7 @@ impl Iam<'_> {
         let resource = match shown {
             Shown::Arn => check.on.arn(),
             Shown::User(name) => format!("user {name}"),
+            Shown::Policy(name) => format!("policy {name}"),
         };
         Err(error(
             StatusCode::FORBIDDEN,
@@ -552,7 +570,7 @@ impl Iam<'_> {
     async fn create_user(&mut self, params: &Params) -> Result<Option<String>> {
         let name = params.required("UserName")?.to_owned();
         let path = requested_path(params, "Path")?;
-        let tags = request_tags(params, false)?;
+        let tags = request_tags(params, false, Tagged::User)?;
         let boundary = requested_boundary(params)?;
         let on = On::user(self.account(), &path, &name);
         // As IAM: the boundary asked for, and the tags (which take TagUser
@@ -692,7 +710,7 @@ impl Iam<'_> {
 
     async fn tag_user(&mut self, params: &Params) -> Result<Option<String>> {
         params.required("UserName")?;
-        let tags = request_tags(params, true)?.unwrap_or_default();
+        let tags = request_tags(params, true, Tagged::User)?.unwrap_or_default();
         let user = self.target(params, "iam:TagUser", tags_context(&tags), no_such_user).await?;
         roles::tag(self.client, user.id, &tags).await?;
         Ok(None)
@@ -910,6 +928,11 @@ impl Iam<'_> {
 
     /// The policy a request names (`PolicyArn`), allowed `action` on it.
     async fn policy(&mut self, params: &Params, action: &'static str) -> Result<Policy> {
+        self.policy_with(params, action, Context::default()).await
+    }
+
+    /// As `policy`, with the condition keys `extra` too.
+    async fn policy_with(&mut self, params: &Params, action: &'static str, extra: Context) -> Result<Policy> {
         let arn = params.required("PolicyArn")?.to_owned();
         let named = managed::named(&arn, self.account()).map_err(|_| {
             error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} does not exist or is not attachable."))
@@ -918,8 +941,18 @@ impl Iam<'_> {
             Named::Aws(p) => On::policy("aws", "/", p.name),
             Named::Own { path, name } => On::policy(self.account(), path, name),
         };
-        self.check(action, on).await?;
-        self.load_policy(named).await
+        // Its tags are its `aws:ResourceTag`s (not `iam:ResourceTag`s, which
+        // are users' and roles' only: probed). One that isn't there is
+        // checked as it would be, untagged.
+        let policy = self.load_policy(named).await;
+        let mut context = extra;
+        if let Ok(policy) = &policy {
+            for (key, value) in &policy.tags {
+                context.set(&format!("aws:ResourceTag/{key}"), value);
+            }
+        }
+        self.check_with(action, on, &context, Shown::Policy(arn)).await?;
+        policy
     }
 
     async fn load_policy(&self, named: Named) -> Result<Policy> {
@@ -956,6 +989,8 @@ impl Iam<'_> {
                     created: "2015-02-06T18:39:46Z".to_owned(),
                     updated: "2015-02-06T18:39:46Z".to_owned(),
                     aws: true,
+                    tags: Vec::new(),
+                    uuid: None,
                 }
             }
             Named::Own { path, name } => {
@@ -969,7 +1004,9 @@ impl Iam<'_> {
                         "SELECT id, name, description, document, version,
                                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
                                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                                ARRAY(SELECT r.id FROM roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name)
+                                ARRAY(SELECT r.id FROM roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name),
+                                ARRAY(SELECT t.key FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq),
+                                ARRAY(SELECT t.value FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq)
                          FROM managed_policies m WHERE account_id = $1 AND name = $2 AND path = $3",
                         &[&self.account(), &name, &path],
                     )
@@ -989,6 +1026,8 @@ impl Iam<'_> {
                     created: row.get(5),
                     updated: row.get(6),
                     aws: false,
+                    tags: roles::tags_of(row.get(8), row.get(9)),
+                    uuid: Some(row.get(0)),
                 }
             }
         })
@@ -1019,20 +1058,80 @@ impl Iam<'_> {
         let name = params.required("PolicyName")?.to_owned();
         let document = params.required("PolicyDocument")?;
         let path = requested_path(params, "Path")?;
-        if params.has_list("Tags.") {
-            return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn's policies have no tags"));
+        let tags = request_tags(params, false, Tagged::Policy)?;
+        // With tags, it takes TagPolicy too (probed).
+        let on = On::policy(self.account(), &path, &name);
+        let context = tags.as_deref().map(tags_context).unwrap_or_default();
+        self.check_with("iam:CreatePolicy", on.clone(), &context, Shown::Policy(name.clone())).await?;
+        if tags.is_some() {
+            self.check_with("iam:TagPolicy", on, &context, Shown::Policy(name.clone())).await?;
         }
-        self.check("iam:CreatePolicy", On::policy(self.account(), &path, &name)).await?;
-        managed::create(self.client, self.account(), &name, &path, document, params.get("Description").unwrap_or("")).await?;
+        let description = params.get("Description").unwrap_or("");
+        let tags = tags.unwrap_or_default();
+        managed::create_tagged(self.client, self.account(), &name, &path, document, description, &tags).await?;
         let policy = self.load_policy(Named::Own { path, name }).await?;
-        Ok(Some(format!("<Policy>{}</Policy>", Self::policy_xml(&policy))))
+        // Its tags, if it was given some (probed).
+        let tags = if tags.is_empty() { String::new() } else { tags_xml("Tags", &policy.tags) };
+        Ok(Some(format!("<Policy>{}{tags}</Policy>", Self::policy_xml(&policy))))
+    }
+
+    /// The account's own policy a request names, which TagPolicy and the like
+    /// change (Cairn's can't be), allowed `action` on it, with `extra`.
+    async fn own_policy_with(&mut self, params: &Params, action: &'static str, extra: Context) -> Result<Policy> {
+        let arn = params.required("PolicyArn")?.to_owned();
+        if arn.len() < 20 {
+            return Err(validation(
+                "1 validation error detected: Value at 'policyArn' failed to satisfy constraint: Member must have length greater than or equal to 20",
+            ));
+        }
+        if !arn.starts_with("arn:aws:iam::") || !arn.contains(":policy/") {
+            return Err(invalid(format!("ARN {arn} is not valid.")));
+        }
+        let policy = self.policy_with(params, action, extra).await.map_err(|e| match e.code {
+            "NoSuchEntity" => error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} was not found.")),
+            _ => e,
+        })?;
+        Self::own(&policy)?;
+        Ok(policy)
+    }
+
+    async fn tag_policy(&mut self, params: &Params) -> Result<Option<String>> {
+        let tags = request_tags(params, true, Tagged::Policy)?.unwrap_or_default();
+        let policy = self.own_policy_with(params, "iam:TagPolicy", tags_context(&tags)).await?;
+        managed::tag(self.client, policy.uuid.expect("an account's own"), &tags).await?;
+        Ok(None)
+    }
+
+    async fn untag_policy(&mut self, params: &Params) -> Result<Option<String>> {
+        let keys = request_keys(params)?;
+        let mut extra = Context::default();
+        extra.set_all("aws:TagKeys", keys.clone());
+        let policy = self.own_policy_with(params, "iam:UntagPolicy", extra).await?;
+        managed::untag(self.client, policy.uuid.expect("an account's own"), &keys).await?;
+        Ok(None)
+    }
+
+    async fn list_policy_tags(&mut self, params: &Params) -> Result<Option<String>> {
+        let policy = self.own_policy_with(params, "iam:ListPolicyTags", Context::default()).await?;
+        let max = max_items(params)?;
+        let start: usize = match params.get("Marker") {
+            Some(m) => m.parse().map_err(|_| invalid("Invalid Marker."))?,
+            None => 0,
+        };
+        let page: Vec<(String, String)> = policy.tags.iter().skip(start).take(max).cloned().collect();
+        let truncated = start + page.len() < policy.tags.len();
+        let marker = match truncated {
+            true => format!("<Marker>{}</Marker>", start + page.len()),
+            false => String::new(),
+        };
+        Ok(Some(format!("{}<IsTruncated>{truncated}</IsTruncated>{marker}", tags_xml("Tags", &page))))
     }
 
     async fn get_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:GetPolicy").await?;
-        // With its tags, which GetPolicy shows (none: Cairn's policies have
-        // none yet), as CreatePolicy and ListPolicies don't (probed).
-        Ok(Some(format!("<Policy>{}<Tags/></Policy>", Self::policy_xml(&policy))))
+        // With its tags, which GetPolicy shows, even none, as ListPolicies
+        // doesn't (probed).
+        Ok(Some(format!("<Policy>{}{}</Policy>", Self::policy_xml(&policy), tags_xml("Tags", &policy.tags))))
     }
 
     /// Refuses changing one of Cairn's (AWS's) policies.
@@ -1219,6 +1318,10 @@ struct Policy {
     bounds: Vec<uuid::Uuid>,
     /// Whether it's one of Cairn's (AWS's).
     aws: bool,
+    /// Its tags, oldest first.
+    tags: Vec<(String, String)>,
+    /// Its ID in Cairn (none for Cairn's own).
+    uuid: Option<uuid::Uuid>,
 }
 
 /// `MaxItems`: 1 to 1000, 100 if not given, as IAM's.

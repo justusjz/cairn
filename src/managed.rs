@@ -215,6 +215,8 @@ pub struct Managed {
     pub users: Vec<String>,
     /// The users whose permissions boundary it is, by name.
     pub bounds: Vec<String>,
+    /// Its tags, oldest first.
+    pub tags: Vec<(String, String)>,
 }
 
 impl Managed {
@@ -229,7 +231,9 @@ const COLUMNS: &str = "m.id, m.name, m.description, m.document, m.version,
      ARRAY(SELECT r.name FROM role_attached_policies x JOIN roles r ON r.id = x.role_id
            WHERE x.policy_id = m.id ORDER BY r.name),
      m.path,
-     ARRAY(SELECT r.name FROM roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name)";
+     ARRAY(SELECT r.name FROM roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name),
+     ARRAY(SELECT t.key FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq),
+     ARRAY(SELECT t.value FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq)";
 
 fn managed_of(row: &tokio_postgres::Row) -> Managed {
     Managed {
@@ -242,6 +246,7 @@ fn managed_of(row: &tokio_postgres::Row) -> Managed {
         users: row.get(6),
         path: row.get(7),
         bounds: row.get(8),
+        tags: crate::roles::tags_of(row.get(9), row.get(10)),
     }
 }
 
@@ -267,6 +272,19 @@ pub async fn get(client: &Object, account: &str, name: &str) -> anyhow::Result<M
 /// Makes the account's managed policy `name`, at `path`. Names are unique
 /// in an account whatever their paths (probed).
 pub async fn create(client: &Object, account: &str, name: &str, path: &str, document: &str, description: &str) -> anyhow::Result<Managed> {
+    create_tagged(client, account, name, path, document, description, &[]).await
+}
+
+/// As `create`, with `tags` (checked: see `check_tags`).
+pub async fn create_tagged(
+    client: &Object,
+    account: &str,
+    name: &str,
+    path: &str,
+    document: &str,
+    description: &str,
+    tags: &[(String, String)],
+) -> anyhow::Result<Managed> {
     check_name(name)?;
     check_path(path)?;
     check_document(document)?;
@@ -284,7 +302,62 @@ pub async fn create(client: &Object, account: &str, name: &str, path: &str, docu
     if made == 0 {
         return refused(Refused::Exists(format!("A policy called {name} already exists. Duplicate names are not allowed.")));
     }
-    get(client, account, name).await
+    let policy = get(client, account, name).await?;
+    if !tags.is_empty() {
+        tag(client, policy.id, tags).await?;
+        return get(client, account, name).await;
+    }
+    Ok(policy)
+}
+
+/// Why `tags` can't be a policy's (the console's; the IAM API says it as
+/// IAM does: see `iam`): as a user's (`roles::check_tags`), but that keys are
+/// case-sensitive (probed).
+pub fn check_tags(tags: &[(String, String)]) -> Result<(), String> {
+    if tags.len() > crate::roles::MAX_TAGS {
+        return Err(format!("a policy has at most {} tags", crate::roles::MAX_TAGS));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (key, value) in tags {
+        if !(1..=128).contains(&key.chars().count()) || value.chars().count() > 256 {
+            return Err("a tag's key is 1 to 128 characters, its value at most 256".to_owned());
+        }
+        if !key.chars().all(crate::roles::tag_char) || !value.chars().all(crate::roles::tag_char) {
+            return Err("tags hold letters, digits, spaces and _.:/=+-@".to_owned());
+        }
+        if key.to_ascii_lowercase().starts_with("aws:") {
+            return Err("Tag keys beginning with aws: are reserved for system use.".to_owned());
+        }
+        if !seen.insert(key.as_str()) {
+            return Err(format!("the tag key {key:?} is given twice"));
+        }
+    }
+    Ok(())
+}
+
+/// Tags policy `id` with `tags`, replacing those it has of the same keys
+/// (case-sensitive), unless it would have more than 50 (T43).
+pub async fn tag(client: &Object, id: Uuid, tags: &[(String, String)]) -> anyhow::Result<()> {
+    let keys: Vec<&str> = tags.iter().map(|(k, _)| k.as_str()).collect();
+    let values: Vec<&str> = tags.iter().map(|(_, v)| v.as_str()).collect();
+    let max = crate::roles::MAX_TAGS as i32;
+    let status: String = client
+        .query_one_cached("SELECT pg_temp.cairn_tag_policy($1, $2, $3, $4)", &[&id, &keys, &values, &max])
+        .await?
+        .get(0);
+    match status.as_str() {
+        "tagged" => Ok(()),
+        "too_many" => Err(crate::roles::TooManyTags.into()),
+        _ => refused(Refused::NoSuch("no such policy".into())),
+    }
+}
+
+/// Removes policy `id`'s tags of `keys` (case-sensitive), those it has.
+pub async fn untag(client: &Object, id: Uuid, keys: &[String]) -> anyhow::Result<()> {
+    client
+        .execute_cached("DELETE FROM managed_policy_tags WHERE policy_id = $1 AND key = ANY ($2)", &[&id, &keys])
+        .await?;
+    Ok(())
 }
 
 /// Replaces the document of the account's managed policy `name` (its

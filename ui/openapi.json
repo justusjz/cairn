@@ -2643,6 +2643,55 @@
         }
       }
     },
+    "/policies/{name}/tags": {
+      "put": {
+        "summary": "Sets a managed policy's tags, as IAM's TagPolicy and UntagPolicy would.",
+        "operationId": "set_policy_tags",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyTags"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/roles": {
       "get": {
         "operationId": "list_roles",
@@ -5619,6 +5668,13 @@
               "null"
             ],
             "description": "Its path (`/`, or `/…/`); `/` if not given."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags (keys case-sensitive)."
           }
         }
       },
@@ -6335,7 +6391,8 @@
           "version",
           "users",
           "path",
-          "bounds"
+          "bounds",
+          "tags"
         ],
         "properties": {
           "arn": {
@@ -6365,6 +6422,13 @@
             "type": "string",
             "description": "Its path (`/`, or `/…/`)."
           },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags (keys case-sensitive), oldest first."
+          },
           "updated_at": {
             "type": [
               "number",
@@ -6383,6 +6447,21 @@
             "type": "integer",
             "format": "int32",
             "description": "Its default version's number (`v1`, ...)."
+          }
+        }
+      },
+      "PolicyTags": {
+        "type": "object",
+        "required": [
+          "tags"
+        ],
+        "properties": {
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "All of its tags (keys case-sensitive): those it has of other keys go\n(UntagPolicy), the rest are set (TagPolicy)."
           }
         }
       },

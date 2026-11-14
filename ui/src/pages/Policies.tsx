@@ -4,7 +4,7 @@
 // deleting (once nothing has it attached) the account's own.
 
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type ManagedPolicy, api } from "../api";
+import { type ManagedPolicy, type Tag, api } from "../api";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
 import { ago, pretty } from "../format";
@@ -46,6 +46,17 @@ export default function Policies() {
                       <Show when={p.path !== "/"}>
                         <div class="subtle small" title={p.arn}>
                           path {p.path}
+                        </div>
+                      </Show>
+                      <Show when={p.tags.length}>
+                        <div class="small">
+                          <For each={p.tags}>
+                            {(t) => (
+                              <span class="chip" title="A tag (aws:ResourceTag in IAM actions on the policy)">
+                                {t.key}={t.value}
+                              </span>
+                            )}
+                          </For>
                         </div>
                       </Show>
                     </td>
@@ -122,6 +133,9 @@ function ManagedPolicyDialog(props: {
   const [document, setDocument] = createSignal(p ? pretty(p.document) : EMPTY);
   const [error, setError] = createSignal<string>();
   const [path, setPath] = createSignal("");
+  const [tags, setTags] = createSignal<Tag[]>((p?.tags ?? []).map((t) => ({ ...t })));
+  const setTag = (i: number, change: Partial<Tag>) => setTags(tags().map((t, j) => (j === i ? { ...t, ...change } : t)));
+  const wantedTags = () => tags().filter((t) => t.key.trim()).map((t) => ({ key: t.key.trim(), value: t.value }));
   const [delegateBoundary, setDelegateBoundary] = createSignal("");
   const [delegatePath, setDelegatePath] = createSignal("/team/");
   onMount(() => dialog.showModal());
@@ -132,9 +146,10 @@ function ManagedPolicyDialog(props: {
         const change: { document?: string; description?: string } = {};
         if (document() !== pretty(p.document)) change.document = document();
         if (description() !== p.description) change.description = description();
-        await api.updatePolicy(p.name, change);
+        if (change.document !== undefined || change.description !== undefined) await api.updatePolicy(p.name, change);
+        if (JSON.stringify(wantedTags()) !== JSON.stringify(p.tags)) await api.setPolicyTags(p.name, wantedTags());
       } else {
-        await api.createPolicy(name().trim(), document(), description(), path().trim());
+        await api.createPolicy(name().trim(), document(), description(), path().trim(), wantedTags());
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -218,6 +233,33 @@ function ManagedPolicyDialog(props: {
           onInput={(e) => setDescription(e.currentTarget.value)}
         />
         <PolicyEditor document={document()} setDocument={setDocument} buckets={props.buckets} readOnly={p?.aws} />
+        <Show when={!p?.aws}>
+          <div class="small">Tags</div>
+          <For each={tags()}>
+            {(t, i) => (
+              <div class="form-row">
+                <input type="text" placeholder="key" aria-label="Tag key" value={t.key} onInput={(e) => setTag(i(), { key: e.currentTarget.value })} />
+                <input
+                  type="text"
+                  placeholder="value"
+                  aria-label="Tag value"
+                  value={t.value}
+                  onInput={(e) => setTag(i(), { value: e.currentTarget.value })}
+                />
+                <button type="button" class="small" onClick={() => setTags(tags().filter((_, j) => j !== i()))}>
+                  Remove
+                </button>
+              </div>
+            )}
+          </For>
+          <button type="button" class="small" disabled={tags().length >= 50} onClick={() => setTags([...tags(), { key: "", value: "" }])}>
+            Add tag
+          </button>
+          <p class="subtle small">
+            Policies see a policy's tags as aws:ResourceTag/… in IAM actions on it (a delegated admin may be let change only
+            the policies tagged as theirs, say). Unlike users', a policy's tag keys are case-sensitive, as in IAM.
+          </p>
+        </Show>
         <Show when={p?.aws}>
           <p class="subtle small">Cairn's policies are AWS's, and can't be changed: make one of your own instead.</p>
         </Show>

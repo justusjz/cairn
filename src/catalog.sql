@@ -77,6 +77,7 @@
 --           policy, or tagging it (I10); deleting the user (by deleting
 --           the row); setting its permissions boundary (a plain UPDATE,
 --           whose trigger keeps the inline policy `cairn:boundary`).
+--   M(m)    A managed policy's row. Exclusive: tagging it (I10).
 --   L(l)    A console login's row (see `console`). Exclusive: giving it a
 --           passkey, removing one, linking an identity to it (I10).
 --   E(e)    An enrollment link's row: locked by the transaction that uses
@@ -165,7 +166,9 @@
 --     which isn't one of its own: see `db::BOUNDARIES`), and it has at most
 --     50 tags, as in IAM: making a key, setting a policy, or tagging it
 --     holds R(r) exclusively, and counts what the user has in a later
---     statement (T28, T29, T42). Likewise a console login
+--     statement (T28, T29, T42). A managed policy has at most 50 tags too:
+--     tagging it holds M(m) exclusively, and counts in a later statement
+--     (T43). Likewise a console login
 --     has at most 8 passkeys, as IAM's MFA devices, and at least one way in
 --     (a passkey, or an identity at an OIDC provider), but by being
 --     deleted, under L(l) (T30, T31, T35, T37); and at most one identity per
@@ -192,7 +195,7 @@
 -- There are none, by three rules, which every transaction follows:
 --
 -- A. All of a transaction's locks are taken up front, in one global order:
---    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, X (by
+--    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, M, X (by
 --    blob id), each stripe in one mode, each blob
 --    in its final mode (exclusive wins over shared). A transaction that waits
 --    for a lock therefore only ever waits for one that comes later in the
@@ -1724,6 +1727,27 @@ BEGIN
     END IF;
     DELETE FROM role_tags WHERE role_id = p_role AND lower(key) IN (SELECT lower(k) FROM unnest(p_keys) k);
     INSERT INTO role_tags (role_id, key, value) SELECT p_role, k, v FROM unnest(p_keys, p_values) AS t(k, v);
+    RETURN 'tagged';
+END
+$$;
+
+-- T43: TagPolicy: sets the managed policy's tags `p_keys` to `p_values`
+-- (keys are case-sensitive, as IAM's are on policies), unless it would have
+-- more than `p_max` (I10). Takes M(m) exclusively, then counts in a later
+-- statement. Returns 'tagged', 'no_such_policy' or 'too_many'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_tag_policy(p_policy uuid, p_keys text[], p_values text[], p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM managed_policies WHERE id = p_policy FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_policy';
+    END IF;
+    IF (SELECT count(*) FROM managed_policy_tags WHERE policy_id = p_policy AND key <> ALL (p_keys))
+       + cardinality(p_keys) > p_max THEN
+        RETURN 'too_many';
+    END IF;
+    DELETE FROM managed_policy_tags WHERE policy_id = p_policy AND key = ANY (p_keys);
+    INSERT INTO managed_policy_tags (policy_id, key, value) SELECT p_policy, k, v FROM unnest(p_keys, p_values) AS t(k, v);
     RETURN 'tagged';
 END
 $$;

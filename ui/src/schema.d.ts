@@ -847,6 +847,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/policies/{name}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a managed policy's tags, as IAM's TagPolicy and UntagPolicy would. */
+        put: operations["set_policy_tags"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/roles": {
         parameters: {
             query?: never;
@@ -1925,6 +1942,8 @@ export interface components {
             name: string;
             /** @description Its path (`/`, or `/…/`); `/` if not given. */
             path?: string | null;
+            /** @description Its tags (keys case-sensitive). */
+            tags?: components["schemas"]["Tag"][];
         };
         NewRate: {
             /**
@@ -2216,6 +2235,8 @@ export interface components {
             name: string;
             /** @description Its path (`/`, or `/…/`). */
             path: string;
+            /** @description Its tags (keys case-sensitive), oldest first. */
+            tags: components["schemas"]["Tag"][];
             /** Format: double */
             updated_at?: number | null;
             /** @description The account's users it's attached to. */
@@ -2225,6 +2246,13 @@ export interface components {
              * @description Its default version's number (`v1`, ...).
              */
             version: number;
+        };
+        PolicyTags: {
+            /**
+             * @description All of its tags (keys case-sensitive): those it has of other keys go
+             *     (UntagPolicy), the rest are set (TagPolicy).
+             */
+            tags: components["schemas"]["Tag"][];
         };
         /** @description A provider to sign in at. */
         ProviderButton: {
@@ -4690,6 +4718,46 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_policy_tags: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyTags"];
+            };
+        };
+        responses: {
+            /** @description Set */
             204: {
                 headers: {
                     [name: string]: unknown;

@@ -446,3 +446,26 @@ async fn names_and_tag_keys_are_unique_regardless_of_case() {
     let user = roles::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
     assert_eq!(user.tags.len(), 49);
 }
+
+/// A managed policy's tags, whose keys (unlike users') are case-sensitive,
+/// as IAM's (probed).
+#[tokio::test]
+async fn policies_tag_keys_are_case_sensitive() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let account = roles::account(&client).await.unwrap();
+    let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
+    let tags = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    let policy = crate::managed::create_tagged(&client, &account, "p", "/", document, "", &tags(&[("team", "a")])).await.unwrap();
+    assert_eq!(policy.tags, tags(&[("team", "a")]));
+    crate::managed::tag(&client, policy.id, &tags(&[("Team", "b"), ("team", "c")])).await.unwrap();
+    assert_eq!(crate::managed::get(&client, &account, "p").await.unwrap().tags, tags(&[("Team", "b"), ("team", "c")]));
+    crate::managed::untag(&client, policy.id, &["TEAM".to_owned(), "team".to_owned()]).await.unwrap();
+    assert_eq!(crate::managed::get(&client, &account, "p").await.unwrap().tags, tags(&[("Team", "b")]));
+    assert!(crate::managed::check_tags(&tags(&[("k", "1"), ("K", "2")])).is_ok());
+    assert!(crate::managed::check_tags(&tags(&[("k", "1"), ("k", "2")])).is_err());
+    // Deleted with the policy.
+    crate::managed::delete(&client, &account, "p").await.unwrap();
+    let left: i64 = client.query_one("SELECT count(*) FROM managed_policy_tags", &[]).await.unwrap().get(0);
+    assert_eq!(left, 0);
+}
