@@ -209,6 +209,7 @@ dependencies = [
  "sha2",
  "tokio",
  "tokio-postgres",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "utoipa",

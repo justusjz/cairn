@@ -86,9 +86,27 @@ pub const REPAIR_AFTER: Setting = Setting {
     unset: None,
 };
 
+/// Whether IAM's OpenID Connect providers may be at private addresses
+/// (1) or only public ones (0, the default; see `oidc::Reach`). Any user
+/// allowed `iam:CreateOpenIDConnectProvider` picks a provider's URL, and
+/// Cairn fetches its discovery document and keys from there, so by default
+/// that can't reach into the cluster's own network (its nodes' peer ports,
+/// a cloud's metadata service). An issuer inside it (a Kubernetes cluster's
+/// own) needs this; Cairn still only ever GETs, and never says what came
+/// back that isn't an issuer's JSON.
+pub const OIDC_PRIVATE_ISSUERS: Setting = Setting {
+    name: "oidc-private-issuers",
+    default: 0,
+    min: 0,
+    max: 1,
+    help: "1 lets IAM's OIDC providers be at private addresses (in-cluster issuers), \
+           0 keeps them to public ones",
+    unset: None,
+};
+
 /// Every setting.
 pub const ALL: &[&Setting] =
-    &[&LIFECYCLE_RATE, &DATA_SHARDS, &PARITY_SHARDS, &REPAIR_AFTER];
+    &[&LIFECYCLE_RATE, &DATA_SHARDS, &PARITY_SHARDS, &REPAIR_AFTER, &OIDC_PRIVATE_ISSUERS];
 
 /// The setting named `name`, if there's one.
 pub fn named(name: &str) -> Option<&'static Setting> {

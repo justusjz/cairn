@@ -155,6 +155,11 @@ impl Who_ {
     }
 }
 
+/// The account of a role's ARN.
+fn trust_account(role: &str) -> Option<&str> {
+    role.strip_prefix("arn:aws:iam::")?.split(':').next()
+}
+
 /// A role's name, from its path and name.
 fn role_name(path_name: &str) -> &str {
     path_name.rsplit('/').next().unwrap_or(path_name)
@@ -318,6 +323,21 @@ impl Access {
         crate::policy::trust_allows(self.identity.iter().map(|p| &**p), caps, trust, &request)
     }
 
+    /// Whether `trust` lets a web identity of the OIDC provider `provider`
+    /// (its ARN) take `action` on the role `role` (its ARN), with the
+    /// condition keys `extra` too (the token's): it has no identity
+    /// policies, so only a statement naming the provider allows it.
+    pub fn web_identity_trusted(&self, provider: &str, action: &str, role: &str, trust: &Policy, extra: &Context) -> bool {
+        let mut context = self.context.clone();
+        context.extend(extra);
+        if let Some(account) = trust_account(role) {
+            context.set("aws:ResourceAccount", account);
+        }
+        let request = crate::policy::Request { principal: Who::WebIdentity { provider }, action, resource: role, context: &context };
+        let caps = crate::policy::Caps { boundary: None, session: None };
+        crate::policy::trust_allows(std::iter::empty(), caps, trust, &request)
+    }
+
     /// The account the principal acts in; `None` if anonymous.
     fn account(&self) -> Option<&str> {
         self.user.as_ref().map(Who_::account)
@@ -457,6 +477,9 @@ fn context(
                 context.set("aws:TokenIssueTime", crate::sessions::iso(session.issued));
                 if let Some(source) = &session.source_identity {
                     context.set("aws:SourceIdentity", source);
+                }
+                if let Some(provider) = &session.provider {
+                    context.set("aws:FederatedProvider", provider);
                 }
                 context.set("aws:MultiFactorAuthPresent", "false");
             }

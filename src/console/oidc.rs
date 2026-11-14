@@ -17,36 +17,23 @@
 //! entered for a matching e-mail address. Providers' URLs must be HTTPS but
 //! on loopback (for trying it, and tests).
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
-
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
 use deadpool_postgres::Object;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::{Method, Request, body::Bytes, header};
-use hyper_rustls::HttpsConnector;
-use hyper_util::{client::legacy::{Client, connect::HttpConnector}, rt::TokioExecutor};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use ring::{digest, signature};
-use serde::Deserialize;
+use ring::digest;
 use serde_json::Value;
+use std::time::Duration;
 use uuid::Uuid;
 
 use super::store;
+use crate::oidc::{Discovery, Expect, Reach, Rejected};
 use crate::{db::Cached, users::Invalid};
 
 /// How long a sign-in at a provider may take.
 pub const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
-/// How long a provider's discovery document and keys are kept.
-const CACHE_TTL: Duration = Duration::from_secs(3600);
-/// How long a provider may take to answer.
-const TIMEOUT: Duration = Duration::from_secs(10);
-/// How far tokens' times may be off.
-const LEEWAY: u64 = 60;
-/// The most a provider's answer may hold.
-const MAX_ANSWER: usize = 1 << 20;
 
 /// A provider, as superadmins configure it.
 #[derive(Clone, Debug)]
@@ -59,98 +46,20 @@ pub struct Provider {
     pub scopes: String,
 }
 
-/// What a provider's discovery document says, of what Cairn uses.
-#[derive(Clone, Debug, Deserialize)]
-struct Discovery {
-    issuer: String,
-    authorization_endpoint: String,
-    token_endpoint: String,
-    jwks_uri: String,
-    #[serde(default)]
-    token_endpoint_auth_methods_supported: Vec<String>,
-}
-
-type Https = Client<HttpsConnector<HttpConnector>, Full<Bytes>>;
-
-/// The HTTP client, and what's cached of providers.
-struct Oidc {
-    client: Https,
-    discovery: Mutex<HashMap<String, (Instant, Discovery)>>,
-    keys: Mutex<HashMap<String, (Instant, Vec<Value>)>>,
-}
-
-fn oidc() -> &'static Oidc {
-    static OIDC: OnceLock<Oidc> = OnceLock::new();
-    OIDC.get_or_init(|| {
-        let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .expect("ring has TLS 1.2 and 1.3")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-        let connector = hyper_rustls::HttpsConnectorBuilder::new().with_tls_config(tls).https_or_http().enable_http1().build();
-        Oidc {
-            client: Client::builder(TokioExecutor::new()).build(connector),
-            discovery: Mutex::default(),
-            keys: Mutex::default(),
-        }
-    })
-}
-
 /// Whether `url` may be a provider's: HTTPS, or HTTP on loopback.
 pub fn check_url(url: &str) -> Result<(), Invalid> {
-    let uri: hyper::Uri = url.parse().map_err(|_| Invalid(format!("{url:?} isn't a URL")))?;
-    let host = uri.host().unwrap_or("");
-    let loopback = host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback()) || host == "[::1]";
-    match uri.scheme_str() {
-        Some("https") => Ok(()),
-        Some("http") if loopback => Ok(()),
-        _ => Err(Invalid(format!("{url:?} isn't an HTTPS URL"))),
-    }
+    crate::oidc::check_url(url, &Reach::operators()).map_err(|e| Invalid(e.0))
 }
 
-/// GETs `url`, as JSON.
-async fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> anyhow::Result<T> {
-    check_url(url)?;
-    let request = Request::builder().method(Method::GET).uri(url).header(header::ACCEPT, "application/json").body(Full::new(Bytes::new()))?;
-    let (status, body) = exchange(request).await?;
-    anyhow::ensure!(status.is_success(), "{url} answered {status}");
-    serde_json::from_slice(&body).with_context(|| format!("{url} didn't answer JSON as expected"))
-}
-
-async fn exchange(request: Request<Full<Bytes>>) -> anyhow::Result<(hyper::StatusCode, Bytes)> {
-    let call = async {
-        let response = oidc().client.request(request).await?;
-        let status = response.status();
-        let body = http_body_util::Limited::new(response.into_body(), MAX_ANSWER)
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("reading the answer: {e}"))?
-            .to_bytes();
-        anyhow::Ok((status, body))
-    };
-    tokio::time::timeout(TIMEOUT, call).await.context("the provider didn't answer in time")?
-}
-
-/// The provider's discovery document (cached).
+/// The provider's discovery document (cached), with the endpoints the
+/// console needs.
 async fn discovery(provider: &Provider) -> anyhow::Result<Discovery> {
-    let issuer = provider.issuer.trim_end_matches('/');
-    if let Some((at, found)) = oidc().discovery.lock().unwrap().get(issuer)
-        && at.elapsed() < CACHE_TTL
-    {
-        return Ok(found.clone());
-    }
-    let found: Discovery = get_json(&format!("{issuer}/.well-known/openid-configuration")).await?;
-    // OIDC Discovery §4.3: the document is the issuer's own.
+    let found = crate::oidc::discovery(&provider.issuer, &Reach::operators()).await?;
     anyhow::ensure!(
-        found.issuer.trim_end_matches('/') == issuer,
-        "the discovery document is of issuer {:?}, not {issuer:?}",
-        found.issuer
+        found.authorization_endpoint.is_some() && found.token_endpoint.is_some(),
+        "{} has no authorization or token endpoint",
+        provider.issuer
     );
-    for url in [&found.authorization_endpoint, &found.token_endpoint, &found.jwks_uri] {
-        check_url(url)?;
-    }
-    oidc().discovery.lock().unwrap().insert(issuer.to_owned(), (Instant::now(), found.clone()));
     Ok(found)
 }
 
@@ -158,26 +67,8 @@ async fn discovery(provider: &Provider) -> anyhow::Result<Discovery> {
 pub async fn check_provider(provider: &Provider) -> anyhow::Result<()> {
     check_url(&provider.issuer)?;
     let found = discovery(provider).await?;
-    keys(&found.jwks_uri, false).await?;
+    crate::oidc::keys(&found.jwks_uri, &Reach::operators(), false).await?;
     Ok(())
-}
-
-/// The provider's keys (JWKs), cached; `fresh`: fetched again, if they're
-/// older than a minute (a key it signs with now that Cairn hasn't seen).
-async fn keys(uri: &str, fresh: bool) -> anyhow::Result<Vec<Value>> {
-    if let Some((at, keys)) = oidc().keys.lock().unwrap().get(uri)
-        && at.elapsed() < CACHE_TTL
-        && !(fresh && at.elapsed() > Duration::from_secs(60))
-    {
-        return Ok(keys.clone());
-    }
-    #[derive(Deserialize)]
-    struct Jwks {
-        keys: Vec<Value>,
-    }
-    let found: Jwks = get_json(uri).await?;
-    oidc().keys.lock().unwrap().insert(uri.to_owned(), (Instant::now(), found.keys.clone()));
-    Ok(found.keys)
 }
 
 fn b64(bytes: &[u8]) -> String {
@@ -277,6 +168,7 @@ pub async fn start(
     carried: Carried<'_>,
 ) -> anyhow::Result<String> {
     let found = discovery(provider).await?;
+    let authorize = found.authorization_endpoint.as_deref().context("no authorization endpoint")?;
     let (state, nonce, verifier) = (random(32), random(32), random(48));
     let challenge = b64(digest::digest(&digest::SHA256, verifier.as_bytes()).as_ref());
     client
@@ -298,8 +190,8 @@ pub async fn start(
     let url = format!(
         "{}{}response_type=code&client_id={}&redirect_uri={}&scope={}&state={state}&nonce={nonce}\
          &code_challenge={challenge}&code_challenge_method=S256",
-        found.authorization_endpoint,
-        if found.authorization_endpoint.contains('?') { '&' } else { '?' },
+        authorize,
+        if authorize.contains('?') { '&' } else { '?' },
         encode(&provider.client_id),
         encode(redirect_uri),
         encode(&provider.scopes),
@@ -392,9 +284,10 @@ async fn redeem(
         encode(redirect_uri),
         encode(verifier)
     );
+    let token_endpoint = found.token_endpoint.as_deref().context("no token endpoint")?;
     let mut request = Request::builder()
         .method(Method::POST)
-        .uri(&found.token_endpoint)
+        .uri(token_endpoint)
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .header(header::ACCEPT, "application/json");
     // client_secret_basic, the default (OIDC Core §9), unless the provider
@@ -410,8 +303,7 @@ async fn redeem(
         }
         None => form.push_str(&format!("&client_id={}", encode(&provider.client_id))),
     }
-    check_url(&found.token_endpoint)?;
-    let (status, body) = exchange(request.body(Full::new(Bytes::from(form)))?).await?;
+    let (status, body) = crate::oidc::exchange(request.body(Full::new(Bytes::from(form)))?, &Reach::operators()).await?;
     let answer: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
     if !status.is_success() {
         let why = answer["error_description"].as_str().or(answer["error"].as_str()).unwrap_or("no reason given");
@@ -425,101 +317,19 @@ async fn redeem(
 
 /// Checks an ID token (OIDC Core §3.1.3.7): the claims, if it's valid.
 async fn verify(provider: &Provider, found: &Discovery, token: &str, nonce: &str) -> anyhow::Result<Result<serde_json::Map<String, Value>, Failed>> {
-    let parts: Vec<&str> = token.split('.').collect();
-    let [head, body, sig] = parts[..] else { return Ok(failed("the ID token isn't a JWT")) };
-    let decode = |part: &str| URL_SAFE_NO_PAD.decode(part.trim_end_matches('='));
-    let (Ok(head_bytes), Ok(body_bytes), Ok(sig)) = (decode(head), decode(body), decode(sig)) else {
-        return Ok(failed("the ID token isn't a JWT"));
-    };
-    let Ok(header) = serde_json::from_slice::<Value>(&head_bytes) else { return Ok(failed("the ID token's header isn't JSON")) };
-    let Ok(Value::Object(claims)) = serde_json::from_slice::<Value>(&body_bytes) else {
-        return Ok(failed("the ID token's claims aren't JSON"));
-    };
-    let alg = header["alg"].as_str().unwrap_or("");
-    let kid = header["kid"].as_str();
-    let signed = format!("{head}.{body}");
-    let mut verified = false;
-    for fresh in [false, true] {
-        let keys = keys(&found.jwks_uri, fresh).await?;
-        let candidates = keys.iter().filter(|k| kid.is_none_or(|kid| k["kid"].as_str() == Some(kid)));
-        if candidates.clone().any(|key| check_signature(alg, key, signed.as_bytes(), &sig)) {
-            verified = true;
-            break;
-        }
-        // A key it signs with that Cairn hasn't fetched yet, if any.
-        if kid.is_none() || keys.iter().any(|k| k["kid"].as_str() == kid) {
-            break;
-        }
-    }
-    if !verified {
-        return Ok(failed(format!("the ID token's signature ({alg}) isn't by {}'s keys", provider.label)));
-    }
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-    let number = |key: &str| claims.get(key).and_then(Value::as_u64);
-    if claims.get("iss").and_then(Value::as_str).map(|i| i.trim_end_matches('/')) != Some(found.issuer.trim_end_matches('/')) {
-        return Ok(failed("the ID token is another issuer's"));
-    }
-    let audiences: Vec<&str> = match claims.get("aud") {
-        Some(Value::String(one)) => vec![one],
-        Some(Value::Array(many)) => many.iter().filter_map(Value::as_str).collect(),
-        _ => Vec::new(),
-    };
-    if !audiences.contains(&provider.client_id.as_str()) {
-        return Ok(failed("the ID token is for another client"));
-    }
-    if audiences.len() > 1 && claims.get("azp").and_then(Value::as_str) != Some(provider.client_id.as_str()) {
-        return Ok(failed("the ID token was issued to another party"));
-    }
-    if number("exp").is_none_or(|exp| exp + LEEWAY < now) {
-        return Ok(failed("the ID token has expired"));
-    }
-    if number("nbf").is_some_and(|nbf| nbf > now + LEEWAY) || number("iat").is_some_and(|iat| iat > now + LEEWAY) {
-        return Ok(failed("the ID token isn't valid yet (is a clock off?)"));
-    }
-    if claims.get("nonce").and_then(Value::as_str) != Some(nonce) {
-        return Ok(failed("the ID token is for another sign-in"));
-    }
-    Ok(Ok(claims))
-}
-
-/// Whether `sig` is `key`'s (a JWK) signature of `message`, by `alg`.
-fn check_signature(alg: &str, key: &Value, message: &[u8], sig: &[u8]) -> bool {
-    let field = |name: &str| key[name].as_str().and_then(|v| URL_SAFE_NO_PAD.decode(v.trim_end_matches('=')).ok());
-    if key["alg"].as_str().is_some_and(|a| a != alg) || key["use"].as_str().is_some_and(|u| u != "sig") {
-        return false;
-    }
-    let rsa = |params: &'static signature::RsaParameters| match (field("n"), field("e")) {
-        (Some(n), Some(e)) if key["kty"] == "RSA" => {
-            signature::RsaPublicKeyComponents { n: &n, e: &e }.verify(params, message, sig).is_ok()
-        }
-        _ => false,
-    };
-    let ec = |crv: &str, alg: &'static signature::EcdsaVerificationAlgorithm| match (field("x"), field("y")) {
-        (Some(x), Some(y)) if key["kty"] == "EC" && key["crv"] == crv => {
-            let point = [&[4u8][..], &x, &y].concat();
-            signature::UnparsedPublicKey::new(alg, point).verify(message, sig).is_ok()
-        }
-        _ => false,
-    };
-    match alg {
-        "RS256" => rsa(&signature::RSA_PKCS1_2048_8192_SHA256),
-        "RS384" => rsa(&signature::RSA_PKCS1_2048_8192_SHA384),
-        "RS512" => rsa(&signature::RSA_PKCS1_2048_8192_SHA512),
-        "PS256" => rsa(&signature::RSA_PSS_2048_8192_SHA256),
-        "PS384" => rsa(&signature::RSA_PSS_2048_8192_SHA384),
-        "PS512" => rsa(&signature::RSA_PSS_2048_8192_SHA512),
-        "ES256" => ec("P-256", &signature::ECDSA_P256_SHA256_FIXED),
-        "ES384" => ec("P-384", &signature::ECDSA_P384_SHA384_FIXED),
-        "EdDSA" => match field("x") {
-            Some(x) if key["kty"] == "OKP" && key["crv"] == "Ed25519" => {
-                signature::UnparsedPublicKey::new(&signature::ED25519, x).verify(message, sig).is_ok()
-            }
-            _ => false,
-        },
-        // `none`, HMAC (a shared secret Cairn has no business checking), and
-        // anything else.
-        _ => false,
-    }
+    let audiences = [provider.client_id.clone()];
+    let expect = Expect { found, audiences: &audiences, nonce: Some(nonce), party: true };
+    Ok(match crate::oidc::verify(token, &Reach::operators(), &expect).await? {
+        Ok((jwt, _)) => Ok(jwt.claims),
+        Err(Rejected::Malformed(why)) => failed(format!("the ID token {why}")),
+        Err(Rejected::Signature(alg)) => failed(format!("the ID token's signature ({alg}) isn't by {}'s keys", provider.label)),
+        Err(Rejected::Issuer) => failed("the ID token is another issuer's"),
+        Err(Rejected::Audience) => failed("the ID token is for another client"),
+        Err(Rejected::Party) => failed("the ID token was issued to another party"),
+        Err(Rejected::Expired { .. }) => failed("the ID token has expired"),
+        Err(Rejected::NotYet) => failed("the ID token isn't valid yet (is a clock off?)"),
+        Err(Rejected::Nonce) => failed("the ID token is for another sign-in"),
+    })
 }
 
 // ─── Identities at providers ─────────────────────────────────────────────────
@@ -636,7 +446,7 @@ pub async fn set_provider(client: &Object, provider: &Provider) -> anyhow::Resul
             ],
         )
         .await?;
-    oidc().discovery.lock().unwrap().remove(provider.issuer.trim_end_matches('/'));
+    crate::oidc::forget(&provider.issuer);
     Ok(())
 }
 
@@ -714,132 +524,6 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: OidcArgs, out: &mut cra
     Ok(())
 }
 
-/// A provider for tests: discovery, keys, and a token endpoint that redeems
-/// the codes a test issues (checking PKCE and the client's secret), with ID
-/// tokens signed by an ES256 key.
+/// The mock provider tests sign in at (see `oidc::mock`).
 #[cfg(test)]
-pub mod mock {
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    use axum::{Json, Router, extract::State, http::HeaderMap, routing::{get, post}};
-    use base64::{Engine, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
-    use ring::rand::SystemRandom;
-    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
-    use serde_json::{Value, json};
-
-    /// What a code redeems to: the claims, and the PKCE challenge it must
-    /// come with.
-    pub struct Grant {
-        pub subject: String,
-        pub email: String,
-        pub nonce: String,
-        pub challenge: String,
-    }
-
-    pub struct Mock {
-        pub issuer: String,
-        key: EcdsaKeyPair,
-        grants: Mutex<HashMap<String, Grant>>,
-        /// Tamper with what's issued: another audience, or nonce.
-        pub audience: Mutex<String>,
-    }
-
-    pub const CLIENT_ID: &str = "cairn-console";
-    pub const CLIENT_SECRET: &str = "s3cret";
-
-    impl Mock {
-        /// Starts one on a loopback port.
-        pub async fn start() -> Arc<Mock> {
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let issuer = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-            let rng = SystemRandom::new();
-            let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-            let key = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng).unwrap();
-            let mock = Arc::new(Mock {
-                issuer,
-                key,
-                grants: Mutex::default(),
-                audience: Mutex::new(CLIENT_ID.to_owned()),
-            });
-            let app = Router::new()
-                .route("/.well-known/openid-configuration", get(discovery))
-                .route("/jwks", get(jwks))
-                .route("/token", post(token))
-                .with_state(mock.clone());
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            mock
-        }
-
-        /// A code for the sign-in that `authorize_url` (Cairn's redirect to
-        /// the provider) starts, as `subject`.
-        pub fn code_for(&self, authorize_url: &str, subject: &str, email: &str) -> (String, String) {
-            let query = authorize_url.split_once('?').unwrap().1;
-            let param = |name: &str| {
-                query.split('&').find_map(|p| p.strip_prefix(&format!("{name}="))).unwrap().to_owned()
-            };
-            assert_eq!(param("code_challenge_method"), "S256");
-            assert_eq!(param("client_id"), CLIENT_ID);
-            let code = format!("code-{}", uuid::Uuid::new_v4());
-            let grant = Grant {
-                subject: subject.to_owned(),
-                email: email.to_owned(),
-                nonce: param("nonce"),
-                challenge: param("code_challenge"),
-            };
-            self.grants.lock().unwrap().insert(code.clone(), grant);
-            (param("state"), code)
-        }
-    }
-
-    async fn discovery(State(mock): State<Arc<Mock>>) -> Json<Value> {
-        let i = &mock.issuer;
-        Json(json!({
-            "issuer": i,
-            "authorization_endpoint": format!("{i}/authorize"),
-            "token_endpoint": format!("{i}/token"),
-            "jwks_uri": format!("{i}/jwks"),
-            "token_endpoint_auth_methods_supported": ["client_secret_basic"],
-        }))
-    }
-
-    async fn jwks(State(mock): State<Arc<Mock>>) -> Json<Value> {
-        let point = mock.key.public_key().as_ref();
-        Json(json!({ "keys": [{
-            "kty": "EC", "crv": "P-256", "kid": "k1", "alg": "ES256", "use": "sig",
-            "x": URL_SAFE_NO_PAD.encode(&point[1..33]), "y": URL_SAFE_NO_PAD.encode(&point[33..]),
-        }]}))
-    }
-
-    async fn token(State(mock): State<Arc<Mock>>, headers: HeaderMap, body: String) -> (axum::http::StatusCode, Json<Value>) {
-        let bad = |why: &str| (axum::http::StatusCode::BAD_REQUEST, Json(json!({ "error": "invalid_grant", "error_description": why })));
-        let basic = format!("Basic {}", STANDARD.encode(format!("{CLIENT_ID}:{CLIENT_SECRET}")));
-        if headers.get("authorization").and_then(|v| v.to_str().ok()) != Some(basic.as_str()) {
-            return bad("the client didn't authenticate");
-        }
-        let form: HashMap<String, String> = body
-            .split('&')
-            .filter_map(|p| p.split_once('='))
-            .map(|(k, v)| (k.to_owned(), percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned()))
-            .collect();
-        let Some(grant) = mock.grants.lock().unwrap().remove(&form["code"]) else { return bad("unknown code") };
-        let challenge = URL_SAFE_NO_PAD.encode(ring::digest::digest(&ring::digest::SHA256, form["code_verifier"].as_bytes()));
-        if challenge != grant.challenge {
-            return bad("PKCE failed");
-        }
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
-        let header = URL_SAFE_NO_PAD.encode(json!({ "alg": "ES256", "kid": "k1", "typ": "JWT" }).to_string());
-        let claims = URL_SAFE_NO_PAD.encode(
-            json!({
-                "iss": mock.issuer, "sub": grant.subject, "aud": *mock.audience.lock().unwrap(),
-                "exp": now + 300, "iat": now, "nonce": grant.nonce,
-                "email": grant.email, "email_verified": true, "name": "Test Person",
-            })
-            .to_string(),
-        );
-        let signed = format!("{header}.{claims}");
-        let sig = mock.key.sign(&SystemRandom::new(), signed.as_bytes()).unwrap();
-        let id_token = format!("{signed}.{}", URL_SAFE_NO_PAD.encode(sig.as_ref()));
-        (axum::http::StatusCode::OK, Json(json!({ "access_token": "at", "token_type": "Bearer", "id_token": id_token })))
-    }
-}
+pub use crate::oidc::mock;

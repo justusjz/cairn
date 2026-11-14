@@ -80,6 +80,9 @@
 --   O(o)    An IAM role's row (`iam_roles`; see `roles`). Exclusive:
 --           setting an inline policy or tagging it (I10); deleting it
 --           (T49), which checks it has no policies left.
+--   D(d)    An IAM OIDC provider's row (`iam_oidc_providers`; see
+--           `iam_oidc`). Exclusive: adding a client ID, tagging it,
+--           setting its thumbprints (I10).
 --   M(m)    A managed policy's row. Exclusive: tagging it (I10); making,
 --           deleting a version, or setting its default (I13).
 --   L(l)    A console login's row (see `console`). Exclusive: giving it a
@@ -174,7 +177,10 @@
 --     tagging it holds M(m) exclusively, and counts in a later statement
 --     (T43). A role's inline policies hold at most 10240 characters
 --     together, and it has at most 50 tags: under O(o), counted in a later
---     statement (T47, T48). Likewise a console login
+--     statement (T47, T48). An IAM OIDC provider has at most 100 client
+--     IDs and 50 tags: under D(d), counted in a later statement (T50,
+--     T51); its thumbprints (at most five, checked before) are replaced
+--     under D(d) too (T52). Likewise a console login
 --     has at most 8 passkeys, as IAM's MFA devices, and at least one way in
 --     (a passkey, or an identity at an OIDC provider), but by being
 --     deleted, under L(l) (T30, T31, T35, T37); and at most one identity per
@@ -207,7 +213,7 @@
 -- There are none, by three rules, which every transaction follows:
 --
 -- A. All of a transaction's locks are taken up front, in one global order:
---    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, O, M, X (by
+--    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, O, D, M, X (by
 --    blob id), each stripe in one mode, each blob
 --    in its final mode (exclusive wins over shared). A transaction that waits
 --    for a lock therefore only ever waits for one that comes later in the
@@ -3025,5 +3031,86 @@ BEGIN
     END IF;
     DELETE FROM iam_roles WHERE id = p_role;
     RETURN 'deleted';
+END
+$$;
+
+-- T50: AddClientIDToOpenIDConnectProvider: adds `p_client` to the
+-- provider's client IDs, unless it would have more than `p_max` (I10).
+-- Takes D(d) exclusively, then counts in a later statement. Returns 'added'
+-- (also if it was there), 'no_such_provider' or 'too_many'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_add_oidc_client_id(p_provider uuid, p_client text, p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM iam_oidc_providers WHERE id = p_provider FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_provider';
+    END IF;
+    IF EXISTS (SELECT 1 FROM iam_oidc_provider_client_ids WHERE provider_id = p_provider AND client_id = p_client) THEN
+        RETURN 'added';
+    END IF;
+    IF (SELECT count(*) FROM iam_oidc_provider_client_ids WHERE provider_id = p_provider) >= p_max THEN
+        RETURN 'too_many';
+    END IF;
+    INSERT INTO iam_oidc_provider_client_ids (provider_id, client_id) VALUES (p_provider, p_client);
+    RETURN 'added';
+END
+$$;
+
+-- T51: TagOpenIDConnectProvider: as T42, for an OIDC provider, under D(d).
+-- Returns 'tagged', 'no_such_provider' or 'too_many'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_tag_oidc_provider(p_provider uuid, p_keys text[], p_values text[], p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM iam_oidc_providers WHERE id = p_provider FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_provider';
+    END IF;
+    IF (SELECT count(*) FROM iam_oidc_provider_tags
+        WHERE provider_id = p_provider AND lower(key) <> ALL (SELECT lower(k) FROM unnest(p_keys) k))
+       + cardinality(p_keys) > p_max THEN
+        RETURN 'too_many';
+    END IF;
+    DELETE FROM iam_oidc_provider_tags WHERE provider_id = p_provider AND lower(key) IN (SELECT lower(k) FROM unnest(p_keys) k);
+    INSERT INTO iam_oidc_provider_tags (provider_id, key, value) SELECT p_provider, k, v FROM unnest(p_keys, p_values) AS t(k, v);
+    RETURN 'tagged';
+END
+$$;
+
+-- T52: UpdateOpenIDConnectProviderThumbprint: replaces the provider's
+-- thumbprints (at most five, none twice: checked by the caller) with `p_thumbprints`,
+-- under D(d), so that two replacements don't mix. Returns 'set' or
+-- 'no_such_provider'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_oidc_thumbprints(p_provider uuid, p_thumbprints text[])
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM iam_oidc_providers WHERE id = p_provider FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_provider';
+    END IF;
+    DELETE FROM iam_oidc_provider_thumbprints WHERE provider_id = p_provider;
+    INSERT INTO iam_oidc_provider_thumbprints (provider_id, thumbprint)
+    SELECT p_provider, t FROM unnest(p_thumbprints) WITH ORDINALITY AS u(t, n) ORDER BY n;
+    RETURN 'set';
+END
+$$;
+
+-- T53: CreateOpenIDConnectProvider: makes the provider, with its client
+-- IDs, thumbprints and tags (each checked by the caller), all at once. A
+-- provider of the URL already there is the unique index's violation.
+-- Returns the new provider's ID.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_create_oidc_provider(
+    p_account text, p_url text, p_clients text[], p_thumbprints text[], p_keys text[], p_values text[])
+RETURNS uuid LANGUAGE plpgsql AS $$
+DECLARE
+    v_id uuid;
+BEGIN
+    INSERT INTO iam_oidc_providers (account_id, url) VALUES (p_account, p_url) RETURNING id INTO v_id;
+    INSERT INTO iam_oidc_provider_client_ids (provider_id, client_id)
+    SELECT v_id, c FROM unnest(p_clients) WITH ORDINALITY AS u(c, n) ORDER BY n;
+    INSERT INTO iam_oidc_provider_thumbprints (provider_id, thumbprint)
+    SELECT v_id, t FROM unnest(p_thumbprints) WITH ORDINALITY AS u(t, n) ORDER BY n;
+    INSERT INTO iam_oidc_provider_tags (provider_id, key, value)
+    SELECT v_id, k, v FROM unnest(p_keys, p_values) WITH ORDINALITY AS u(k, v, n) ORDER BY n;
+    RETURN v_id;
 END
 $$;

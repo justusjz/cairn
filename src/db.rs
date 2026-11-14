@@ -230,6 +230,7 @@ const MIGRATIONS: &[&str] = &[
     USERS_RENAMED,
     IAM_ROLES,
     SESSIONS,
+    IAM_OIDC_PROVIDERS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2358,6 +2359,60 @@ BEGIN
     RETURN NEW;
 END
 $$;
+"#;
+/// Migration 50: IAM's OpenID Connect providers (see `iam_oidc`,
+/// `plans/roles.md` step 5), which roles' trust policies name as
+/// `Federated` principals, for AssumeRoleWithWebIdentity. Not the console's
+/// sign-in providers (`oidc_providers`): those are operators' OAuth
+/// clients. A provider's URL is kept as its ARN has it: host and path,
+/// without `https://`. Changed as the lock protocol says (D(d)).
+const IAM_OIDC_PROVIDERS: &str = r#"
+CREATE TABLE iam_oidc_providers (
+    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id text NOT NULL REFERENCES accounts (id),
+    url        text NOT NULL CHECK (length(url) BETWEEN 1 AND 255 AND url !~ '^[a-z]+://'),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX iam_oidc_providers_url ON iam_oidc_providers (account_id, url);
+
+CREATE TABLE iam_oidc_provider_client_ids (
+    provider_id uuid NOT NULL REFERENCES iam_oidc_providers (id) ON DELETE CASCADE,
+    client_id   text NOT NULL CHECK (length(client_id) BETWEEN 1 AND 255),
+    seq         bigint GENERATED ALWAYS AS IDENTITY,
+    PRIMARY KEY (provider_id, client_id)
+);
+
+CREATE TABLE iam_oidc_provider_thumbprints (
+    provider_id uuid NOT NULL REFERENCES iam_oidc_providers (id) ON DELETE CASCADE,
+    thumbprint  text NOT NULL CHECK (thumbprint ~ '^[0-9A-Fa-f]{40}$'),
+    seq         bigint GENERATED ALWAYS AS IDENTITY,
+    PRIMARY KEY (provider_id, thumbprint)
+);
+
+CREATE TABLE iam_oidc_provider_tags (
+    provider_id uuid NOT NULL REFERENCES iam_oidc_providers (id) ON DELETE CASCADE,
+    key         text NOT NULL CHECK (length(key) BETWEEN 1 AND 128),
+    value       text NOT NULL CHECK (length(value) <= 256),
+    seq         bigint GENERATED ALWAYS AS IDENTITY
+);
+CREATE UNIQUE INDEX iam_oidc_provider_tags_key ON iam_oidc_provider_tags (provider_id, lower(key));
+
+CREATE TRIGGER iam_oidc_providers_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_oidc_providers
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_oidc_providers_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_oidc_providers
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER iam_oidc_provider_client_ids_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_oidc_provider_client_ids
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_oidc_provider_client_ids_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_oidc_provider_client_ids
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER iam_oidc_provider_thumbprints_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_oidc_provider_thumbprints
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_oidc_provider_thumbprints_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_oidc_provider_thumbprints
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER iam_oidc_provider_tags_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_oidc_provider_tags
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_oidc_provider_tags_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_oidc_provider_tags
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
 "#;
 #[cfg(test)]
 mod tests {

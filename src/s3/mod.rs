@@ -181,6 +181,10 @@ async fn handle_request(
         {
             return Ok(forbidden("AccessDenied", "request is not signed"));
         }
+        // STS's AssumeRoleWithWebIdentity, which is unsigned.
+        None if crate::iam::wants_unsigned(&req) => {
+            return Ok(box_response(crate::iam::handle_unsigned(&app, req, peer).await));
+        }
         None => None,
     };
     let account = crate::users::account(&app.pool.get().await?).await?;

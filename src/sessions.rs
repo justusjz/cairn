@@ -86,6 +86,10 @@ pub struct Session {
     /// Whether a role's session assumed it (role chaining).
     #[serde(rename = "c", default, skip_serializing_if = "std::ops::Not::not")]
     pub chained: bool,
+    /// The OIDC provider (its ARN) of the web identity that assumed it
+    /// (AssumeRoleWithWebIdentity), passed on to roles it assumes.
+    #[serde(rename = "f", default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
 }
 
 /// Why a token isn't one.

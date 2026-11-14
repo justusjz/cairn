@@ -99,6 +99,9 @@ pub enum Principal<'a> {
     Session { account: &'a str, role: &'a str, id: &'a str, session: &'a str },
     /// A federated user (GetFederationToken's), by its name.
     Federated { account: &'a str, name: &'a str },
+    /// A web identity (AssumeRoleWithWebIdentity's caller), by its OIDC
+    /// provider's ARN (`arn:aws:iam::<account>:oidc-provider/<url>`).
+    WebIdentity { provider: &'a str },
 }
 
 /// How a statement is about a principal.
@@ -383,6 +386,9 @@ struct Principals {
     /// Role sessions, by their account, role name and session name
     /// (`arn:aws:sts::<account>:assumed-role/<role>/<session>`).
     sessions: Vec<(String, String, String)>,
+    /// Identity providers (`Federated`), by their ARNs: web identities of
+    /// an OIDC provider of the account.
+    federated: Vec<String>,
 }
 
 impl Principals {
@@ -412,6 +418,15 @@ impl Principals {
                 true => direct(!self.everyone),
                 false => direct(self.everyone || (whole(account) && (!allow || cross))),
             },
+            // Only a statement naming its provider lets a web identity in;
+            // everyone (`*`) only denies it. (Probe: whether `*` allows.)
+            Principal::WebIdentity { provider } => {
+                let named = self.federated.iter().any(|f| f == provider);
+                match self.not {
+                    true => direct(!(self.everyone || named)),
+                    false => direct(named || (self.everyone && !allow)),
+                }
+            }
             Principal::User { account, id, .. } => {
                 // By its ID: the user the ARN named when the policy was
                 // set, renamed or moved since or not (probed), and not one
@@ -941,7 +956,15 @@ fn parse_principals(
         false => Invalid::malformed("Invalid principal in policy"),
     };
     let mut principals =
-        Principals { not, everyone: false, users: Vec::new(), accounts: Vec::new(), roles: Vec::new(), sessions: Vec::new() };
+        Principals {
+        not,
+        everyone: false,
+        users: Vec::new(),
+        accounts: Vec::new(),
+        roles: Vec::new(),
+        sessions: Vec::new(),
+        federated: Vec::new(),
+    };
     let entries = match value {
         Json::String(s) if s == "*" => {
             principals.everyone = true;
@@ -1010,11 +1033,15 @@ fn parse_principals(
                     ids.sort();
                 }
             }
-            // AWS services and identity providers never call Cairn: they're
-            // named, and never match.
+            // AWS services never call Cairn: they're named, and never
+            // match. Identity providers are: an OIDC provider's web
+            // identities (AssumeRoleWithWebIdentity), by its ARN.
             "Service" | "Federated" => {
                 if let Some(id) = ids.iter().find(|id| id.is_empty() || id.contains('*')) {
                     return Err(invalid_one(kind, id));
+                }
+                if kind == "Federated" {
+                    principals.federated.extend(ids.iter().cloned());
                 }
             }
             // There are no canonical user IDs in Cairn.

@@ -399,12 +399,13 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     // Sessions' (temporary credentials': see `sessions`).
     ("aws:sourceidentity", Support::Evaluated),
     ("aws:tokenissuetime", Support::Evaluated),
+    // A web identity's session's OIDC provider (its ARN).
+    ("aws:federatedprovider", Support::Evaluated),
     ("aws:calledvia", Support::Absent),
     ("aws:calledviafirst", Support::Absent),
     ("aws:calledvialast", Support::Absent),
     ("aws:ec2instancesourceprivateipv4", Support::Absent),
     ("aws:ec2instancesourcevpc", Support::Absent),
-    ("aws:federatedprovider", Support::Absent),
     ("aws:principalorgid", Support::Absent),
     ("aws:principalorgpaths", Support::Absent),
     ("aws:principalservicename", Support::Absent),

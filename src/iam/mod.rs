@@ -20,8 +20,11 @@
 //! the default; and roles (see `roles`, `plans/roles.md`). Groups aren't
 //! (NotImplemented).
 
+mod oidc;
 mod roles;
 mod sts;
+#[cfg(test)]
+mod web_identity_tests;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -168,6 +171,69 @@ pub async fn handle(app: &Arc<App>, req: Request<crate::listen::ClientBody>, sig
     let sts = signed.service == "sts";
     let request_id = uuid::Uuid::new_v4().to_string();
     let result = respond(app, req, &signed, peer, &request_id).await;
+    answer(sts, &request_id, result)
+}
+
+/// Whether an unsigned request is STS's: a form posted to `/`, or a GET of
+/// `/` naming an `Action`, as AssumeRoleWithWebIdentity is sent (the
+/// token is its authentication). S3 has neither: its forms (POST Object)
+/// are multipart, and its GET of `/` (ListBuckets) takes no `Action`.
+pub fn wants_unsigned<B>(req: &Request<B>) -> bool {
+    if req.uri().path() != "/" {
+        return false;
+    }
+    let query = req.uri().query().unwrap_or("");
+    match *req.method() {
+        hyper::Method::POST => {
+            query.is_empty()
+                && req
+                    .headers()
+                    .get(hyper::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|t| t.to_ascii_lowercase().starts_with("application/x-www-form-urlencoded"))
+        }
+        hyper::Method::GET => query.split('&').any(|p| p.starts_with("Action=")),
+        _ => false,
+    }
+}
+
+/// An unsigned STS request (see `wants_unsigned`): AssumeRoleWithWebIdentity,
+/// or else refused as STS refuses a request without credentials.
+pub async fn handle_unsigned(app: &Arc<App>, req: Request<crate::listen::ClientBody>, peer: IpAddr) -> Response<Full<Bytes>> {
+    let request_id = uuid::Uuid::new_v4().to_string();
+    let result = respond_unsigned(app, req, peer).await;
+    answer(true, &request_id, result)
+}
+
+async fn respond_unsigned(app: &Arc<App>, req: Request<crate::listen::ClientBody>, peer: IpAddr) -> Result<Answer> {
+    let (parts, body) = req.into_parts();
+    let body = Limited::new(body, MAX_BODY)
+        .collect()
+        .await
+        .map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body is too large, or broken"))?
+        .to_bytes();
+    let mut params = HashMap::new();
+    Params::parse(parts.uri.query().unwrap_or(""), &mut params)?;
+    if !body.is_empty() {
+        let text = std::str::from_utf8(&body).map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body isn't UTF-8"))?;
+        Params::parse(text, &mut params)?;
+    }
+    let params = Params(params);
+    let action = params.required("Action")?.to_owned();
+    if action != "AssumeRoleWithWebIdentity" {
+        return Err(error(StatusCode::FORBIDDEN, "MissingAuthenticationToken", "Request is missing Authentication Token"));
+    }
+    let client = app.pool.get().await?;
+    let account = users::account(&client).await?;
+    let origin = Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: None, form: false };
+    let access = Access::new(None, &account, &parts.method, &parts.headers, "", &origin)?;
+    let sts = sts::Sts { app, client: &client, account: &account };
+    let inner = sts.assume_role_with_web_identity(&access, &params).await?;
+    Ok((action, inner))
+}
+
+/// A request's answer, as IAM (or, `sts`, STS) writes it.
+fn answer(sts: bool, request_id: &str, result: Result<Answer>) -> Response<Full<Bytes>> {
     let xmlns = if sts { STS_XMLNS } else { IAM_XMLNS };
     let (status, body) = match result {
         Ok((action, inner)) => {
@@ -196,7 +262,7 @@ pub async fn handle(app: &Arc<App>, req: Request<crate::listen::ClientBody>, sig
     Response::builder()
         .status(status)
         .header("content-type", "text/xml")
-        .header("x-amzn-requestid", &request_id)
+        .header("x-amzn-requestid", request_id)
         .body(Full::new(Bytes::from(body)))
         .unwrap()
 }
@@ -310,11 +376,21 @@ async fn respond(
         (_, "AttachRolePolicy") => iam.attach_role_policy(&params, true).await?,
         (_, "DetachRolePolicy") => iam.attach_role_policy(&params, false).await?,
         (_, "ListAttachedRolePolicies") => iam.list_attached_role_policies(&params).await?,
+        (_, "CreateOpenIDConnectProvider") => iam.create_open_id_connect_provider(&params).await?,
+        (_, "GetOpenIDConnectProvider") => iam.get_open_id_connect_provider(&params).await?,
+        (_, "ListOpenIDConnectProviders") => iam.list_open_id_connect_providers().await?,
+        (_, "DeleteOpenIDConnectProvider") => iam.delete_open_id_connect_provider(&params).await?,
+        (_, "AddClientIDToOpenIDConnectProvider") => iam.add_client_id_to_open_id_connect_provider(&params).await?,
+        (_, "RemoveClientIDFromOpenIDConnectProvider") => iam.remove_client_id_from_open_id_connect_provider(&params).await?,
+        (_, "UpdateOpenIDConnectProviderThumbprint") => iam.update_open_id_connect_provider_thumbprint(&params).await?,
+        (_, "TagOpenIDConnectProvider") => iam.tag_open_id_connect_provider(&params).await?,
+        (_, "UntagOpenIDConnectProvider") => iam.untag_open_id_connect_provider(&params).await?,
+        (_, "ListOpenIDConnectProviderTags") => iam.list_open_id_connect_provider_tags(&params).await?,
         (_, other) => {
             return Err(error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                format!("Cairn's IAM has users and roles (with paths, tags and permissions boundaries), access keys, inline and managed policies; not {other}"),
+                format!("Cairn's IAM has users and roles (with paths, tags and permissions boundaries), access keys, inline and managed policies, and OpenID Connect providers; not {other}"),
             ));
         }
     };

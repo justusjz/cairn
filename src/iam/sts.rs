@@ -7,7 +7,10 @@ use hyper::StatusCode;
 use super::{Error, Iam, Params, Result, error, request_keys_named, validation};
 use crate::{
     db::Cached,
+    iam_oidc::{self, Provider},
     managed,
+    oidc::Rejected,
+    s3::access::Access,
     policy::{Context, Kind, Policy},
     roles::{self, Role},
     s3::{actions::On, util::xml_escape},
@@ -93,7 +96,15 @@ struct SessionPolicies {
     arns: Vec<String>,
 }
 
-impl Iam<'_> {
+/// What issuing sessions needs: the node, a database connection, and the
+/// account (an Iam's, or a web identity's role's).
+pub(super) struct Sts<'a> {
+    pub app: &'a std::sync::Arc<crate::App>,
+    pub client: &'a deadpool_postgres::Object,
+    pub account: &'a str,
+}
+
+impl Sts<'_> {
     /// The session policies a request asks for (`Policy`, `PolicyArns`).
     async fn session_policies(&self, params: &Params, checks: &mut Checks) -> Result<SessionPolicies> {
         let policy = params.get("Policy").map(str::to_owned);
@@ -125,7 +136,7 @@ impl Iam<'_> {
             None => None,
         };
         for arn in &asked.arns {
-            if managed::document(self.client, self.account(), arn).await?.is_none() {
+            if managed::document(self.client, self.account, arn).await?.is_none() {
                 return Err(validation(
                     "At least one Policy ARN in the PolicyArns parameter does not match an existing IAM Managed Policy ARN.",
                 ));
@@ -170,7 +181,14 @@ impl Iam<'_> {
             transitive: Vec::new(),
             source_identity: None,
             chained: false,
+            provider: None,
         })
+    }
+}
+
+impl Iam<'_> {
+    fn sts(&self) -> Sts<'_> {
+        Sts { app: self.app, client: self.client, account: self.account() }
     }
 
     pub(super) fn get_caller_identity(&self) -> Option<String> {
@@ -200,7 +218,7 @@ impl Iam<'_> {
             checks.pattern(source, "sourceIdentity", "+=,.@-", "[\\w+=,.@-]*");
         }
         let seconds = duration(params, &mut checks, roles::SESSION_DURATIONS.end().to_owned() as i64)?;
-        let asked = self.session_policies(params, &mut checks).await?;
+        let asked = self.sts().session_policies(params, &mut checks).await?;
         let tags = session_tags(params, &mut checks)?;
         let transitive = request_keys_named(params, "TransitiveTagKeys");
         checks.done()?;
@@ -288,15 +306,17 @@ impl Iam<'_> {
         if seconds > role.max_session_duration as i64 {
             return Err(validation("The requested DurationSeconds exceeds the MaxSessionDuration set for this role."));
         }
-        let policies = self.checked_session_policies(asked).await?;
-        let mut session = self.session(Who::Role { id: role.id, session: name.clone() }, seconds)?;
+        let policies = self.sts().checked_session_policies(asked).await?;
+        let mut session = self.sts().session(Who::Role { id: role.id, session: name.clone() }, seconds)?;
         session.policy = policies.policy;
         session.policy_arns = policies.arns;
         session.tags = tags;
         session.transitive = transitive;
         session.source_identity = source;
         session.chained = chained;
-        let (mut xml, size) = self.issue(&session).await?;
+        // A web identity's provider passes on down a chain.
+        session.provider = caller.filter(|_| chained).and_then(|c| c.provider.clone());
+        let (mut xml, size) = self.sts().issue(&session).await?;
         xml.push_str(&format!(
             "<AssumedRoleUser><AssumedRoleId>{}:{}</AssumedRoleId><Arn>arn:aws:sts::{}:assumed-role/{}/{}</Arn></AssumedRoleUser>",
             roles::unique_id(role.id),
@@ -322,8 +342,8 @@ impl Iam<'_> {
         if params.get("SerialNumber").is_some() || params.get("TokenCode").is_some() {
             return Err(mfa_refused());
         }
-        let session = self.session(Who::User { id: self.principal.id }, seconds.unwrap_or(DEFAULT_LONG))?;
-        let (credentials, size) = self.issue(&session).await?;
+        let session = self.sts().session(Who::User { id: self.principal.id }, seconds.unwrap_or(DEFAULT_LONG))?;
+        let (credentials, size) = self.sts().issue(&session).await?;
         Ok(Some(credentials + &size))
     }
 
@@ -333,7 +353,7 @@ impl Iam<'_> {
         checks.length(&name, "name", 2, 32);
         checks.pattern(&name, "name", "+=,.@-", "[\\w+=,.@-]*");
         let seconds = duration(params, &mut checks, MAX_DURATION)?;
-        let asked = self.session_policies(params, &mut checks).await?;
+        let asked = self.sts().session_policies(params, &mut checks).await?;
         let tags = session_tags(params, &mut checks)?;
         checks.done()?;
         check_tags(&tags, &[])?;
@@ -355,12 +375,12 @@ impl Iam<'_> {
         if self.principal.session.is_some() {
             return Err(refused());
         }
-        let policies = self.checked_session_policies(asked).await?;
-        let mut session = self.session(Who::Federated { id: self.principal.id, name: name.clone() }, seconds.unwrap_or(DEFAULT_LONG))?;
+        let policies = self.sts().checked_session_policies(asked).await?;
+        let mut session = self.sts().session(Who::Federated { id: self.principal.id, name: name.clone() }, seconds.unwrap_or(DEFAULT_LONG))?;
         session.policy = policies.policy;
         session.policy_arns = policies.arns;
         session.tags = tags;
-        let (mut xml, size) = self.issue(&session).await?;
+        let (mut xml, size) = self.sts().issue(&session).await?;
         xml.push_str(&format!(
             "<FederatedUser><FederatedUserId>{}:{}</FederatedUserId><Arn>{}</Arn></FederatedUser>",
             self.account(),
@@ -397,6 +417,200 @@ impl Iam<'_> {
             return Err(validation("Access key ID is not valid."));
         }
         Ok(Some(format!("<Account>{}</Account>", self.account())))
+    }
+}
+
+/// A web identity token's error, as STS's (`InvalidIdentityToken`).
+fn invalid_identity(message: impl Into<String>) -> Error {
+    error(StatusCode::BAD_REQUEST, "InvalidIdentityToken", message)
+}
+
+/// The session tags and transitive keys a web identity token carries
+/// (`https://aws.amazon.com/tags`: `principal_tags`, each a list of one
+/// value, and `transitive_tag_keys`), as AWS reads them.
+fn token_tags(claims: &crate::oidc::Claims) -> Result<(Vec<(String, String)>, Vec<String>)> {
+    let Some(value) = claims.get("https://aws.amazon.com/tags") else { return Ok((Vec::new(), Vec::new())) };
+    let bad = || invalid_identity("The token's session tags (https://aws.amazon.com/tags) aren't valid.");
+    let mut tags = Vec::new();
+    if let Some(principal) = value.get("principal_tags") {
+        let principal = principal.as_object().ok_or_else(bad)?;
+        for (key, values) in principal {
+            let value = match values {
+                serde_json::Value::Array(values) if values.len() == 1 => values[0].as_str().ok_or_else(bad)?,
+                serde_json::Value::String(value) => value.as_str(),
+                _ => return Err(bad()),
+            };
+            tags.push((key.clone(), value.to_owned()));
+        }
+    }
+    let transitive = match value.get("transitive_tag_keys") {
+        Some(serde_json::Value::Array(keys)) => keys.iter().map(|k| k.as_str().map(str::to_owned).ok_or_else(bad)).collect::<Result<_>>()?,
+        Some(_) => return Err(bad()),
+        None => Vec::new(),
+    };
+    Ok((tags, transitive))
+}
+
+impl Sts<'_> {
+    /// AssumeRoleWithWebIdentity: unsigned, the token (an OIDC provider's ID
+    /// token) its authentication. The token's issuer must be one of the
+    /// account's providers (matched before anything is fetched, so the
+    /// caller never picks what Cairn fetches), its signature by the
+    /// issuer's keys, its audience one of the provider's client IDs; then
+    /// the role's trust policy must let the provider's web identities in,
+    /// with the token's claims as condition keys (`<url>:sub`, `:aud`,
+    /// `:amr`).
+    pub(super) async fn assume_role_with_web_identity(&self, access: &Access, params: &Params) -> Result<Option<String>> {
+        let mut checks = Checks(Vec::new());
+        let arn = params.required("RoleArn")?.to_owned();
+        checks.length(&arn, "roleArn", 20, 2048);
+        let name = params.required("RoleSessionName")?.to_owned();
+        checks.length(&name, "roleSessionName", 2, 64);
+        checks.pattern(&name, "roleSessionName", "+=,.@-", "[\\w+=,.@-]*");
+        let token = params.required("WebIdentityToken")?.to_owned();
+        if token.chars().count() < 4 {
+            checks.0.push("Value at 'webIdentityToken' failed to satisfy constraint: Member must have length greater than or equal to 4".into());
+        } else if token.chars().count() > 20000 {
+            checks.0.push("Value at 'webIdentityToken' failed to satisfy constraint: Member must have length less than or equal to 20000".into());
+        }
+        let seconds = duration(params, &mut checks, roles::SESSION_DURATIONS.end().to_owned() as i64)?;
+        let asked = self.session_policies(params, &mut checks).await?;
+        checks.done()?;
+        if params.get("ProviderId").is_some() {
+            return Err(invalid_parameter("Cairn takes OpenID Connect ID tokens only, not OAuth 2.0 access tokens (ProviderId)."));
+        }
+        // The provider, by the token's issuer.
+        let jwt = crate::oidc::Jwt::parse(&token)
+            .map_err(|_| invalid_identity("The ID token provided is not a valid JWT. (You may see this error if you sent an Access Token)"))?;
+        let issuer = jwt.text("iss").unwrap_or("").to_owned();
+        let url = issuer.strip_prefix("https://").map(|u| u.trim_end_matches('/'));
+        let provider = match url {
+            Some(url) if !url.is_empty() => Provider::load(self.client, self.account, url).await?,
+            _ => None,
+        };
+        let Some(provider) = provider else {
+            return Err(invalid_identity(format!("No OpenIDConnect provider found in your account for {issuer}")));
+        };
+        let reach = provider.reach(iam_oidc::private_allowed(self.client).await?);
+        let unreachable = |e: anyhow::Error| {
+            error(
+                StatusCode::BAD_REQUEST,
+                "IDPCommunicationError",
+                format!("Couldn't retrieve verification key from your identity provider, please reference AssumeRoleWithWebIdentity documentation for requirements ({e:#})"),
+            )
+        };
+        let found = crate::oidc::discovery(&provider.issuer(), &reach).await.map_err(unreachable)?;
+        let expect = crate::oidc::Expect { found: &found, audiences: &provider.client_ids, nonce: None, party: false };
+        let (jwt, audience) = match crate::oidc::verify(&token, &reach, &expect).await.map_err(unreachable)? {
+            Ok(verified) => verified,
+            Err(Rejected::Expired { exp, now }) => {
+                return Err(error(
+                    StatusCode::BAD_REQUEST,
+                    "ExpiredTokenException",
+                    format!("Token expired: current date/time {now} must be before the expiration date/time{exp}"),
+                ));
+            }
+            Err(Rejected::Audience) => return Err(invalid_identity("Incorrect token audience")),
+            Err(Rejected::Signature(_)) => return Err(invalid_identity("The token's signature isn't the identity provider's.")),
+            Err(Rejected::Issuer) => return Err(invalid_identity("Issuer mismatch")),
+            Err(Rejected::NotYet) => return Err(invalid_identity("The token isn't valid yet.")),
+            Err(Rejected::Malformed(_) | Rejected::Party | Rejected::Nonce) => {
+                return Err(invalid_identity("The ID token provided is not a valid JWT. (You may see this error if you sent an Access Token)"));
+            }
+        };
+        let Some(subject) = jwt.text("sub").filter(|s| !s.is_empty()).map(str::to_owned) else {
+            return Err(invalid_identity("The token has no subject (sub)."));
+        };
+        let (tags, transitive) = token_tags(&jwt.claims)?;
+        check_tags(&tags, &transitive)?;
+        let source = match jwt.claims.get("https://aws.amazon.com/source_identity") {
+            Some(value) => {
+                let source = value.as_str().unwrap_or("").to_owned();
+                let mut checks = Checks(Vec::new());
+                checks.length(&source, "sourceIdentity", 2, 64);
+                checks.pattern(&source, "sourceIdentity", "+=,.@-", "[\\w+=,.@-]*");
+                checks.done()?;
+                Some(source)
+            }
+            None => None,
+        };
+        // The role, by its whole ARN; one that isn't there is refused as one
+        // that may not be assumed.
+        let denied = || error(StatusCode::FORBIDDEN, "AccessDenied", "Not authorized to perform sts:AssumeRoleWithWebIdentity");
+        let role = match role_of_arn(&arn, self.account) {
+            Some((path, role_name)) => Role::load(self.client, self.account, role_name)
+                .await?
+                .filter(|r| r.path == path && r.name == role_name),
+            None => None,
+        };
+        let Some(role) = role else { return Err(denied()) };
+        let trust = Policy::parse(&role.trust, Kind::Trust)
+            .map_err(|e| anyhow::anyhow!("role {}'s trust policy doesn't parse: {}", role.name, e.message))?
+            .with_ids(role.trust_principals.clone());
+        let provider_arn = provider.arn();
+        let mut context = Context::default();
+        context.set("sts:RoleSessionName", &name);
+        context.set("aws:FederatedProvider", &provider_arn);
+        context.set(&format!("{}:sub", provider.url), &subject);
+        context.set(&format!("{}:aud", provider.url), &audience);
+        match jwt.claims.get("amr") {
+            Some(serde_json::Value::Array(amr)) => {
+                context.set_all(&format!("{}:amr", provider.url), amr.iter().filter_map(|a| a.as_str().map(str::to_owned)).collect());
+            }
+            Some(serde_json::Value::String(amr)) => context.set(&format!("{}:amr", provider.url), amr),
+            _ => {}
+        }
+        if let Some(source) = &source {
+            context.set("sts:SourceIdentity", source);
+        }
+        for (key, value) in &tags {
+            context.set(&format!("aws:RequestTag/{key}"), value);
+        }
+        if !tags.is_empty() {
+            context.set_all("aws:TagKeys", tags.iter().map(|(k, _)| k.clone()).collect());
+        }
+        if !transitive.is_empty() {
+            context.set_all("sts:TransitiveTagKeys", transitive.clone());
+        }
+        let role_arn = role.arn();
+        let trusted = |action: &str| access.web_identity_trusted(&provider_arn, action, &role_arn, &trust, &context);
+        if !trusted("sts:AssumeRoleWithWebIdentity") {
+            return Err(denied());
+        }
+        if !tags.is_empty() && !trusted("sts:TagSession") {
+            return Err(error(StatusCode::FORBIDDEN, "AccessDenied", "Not authorized to perform sts:TagSession"));
+        }
+        if source.is_some() && !trusted("sts:SetSourceIdentity") {
+            return Err(error(StatusCode::FORBIDDEN, "AccessDenied", "Not authorized to perform sts:SetSourceIdentity"));
+        }
+        let seconds = seconds.unwrap_or(ROLE_DEFAULT.min(role.max_session_duration as i64));
+        if seconds > role.max_session_duration as i64 {
+            return Err(validation("The requested DurationSeconds exceeds the MaxSessionDuration set for this role."));
+        }
+        let policies = self.checked_session_policies(asked).await?;
+        let mut session = self.session(Who::Role { id: role.id, session: name.clone() }, seconds)?;
+        session.policy = policies.policy;
+        session.policy_arns = policies.arns;
+        session.tags = tags;
+        session.transitive = transitive;
+        session.source_identity = source;
+        session.provider = Some(provider_arn);
+        let (mut xml, size) = self.issue(&session).await?;
+        xml.push_str(&format!("<SubjectFromWebIdentityToken>{}</SubjectFromWebIdentityToken>", xml_escape(&subject)));
+        xml.push_str(&format!(
+            "<AssumedRoleUser><AssumedRoleId>{}:{}</AssumedRoleId><Arn>arn:aws:sts::{}:assumed-role/{}/{}</Arn></AssumedRoleUser>",
+            roles::unique_id(role.id),
+            xml_escape(&name),
+            role.account,
+            xml_escape(&role.name),
+            xml_escape(&name)
+        ));
+        xml.push_str(&packed(&size));
+        xml.push_str(&format!("<Provider>{}</Provider><Audience>{}</Audience>", xml_escape(&issuer), xml_escape(&audience)));
+        if let Some(source) = &session.source_identity {
+            xml.push_str(&format!("<SourceIdentity>{}</SourceIdentity>", xml_escape(source)));
+        }
+        Ok(Some(xml))
     }
 }
 

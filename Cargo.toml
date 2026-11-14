@@ -45,6 +45,10 @@ futures-core = "0.3.34"
 reed-solomon-simd = "3.1"
 tower = { version = "0.5", features = ["util"] }
 
+[dev-dependencies]
+# The mock OIDC issuer's HTTPS (`oidc::mock`); hyper-rustls's already.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+
 # The erasure code's arithmetic is slow unoptimized, which tests of coded
 # blobs feel.
 [profile.dev.package.reed-solomon-simd]
