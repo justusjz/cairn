@@ -117,8 +117,8 @@ pub const BOUNDARY_ARN: &str = "(SELECT coalesce(
         'arn:aws:iam::aws:policy/' || r.boundary_aws))";
 
 /// The SQL of a user `r`'s tags: keys, then values, newest first.
-pub const TAG_KEYS: &str = "ARRAY(SELECT t.key FROM role_tags t WHERE t.role_id = r.id ORDER BY t.seq DESC)";
-pub const TAG_VALUES: &str = "ARRAY(SELECT t.value FROM role_tags t WHERE t.role_id = r.id ORDER BY t.seq DESC)";
+pub const TAG_KEYS: &str = "ARRAY(SELECT t.key FROM user_tags t WHERE t.user_id = r.id ORDER BY t.seq DESC)";
+pub const TAG_VALUES: &str = "ARRAY(SELECT t.value FROM user_tags t WHERE t.user_id = r.id ORDER BY t.seq DESC)";
 
 /// Tags as two lists (keys, values), paired.
 pub fn tags_of(keys: Vec<String>, values: Vec<String>) -> Vec<(String, String)> {
@@ -134,14 +134,14 @@ impl Principal {
     /// Loads the user whose active access key `access_key` is, or `None` if
     /// there's none.
     pub async fn load(client: &Object, access_key: &str) -> anyhow::Result<Option<Self>> {
-        Self::load_where(client, "FROM access_keys k JOIN roles r ON r.id = k.role_id
+        Self::load_where(client, "FROM access_keys k JOIN users r ON r.id = k.user_id
              WHERE k.access_key_id = $1 AND k.active", "k.secret", &access_key).await
     }
 
     /// Loads user `id` itself, as the console acts as it (no secret: it
     /// signs nothing), or `None` if there's none.
     pub async fn load_user(client: &Object, id: uuid::Uuid) -> anyhow::Result<Option<Self>> {
-        Self::load_where(client, "FROM roles r WHERE r.id = $1", "''::text", &id).await
+        Self::load_where(client, "FROM users r WHERE r.id = $1", "''::text", &id).await
     }
 
     async fn load_where(
@@ -153,12 +153,12 @@ impl Principal {
         let row = client
             .query_opt_cached(
                 &format!("SELECT {secret}, r.admin, r.id, r.name, r.account_id,
-                        ARRAY(SELECT document FROM role_policies
-                              WHERE role_id = r.id AND name NOT LIKE 'cairn:%' ORDER BY name),
-                        ARRAY(SELECT m.document FROM role_attached_policies x
-                              JOIN managed_policies m ON m.id = x.policy_id WHERE x.role_id = r.id ORDER BY m.name),
-                        ARRAY(SELECT x.aws_policy FROM role_attached_policies x
-                              WHERE x.role_id = r.id AND x.aws_policy IS NOT NULL ORDER BY x.aws_policy),
+                        ARRAY(SELECT document FROM user_policies
+                              WHERE user_id = r.id AND name NOT LIKE 'cairn:%' ORDER BY name),
+                        ARRAY(SELECT m.document FROM user_attached_policies x
+                              JOIN managed_policies m ON m.id = x.policy_id WHERE x.user_id = r.id ORDER BY m.name),
+                        ARRAY(SELECT x.aws_policy FROM user_attached_policies x
+                              WHERE x.user_id = r.id AND x.aws_policy IS NOT NULL ORDER BY x.aws_policy),
                         r.path, {TAG_KEYS}, {TAG_VALUES}, {BOUNDARY_ARN},
                         (SELECT m.document FROM managed_policies m WHERE m.id = r.boundary_policy_id),
                         r.boundary_aws
@@ -586,7 +586,7 @@ pub async fn create_user(
     let (own, aws) = BoundaryRef::columns(boundary);
     let inserted = client
         .execute_cached(
-            "INSERT INTO roles (name, secret, admin, account_id, path, boundary_policy_id, boundary_aws)
+            "INSERT INTO users (name, secret, admin, account_id, path, boundary_policy_id, boundary_aws)
              SELECT $1, 'unusable:' || gen_random_uuid() || gen_random_uuid(), false, a.id, $3, $4, $5
              FROM accounts a WHERE a.id = $2
              ON CONFLICT DO NOTHING",
@@ -626,7 +626,7 @@ pub async fn set_boundary(client: &Object, account_id: &str, id: uuid::Uuid, bou
     let (own, aws) = BoundaryRef::columns(boundary);
     let updated = client
         .execute_cached(
-            "UPDATE roles SET boundary_policy_id = $3, boundary_aws = $4 WHERE id = $1 AND account_id = $2",
+            "UPDATE users SET boundary_policy_id = $3, boundary_aws = $4 WHERE id = $1 AND account_id = $2",
             &[&id, &account_id, &own, &aws],
         )
         .await?;
@@ -672,7 +672,7 @@ pub async fn tag(client: &Object, id: uuid::Uuid, tags: &[(String, String)]) -> 
     let keys: Vec<&str> = tags.iter().map(|(k, _)| k.as_str()).collect();
     let values: Vec<&str> = tags.iter().map(|(_, v)| v.as_str()).collect();
     let status: String = client
-        .query_one_cached("SELECT pg_temp.cairn_tag_role($1, $2, $3, $4)", &[&id, &keys, &values, &(MAX_TAGS as i32)])
+        .query_one_cached("SELECT pg_temp.cairn_tag_user($1, $2, $3, $4)", &[&id, &keys, &values, &(MAX_TAGS as i32)])
         .await?
         .get(0);
     match status.as_str() {
@@ -742,7 +742,7 @@ impl std::error::Error for TooManyTags {}
 pub async fn untag(client: &Object, id: uuid::Uuid, keys: &[String]) -> anyhow::Result<()> {
     client
         .execute_cached(
-            "DELETE FROM role_tags WHERE role_id = $1 AND lower(key) IN (SELECT lower(k) FROM unnest($2::text[]) k)",
+            "DELETE FROM user_tags WHERE user_id = $1 AND lower(key) IN (SELECT lower(k) FROM unnest($2::text[]) k)",
             &[&id, &keys],
         )
         .await?;
@@ -755,7 +755,7 @@ pub async fn untag(client: &Object, id: uuid::Uuid, keys: &[String]) -> anyhow::
 pub async fn rename(client: &Object, account_id: &str, id: uuid::Uuid, name: &str, path: &str) -> anyhow::Result<()> {
     validate_name(name)?;
     let updated = client
-        .execute_cached("UPDATE roles SET name = $3, path = $4 WHERE id = $1 AND account_id = $2", &[&id, &account_id, &name, &path])
+        .execute_cached("UPDATE users SET name = $3, path = $4 WHERE id = $1 AND account_id = $2", &[&id, &account_id, &name, &path])
         .await;
     match updated {
         Ok(1) => Ok(()),
@@ -794,7 +794,7 @@ impl Target {
                     "SELECT r.id, r.name, r.path, r.admin,
                             to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
                             {TAG_KEYS}, {TAG_VALUES}, {BOUNDARY_ARN}
-                     FROM roles r WHERE r.account_id = $1 AND lower(r.name) = lower($2)"
+                     FROM users r WHERE r.account_id = $1 AND lower(r.name) = lower($2)"
                 ),
                 &[&account, &name],
             )
@@ -888,12 +888,12 @@ async fn create_with_key(
     let inserted = client
         .execute_cached(
             "WITH r AS (
-                 INSERT INTO roles (name, secret, admin, account_id)
+                 INSERT INTO users (name, secret, admin, account_id)
                  VALUES ($1, CASE WHEN $5 = $1 THEN $2
                              ELSE 'unusable:' || gen_random_uuid() || gen_random_uuid() END, $3, $4)
                  ON CONFLICT DO NOTHING RETURNING id
              )
-             INSERT INTO access_keys (access_key_id, role_id, secret) SELECT $5, id, $2 FROM r",
+             INSERT INTO access_keys (access_key_id, user_id, secret) SELECT $5, id, $2 FROM r",
             &[&name, &secret, &admin, &account_id, &key],
         )
         .await;
@@ -937,7 +937,7 @@ fn generate_key_id() -> anyhow::Result<String> {
 /// User `name` of account `account` (its ID): its ID, if there's one.
 pub async fn id_of(client: &Object, account: &str, name: &str) -> anyhow::Result<uuid::Uuid> {
     client
-        .query_opt_cached("SELECT id FROM roles WHERE account_id = $1 AND lower(name) = lower($2)", &[&account, &name])
+        .query_opt_cached("SELECT id FROM users WHERE account_id = $1 AND lower(name) = lower($2)", &[&account, &name])
         .await?
         .map(|row| row.get(0))
         .ok_or_else(|| invalid(format!("no user named {name:?}")))
@@ -994,8 +994,8 @@ pub async fn delete_key(client: &Object, user: Option<(&str, &str)>, id: &str) -
     let (account, name) = user.unzip();
     let deleted = client
         .execute_cached(
-            "DELETE FROM access_keys k USING roles r
-             WHERE k.access_key_id = $1 AND r.id = k.role_id
+            "DELETE FROM access_keys k USING users r
+             WHERE k.access_key_id = $1 AND r.id = k.user_id
                AND ($2::text IS NULL OR (r.account_id = $2 AND lower(r.name) = lower($3)))",
             &[&id, &account, &name],
         )
@@ -1012,8 +1012,8 @@ pub async fn set_key_active(client: &Object, user: Option<(&str, &str)>, id: &st
     let (account, name) = user.unzip();
     let updated = client
         .execute_cached(
-            "UPDATE access_keys k SET active = $3 FROM roles r
-             WHERE k.access_key_id = $1 AND r.id = k.role_id
+            "UPDATE access_keys k SET active = $3 FROM users r
+             WHERE k.access_key_id = $1 AND r.id = k.user_id
                AND ($2::text IS NULL OR (r.account_id = $2 AND lower(r.name) = lower($4)))",
             &[&id, &account, &active, &name],
         )
@@ -1066,7 +1066,7 @@ pub async fn put_policy(client: &Object, account: &str, user: &str, name: &str, 
 pub async fn get_policy(client: &Object, account: &str, user: &str, name: &str) -> anyhow::Result<String> {
     let row = client
         .query_opt_cached(
-            "SELECT p.document FROM role_policies p JOIN roles r ON r.id = p.role_id
+            "SELECT p.document FROM user_policies p JOIN users r ON r.id = p.user_id
              WHERE r.account_id = $3 AND lower(r.name) = lower($1) AND p.name = $2 AND p.name NOT LIKE 'cairn:%'",
             &[&user, &name, &account],
         )
@@ -1078,8 +1078,8 @@ pub async fn get_policy(client: &Object, account: &str, user: &str, name: &str) 
 pub async fn delete_policy(client: &Object, account: &str, user: &str, name: &str) -> anyhow::Result<()> {
     let deleted = client
         .execute_cached(
-            "DELETE FROM role_policies p USING roles r
-             WHERE r.id = p.role_id AND r.account_id = $3 AND lower(r.name) = lower($1) AND p.name = $2 AND p.name NOT LIKE 'cairn:%'",
+            "DELETE FROM user_policies p USING users r
+             WHERE r.id = p.user_id AND r.account_id = $3 AND lower(r.name) = lower($1) AND p.name = $2 AND p.name NOT LIKE 'cairn:%'",
             &[&user, &name, &account],
         )
         .await?;
@@ -1107,7 +1107,7 @@ pub async fn update(
     }
     if let Some(admin) = admin {
         let updated = client
-            .execute_cached("UPDATE roles SET admin = $2 WHERE lower(name) = lower($1) AND account_id = $3", &[&name, &admin, &account])
+            .execute_cached("UPDATE users SET admin = $2 WHERE lower(name) = lower($1) AND account_id = $3", &[&name, &admin, &account])
             .await?;
         if updated == 0 {
             return Err(invalid(format!("no user named {name:?}")));
@@ -1117,8 +1117,8 @@ pub async fn update(
         // The key named as the user (a migrated role's only one).
         let updated = client
             .execute_cached(
-                "UPDATE access_keys k SET secret = $2 FROM roles r
-                 WHERE lower(r.name) = lower($1) AND r.account_id = $3 AND k.role_id = r.id AND k.access_key_id = r.name",
+                "UPDATE access_keys k SET secret = $2 FROM users r
+                 WHERE lower(r.name) = lower($1) AND r.account_id = $3 AND k.user_id = r.id AND k.access_key_id = r.name",
                 &[&name, &secret, &account],
             )
             .await?;
@@ -1135,7 +1135,7 @@ pub async fn update(
 pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Result<()> {
     let role = id_of(client, account, name).await?;
     let deleted: bool = client
-        .query_one_cached("SELECT pg_temp.cairn_delete_role($1)", &[&role])
+        .query_one_cached("SELECT pg_temp.cairn_delete_user($1)", &[&role])
         .await?
         .get(0);
     if !deleted {
@@ -1158,7 +1158,7 @@ pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
     }
     let client = app.pool.get().await?;
     let roles: Vec<uuid::Uuid> = client
-        .query_cached("SELECT id FROM roles WHERE kms_entity_id IS NULL ORDER BY created_at", &[])
+        .query_cached("SELECT id FROM users WHERE kms_entity_id IS NULL ORDER BY created_at", &[])
         .await?
         .iter()
         .map(|row| row.get(0))
@@ -1171,7 +1171,7 @@ pub async fn identify(app: &crate::App) -> anyhow::Result<()> {
         app.pool
             .get()
             .await?
-            .execute_cached("UPDATE roles SET kms_entity_id = $2 WHERE id = $1", &[&role, &entity])
+            .execute_cached("UPDATE users SET kms_entity_id = $2 WHERE id = $1", &[&role, &entity])
             .await?;
     }
     Ok(())
@@ -1216,15 +1216,15 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
             &format!("SELECT r.name, r.admin, extract(epoch FROM r.created_at)::float8,
                     NULL, NULL,
                     r.id, r.kms_entity_id,
-                    ARRAY(SELECT k.access_key_id FROM access_keys k WHERE k.role_id = r.id
+                    ARRAY(SELECT k.access_key_id FROM access_keys k WHERE k.user_id = r.id
                           ORDER BY k.created_at, k.access_key_id),
-                    ARRAY(SELECT k.active FROM access_keys k WHERE k.role_id = r.id
+                    ARRAY(SELECT k.active FROM access_keys k WHERE k.user_id = r.id
                           ORDER BY k.created_at, k.access_key_id),
                     ARRAY(SELECT extract(epoch FROM k.created_at)::float8 FROM access_keys k
-                          WHERE k.role_id = r.id ORDER BY k.created_at, k.access_key_id),
-                    ARRAY(SELECT p.name FROM role_policies p WHERE p.role_id = r.id AND p.name NOT LIKE 'cairn:%' ORDER BY p.name),
+                          WHERE k.user_id = r.id ORDER BY k.created_at, k.access_key_id),
+                    ARRAY(SELECT p.name FROM user_policies p WHERE p.user_id = r.id AND p.name NOT LIKE 'cairn:%' ORDER BY p.name),
                     r.account_id, r.path, {TAG_KEYS}, {TAG_VALUES}, {BOUNDARY_ARN}
-             FROM roles r ORDER BY r.name"),
+             FROM users r ORDER BY r.name"),
             &[],
         )
         .await?;

@@ -167,7 +167,7 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
     let rows = client
         .query_cached(
             "SELECT g.bucket, g.role, g.permission, r.account_id
-             FROM role_grants g JOIN roles r ON r.name = g.role
+             FROM role_grants g JOIN users r ON r.name = g.role
              -- From before accounts: the first tenant account's users.
              WHERE r.account_id = (SELECT id FROM accounts WHERE NOT operator)
              ORDER BY g.bucket",
@@ -294,7 +294,7 @@ pub async fn to_managed(client: &Object) -> anyhow::Result<usize> {
         let grants = in_policy(&policy);
         for (arn, permission) in &grants {
             let Some(user) = arn.strip_prefix(&prefix) else { continue };
-            if client.query_opt_cached("SELECT 1 FROM roles WHERE account_id = $1 AND lower(name) = lower($2)", &[&account, &user]).await?.is_none() {
+            if client.query_opt_cached("SELECT 1 FROM users WHERE account_id = $1 AND lower(name) = lower($2)", &[&account, &user]).await?.is_none() {
                 continue;
             }
             change(client, &account, user, &bucket, &[*permission], true).await?;

@@ -92,9 +92,9 @@ pub async fn create_enrollment(client: &Object, account: &str, user: &str) -> an
     let (token, hash) = token()?;
     let made = client
         .execute_cached(
-            "WITH r AS (SELECT id, account_id FROM roles WHERE lower(name) = lower($1) AND account_id = $4),
-                  d AS (DELETE FROM console_enrollments e USING r WHERE e.role_id = r.id)
-             INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
+            "WITH r AS (SELECT id, account_id FROM users WHERE lower(name) = lower($1) AND account_id = $4),
+                  d AS (DELETE FROM console_enrollments e USING r WHERE e.user_id = r.id)
+             INSERT INTO console_enrollments (token_hash, user_id, account_id, expires_at)
              SELECT $2, r.id, r.account_id, now() + make_interval(secs => $3) FROM r",
             &[&user, &hash, &secs(ENROLLMENT_TTL), &account],
         )
@@ -133,11 +133,11 @@ pub async fn console_access(client: &Object, account: &str) -> anyhow::Result<st
                     extract(epoch FROM greatest(
                         (SELECT max(p.last_used_at) FROM passkeys p WHERE p.login_id = li.login_id),
                         (SELECT max(o.last_used_at) FROM login_oidc o WHERE o.login_id = li.login_id)))::float8,
-                    EXISTS (SELECT 1 FROM console_enrollments e WHERE e.role_id = r.id AND e.expires_at > now())
-             FROM roles r LEFT JOIN login_identities li ON li.role_id = r.id
+                    EXISTS (SELECT 1 FROM console_enrollments e WHERE e.user_id = r.id AND e.expires_at > now())
+             FROM users r LEFT JOIN login_identities li ON li.user_id = r.id
              WHERE r.account_id = $1
                AND (li.login_id IS NOT NULL
-                    OR EXISTS (SELECT 1 FROM console_enrollments e WHERE e.role_id = r.id AND e.expires_at > now()))",
+                    OR EXISTS (SELECT 1 FROM console_enrollments e WHERE e.user_id = r.id AND e.expires_at > now()))",
             &[&account],
         )
         .await?;
@@ -162,7 +162,7 @@ pub async fn enrollment(client: &Object, token: &str) -> anyhow::Result<Option<I
         .query_opt_cached(
             &format!(
                 "SELECT {IDENTITY} FROM console_enrollments e
-                 JOIN accounts a ON a.id = e.account_id JOIN roles r ON r.id = e.role_id
+                 JOIN accounts a ON a.id = e.account_id JOIN users r ON r.id = e.user_id
                  WHERE e.token_hash = $1 AND e.expires_at > now()"
             ),
             &[&hash(token)],
@@ -341,7 +341,7 @@ pub async fn identities(client: &Object, login: Uuid) -> anyhow::Result<Vec<Iden
         .query_cached(
             &format!(
                 "SELECT {IDENTITY} FROM login_identities i
-                 JOIN accounts a ON a.id = i.account_id JOIN roles r ON r.id = i.role_id
+                 JOIN accounts a ON a.id = i.account_id JOIN users r ON r.id = i.user_id
                  WHERE i.login_id = $1 ORDER BY a.name"
             ),
             &[&login],
@@ -406,7 +406,7 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
                  FROM console_sessions s
                  JOIN logins l ON l.id = s.login_id
                  JOIN login_identities i ON i.login_id = s.login_id AND i.account_id = s.account_id
-                 JOIN accounts a ON a.id = i.account_id JOIN roles r ON r.id = i.role_id
+                 JOIN accounts a ON a.id = i.account_id JOIN users r ON r.id = i.user_id
                  WHERE s.token_hash = $1 AND s.expires_at > now()
                    AND s.last_seen_at > now() - make_interval(secs => $2)"
             ),

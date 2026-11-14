@@ -270,7 +270,7 @@ info "Creating roles..."
     entity=""
     for _ in $(seq 1 30); do
         entity=$(podman exec "$PG_CONTAINER" psql -U "$PG_USER" -d "$PG_DB" -tAc \
-            "SELECT kms_entity_id FROM roles WHERE name = '$ACCESS_KEY' AND kms_entity_id IS NOT NULL")
+            "SELECT kms_entity_id FROM users WHERE name = '$ACCESS_KEY' AND kms_entity_id IS NOT NULL")
         [ -n "$entity" ] && break
         sleep 1
     done

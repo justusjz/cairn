@@ -277,7 +277,7 @@ async fn a_public_policy_waits_for_its_accounts_block() {
 async fn a_users_keys_are_counted_after_its_row_is_held() {
     let Some(app) = node().await else { return };
     crate::roles::create(&connection(&app).await, "u", None, false).await.unwrap();
-    let make = "SELECT pg_temp.cairn_create_key((SELECT id FROM roles WHERE name = 'u'), $1, 'secretsecret', 2)";
+    let make = "SELECT pg_temp.cairn_create_key((SELECT id FROM users WHERE name = 'u'), $1, 'secretsecret', 2)";
     let mut held = connection(&app).await;
     let tx = held.transaction().await.unwrap();
     let made: String = tx.query_one(make, &[&"SECOND"]).await.unwrap().get(0);
@@ -289,7 +289,7 @@ async fn a_users_keys_are_counted_after_its_row_is_held() {
     assert_waits(&third).await;
     tx.commit().await.unwrap();
     assert_eq!(third.await.unwrap(), "too_many");
-    let keys = "SELECT count(*) FROM access_keys k JOIN roles r ON r.id = k.role_id WHERE r.name = 'u'";
+    let keys = "SELECT count(*) FROM access_keys k JOIN users r ON r.id = k.user_id WHERE r.name = 'u'";
     assert_eq!(query_i64(&app, keys).await, 2);
 }
 
@@ -299,7 +299,7 @@ async fn a_users_keys_are_counted_after_its_row_is_held() {
 async fn a_users_tags_are_counted_after_its_row_is_held() {
     let Some(app) = node().await else { return };
     crate::roles::create(&connection(&app).await, "u", None, false).await.unwrap();
-    let tag = "SELECT pg_temp.cairn_tag_role((SELECT id FROM roles WHERE name = 'u'), $1, $2, 50)";
+    let tag = "SELECT pg_temp.cairn_tag_user((SELECT id FROM users WHERE name = 'u'), $1, $2, 50)";
     let keys = |from: usize| (from..from + 30).map(|i| format!("k{i}")).collect::<Vec<_>>();
     let values = vec![String::new(); 30];
     let mut held = connection(&app).await;
@@ -314,7 +314,7 @@ async fn a_users_tags_are_counted_after_its_row_is_held() {
     assert_waits(&second).await;
     tx.commit().await.unwrap();
     assert_eq!(second.await.unwrap(), "too_many");
-    let count = "SELECT count(*) FROM role_tags t JOIN roles r ON r.id = t.role_id WHERE r.name = 'u'";
+    let count = "SELECT count(*) FROM user_tags t JOIN users r ON r.id = t.user_id WHERE r.name = 'u'";
     assert_eq!(query_i64(&app, count).await, 30);
 }
 

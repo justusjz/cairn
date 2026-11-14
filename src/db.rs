@@ -55,9 +55,9 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 pub(crate) const PROTOCOL: &str = "6";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
-/// gate (`cairn_require_users`, last raised by `SINGLE_ACCOUNT`) requires of
+/// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
 /// every session that changes users, their keys or policies.
-pub(crate) const USERS_GATE: &str = "5";
+pub(crate) const USERS_GATE: &str = "6";
 
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
@@ -227,6 +227,7 @@ const MIGRATIONS: &[&str] = &[
     POLICY_VERSIONS,
     SINGLE_ACCOUNT,
     NO_ROOT,
+    USERS_RENAMED,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2061,6 +2062,158 @@ DELETE FROM console_enrollments WHERE role_id IS NULL;
 DROP INDEX login_identities_root;
 ALTER TABLE login_identities ALTER COLUMN role_id SET NOT NULL;
 ALTER TABLE console_enrollments ALTER COLUMN role_id SET NOT NULL;
+"#;
+/// Migration 47: users' tables are named as users (`roles` was their name
+/// from before they were IAM users; IAM roles are another thing, see
+/// `plans/roles.md`): `roles` → `users`, `role_policies`,
+/// `role_attached_policies`, `role_tags` → `user_…`, and every `role_id` →
+/// `user_id`. `role_grants` stays (only read, to move what's left of it).
+/// Older nodes read the old names until they're upgraded: each renamed table
+/// keeps a view by its old name, with its old columns, and the tables whose
+/// names stay keep a `role_id` (generated, the same as `user_id`). They may
+/// change no users (`cairn.users` 6), nor logins' identities or enrollment
+/// links (whose `role_id` they could no longer write).
+const USERS_RENAMED: &str = r#"
+-- The gate is raised first (see `init`).
+CREATE OR REPLACE FUNCTION cairn_require_users() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.users', true) IS DISTINCT FROM '6' THEN
+        RAISE EXCEPTION 'this Cairn is too old to change users: their tables were renamed; upgrade it'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE roles RENAME TO users;
+ALTER TABLE role_policies RENAME TO user_policies;
+ALTER TABLE role_attached_policies RENAME TO user_attached_policies;
+ALTER TABLE role_tags RENAME TO user_tags;
+ALTER SEQUENCE role_tags_seq_seq RENAME TO user_tags_seq_seq;
+ALTER TABLE user_policies RENAME COLUMN role_id TO user_id;
+ALTER TABLE user_attached_policies RENAME COLUMN role_id TO user_id;
+ALTER TABLE user_tags RENAME COLUMN role_id TO user_id;
+ALTER TABLE access_keys RENAME COLUMN role_id TO user_id;
+ALTER TABLE login_identities RENAME COLUMN role_id TO user_id;
+ALTER TABLE console_enrollments RENAME COLUMN role_id TO user_id;
+
+ALTER TABLE users RENAME CONSTRAINT roles_account_name TO users_account_name;
+ALTER TABLE users RENAME CONSTRAINT roles_id TO users_id;
+ALTER TABLE users RENAME CONSTRAINT roles_one_boundary TO users_one_boundary;
+ALTER TABLE users RENAME CONSTRAINT roles_path_check TO users_path_check;
+ALTER TABLE users RENAME CONSTRAINT roles_account_id_fkey TO users_account_id_fkey;
+ALTER TABLE users RENAME CONSTRAINT roles_boundary_policy_id_fkey TO users_boundary_policy_id_fkey;
+ALTER INDEX roles_account_lower_name RENAME TO users_account_lower_name;
+ALTER INDEX roles_boundary RENAME TO users_boundary;
+ALTER TRIGGER roles_boundary_account ON users RENAME TO users_boundary_account;
+ALTER TRIGGER roles_boundary_for_older ON users RENAME TO users_boundary_for_older;
+ALTER TRIGGER roles_protocol ON users RENAME TO users_protocol;
+ALTER TRIGGER roles_users ON users RENAME TO users_users;
+
+ALTER TABLE user_policies RENAME CONSTRAINT role_policies_pkey TO user_policies_pkey;
+ALTER TABLE user_policies RENAME CONSTRAINT role_policies_role_id_fkey TO user_policies_user_id_fkey;
+ALTER TRIGGER role_policies_operator ON user_policies RENAME TO user_policies_operator;
+ALTER TRIGGER role_policies_protocol ON user_policies RENAME TO user_policies_protocol;
+ALTER TRIGGER role_policies_users ON user_policies RENAME TO user_policies_users;
+
+ALTER TABLE user_attached_policies RENAME CONSTRAINT role_attached_policies_check TO user_attached_policies_check;
+ALTER TABLE user_attached_policies RENAME CONSTRAINT role_attached_policies_policy_id_fkey TO user_attached_policies_policy_id_fkey;
+ALTER TABLE user_attached_policies RENAME CONSTRAINT role_attached_policies_role_id_fkey TO user_attached_policies_user_id_fkey;
+ALTER INDEX role_attached_policies_aws RENAME TO user_attached_policies_aws;
+ALTER INDEX role_attached_policies_own RENAME TO user_attached_policies_own;
+ALTER INDEX role_attached_policies_policy RENAME TO user_attached_policies_policy;
+ALTER TRIGGER role_attached_policies_account ON user_attached_policies RENAME TO user_attached_policies_account;
+ALTER TRIGGER role_attached_policies_operator ON user_attached_policies RENAME TO user_attached_policies_operator;
+ALTER TRIGGER role_attached_policies_protocol ON user_attached_policies RENAME TO user_attached_policies_protocol;
+ALTER TRIGGER role_attached_policies_users ON user_attached_policies RENAME TO user_attached_policies_users;
+
+ALTER TABLE user_tags RENAME CONSTRAINT role_tags_key_check TO user_tags_key_check;
+ALTER TABLE user_tags RENAME CONSTRAINT role_tags_value_check TO user_tags_value_check;
+ALTER TABLE user_tags RENAME CONSTRAINT role_tags_role_id_fkey TO user_tags_user_id_fkey;
+ALTER INDEX role_tags_key RENAME TO user_tags_key;
+ALTER TRIGGER role_tags_operator ON user_tags RENAME TO user_tags_operator;
+ALTER TRIGGER role_tags_protocol ON user_tags RENAME TO user_tags_protocol;
+ALTER TRIGGER role_tags_users ON user_tags RENAME TO user_tags_users;
+
+ALTER TABLE access_keys RENAME CONSTRAINT access_keys_role_id_fkey TO access_keys_user_id_fkey;
+ALTER INDEX access_keys_role RENAME TO access_keys_user;
+ALTER TABLE login_identities RENAME CONSTRAINT login_identities_role_id_fkey TO login_identities_user_id_fkey;
+ALTER TABLE console_enrollments RENAME CONSTRAINT console_enrollments_role_id_fkey TO console_enrollments_user_id_fkey;
+ALTER INDEX console_enrollments_role RENAME TO console_enrollments_user;
+
+-- The functions the triggers run, by the new names.
+CREATE OR REPLACE FUNCTION cairn_attached_policy_account() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.policy_id IS NOT NULL AND (SELECT account_id FROM managed_policies WHERE id = NEW.policy_id)
+        IS DISTINCT FROM (SELECT account_id FROM users WHERE id = NEW.user_id) THEN
+        RAISE EXCEPTION 'a user''s managed policies are its own account''s' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE OR REPLACE FUNCTION cairn_boundary_for_older() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.boundary_policy_id IS NOT NULL OR NEW.boundary_aws IS NOT NULL THEN
+        INSERT INTO user_policies (user_id, name, document)
+        VALUES (NEW.id, 'cairn:boundary', '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}')
+        ON CONFLICT DO NOTHING;
+    ELSE
+        DELETE FROM user_policies WHERE user_id = NEW.id AND name = 'cairn:boundary';
+    END IF;
+    RETURN NULL;
+END
+$$;
+CREATE OR REPLACE FUNCTION cairn_legacy_secret() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    v_key access_keys;
+BEGIN
+    v_key := CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+    UPDATE users u SET secret = coalesce(
+        (SELECT k.secret FROM access_keys k WHERE k.access_key_id = u.name AND k.user_id = u.id AND k.active),
+        'unusable:' || gen_random_uuid() || gen_random_uuid())
+    WHERE u.id = v_key.user_id AND u.name = v_key.access_key_id;
+    RETURN NULL;
+END
+$$;
+CREATE OR REPLACE FUNCTION cairn_operator_members() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (SELECT a.operator FROM users u JOIN accounts a ON a.id = u.account_id WHERE u.id = NEW.user_id) THEN
+        RAISE EXCEPTION 'the operator account''s users are superadmins, with no access keys or policies'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE OR REPLACE FUNCTION cairn_policy_principals() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.policy_principals := CASE WHEN NEW.policy IS NOT NULL THEN (
+        SELECT coalesce(jsonb_object_agg(p.arn, u.id::text), '{}'::jsonb)
+        FROM (
+            SELECT DISTINCT a #>> '{}' AS arn
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].Principal.AWS[*]') a
+            UNION
+            SELECT a #>> '{}'
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].NotPrincipal.AWS[*]') a
+        ) p
+        JOIN users u ON u.account_id = substring(p.arn FROM '^arn:aws:iam::([0-9]{12}):user/')
+                    AND substring(u.path FROM 2) || u.name = substring(p.arn FROM '^arn:aws:iam::[0-9]{12}:user/(.+)$')
+    ) END;
+    RETURN NEW;
+END
+$$;
+
+-- For older nodes, until they're upgraded: the old names, to read.
+CREATE VIEW roles AS SELECT * FROM users;
+CREATE VIEW role_policies AS SELECT user_id AS role_id, name, document FROM user_policies;
+CREATE VIEW role_attached_policies AS SELECT user_id AS role_id, policy_id, aws_policy, created_at FROM user_attached_policies;
+CREATE VIEW role_tags AS SELECT user_id AS role_id, key, value, seq FROM user_tags;
+ALTER TABLE access_keys ADD COLUMN role_id uuid GENERATED ALWAYS AS (user_id) STORED;
+ALTER TABLE login_identities ADD COLUMN role_id uuid GENERATED ALWAYS AS (user_id) STORED;
+ALTER TABLE console_enrollments ADD COLUMN role_id uuid GENERATED ALWAYS AS (user_id) STORED;
+CREATE TRIGGER login_identities_users BEFORE INSERT OR DELETE OR UPDATE OR TRUNCATE ON login_identities
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER console_enrollments_users BEFORE INSERT OR DELETE OR UPDATE OR TRUNCATE ON console_enrollments
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
 "#;
 #[cfg(test)]
 mod tests {

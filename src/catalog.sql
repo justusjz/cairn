@@ -72,7 +72,7 @@
 --   G(g)    The role_grants rows, from before grants were bucket policies
 --           (see `grants`; only deleted now). Locked (exclusively, in
 --           primary-key order) before they're deleted.
---   R(r)    The role's (user's) row.
+--   R(r)    A user's row (`users`; `roles` before migration 47).
 --           Exclusive: giving it an access key, setting an inline
 --           policy, or tagging it (I10); deleting the user (by deleting
 --           the row); setting its permissions boundary (a plain UPDATE,
@@ -226,7 +226,7 @@
 --    covers the source key): then the copy starts over ('source_changed').
 --
 -- Statements that run on their own (the pending blob and location inserts,
--- CreateMultipartUpload, role creation and updates, the heartbeat, the
+-- CreateMultipartUpload, user creation and updates, the heartbeat, the
 -- scrubber's and reads' updates of a location's `checked_at`, and the
 -- scrubber's changes to `scrub_findings`) hold nothing that anyone waits for
 -- while they wait, so they can't be part of a cycle either. (A location insert's FK checks lock its node's row shared,
@@ -1669,22 +1669,22 @@ $$;
 
 -- T28: gives a user an access key, unless it has `p_max` already (I10).
 -- Takes R(r) exclusively, then counts its keys. The key's FK check locks the
--- row shared, which it holds already; its trigger keeps `roles.secret` (see
+-- row shared, which it holds already; its trigger keeps `users.secret` (see
 -- migration 29), on the same row. Returns 'created', 'no_such_user',
 -- 'too_many' or 'taken' (another key has the ID).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_create_key(p_role uuid, p_id text, p_secret text, p_max integer)
+CREATE OR REPLACE FUNCTION pg_temp.cairn_create_key(p_user uuid, p_id text, p_secret text, p_max integer)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
-    v_role uuid;
+    v_user uuid;
 BEGIN
-    SELECT id INTO v_role FROM roles WHERE id = p_role FOR UPDATE;
+    SELECT id INTO v_user FROM users WHERE id = p_user FOR UPDATE;
     IF NOT FOUND THEN
         RETURN 'no_such_user';
     END IF;
-    IF (SELECT count(*) FROM access_keys WHERE role_id = v_role) >= p_max THEN
+    IF (SELECT count(*) FROM access_keys WHERE user_id = v_user) >= p_max THEN
         RETURN 'too_many';
     END IF;
-    INSERT INTO access_keys (access_key_id, role_id, secret) VALUES (p_id, v_role, p_secret)
+    INSERT INTO access_keys (access_key_id, user_id, secret) VALUES (p_id, v_user, p_secret)
     ON CONFLICT DO NOTHING;
     IF NOT FOUND THEN
         RETURN 'taken';
@@ -1697,22 +1697,22 @@ $$;
 -- more than `p_max` characters (but whitespace) together (I10). Takes R(r)
 -- exclusively, then sizes the others. Returns 'set', 'no_such_user' or
 -- 'too_big'.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_put_policy(p_role uuid, p_name text, p_document text, p_max integer)
+CREATE OR REPLACE FUNCTION pg_temp.cairn_put_policy(p_user uuid, p_name text, p_document text, p_max integer)
 RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
-    v_role uuid;
+    v_user uuid;
 BEGIN
-    SELECT id INTO v_role FROM roles WHERE id = p_role FOR UPDATE;
+    SELECT id INTO v_user FROM users WHERE id = p_user FOR UPDATE;
     IF NOT FOUND THEN
         RETURN 'no_such_user';
     END IF;
     IF (SELECT coalesce(sum(length(regexp_replace(document, '\s', '', 'g'))), 0)
-        FROM role_policies WHERE role_id = v_role AND name <> p_name AND name NOT LIKE 'cairn:%')
+        FROM user_policies WHERE user_id = v_user AND name <> p_name AND name NOT LIKE 'cairn:%')
        + length(regexp_replace(p_document, '\s', '', 'g')) > p_max THEN
         RETURN 'too_big';
     END IF;
-    INSERT INTO role_policies (role_id, name, document) VALUES (v_role, p_name, p_document)
-    ON CONFLICT (role_id, name) DO UPDATE SET document = EXCLUDED.document;
+    INSERT INTO user_policies (user_id, name, document) VALUES (v_user, p_name, p_document)
+    ON CONFLICT (user_id, name) DO UPDATE SET document = EXCLUDED.document;
     RETURN 'set';
 END
 $$;
@@ -1721,19 +1721,19 @@ $$;
 -- differs from one it has only in case replaces it, key and all), unless it
 -- would have more than `p_max` (I10). Takes R(r) exclusively, then counts
 -- in a later statement. Returns 'tagged', 'no_such_user' or 'too_many'.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_tag_role(p_role uuid, p_keys text[], p_values text[], p_max integer)
+CREATE OR REPLACE FUNCTION pg_temp.cairn_tag_user(p_user uuid, p_keys text[], p_values text[], p_max integer)
 RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
-    PERFORM 1 FROM roles WHERE id = p_role FOR UPDATE;
+    PERFORM 1 FROM users WHERE id = p_user FOR UPDATE;
     IF NOT FOUND THEN
         RETURN 'no_such_user';
     END IF;
-    IF (SELECT count(*) FROM role_tags WHERE role_id = p_role AND lower(key) <> ALL (SELECT lower(k) FROM unnest(p_keys) k))
+    IF (SELECT count(*) FROM user_tags WHERE user_id = p_user AND lower(key) <> ALL (SELECT lower(k) FROM unnest(p_keys) k))
        + cardinality(p_keys) > p_max THEN
         RETURN 'too_many';
     END IF;
-    DELETE FROM role_tags WHERE role_id = p_role AND lower(key) IN (SELECT lower(k) FROM unnest(p_keys) k);
-    INSERT INTO role_tags (role_id, key, value) SELECT p_role, k, v FROM unnest(p_keys, p_values) AS t(k, v);
+    DELETE FROM user_tags WHERE user_id = p_user AND lower(key) IN (SELECT lower(k) FROM unnest(p_keys) k);
+    INSERT INTO user_tags (user_id, key, value) SELECT p_user, k, v FROM unnest(p_keys, p_values) AS t(k, v);
     RETURN 'tagged';
 END
 $$;
@@ -1895,25 +1895,25 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_link_identity(p_login uuid, p_enrollmen
     OUT status text, OUT account text)
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_role uuid;
+    v_user uuid;
 BEGIN
-    SELECT e.account_id, e.role_id INTO account, v_role FROM console_enrollments e
+    SELECT e.account_id, e.user_id INTO account, v_user FROM console_enrollments e
     WHERE e.token_hash = p_enrollment AND e.expires_at > now()
-      AND (e.role_id IS NULL OR EXISTS (SELECT 1 FROM roles r WHERE r.id = e.role_id))
+      AND (e.user_id IS NULL OR EXISTS (SELECT 1 FROM users r WHERE r.id = e.user_id))
     FOR UPDATE;
     IF NOT FOUND THEN
         status := 'no_enrollment';
         RETURN;
     END IF;
     IF EXISTS (SELECT 1 FROM login_identities WHERE login_id = p_login AND account_id = account
-               AND role_id IS DISTINCT FROM v_role) THEN
+               AND user_id IS DISTINCT FROM v_user) THEN
         status := 'account_taken';
         RETURN;
     END IF;
     DELETE FROM console_enrollments WHERE token_hash = p_enrollment;
     DELETE FROM login_identities
-    WHERE account_id = account AND role_id IS NOT DISTINCT FROM v_role AND login_id <> p_login;
-    INSERT INTO login_identities (login_id, account_id, role_id) VALUES (p_login, account, v_role)
+    WHERE account_id = account AND user_id IS NOT DISTINCT FROM v_user AND login_id <> p_login;
+    INSERT INTO login_identities (login_id, account_id, user_id) VALUES (p_login, account, v_user)
     ON CONFLICT DO NOTHING;
     status := 'linked';
 END
@@ -2075,12 +2075,12 @@ $$;
 -- policies and console identities go with it (cascades). (Its grants are
 -- statements of buckets' policies, which `grants` removes first.) Returns
 -- whether there was one.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_role(p_role uuid)
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_user(p_user uuid)
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
     v_deleted bigint;
 BEGIN
-    DELETE FROM roles WHERE id = p_role;
+    DELETE FROM users WHERE id = p_user;
     GET DIAGNOSTICS v_deleted = ROW_COUNT;
     RETURN v_deleted > 0;
 END

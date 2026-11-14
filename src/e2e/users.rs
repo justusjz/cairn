@@ -111,6 +111,45 @@ async fn older_cairns_see_the_first_keys_secret_and_cant_change_users() {
     tx.batch_execute("UPDATE roles SET admin = true, kms_entity_id = 'e' WHERE name = 'bob'").await.unwrap();
 }
 
+/// Older Cairns read users by the tables' and columns' old names (migration
+/// 47), as they loaded a request's user; they may not link logins to users.
+#[tokio::test]
+async fn older_cairns_read_users_by_their_old_names() {
+    let Some(app) = node().await else { return };
+    let mut client = app.pool.get().await.unwrap();
+    let secret = roles::create(&client, "olaf", None, false).await.unwrap();
+    let account = crate::roles::account(&client).await.unwrap();
+    roles::put_policy(&client, &account, "olaf", "own", r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:GetObject","Resource":"*"}]}"#)
+        .await
+        .unwrap();
+    crate::managed::attach(&client, &account, "olaf", "arn:aws:iam::aws:policy/CairnOperatorAccess", true).await.unwrap();
+    let id = crate::roles::id_of(&client, &account, "olaf").await.unwrap();
+    roles::tag(&client, id, &[("team".to_owned(), "a".to_owned())]).await.unwrap();
+    // Cairn 0.6's query, but for its columns that came later.
+    let row = client
+        .query_one(
+            "SELECT k.secret, r.admin, r.name, r.account_id,
+                    ARRAY(SELECT document FROM role_policies WHERE role_id = r.id AND name NOT LIKE 'cairn:%' ORDER BY name),
+                    ARRAY(SELECT x.aws_policy FROM role_attached_policies x WHERE x.role_id = r.id AND x.aws_policy IS NOT NULL),
+                    ARRAY(SELECT t.key FROM role_tags t WHERE t.role_id = r.id ORDER BY t.seq DESC)
+             FROM access_keys k JOIN roles r ON r.id = k.role_id
+             JOIN accounts a ON a.id = r.account_id
+             WHERE k.access_key_id = $1 AND k.active AND NOT a.operator",
+            &[&"olaf"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), secret);
+    assert_eq!(row.get::<_, Vec<String>>(4).len(), 1);
+    assert_eq!(row.get::<_, Vec<String>>(5), ["CairnOperatorAccess"]);
+    assert_eq!(row.get::<_, Vec<String>>(6), ["team"]);
+
+    let tx = client.transaction().await.unwrap();
+    tx.batch_execute("SET LOCAL cairn.users = '5'").await.unwrap();
+    let err = tx.batch_execute("DELETE FROM login_identities").await.unwrap_err();
+    assert!(format!("{err:?}").contains("too old to change users"), "{err:?}");
+}
+
 #[tokio::test]
 async fn inline_policies_are_checked_and_kept_as_given() {
     let Some(app) = node().await else { return };
@@ -261,7 +300,7 @@ async fn old_grants_move_into_managed_policies() {
     roles::grant(&client, &account, "olga", BUCKET, &[roles::Permission::Write]).await.unwrap();
     assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read"), format!("{BUCKET}-write-grant")]);
     roles::delete(&client, &account, "olga").await.unwrap();
-    let left: i64 = client.query_one("SELECT count(*) FROM role_attached_policies", &[]).await.unwrap().get(0);
+    let left: i64 = client.query_one("SELECT count(*) FROM user_attached_policies", &[]).await.unwrap().get(0);
     assert_eq!(left, 0);
 }
 
@@ -353,10 +392,10 @@ async fn the_operators_join_the_account() {
     let names: Vec<String> = client.query("SELECT name FROM accounts WHERE NOT operator", &[]).await.unwrap().iter().map(|r| r.get(0)).collect();
     assert_eq!(names, ["default"]);
     let operators: i64 =
-        client.query_one("SELECT count(*) FROM roles r JOIN accounts a ON a.id = r.account_id WHERE a.operator", &[]).await.unwrap().get(0);
+        client.query_one("SELECT count(*) FROM users r JOIN accounts a ON a.id = r.account_id WHERE a.operator", &[]).await.unwrap().get(0);
     assert_eq!(operators, 0);
     let users: Vec<(String, bool, String)> = client
-        .query("SELECT name, admin, account_id FROM roles ORDER BY name", &[])
+        .query("SELECT name, admin, account_id FROM users ORDER BY name", &[])
         .await
         .unwrap()
         .iter()
@@ -369,7 +408,7 @@ async fn the_operators_join_the_account() {
     let identities: Vec<(String, String, Option<String>)> = client
         .query(
             "SELECT l.name, i.account_id, r.name FROM login_identities i JOIN logins l ON l.id = i.login_id
-             LEFT JOIN roles r ON r.id = i.role_id ORDER BY l.name",
+             LEFT JOIN users r ON r.id = i.user_id ORDER BY l.name",
             &[],
         )
         .await
@@ -411,7 +450,7 @@ async fn the_roots_login_becomes_an_admin() {
     crate::db::init(&pool, usize::MAX).await.unwrap();
     let row = client
         .query_one(
-            "SELECT r.name, r.admin FROM login_identities i JOIN roles r ON r.id = i.role_id
+            "SELECT r.name, r.admin FROM login_identities i JOIN users r ON r.id = i.user_id
              WHERE i.login_id = '00000000-0000-4000-8000-000000000001'",
             &[],
         )
@@ -422,7 +461,7 @@ async fn the_roots_login_becomes_an_admin() {
     assert_eq!(links, 0);
     let err = client
         .execute(
-            "INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
+            "INSERT INTO console_enrollments (token_hash, user_id, account_id, expires_at)
              SELECT '\\x01', NULL, id, now() FROM accounts WHERE NOT operator",
             &[],
         )

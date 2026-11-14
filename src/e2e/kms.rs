@@ -445,7 +445,7 @@ async fn role(app: &Arc<App>, name: &str, keys: &[&str]) -> Uuid {
     let client = app.pool.get().await.unwrap();
     crate::roles::create(&client, &name, None, false).await.unwrap();
     crate::roles::identify(app).await.unwrap();
-    let row = client.query_one("SELECT id, kms_entity_id FROM roles WHERE name = $1", &[&name]).await.unwrap();
+    let row = client.query_one("SELECT id, kms_entity_id FROM users WHERE name = $1", &[&name]).await.unwrap();
     let (id, entity): (Uuid, Option<String>) = (row.get(0), row.get(1));
     assert!(entity.is_some(), "identify gives every role its entity");
     allow(app, id, keys).await;
@@ -460,7 +460,7 @@ async fn allow(app: &App, role: Uuid, keys: &[&str]) {
         .get()
         .await
         .unwrap()
-        .query_one("SELECT kms_entity_id FROM roles WHERE id = $1", &[&role])
+        .query_one("SELECT kms_entity_id FROM users WHERE id = $1", &[&role])
         .await
         .unwrap()
         .get(0);
@@ -492,7 +492,7 @@ async fn roles_use_the_keys_openbao_lets_them() {
     let Some(app) = kms_node().await else { return };
     let alice = role(&app, "alice", &["transit/cairn-test"]).await;
     let bob = role(&app, "bob", &[]).await;
-    let entities = super::query_i64(&app, "SELECT count(DISTINCT kms_entity_id) FROM roles").await;
+    let entities = super::query_i64(&app, "SELECT count(DISTINCT kms_entity_id) FROM users").await;
     assert_eq!(entities, 2);
     // Identifying a role again finds the same entity.
     let entity: String = app
@@ -500,7 +500,7 @@ async fn roles_use_the_keys_openbao_lets_them() {
         .get()
         .await
         .unwrap()
-        .query_one("SELECT kms_entity_id FROM roles WHERE id = $1", &[&bob])
+        .query_one("SELECT kms_entity_id FROM users WHERE id = $1", &[&bob])
         .await
         .unwrap()
         .get(0);

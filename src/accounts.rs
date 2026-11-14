@@ -36,7 +36,7 @@ pub async fn run(app: &Arc<App>, args: AccountArgs, out: &mut Output) -> anyhow:
             let row = client
                 .query_one_cached(
                     "SELECT a.id,
-                            (SELECT count(*) FROM roles r WHERE r.account_id = a.id),
+                            (SELECT count(*) FROM users r WHERE r.account_id = a.id),
                             (SELECT count(*) FROM buckets b WHERE b.account_id = a.id)
                      FROM accounts a WHERE NOT a.operator",
                     &[],

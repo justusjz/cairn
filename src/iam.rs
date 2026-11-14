@@ -546,7 +546,7 @@ impl Iam<'_> {
         let rows = self
             .client
             .query_cached(
-                "SELECT name FROM roles WHERE account_id = $1 AND name > $2 AND starts_with(path, $3)
+                "SELECT name FROM users WHERE account_id = $1 AND name > $2 AND starts_with(path, $3)
                  ORDER BY name LIMIT $4",
                 &[&self.account(), &after, &prefix, &(max as i64 + 1)],
             )
@@ -589,7 +589,7 @@ impl Iam<'_> {
         };
         let exists = self
             .client
-            .query_opt_cached("SELECT 1 FROM roles WHERE lower(name) = lower($1) AND account_id = $2", &[&name, &self.account()])
+            .query_opt_cached("SELECT 1 FROM users WHERE lower(name) = lower($1) AND account_id = $2", &[&name, &self.account()])
             .await?
             .is_some();
         if exists {
@@ -636,7 +636,7 @@ impl Iam<'_> {
         {
             let exists = self
                 .client
-                .query_opt_cached("SELECT 1 FROM roles WHERE lower(name) = lower($1) AND account_id = $2", &[&name, &self.account()])
+                .query_opt_cached("SELECT 1 FROM users WHERE lower(name) = lower($1) AND account_id = $2", &[&name, &self.account()])
                 .await?
                 .is_some();
             if exists {
@@ -666,13 +666,13 @@ impl Iam<'_> {
         let count = async |sql: &'static str| -> Result<i64> {
             Ok(client.query_one_cached(sql, &[&user.id]).await?.get(0))
         };
-        if count("SELECT count(*) FROM access_keys WHERE role_id = $1").await? > 0 {
+        if count("SELECT count(*) FROM access_keys WHERE user_id = $1").await? > 0 {
             return Err(conflict("delete access keys"));
         }
-        if count("SELECT count(*) FROM role_policies WHERE role_id = $1 AND name NOT LIKE 'cairn:%'").await? > 0 {
+        if count("SELECT count(*) FROM user_policies WHERE user_id = $1 AND name NOT LIKE 'cairn:%'").await? > 0 {
             return Err(conflict("delete policies"));
         }
-        if user.admin || count("SELECT count(*) FROM role_attached_policies WHERE role_id = $1").await? > 0 {
+        if user.admin || count("SELECT count(*) FROM user_attached_policies WHERE user_id = $1").await? > 0 {
             return Err(conflict("detach all policies"));
         }
         roles::delete(self.client, self.account(), &user.name).await?;
@@ -776,7 +776,7 @@ impl Iam<'_> {
         let rows = self
             .client
             .query_cached(
-                &format!("SELECT access_key_id, active, {ISO} FROM access_keys WHERE role_id = $1 ORDER BY created_at, access_key_id"),
+                &format!("SELECT access_key_id, active, {ISO} FROM access_keys WHERE user_id = $1 ORDER BY created_at, access_key_id"),
                 &[&user.id],
             )
             .await?;
@@ -801,7 +801,7 @@ impl Iam<'_> {
         let id = params.required("AccessKeyId")?.to_owned();
         let mine = self
             .client
-            .query_opt_cached("SELECT 1 FROM access_keys WHERE access_key_id = $1 AND role_id = $2", &[&id, &user.id])
+            .query_opt_cached("SELECT 1 FROM access_keys WHERE access_key_id = $1 AND user_id = $2", &[&id, &user.id])
             .await?
             .is_some();
         if !mine {
@@ -878,7 +878,7 @@ impl Iam<'_> {
         let rows = self
             .client
             .query_cached(
-                "SELECT name FROM role_policies WHERE role_id = $1 AND name NOT LIKE 'cairn:%' ORDER BY name",
+                "SELECT name FROM user_policies WHERE user_id = $1 AND name NOT LIKE 'cairn:%' ORDER BY name",
                 &[&user.id],
             )
             .await?;
@@ -968,7 +968,7 @@ impl Iam<'_> {
                 let bounds = self
                     .client
                     .query_cached(
-                        "SELECT id FROM roles WHERE account_id = $1 AND boundary_aws = $2 ORDER BY name",
+                        "SELECT id FROM users WHERE account_id = $1 AND boundary_aws = $2 ORDER BY name",
                         &[&self.account(), &p.name],
                     )
                     .await?
@@ -1004,7 +1004,7 @@ impl Iam<'_> {
                         "SELECT id, name, description, document, version,
                                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
                                 to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                                ARRAY(SELECT r.id FROM roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name),
+                                ARRAY(SELECT r.id FROM users r WHERE r.boundary_policy_id = m.id ORDER BY r.name),
                                 ARRAY(SELECT t.key FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq),
                                 ARRAY(SELECT t.value FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq)
                          FROM managed_policies m WHERE account_id = $1 AND name = $2 AND path = $3",
@@ -1335,7 +1335,7 @@ impl Iam<'_> {
         }
         let mut members = String::new();
         for id in users {
-            let name: String = self.client.query_one_cached("SELECT name FROM roles WHERE id = $1", &[&id]).await?.get(0);
+            let name: String = self.client.query_one_cached("SELECT name FROM users WHERE id = $1", &[&id]).await?.get(0);
             members.push_str(&format!(
                 "<member><UserName>{}</UserName><UserId>{}</UserId></member>",
                 xml_escape(&name),

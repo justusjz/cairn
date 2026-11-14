@@ -236,10 +236,10 @@ impl Managed {
 
 const COLUMNS: &str = "m.id, m.name, m.description, m.document, m.version,
      extract(epoch FROM m.updated_at)::float8,
-     ARRAY(SELECT r.name FROM role_attached_policies x JOIN roles r ON r.id = x.role_id
+     ARRAY(SELECT r.name FROM user_attached_policies x JOIN users r ON r.id = x.user_id
            WHERE x.policy_id = m.id ORDER BY r.name),
      m.path,
-     ARRAY(SELECT r.name FROM roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name),
+     ARRAY(SELECT r.name FROM users r WHERE r.boundary_policy_id = m.id ORDER BY r.name),
      ARRAY(SELECT t.key FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq),
      ARRAY(SELECT t.value FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq)";
 
@@ -499,7 +499,7 @@ pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Resul
     let deleted = client
         .execute_cached(
             "DELETE FROM managed_policies m WHERE m.id = $1
-             AND NOT EXISTS (SELECT 1 FROM role_attached_policies x WHERE x.policy_id = m.id)",
+             AND NOT EXISTS (SELECT 1 FROM user_attached_policies x WHERE x.policy_id = m.id)",
             &[&policy.id],
         )
         .await;
@@ -526,12 +526,12 @@ pub struct Attached {
 pub async fn attached_all(client: &Object, account: &str) -> anyhow::Result<HashMap<Uuid, Vec<Attached>>> {
     let rows = client
         .query_cached(
-            "SELECT r.id, NULL::text, 'AdministratorAccess' FROM roles r WHERE r.account_id = $1 AND r.admin
+            "SELECT r.id, NULL::text, 'AdministratorAccess' FROM users r WHERE r.account_id = $1 AND r.admin
              UNION ALL
-             SELECT r.id, NULL, x.aws_policy FROM role_attached_policies x JOIN roles r ON r.id = x.role_id
+             SELECT r.id, NULL, x.aws_policy FROM user_attached_policies x JOIN users r ON r.id = x.user_id
              WHERE r.account_id = $1 AND x.aws_policy IS NOT NULL
              UNION ALL
-             SELECT r.id, m.account_id || ' ' || m.path, m.name FROM role_attached_policies x JOIN roles r ON r.id = x.role_id
+             SELECT r.id, m.account_id || ' ' || m.path, m.name FROM user_attached_policies x JOIN users r ON r.id = x.user_id
              JOIN managed_policies m ON m.id = x.policy_id WHERE r.account_id = $1
              ORDER BY 1, 2 NULLS FIRST, 3",
             &[&account],
@@ -565,8 +565,8 @@ pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attac
     if attach {
         let count: i64 = client
             .query_one_cached(
-                "SELECT (SELECT count(*) FROM role_attached_policies WHERE role_id = $1)
-                      + (SELECT count(*) FROM roles WHERE id = $1 AND admin)",
+                "SELECT (SELECT count(*) FROM user_attached_policies WHERE user_id = $1)
+                      + (SELECT count(*) FROM users WHERE id = $1 AND admin)",
                 &[&role],
             )
             .await?
@@ -577,16 +577,16 @@ pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attac
     }
     let changed = match &policy {
         Named::Aws(p) if p.name == ADMINISTRATOR_ACCESS => {
-            if !attach && !client.query_one_cached("SELECT admin FROM roles WHERE id = $1", &[&role]).await?.get::<_, bool>(0) {
+            if !attach && !client.query_one_cached("SELECT admin FROM users WHERE id = $1", &[&role]).await?.get::<_, bool>(0) {
                 0
             } else {
-                client.execute_cached("UPDATE roles SET admin = $2 WHERE id = $1", &[&role, &attach]).await?
+                client.execute_cached("UPDATE users SET admin = $2 WHERE id = $1", &[&role, &attach]).await?
             }
         }
         Named::Aws(p) if attach => {
             client
                 .execute_cached(
-                    "INSERT INTO role_attached_policies (role_id, aws_policy) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    "INSERT INTO user_attached_policies (user_id, aws_policy) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                     &[&role, &p.name],
                 )
                 .await?;
@@ -594,7 +594,7 @@ pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attac
         }
         Named::Aws(p) => {
             client
-                .execute_cached("DELETE FROM role_attached_policies WHERE role_id = $1 AND aws_policy = $2", &[&role, &p.name])
+                .execute_cached("DELETE FROM user_attached_policies WHERE user_id = $1 AND aws_policy = $2", &[&role, &p.name])
                 .await?
         }
         Named::Own { path, name } => {
@@ -605,14 +605,14 @@ pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attac
             if attach {
                 client
                     .execute_cached(
-                        "INSERT INTO role_attached_policies (role_id, policy_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                        "INSERT INTO user_attached_policies (user_id, policy_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
                         &[&role, &id],
                     )
                     .await?;
                 1
             } else {
                 client
-                    .execute_cached("DELETE FROM role_attached_policies WHERE role_id = $1 AND policy_id = $2", &[&role, &id])
+                    .execute_cached("DELETE FROM user_attached_policies WHERE user_id = $1 AND policy_id = $2", &[&role, &id])
                     .await?
             }
         }

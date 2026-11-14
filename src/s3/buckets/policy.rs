@@ -66,7 +66,7 @@ pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<
     for (account, user) in policy.users() {
         let exists = client
             .query_opt_cached(
-                "SELECT 1 FROM roles WHERE substring(path FROM 2) || name = $1 AND account_id = $2",
+                "SELECT 1 FROM users WHERE substring(path FROM 2) || name = $1 AND account_id = $2",
                 &[&user, &account],
             )
             .await?
@@ -99,7 +99,7 @@ pub async fn shown(client: &Object, bucket: &str) -> anyhow::Result<Option<Optio
                                 'arn:aws:iam::' || r.account_id || ':user/' || substring(r.path FROM 2) || r.name,
                                 p.value)), '{}'::jsonb)
                      FROM jsonb_each_text(b.policy_principals) p
-                     LEFT JOIN roles r ON r.id::text = p.value
+                     LEFT JOIN users r ON r.id::text = p.value
                      WHERE r.id IS NULL
                         OR p.key <> 'arn:aws:iam::' || r.account_id || ':user/' || substring(r.path FROM 2) || r.name)::text
              FROM buckets b WHERE b.name = $1",

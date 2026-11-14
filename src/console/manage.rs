@@ -1063,7 +1063,7 @@ async fn who_has_access(
 ) -> anyhow::Result<HashMap<String, Vec<(String, Vec<&'static str>)>>> {
     use crate::s3::access::{Access, Origin};
     let mut found: HashMap<String, Vec<(String, Vec<&'static str>)>> = HashMap::new();
-    let users = client.query_cached("SELECT id, name FROM roles WHERE account_id = $1 ORDER BY name", &[&account]).await?;
+    let users = client.query_cached("SELECT id, name FROM users WHERE account_id = $1 ORDER BY name", &[&account]).await?;
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
     for row in users {
         let Some(principal) = roles::Principal::load_user(client, row.get(0)).await? else { continue };
@@ -2798,7 +2798,7 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
     let account = actor.account();
     let attached = crate::managed::attached_all(&client, account).await?;
     let names: HashMap<uuid::Uuid, String> = client
-        .query_cached("SELECT id, name FROM roles WHERE account_id = $1", &[&account])
+        .query_cached("SELECT id, name FROM users WHERE account_id = $1", &[&account])
         .await?
         .iter()
         .map(|r| (r.get(0), r.get(1)))
@@ -2807,7 +2807,7 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
     let mut aws_bounds: HashMap<String, Vec<String>> = HashMap::new();
     for row in client
         .query_cached(
-            "SELECT boundary_aws, name FROM roles WHERE account_id = $1 AND boundary_aws IS NOT NULL ORDER BY name",
+            "SELECT boundary_aws, name FROM users WHERE account_id = $1 AND boundary_aws IS NOT NULL ORDER BY name",
             &[&account],
         )
         .await?
