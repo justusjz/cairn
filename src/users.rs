@@ -421,22 +421,24 @@ enum UserCommand {
         #[arg(long)]
         admin: bool,
     },
-    /// Change a user's admin flag, and/or the secret of its access key named
-    /// as it (a migrated role's; others are rotated with `key create` and
-    /// `key delete`).
+    /// Change a user's admin flag (the way back in for an admin locked out),
+    /// and/or (deprecated) the secret of its access key named as it.
     Update {
         name: String,
         /// Give (true) or take (false) `AdministratorAccess`.
         #[arg(long)]
         admin: Option<bool>,
-        /// Replace the secret with a newly generated one, and print it.
+        /// Deprecated: replace the secret with a newly generated one, and
+        /// print it. Rotate a key by making another instead, as in IAM.
         #[arg(long, conflicts_with = "secret")]
         rotate_secret: bool,
-        /// Replace the secret with this one (at least 8 characters).
+        /// Deprecated: replace the secret with this one (at least 8
+        /// characters).
         #[arg(long)]
         secret: Option<String>,
     },
-    /// Delete a user, and all its access keys, grants and policies.
+    /// Deprecated (use the IAM API or the console): delete a user, and all
+    /// its access keys, grants and policies.
     Delete { name: String },
     /// List users, their admin flag, access keys, grants and policies
     /// (secrets are not shown).
@@ -447,13 +449,17 @@ enum UserCommand {
     /// them, say). Made from the node's console URL; if the node serves no
     /// console, only the link's path is printed.
     Enroll { name: String },
-    /// Manage a user's access keys (at most two).
+    /// Deprecated (use the IAM API or the console): manage a user's access
+    /// keys (at most two).
     #[command(subcommand)]
     Key(KeyCommand),
     /// Manage a user's inline identity policies (IAM's policy language).
+    /// Only `delete` stays (the way out of one that locks an admin out); use
+    /// the IAM API or the console for the rest.
     #[command(subcommand)]
     Policy(PolicyCommand),
-    /// Grant permissions on an existing bucket of the account: attaches the
+    /// Deprecated (use the IAM API or the console): grant permissions on an
+    /// existing bucket of the account: attaches the
     /// account's managed policy `/cairn/grants/<bucket>-<permission>`, made
     /// if needed.
     Grant {
@@ -462,7 +468,8 @@ enum UserCommand {
         #[arg(required = true, value_enum)]
         permissions: Vec<Permission>,
     },
-    /// Revoke permissions on a bucket (detaches their managed policies);
+    /// Deprecated (use the IAM API or the console): revoke permissions on a
+    /// bucket (detaches their managed policies);
     /// all of them if none are listed.
     Revoke {
         name: String,
@@ -470,7 +477,8 @@ enum UserCommand {
         #[arg(value_enum)]
         permissions: Vec<Permission>,
     },
-    /// Attach a managed policy to a user, by its ARN: Cairn's
+    /// Deprecated (use the IAM API or the console; `update --admin` is the
+    /// way back in): attach a managed policy to a user, by its ARN: Cairn's
     /// (`arn:aws:iam::aws:policy/CairnOperatorAccess`, say) or the account's.
     Attach { name: String, arn: String },
     /// Detach a managed policy from a user (one that denies it, say).
@@ -502,7 +510,8 @@ enum KeyCommand {
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum PolicyCommand {
-    /// Set a user's inline policy `name` to the JSON in `file` (`-`: stdin).
+    /// Deprecated: set a user's inline policy `name` to the JSON in `file`
+    /// (`-`: stdin).
     Put {
         user: String,
         name: String,
@@ -512,7 +521,7 @@ enum PolicyCommand {
         #[arg(skip)]
         document: String,
     },
-    /// Print a user's inline policy.
+    /// Deprecated: print a user's inline policy.
     Get { user: String, name: String },
     /// Delete a user's inline policy.
     Delete { user: String, name: String },
@@ -530,7 +539,34 @@ impl UserArgs {
 
 /// `cairn user …` (or `cairn role …`): user management, on a node (see
 /// `admin`).
+/// What replaces `command`, if it's one of those going: the command line is
+/// for setting a cluster up and getting back in (`create`, `enroll`,
+/// `update --admin`, `detach`, `unbound`, deleting an inline policy, `list`),
+/// not a second IAM API.
+fn deprecated(command: &UserCommand) -> Option<&'static str> {
+    match command {
+        UserCommand::Update { rotate_secret, secret, .. } if *rotate_secret || secret.is_some() => Some(
+            "an access key's secret never changes, as in IAM: rotate a key by making a second one \
+             (`aws iam create-access-key`, or the console), moving its clients over, and deleting the first",
+        ),
+        UserCommand::Grant { .. } | UserCommand::Revoke { .. } | UserCommand::Attach { .. } => {
+            Some("use the IAM API (`aws iam attach-user-policy`, `detach-user-policy`) or the console")
+        }
+        UserCommand::Delete { .. } => Some("use the IAM API (`aws iam delete-user`) or the console"),
+        UserCommand::Key(_) => Some(
+            "use the IAM API (`aws iam create-access-key`, `update-access-key`, `delete-access-key`) or the console",
+        ),
+        UserCommand::Policy(PolicyCommand::Put { .. } | PolicyCommand::Get { .. }) => {
+            Some("use the IAM API (`aws iam put-user-policy`, `get-user-policy`) or the console")
+        }
+        _ => None,
+    }
+}
+
 pub async fn run(app: &std::sync::Arc<crate::App>, args: UserArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
+    if let Some(instead) = deprecated(&args.command) {
+        out.warn(format_args!("this command is deprecated and will be removed: {instead}"));
+    }
     let client = app.pool.get().await?;
     let account_id = account(&client).await?;
     let account_id = account_id.as_str();
@@ -1450,4 +1486,52 @@ pub async fn revoke(
     let all = [Permission::Read, Permission::Write, Permission::DeleteVersion];
     let permissions = if permissions.is_empty() { &all[..] } else { permissions };
     crate::grants::change(client, account, name, bucket, permissions, false).await
+}
+
+#[cfg(test)]
+mod cli {
+    use clap::Parser;
+
+    use super::*;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[command(flatten)]
+        user: UserArgs,
+    }
+
+    fn command(args: &[&str]) -> UserCommand {
+        Cli::parse_from(std::iter::once("cairn").chain(args.iter().copied())).user.command
+    }
+
+    /// The command line keeps what the IAM API can't do (set a cluster up,
+    /// and get back in); the rest is going.
+    #[test]
+    fn keeps_only_what_iam_cannot_do() {
+        let kept: &[&[&str]] = &[
+            &["create", "a", "--admin"],
+            &["update", "a", "--admin", "true"],
+            &["enroll", "a"],
+            &["detach", "a", "arn:aws:iam::aws:policy/AdministratorAccess"],
+            &["unbound", "a"],
+            &["policy", "delete", "a", "p"],
+            &["list"],
+        ];
+        for args in kept {
+            assert!(deprecated(&command(args)).is_none(), "{args:?}");
+        }
+        let going: &[&[&str]] = &[
+            &["grant", "a", "b", "read"],
+            &["revoke", "a", "b"],
+            &["attach", "a", "arn:aws:iam::aws:policy/AdministratorAccess"],
+            &["delete", "a"],
+            &["key", "delete", "k"],
+            &["policy", "get", "a", "p"],
+            &["update", "a", "--rotate-secret"],
+            &["update", "a", "--secret", "12345678"],
+        ];
+        for args in going {
+            assert!(deprecated(&command(args)).is_some(), "{args:?}");
+        }
+    }
 }

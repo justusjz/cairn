@@ -127,13 +127,11 @@ cairn serve \
 ```
 
 The S3 API is now served on `:9000`. Every request must be signed (SigV4) with
-the credentials of a user, and a fresh database has none. Create an admin user
-to manage buckets, and an application user with access to a bucket (see
-[Users and permissions](#users-and-permissions)):
+the credentials of a user, and a fresh database has none. Create the first
+admin (see [Users and permissions](#users-and-permissions)):
 
 ```sh
 cairn user create admin --admin        # prints its access key ID and secret
-cairn user create app                  # prints its access key ID and secret
 ```
 
 The `cairn` commands that manage the cluster (`user`, `account`, `oidc`,
@@ -144,15 +142,28 @@ the one `--peer-url` (`CAIRN_PEER_URL`, as `cairn serve` has it) names, so
 a node's own environment points them at it. Any node does, as they share the
 database; it has to be running.
 
-Create a bucket as the admin, grant the application user access to it, and use
-it:
+Everything else goes through the S3 and IAM APIs (both on the S3 endpoint)
+or the [console](#console). As the admin, with the AWS CLI, create a bucket
+and an application user that may use it:
 
 ```sh
-s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
-    --access_key=admin --secret_key=<admin secret> mb s3://my-bucket
-cairn user grant app my-bucket read write
-s3cmd --host=localhost:9000 --host-bucket=localhost:9000 --no-ssl \
-    --access_key=app --secret_key=<app secret> put file.txt s3://my-bucket/
+export AWS_ENDPOINT_URL=http://localhost:9000 AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=<admin key ID> AWS_SECRET_ACCESS_KEY=<admin secret>
+aws s3 mb s3://my-bucket
+aws iam create-user --user-name app
+aws iam put-user-policy --user-name app --policy-name my-bucket --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [{"Effect": "Allow",
+    "Action": ["s3:ListBucket", "s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
+    "Resource": ["arn:aws:s3:::my-bucket", "arn:aws:s3:::my-bucket/*"]}]}'
+aws iam create-access-key --user-name app   # prints its access key ID and secret
+```
+
+And use it as the application:
+
+```sh
+AWS_ACCESS_KEY_ID=<app key ID> AWS_SECRET_ACCESS_KEY=<app secret> \
+    aws s3 cp file.txt s3://my-bucket/
 ```
 
 ### `serve` flags
@@ -338,7 +349,8 @@ allows; else it's denied. They are:
   And the account's own (`arn:aws:iam::<account>:policy/<name>`), made with
   the console's Policies page or the IAM API: a document of up to 6,144
   characters (but whitespace); a user has at most 10 attached, as in IAM.
-  **Grants** are the simple way to make them: `cairn user grant` attaches
+  **Grants** (deprecated, as `cairn user grant` is) were the simple way to
+  make them: `cairn user grant` attaches
   the account's policy `/cairn/grants/<bucket>-<permission>` (making it,
   the first time; with a suffix if another policy has the name). Only
   policies at that path are taken for grants: IAM decides who may change a
@@ -488,21 +500,25 @@ hyphens, starting and ending with a letter or digit, not formatted like an IP
 address, and without the prefixes and suffixes S3 reserves (such as `xn--` or
 `-s3alias`).
 
-Manage users with `cairn user <command>`:
+Manage users with the IAM API or the console. `cairn user <command>` is for
+setting a cluster up and for getting back in (it acts on the database,
+whatever the policies say): `create`, `update --admin`, `enroll`, `detach`,
+`unbound`, `policy delete` and `list`. Its other commands are deprecated, will
+be removed, and print a warning when used:
 
 | Command | Description |
 | --- | --- |
 | `create <name> [--admin] [--id <ID>] [--secret <S>]` | Create a user, with an access key of a random 20-char ID (or `--id`). Prints the ID, and a generated 40-char secret unless `--secret` is given (min. 8 chars). |
-| `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin, or replace the secret of the key named as the user, which only roles migrated from before access keys have (`--rotate-secret` prints the new one); other keys are rotated with `key create` and `key delete`. |
-| `delete <name>` | Delete a user, with its keys and policies. |
-| `grant <name> <bucket> <read\|write\|delete-version>...` | Grant permissions on an existing bucket of the account: attaches its managed policy `/cairn/grants/<bucket>-<permission>`, made the first time. |
-| `revoke <name> <bucket> [read\|write\|delete-version]...` | Revoke permissions on a bucket (detaches those policies); all of them if none are listed. |
-| `attach <name> <arn>` / `detach <name> <arn>` | Attach or detach a managed policy, Cairn's (`arn:aws:iam::aws:policy/CairnOperatorAccess`) or the account's. |
+| `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin. Deprecated: replace the secret of the key named as the user (`--rotate-secret` prints the new one); rotate a key by making a second one and deleting the first instead, as in IAM. |
+| `delete <name>` (deprecated) | Delete a user, with its keys and policies. |
+| `grant <name> <bucket> <read\|write\|delete-version>...` (deprecated) | Grant permissions on an existing bucket of the account: attaches its managed policy `/cairn/grants/<bucket>-<permission>`, made the first time. |
+| `revoke <name> <bucket> [read\|write\|delete-version]...` (deprecated) | Revoke permissions on a bucket (detaches those policies); all of them if none are listed. |
+| `attach <name> <arn>` (deprecated) / `detach <name> <arn>` | Attach or detach a managed policy, Cairn's (`arn:aws:iam::aws:policy/CairnOperatorAccess`) or the account's. |
 | `unbound <name>` | Take a user's permissions boundary off, whatever its policies say. |
-| `key create <name> [--id <ID>] [--secret <S>]` | Make the user another access key (at most two). Prints its ID and secret. |
-| `key activate\|deactivate\|delete <ID>` | Let a key sign requests, stop it, or delete it. |
-| `policy put <name> <policy> <file>` | Set an inline policy (JSON; `-` reads stdin). A user's policies hold at most 2048 characters together, as in IAM. |
-| `policy get\|delete <name> <policy>` | Show or delete an inline policy. |
+| `key create <name> [--id <ID>] [--secret <S>]` (deprecated) | Make the user another access key (at most two). Prints its ID and secret. |
+| `key activate\|deactivate\|delete <ID>` (deprecated) | Let a key sign requests, stop it, or delete it. |
+| `policy put <name> <policy> <file>` (deprecated) | Set an inline policy (JSON; `-` reads stdin). A user's policies hold at most 2048 characters together, as in IAM. |
+| `policy get` (deprecated) / `policy delete <name> <policy>` | Show or delete an inline policy. |
 | `list` | List users, their ARNs, admin flags, keys, attached and inline policies (secrets are not shown). |
 | `enroll <name>` | Print a one-time link (24 hours) for the user to sign in to the [console](#console): a new login with a passkey, or (opened signed in) added to the login. A new link replaces the last. It's made from the console URL of the node the command runs on; one that serves no console prints the link's path. |
 
