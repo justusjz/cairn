@@ -106,6 +106,15 @@ pub struct Boundary {
     pub document: String,
 }
 
+/// An IAM unique ID (`AIDA…` for a user, `AROA…` for a role): `prefix`,
+/// then 17 characters from Cairn's ID, which never changes or comes back.
+pub fn unique_id(prefix: &str, id: uuid::Uuid) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+    let bits = u128::from_be_bytes(*id.as_bytes());
+    let tail: String = (0..17).map(|i| ALPHABET[((bits >> (5 * i)) & 31) as usize] as char).collect();
+    format!("{prefix}{tail}")
+}
+
 /// A user's ARN: its account's, its path's and its name's.
 pub fn user_arn(account: &str, path: &str, name: &str) -> String {
     format!("arn:aws:iam::{account}:user/{}{name}", path.strip_prefix('/').unwrap_or(path))
@@ -1031,7 +1040,7 @@ pub async fn set_key_active(client: &Object, user: Option<(&str, &str)>, id: &st
 const MAX_POLICIES: usize = 2048;
 
 /// Whether `name` may name an inline policy, as in IAM.
-fn validate_policy_name(name: &str) -> anyhow::Result<()> {
+pub(crate) fn validate_policy_name(name: &str) -> anyhow::Result<()> {
     let valid = (1..=128).contains(&name.len())
         && name.chars().all(|c| c.is_ascii_alphanumeric() || "+=,.@_-".contains(c));
     if !valid {

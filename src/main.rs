@@ -51,6 +51,7 @@ mod nodes;
 mod packer;
 mod payload;
 mod policy;
+mod roles;
 mod s3;
 mod scrub;
 mod settings;

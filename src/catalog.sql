@@ -77,6 +77,9 @@
 --           policy, or tagging it (I10); deleting the user (by deleting
 --           the row); setting its permissions boundary (a plain UPDATE,
 --           whose trigger keeps the inline policy `cairn:boundary`).
+--   O(o)    An IAM role's row (`iam_roles`; see `roles`). Exclusive:
+--           setting an inline policy or tagging it (I10); deleting it
+--           (T49), which checks it has no policies left.
 --   M(m)    A managed policy's row. Exclusive: tagging it (I10); making,
 --           deleting a version, or setting its default (I13).
 --   L(l)    A console login's row (see `console`). Exclusive: giving it a
@@ -169,7 +172,9 @@
 --     holds R(r) exclusively, and counts what the user has in a later
 --     statement (T28, T29, T42). A managed policy has at most 50 tags too:
 --     tagging it holds M(m) exclusively, and counts in a later statement
---     (T43). Likewise a console login
+--     (T43). A role's inline policies hold at most 10240 characters
+--     together, and it has at most 50 tags: under O(o), counted in a later
+--     statement (T47, T48). Likewise a console login
 --     has at most 8 passkeys, as IAM's MFA devices, and at least one way in
 --     (a passkey, or an identity at an OIDC provider), but by being
 --     deleted, under L(l) (T30, T31, T35, T37); and at most one identity per
@@ -202,7 +207,7 @@
 -- There are none, by three rules, which every transaction follows:
 --
 -- A. All of a transaction's locks are taken up front, in one global order:
---    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, M, X (by
+--    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, O, M, X (by
 --    blob id), each stripe in one mode, each blob
 --    in its final mode (exclusive wins over shared). A transaction that waits
 --    for a lock therefore only ever waits for one that comes later in the
@@ -2956,5 +2961,69 @@ BEGIN
         v_from := pg_temp.cairn_prefix_end(v_cp);
         EXIT WHEN v_from IS NULL;
     END LOOP;
+END
+$$;
+
+-- T47: PutRolePolicy: sets the role's inline policy `p_name`, unless its
+-- inline policies would hold more than `p_max` characters (but whitespace)
+-- together (I10). Takes O(o) exclusively, then sizes them in a later
+-- statement. Returns 'set', 'no_such_role' or 'too_big'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_put_role_policy(p_role uuid, p_name text, p_document text, p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM iam_roles WHERE id = p_role FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_role';
+    END IF;
+    IF (SELECT coalesce(sum(length(regexp_replace(document, '\s', '', 'g'))), 0)
+        FROM iam_role_policies WHERE role_id = p_role AND name <> p_name)
+       + length(regexp_replace(p_document, '\s', '', 'g')) > p_max THEN
+        RETURN 'too_big';
+    END IF;
+    INSERT INTO iam_role_policies (role_id, name, document) VALUES (p_role, p_name, p_document)
+    ON CONFLICT (role_id, name) DO UPDATE SET document = EXCLUDED.document;
+    RETURN 'set';
+END
+$$;
+
+-- T48: TagRole: as T42, for a role, under O(o). Returns 'tagged',
+-- 'no_such_role' or 'too_many'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_tag_role(p_role uuid, p_keys text[], p_values text[], p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM iam_roles WHERE id = p_role FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_role';
+    END IF;
+    IF (SELECT count(*) FROM iam_role_tags WHERE role_id = p_role AND lower(key) <> ALL (SELECT lower(k) FROM unnest(p_keys) k))
+       + cardinality(p_keys) > p_max THEN
+        RETURN 'too_many';
+    END IF;
+    DELETE FROM iam_role_tags WHERE role_id = p_role AND lower(key) IN (SELECT lower(k) FROM unnest(p_keys) k);
+    INSERT INTO iam_role_tags (role_id, key, value) SELECT p_role, k, v FROM unnest(p_keys, p_values) AS t(k, v);
+    RETURN 'tagged';
+END
+$$;
+
+-- T49: DeleteRole: deletes the role, unless it has inline or attached
+-- policies left, as IAM refuses it (its tags and boundary don't keep it).
+-- Takes O(o) exclusively, then checks in a later statement, so that no
+-- policy set meanwhile goes with it unseen. Returns 'deleted',
+-- 'no_such_role', 'policies' or 'attached'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_role(p_role uuid)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM iam_roles WHERE id = p_role FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_role';
+    END IF;
+    IF EXISTS (SELECT 1 FROM iam_role_policies WHERE role_id = p_role) THEN
+        RETURN 'policies';
+    END IF;
+    IF EXISTS (SELECT 1 FROM iam_role_attached_policies WHERE role_id = p_role) THEN
+        RETURN 'attached';
+    END IF;
+    DELETE FROM iam_roles WHERE id = p_role;
+    RETURN 'deleted';
 END
 $$;

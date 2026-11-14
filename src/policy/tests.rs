@@ -686,3 +686,104 @@ fn tag_keys_are_any_case() {
     context.set("aws:ResourceTag/team", "A");
     assert_eq!(check(&policy, user("alice"), "iam:GetUser", &arn, &context), Decision::NotApplicable, "values aren't");
 }
+
+/// A trust policy (`Principal`) of the probed shapes, refused or taken as
+/// IAM takes it, with IAM's messages (probed: `plans/roles.md`).
+#[test]
+fn trust_policies_are_checked_as_iam_checks_them() {
+    let demo = format!("arn:aws:iam::{ACCOUNT}:user/demo");
+    let statement = |rest: &str| format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow",{rest}}}]}}"#);
+    let refusals = [
+        (statement(r#""Action":"sts:AssumeRole""#), "Missing required field Principal"),
+        (statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"Action":"sts:AssumeRole","Resource":"*""#)), "Has prohibited field Resource"),
+        (statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"Action":"s3:GetObject""#)), "AssumeRole policy may only specify STS AssumeRole actions."),
+        (statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"Action":"sts:GetSessionToken""#)), "AssumeRole policy may only specify STS AssumeRole actions."),
+        (statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"Action":"sts:*""#)), "AssumeRole policy may only specify STS AssumeRole actions."),
+        (statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"Action":"*""#)), "AssumeRole policy may only specify STS AssumeRole actions."),
+        (statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"NotAction":"s3:*""#)), "AssumeRole policy may only specify STS AssumeRole actions."),
+        (
+            statement(&format!(r#""Principal":{{"AWS":"arn:aws:iam::{ACCOUNT}:user/*"}},"Action":"sts:AssumeRole""#)),
+            r#"Invalid principal in policy: "AWS":"arn:aws:iam::123456789012:user/*""#,
+        ),
+        (
+            statement(&format!(r#""Principal":{{"AWS":"arn:aws:iam::{ACCOUNT}:role/probe-*"}},"Action":"sts:AssumeRole""#)),
+            r#"Invalid principal in policy: "AWS":"arn:aws:iam::123456789012:role/probe-*""#,
+        ),
+        (
+            format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","NotPrincipal":{{"AWS":"{demo}"}},"Action":"sts:AssumeRole"}}]}}"#),
+            "Allow with NotPrincipal is not allowed.",
+        ),
+        (r#"{"Version":"2012-10-17","Statement":[]}"#.to_owned(), "Could not parse the policy: Statement is empty!"),
+        ("{".to_owned(), "This policy contains invalid Json"),
+    ];
+    for (json, message) in refusals {
+        let e = refused(&json, Kind::Trust);
+        assert_eq!((e.code, e.message.as_str()), ("MalformedPolicy", message), "{json}");
+    }
+    // Taken, and kept as IAM shows them: an account as its root, one
+    // value as itself, principals sorted, no Version as 2008-10-17.
+    let taken = [
+        (statement(r#""Principal":{"AWS":"*"},"Action":"sts:AssumeRole""#), None),
+        (
+            statement(&format!(r#""Principal":{{"AWS":"{ACCOUNT}"}},"Action":["sts:AssumeRole"]"#)),
+            Some(format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{ACCOUNT}:root"}},"Action":"sts:AssumeRole"}}]}}"#)),
+        ),
+        (
+            statement(&format!(r#""Principal":{{"AWS":["{demo}","arn:aws:iam::{ACCOUNT}:root"]}},"Action":"sts:AssumeRole""#)),
+            Some(format!(
+                r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":["arn:aws:iam::{ACCOUNT}:root","{demo}"]}},"Action":"sts:AssumeRole"}}]}}"#
+            )),
+        ),
+        (
+            statement(&format!(r#""Principal":{{"Federated":"arn:aws:iam::{ACCOUNT}:oidc-provider/example.com"}},"Action":"sts:AssumeRoleWithWebIdentity""#)),
+            None,
+        ),
+        (statement(r#""Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole""#), None),
+        (statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"Action":"sts:TagSession""#)), None),
+        (
+            statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"Action":"sts:AssumeRole","Condition":{{"StringEquals":{{"aws:Frobnicate":"x"}}}}"#)),
+            None,
+        ),
+        (
+            statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"Action":"sts:AssumeRole","Condition":{{"StringLike":{{"sts:RoleSessionName":"x*"}}}}"#)),
+            None,
+        ),
+        (
+            format!(r#"{{"Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{demo}"}},"Action":"sts:AssumeRole"}}]}}"#),
+            Some(format!(r#"{{"Version":"2008-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"{demo}"}},"Action":"sts:AssumeRole"}}]}}"#)),
+        ),
+    ];
+    for (json, normalized) in taken {
+        let policy = Policy::parse(&json, Kind::Trust).unwrap_or_else(|e| panic!("{json}: {e:?}"));
+        if let Some(normalized) = normalized {
+            assert_eq!(policy.normalized(), normalized);
+        }
+    }
+    // What it names, for IAM to check that they exist.
+    let policy = Policy::parse(
+        &statement(&format!(
+            r#""Principal":{{"AWS":["{demo}","arn:aws:iam::{ACCOUNT}:role/team/r","arn:aws:sts::{ACCOUNT}:assumed-role/r/s"]}},"Action":"sts:AssumeRole""#
+        )),
+        Kind::Trust,
+    )
+    .unwrap();
+    assert_eq!(policy.users().collect::<Vec<_>>(), [(ACCOUNT, "demo")]);
+    assert_eq!(policy.roles().collect::<Vec<_>>(), [(ACCOUNT, "team/r")]);
+    assert_eq!(policy.sessions().collect::<Vec<_>>(), [(ACCOUNT, "r", "s")]);
+    // STS's keys that Cairn doesn't decide are refused, as other
+    // undecidable keys are.
+    let e = refused(
+        &statement(&format!(r#""Principal":{{"AWS":"{demo}"}},"Action":"sts:AssumeRole","Condition":{{"StringEquals":{{"sts:Frobnicate":"x"}}}}"#)),
+        Kind::Trust,
+    );
+    assert_eq!(e.code, "NotImplemented");
+    // Roles and sessions are no bucket policy's principals (yet).
+    let e = refused(
+        &format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{ACCOUNT}:role/r"}},"Action":"s3:GetObject","Resource":"{}"}}]}}"#,
+            object("*")
+        ),
+        Kind::Bucket(BUCKET),
+    );
+    assert_eq!(e.message, "Invalid principal in policy");
+}

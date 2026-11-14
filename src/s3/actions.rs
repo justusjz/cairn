@@ -39,6 +39,13 @@ pub enum On {
     /// (without its leading `/`), for `iam:ListUsers` (`user/`, then the
     /// prefix: probed).
     Users(String, String),
+    /// An IAM role of an account (by its ID), by its path (without its
+    /// leading `/`) and name, for IAM's actions on it, and STS's
+    /// AssumeRole (see `On::role`).
+    Role(String, String),
+    /// An account's roles whose paths start with a prefix, for
+    /// `iam:ListRoles` (`role/`, then the prefix: probed).
+    Roles(String, String),
     /// A managed policy of an account (by its ID; `aws`: Cairn's), by its
     /// path (without its leading `/`) and name, for IAM's actions on it.
     Policy(String, String),
@@ -60,6 +67,8 @@ impl On {
             On::Object(bucket, key) => format!("arn:aws:s3:::{bucket}/{key}"),
             On::User(account, name) => format!("arn:aws:iam::{account}:user/{name}"),
             On::Users(account, prefix) => format!("arn:aws:iam::{account}:user/{prefix}"),
+            On::Role(account, name) => format!("arn:aws:iam::{account}:role/{name}"),
+            On::Roles(account, prefix) => format!("arn:aws:iam::{account}:role/{prefix}"),
             On::Policy(account, name) => format!("arn:aws:iam::{account}:policy/{name}"),
             On::Cluster => CLUSTER_ARN.to_owned(),
         }
@@ -73,6 +82,16 @@ impl On {
     /// `account`'s users at paths starting with `prefix` (`/…`).
     pub fn users(account: &str, prefix: &str) -> On {
         On::Users(account.to_owned(), prefix.strip_prefix('/').unwrap_or(prefix).to_owned())
+    }
+
+    /// Role `name` of `account`, at `path`.
+    pub fn role(account: &str, path: &str, name: &str) -> On {
+        On::Role(account.to_owned(), format!("{}{name}", path.strip_prefix('/').unwrap_or(path)))
+    }
+
+    /// `account`'s roles at paths starting with `prefix` (`/…`).
+    pub fn roles(account: &str, prefix: &str) -> On {
+        On::Roles(account.to_owned(), prefix.strip_prefix('/').unwrap_or(prefix).to_owned())
     }
 
     /// Managed policy `name` of `account` (`aws`: Cairn's), at `path`.

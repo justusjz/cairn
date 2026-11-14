@@ -228,6 +228,7 @@ const MIGRATIONS: &[&str] = &[
     SINGLE_ACCOUNT,
     NO_ROOT,
     USERS_RENAMED,
+    IAM_ROLES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2213,6 +2214,113 @@ ALTER TABLE console_enrollments ADD COLUMN role_id uuid GENERATED ALWAYS AS (use
 CREATE TRIGGER login_identities_users BEFORE INSERT OR DELETE OR UPDATE OR TRUNCATE ON login_identities
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
 CREATE TRIGGER console_enrollments_users BEFORE INSERT OR DELETE OR UPDATE OR TRUNCATE ON console_enrollments
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+"#;
+/// Migration 48: IAM roles (see `roles`, `plans/roles.md`): assumable
+/// identities with a trust policy, inline and managed policies, tags and a
+/// permissions boundary, as users have. Named `iam_role…`, as `role…` are
+/// older nodes' views of users' tables (`USERS_RENAMED`). A trust policy's
+/// users and roles are kept by their IDs, as a bucket policy's users are
+/// (`PRINCIPAL_IDS`), so it names those it named when it was set.
+const IAM_ROLES: &str = r#"
+CREATE TABLE iam_roles (
+    id                   uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id           text NOT NULL REFERENCES accounts (id),
+    name                 text NOT NULL CHECK (name ~ '^[A-Za-z0-9+=,.@_-]{1,64}$'),
+    path                 text NOT NULL DEFAULT '/'
+                         CHECK (length(path) <= 512 AND path ~ '^/([A-Za-z0-9+=,.@_/-]*/)?$' AND path <> '//'),
+    trust_policy         text NOT NULL,
+    trust_principals     jsonb NOT NULL DEFAULT '{}',
+    description          text NOT NULL DEFAULT '' CHECK (length(description) <= 1000),
+    max_session_duration integer NOT NULL DEFAULT 3600 CHECK (max_session_duration BETWEEN 3600 AND 43200),
+    boundary_policy_id   uuid REFERENCES managed_policies (id),
+    boundary_aws         text,
+    kms_entity_id        text,
+    created_at           timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT iam_roles_one_boundary CHECK (boundary_policy_id IS NULL OR boundary_aws IS NULL)
+);
+CREATE UNIQUE INDEX iam_roles_account_lower_name ON iam_roles (account_id, lower(name));
+CREATE INDEX iam_roles_boundary ON iam_roles (boundary_policy_id) WHERE boundary_policy_id IS NOT NULL;
+
+CREATE TABLE iam_role_policies (
+    role_id  uuid NOT NULL REFERENCES iam_roles (id) ON DELETE CASCADE,
+    name     text NOT NULL,
+    document text NOT NULL,
+    PRIMARY KEY (role_id, name)
+);
+
+CREATE TABLE iam_role_attached_policies (
+    role_id    uuid NOT NULL REFERENCES iam_roles (id) ON DELETE CASCADE,
+    policy_id  uuid REFERENCES managed_policies (id),
+    aws_policy text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK ((policy_id IS NULL) <> (aws_policy IS NULL))
+);
+CREATE UNIQUE INDEX iam_role_attached_policies_own ON iam_role_attached_policies (role_id, policy_id)
+    WHERE policy_id IS NOT NULL;
+CREATE UNIQUE INDEX iam_role_attached_policies_aws ON iam_role_attached_policies (role_id, aws_policy)
+    WHERE aws_policy IS NOT NULL;
+CREATE INDEX iam_role_attached_policies_policy ON iam_role_attached_policies (policy_id);
+
+CREATE TABLE iam_role_tags (
+    role_id uuid NOT NULL REFERENCES iam_roles (id) ON DELETE CASCADE,
+    key     text NOT NULL CHECK (length(key) BETWEEN 1 AND 128),
+    value   text NOT NULL CHECK (length(value) <= 256),
+    seq     bigint GENERATED ALWAYS AS IDENTITY
+);
+CREATE UNIQUE INDEX iam_role_tags_key ON iam_role_tags (role_id, lower(key));
+
+-- A role's boundary and managed policies are its own account's.
+CREATE TRIGGER iam_roles_boundary_account BEFORE INSERT OR UPDATE OF boundary_policy_id, account_id ON iam_roles
+    FOR EACH ROW EXECUTE FUNCTION cairn_boundary_account();
+CREATE FUNCTION cairn_role_attached_policy_account() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.policy_id IS NOT NULL AND (SELECT account_id FROM managed_policies WHERE id = NEW.policy_id)
+        IS DISTINCT FROM (SELECT account_id FROM iam_roles WHERE id = NEW.role_id) THEN
+        RAISE EXCEPTION 'a role''s managed policies are its own account''s' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER iam_role_attached_policies_account BEFORE INSERT OR UPDATE ON iam_role_attached_policies
+    FOR EACH ROW EXECUTE FUNCTION cairn_role_attached_policy_account();
+
+-- The users and roles a trust policy names, by ARN: their IDs.
+CREATE FUNCTION cairn_trust_principals() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.trust_principals := (
+        SELECT coalesce(jsonb_object_agg(p.arn, coalesce(u.id, r.id)::text), '{}'::jsonb)
+        FROM (
+            SELECT DISTINCT a #>> '{}' AS arn
+            FROM jsonb_path_query(NEW.trust_policy::jsonb, 'lax $.Statement[*].Principal.AWS[*]') a
+        ) p
+        LEFT JOIN users u ON u.account_id = substring(p.arn FROM '^arn:aws:iam::([0-9]{12}):user/')
+                         AND substring(u.path FROM 2) || u.name = substring(p.arn FROM '^arn:aws:iam::[0-9]{12}:user/(.+)$')
+        LEFT JOIN iam_roles r ON r.account_id = substring(p.arn FROM '^arn:aws:iam::([0-9]{12}):role/')
+                             AND substring(r.path FROM 2) || r.name = substring(p.arn FROM '^arn:aws:iam::[0-9]{12}:role/(.+)$')
+        WHERE u.id IS NOT NULL OR r.id IS NOT NULL
+    );
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER iam_roles_trust_principals BEFORE INSERT OR UPDATE OF trust_policy ON iam_roles
+    FOR EACH ROW EXECUTE FUNCTION cairn_trust_principals();
+
+CREATE TRIGGER iam_roles_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_roles
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_roles_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_roles
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER iam_role_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_role_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_role_policies_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_role_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER iam_role_attached_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_role_attached_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_role_attached_policies_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_role_attached_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER iam_role_tags_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_role_tags
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_role_tags_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_role_tags
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
 "#;
 #[cfg(test)]

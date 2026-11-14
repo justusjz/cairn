@@ -38,6 +38,7 @@ mod multipart;
 mod object_lock;
 mod post_object;
 mod public_access;
+mod roles;
 mod users;
 mod tagging;
 

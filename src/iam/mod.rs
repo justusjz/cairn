@@ -17,7 +17,10 @@
 //! `plans/boundaries.md`, probed), access keys, inline policies, and managed
 //! policies (see `managed`): Cairn's, which have AWS's names, and an
 //! account's own, with paths and tags, of which Cairn keeps one version,
-//! the default. Groups and roles aren't (NotImplemented).
+//! the default; and roles (see `roles`, `plans/roles.md`). Groups aren't
+//! (NotImplemented).
+
+mod roles;
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -86,6 +89,7 @@ impl From<anyhow::Error> for Error {
             Ok(Refused::Malformed(m)) => return error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", m),
             Ok(Refused::Invalid(m)) => return invalid(m),
             Ok(Refused::Validation(m)) => return validation(m),
+            Ok(Refused::Unsupported(m)) => return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", m),
             Err(e) => e,
         };
         let e = match e.downcast::<users::TooManyTags>() {
@@ -271,11 +275,30 @@ async fn respond(
         (_, "TagPolicy") => iam.tag_policy(&params).await?,
         (_, "UntagPolicy") => iam.untag_policy(&params).await?,
         (_, "ListPolicyTags") => iam.list_policy_tags(&params).await?,
+        (_, "CreateRole") => iam.create_role(&params).await?,
+        (_, "GetRole") => iam.get_role(&params).await?,
+        (_, "ListRoles") => iam.list_roles(&params).await?,
+        (_, "UpdateRole") => iam.update_role(&params).await?,
+        (_, "UpdateRoleDescription") => iam.update_role_description(&params).await?,
+        (_, "UpdateAssumeRolePolicy") => iam.update_assume_role_policy(&params).await?,
+        (_, "DeleteRole") => iam.delete_role(&params).await?,
+        (_, "PutRolePermissionsBoundary") => iam.put_role_permissions_boundary(&params).await?,
+        (_, "DeleteRolePermissionsBoundary") => iam.delete_role_permissions_boundary(&params).await?,
+        (_, "TagRole") => iam.tag_role(&params).await?,
+        (_, "UntagRole") => iam.untag_role(&params).await?,
+        (_, "ListRoleTags") => iam.list_role_tags(&params).await?,
+        (_, "PutRolePolicy") => iam.put_role_policy(&params).await?,
+        (_, "GetRolePolicy") => iam.get_role_policy(&params).await?,
+        (_, "ListRolePolicies") => iam.list_role_policies(&params).await?,
+        (_, "DeleteRolePolicy") => iam.delete_role_policy(&params).await?,
+        (_, "AttachRolePolicy") => iam.attach_role_policy(&params, true).await?,
+        (_, "DetachRolePolicy") => iam.attach_role_policy(&params, false).await?,
+        (_, "ListAttachedRolePolicies") => iam.list_attached_role_policies(&params).await?,
         (_, other) => {
             return Err(error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                format!("Cairn's IAM has users (with paths, tags and permissions boundaries), access keys, inline and managed policies; not {other}"),
+                format!("Cairn's IAM has users and roles (with paths, tags and permissions boundaries), access keys, inline and managed policies; not {other}"),
             ));
         }
     };
@@ -285,10 +308,7 @@ async fn respond(
 /// A user's ID as IAM shows one (`AIDA`, then 17 characters), from its
 /// Cairn ID, which never changes or comes back.
 fn user_id(id: uuid::Uuid) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-    let bits = u128::from_be_bytes(*id.as_bytes());
-    let tail: String = (0..17).map(|i| ALPHABET[((bits >> (5 * i)) & 31) as usize] as char).collect();
-    format!("AIDA{tail}")
+    users::unique_id("AIDA", id)
 }
 
 /// An ISO 8601 time from SQL (see `ISO`).
@@ -307,6 +327,8 @@ struct Iam<'a> {
 enum Shown {
     Arn,
     User(String),
+    /// A role, by its name (`role NAME`: probed).
+    Role(String),
     /// A policy, by its ARN, or (one to make) its name.
     Policy(String),
 }
@@ -473,6 +495,7 @@ impl Iam<'_> {
         let resource = match shown {
             Shown::Arn => check.on.arn(),
             Shown::User(name) => format!("user {name}"),
+            Shown::Role(name) => format!("role {name}"),
             Shown::Policy(name) => format!("policy {name}"),
         };
         Err(error(
@@ -965,6 +988,7 @@ impl Iam<'_> {
         Ok(match named {
             Named::Aws(p) => {
                 let arn = managed::aws_arn(p.name);
+                let (roles, role_bounds) = crate::roles::of_policy(self.client, self.account(), &arn).await?;
                 let bounds = self
                     .client
                     .query_cached(
@@ -978,6 +1002,8 @@ impl Iam<'_> {
                 Policy {
                     users: users(arn.clone()).await?,
                     bounds,
+                    roles,
+                    role_bounds,
                     arn,
                     id: managed::policy_id(None, p.name),
                     name: p.name.to_owned(),
@@ -1013,9 +1039,12 @@ impl Iam<'_> {
                     .await?
                     .ok_or_else(not_found)?;
                 let arn = managed::arn(self.account(), &path, &name);
+                let (roles, role_bounds) = crate::roles::of_policy(self.client, self.account(), &arn).await?;
                 Policy {
                     users: users(arn.clone()).await?,
                     bounds: row.get(7),
+                    roles,
+                    role_bounds,
                     arn,
                     id: managed::policy_id(Some(row.get(0)), &name),
                     name: row.get(1),
@@ -1047,8 +1076,8 @@ impl Iam<'_> {
             policy.id,
             xml_escape(&policy.path),
             xml_escape(&policy.arn),
-            policy.users.len(),
-            policy.bounds.len(),
+            policy.users.len() + policy.roles.len(),
+            policy.bounds.len() + policy.role_bounds.len(),
             policy.created,
             policy.updated
         )
@@ -1169,7 +1198,7 @@ impl Iam<'_> {
                 policies.push(self.load_policy(Named::Own { path: p.path, name: p.name }).await?);
             }
         }
-        policies.retain(|p| p.path.starts_with(&prefix) && (!only_attached || !p.users.is_empty()));
+        policies.retain(|p| p.path.starts_with(&prefix) && (!only_attached || !p.users.is_empty() || !p.roles.is_empty()));
         // Paged by ARN.
         policies.sort_by(|a, b| a.arn.cmp(&b.arn));
         if let Some(after) = params.get("Marker") {
@@ -1323,8 +1352,9 @@ impl Iam<'_> {
                 )));
             }
         };
+        let entities = params.get("EntityFilter");
         let mut users = Vec::new();
-        if matches!(params.get("EntityFilter"), None | Some("User")) {
+        if matches!(entities, None | Some("User")) {
             if attached {
                 users.extend(policy.users.iter().copied());
             }
@@ -1342,8 +1372,24 @@ impl Iam<'_> {
                 user_id(id)
             ));
         }
+        let mut roles: Vec<(uuid::Uuid, String)> = Vec::new();
+        if matches!(entities, None | Some("Role")) {
+            if attached {
+                roles.extend(policy.roles.iter().cloned());
+            }
+            if bounded {
+                let more: Vec<_> = policy.role_bounds.iter().filter(|(id, _)| !roles.iter().any(|(r, _)| r == id)).cloned().collect();
+                roles.extend(more);
+            }
+        }
+        let role_members: String = roles
+            .iter()
+            .map(|(id, name)| {
+                format!("<member><RoleName>{}</RoleName><RoleId>{}</RoleId></member>", xml_escape(name), crate::roles::unique_id(*id))
+            })
+            .collect();
         Ok(Some(format!(
-            "<PolicyGroups/><PolicyUsers>{members}</PolicyUsers><PolicyRoles/><IsTruncated>false</IsTruncated>"
+            "<PolicyGroups/><PolicyUsers>{members}</PolicyUsers><PolicyRoles>{role_members}</PolicyRoles><IsTruncated>false</IsTruncated>"
         )))
     }
 }
@@ -1364,6 +1410,10 @@ struct Policy {
     users: Vec<uuid::Uuid>,
     /// The users whose permissions boundary it is (their IDs).
     bounds: Vec<uuid::Uuid>,
+    /// The roles it's attached to, and those whose boundary it is: their
+    /// IDs and names.
+    roles: Vec<(uuid::Uuid, String)>,
+    role_bounds: Vec<(uuid::Uuid, String)>,
     /// Whether it's one of Cairn's (AWS's).
     aws: bool,
     /// Its tags, oldest first.

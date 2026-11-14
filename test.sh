@@ -2431,6 +2431,51 @@ iam_api_ok() {
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
+# IAM roles over the IAM API, as the AWS CLI calls it: made with a trust
+# policy (refused naming a user that isn't there), read back as IAM shows
+# it, changed, given inline and managed policies, tags and a boundary,
+# listed, and deleted once its policies are gone; reader may do none of it.
+iam_roles_ok() {
+    local r="role-$(date +%s)" acct trust="$WORK_DIR/trust.json" doc="$WORK_DIR/role-policy.json" out
+    acct=$(awss3 sts get-caller-identity --query Account --output text 2>/dev/null) || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::'"$acct"':user/nobody"},"Action":"sts:AssumeRole"}]}' > "$trust"
+    out=$(awss3 iam create-role --role-name "$r" --assume-role-policy-document "file://$trust" 2>&1) && return 1
+    echo "$out" | grep -q 'Invalid principal in policy' || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"'"$acct"'"},"Action":["sts:AssumeRole"]}]}' > "$trust"
+    awss3 iam create-role --role-name "$r" --path /team/ --assume-role-policy-document "file://$trust" \
+        --description first --max-session-duration 7200 --tags Key=team,Value=a >/dev/null 2>&1 || return 1
+    out=$(awss3 iam create-role --role-name "$r" --assume-role-policy-document "file://$trust" 2>&1) && return 1
+    echo "$out" | grep -q EntityAlreadyExists || return 1
+    [ "$(awss3 iam get-role --role-name "$r" --query Role.Arn --output text 2>/dev/null)" \
+        = "arn:aws:iam::$acct:role/team/$r" ] || return 1
+    awss3 iam get-role --role-name "$r" --query 'Role.AssumeRolePolicyDocument.Statement[0].Principal.AWS' --output text 2>/dev/null \
+        | grep -qx "arn:aws:iam::$acct:root" || return 1
+    awss3 iam get-role --role-name "$r" --query 'Role.[RoleId,MaxSessionDuration,Description,Tags[0].Value]' --output text 2>/dev/null \
+        | grep -qP '^AROA[A-Z2-7]{17}\t7200\tfirst\ta$' || return 1
+    awss3 iam update-role --role-name "$r" --max-session-duration 3600 >/dev/null 2>&1 || return 1
+    awss3 iam update-role-description --role-name "$r" --description second --query Role.Description --output text 2>/dev/null \
+        | grep -qx second || return 1
+    awss3 iam list-roles --path-prefix /team/ --query 'Roles[].RoleName' --output text 2>/dev/null | grep -qw "$r" || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}' > "$doc"
+    awss3 iam put-role-policy --role-name "$r" --policy-name list --policy-document "file://$doc" >/dev/null 2>&1 || return 1
+    awss3 iam attach-role-policy --role-name "$r" --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess >/dev/null 2>&1 || return 1
+    awss3 iam put-role-permissions-boundary --role-name "$r" \
+        --permissions-boundary arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess >/dev/null 2>&1 || return 1
+    awss3 iam list-entities-for-policy --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess \
+        --query 'PolicyRoles[].RoleName' --output text 2>/dev/null | grep -qw "$r" || return 1
+    out=$(as_role reader readersecret iam get-role --role-name "$r" 2>&1) && return 1
+    echo "$out" | grep -q "not authorized to perform: iam:GetRole on resource: role $r" || return 1
+    out=$(awss3 iam delete-role --role-name "$r" 2>&1) && return 1
+    echo "$out" | grep -q 'must delete policies first' || return 1
+    awss3 iam delete-role-policy --role-name "$r" --policy-name list >/dev/null 2>&1 || return 1
+    out=$(awss3 iam delete-role --role-name "$r" 2>&1) && return 1
+    echo "$out" | grep -q 'must detach all policies first' || return 1
+    awss3 iam detach-role-policy --role-name "$r" --policy-arn arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess >/dev/null 2>&1 || return 1
+    awss3 iam delete-role --role-name "$r" >/dev/null 2>&1 || return 1
+    out=$(awss3 iam get-role --role-name "$r" 2>&1) && return 1
+    echo "$out" | grep -q NoSuchEntity
+}
+
 # Managed policies over the IAM API, as the AWS CLI calls it: an account's
 # own (made, read back, attached, a new version, deleted once detached) and
 # Cairn's (AWS's ARNs), which allow what AWS's do and can't be changed.
@@ -2777,6 +2822,7 @@ run_test    "IAM API: users, keys, inline policies"  iam_api_ok
 run_test    "IAM API: managed policies"              iam_managed_ok
 run_test    "IAM API: boundaries, paths, tags"       iam_boundaries_ok
 run_test    "IAM API: policy versions and tags"      iam_versions_ok
+run_test    "IAM API: roles"                         iam_roles_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok

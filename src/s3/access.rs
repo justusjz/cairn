@@ -45,6 +45,8 @@ fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Result<Arc<Polic
         match kind {
             Kind::Identity => None,
             Kind::Bucket(bucket) => Some(bucket.to_owned()),
+            // No bucket's name has a NUL.
+            Kind::Trust => Some("\0trust".to_owned()),
         },
         text.to_owned(),
         ids.map(str::to_owned),
@@ -214,7 +216,7 @@ impl Access {
         // by its name) the principal's own account's. A bucket to create is
         // the principal's, whoever has its name (that's BucketAlreadyExists).
         let owner = match &check.on {
-            On::User(account, _) | On::Users(account, _) => Some(account.as_str()),
+            On::User(account, _) | On::Users(account, _) | On::Role(account, _) | On::Roles(account, _) => Some(account.as_str()),
             // Cairn's (AWS's) policies are no account's: as the principal's own.
             On::Policy(account, _) if account != "aws" => Some(account.as_str()),
             // The account's, whose operators' policies allow them `cairn:`

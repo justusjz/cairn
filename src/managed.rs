@@ -85,20 +85,23 @@ pub enum Refused {
     Malformed(String),
     /// InvalidInput (400).
     Invalid(String),
+    /// NotImplemented (501): what IAM would take, but Cairn can't decide (a
+    /// condition key it doesn't evaluate).
+    Unsupported(String),
 }
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refused::NoSuch(m) | Refused::Exists(m) | Refused::Conflict(m) | Refused::Limit(m) => f.write_str(m),
-            Refused::Malformed(m) | Refused::Invalid(m) | Refused::Validation(m) => f.write_str(m),
+            Refused::Malformed(m) | Refused::Invalid(m) | Refused::Validation(m) | Refused::Unsupported(m) => f.write_str(m),
         }
     }
 }
 
 impl std::error::Error for Refused {}
 
-fn refused<T>(r: Refused) -> anyhow::Result<T> {
+pub(crate) fn refused<T>(r: Refused) -> anyhow::Result<T> {
     Err(r.into())
 }
 
@@ -223,6 +226,10 @@ pub struct Managed {
     pub users: Vec<String>,
     /// The users whose permissions boundary it is, by name.
     pub bounds: Vec<String>,
+    /// The roles it's attached to, by name.
+    pub roles: Vec<String>,
+    /// The roles whose permissions boundary it is, by name.
+    pub role_bounds: Vec<String>,
     /// Its tags, oldest first.
     pub tags: Vec<(String, String)>,
 }
@@ -241,7 +248,10 @@ const COLUMNS: &str = "m.id, m.name, m.description, m.document, m.version,
      m.path,
      ARRAY(SELECT r.name FROM users r WHERE r.boundary_policy_id = m.id ORDER BY r.name),
      ARRAY(SELECT t.key FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq),
-     ARRAY(SELECT t.value FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq)";
+     ARRAY(SELECT t.value FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq),
+     ARRAY(SELECT r.name FROM iam_role_attached_policies x JOIN iam_roles r ON r.id = x.role_id
+           WHERE x.policy_id = m.id ORDER BY r.name),
+     ARRAY(SELECT r.name FROM iam_roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name)";
 
 fn managed_of(row: &tokio_postgres::Row) -> Managed {
     Managed {
@@ -255,6 +265,8 @@ fn managed_of(row: &tokio_postgres::Row) -> Managed {
         path: row.get(7),
         bounds: row.get(8),
         tags: crate::users::tags_of(row.get(9), row.get(10)),
+        roles: row.get(11),
+        role_bounds: row.get(12),
     }
 }
 
@@ -480,11 +492,12 @@ pub async fn describe(client: &Object, account: &str, name: &str, description: &
     Ok(())
 }
 
-/// Deletes the account's managed policy `name`, unless it's attached, or
-/// a user's permissions boundary (whose foreign key keeps it, too).
+/// Deletes the account's managed policy `name`, unless it's attached (to a
+/// user or a role), or a user's or role's permissions boundary (whose
+/// foreign key keeps it, too).
 pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Result<()> {
     let policy = get(client, account, name).await?;
-    if !policy.users.is_empty() || !policy.bounds.is_empty() {
+    if !policy.users.is_empty() || !policy.bounds.is_empty() || !policy.roles.is_empty() || !policy.role_bounds.is_empty() {
         return refused(Refused::Conflict("Cannot delete a policy attached to entities.".into()));
     }
     // Its other versions go first, as in IAM (probed). (One made meanwhile
@@ -499,7 +512,8 @@ pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Resul
     let deleted = client
         .execute_cached(
             "DELETE FROM managed_policies m WHERE m.id = $1
-             AND NOT EXISTS (SELECT 1 FROM user_attached_policies x WHERE x.policy_id = m.id)",
+             AND NOT EXISTS (SELECT 1 FROM user_attached_policies x WHERE x.policy_id = m.id)
+             AND NOT EXISTS (SELECT 1 FROM iam_role_attached_policies x WHERE x.policy_id = m.id)",
             &[&policy.id],
         )
         .await;

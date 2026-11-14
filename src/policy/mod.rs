@@ -220,7 +220,26 @@ pub enum Kind<'a> {
     /// A bucket's: every statement names its principals, and only the
     /// bucket and its objects are resources.
     Bucket(&'a str),
+    /// A role's trust policy (its AssumeRolePolicyDocument): every statement
+    /// names its principals, no resources (it's about the role), and only
+    /// the actions that assume a role (`TRUST_ACTIONS`).
+    Trust,
 }
+
+/// The actions a trust policy may name (probed: no wildcards, not
+/// `NotAction`).
+pub const TRUST_ACTIONS: &[&str] = &[
+    "sts:AssumeRole",
+    "sts:AssumeRoleWithWebIdentity",
+    "sts:AssumeRoleWithSAML",
+    "sts:TagSession",
+    "sts:SetSourceIdentity",
+    "sts:SetContext",
+];
+
+/// The condition keys of STS's that Cairn decides, lowercase, in trust
+/// policies.
+const STS_KEYS: &[&str] = &["sts:externalid", "sts:rolesessionname", "sts:sourceidentity", "sts:transitivetagkeys"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Policy {
@@ -263,6 +282,13 @@ struct Principals {
     users: Vec<(String, String)>,
     /// Accounts (an ID, or its root ARN).
     accounts: Vec<String>,
+    /// Roles, by their account, and path and name, as users (trust
+    /// policies').
+    roles: Vec<(String, String)>,
+    /// Role sessions, by their account, role name and session name
+    /// (`arn:aws:sts::<account>:assumed-role/<role>/<session>`; trust
+    /// policies').
+    sessions: Vec<(String, String, String)>,
 }
 
 impl Principals {
@@ -368,6 +394,18 @@ impl Policy {
         self.principals().flat_map(|p| p.accounts.iter().map(String::as_str))
     }
 
+    /// The roles it names as principals, (account, path and name): they
+    /// must exist.
+    pub fn roles(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.principals().flat_map(|p| p.roles.iter().map(|(a, n)| (a.as_str(), n.as_str())))
+    }
+
+    /// The role sessions it names as principals, (account, role name,
+    /// session name): their roles must exist.
+    pub fn sessions(&self) -> impl Iterator<Item = (&str, &str, &str)> {
+        self.principals().flat_map(|p| p.sessions.iter().map(|(a, r, s)| (a.as_str(), r.as_str(), s.as_str())))
+    }
+
     fn principals(&self) -> impl Iterator<Item = &Principals> {
         self.statements.iter().filter_map(|s| s.principals.as_ref())
     }
@@ -468,7 +506,7 @@ impl Policy {
         let mut normalized = Vec::new();
         for statement in statements {
             let Json::Object(fields) = statement else { return Err(syntax()) };
-            if kind == Kind::Identity
+            if matches!(kind, Kind::Identity | Kind::Trust)
                 && let Some((_, Json::String(sid))) = fields.iter().find(|(name, _)| name == "Sid")
             {
                 // IAM's; S3 takes the same Sid twice (probed).
@@ -543,7 +581,7 @@ fn s3_actions(name: &str, kind: Kind) -> Vec<&'static (&'static str, Applies, &'
     ACTIONS
         .iter()
         .filter(|(action, applies, _)| match kind {
-            Kind::Identity => true,
+            Kind::Identity | Kind::Trust => true,
             Kind::Bucket(_) => matches!(applies, Applies::Bucket | Applies::Object) && *action != "CreateBucket",
         })
         .filter(|(action, _, _)| pattern.matches(action, true))
@@ -605,12 +643,12 @@ impl Statement {
         let principals = match (kind, either("Principal")) {
             (Kind::Identity, Some(_)) => return Err(Invalid::malformed("Policy document should not specify a principal.")),
             (Kind::Identity, None) => None,
-            (Kind::Bucket(_), None) => return Err(Invalid::malformed("Missing required field Principal")),
-            (Kind::Bucket(_), Some((not, value))) => {
+            (Kind::Bucket(_) | Kind::Trust, None) => return Err(Invalid::malformed("Missing required field Principal")),
+            (Kind::Bucket(_) | Kind::Trust, Some((not, value))) => {
                 if not && allow {
                     return Err(Invalid::malformed("Allow with NotPrincipal is not allowed."));
                 }
-                let (principals, text) = parse_principals(not, value, rename)?;
+                let (principals, text) = parse_principals(not, value, kind, rename)?;
                 out.push(format!("\"{}Principal\":{text}", if not { "Not" } else { "" }));
                 Some(principals)
             }
@@ -621,6 +659,11 @@ impl Statement {
         let actions = Matches { not, patterns: strings(actions)? };
         if actions.patterns.is_empty() {
             return Err(Invalid::malformed("Missing required field Action cannot be empty!"));
+        }
+        if kind == Kind::Trust
+            && (actions.not || !actions.patterns.iter().all(|a| TRUST_ACTIONS.iter().any(|t| t.eq_ignore_ascii_case(a))))
+        {
+            return Err(Invalid::malformed("AssumeRole policy may only specify STS AssumeRole actions."));
         }
         out.push(format!("\"{}Action\":{}", if not { "Not" } else { "" }, one_or_list(&actions.patterns)));
         // The actions each pattern names (with wildcards, several).
@@ -647,15 +690,22 @@ impl Statement {
                 return Err(invalid());
             }
         }
-        let Some((not, resources)) = either("Resource") else {
-            return Err(Invalid::malformed("Statement is missing required element"));
+        // A trust policy's statements are about the role whose it is.
+        let resources = match (kind, either("Resource")) {
+            (Kind::Trust, Some((not, _))) => {
+                return Err(Invalid::malformed(format!("Has prohibited field {}Resource", if not { "Not" } else { "" })));
+            }
+            (Kind::Trust, None) => Matches { not: false, patterns: vec!["*".to_owned()] },
+            (_, None) => return Err(Invalid::malformed("Statement is missing required element")),
+            (_, Some((not, resources))) => Matches { not, patterns: strings(resources)? },
         };
-        let resources = Matches { not, patterns: strings(resources)? };
         let mut kinds = Vec::new();
-        for resource in &resources.patterns {
-            kinds.push(resource_kind(resource, kind)?);
+        if kind != Kind::Trust {
+            for resource in &resources.patterns {
+                kinds.push(resource_kind(resource, kind)?);
+            }
+            out.push(format!("\"{}Resource\":{}", if resources.not { "Not" } else { "" }, one_or_list(&resources.patterns)));
         }
-        out.push(format!("\"{}Resource\":{}", if not { "Not" } else { "" }, one_or_list(&resources.patterns)));
         // As S3 checks a bucket policy: each action must apply to one of the
         // statement's resources (an object action to an object, ...).
         if let Kind::Bucket(_) = kind
@@ -700,7 +750,7 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
     let invalid = || Invalid::malformed("Policy has invalid resource");
     if resource == "*" {
         return match kind {
-            Kind::Identity => Ok(None),
+            Kind::Identity | Kind::Trust => Ok(None),
             Kind::Bucket(_) => Err(invalid()),
         };
     }
@@ -742,10 +792,17 @@ fn is_account(id: &str) -> bool {
 fn parse_principals(
     not: bool,
     value: &Json,
+    kind: Kind,
     rename: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(Principals, String), Invalid> {
-    let invalid = || Invalid::malformed("Invalid principal in policy");
-    let mut principals = Principals { not, everyone: false, users: Vec::new(), accounts: Vec::new() };
+    let trust = kind == Kind::Trust;
+    // IAM's message names the principal (probed); S3's doesn't.
+    let invalid_one = |what: &str, id: &str| match trust {
+        true => Invalid::malformed(format!("Invalid principal in policy: {}:{}", string(what), string(id))),
+        false => Invalid::malformed("Invalid principal in policy"),
+    };
+    let mut principals =
+        Principals { not, everyone: false, users: Vec::new(), accounts: Vec::new(), roles: Vec::new(), sessions: Vec::new() };
     let entries = match value {
         Json::String(s) if s == "*" => {
             principals.everyone = true;
@@ -770,34 +827,59 @@ fn parse_principals(
                     if is_account(id) {
                         *id = format!("arn:aws:iam::{id}:root");
                     }
+                    let shown = id.clone();
+                    let invalid = || invalid_one("AWS", &shown);
+                    // A role's session (trust policies').
+                    if let Some(rest) = id.strip_prefix("arn:aws:sts::").filter(|_| trust) {
+                        let (account, what) = rest.split_once(':').ok_or_else(invalid)?;
+                        let session = what.strip_prefix("assumed-role/").and_then(|s| s.split_once('/'));
+                        match session {
+                            Some((role, session))
+                                if is_account(account) && !role.is_empty() && !session.is_empty() && !id.contains(['*', '?']) =>
+                            {
+                                principals.sessions.push((account.to_owned(), role.to_owned(), session.to_owned()));
+                            }
+                            _ => return Err(invalid()),
+                        }
+                        continue;
+                    }
                     let rest = id.strip_prefix("arn:aws:iam::").ok_or_else(invalid)?;
                     let (account, what) = rest.split_once(':').ok_or_else(invalid)?;
                     if !is_account(account) {
                         return Err(invalid());
                     }
-                    match what.strip_prefix("user/") {
-                        _ if what == "root" => principals.accounts.push(account.to_owned()),
+                    let named = |prefix: &str| what.strip_prefix(prefix).filter(|n| !n.is_empty() && !n.contains(['*', '?']));
+                    if what == "root" {
+                        principals.accounts.push(account.to_owned());
+                    } else if let Some(user) = named("user/") {
                         // A user, by its path and name.
-                        Some(user) if !user.is_empty() && !user.contains(['*', '?']) => {
-                            principals.users.push((account.to_owned(), user.to_owned()));
-                            if let Some(name) = rename(id) {
-                                *id = name;
-                            }
+                        principals.users.push((account.to_owned(), user.to_owned()));
+                        if let Some(name) = rename(id) {
+                            *id = name;
                         }
-                        // Roles and the rest: Cairn has none.
-                        _ => return Err(invalid()),
+                    } else if let Some(role) = named("role/").filter(|_| trust) {
+                        principals.roles.push((account.to_owned(), role.to_owned()));
+                        if let Some(name) = rename(id) {
+                            *id = name;
+                        }
+                    } else {
+                        return Err(invalid());
                     }
+                }
+                // IAM keeps them sorted (probed).
+                if trust {
+                    ids.sort();
                 }
             }
             // AWS services and identity providers never call Cairn: they're
             // named, and never match.
             "Service" | "Federated" => {
-                if ids.iter().any(|id| id.is_empty() || id.contains('*')) {
-                    return Err(invalid());
+                if let Some(id) = ids.iter().find(|id| id.is_empty() || id.contains('*')) {
+                    return Err(invalid_one(kind, id));
                 }
             }
             // There are no canonical user IDs in Cairn.
-            "CanonicalUser" => return Err(invalid()),
+            "CanonicalUser" => return Err(invalid_one(kind, &ids[0])),
             _ => return Err(syntax()),
         }
         out.push(format!("{}:{}", string(kind), one_or_list(&ids)));
@@ -837,9 +919,18 @@ fn parse_conditions(
                 // request has it.
                 None if lower.starts_with("aws:") => {}
                 None if lower.starts_with("s3:") => return Err(invalid_key()),
+                // STS's, in a trust policy: those Cairn decides, the rest
+                // refused as undecidable.
+                None if kind == Kind::Trust && lower.starts_with("sts:") => {
+                    if !STS_KEYS.iter().any(|k| *k == lower) {
+                        unsupported.get_or_insert_with(|| key.clone());
+                    }
+                }
                 // Another service's: no request to Cairn has it. Only in
-                // identity policies (probed).
-                None if kind == Kind::Identity && lower.split_once(':').is_some_and(|(s, k)| !s.is_empty() && !k.is_empty()) => {}
+                // identity and trust policies (probed: IAM takes keys it
+                // doesn't know).
+                None if matches!(kind, Kind::Identity | Kind::Trust)
+                    && lower.split_once(':').is_some_and(|(s, k)| !s.is_empty() && !k.is_empty()) => {}
                 None => return Err(invalid_key()),
             }
             // Numbers and booleans may be written without quotes.
