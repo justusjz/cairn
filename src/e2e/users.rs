@@ -352,6 +352,11 @@ async fn operators_are_users_with_cairn_actions() {
     assert!(may("boss", "cairn:PutSetting", On::Cluster).await);
     assert!(may("boss", "s3:GetObject", object()).await);
     assert!(!may("nobody", "cairn:GetCluster", On::Cluster).await);
+    // A policy may name the cluster by its ARN.
+    let named = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"cairn:GetCluster","Resource":"arn:aws:cairn:::cluster"}]}"#;
+    users::put_policy(&client, &account, "nobody", "cluster", named).await.unwrap();
+    assert!(may("nobody", "cairn:GetCluster", On::Cluster).await);
+    assert!(!may("nobody", "cairn:PutSetting", On::Cluster).await);
 }
 
 /// Migration 45 makes the operator account's people the account's (see

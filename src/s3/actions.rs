@@ -47,6 +47,10 @@ pub enum On {
     Cluster,
 }
 
+/// The cluster's ARN, which `cairn:` actions are on: Cairn's own resource,
+/// with no equivalent in AWS, so named as S3's are (no region or account).
+pub const CLUSTER_ARN: &str = "arn:aws:cairn:::cluster";
+
 impl On {
     /// Its ARN.
     pub fn arn(&self) -> String {
@@ -57,7 +61,7 @@ impl On {
             On::User(account, name) => format!("arn:aws:iam::{account}:user/{name}"),
             On::Users(account, prefix) => format!("arn:aws:iam::{account}:user/{prefix}"),
             On::Policy(account, name) => format!("arn:aws:iam::{account}:policy/{name}"),
-            On::Cluster => "arn:cairn:::cluster".to_owned(),
+            On::Cluster => CLUSTER_ARN.to_owned(),
         }
     }
 
