@@ -13,11 +13,11 @@
 //! (`AdministratorAccess`) may do all of it in its account, and a user what
 //! its policies allow (its own keys, say). Another account's users are none.
 //!
-//! What's there: users (no paths, tags or permissions boundaries: refused),
-//! access keys, inline policies, and managed policies (see `managed`):
-//! Cairn's, which have AWS's names, and an account's own, of which Cairn
-//! keeps one version, the default. Groups and roles aren't
-//! (NotImplemented).
+//! What's there: users, with paths, tags and permissions boundaries (see
+//! `plans/boundaries.md`, probed), access keys, inline policies, and managed
+//! policies (see `managed`): Cairn's, which have AWS's names, and an
+//! account's own, with paths (no tags), of which Cairn keeps one version,
+//! the default. Groups and roles aren't (NotImplemented).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -32,8 +32,8 @@ use crate::{
     auth::Signed,
     managed::{self, Named},
     db::Cached,
-    policy::Verdict,
-    roles::{self, Principal},
+    policy::{Context, Verdict},
+    roles::{self, Principal, Target},
     s3::{
         access::{Access, Origin},
         actions::{Check, On},
@@ -85,6 +85,11 @@ impl From<anyhow::Error> for Error {
             Ok(Refused::Limit(m)) => return error(StatusCode::CONFLICT, "LimitExceeded", m),
             Ok(Refused::Malformed(m)) => return error(StatusCode::BAD_REQUEST, "MalformedPolicyDocument", m),
             Ok(Refused::Invalid(m)) => return invalid(m),
+            Ok(Refused::Validation(m)) => return validation(m),
+            Err(e) => e,
+        };
+        let e = match e.downcast::<roles::TooManyTags>() {
+            Ok(too_many) => return error(StatusCode::CONFLICT, "LimitExceeded", too_many.to_string()),
             Err(e) => e,
         };
         match e.downcast::<roles::Invalid>() {
@@ -227,7 +232,7 @@ async fn respond(
     let inner = match (signed.service.as_str(), action.as_str()) {
         ("sts", "GetCallerIdentity") => Some(format!(
             "<Arn>{}</Arn><UserId>{}</UserId><Account>{}</Account>",
-            xml_escape(&user_arn(&principal.account, &principal.name)),
+            xml_escape(&principal.arn()),
             user_id(principal.id),
             principal.account
         )),
@@ -236,6 +241,12 @@ async fn respond(
         (_, "ListUsers") => iam.list_users(&params).await?,
         (_, "CreateUser") => iam.create_user(&params).await?,
         (_, "DeleteUser") => iam.delete_user(&params).await?,
+        (_, "UpdateUser") => iam.update_user(&params).await?,
+        (_, "PutUserPermissionsBoundary") => iam.put_user_permissions_boundary(&params).await?,
+        (_, "DeleteUserPermissionsBoundary") => iam.delete_user_permissions_boundary(&params).await?,
+        (_, "TagUser") => iam.tag_user(&params).await?,
+        (_, "UntagUser") => iam.untag_user(&params).await?,
+        (_, "ListUserTags") => iam.list_user_tags(&params).await?,
         (_, "CreateAccessKey") => iam.create_access_key(&params).await?,
         (_, "ListAccessKeys") => iam.list_access_keys(&params).await?,
         (_, "UpdateAccessKey") => iam.update_access_key(&params).await?,
@@ -261,15 +272,11 @@ async fn respond(
             return Err(error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                format!("Cairn's IAM has users, access keys, inline and managed policies; not {other}"),
+                format!("Cairn's IAM has users (with paths, tags and permissions boundaries), access keys, inline and managed policies; not {other}"),
             ));
         }
     };
     Ok((action, inner))
-}
-
-fn user_arn(account: &str, name: &str) -> String {
-    format!("arn:aws:iam::{account}:user/{name}")
 }
 
 /// A user's ID as IAM shows one (`AIDA`, then 17 characters), from its
@@ -292,12 +299,139 @@ struct Iam<'a> {
     access: &'a mut Access,
 }
 
-/// A user of the signer's account.
-struct User {
-    id: uuid::Uuid,
-    name: String,
-    admin: bool,
-    created: String,
+/// What a 403 says the resource was: a user that exists by its name (`user
+/// NAME`), anything else by its ARN (probed).
+enum Shown {
+    Arn,
+    User(String),
+}
+
+/// The tags a request sets (`Tags.member.N.Key` and `.Value`), checked as
+/// IAM checks them (probed): at most 50, keys of 1 to 128 characters, values
+/// of at most 256, of letters, digits, spaces and `_.:/=+-@`, no `aws:` keys,
+/// no key twice regardless of case. `None` if it sets none.
+fn request_tags(params: &Params, required: bool) -> Result<Option<Vec<(String, String)>>> {
+    let mut tags = Vec::new();
+    for n in 1.. {
+        let key = params.get(&format!("Tags.member.{n}.Key"));
+        let value = params.get(&format!("Tags.member.{n}.Value"));
+        if key.is_none() && value.is_none() {
+            break;
+        }
+        tags.push((key.unwrap_or("").to_owned(), value.unwrap_or("").to_owned()));
+    }
+    if tags.is_empty() {
+        return match required {
+            true if params.has_list("Tags") => Err(invalid("Error occurred while validating input. ")),
+            true => params.required("Tags").map(|_| None),
+            false => Ok(None),
+        };
+    }
+    if tags.len() > MAX_TAGS {
+        return Err(validation(format!(
+            "1 validation error detected: Value at 'tags' failed to satisfy constraint: Member must have length less than or equal to {MAX_TAGS}"
+        )));
+    }
+    let mut errors = Vec::new();
+    for (i, (key, value)) in tags.iter().enumerate() {
+        let at = |what: &str| format!("Value at 'tags.{}.member.{what}' failed to satisfy constraint: Member must", i + 1);
+        errors.extend(tag_errors(key, &at("key"), 1, 128));
+        errors.extend(tag_errors(value, &at("value"), 0, 256));
+    }
+    if !errors.is_empty() {
+        return Err(validation(validation_errors(&errors)));
+    }
+    if tags.iter().any(|(key, _)| key.to_ascii_lowercase().starts_with("aws:")) {
+        return Err(invalid("Tag keys beginning with aws: are reserved for system use."));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if !tags.iter().all(|(key, _)| seen.insert(key.to_lowercase())) {
+        return Err(invalid("Duplicate tag keys found. Please note that Tag keys are case insensitive."));
+    }
+    Ok(Some(tags))
+}
+
+use roles::MAX_TAGS;
+
+/// What's wrong with a tag's key or value (`text`), as IAM's validation
+/// errors say it (`at`: where, and "Member must"): its length (`min` to
+/// `max` characters), and its characters.
+fn tag_errors(text: &str, at: &str, min: usize, max: usize) -> Vec<String> {
+    let mut errors = Vec::new();
+    let length = text.chars().count();
+    if length < min {
+        errors.push(format!("{at} have length greater than or equal to {min}"));
+    }
+    if length > max {
+        errors.push(format!("{at} have length less than or equal to {max}"));
+    }
+    let fine = roles::tag_char;
+    let pattern = if min > 0 { "+" } else { "*" };
+    if (min > 0 && text.is_empty()) || !text.chars().all(fine) {
+        errors.push(format!("{at} satisfy regular expression pattern: [\\p{{L}}\\p{{Z}}\\p{{N}}_.:/=+\\-@]{pattern}"));
+    }
+    errors
+}
+
+/// Validation errors, as IAM lists them.
+fn validation_errors(errors: &[String]) -> String {
+    let s = if errors.len() == 1 { "" } else { "s" };
+    format!("{} validation error{s} detected: {}", errors.len(), errors.join("; "))
+}
+
+/// The keys a request names (`TagKeys.member.N`).
+fn request_keys(params: &Params) -> Result<Vec<String>> {
+    let keys: Vec<String> = (1..).map_while(|n| params.get(&format!("TagKeys.member.{n}")).map(str::to_owned)).collect();
+    if keys.is_empty() {
+        params.required("TagKeys")?;
+    }
+    if keys.len() > MAX_TAGS {
+        return Err(validation(format!(
+            "1 validation error detected: Value at 'tagKeys' failed to satisfy constraint: Member must have length less than or equal to {MAX_TAGS}"
+        )));
+    }
+    let mut errors = Vec::new();
+    for (i, key) in keys.iter().enumerate() {
+        let at = format!("Value at 'tagKeys.{}.member' failed to satisfy constraint: Member must", i + 1);
+        errors.extend(tag_errors(key, &at, 1, 128));
+    }
+    if !errors.is_empty() {
+        return Err(validation(validation_errors(&errors)));
+    }
+    Ok(keys)
+}
+
+use roles::request_tags_context as tags_context;
+
+/// Tags as IAM writes them, in `element`.
+fn tags_xml(element: &str, tags: &[(String, String)]) -> String {
+    let members: String = tags
+        .iter()
+        .map(|(k, v)| format!("<member><Key>{}</Key><Value>{}</Value></member>", xml_escape(k), xml_escape(v)))
+        .collect();
+    format!("<{element}>{members}</{element}>")
+}
+
+/// A requested permissions boundary (`PermissionsBoundary`), checked as IAM
+/// checks its length (probed): the ARN, or `None`.
+fn requested_boundary(params: &Params) -> Result<Option<String>> {
+    match params.get("PermissionsBoundary") {
+        None => Ok(None),
+        Some(arn) if arn.len() < 20 || arn.len() > 2048 => {
+            let (bound, n) = if arn.len() < 20 { ("greater", 20) } else { ("less", 2048) };
+            Err(validation(format!(
+                "1 validation error detected: Value at 'permissionsBoundary' failed to satisfy constraint: Member must have length {bound} than or equal to {n}"
+            )))
+        }
+        Some(arn) => Ok(Some(arn.to_owned())),
+    }
+}
+
+/// A path a request gives as `param` (`Path`, ...), checked; `/` if none.
+fn requested_path(params: &Params, param: &str) -> Result<String> {
+    let path = params.get(param).unwrap_or("/");
+    roles::check_path(path, &lower_first(param), false).map_err(validation)?;
+    Ok(path.to_owned())
 }
 
 impl Iam<'_> {
@@ -307,84 +441,107 @@ impl Iam<'_> {
 
     /// Refuses the request unless `action` on `on` is allowed, as IAM says.
     async fn check(&mut self, action: &'static str, on: On) -> Result<()> {
+        self.check_with(action, on, &Context::default(), Shown::Arn).await
+    }
+
+    /// As `check`, with the condition keys `extra` too, saying what the
+    /// resource is as `shown`.
+    async fn check_with(&mut self, action: &'static str, on: On, extra: &Context, shown: Shown) -> Result<()> {
         let check = Check { action, on };
         self.access.load_all(self.app, std::slice::from_ref(&check)).await?;
-        let verdict = self.access.verdict(&check);
+        let verdict = self.access.verdict_with(&check, extra);
         if verdict == Verdict::Allow {
             return Ok(());
         }
-        let why = match verdict {
-            Verdict::ExplicitDeny { .. } => "with an explicit deny in an identity-based policy".to_owned(),
-            _ => format!("because no identity-based policy allows the {action} action"),
+        let resource = match shown {
+            Shown::Arn => check.on.arn(),
+            Shown::User(name) => format!("user {name}"),
         };
         Err(error(
             StatusCode::FORBIDDEN,
             "AccessDenied",
             format!(
-                "User: {} is not authorized to perform: {action} on resource: {} {why}",
-                user_arn(self.account(), &self.principal.name),
-                check.on.arn()
+                "User: {} is not authorized to perform: {action} on resource: {resource} {}",
+                self.principal.arn(),
+                verdict.why(action, self.access.boundary())
             ),
         ))
     }
 
     /// The user a request names (`UserName`), or its signer: allowed
-    /// `action` on it, and one of its account.
-    async fn user(&mut self, params: &Params, action: &'static str) -> Result<User> {
+    /// `action` on it (with its condition keys, and `extra`), and one of its
+    /// account. `missing`: what a user that isn't there is.
+    async fn target(&mut self, params: &Params, action: &'static str, extra: Context, missing: fn(&str) -> Error) -> Result<Target> {
         let name = params.get("UserName").unwrap_or(&self.principal.name).to_owned();
-        self.check(action, On::User(self.account().to_owned(), name.clone())).await?;
-        let row = self
-            .client
-            .query_opt_cached(
-                &format!("SELECT id, name, admin, {ISO} FROM roles WHERE name = $1 AND account_id = $2"),
-                &[&name, &self.account()],
-            )
-            .await?
-            .ok_or_else(|| no_such_user(&name))?;
-        Ok(User { id: row.get(0), name: row.get(1), admin: row.get(2), created: row.get(3) })
+        let target = Target::load(self.client, self.account(), &name).await?;
+        let (on, mut context) = match &target {
+            Some(target) => (target.on(), target.context(action)),
+            None => (On::user(self.account(), "/", &name), Context::default()),
+        };
+        context.extend(&extra);
+        self.check_with(action, on, &context, Shown::User(name.clone())).await?;
+        target.ok_or_else(|| missing(&name))
     }
 
-    fn user_xml(&self, user: &User) -> String {
-        format!(
-            "<Path>/</Path><UserName>{}</UserName><UserId>{}</UserId><Arn>{}</Arn><CreateDate>{}</CreateDate>",
+    /// `target`, for a user that isn't there being IAM's usual NoSuchEntity.
+    async fn user(&mut self, params: &Params, action: &'static str) -> Result<Target> {
+        self.target(params, action, Context::default(), no_such_user).await
+    }
+
+    /// A user as IAM shows it: in lists (`full`: not), without its
+    /// boundary and tags.
+    fn user_xml(user: &Target, full: bool) -> String {
+        let mut xml = format!(
+            "<Path>{}</Path><UserName>{}</UserName><UserId>{}</UserId><Arn>{}</Arn><CreateDate>{}</CreateDate>",
+            xml_escape(&user.path),
             xml_escape(&user.name),
             user_id(user.id),
-            xml_escape(&user_arn(self.account(), &user.name)),
+            xml_escape(&user.arn()),
             user.created
-        )
+        );
+        if full {
+            if let Some(boundary) = &user.boundary {
+                xml.push_str(&format!(
+                    "<PermissionsBoundary><PermissionsBoundaryType>Policy</PermissionsBoundaryType>\
+                     <PermissionsBoundaryArn>{}</PermissionsBoundaryArn></PermissionsBoundary>",
+                    xml_escape(boundary)
+                ));
+            }
+            if !user.tags.is_empty() {
+                xml.push_str(&tags_xml("Tags", &user.tags));
+            }
+        }
+        xml
     }
 
     async fn get_user(&mut self, params: &Params) -> Result<Option<String>> {
         let user = self.user(params, "iam:GetUser").await?;
-        Ok(Some(format!("<User>{}</User>", self.user_xml(&user))))
+        Ok(Some(format!("<User>{}</User>", Self::user_xml(&user, true))))
     }
 
     async fn list_users(&mut self, params: &Params) -> Result<Option<String>> {
-        self.check("iam:ListUsers", On::Users(self.account().to_owned())).await?;
-        // There are no paths: every user's is `/`.
-        if params.get("PathPrefix").is_some_and(|p| !"/".starts_with(p) && !p.starts_with('/')) {
-            return Err(validation("a path prefix starts with /"));
-        }
-        let none = params.get("PathPrefix").is_some_and(|p| p != "/" && !p.is_empty());
+        let prefix = params.get("PathPrefix").unwrap_or("/").to_owned();
+        roles::check_path(&prefix, "pathPrefix", true).map_err(validation)?;
+        self.check("iam:ListUsers", On::users(self.account(), &prefix)).await?;
         let max = max_items(params)?;
         let after = params.get("Marker").unwrap_or("");
         let rows = self
             .client
             .query_cached(
-                &format!(
-                    "SELECT id, name, admin, {ISO} FROM roles WHERE account_id = $1 AND name > $2 ORDER BY name LIMIT $3"
-                ),
-                &[&self.account(), &after, &(max as i64 + 1)],
+                "SELECT name FROM roles WHERE account_id = $1 AND name > $2 AND starts_with(path, $3)
+                 ORDER BY name LIMIT $4",
+                &[&self.account(), &after, &prefix, &(max as i64 + 1)],
             )
             .await?;
-        let users: Vec<User> = if none {
-            Vec::new()
-        } else {
-            rows.iter().map(|r| User { id: r.get(0), name: r.get(1), admin: r.get(2), created: r.get(3) }).collect()
-        };
+        let mut users = Vec::new();
+        for row in &rows {
+            if let Some(user) = Target::load(self.client, self.account(), row.get(0)).await? {
+                users.push(user);
+            }
+        }
         let truncated = users.len() > max;
         let listed = &users[..users.len().min(max)];
-        let members: String = listed.iter().map(|u| format!("<member>{}</member>", self.user_xml(u))).collect();
+        let members: String = listed.iter().map(|u| format!("<member>{}</member>", Self::user_xml(u, false))).collect();
         let marker = match (truncated, listed.last()) {
             (true, Some(last)) => format!("<Marker>{}</Marker>", xml_escape(&last.name)),
             _ => String::new(),
@@ -394,39 +551,96 @@ impl Iam<'_> {
 
     async fn create_user(&mut self, params: &Params) -> Result<Option<String>> {
         let name = params.required("UserName")?.to_owned();
-        if params.get("Path").is_some_and(|p| p != "/") {
-            return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn's users have no paths but /"));
+        let path = requested_path(params, "Path")?;
+        let tags = request_tags(params, false)?;
+        let boundary = requested_boundary(params)?;
+        let on = On::user(self.account(), &path, &name);
+        // As IAM: the boundary asked for, and the tags (which take TagUser
+        // too: probed).
+        let mut context = tags.as_deref().map(tags_context).unwrap_or_default();
+        if let Some(arn) = &boundary {
+            context.set("iam:PermissionsBoundary", arn);
         }
-        if params.has_list("Tags.") {
-            return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn's users have no tags"));
+        self.check_with("iam:CreateUser", on.clone(), &context, Shown::Arn).await?;
+        if tags.is_some() {
+            self.check_with("iam:TagUser", on, &context, Shown::Arn).await?;
         }
-        if params.get("PermissionsBoundary").is_some() {
-            return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn has no permissions boundaries yet"));
-        }
-        self.check("iam:CreateUser", On::User(self.account().to_owned(), name.clone())).await?;
+        let boundary = match &boundary {
+            Some(arn) => Some(managed::boundary(self.client, self.account(), arn).await?),
+            None => None,
+        };
         let exists = self
             .client
-            .query_opt_cached("SELECT 1 FROM roles WHERE name = $1 AND account_id = $2", &[&name, &self.account()])
+            .query_opt_cached("SELECT 1 FROM roles WHERE lower(name) = lower($1) AND account_id = $2", &[&name, &self.account()])
             .await?
             .is_some();
         if exists {
             return Err(error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists.")));
         }
-        roles::create_without_key(self.client, self.account(), &name).await.map_err(|e| match e.downcast::<roles::Invalid>() {
-            Ok(invalid) if invalid.0.contains("already") => {
+        roles::create_user(self.client, self.account(), &name, &path, boundary.as_ref()).await.map_err(|e| {
+            match e.downcast::<roles::Invalid>() {
+                Ok(invalid) if invalid.0.contains("already") => {
+                    error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists."))
+                }
+                Ok(invalid) => validation(invalid.0),
+                Err(e) => e.into(),
+            }
+        })?;
+        let user = Target::load(self.client, self.account(), &name).await?.ok_or_else(|| no_such_user(&name))?;
+        if let Some(tags) = &tags {
+            roles::tag(self.client, user.id, tags).await?;
+        }
+        let user = Target::load(self.client, self.account(), &name).await?.ok_or_else(|| no_such_user(&name))?;
+        Ok(Some(format!("<User>{}</User>", Self::user_xml(&user, true))))
+    }
+
+    /// UpdateUser: moves (`NewPath`) or renames (`NewUserName`) a user,
+    /// which takes iam:UpdateUser on it and on where it goes: its new path
+    /// (`user/<path>`), or, renamed, its new ARN (probed).
+    async fn update_user(&mut self, params: &Params) -> Result<Option<String>> {
+        params.required("UserName")?;
+        let new_path = match params.get("NewPath") {
+            Some(_) => Some(requested_path(params, "NewPath")?),
+            None => None,
+        };
+        let new_name = params.get("NewUserName").map(str::to_owned);
+        let user = self.user(params, "iam:UpdateUser").await?;
+        let path = new_path.clone().unwrap_or_else(|| user.path.clone());
+        let to = match &new_name {
+            Some(name) => On::user(self.account(), &path, name),
+            None => On::users(self.account(), &path),
+        };
+        if new_path.is_some() || new_name.is_some() {
+            self.check("iam:UpdateUser", to).await?;
+        }
+        if let Some(name) = &new_name
+            && !name.eq_ignore_ascii_case(&user.name)
+        {
+            let exists = self
+                .client
+                .query_opt_cached("SELECT 1 FROM roles WHERE lower(name) = lower($1) AND account_id = $2", &[&name, &self.account()])
+                .await?
+                .is_some();
+            if exists {
+                return Err(error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists.")));
+            }
+        }
+        let name = new_name.unwrap_or_else(|| user.name.clone());
+        roles::rename(self.client, self.account(), user.id, &name, &path).await.map_err(|e| match e.downcast::<roles::Invalid>() {
+            Ok(i) if i.0.contains("already") => {
                 error(StatusCode::CONFLICT, "EntityAlreadyExists", format!("User with name {name} already exists."))
             }
-            Ok(invalid) => validation(invalid.0),
+            Ok(i) => validation(i.0),
             Err(e) => e.into(),
         })?;
-        let user = self.user(&Params([("UserName".to_owned(), name)].into()), "iam:CreateUser").await?;
-        Ok(Some(format!("<User>{}</User>", self.user_xml(&user))))
+        Ok(None)
     }
 
     async fn delete_user(&mut self, params: &Params) -> Result<Option<String>> {
         params.required("UserName")?;
         let user = self.user(params, "iam:DeleteUser").await?;
-        // As IAM: what's attached to a user goes first.
+        // As IAM: what's attached to a user goes first (but its boundary and
+        // tags: probed).
         let conflict = |what: &str| {
             error(StatusCode::CONFLICT, "DeleteConflict", format!("Cannot delete entity, must {what} first."))
         };
@@ -437,7 +651,7 @@ impl Iam<'_> {
         if count("SELECT count(*) FROM access_keys WHERE role_id = $1").await? > 0 {
             return Err(conflict("delete access keys"));
         }
-        if count("SELECT count(*) FROM role_policies WHERE role_id = $1").await? > 0 {
+        if count("SELECT count(*) FROM role_policies WHERE role_id = $1 AND name NOT LIKE 'cairn:%'").await? > 0 {
             return Err(conflict("delete policies"));
         }
         if user.admin || count("SELECT count(*) FROM role_attached_policies WHERE role_id = $1").await? > 0 {
@@ -445,6 +659,71 @@ impl Iam<'_> {
         }
         roles::delete(self.client, self.account(), &user.name).await?;
         Ok(None)
+    }
+
+    async fn put_user_permissions_boundary(&mut self, params: &Params) -> Result<Option<String>> {
+        params.required("UserName")?;
+        let Some(arn) = requested_boundary(params)? else {
+            params.required("PermissionsBoundary")?;
+            unreachable!()
+        };
+        // Decided by the boundary asked for (probed).
+        let mut extra = Context::default();
+        extra.set("iam:PermissionsBoundary", &arn);
+        let not_found = |name: &str| error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("User {name} was not found."));
+        let user = self.target(params, "iam:PutUserPermissionsBoundary", extra, not_found).await?;
+        let boundary = managed::boundary(self.client, self.account(), &arn).await?;
+        if !roles::set_boundary(self.client, self.account(), user.id, Some(&boundary)).await? {
+            return Err(not_found(&user.name));
+        }
+        Ok(None)
+    }
+
+    async fn delete_user_permissions_boundary(&mut self, params: &Params) -> Result<Option<String>> {
+        params.required("UserName")?;
+        let not_found = |name: &str| error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("User {name} was not found."));
+        let user = self.target(params, "iam:DeleteUserPermissionsBoundary", Context::default(), not_found).await?;
+        if user.boundary.is_none() {
+            return Err(error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Principal {} does not have scope", user_id(user.id))));
+        }
+        roles::set_boundary(self.client, self.account(), user.id, None).await?;
+        Ok(None)
+    }
+
+    async fn tag_user(&mut self, params: &Params) -> Result<Option<String>> {
+        params.required("UserName")?;
+        let tags = request_tags(params, true)?.unwrap_or_default();
+        let user = self.target(params, "iam:TagUser", tags_context(&tags), no_such_user).await?;
+        roles::tag(self.client, user.id, &tags).await?;
+        Ok(None)
+    }
+
+    async fn untag_user(&mut self, params: &Params) -> Result<Option<String>> {
+        params.required("UserName")?;
+        let keys = request_keys(params)?;
+        let mut extra = Context::default();
+        extra.set_all("aws:TagKeys", keys.clone());
+        let user = self.target(params, "iam:UntagUser", extra, no_such_user).await?;
+        roles::untag(self.client, user.id, &keys).await?;
+        Ok(None)
+    }
+
+    async fn list_user_tags(&mut self, params: &Params) -> Result<Option<String>> {
+        params.required("UserName")?;
+        let user = self.user(params, "iam:ListUserTags").await?;
+        let max = max_items(params)?;
+        // A marker is where the next page starts.
+        let start: usize = match params.get("Marker") {
+            Some(m) => m.parse().map_err(|_| invalid("Invalid Marker."))?,
+            None => 0,
+        };
+        let page: Vec<(String, String)> = user.tags.iter().skip(start).take(max).cloned().collect();
+        let truncated = start + page.len() < user.tags.len();
+        let marker = match truncated {
+            true => format!("<Marker>{}</Marker>", start + page.len()),
+            false => String::new(),
+        };
+        Ok(Some(format!("{}<IsTruncated>{truncated}</IsTruncated>{marker}", tags_xml("Tags", &page))))
     }
 
     async fn create_access_key(&mut self, params: &Params) -> Result<Option<String>> {
@@ -500,7 +779,7 @@ impl Iam<'_> {
     }
 
     /// The access key a request names, of `user`.
-    async fn key_of(&self, params: &Params, user: &User) -> Result<String> {
+    async fn key_of(&self, params: &Params, user: &Target) -> Result<String> {
         let id = params.required("AccessKeyId")?.to_owned();
         let mine = self
             .client
@@ -580,7 +859,10 @@ impl Iam<'_> {
         let user = self.user(params, "iam:ListUserPolicies").await?;
         let rows = self
             .client
-            .query_cached("SELECT name FROM role_policies WHERE role_id = $1 ORDER BY name", &[&user.id])
+            .query_cached(
+                "SELECT name FROM role_policies WHERE role_id = $1 AND name NOT LIKE 'cairn:%' ORDER BY name",
+                &[&user.id],
+            )
             .await?;
         let members: String = rows.iter().map(|r| format!("<member>{}</member>", xml_escape(r.get::<_, &str>(0)))).collect();
         Ok(Some(format!("<PolicyNames>{members}</PolicyNames><IsTruncated>false</IsTruncated>")))
@@ -602,7 +884,9 @@ impl Iam<'_> {
         params.required("UserName")?;
         let arn = params.required("PolicyArn")?.to_owned();
         let action = if attach { "iam:AttachUserPolicy" } else { "iam:DetachUserPolicy" };
-        let user = self.user(params, action).await?;
+        let mut extra = Context::default();
+        extra.set("iam:PolicyARN", &arn);
+        let user = self.target(params, action, extra, no_such_user).await?;
         managed::attach(self.client, self.account(), &user.name, &arn, attach).await?;
         Ok(None)
     }
@@ -631,8 +915,8 @@ impl Iam<'_> {
             error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} does not exist or is not attachable."))
         })?;
         let on = match &named {
-            Named::Aws(p) => On::Policy("aws".to_owned(), p.name.to_owned()),
-            Named::Own(name) => On::Policy(self.account().to_owned(), name.clone()),
+            Named::Aws(p) => On::policy("aws", "/", p.name),
+            Named::Own { path, name } => On::policy(self.account(), path, name),
         };
         self.check(action, on).await?;
         self.load_policy(named).await
@@ -648,11 +932,23 @@ impl Iam<'_> {
         Ok(match named {
             Named::Aws(p) => {
                 let arn = managed::aws_arn(p.name);
+                let bounds = self
+                    .client
+                    .query_cached(
+                        "SELECT id FROM roles WHERE account_id = $1 AND boundary_aws = $2 ORDER BY name",
+                        &[&self.account(), &p.name],
+                    )
+                    .await?
+                    .iter()
+                    .map(|r| r.get(0))
+                    .collect();
                 Policy {
                     users: users(arn.clone()).await?,
+                    bounds,
                     arn,
                     id: managed::policy_id(None, p.name),
                     name: p.name.to_owned(),
+                    path: "/".to_owned(),
                     description: p.description.to_owned(),
                     document: p.document.to_owned(),
                     version: 1,
@@ -662,27 +958,31 @@ impl Iam<'_> {
                     aws: true,
                 }
             }
-            Named::Own(name) => {
+            Named::Own { path, name } => {
+                let not_found = || {
+                    let arn = managed::arn(self.account(), &path, &name);
+                    error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} was not found."))
+                };
                 let row = self
                     .client
                     .query_opt_cached(
                         "SELECT id, name, description, document, version,
                                 to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
-                                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')
-                         FROM managed_policies WHERE account_id = $1 AND name = $2",
-                        &[&self.account(), &name],
+                                to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                                ARRAY(SELECT r.id FROM roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name)
+                         FROM managed_policies m WHERE account_id = $1 AND name = $2 AND path = $3",
+                        &[&self.account(), &name, &path],
                     )
                     .await?
-                    .ok_or_else(|| {
-                        let arn = managed::arn(self.account(), &name);
-                        error(StatusCode::NOT_FOUND, "NoSuchEntity", format!("Policy {arn} was not found."))
-                    })?;
-                let arn = managed::arn(self.account(), &name);
+                    .ok_or_else(not_found)?;
+                let arn = managed::arn(self.account(), &path, &name);
                 Policy {
                     users: users(arn.clone()).await?,
+                    bounds: row.get(7),
                     arn,
                     id: managed::policy_id(Some(row.get(0)), &name),
                     name: row.get(1),
+                    path,
                     description: row.get(2),
                     document: row.get(3),
                     version: row.get(4),
@@ -700,14 +1000,16 @@ impl Iam<'_> {
             false => format!("<Description>{}</Description>", xml_escape(&policy.description)),
         };
         format!(
-            "<PolicyName>{}</PolicyName><DefaultVersionId>v{}</DefaultVersionId><PolicyId>{}</PolicyId><Path>/</Path>\
-             <Arn>{}</Arn><AttachmentCount>{}</AttachmentCount><PermissionsBoundaryUsageCount>0</PermissionsBoundaryUsageCount>\
+            "<PolicyName>{}</PolicyName><DefaultVersionId>v{}</DefaultVersionId><PolicyId>{}</PolicyId><Path>{}</Path>\
+             <Arn>{}</Arn><AttachmentCount>{}</AttachmentCount><PermissionsBoundaryUsageCount>{}</PermissionsBoundaryUsageCount>\
              <IsAttachable>true</IsAttachable>{description}<CreateDate>{}</CreateDate><UpdateDate>{}</UpdateDate>",
             xml_escape(&policy.name),
             policy.version,
             policy.id,
+            xml_escape(&policy.path),
             xml_escape(&policy.arn),
             policy.users.len(),
+            policy.bounds.len(),
             policy.created,
             policy.updated
         )
@@ -716,21 +1018,21 @@ impl Iam<'_> {
     async fn create_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let name = params.required("PolicyName")?.to_owned();
         let document = params.required("PolicyDocument")?;
-        if params.get("Path").is_some_and(|p| p != "/") {
-            return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn's policies have no paths but /"));
-        }
+        let path = requested_path(params, "Path")?;
         if params.has_list("Tags.") {
             return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", "Cairn's policies have no tags"));
         }
-        self.check("iam:CreatePolicy", On::Policy(self.account().to_owned(), name.clone())).await?;
-        managed::create(self.client, self.account(), &name, document, params.get("Description").unwrap_or("")).await?;
-        let policy = self.load_policy(Named::Own(name)).await?;
+        self.check("iam:CreatePolicy", On::policy(self.account(), &path, &name)).await?;
+        managed::create(self.client, self.account(), &name, &path, document, params.get("Description").unwrap_or("")).await?;
+        let policy = self.load_policy(Named::Own { path, name }).await?;
         Ok(Some(format!("<Policy>{}</Policy>", Self::policy_xml(&policy))))
     }
 
     async fn get_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:GetPolicy").await?;
-        Ok(Some(format!("<Policy>{}</Policy>", Self::policy_xml(&policy))))
+        // With its tags, which GetPolicy shows (none: Cairn's policies have
+        // none yet), as CreatePolicy and ListPolicies don't (probed).
+        Ok(Some(format!("<Policy>{}<Tags/></Policy>", Self::policy_xml(&policy))))
     }
 
     /// Refuses changing one of Cairn's (AWS's) policies.
@@ -755,8 +1057,8 @@ impl Iam<'_> {
             return Err(validation("Scope is All, AWS or Local"));
         }
         let only_attached = params.get("OnlyAttached") == Some("true");
-        // There are no paths: every policy's is `/`.
-        let none = params.get("PathPrefix").is_some_and(|p| p != "/" && !p.is_empty());
+        let prefix = params.get("PathPrefix").unwrap_or("/").to_owned();
+        roles::check_path(&prefix, "pathPrefix", true).map_err(validation)?;
         let mut policies = Vec::new();
         if scope != "Local" {
             for p in managed::AWS_POLICIES {
@@ -765,10 +1067,10 @@ impl Iam<'_> {
         }
         if scope != "AWS" {
             for p in managed::list(self.client, self.account()).await? {
-                policies.push(self.load_policy(Named::Own(p.name)).await?);
+                policies.push(self.load_policy(Named::Own { path: p.path, name: p.name }).await?);
             }
         }
-        policies.retain(|p| !none && (!only_attached || !p.users.is_empty()));
+        policies.retain(|p| p.path.starts_with(&prefix) && (!only_attached || !p.users.is_empty()));
         // Paged by ARN.
         policies.sort_by(|a, b| a.arn.cmp(&b.arn));
         if let Some(after) = params.get("Marker") {
@@ -839,7 +1141,7 @@ impl Iam<'_> {
             ));
         }
         managed::update(self.client, self.account(), &policy.name, document).await?;
-        let policy = self.load_policy(Named::Own(policy.name)).await?;
+        let policy = self.load_policy(Named::Own { path: policy.path, name: policy.name }).await?;
         Ok(Some(format!("<PolicyVersion>{}</PolicyVersion>", Self::version_xml(&policy, false))))
     }
 
@@ -858,12 +1160,32 @@ impl Iam<'_> {
         Ok(None)
     }
 
+    /// ListEntitiesForPolicy: the users it's attached to, and those whose
+    /// permissions boundary it is (`PolicyUsageFilter`: one or the other;
+    /// probed).
     async fn list_entities_for_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:ListEntitiesForPolicy").await?;
-        let users = match params.get("EntityFilter") {
-            None | Some("User") => policy.users.clone(),
-            Some(_) => Vec::new(),
+        let (attached, bounded) = match params.get("PolicyUsageFilter") {
+            None => (true, true),
+            Some("PermissionsPolicy") => (true, false),
+            Some("PermissionsBoundary") => (false, true),
+            Some(other) => {
+                return Err(validation(format!(
+                    "1 validation error detected: Value '{other}' at 'policyUsageFilter' failed to satisfy constraint: \
+                     Member must satisfy enum value set: [PermissionsPolicy, PermissionsBoundary]"
+                )));
+            }
         };
+        let mut users = Vec::new();
+        if matches!(params.get("EntityFilter"), None | Some("User")) {
+            if attached {
+                users.extend(policy.users.iter().copied());
+            }
+            if bounded {
+                let more: Vec<uuid::Uuid> = policy.bounds.iter().copied().filter(|id| !users.contains(id)).collect();
+                users.extend(more);
+            }
+        }
         let mut members = String::new();
         for id in users {
             let name: String = self.client.query_one_cached("SELECT name FROM roles WHERE id = $1", &[&id]).await?.get(0);
@@ -884,6 +1206,8 @@ struct Policy {
     arn: String,
     id: String,
     name: String,
+    /// Its path (`/`, or `/…/`).
+    path: String,
     description: String,
     document: String,
     version: i32,
@@ -891,6 +1215,8 @@ struct Policy {
     updated: String,
     /// The users it's attached to (their IDs).
     users: Vec<uuid::Uuid>,
+    /// The users whose permissions boundary it is (their IDs).
+    bounds: Vec<uuid::Uuid>,
     /// Whether it's one of Cairn's (AWS's).
     aws: bool,
 }

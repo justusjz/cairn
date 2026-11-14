@@ -2480,6 +2480,76 @@ iam_managed_ok() {
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
+# Delegated user management, as AWS's guide has it: a permissions boundary
+# caps what a user's policies allow (identity policies and its own IAM
+# actions alike), and a delegated admin may make users under a path only
+# with that boundary, tags and all, but can't take it off them.
+iam_boundaries_ok() {
+    local t="$(date +%s)" b="bnd-$(date +%s)" doc="$WORK_DIR/iam-bnd.json" acct key id secret out
+    local boss="boss-$t" made="made-$t" bnd arn
+    acct=$(awss3 sts get-caller-identity --query Account --output text 2>/dev/null) || return 1
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    # The boundary: list the bucket, and manage users under /team/.
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::'"$b"'"},
+        {"Effect":"Allow","Action":"iam:*","Resource":"arn:aws:iam::'"$acct"':user/team/*"}]}' > "$doc"
+    bnd=$(awss3 iam create-policy --policy-name "$b" --path /bounds/ --policy-document "file://$doc" \
+        --query Policy.Arn --output text 2>/dev/null) || return 1
+    [ "$bnd" = "arn:aws:iam::$acct:policy/bounds/$b" ] || return 1
+    # The delegated admin: everything on /team/ users, but only with the
+    # boundary; and it has the boundary itself.
+    awss3 iam create-user --user-name "$boss" --path /team/ --permissions-boundary "$bnd" \
+        --tags Key=team,Value=a >/dev/null 2>&1 || return 1
+    awss3 iam get-user --user-name "$boss" --query User.PermissionsBoundary.PermissionsBoundaryArn \
+        --output text 2>/dev/null | grep -qx "$bnd" || return 1
+    awss3 iam get-user --user-name "$boss" --query User.Arn --output text 2>/dev/null \
+        | grep -qx "arn:aws:iam::$acct:user/team/$boss" || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"},
+        {"Effect":"Allow","Action":["iam:CreateUser","iam:PutUserPolicy","iam:TagUser"],"Resource":"arn:aws:iam::'"$acct"':user/team/*",
+         "Condition":{"StringEquals":{"iam:PermissionsBoundary":"'"$bnd"'"}}},
+        {"Effect":"Allow","Action":["iam:GetUser","iam:CreateAccessKey"],"Resource":"arn:aws:iam::'"$acct"':user/team/*"}]}' > "$doc"
+    awss3 iam put-user-policy --user-name "$boss" --policy-name delegated --policy-document "file://$doc" >/dev/null 2>&1 || return 1
+    key=$(awss3 iam create-access-key --user-name "$boss" \
+        --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>/dev/null) || return 1
+    id=$(echo "$key" | cut -f1); secret=$(echo "$key" | cut -f2)
+    # Its s3:* is capped by the boundary: it lists, but can't write.
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    out=$(as_role "$id" "$secret" s3api put-object --bucket "$b" --key x --body "$SMALL" 2>&1) && return 1
+    echo "$out" | grep -q 'because no permissions boundary allows the s3:PutObject action' || return 1
+    # It makes users under /team/ with the boundary, not without, nor elsewhere.
+    out=$(as_role "$id" "$secret" iam create-user --user-name "$made" --path /team/ 2>&1) && return 1
+    echo "$out" | grep -q 'not authorized to perform: iam:CreateUser' || return 1
+    ! as_role "$id" "$secret" iam create-user --user-name "$made" --permissions-boundary "$bnd" >/dev/null 2>&1 || return 1
+    as_role "$id" "$secret" iam create-user --user-name "$made" --path /team/ --permissions-boundary "$bnd" \
+        >/dev/null 2>&1 || return 1
+    # Nor can it take the boundary off (its policy doesn't allow it, though
+    # its boundary would).
+    out=$(as_role "$id" "$secret" iam delete-user-permissions-boundary --user-name "$made" 2>&1) && return 1
+    echo "$out" | grep -q 'because no identity-based policy allows the iam:DeleteUserPermissionsBoundary' || return 1
+    awss3 iam list-entities-for-policy --policy-arn "$bnd" --policy-usage-filter PermissionsBoundary \
+        --query 'length(PolicyUsers)' --output text 2>/dev/null | grep -qx 2 || return 1
+    out=$(awss3 iam delete-policy --policy-arn "$bnd" 2>&1) && return 1
+    echo "$out" | grep -q DeleteConflict || return 1
+    # Tags: case-insensitive keys, shown by GetUser and ListUserTags.
+    awss3 iam tag-user --user-name "$made" --tags Key=Env,Value=dev >/dev/null 2>&1 || return 1
+    awss3 iam tag-user --user-name "$made" --tags Key=env,Value=prod >/dev/null 2>&1 || return 1
+    awss3 iam list-user-tags --user-name "$made" --query 'Tags[0].[Key,Value]' --output text 2>/dev/null \
+        | grep -qP '^env\tprod$' || return 1
+    awss3 iam list-users --path-prefix /team/ --query 'length(Users)' --output text 2>/dev/null | grep -qx 2 || return 1
+    # Moved and renamed.
+    awss3 iam update-user --user-name "$made" --new-path /elsewhere/ --new-user-name "$made-2" >/dev/null 2>&1 || return 1
+    awss3 iam get-user --user-name "$made-2" --query User.Arn --output text 2>/dev/null \
+        | grep -qx "arn:aws:iam::$acct:user/elsewhere/$made-2" || return 1
+    for u in "$boss" "$made-2"; do
+        awss3 iam delete-user-permissions-boundary --user-name "$u" >/dev/null 2>&1 || return 1
+    done
+    awss3 iam delete-access-key --user-name "$boss" --access-key-id "$id" >/dev/null 2>&1 || return 1
+    awss3 iam delete-user-policy --user-name "$boss" --policy-name delegated >/dev/null 2>&1 || return 1
+    awss3 iam delete-user --user-name "$boss" >/dev/null 2>&1 || return 1
+    awss3 iam delete-user --user-name "$made-2" >/dev/null 2>&1 || return 1
+    awss3 iam delete-policy --policy-arn "$bnd" >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
 # writer holds read/write on $OBUCKET only. It can use its own bucket, but can't
 # copy out of $BUCKET (no read on the source), nor reach an upload in $BUCKET by
 # its ID through its own bucket's URL.
@@ -2663,6 +2733,7 @@ run_test    "ListBuckets filtered by grants"        list_buckets_filtered_ok
 run_test    "Admin has AdministratorAccess"          admin_scope_ok
 run_test    "IAM API: users, keys, inline policies"  iam_api_ok
 run_test    "IAM API: managed policies"              iam_managed_ok
+run_test    "IAM API: boundaries, paths, tags"       iam_boundaries_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok

@@ -54,10 +54,16 @@ impl Context {
         self.values.insert(key.to_ascii_lowercase(), vec![value.into()]);
     }
 
-    /// A multivalued key's values (none of Cairn's requests have one yet).
-    #[cfg(test)]
+    /// A multivalued key's values (`aws:TagKeys`).
     pub fn set_all(&mut self, key: &str, values: Vec<String>) {
         self.values.insert(key.to_ascii_lowercase(), values);
+    }
+
+    /// Sets every key `other` has, as it has it.
+    pub fn extend(&mut self, other: &Context) {
+        for (key, values) in &other.values {
+            self.values.insert(key.clone(), values.clone());
+        }
     }
 
     pub fn get(&self, key: &str) -> Option<&[String]> {
@@ -118,8 +124,29 @@ pub enum Verdict {
     /// A statement denies it, in an identity policy (`identity`) or the
     /// bucket's.
     ExplicitDeny { identity: bool },
+    /// A statement of the user's permissions boundary denies it.
+    BoundaryDeny,
     /// Nothing allows it.
     ImplicitDeny,
+    /// Its permissions boundary doesn't allow it (and no bucket policy
+    /// allows it by itself).
+    OutsideBoundary,
+}
+
+impl Verdict {
+    /// Why a request for `action` was denied, as AWS's messages end
+    /// (probed): `boundary` is the ARN of the user's permissions boundary.
+    pub fn why(self, action: &str, boundary: Option<&str>) -> String {
+        match self {
+            Verdict::ExplicitDeny { identity: true } => "with an explicit deny in an identity-based policy".to_owned(),
+            Verdict::ExplicitDeny { identity: false } => "with an explicit deny in a resource-based policy".to_owned(),
+            Verdict::BoundaryDeny => {
+                format!("with an explicit deny in a permissions boundary: {}", boundary.unwrap_or_default())
+            }
+            Verdict::OutsideBoundary => format!("because no permissions boundary allows the {action} action"),
+            _ => format!("because no identity-based policy allows the {action} action"),
+        }
+    }
 }
 
 /// The verdict on a request by `identity` (the user's policies; none count
@@ -132,14 +159,20 @@ pub fn verdict<'p>(
     bucket: Option<&'p Policy>,
     request: &Request,
 ) -> Verdict {
-    verdict_across(identity, bucket, request, false)
+    verdict_across(identity, None, bucket, request, false)
 }
 
-/// As `verdict`, for a resource of another account than the principal's
-/// (`cross`), when that's so: then an identity policy's Allow alone isn't
+/// As `verdict`, for a user whose permissions boundary is `boundary`, and a
+/// resource of another account than the principal's (`cross`), when those
+/// are so. A boundary caps what the identity policies allow: they allow
+/// only what it allows too, and a Deny in it denies. Within the account, a
+/// bucket policy's Allow (which, there, is always one naming the user
+/// itself, or everyone: see `Principals::about`) isn't capped by it
+/// (probed). Across accounts, an identity policy's Allow alone isn't
 /// enough, nor the bucket's alone: both must allow it, as in AWS.
 pub fn verdict_across<'p>(
     identity: impl IntoIterator<Item = &'p Policy>,
+    boundary: Option<&'p Policy>,
     bucket: Option<&'p Policy>,
     request: &Request,
     cross: bool,
@@ -153,16 +186,27 @@ pub fn verdict_across<'p>(
             Decision::NotApplicable => {}
         }
     }
+    let boundary_allows = match boundary.filter(|_| !anonymous).map(|policy| policy.evaluate(request)) {
+        Some(Decision::Deny) => return Verdict::BoundaryDeny,
+        Some(Decision::Allow) | None => true,
+        Some(Decision::NotApplicable) => false,
+    };
     let bucket_allows = match bucket.map(|policy| policy.evaluate_across(request, cross)) {
         Some(Decision::Deny) => return Verdict::ExplicitDeny { identity: false },
         Some(Decision::Allow) => true,
         _ => false,
     };
     let allowed = match cross && !anonymous {
-        true => identity_allows && bucket_allows,
-        false => identity_allows || bucket_allows,
+        true => identity_allows && boundary_allows && bucket_allows,
+        false => identity_allows && boundary_allows || bucket_allows,
     };
-    if allowed { Verdict::Allow } else { Verdict::ImplicitDeny }
+    // A boundary that doesn't allow it is why, whether or not an identity
+    // policy does (probed).
+    match allowed {
+        true => Verdict::Allow,
+        false if !boundary_allows => Verdict::OutsideBoundary,
+        false => Verdict::ImplicitDeny,
+    }
 }
 
 /// The actions on a bucket's policy, which its account's root may always
@@ -231,7 +275,9 @@ struct Principals {
     not: bool,
     /// `"*"`, or `{"AWS": "*"}`: everyone, anonymous too.
     everyone: bool,
-    /// Users, by their account and name (`arn:aws:iam::<account>:user/<name>`).
+    /// Users, by their account, and path and name
+    /// (`arn:aws:iam::<account>:user/<path…/name>`, without the path's
+    /// leading `/`).
     users: Vec<(String, String)>,
     /// Accounts (an ID, or its root ARN).
     accounts: Vec<String>,
@@ -249,9 +295,12 @@ impl Principals {
                 let whole = self.accounts.iter().any(|a| a == account);
                 (self.everyone || whole) != self.not
             }
-            Principal::User { account, name, id } => {
+            Principal::User { account, id, .. } => {
+                // By its ID: the user the ARN named when the policy was
+                // set, renamed or moved since or not (probed), and not one
+                // that has the ARN since.
                 let user = self.users.iter().any(|(a, n)| {
-                    a == account && n == name && ids.get(&user_arn(a, n)).is_some_and(|named| named == id)
+                    a == account && ids.get(&user_arn(a, n)).is_some_and(|named| named == id)
                 });
                 let whole = self.accounts.iter().any(|a| a == account);
                 if self.not {
@@ -748,8 +797,7 @@ fn parse_principals(
                     }
                     match what.strip_prefix("user/") {
                         _ if what == "root" => principals.accounts.push(account.to_owned()),
-                        // A user (Cairn's have no paths; one with a path is
-                        // a user there isn't).
+                        // A user, by its path and name.
                         Some(user) if !user.is_empty() && !user.contains(['*', '?']) => {
                             principals.users.push((account.to_owned(), user.to_owned()));
                             if let Some(name) = rename(id) {

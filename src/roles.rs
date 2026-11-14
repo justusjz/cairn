@@ -80,6 +80,12 @@ pub struct Principal {
     /// documents of its attached managed policies (but AdministratorAccess,
     /// which is `admin`).
     pub policies: Vec<String>,
+    /// Its path (`/`, or `/…/`), which its ARN has before its name.
+    pub path: String,
+    /// Its tags (`aws:PrincipalTag/…`), as they were set.
+    pub tags: Vec<(String, String)>,
+    /// Its permissions boundary, which caps what its policies allow.
+    pub boundary: Option<Boundary>,
     /// Grants, for tests of what they allowed before they were bucket
     /// policies (`s3::authorize`); grants are statements of buckets'
     /// policies now (see `grants`).
@@ -91,7 +97,40 @@ pub struct Principal {
     delete_version: HashSet<String>,
 }
 
+/// A user's permissions boundary: a managed policy's ARN and document.
+#[derive(Clone, Debug)]
+pub struct Boundary {
+    pub arn: String,
+    pub document: String,
+}
+
+/// A user's ARN: its account's, its path's and its name's.
+pub fn user_arn(account: &str, path: &str, name: &str) -> String {
+    format!("arn:aws:iam::{account}:user/{}{name}", path.strip_prefix('/').unwrap_or(path))
+}
+
+/// The SQL of a user `r`'s boundary's ARN (NULL if it has none), as its
+/// managed policy's (`managed::arn`) or Cairn's.
+pub const BOUNDARY_ARN: &str = "(SELECT coalesce(
+        (SELECT 'arn:aws:iam::' || m.account_id || ':policy/' || substring(m.path FROM 2) || m.name
+         FROM managed_policies m WHERE m.id = r.boundary_policy_id),
+        'arn:aws:iam::aws:policy/' || r.boundary_aws))";
+
+/// The SQL of a user `r`'s tags: keys, then values, newest first.
+pub const TAG_KEYS: &str = "ARRAY(SELECT t.key FROM role_tags t WHERE t.role_id = r.id ORDER BY t.seq DESC)";
+pub const TAG_VALUES: &str = "ARRAY(SELECT t.value FROM role_tags t WHERE t.role_id = r.id ORDER BY t.seq DESC)";
+
+/// Tags as two lists (keys, values), paired.
+pub fn tags_of(keys: Vec<String>, values: Vec<String>) -> Vec<(String, String)> {
+    keys.into_iter().zip(values).collect()
+}
+
 impl Principal {
+    /// Its ARN.
+    pub fn arn(&self) -> String {
+        user_arn(&self.account, &self.path, &self.name)
+    }
+
     /// Loads the user whose active access key `access_key` is, or `None` if
     /// there's none.
     pub async fn load(client: &Object, access_key: &str) -> anyhow::Result<Option<Self>> {
@@ -117,11 +156,15 @@ impl Principal {
         let row = client
             .query_opt_cached(
                 &format!("SELECT {secret}, r.admin, r.id, r.name, r.account_id,
-                        ARRAY(SELECT document FROM role_policies WHERE role_id = r.id ORDER BY name),
+                        ARRAY(SELECT document FROM role_policies
+                              WHERE role_id = r.id AND name NOT LIKE 'cairn:%' ORDER BY name),
                         ARRAY(SELECT m.document FROM role_attached_policies x
                               JOIN managed_policies m ON m.id = x.policy_id WHERE x.role_id = r.id ORDER BY m.name),
                         ARRAY(SELECT x.aws_policy FROM role_attached_policies x
-                              WHERE x.role_id = r.id AND x.aws_policy IS NOT NULL ORDER BY x.aws_policy)
+                              WHERE x.role_id = r.id AND x.aws_policy IS NOT NULL ORDER BY x.aws_policy),
+                        r.path, {TAG_KEYS}, {TAG_VALUES}, {BOUNDARY_ARN},
+                        (SELECT m.document FROM managed_policies m WHERE m.id = r.boundary_policy_id),
+                        r.boundary_aws
                  {from}"),
                 &[param],
             )
@@ -135,6 +178,17 @@ impl Principal {
                 policies.extend(aws.iter().filter_map(|name| crate::managed::aws(name)).map(|p| p.document.to_owned()));
                 policies
             },
+            path: r.get(8),
+            tags: tags_of(r.get(9), r.get(10)),
+            boundary: r.get::<_, Option<String>>(11).and_then(|arn| {
+                let document = r
+                    .get::<_, Option<String>>(12)
+                    .or_else(|| r.get::<_, Option<String>>(13).and_then(|name| crate::managed::aws(&name)).map(|p| p.document.to_owned()))
+                    // One of Cairn's that this Cairn doesn't know: it
+                    // allows nothing, rather than everything.
+                    .unwrap_or_else(|| r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}"#.to_owned());
+                Some(Boundary { arn, document })
+            }),
             secret: r.get(0),
             admin: r.get(1),
             id: r.get(2),
@@ -182,6 +236,9 @@ impl Principal {
             write: on(Permission::Write),
             delete_version: on(Permission::DeleteVersion),
             policies: Vec::new(),
+            path: "/".to_owned(),
+            tags: Vec::new(),
+            boundary: None,
         }
     }
 
@@ -392,7 +449,13 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: RoleArgs, out: &mut cra
             for role in list(&client).await?.into_iter().filter(|r| r.account_id == account_id) {
                 let admin = if role.admin { " (admin)" } else { "" };
                 outln!(out, "{}{admin}", role.name);
-                outln!(out, "  arn:aws:iam::{account_id}:user/{}", role.name);
+                outln!(out, "  {}", user_arn(account_id, &role.path, &role.name));
+                if let Some(boundary) = &role.boundary {
+                    outln!(out, "  boundary {boundary}");
+                }
+                for (key, value) in &role.tags {
+                    outln!(out, "  tag {key}={value}");
+                }
                 outln!(out, "  id {}", role.id);
                 if let Some(entity) = role.kms_entity_id {
                     outln!(out, "  KMS entity {entity}");
@@ -549,14 +612,31 @@ pub async fn create_in(
 /// operator account is a superadmin, by being one, and never gets keys;
 /// it's marked admin for older nodes (see `db`, migration 39).
 pub async fn create_without_key(client: &Object, account_id: &str, name: &str) -> anyhow::Result<()> {
+    create_user(client, account_id, name, "/", None).await
+}
+
+/// Creates a user of the account `account_id`, as `create_without_key`, at
+/// `path` (checked: see `check_path`), with the permissions boundary
+/// `boundary`. Names are unique in an account regardless of case, as IAM's.
+pub async fn create_user(
+    client: &Object,
+    account_id: &str,
+    name: &str,
+    path: &str,
+    boundary: Option<&BoundaryRef>,
+) -> anyhow::Result<()> {
     validate_name(name)?;
+    if boundary.is_some() {
+        refuse_operator(client, account_id, "permissions boundaries").await?;
+    }
+    let (own, aws) = BoundaryRef::columns(boundary);
     let inserted = client
         .execute_cached(
-            "INSERT INTO roles (name, secret, admin, account_id)
-             SELECT $1, 'unusable:' || gen_random_uuid() || gen_random_uuid(), a.operator, a.id
+            "INSERT INTO roles (name, secret, admin, account_id, path, boundary_policy_id, boundary_aws)
+             SELECT $1, 'unusable:' || gen_random_uuid() || gen_random_uuid(), a.operator, a.id, $3, $4, $5
              FROM accounts a WHERE a.id = $2
              ON CONFLICT DO NOTHING",
-            &[&name, &account_id],
+            &[&name, &account_id, &path, &own, &aws],
         )
         .await?;
     if inserted == 0 {
@@ -565,8 +645,264 @@ pub async fn create_without_key(client: &Object, account_id: &str, name: &str) -
     Ok(())
 }
 
+/// A permissions boundary, as a user keeps it: one of its account's managed
+/// policies (by ID), or one of Cairn's (by name).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BoundaryRef {
+    Own(uuid::Uuid),
+    Aws(&'static str),
+}
+
+impl BoundaryRef {
+    /// `roles.boundary_policy_id` and `roles.boundary_aws` for `boundary`.
+    pub fn columns(boundary: Option<&BoundaryRef>) -> (Option<uuid::Uuid>, Option<&'static str>) {
+        match boundary {
+            Some(BoundaryRef::Own(id)) => (Some(*id), None),
+            Some(BoundaryRef::Aws(name)) => (None, Some(*name)),
+            None => (None, None),
+        }
+    }
+}
+
+/// Sets (or, `None`, removes) the permissions boundary of user `id`, of
+/// account `account_id`. A plain UPDATE of the user's row (see catalog.sql's
+/// R(r)), whose trigger keeps the inline policy older Cairns read in its
+/// place (`db::BOUNDARIES`). Whether there's such a user.
+pub async fn set_boundary(client: &Object, account_id: &str, id: uuid::Uuid, boundary: Option<&BoundaryRef>) -> anyhow::Result<bool> {
+    if boundary.is_some() {
+        refuse_operator(client, account_id, "permissions boundaries").await?;
+    }
+    let (own, aws) = BoundaryRef::columns(boundary);
+    let updated = client
+        .execute_cached(
+            "UPDATE roles SET boundary_policy_id = $3, boundary_aws = $4 WHERE id = $1 AND account_id = $2",
+            &[&id, &account_id, &own, &aws],
+        )
+        .await?;
+    Ok(updated == 1)
+}
+
+/// Why a path isn't one, as IAM says (probed), for its parameter `param`
+/// (`path`, `newPath`, `pathPrefix`); `prefix`: a path prefix, which
+/// needn't end in `/`.
+pub fn check_path(path: &str, param: &str, prefix: bool) -> Result<(), String> {
+    if path.len() > 512 {
+        return Err(format!(
+            "1 validation error detected: Value at '{param}' failed to satisfy constraint: Member must have length less than or equal to 512"
+        ));
+    }
+    let shape = match prefix {
+        true => path.starts_with('/'),
+        false => path == "/" || (path.len() >= 3 && path.starts_with('/') && path.ends_with('/')),
+    };
+    let printable = path.bytes().all(|b| (0x21..=0x7e).contains(&b));
+    if !shape || !printable {
+        return Err(match prefix {
+            true => format!(
+                "The specified value for {param} is invalid. It must begin with the / character and contain only alphanumeric characters and/or / characters."
+            ),
+            false => format!(
+                "The specified value for {param} is invalid. It must begin and end with / and contain only alphanumeric characters and/or / characters."
+            ),
+        });
+    }
+    if !path.chars().all(|c| c.is_ascii_alphanumeric() || "+=,.@_-/".contains(c)) {
+        return Err(format!(
+            "The specified value for {param} is invalid. It must begin and end with / and must be alphanumeric, including the following common characters: equal (=), comma (,), period (.), at (@), and hyphen (-)"
+        ));
+    }
+    Ok(())
+}
+
+/// Tags user `id` with `tags` (checked: see `iam`), replacing those it has
+/// of the same keys (regardless of case), unless it would have more than
+/// 50 (T42).
+pub async fn tag(client: &Object, id: uuid::Uuid, tags: &[(String, String)]) -> anyhow::Result<()> {
+    let keys: Vec<&str> = tags.iter().map(|(k, _)| k.as_str()).collect();
+    let values: Vec<&str> = tags.iter().map(|(_, v)| v.as_str()).collect();
+    let status: String = client
+        .query_one_cached("SELECT pg_temp.cairn_tag_role($1, $2, $3, $4)", &[&id, &keys, &values, &(MAX_TAGS as i32)])
+        .await?
+        .get(0);
+    match status.as_str() {
+        "tagged" => Ok(()),
+        "too_many" => Err(TooManyTags.into()),
+        _ => Err(invalid("no such user")),
+    }
+}
+
+/// The most tags a user has, as in IAM.
+pub const MAX_TAGS: usize = 50;
+
+/// Whether `c` may be in a tag's key or value, as in IAM: letters, digits,
+/// spaces and `_.:/=+-@`.
+pub fn tag_char(c: char) -> bool {
+    c.is_alphanumeric() || (c.is_whitespace() && !c.is_control()) || "_.:/=+-@".contains(c)
+}
+
+/// Why `tags` can't be a user's (the console's; the IAM API says it as IAM
+/// does: see `iam`).
+pub fn check_tags(tags: &[(String, String)]) -> Result<(), String> {
+    if tags.len() > MAX_TAGS {
+        return Err(format!("a user has at most {MAX_TAGS} tags"));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (key, value) in tags {
+        if !(1..=128).contains(&key.chars().count()) || value.chars().count() > 256 {
+            return Err("a tag's key is 1 to 128 characters, its value at most 256".to_owned());
+        }
+        if !key.chars().all(tag_char) || !value.chars().all(tag_char) {
+            return Err("tags hold letters, digits, spaces and _.:/=+-@".to_owned());
+        }
+        if key.to_ascii_lowercase().starts_with("aws:") {
+            return Err("Tag keys beginning with aws: are reserved for system use.".to_owned());
+        }
+        if !seen.insert(key.to_lowercase()) {
+            return Err("Duplicate tag keys found. Please note that Tag keys are case insensitive.".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// The condition keys of a request that sets `tags`: `aws:RequestTag/…`
+/// and `aws:TagKeys`.
+pub fn request_tags_context(tags: &[(String, String)]) -> crate::policy::Context {
+    let mut context = crate::policy::Context::default();
+    for (key, value) in tags {
+        context.set(&format!("aws:RequestTag/{key}"), value);
+    }
+    context.set_all("aws:TagKeys", tags.iter().map(|(k, _)| k.clone()).collect());
+    context
+}
+
+/// A user would have more than `MAX_TAGS` tags.
+#[derive(Debug)]
+pub struct TooManyTags;
+
+impl std::fmt::Display for TooManyTags {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The number of tags has reached the maximum limit.")
+    }
+}
+
+impl std::error::Error for TooManyTags {}
+
+/// Removes user `id`'s tags of `keys` (regardless of case), those it has.
+pub async fn untag(client: &Object, id: uuid::Uuid, keys: &[String]) -> anyhow::Result<()> {
+    client
+        .execute_cached(
+            "DELETE FROM role_tags WHERE role_id = $1 AND lower(key) IN (SELECT lower(k) FROM unnest($2::text[]) k)",
+            &[&id, &keys],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Renames user `id` of `account_id` to `name`, at `path` (IAM's
+/// UpdateUser). Its keys, policies and grants are its ID's, and stay; the
+/// bucket policies that name it name its ID (see `db::PRINCIPAL_IDS`).
+pub async fn rename(client: &Object, account_id: &str, id: uuid::Uuid, name: &str, path: &str) -> anyhow::Result<()> {
+    validate_name(name)?;
+    let updated = client
+        .execute_cached("UPDATE roles SET name = $3, path = $4 WHERE id = $1 AND account_id = $2", &[&id, &account_id, &name, &path])
+        .await;
+    match updated {
+        Ok(1) => Ok(()),
+        Ok(_) => Err(invalid(format!("no user named {name:?}"))),
+        Err(e) if e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) => {
+            Err(invalid(format!("a user named {name:?} already exists")))
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// A user as IAM's actions on it are checked (see `iam`): its ARN (its
+/// path, and name), its tags (`aws:ResourceTag/…`) and its boundary
+/// (`iam:PermissionsBoundary`).
+#[derive(Clone, Debug)]
+pub struct Target {
+    pub id: uuid::Uuid,
+    pub account: String,
+    pub name: String,
+    pub path: String,
+    pub admin: bool,
+    /// When it was made (ISO 8601, as IAM writes times).
+    pub created: String,
+    /// Its tags, newest first.
+    pub tags: Vec<(String, String)>,
+    /// Its boundary's ARN.
+    pub boundary: Option<String>,
+}
+
+impl Target {
+    /// User `name` of `account`, if there's one.
+    pub async fn load(client: &Object, account: &str, name: &str) -> anyhow::Result<Option<Target>> {
+        let row = client
+            .query_opt_cached(
+                &format!(
+                    "SELECT r.id, r.name, r.path, r.admin,
+                            to_char(r.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"'),
+                            {TAG_KEYS}, {TAG_VALUES}, {BOUNDARY_ARN}
+                     FROM roles r WHERE r.account_id = $1 AND lower(r.name) = lower($2)"
+                ),
+                &[&account, &name],
+            )
+            .await?;
+        Ok(row.map(|r| Target {
+            id: r.get(0),
+            account: account.to_owned(),
+            name: r.get(1),
+            path: r.get(2),
+            admin: r.get(3),
+            created: r.get(4),
+            tags: tags_of(r.get(5), r.get(6)),
+            boundary: r.get(7),
+        }))
+    }
+
+    /// Its ARN.
+    pub fn arn(&self) -> String {
+        user_arn(&self.account, &self.path, &self.name)
+    }
+
+    /// What IAM's actions on it are checked against.
+    pub fn on(&self) -> crate::s3::actions::On {
+        crate::s3::actions::On::user(&self.account, &self.path, &self.name)
+    }
+
+    /// The condition keys of `action` on it: its tags, as
+    /// `aws:ResourceTag/…` and `iam:ResourceTag/…`, and (for the actions
+    /// that take it, but CreateUser and PutUserPermissionsBoundary, which
+    /// are about the boundary asked for) its boundary, as
+    /// `iam:PermissionsBoundary` (probed).
+    pub fn context(&self, action: &str) -> crate::policy::Context {
+        let mut context = crate::policy::Context::default();
+        for (key, value) in &self.tags {
+            context.set(&format!("aws:ResourceTag/{key}"), value);
+            context.set(&format!("iam:ResourceTag/{key}"), value);
+        }
+        if CURRENT_BOUNDARY_ACTIONS.iter().any(|a| a.eq_ignore_ascii_case(action))
+            && let Some(boundary) = &self.boundary
+        {
+            context.set("iam:PermissionsBoundary", boundary);
+        }
+        context
+    }
+}
+
+/// The actions on a user whose `iam:PermissionsBoundary` is the user's
+/// boundary (as it is), from IAM's service reference (probed).
+const CURRENT_BOUNDARY_ACTIONS: &[&str] = &[
+    "iam:AttachUserPolicy",
+    "iam:DetachUserPolicy",
+    "iam:PutUserPolicy",
+    "iam:DeleteUserPolicy",
+    "iam:DeleteUserPermissionsBoundary",
+];
+
 /// Creates a user of the account `account_id`, with an access key of a
 /// random ID, as IAM makes them: the key's ID and secret.
+#[cfg(test)]
 pub async fn create_for(
     client: &Object,
     account_id: &str,
@@ -686,7 +1022,7 @@ fn generate_key_id() -> anyhow::Result<String> {
 /// User `name` of account `account` (its ID): its ID, if there's one.
 pub async fn id_of(client: &Object, account: &str, name: &str) -> anyhow::Result<uuid::Uuid> {
     client
-        .query_opt_cached("SELECT id FROM roles WHERE account_id = $1 AND name = $2", &[&account, &name])
+        .query_opt_cached("SELECT id FROM roles WHERE account_id = $1 AND lower(name) = lower($2)", &[&account, &name])
         .await?
         .map(|row| row.get(0))
         .ok_or_else(|| invalid(format!("no user named {name:?}")))
@@ -746,7 +1082,7 @@ pub async fn delete_key(client: &Object, user: Option<(&str, &str)>, id: &str) -
         .execute_cached(
             "DELETE FROM access_keys k USING roles r
              WHERE k.access_key_id = $1 AND r.id = k.role_id
-               AND ($2::text IS NULL OR (r.account_id = $2 AND r.name = $3))",
+               AND ($2::text IS NULL OR (r.account_id = $2 AND lower(r.name) = lower($3)))",
             &[&id, &account, &name],
         )
         .await?;
@@ -764,7 +1100,7 @@ pub async fn set_key_active(client: &Object, user: Option<(&str, &str)>, id: &st
         .execute_cached(
             "UPDATE access_keys k SET active = $3 FROM roles r
              WHERE k.access_key_id = $1 AND r.id = k.role_id
-               AND ($2::text IS NULL OR (r.account_id = $2 AND r.name = $4))",
+               AND ($2::text IS NULL OR (r.account_id = $2 AND lower(r.name) = lower($4)))",
             &[&id, &account, &active, &name],
         )
         .await?;
@@ -818,7 +1154,7 @@ pub async fn get_policy(client: &Object, account: &str, user: &str, name: &str) 
     let row = client
         .query_opt_cached(
             "SELECT p.document FROM role_policies p JOIN roles r ON r.id = p.role_id
-             WHERE r.account_id = $3 AND r.name = $1 AND p.name = $2",
+             WHERE r.account_id = $3 AND lower(r.name) = lower($1) AND p.name = $2 AND p.name NOT LIKE 'cairn:%'",
             &[&user, &name, &account],
         )
         .await?;
@@ -830,7 +1166,7 @@ pub async fn delete_policy(client: &Object, account: &str, user: &str, name: &st
     let deleted = client
         .execute_cached(
             "DELETE FROM role_policies p USING roles r
-             WHERE r.id = p.role_id AND r.account_id = $3 AND r.name = $1 AND p.name = $2",
+             WHERE r.id = p.role_id AND r.account_id = $3 AND lower(r.name) = lower($1) AND p.name = $2 AND p.name NOT LIKE 'cairn:%'",
             &[&user, &name, &account],
         )
         .await?;
@@ -859,7 +1195,7 @@ pub async fn update(
     }
     if let Some(admin) = admin {
         let updated = client
-            .execute_cached("UPDATE roles SET admin = $2 WHERE name = $1 AND account_id = $3", &[&name, &admin, &account])
+            .execute_cached("UPDATE roles SET admin = $2 WHERE lower(name) = lower($1) AND account_id = $3", &[&name, &admin, &account])
             .await?;
         if updated == 0 {
             return Err(invalid(format!("no user named {name:?}")));
@@ -870,7 +1206,7 @@ pub async fn update(
         let updated = client
             .execute_cached(
                 "UPDATE access_keys k SET secret = $2 FROM roles r
-                 WHERE r.name = $1 AND r.account_id = $3 AND k.role_id = r.id AND k.access_key_id = r.name",
+                 WHERE lower(r.name) = lower($1) AND r.account_id = $3 AND k.role_id = r.id AND k.access_key_id = r.name",
                 &[&name, &secret, &account],
             )
             .await?;
@@ -953,13 +1289,19 @@ pub struct RoleInfo {
     pub keys: Vec<KeyInfo>,
     /// The names of its inline policies, sorted.
     pub policies: Vec<String>,
+    /// Its path (`/`, or `/…/`).
+    pub path: String,
+    /// Its tags, newest first.
+    pub tags: Vec<(String, String)>,
+    /// Its permissions boundary's ARN.
+    pub boundary: Option<String>,
 }
 
 /// Every role, by name.
 pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
     let rows = client
         .query_cached(
-            "SELECT r.name, r.admin, extract(epoch FROM r.created_at)::float8,
+            &format!("SELECT r.name, r.admin, extract(epoch FROM r.created_at)::float8,
                     NULL, NULL,
                     r.id, r.kms_entity_id,
                     ARRAY(SELECT k.access_key_id FROM access_keys k WHERE k.role_id = r.id
@@ -968,9 +1310,9 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                           ORDER BY k.created_at, k.access_key_id),
                     ARRAY(SELECT extract(epoch FROM k.created_at)::float8 FROM access_keys k
                           WHERE k.role_id = r.id ORDER BY k.created_at, k.access_key_id),
-                    ARRAY(SELECT p.name FROM role_policies p WHERE p.role_id = r.id ORDER BY p.name),
-                    a.id
-             FROM roles r JOIN accounts a ON a.id = r.account_id ORDER BY a.operator, a.name, r.name",
+                    ARRAY(SELECT p.name FROM role_policies p WHERE p.role_id = r.id AND p.name NOT LIKE 'cairn:%' ORDER BY p.name),
+                    a.id, r.path, {TAG_KEYS}, {TAG_VALUES}, {BOUNDARY_ARN}
+             FROM roles r JOIN accounts a ON a.id = r.account_id ORDER BY a.operator, a.name, r.name"),
             &[],
         )
         .await?;
@@ -991,6 +1333,9 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<RoleInfo>> {
                     .collect(),
                 policies: r.get(10),
                 account_id: r.get(11),
+                path: r.get(12),
+                tags: tags_of(r.get(13), r.get(14)),
+                boundary: r.get(15),
             })
         })
         .collect()

@@ -73,8 +73,10 @@
 --           (see `grants`; only deleted now). Locked (exclusively, in
 --           primary-key order) before they're deleted.
 --   R(r)    The role's (user's) row.
---           Exclusive: giving it an access key, or setting an inline
---           policy (I10); deleting the user (by deleting the row).
+--           Exclusive: giving it an access key, setting an inline
+--           policy, or tagging it (I10); deleting the user (by deleting
+--           the row); setting its permissions boundary (a plain UPDATE,
+--           whose trigger keeps the inline policy `cairn:boundary`).
 --   L(l)    A console login's row (see `console`). Exclusive: giving it a
 --           passkey, removing one, linking an identity to it (I10).
 --   E(e)    An enrollment link's row: locked by the transaction that uses
@@ -158,10 +160,12 @@
 --     change the locations; the only other inserts are a pending blob's
 --     sinks, each with a shard of its own. A committed blob has a location
 --     for each of its shards: they change together, under X(x) exclusive.
--- I10. A user has at most two access keys, and its inline policies hold at
---     most 2048 characters (but whitespace) together, as in IAM: making a
---     key, or setting a policy, holds R(r) exclusively, and counts what the
---     user has in a later statement (T28, T29). Likewise a console login
+-- I10. A user has at most two access keys, its inline policies hold at
+--     most 2048 characters (but whitespace) together (but `cairn:boundary`,
+--     which isn't one of its own: see `db::BOUNDARIES`), and it has at most
+--     50 tags, as in IAM: making a key, setting a policy, or tagging it
+--     holds R(r) exclusively, and counts what the user has in a later
+--     statement (T28, T29, T42). Likewise a console login
 --     has at most 8 passkeys, as IAM's MFA devices, and at least one way in
 --     (a passkey, or an identity at an OIDC provider), but by being
 --     deleted, under L(l) (T30, T31, T35, T37); and at most one identity per
@@ -1693,13 +1697,34 @@ BEGIN
         RETURN 'no_such_user';
     END IF;
     IF (SELECT coalesce(sum(length(regexp_replace(document, '\s', '', 'g'))), 0)
-        FROM role_policies WHERE role_id = v_role AND name <> p_name)
+        FROM role_policies WHERE role_id = v_role AND name <> p_name AND name NOT LIKE 'cairn:%')
        + length(regexp_replace(p_document, '\s', '', 'g')) > p_max THEN
         RETURN 'too_big';
     END IF;
     INSERT INTO role_policies (role_id, name, document) VALUES (v_role, p_name, p_document)
     ON CONFLICT (role_id, name) DO UPDATE SET document = EXCLUDED.document;
     RETURN 'set';
+END
+$$;
+
+-- T42: TagUser: sets the user's tags `p_keys` to `p_values` (a key that
+-- differs from one it has only in case replaces it, key and all), unless it
+-- would have more than `p_max` (I10). Takes R(r) exclusively, then counts
+-- in a later statement. Returns 'tagged', 'no_such_user' or 'too_many'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_tag_role(p_role uuid, p_keys text[], p_values text[], p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM roles WHERE id = p_role FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_user';
+    END IF;
+    IF (SELECT count(*) FROM role_tags WHERE role_id = p_role AND lower(key) <> ALL (SELECT lower(k) FROM unnest(p_keys) k))
+       + cardinality(p_keys) > p_max THEN
+        RETURN 'too_many';
+    END IF;
+    DELETE FROM role_tags WHERE role_id = p_role AND lower(key) IN (SELECT lower(k) FROM unnest(p_keys) k);
+    INSERT INTO role_tags (role_id, key, value) SELECT p_role, k, v FROM unnest(p_keys, p_values) AS t(k, v);
+    RETURN 'tagged';
 END
 $$;
 

@@ -576,3 +576,113 @@ fn an_action_sees_only_the_s3_keys_it_takes() {
     // An action that isn't S3's takes no `s3:` key.
     assert!(kept("iam:GetUser").get("s3:authType").is_none());
 }
+
+/// A permissions boundary caps what identity policies allow, as AWS's does
+/// (probed: see `plans/boundaries.md`): a Deny in it denies; a bucket policy
+/// that names the user, or everyone, allows within the account beyond it,
+/// but one that names the account delegates to the identity policies,
+/// which it caps; across accounts, both sides must allow, the boundary too.
+#[test]
+fn a_boundary_caps_identity_policies() {
+    let s3_all = identity_policy(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#);
+    let list_only = identity_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#,
+    );
+    let deny_secret = identity_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"},
+            {"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/secret/*"}]}"#,
+    );
+    let context = context_of("alice");
+    let resource = object("k");
+    let secret = object("secret/k");
+    let request = |resource: &'static str| Request { principal: user("alice"), action: "s3:GetObject", resource, context: &context };
+    let get = Request { resource: &resource, ..request("") };
+    let get_secret = Request { resource: &secret, ..request("") };
+    let decide = |boundary: Option<&Policy>, bucket: Option<&Policy>, request: &Request, cross: bool| {
+        verdict_across([&s3_all], boundary, bucket, request, cross)
+    };
+    assert_eq!(decide(None, None, &get, false), Verdict::Allow);
+    assert_eq!(decide(Some(&list_only), None, &get, false), Verdict::OutsideBoundary);
+    assert_eq!(decide(Some(&deny_secret), None, &get, false), Verdict::Allow);
+    assert_eq!(decide(Some(&deny_secret), None, &get_secret, false), Verdict::BoundaryDeny);
+    // Neither allows: it's the boundary that doesn't (probed).
+    assert_eq!(verdict_across([], Some(&list_only), None, &get, false), Verdict::OutsideBoundary);
+    // A boundary alone allows nothing.
+    assert_eq!(verdict_across([], Some(&s3_all), None, &get, false), Verdict::ImplicitDeny);
+
+    let by_user = bucket_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/alice"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
+    );
+    let by_everyone = bucket_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*",
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
+    );
+    let by_account = bucket_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"123456789012"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
+    );
+    assert_eq!(decide(Some(&list_only), Some(&by_user), &get, false), Verdict::Allow);
+    assert_eq!(verdict_across([], Some(&list_only), Some(&by_user), &get, false), Verdict::Allow);
+    assert_eq!(decide(Some(&list_only), Some(&by_everyone), &get, false), Verdict::Allow);
+    assert_eq!(decide(Some(&list_only), Some(&by_account), &get, false), Verdict::OutsideBoundary);
+    assert_eq!(decide(Some(&deny_secret), Some(&by_user), &get_secret, false), Verdict::BoundaryDeny);
+    // Across accounts: the boundary caps the identity side, which must
+    // allow too.
+    assert_eq!(decide(Some(&list_only), Some(&by_user), &get, true), Verdict::OutsideBoundary);
+    assert_eq!(decide(Some(&s3_all), Some(&by_user), &get, true), Verdict::Allow);
+
+    assert_eq!(
+        Verdict::OutsideBoundary.why("s3:GetObject", Some("arn:aws:iam::123456789012:policy/b")),
+        "because no permissions boundary allows the s3:GetObject action"
+    );
+    assert_eq!(
+        Verdict::BoundaryDeny.why("s3:GetObject", Some("arn:aws:iam::123456789012:policy/b")),
+        "with an explicit deny in a permissions boundary: arn:aws:iam::123456789012:policy/b"
+    );
+}
+
+/// A bucket policy names a user by its ARN, path and all, and decides by
+/// the user's ID: the one it named, renamed or moved since (probed).
+#[test]
+fn names_users_by_their_ids_whatever_their_arns() {
+    let json = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{ACCOUNT}:user/team/bob"}},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
+    );
+    let policy = Policy::parse(&json, Kind::Bucket(BUCKET)).unwrap();
+    assert_eq!(policy.users().collect::<Vec<_>>(), [(ACCOUNT, "team/bob")]);
+    let arn = user_arn(ACCOUNT, "team/bob");
+    let policy = policy.with_ids([(arn.clone(), "id-1".to_owned())].into());
+    let context = Context::default();
+    let resource = object("k");
+    let request = |name, id| Request {
+        principal: Principal::User { account: ACCOUNT, name, id },
+        action: "s3:GetObject",
+        resource: &resource,
+        context: &context,
+    };
+    assert_eq!(policy.evaluate(&request("bob", "id-1")), Decision::Allow);
+    assert_eq!(policy.evaluate(&request("robert", "id-1")), Decision::Allow, "renamed");
+    assert_eq!(policy.evaluate(&request("bob", "id-2")), Decision::NotApplicable);
+    // Shown by its ARN now.
+    let renamed = format!("arn:aws:iam::{ACCOUNT}:user/other/robert");
+    let shown = policy.shown(Kind::Bucket(BUCKET), &[(arn.clone(), renamed.clone())].into());
+    assert!(shown.contains(&renamed) && !shown.contains(&arn), "{shown}");
+}
+
+/// Tags are condition keys whose tag keys are any case (probed).
+#[test]
+fn tag_keys_are_any_case() {
+    let policy = identity_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"iam:GetUser","Resource":"*",
+            "Condition":{"StringEquals":{"aws:ResourceTag/Team":"a","aws:PrincipalTag/dept":"x"}}}]}"#,
+    );
+    let mut context = Context::default();
+    context.set("aws:ResourceTag/team", "a");
+    context.set("aws:PrincipalTag/Dept", "x");
+    let arn = user_arn(ACCOUNT, "bob");
+    assert_eq!(check(&policy, user("alice"), "iam:GetUser", &arn, &context), Decision::Allow);
+    context.set("aws:ResourceTag/team", "A");
+    assert_eq!(check(&policy, user("alice"), "iam:GetUser", &arn, &context), Decision::NotApplicable, "values aren't");
+}

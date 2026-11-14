@@ -32,11 +32,15 @@ pub enum On {
     Account,
     Bucket(String),
     Object(String, String),
-    /// A user of an account (by its ID), for IAM's actions on it.
+    /// A user of an account (by its ID), by its path (without its leading
+    /// `/`) and name, for IAM's actions on it (see `On::user`).
     User(String, String),
-    /// An account's users (by its ID), for `iam:ListUsers`.
-    Users(String),
-    /// A managed policy of an account (by its ID), for IAM's actions on it.
+    /// An account's users (by its ID) whose paths start with a prefix
+    /// (without its leading `/`), for `iam:ListUsers` (`user/`, then the
+    /// prefix: probed).
+    Users(String, String),
+    /// A managed policy of an account (by its ID; `aws`: Cairn's), by its
+    /// path (without its leading `/`) and name, for IAM's actions on it.
     Policy(String, String),
     /// The cluster, for the operator's actions (`cairn:`): the operator
     /// account's.
@@ -51,10 +55,25 @@ impl On {
             On::Bucket(bucket) => format!("arn:aws:s3:::{bucket}"),
             On::Object(bucket, key) => format!("arn:aws:s3:::{bucket}/{key}"),
             On::User(account, name) => format!("arn:aws:iam::{account}:user/{name}"),
-            On::Users(account) => format!("arn:aws:iam::{account}:user/*"),
+            On::Users(account, prefix) => format!("arn:aws:iam::{account}:user/{prefix}"),
             On::Policy(account, name) => format!("arn:aws:iam::{account}:policy/{name}"),
             On::Cluster => "arn:cairn:::cluster".to_owned(),
         }
+    }
+
+    /// User `name` of `account`, at `path`.
+    pub fn user(account: &str, path: &str, name: &str) -> On {
+        On::User(account.to_owned(), format!("{}{name}", path.strip_prefix('/').unwrap_or(path)))
+    }
+
+    /// `account`'s users at paths starting with `prefix` (`/…`).
+    pub fn users(account: &str, prefix: &str) -> On {
+        On::Users(account.to_owned(), prefix.strip_prefix('/').unwrap_or(prefix).to_owned())
+    }
+
+    /// Managed policy `name` of `account` (`aws`: Cairn's), at `path`.
+    pub fn policy(account: &str, path: &str, name: &str) -> On {
+        On::Policy(account.to_owned(), format!("{}{name}", path.strip_prefix('/').unwrap_or(path)))
     }
 
     /// The bucket whose policy applies, if any.

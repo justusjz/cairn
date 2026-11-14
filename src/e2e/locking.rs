@@ -293,6 +293,31 @@ async fn a_users_keys_are_counted_after_its_row_is_held() {
     assert_eq!(query_i64(&app, keys).await, 2);
 }
 
+/// I10: tags being set on a user, not yet committed, hold the user's row:
+/// more set meanwhile wait for them, and then count them.
+#[tokio::test]
+async fn a_users_tags_are_counted_after_its_row_is_held() {
+    let Some(app) = node().await else { return };
+    crate::roles::create(&connection(&app).await, "u", None, false).await.unwrap();
+    let tag = "SELECT pg_temp.cairn_tag_role((SELECT id FROM roles WHERE name = 'u'), $1, $2, 50)";
+    let keys = |from: usize| (from..from + 30).map(|i| format!("k{i}")).collect::<Vec<_>>();
+    let values = vec![String::new(); 30];
+    let mut held = connection(&app).await;
+    let tx = held.transaction().await.unwrap();
+    let tagged: String = tx.query_one(tag, &[&keys(0), &values]).await.unwrap().get(0);
+    assert_eq!(tagged, "tagged");
+    let app2 = app.clone();
+    let (more, values2) = (keys(30), values.clone());
+    let second = tokio::spawn(async move {
+        connection(&app2).await.query_one(tag, &[&more, &values2]).await.unwrap().get::<_, String>(0)
+    });
+    assert_waits(&second).await;
+    tx.commit().await.unwrap();
+    assert_eq!(second.await.unwrap(), "too_many");
+    let count = "SELECT count(*) FROM role_tags t JOIN roles r ON r.id = t.role_id WHERE r.name = 'u'";
+    assert_eq!(query_i64(&app, count).await, 30);
+}
+
 /// I1: a conditional write is decided (by Cairn) against the current object,
 /// and lands only if that's still the current one when it holds the key: one
 /// that another write replaced meanwhile makes it decide again, against the

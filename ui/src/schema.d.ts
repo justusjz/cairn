@@ -876,7 +876,11 @@ export interface paths {
         delete: operations["delete_role"];
         options?: never;
         head?: never;
-        patch?: never;
+        /**
+         * Renames or moves a user, as IAM's UpdateUser: allowed on it, and on
+         *     where it goes (its new ARN; moved only, its new path: see `iam`).
+         */
+        patch: operations["update_role"];
         trace?: never;
     };
     "/roles/{role}/admin": {
@@ -909,6 +913,27 @@ export interface paths {
         post: operations["attach_policy"];
         /** Detaches a managed policy from a user. */
         delete: operations["detach_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/boundary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a user's permissions boundary, as IAM's
+         *     PutUserPermissionsBoundary (decided by the boundary asked for).
+         */
+        put: operations["set_boundary"];
+        post?: never;
+        /** Removes a user's permissions boundary. */
+        delete: operations["delete_boundary"];
         options?: never;
         head?: never;
         patch?: never;
@@ -999,6 +1024,23 @@ export interface paths {
         put?: never;
         /** Replaces a role's secret. */
         post: operations["rotate_secret"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/roles/{role}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a user's tags, as IAM's TagUser and UntagUser would. */
+        put: operations["set_role_tags"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1189,6 +1231,10 @@ export interface components {
             block_public_policy: boolean;
             ignore_public_acls: boolean;
             restrict_public_buckets: boolean;
+        };
+        BoundaryArn: {
+            /** @description A managed policy's ARN: the account's own, or one of Cairn's. */
+            arn: string;
         };
         /**
          * @description Who may get at a bucket, besides its users' grants and policies: its
@@ -1877,6 +1923,8 @@ export interface components {
             description?: string;
             document: string;
             name: string;
+            /** @description Its path (`/`, or `/…/`); `/` if not given. */
+            path?: string | null;
         };
         NewRate: {
             /**
@@ -1892,12 +1940,18 @@ export interface components {
              */
             access_key?: boolean;
             admin?: boolean;
+            /** @description Its permissions boundary: a managed policy's ARN. */
+            boundary?: string | null;
             name: string;
+            /** @description Its path (`/`, or `/…/`); `/` if not given. */
+            path?: string | null;
             /**
              * @description The access key's secret: at least 8 characters; one is generated if
              *     not given. Implies `access_key`.
              */
             secret?: string | null;
+            /** @description Its tags. */
+            tags?: components["schemas"]["Tag"][];
         };
         NewSecret: {
             /** @description At least 8 characters; one is generated if not given. */
@@ -2155,9 +2209,13 @@ export interface components {
             arn: string;
             /** @description Whether it's one of Cairn's (AWS's), which can't be changed. */
             aws: boolean;
+            /** @description The account's users whose permissions boundary it is. */
+            bounds: string[];
             description: string;
             document: string;
             name: string;
+            /** @description Its path (`/`, or `/…/`). */
+            path: string;
             /** Format: double */
             updated_at?: number | null;
             /** @description The account's users it's attached to. */
@@ -2211,11 +2269,21 @@ export interface components {
              */
             slot_secs: number;
         };
+        RoleChange: {
+            /** @description Its new name (unique in the account regardless of case). */
+            name?: string | null;
+            /** @description Its new path (`/`, or `/…/`). */
+            path?: string | null;
+        };
         /** @description A role, never with its secret. */
         RoleSummary: {
             admin: boolean;
+            /** @description Its ARN. */
+            arn: string;
             /** @description Its attached managed policies (AdministratorAccess, if it's an admin). */
             attached: components["schemas"]["AttachedPolicy"][];
+            /** @description Its permissions boundary's ARN, which caps what its policies allow. */
+            boundary?: string | null;
             console?: components["schemas"]["ConsoleAccess"] | null;
             /** Format: double */
             created_at: number;
@@ -2232,8 +2300,19 @@ export interface components {
              */
             kms_entity_id?: string | null;
             name: string;
+            /** @description Its path (`/`, or `/…/`), which its ARN has before its name. */
+            path: string;
             /** @description The names of its inline policies. */
             policies: string[];
+            /** @description Its tags, newest first. */
+            tags: components["schemas"]["Tag"][];
+        };
+        RoleTags: {
+            /**
+             * @description All of its tags: those it has of other keys go (UntagUser), the
+             *     rest are set (TagUser).
+             */
+            tags: components["schemas"]["Tag"][];
         };
         Rule: {
             /** @description `ExposeHeader`s: the response headers a page may read. */
@@ -2330,7 +2409,10 @@ export interface components {
             challenge_id?: string | null;
             credential?: components["schemas"]["Assertion"] | null;
         };
-        /** @description A tag of a bucket or an object version (see `s3::tags`). */
+        /**
+         * @description A tag of a bucket, an object version (see `s3::tags`) or a user (whose
+         *     keys are unique regardless of case).
+         */
         Tag: {
             key: string;
             value: string;
@@ -4734,6 +4816,46 @@ export interface operations {
             };
         };
     };
+    update_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RoleChange"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     set_admin: {
         parameters: {
             query?: never;
@@ -4828,6 +4950,82 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Detached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BoundaryArn"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -5142,6 +5340,46 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["Secret"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_role_tags: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                role: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RoleTags"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {

@@ -236,7 +236,7 @@ async fn old_grants_move_into_managed_policies() {
     assert!(policy.contains(&format!("arn:aws:iam::{account}:user/olga")), "{policy}");
     // One the account has already, of another document, keeps its name.
     let other = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
-    crate::managed::create(&client, &account, &format!("{BUCKET}-write"), other, "").await.unwrap();
+    crate::managed::create(&client, &account, &format!("{BUCKET}-write"), "/", other, "").await.unwrap();
     assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 2);
     assert_eq!(crate::grants::to_managed(&client).await.unwrap(), 0);
     assert_eq!(attached(&client, &account, "olga").await, [format!("{BUCKET}-read"), format!("{BUCKET}-write-grant")]);
@@ -347,4 +347,102 @@ async fn accounts_have_users_of_the_same_name() {
     roles::delete(&client, &acme, "ada").await.unwrap();
     assert!(Principal::load(&client, &first).await.unwrap().is_some());
     assert!(Principal::load(&client, &second).await.unwrap().is_none());
+}
+
+/// A user with a permissions boundary is capped by it here; to older Cairns,
+/// which know no boundaries, it has an inline policy that denies it
+/// everything (which only they read), and they can't change users, keys or
+/// policies at all, so as not to undo that.
+#[tokio::test]
+async fn older_cairns_deny_bounded_users_everything() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let account = roles::account(&client).await.unwrap();
+    roles::create(&client, "bounded", None, false).await.unwrap();
+    let all = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
+    roles::put_policy(&client, &account, "bounded", "all", all).await.unwrap();
+    let list = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"*"}]}"#;
+    let bound = crate::managed::create(&client, &account, "bound", "/bounds/", list, "").await.unwrap();
+    let id = roles::id_of(&client, &account, "bounded").await.unwrap();
+    assert!(roles::set_boundary(&client, &account, id, Some(&roles::BoundaryRef::Own(bound.id))).await.unwrap());
+
+    // Here: its policies, and its boundary, by its ARN (path and all).
+    let principal = Principal::load(&client, "bounded").await.unwrap().unwrap();
+    assert_eq!(principal.policies, [all]);
+    let boundary = principal.boundary.as_ref().unwrap();
+    assert_eq!(boundary.arn, format!("arn:aws:iam::{account}:policy/bounds/bound"));
+    assert_eq!(boundary.document, list);
+    let listed = roles::list(&client).await.unwrap();
+    let user = listed.iter().find(|u| u.name == "bounded").unwrap();
+    assert_eq!(user.policies, ["all"]);
+    assert_eq!(user.boundary.as_deref(), Some(boundary.arn.as_str()));
+    assert!(roles::get_policy(&client, &account, "bounded", "cairn:boundary").await.is_err());
+    assert!(roles::delete_policy(&client, &account, "bounded", "cairn:boundary").await.is_err());
+
+    // What an older Cairn reads: every inline policy, a Deny-all among them.
+    let older: Vec<String> = client
+        .query_one("SELECT ARRAY(SELECT document FROM role_policies WHERE role_id = $1 ORDER BY name)", &[&id])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(older.len(), 2);
+    assert!(older.iter().any(|d| d.contains(r#""Effect":"Deny","Action":"*","Resource":"*""#)), "{older:?}");
+    // The boundary can't be deleted while it's one.
+    let err = crate::managed::delete(&client, &account, "bound").await.unwrap_err();
+    assert!(err.to_string().contains("attached to entities"), "{err}");
+
+    // An older Cairn's session changes no user, key or policy.
+    let mut session = app.pool.get().await.unwrap();
+    for change in [
+        "DELETE FROM role_policies WHERE name = 'cairn:boundary'",
+        "UPDATE roles SET boundary_policy_id = NULL WHERE name = 'bounded'",
+        "INSERT INTO role_tags (role_id, key, value) SELECT id, 'k', 'v' FROM roles WHERE name = 'bounded'",
+        "DELETE FROM access_keys",
+        "DELETE FROM managed_policies WHERE name = 'nothing'",
+    ] {
+        let tx = session.transaction().await.unwrap();
+        tx.batch_execute("SET LOCAL cairn.users = '2'").await.unwrap();
+        let err = tx.batch_execute(change).await.unwrap_err();
+        assert!(format!("{err:?}").contains("too old to change users"), "{change}: {err:?}");
+    }
+
+    // Without its boundary, the Deny-all goes too.
+    assert!(roles::set_boundary(&client, &account, id, None).await.unwrap());
+    assert!(Principal::load(&client, "bounded").await.unwrap().unwrap().boundary.is_none());
+    let count: i64 = client.query_one("SELECT count(*) FROM role_policies WHERE role_id = $1", &[&id]).await.unwrap().get(0);
+    assert_eq!(count, 1);
+    crate::managed::delete(&client, &account, "bound").await.unwrap();
+}
+
+/// User names are unique in an account regardless of case, as IAM's; a
+/// user's tags are at most 50, their keys unique regardless of case.
+#[tokio::test]
+async fn names_and_tag_keys_are_unique_regardless_of_case() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let account = roles::account(&client).await.unwrap();
+    roles::create_user(&client, &account, "Ada", "/team/", None).await.unwrap();
+    let err = roles::create_user(&client, &account, "ada", "/", None).await.unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    roles::create_user(&client, &account, "bob", "/", None).await.unwrap();
+    let ada = roles::id_of(&client, &account, "Ada").await.unwrap();
+    let err = roles::rename(&client, &account, ada, "BOB", "/").await.unwrap_err();
+    assert!(err.to_string().contains("already exists"), "{err}");
+    roles::rename(&client, &account, ada, "ADA", "/elsewhere/").await.unwrap();
+    let user = roles::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
+    assert_eq!(user.arn(), format!("arn:aws:iam::{account}:user/elsewhere/ADA"));
+
+    let tags = |pairs: &[(&str, &str)]| pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect::<Vec<_>>();
+    roles::tag(&client, ada, &tags(&[("team", "a"), ("env", "dev")])).await.unwrap();
+    roles::tag(&client, ada, &tags(&[("Team", "b")])).await.unwrap();
+    let user = roles::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
+    assert_eq!(user.tags, tags(&[("Team", "b"), ("env", "dev")]));
+    assert_eq!(user.context("iam:GetUser").get("aws:ResourceTag/team"), Some(&["b".to_owned()][..]));
+    let many: Vec<(String, String)> = (0..49).map(|i| (format!("k{i}"), String::new())).collect();
+    let err = roles::tag(&client, ada, &many).await.unwrap_err();
+    assert!(err.downcast_ref::<roles::TooManyTags>().is_some(), "{err}");
+    roles::tag(&client, ada, &many[..48]).await.unwrap();
+    roles::untag(&client, ada, &["TEAM".to_owned(), "nope".to_owned()]).await.unwrap();
+    let user = roles::Target::load(&client, &account, "ADA").await.unwrap().unwrap();
+    assert_eq!(user.tags.len(), 49);
 }

@@ -33,6 +33,7 @@ use super::actor::Actor;
 use super::web::{ApiError, ErrorBody};
 use crate::peer::stats::{NodeStats, node_stats};
 use crate::s3::actions::{Check, On};
+use crate::policy::Context;
 use crate::s3::util::xml_escape;
 use crate::db::Cached;
 use crate::{
@@ -102,7 +103,9 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_object_tags))
         .routes(routes!(get_bucket_cors, put_bucket_cors, delete_bucket_cors))
         .routes(routes!(list_roles, create_role))
-        .routes(routes!(delete_role))
+        .routes(routes!(delete_role, update_role))
+        .routes(routes!(set_boundary, delete_boundary))
+        .routes(routes!(set_role_tags))
         .routes(routes!(rotate_secret))
         .routes(routes!(set_admin))
         .routes(routes!(list_policies, create_policy))
@@ -824,8 +827,9 @@ pub(super) struct BucketSummary {
     object_lock: bool,
 }
 
-/// A tag of a bucket or an object version (see `s3::tags`).
-#[derive(Serialize, Deserialize, ToSchema)]
+/// A tag of a bucket, an object version (see `s3::tags`) or a user (whose
+/// keys are unique regardless of case).
+#[derive(Serialize, Deserialize, ToSchema, Clone)]
 pub(super) struct Tag {
     key: String,
     value: String,
@@ -850,7 +854,7 @@ async fn list_buckets(State(app): AppState, Extension(actor): Extension<Actor>) 
     let mut listed: Vec<BucketSummary> = buckets.into_iter().zip(listed).filter(|(_, l)| *l).map(|(b, _)| b).collect();
     // How many of the account's users have access to its buckets, by their
     // policies, if the actor may see its users.
-    if actor.allows(&app, "iam:ListUsers", On::Users(actor.account().to_owned())).await? {
+    if actor.allows(&app, "iam:ListUsers", On::users(actor.account(), "/")).await? {
         let own: Vec<String> = listed.iter().filter(|b| b.account == actor.account()).map(|b| b.name.clone()).collect();
         let counts = who_has_access(&app.pool.get().await?, actor.account(), &own).await?;
         for bucket in &mut listed {
@@ -1118,7 +1122,7 @@ async fn get_bucket_access(
     // Its account's users, if the actor may see them.
     let owner: String = client.query_one_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await?.get(0);
     let account_public_access_block = public_access::account(&client, &owner).await?;
-    let users = match owner == actor.account() && actor.allows(&app, "iam:ListUsers", On::Users(owner.clone())).await? {
+    let users = match owner == actor.account() && actor.allows(&app, "iam:ListUsers", On::users(&owner, "/")).await? {
         true => who_has_access(&client, &owner, std::slice::from_ref(&bucket))
             .await?
             .remove(&bucket)
@@ -2369,11 +2373,29 @@ async fn account_of(app: &App, actor: &Actor, name: &str) -> Result<String> {
 }
 
 /// Refuses the request unless IAM's `action` on the session's user `name` is
-/// allowed: its account.
+/// allowed (by its ARN, tags and boundary: see `roles::Target`): its
+/// account.
 async fn check_user(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str) -> Result<String> {
+    Ok(check_user_with(app, actor, action, name, Context::default()).await?.account)
+}
+
+/// As `check_user`, with the condition keys `extra` too: the user.
+async fn check_user_with(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str, extra: Context) -> Result<roles::Target> {
     let account = account_of(app, actor, name).await?;
-    actor.check(app, action, On::User(account.clone(), name.to_owned())).await?;
-    Ok(account)
+    let target = roles::Target::load(&app.pool.get().await?, &account, name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no user named {name:?}")))?;
+    let mut context = target.context(action);
+    context.extend(&extra);
+    actor.check_with(app, action, target.on(), &context).await?;
+    Ok(target)
+}
+
+/// The condition key `key` set to `value`.
+fn key(key: &str, value: &str) -> Context {
+    let mut context = Context::default();
+    context.set(key, value);
+    context
 }
 
 
@@ -2398,7 +2420,17 @@ pub(super) struct RoleSummary {
     /// How it signs in to the console, if it does (a person's); `None`:
     /// it doesn't, and no link for it is out (a service's).
     console: Option<ConsoleAccess>,
+    /// Its path (`/`, or `/…/`), which its ARN has before its name.
+    path: String,
+    /// Its ARN.
+    arn: String,
+    /// Its tags, newest first.
+    tags: Vec<Tag>,
+    /// Its permissions boundary's ARN, which caps what its policies allow.
+    boundary: Option<String>,
 }
+
+
 
 /// How a user signs in to the console (see `store::ConsoleAccess`).
 #[derive(Serialize, ToSchema)]
@@ -2431,16 +2463,38 @@ struct AttachedPolicy {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn list_roles(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<RoleSummary>>> {
-    // The session's account's users, as ListUsers lists them.
-    actor.check(&app, "iam:ListUsers", On::Users(actor.account().to_owned())).await?;
+    // The session's account's users, as ListUsers lists them: all of them,
+    // or (a delegated admin's) those at the paths it may list.
+    let all = actor.allows(&app, "iam:ListUsers", On::users(actor.account(), "/")).await?;
     let client = app.pool.get().await?;
     let mut console = super::store::console_access(&client, actor.account()).await?;
     let mut attached = crate::managed::attached_all(&client, actor.account()).await?;
-    let roles = roles::list(&client)
-        .await?
+    let mut listed = Vec::new();
+    let mut paths: HashMap<String, bool> = HashMap::new();
+    for r in roles::list(&client).await?.into_iter().filter(|r| r.account_id == actor.account()) {
+        let may = match paths.get(&r.path) {
+            _ if all => true,
+            Some(may) => *may,
+            None => {
+                let may = actor.allows(&app, "iam:ListUsers", On::users(actor.account(), &r.path)).await?;
+                paths.insert(r.path.clone(), may);
+                may
+            }
+        };
+        if may {
+            listed.push(r);
+        }
+    }
+    if !all && listed.is_empty() {
+        actor.check(&app, "iam:ListUsers", On::users(actor.account(), "/")).await?;
+    }
+    let roles = listed
         .into_iter()
-        .filter(|r| r.account_id == actor.account())
         .map(|r| RoleSummary {
+            arn: roles::user_arn(&r.account_id, &r.path, &r.name),
+            path: r.path,
+            tags: r.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
+            boundary: r.boundary,
             console: console.remove(&r.id).map(|c| ConsoleAccess {
                 enrolled: c.enrolled,
                 passkeys: c.passkeys,
@@ -2482,6 +2536,13 @@ struct NewRole {
     secret: Option<String>,
     #[serde(default)]
     admin: bool,
+    /// Its path (`/`, or `/…/`); `/` if not given.
+    path: Option<String>,
+    /// Its tags.
+    #[serde(default)]
+    tags: Vec<Tag>,
+    /// Its permissions boundary: a managed policy's ARN.
+    boundary: Option<String>,
 }
 
 /// A new user: its access key's ID and secret, if it got one, which is
@@ -2511,29 +2572,72 @@ async fn create_role(
 ) -> Result<(StatusCode, Json<NewUser>)> {
     let client = app.pool.get().await?;
     let account = actor.account().to_owned();
-    actor.check(&app, "iam:CreateUser", On::User(account.clone(), body.name.clone())).await?;
+    let path = body.path.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| "/".to_owned());
+    roles::check_path(&path, "path", false).map_err(ApiError::BadRequest)?;
+    let tags: Vec<(String, String)> = body.tags.iter().map(|t| (t.key.clone(), t.value.clone())).collect();
+    roles::check_tags(&tags).map_err(ApiError::BadRequest)?;
+    let boundary_arn = body.boundary.clone().filter(|b| !b.is_empty());
+    // Checked as IAM's CreateUser (with the boundary and tags asked for),
+    // and the rest as what the new user would be (see `roles::Target`).
+    let new = roles::Target {
+        id: uuid::Uuid::nil(),
+        account: account.clone(),
+        name: body.name.clone(),
+        path: path.clone(),
+        admin: false,
+        created: String::new(),
+        tags: tags.clone(),
+        boundary: boundary_arn.clone(),
+    };
+    let mut asked = roles::request_tags_context(&tags);
+    if let Some(arn) = &boundary_arn {
+        asked.set("iam:PermissionsBoundary", arn);
+    }
+    actor.check_with(&app, "iam:CreateUser", new.on(), &asked).await?;
+    if !tags.is_empty() {
+        actor.check_with(&app, "iam:TagUser", new.on(), &asked).await?;
+    }
     let secret = body.secret.filter(|s| !s.is_empty());
     let access_key = body.access_key || secret.is_some();
-    if roles::is_operator(&client, &account).await? && (access_key || body.admin) {
-        roles::refuse_operator(&client, &account, "access keys or admin flag").await?;
+    if roles::is_operator(&client, &account).await? && (access_key || body.admin || boundary_arn.is_some()) {
+        roles::refuse_operator(&client, &account, "access keys, admin flag or permissions boundary").await?;
     }
     if body.admin {
-        actor.check(&app, "iam:AttachUserPolicy", On::User(account.clone(), body.name.clone())).await?;
+        let mut context = new.context("iam:AttachUserPolicy");
+        context.extend(&key("iam:PolicyARN", &crate::managed::aws_arn(crate::managed::ADMINISTRATOR_ACCESS)));
+        actor.check_with(&app, "iam:AttachUserPolicy", new.on(), &context).await?;
     }
     if access_key {
-        actor.check(&app, "iam:CreateAccessKey", On::User(account.clone(), body.name.clone())).await?;
+        actor.check_with(&app, "iam:CreateAccessKey", new.on(), &new.context("iam:CreateAccessKey")).await?;
     }
-    let access_key = match access_key {
-        true => {
-            let (key, secret) = roles::create_for(&client, &account, &body.name, secret, body.admin).await?;
-            Some(Secret { name: key, secret })
+    let boundary = match &boundary_arn {
+        Some(arn) => Some(crate::managed::boundary(&client, &account, arn).await?),
+        None => None,
+    };
+    roles::create_user(&client, &account, &body.name, &path, boundary.as_ref()).await?;
+    let id = roles::id_of(&client, &account, &body.name).await?;
+    let made = async {
+        if !tags.is_empty() {
+            roles::tag(&client, id, &tags).await?;
         }
-        false => {
-            roles::create_without_key(&client, &account, &body.name).await?;
-            if body.admin {
-                roles::update(&client, &account, &body.name, Some(true), None).await?;
+        if body.admin {
+            roles::update(&client, &account, &body.name, Some(true), None).await?;
+        }
+        anyhow::Ok(match access_key {
+            true => {
+                let (key, secret) = roles::create_key(&client, &account, &body.name, None, secret).await?;
+                Some(Secret { name: key, secret })
             }
-            None
+            false => None,
+        })
+    };
+    let access_key = match made.await {
+        Ok(key) => key,
+        Err(e) => {
+            // All or nothing, as before (the user, then its key, were one
+            // statement).
+            let _ = roles::delete(&client, &account, &body.name).await;
+            return Err(e.into());
         }
     };
     // Its identity in the KMS, so that key owners can grant it keys now; if
@@ -2605,6 +2709,135 @@ async fn rotate_secret(
 }
 
 #[derive(Deserialize, ToSchema)]
+struct RoleChange {
+    /// Its new name (unique in the account regardless of case).
+    name: Option<String>,
+    /// Its new path (`/`, or `/…/`).
+    path: Option<String>,
+}
+
+/// Renames or moves a user, as IAM's UpdateUser: allowed on it, and on
+/// where it goes (its new ARN; moved only, its new path: see `iam`).
+#[utoipa::path(patch, path = "/roles/{role}", params(("role" = String, Path)), request_body = RoleChange, responses(
+    (status = 204, description = "Changed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn update_role(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(role): Path<String>,
+    Json(body): Json<RoleChange>,
+) -> Result<StatusCode> {
+    let new_path = body.path.filter(|p| !p.is_empty());
+    if let Some(path) = &new_path {
+        roles::check_path(path, "path", false).map_err(ApiError::BadRequest)?;
+    }
+    let user = check_user_with(&app, &actor, "iam:UpdateUser", &role, Context::default()).await?;
+    let path = new_path.clone().unwrap_or_else(|| user.path.clone());
+    let to = match &body.name {
+        Some(name) => On::user(&user.account, &path, name),
+        None => On::users(&user.account, &path),
+    };
+    actor.check(&app, "iam:UpdateUser", to).await?;
+    let name = body.name.unwrap_or_else(|| user.name.clone());
+    roles::rename(&app.pool.get().await?, &user.account, user.id, &name, &path).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, ToSchema)]
+struct BoundaryArn {
+    /// A managed policy's ARN: the account's own, or one of Cairn's.
+    arn: String,
+}
+
+/// Sets a user's permissions boundary, as IAM's
+/// PutUserPermissionsBoundary (decided by the boundary asked for).
+#[utoipa::path(put, path = "/roles/{role}/boundary", params(("role" = String, Path)), request_body = BoundaryArn, responses(
+    (status = 204, description = "Set"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn set_boundary(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(role): Path<String>,
+    Json(body): Json<BoundaryArn>,
+) -> Result<StatusCode> {
+    let extra = key("iam:PermissionsBoundary", &body.arn);
+    let user = check_user_with(&app, &actor, "iam:PutUserPermissionsBoundary", &role, extra).await?;
+    let client = app.pool.get().await?;
+    let boundary = crate::managed::boundary(&client, &user.account, &body.arn).await?;
+    roles::set_boundary(&client, &user.account, user.id, Some(&boundary)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes a user's permissions boundary.
+#[utoipa::path(delete, path = "/roles/{role}/boundary", params(("role" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_boundary(State(app): AppState, Extension(actor): Extension<Actor>, Path(role): Path<String>) -> Result<StatusCode> {
+    let user = check_user_with(&app, &actor, "iam:DeleteUserPermissionsBoundary", &role, Context::default()).await?;
+    if user.boundary.is_none() {
+        return Err(ApiError::NotFound(format!("{role:?} has no permissions boundary")));
+    }
+    roles::set_boundary(&app.pool.get().await?, &user.account, user.id, None).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, ToSchema)]
+struct RoleTags {
+    /// All of its tags: those it has of other keys go (UntagUser), the
+    /// rest are set (TagUser).
+    tags: Vec<Tag>,
+}
+
+/// Sets a user's tags, as IAM's TagUser and UntagUser would.
+#[utoipa::path(put, path = "/roles/{role}/tags", params(("role" = String, Path)), request_body = RoleTags, responses(
+    (status = 204, description = "Set"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn set_role_tags(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(role): Path<String>,
+    Json(body): Json<RoleTags>,
+) -> Result<StatusCode> {
+    let tags: Vec<(String, String)> = body.tags.into_iter().map(|t| (t.key, t.value)).collect();
+    roles::check_tags(&tags).map_err(ApiError::BadRequest)?;
+    let account = account_of(&app, &actor, &role).await?;
+    let client = app.pool.get().await?;
+    let user = roles::Target::load(&client, &account, &role)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no user named {role:?}")))?;
+    let gone: Vec<String> = user
+        .tags
+        .iter()
+        .filter(|(k, _)| !tags.iter().any(|(key, _)| key.eq_ignore_ascii_case(k)))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let changed: Vec<(String, String)> = tags.iter().filter(|t| !user.tags.contains(t)).cloned().collect();
+    if !gone.is_empty() {
+        let mut extra = Context::default();
+        extra.set_all("aws:TagKeys", gone.clone());
+        check_user_with(&app, &actor, "iam:UntagUser", &role, extra).await?;
+    }
+    if !changed.is_empty() {
+        check_user_with(&app, &actor, "iam:TagUser", &role, roles::request_tags_context(&changed)).await?;
+    }
+    if !gone.is_empty() {
+        roles::untag(&client, user.id, &gone).await?;
+    }
+    if !changed.is_empty() {
+        roles::tag(&client, user.id, &changed).await?;
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, ToSchema)]
 struct AdminFlag {
     admin: bool,
 }
@@ -2624,7 +2857,8 @@ async fn set_admin(
 ) -> Result<StatusCode> {
     // AdministratorAccess, attached or detached.
     let action = if body.admin { "iam:AttachUserPolicy" } else { "iam:DetachUserPolicy" };
-    let account = check_user(&app, &actor, action, &role).await?;
+    let arn = crate::managed::aws_arn(crate::managed::ADMINISTRATOR_ACCESS);
+    let account = check_user_with(&app, &actor, action, &role, key("iam:PolicyARN", &arn)).await?.account;
     roles::update(&app.pool.get().await?, &account, &role, Some(body.admin), None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2645,6 +2879,10 @@ struct PolicySummary {
     updated_at: Option<f64>,
     /// The account's users it's attached to.
     users: Vec<String>,
+    /// Its path (`/`, or `/…/`).
+    path: String,
+    /// The account's users whose permissions boundary it is.
+    bounds: Vec<String>,
 }
 
 #[utoipa::path(get, path = "/policies", responses(
@@ -2663,6 +2901,17 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
         .iter()
         .map(|r| (r.get(0), r.get(1)))
         .collect();
+    // Who has which of Cairn's as a boundary.
+    let mut aws_bounds: HashMap<String, Vec<String>> = HashMap::new();
+    for row in client
+        .query_cached(
+            "SELECT boundary_aws, name FROM roles WHERE account_id = $1 AND boundary_aws IS NOT NULL ORDER BY name",
+            &[&account],
+        )
+        .await?
+    {
+        aws_bounds.entry(row.get(0)).or_default().push(row.get(1));
+    }
     let users_of = |arn: &str| {
         let mut users: Vec<String> = attached
             .iter()
@@ -2685,12 +2934,14 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
                 document: p.document.to_owned(),
                 version: 1,
                 updated_at: None,
+                path: "/".to_owned(),
+                bounds: aws_bounds.remove(p.name).unwrap_or_default(),
             }
         })
         .collect();
     for p in crate::managed::list(&client, account).await? {
         policies.push(PolicySummary {
-            arn: crate::managed::arn(account, &p.name),
+            arn: p.arn(account),
             name: p.name,
             aws: false,
             description: p.description,
@@ -2698,6 +2949,8 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
             version: p.version,
             updated_at: Some(p.updated_at),
             users: p.users,
+            path: p.path,
+            bounds: p.bounds,
         });
     }
     Ok(Json(policies))
@@ -2709,6 +2962,8 @@ struct NewPolicy {
     document: String,
     #[serde(default)]
     description: String,
+    /// Its path (`/`, or `/…/`); `/` if not given.
+    path: Option<String>,
 }
 
 #[utoipa::path(post, path = "/policies", request_body = NewPolicy, responses(
@@ -2718,8 +2973,9 @@ struct NewPolicy {
 ))]
 async fn create_policy(State(app): AppState, Extension(actor): Extension<Actor>, Json(body): Json<NewPolicy>) -> Result<StatusCode> {
     let account = actor.account().to_owned();
-    actor.check(&app, "iam:CreatePolicy", On::Policy(account.clone(), body.name.clone())).await?;
-    crate::managed::create(&app.pool.get().await?, &account, &body.name, &body.document, &body.description).await?;
+    let path = body.path.clone().filter(|p| !p.is_empty()).unwrap_or_else(|| "/".to_owned());
+    actor.check(&app, "iam:CreatePolicy", On::policy(&account, &path, &body.name)).await?;
+    crate::managed::create(&app.pool.get().await?, &account, &body.name, &path, &body.document, &body.description).await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -2743,8 +2999,9 @@ async fn update_policy(
     Json(body): Json<PolicyChange>,
 ) -> Result<StatusCode> {
     let account = actor.account().to_owned();
-    actor.check(&app, "iam:CreatePolicyVersion", On::Policy(account.clone(), name.clone())).await?;
     let client = app.pool.get().await?;
+    let path = crate::managed::get(&client, &account, &name).await?.path;
+    actor.check(&app, "iam:CreatePolicyVersion", On::policy(&account, &path, &name)).await?;
     if let Some(document) = &body.document {
         crate::managed::update(&client, &account, &name, document).await?;
     }
@@ -2761,8 +3018,10 @@ async fn update_policy(
 ))]
 async fn delete_policy_managed(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
     let account = actor.account().to_owned();
-    actor.check(&app, "iam:DeletePolicy", On::Policy(account.clone(), name.clone())).await?;
-    crate::managed::delete(&app.pool.get().await?, &account, &name).await?;
+    let client = app.pool.get().await?;
+    let path = crate::managed::get(&client, &account, &name).await?.path;
+    actor.check(&app, "iam:DeletePolicy", On::policy(&account, &path, &name)).await?;
+    crate::managed::delete(&client, &account, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -2784,7 +3043,7 @@ async fn attach_policy(
     Path(role): Path<String>,
     Json(body): Json<PolicyArn>,
 ) -> Result<StatusCode> {
-    let account = check_user(&app, &actor, "iam:AttachUserPolicy", &role).await?;
+    let account = check_user_with(&app, &actor, "iam:AttachUserPolicy", &role, key("iam:PolicyARN", &body.arn)).await?.account;
     crate::managed::attach(&app.pool.get().await?, &account, &role, &body.arn, true).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -2801,7 +3060,7 @@ async fn detach_policy(
     Path(role): Path<String>,
     Query(params): Query<PolicyArn>,
 ) -> Result<StatusCode> {
-    let account = check_user(&app, &actor, "iam:DetachUserPolicy", &role).await?;
+    let account = check_user_with(&app, &actor, "iam:DetachUserPolicy", &role, key("iam:PolicyARN", &params.arn)).await?.account;
     crate::managed::attach(&app.pool.get().await?, &account, &role, &params.arn, false).await?;
     Ok(StatusCode::NO_CONTENT)
 }

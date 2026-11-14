@@ -71,6 +71,8 @@ pub enum Refused {
     Conflict(String),
     /// LimitExceeded (409).
     Limit(String),
+    /// ValidationError (400).
+    Validation(String),
     /// MalformedPolicyDocument (400).
     Malformed(String),
     /// InvalidInput (400).
@@ -81,7 +83,7 @@ impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refused::NoSuch(m) | Refused::Exists(m) | Refused::Conflict(m) | Refused::Limit(m) => f.write_str(m),
-            Refused::Malformed(m) | Refused::Invalid(m) => f.write_str(m),
+            Refused::Malformed(m) | Refused::Invalid(m) | Refused::Validation(m) => f.write_str(m),
         }
     }
 }
@@ -97,9 +99,9 @@ pub fn aws_arn(name: &str) -> String {
     format!("arn:aws:iam::aws:policy/{name}")
 }
 
-/// An account's policy's ARN.
-pub fn arn(account: &str, name: &str) -> String {
-    format!("arn:aws:iam::{account}:policy/{name}")
+/// An account's policy's ARN, at `path` (`/`, or `/…/`).
+pub fn arn(account: &str, path: &str, name: &str) -> String {
+    format!("arn:aws:iam::{account}:policy/{}{name}", path.strip_prefix('/').unwrap_or(path))
 }
 
 /// Cairn's policy named `name`.
@@ -111,8 +113,8 @@ pub fn aws(name: &str) -> Option<&'static AwsPolicy> {
 #[derive(Debug, PartialEq)]
 pub enum Named {
     Aws(&'static AwsPolicy),
-    /// One of the account's own, by name.
-    Own(String),
+    /// One of the account's own, by its path (`/`, or `/…/`) and name.
+    Own { path: String, name: String },
 }
 
 impl std::fmt::Debug for AwsPolicy {
@@ -128,19 +130,50 @@ impl PartialEq for AwsPolicy {
 }
 
 /// The policy `arn` names, as `account` sees it: one of Cairn's, or one of
-/// the account's own (another account's are none it may attach).
+/// the account's own (another account's are none it may attach), by its
+/// path and name (whether the policy is at that path is the caller's to
+/// check: see `own`).
 pub fn named(arn: &str, account: &str) -> anyhow::Result<Named> {
     let no_such = || Refused::NoSuch(format!("Policy {arn} does not exist or is not attachable."));
     let Some(rest) = arn.strip_prefix("arn:aws:iam::") else { return refused(Refused::Invalid(format!("ARN {arn} is not valid."))) };
-    let Some((owner, name)) = rest.split_once(":policy/") else { return refused(Refused::Invalid(format!("ARN {arn} is not valid."))) };
-    // No paths: a name has no `/`.
-    if name.contains('/') {
+    let Some((owner, rest)) = rest.split_once(":policy/") else { return refused(Refused::Invalid(format!("ARN {arn} is not valid."))) };
+    let (path, name) = match rest.rsplit_once('/') {
+        Some((path, name)) => (format!("/{path}/"), name),
+        None => ("/".to_owned(), rest),
+    };
+    if name.is_empty() {
         return refused(no_such());
     }
     match owner {
-        "aws" => aws(name).map(Named::Aws).ok_or_else(|| no_such().into()),
-        owner if owner == account => Ok(Named::Own(name.to_owned())),
+        // Cairn's have no paths.
+        "aws" if path == "/" => aws(name).map(Named::Aws).ok_or_else(|| no_such().into()),
+        owner if owner == account => Ok(Named::Own { path, name: name.to_owned() }),
         _ => refused(no_such()),
+    }
+}
+
+/// The account's own policy at `path` named `name` (as `named` gives it).
+pub async fn own(client: &Object, account: &str, path: &str, name: &str) -> anyhow::Result<Managed> {
+    match get(client, account, name).await {
+        Ok(policy) if policy.path == path => Ok(policy),
+        Ok(_) | Err(_) => refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, path, name)))),
+    }
+}
+
+/// The permissions boundary `arn` names, for a user of `account`, as IAM
+/// refuses one (probed): a managed policy, the account's own or Cairn's.
+pub async fn boundary(client: &Object, account: &str, arn: &str) -> anyhow::Result<crate::roles::BoundaryRef> {
+    let scope = || Refused::NoSuch(format!("Scope ARN: {arn} does not exist or is not attachable."));
+    let policy = arn.strip_prefix("arn:aws:iam::").and_then(|rest| rest.split_once(":policy/"));
+    if policy.is_none_or(|(owner, _)| owner != "aws" && !(owner.len() == 12 && owner.bytes().all(|b| b.is_ascii_digit()))) {
+        return refused(Refused::Invalid(format!("ARN {arn} is not valid.")));
+    }
+    match named(arn, account).map_err(|_| scope())? {
+        Named::Aws(p) => Ok(crate::roles::BoundaryRef::Aws(p.name)),
+        Named::Own { path, name } => match own(client, account, &path, &name).await {
+            Ok(policy) => Ok(crate::roles::BoundaryRef::Own(policy.id)),
+            Err(_) => refused(scope()),
+        },
     }
 }
 
@@ -151,6 +184,11 @@ pub fn check_document(document: &str) -> anyhow::Result<()> {
         return refused(Refused::Limit(format!("Cannot exceed quota for PolicySize: {MAX_DOCUMENT}")));
     }
     Ok(())
+}
+
+/// Checks a policy's path (see `roles::check_path`).
+fn check_path(path: &str) -> anyhow::Result<()> {
+    crate::roles::check_path(path, "path", false).map_err(|m| Refused::Validation(m).into())
 }
 
 fn check_name(name: &str) -> anyhow::Result<()> {
@@ -166,6 +204,8 @@ fn check_name(name: &str) -> anyhow::Result<()> {
 pub struct Managed {
     pub id: Uuid,
     pub name: String,
+    /// Its path (`/`, or `/…/`), which its ARN has before its name.
+    pub path: String,
     pub description: String,
     pub document: String,
     /// Its default version's number (`v1`, ...).
@@ -173,12 +213,23 @@ pub struct Managed {
     pub updated_at: f64,
     /// The users it's attached to, by name.
     pub users: Vec<String>,
+    /// The users whose permissions boundary it is, by name.
+    pub bounds: Vec<String>,
+}
+
+impl Managed {
+    /// Its ARN, as an account's (`account`'s) policy.
+    pub fn arn(&self, account: &str) -> String {
+        arn(account, &self.path, &self.name)
+    }
 }
 
 const COLUMNS: &str = "m.id, m.name, m.description, m.document, m.version,
      extract(epoch FROM m.updated_at)::float8,
      ARRAY(SELECT r.name FROM role_attached_policies x JOIN roles r ON r.id = x.role_id
-           WHERE x.policy_id = m.id ORDER BY r.name)";
+           WHERE x.policy_id = m.id ORDER BY r.name),
+     m.path,
+     ARRAY(SELECT r.name FROM roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name)";
 
 fn managed_of(row: &tokio_postgres::Row) -> Managed {
     Managed {
@@ -189,6 +240,8 @@ fn managed_of(row: &tokio_postgres::Row) -> Managed {
         version: row.get(4),
         updated_at: row.get(5),
         users: row.get(6),
+        path: row.get(7),
+        bounds: row.get(8),
     }
 }
 
@@ -207,13 +260,15 @@ pub async fn get(client: &Object, account: &str, name: &str) -> anyhow::Result<M
         .await?;
     match row {
         Some(row) => Ok(managed_of(&row)),
-        None => refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, name)))),
+        None => refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, "/", name)))),
     }
 }
 
-/// Makes the account's managed policy `name`.
-pub async fn create(client: &Object, account: &str, name: &str, document: &str, description: &str) -> anyhow::Result<Managed> {
+/// Makes the account's managed policy `name`, at `path`. Names are unique
+/// in an account whatever their paths (probed).
+pub async fn create(client: &Object, account: &str, name: &str, path: &str, document: &str, description: &str) -> anyhow::Result<Managed> {
     check_name(name)?;
+    check_path(path)?;
     check_document(document)?;
     if description.len() > MAX_DESCRIPTION {
         return refused(Refused::Invalid(format!("a policy's description is at most {MAX_DESCRIPTION} characters")));
@@ -221,9 +276,9 @@ pub async fn create(client: &Object, account: &str, name: &str, document: &str, 
     crate::roles::refuse_operator(client, account, "managed policies").await?;
     let made = client
         .execute_cached(
-            "INSERT INTO managed_policies (account_id, name, document, description) VALUES ($1, $2, $3, $4)
+            "INSERT INTO managed_policies (account_id, name, document, description, path) VALUES ($1, $2, $3, $4, $5)
              ON CONFLICT DO NOTHING",
-            &[&account, &name, &document, &description],
+            &[&account, &name, &document, &description, &path],
         )
         .await?;
     if made == 0 {
@@ -245,7 +300,7 @@ pub async fn update(client: &Object, account: &str, name: &str, document: &str) 
         .await?;
     match row {
         Some(row) => Ok(row.get(0)),
-        None => refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, name)))),
+        None => refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, "/", name)))),
     }
 }
 
@@ -262,15 +317,16 @@ pub async fn describe(client: &Object, account: &str, name: &str, description: &
         )
         .await?;
     if updated == 0 {
-        return refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, name))));
+        return refused(Refused::NoSuch(format!("Policy {} was not found.", arn(account, "/", name))));
     }
     Ok(())
 }
 
-/// Deletes the account's managed policy `name`, unless it's attached.
+/// Deletes the account's managed policy `name`, unless it's attached, or
+/// a user's permissions boundary (whose foreign key keeps it, too).
 pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Result<()> {
     let policy = get(client, account, name).await?;
-    if !policy.users.is_empty() {
+    if !policy.users.is_empty() || !policy.bounds.is_empty() {
         return refused(Refused::Conflict("Cannot delete a policy attached to entities.".into()));
     }
     let deleted = client
@@ -308,7 +364,7 @@ pub async fn attached_all(client: &Object, account: &str) -> anyhow::Result<Hash
              SELECT r.id, NULL, x.aws_policy FROM role_attached_policies x JOIN roles r ON r.id = x.role_id
              WHERE r.account_id = $1 AND x.aws_policy IS NOT NULL
              UNION ALL
-             SELECT r.id, m.account_id, m.name FROM role_attached_policies x JOIN roles r ON r.id = x.role_id
+             SELECT r.id, m.account_id || ' ' || m.path, m.name FROM role_attached_policies x JOIN roles r ON r.id = x.role_id
              JOIN managed_policies m ON m.id = x.policy_id WHERE r.account_id = $1
              ORDER BY 1, 2 NULLS FIRST, 3",
             &[&account],
@@ -317,8 +373,8 @@ pub async fn attached_all(client: &Object, account: &str) -> anyhow::Result<Hash
     let mut all: HashMap<Uuid, Vec<Attached>> = HashMap::new();
     for row in rows {
         let (user, owner, name): (Uuid, Option<String>, String) = (row.get(0), row.get(1), row.get(2));
-        let arn = match &owner {
-            Some(owner) => arn(owner, &name),
+        let arn = match owner.as_deref().and_then(|o| o.split_once(' ')) {
+            Some((owner, path)) => arn(owner, path, &name),
             None => aws_arn(&name),
         };
         all.entry(user).or_default().push(Attached { name, arn });
@@ -375,8 +431,11 @@ pub async fn attach(client: &Object, account: &str, user: &str, arn: &str, attac
                 .execute_cached("DELETE FROM role_attached_policies WHERE role_id = $1 AND aws_policy = $2", &[&role, &p.name])
                 .await?
         }
-        Named::Own(name) => {
-            let id = get(client, account, name).await?.id;
+        Named::Own { path, name } => {
+            let id = own(client, account, path, name)
+                .await
+                .map_err(|_| Refused::NoSuch(format!("Policy {arn} does not exist or is not attachable.")))?
+                .id;
             if attach {
                 client
                     .execute_cached(
@@ -427,11 +486,15 @@ mod tests {
     #[test]
     fn arns_name_policies() {
         assert_eq!(named("arn:aws:iam::aws:policy/AmazonS3FullAccess", "123").unwrap(), Named::Aws(&AWS_POLICIES[1]));
-        assert_eq!(named("arn:aws:iam::123:policy/mine", "123").unwrap(), Named::Own("mine".into()));
+        assert_eq!(named("arn:aws:iam::123:policy/mine", "123").unwrap(), Named::Own { path: "/".into(), name: "mine".into() });
+        assert_eq!(
+            named("arn:aws:iam::123:policy/a/b/mine", "123").unwrap(),
+            Named::Own { path: "/a/b/".into(), name: "mine".into() }
+        );
         // Another account's, or one that isn't there.
         assert!(named("arn:aws:iam::456:policy/theirs", "123").is_err());
         assert!(named("arn:aws:iam::aws:policy/AmazonEC2FullAccess", "123").is_err());
-        assert!(named("arn:aws:iam::123:policy/a/b", "123").is_err());
+        assert!(named("arn:aws:iam::aws:policy/a/AmazonS3FullAccess", "123").is_err());
         assert!(named("nonsense", "123").is_err());
     }
 

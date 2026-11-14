@@ -378,6 +378,8 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     ("aws:epochtime", Support::Evaluated),
     ("aws:principalaccount", Support::Evaluated),
     ("aws:principalarn", Support::Evaluated),
+    // The signing user's tags.
+    ("aws:principaltag/", Support::Evaluated),
     ("aws:principalisawsservice", Support::Evaluated),
     ("aws:principaltype", Support::Evaluated),
     ("aws:referer", Support::Evaluated),
@@ -401,7 +403,7 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     ("aws:principalorgpaths", Support::Absent),
     ("aws:principalservicename", Support::Absent),
     ("aws:principalservicenameslist", Support::Absent),
-    ("aws:principaltag/", Support::Absent),
+
     ("aws:resourceorgid", Support::Absent),
     ("aws:resourceorgpaths", Support::Absent),
     ("aws:sourceaccount", Support::Absent),
@@ -414,10 +416,13 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     ("aws:sourcevpce", Support::Absent),
     ("aws:tokenissuetime", Support::Absent),
     ("aws:vpcsourceip", Support::Absent),
-    // Buckets have tags.
-    ("aws:requesttag/", Support::Unsupported),
-    ("aws:resourcetag/", Support::Unsupported),
-    ("aws:tagkeys", Support::Unsupported),
+    // A user's tags, and those IAM's requests set (see `iam`). Never on
+    // S3's: a bucket's tags are its `aws:ResourceTag`s only with its ABAC
+    // enabled, which it's not by default (probed), and Cairn has no
+    // PutBucketAbac; nor does Cairn's CreateBucket take tags.
+    ("aws:requesttag/", Support::Evaluated),
+    ("aws:resourcetag/", Support::Evaluated),
+    ("aws:tagkeys", Support::Evaluated),
 ];
 
 /// The `s3:` keys Cairn's requests carry, lowercase; a trailing `/` takes
@@ -669,8 +674,8 @@ mod tests {
         assert_eq!(support("s3:object-lock-mode"), Some(Support::Evaluated));
         assert_eq!(support("s3:object-lock-event-hold"), Some(Support::Unsupported));
         assert_eq!(support("s3:DataAccessPointArn"), Some(Support::Absent));
-        assert_eq!(support("aws:PrincipalTag/team"), Some(Support::Absent));
-        assert_eq!(support("aws:ResourceTag/team"), Some(Support::Unsupported));
+        assert_eq!(support("aws:PrincipalTag/team"), Some(Support::Evaluated));
+        assert_eq!(support("aws:ResourceTag/team"), Some(Support::Evaluated));
         assert_eq!(support("s3:frobnicate"), None);
         assert_eq!(support("aws:frobnicate"), None);
         assert_eq!(support("kms:ViaService"), None);

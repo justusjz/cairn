@@ -14,7 +14,7 @@ use axum::http::{HeaderMap, Method};
 use super::web::ApiError;
 use crate::{
     App,
-    policy::Verdict,
+    policy::{Context, Verdict},
     roles::Principal,
     s3::{
         access::{Access, Origin},
@@ -52,7 +52,7 @@ impl User {
     /// Its ARN.
     fn arn(&self) -> String {
         match &self.subject {
-            Subject::User(principal) => format!("arn:aws:iam::{}:user/{}", self.account, principal.name),
+            Subject::User(principal) => principal.arn(),
             Subject::Root => format!("arn:aws:iam::{}:root", self.account),
         }
     }
@@ -119,12 +119,23 @@ impl Actor {
         self.check_all(app, &[Check { action, on }]).await
     }
 
+    /// As `check`, with the condition keys `extra` too (a user's tags, an
+    /// IAM request's: see `Access::verdict_with`).
+    pub async fn check_with(&self, app: &Arc<App>, action: &'static str, on: On, extra: &Context) -> Result<(), ApiError> {
+        let check = Check { action, on };
+        let access = self.access(app, std::slice::from_ref(&check)).await?;
+        match access.verdict_with(&check, extra) {
+            Verdict::Allow => Ok(()),
+            verdict => Err(ApiError::Forbidden(denied(&self.0, &check, verdict, access.boundary()))),
+        }
+    }
+
     /// Refuses the request unless every one of `checks` is allowed.
     /// A bucket's policy is its account's alone (see `Access::foreign`).
     pub async fn check_all(&self, app: &Arc<App>, checks: &[Check]) -> Result<(), ApiError> {
         let access = self.access(app, checks).await?;
         if let Some((check, verdict)) = checks.iter().map(|c| (c, access.verdict(c))).find(|(_, v)| *v != Verdict::Allow) {
-            return Err(ApiError::Forbidden(denied(&self.0, check, verdict)));
+            return Err(ApiError::Forbidden(denied(&self.0, check, verdict, access.boundary())));
         }
         if let Some(check) = checks.iter().find(|c| access.foreign(c)) {
             return Err(ApiError::Forbidden(format!(
@@ -137,15 +148,11 @@ impl Actor {
 }
 
 /// What S3 says when `check` is denied to `user` (see `Access::denied`).
-fn denied(user: &User, check: &Check, verdict: Verdict) -> String {
+fn denied(user: &User, check: &Check, verdict: Verdict, boundary: Option<&str>) -> String {
     let on = match &check.on {
         On::Account => String::new(),
         on => format!(" on resource: \"{}\"", on.arn()),
     };
-    let why = match verdict {
-        Verdict::ExplicitDeny { identity: true } => "with an explicit deny in an identity-based policy".to_owned(),
-        Verdict::ExplicitDeny { identity: false } => "with an explicit deny in a resource-based policy".to_owned(),
-        _ => format!("because no identity-based policy allows the {} action", check.action),
-    };
+    let why = verdict.why(check.action, boundary);
     format!("User: {} is not authorized to perform: {}{on} {why}", user.arn(), check.action)
 }

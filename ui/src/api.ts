@@ -36,6 +36,7 @@ export type LifecycleConfiguration = Schemas["LifecycleConfiguration"];
 export type LifecycleRule = Schemas["LifecycleRule"];
 export type BucketAccess = Schemas["BucketAccess"];
 export type PublicAccessBlock = Schemas["Block"];
+export type Tag = Schemas["Tag"];
 
 /** Where the API is (also in the spec's `servers`). */
 const BASE = "/api";
@@ -104,16 +105,39 @@ export const api = {
   roles: () => ok(client.GET("/roles")),
   /** A person (no access key: they sign in through a console link), or a
    * service (`accessKey`: one, named as it, whose secret comes back once). */
-  createRole: (name: string, opts: { accessKey?: boolean; admin?: boolean } = {}) =>
-    ok(client.POST("/roles", { body: { name, access_key: opts.accessKey ?? false, admin: opts.admin ?? false } })),
+  createRole: (
+    name: string,
+    opts: { accessKey?: boolean; admin?: boolean; path?: string; boundary?: string; tags?: Tag[] } = {},
+  ) =>
+    ok(
+      client.POST("/roles", {
+        body: {
+          name,
+          access_key: opts.accessKey ?? false,
+          admin: opts.admin ?? false,
+          path: opts.path || null,
+          boundary: opts.boundary || null,
+          tags: opts.tags ?? [],
+        },
+      }),
+    ),
   deleteRole: (role: string) => ok(client.DELETE("/roles/{role}", { params: rolePath(role) })),
+  /** Renames or moves a user (IAM's UpdateUser). */
+  updateRole: (role: string, change: { name?: string; path?: string }) =>
+    ok(client.PATCH("/roles/{role}", { params: rolePath(role), body: { name: change.name ?? null, path: change.path ?? null } })),
+  setBoundary: (role: string, arn: string) =>
+    ok(client.PUT("/roles/{role}/boundary", { params: rolePath(role), body: { arn } })),
+  deleteBoundary: (role: string) => ok(client.DELETE("/roles/{role}/boundary", { params: rolePath(role) })),
+  /** Sets all of a user's tags. */
+  setRoleTags: (role: string, tags: Tag[]) =>
+    ok(client.PUT("/roles/{role}/tags", { params: rolePath(role), body: { tags } })),
   rotateSecret: (role: string) =>
     ok(client.POST("/roles/{role}/secret", { params: rolePath(role), body: {} })),
   setAdmin: (role: string, admin: boolean) =>
     ok(client.PUT("/roles/{role}/admin", { params: rolePath(role), body: { admin } })),
   policies: () => ok(client.GET("/policies")),
-  createPolicy: (name: string, document: string, description: string) =>
-    ok(client.POST("/policies", { body: { name, document, description } })),
+  createPolicy: (name: string, document: string, description: string, path?: string) =>
+    ok(client.POST("/policies", { body: { name, document, description, path: path || null } })),
   updatePolicy: (name: string, change: { document?: string; description?: string }) =>
     ok(client.PUT("/policies/{name}", { params: { path: { name } }, body: change })),
   deleteManagedPolicy: (name: string) => ok(client.DELETE("/policies/{name}", { params: { path: { name } } })),

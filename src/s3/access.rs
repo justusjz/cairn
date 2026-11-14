@@ -105,6 +105,10 @@ pub struct Access {
     /// The operator account, whose the cluster is (loaded for checks on it).
     operator: Option<String>,
     identity: Vec<Arc<Policy>>,
+    /// The user's permissions boundary, and its ARN.
+    boundary: Option<(Arc<Policy>, String)>,
+    /// The user's ARN (its path and all).
+    arn: Option<String>,
     pub context: Context,
     /// Each bucket loaded: whether it exists, and its policy (see `Loaded`).
     buckets: HashMap<String, Loaded>,
@@ -122,6 +126,7 @@ impl Access {
         origin: &Origin,
     ) -> anyhow::Result<Access> {
         let mut identity = Vec::new();
+        let mut boundary = None;
         if let Some(principal) = principal {
             if principal.admin {
                 identity.push(parsed(&actions::admin_policy(), Kind::Identity, None)?);
@@ -129,12 +134,17 @@ impl Access {
             for document in &principal.policies {
                 identity.push(parsed(document, Kind::Identity, None)?);
             }
+            if let Some(b) = &principal.boundary {
+                boundary = Some((parsed(&b.document, Kind::Identity, None)?, b.arn.clone()));
+            }
         }
         Ok(Access {
             root: None,
             operator: None,
             user: principal.map(|p| (p.account.clone(), p.name.clone(), p.id.to_string())),
+            arn: principal.map(Principal::arn),
             identity,
+            boundary,
             context: context(principal, account, method, headers, query, origin),
             buckets: HashMap::new(),
         })
@@ -154,9 +164,16 @@ impl Access {
             root: Some(account.to_owned()),
             operator: None,
             identity: Vec::new(),
+            boundary: None,
+            arn: None,
             context,
             buckets: HashMap::new(),
         }
+    }
+
+    /// The ARN of the user's permissions boundary, if it has one.
+    pub fn boundary(&self) -> Option<&str> {
+        self.boundary.as_ref().map(|(_, arn)| arn.as_str())
     }
 
     /// Loads `bucket`'s policy, for the checks on it; whether it exists.
@@ -207,6 +224,13 @@ impl Access {
     /// The verdict on `check`, whose bucket's policy is loaded (else the
     /// bucket is taken to have none).
     pub fn verdict(&self, check: &Check) -> Verdict {
+        self.verdict_with(check, &Context::default())
+    }
+
+    /// As `verdict`, with the condition keys `extra` too: those of the
+    /// resource (a user's tags, say) and of what an IAM request asks for
+    /// (see `iam`).
+    pub fn verdict_with(&self, check: &Check, extra: &Context) -> Verdict {
         // The cluster, and the operator account's own users, are its
         // members' (superadmins'), by being its members: no policy grants
         // or denies them. And nothing else is: the operator account owns no
@@ -215,7 +239,7 @@ impl Access {
         match (&check.on, operator) {
             (On::Cluster, Some(_)) => return Verdict::Allow,
             (On::Cluster, None) => return Verdict::ImplicitDeny,
-            (On::User(account, _) | On::Users(account), Some(operator))
+            (On::User(account, _) | On::Users(account, _), Some(operator))
                 if account == operator && check.action.starts_with("iam:") =>
             {
                 return Verdict::Allow;
@@ -239,7 +263,7 @@ impl Access {
         // by its name) the principal's own account's. A bucket to create is
         // the principal's, whoever has its name (that's BucketAlreadyExists).
         let owner = match &check.on {
-            On::User(account, _) | On::Users(account) => Some(account.as_str()),
+            On::User(account, _) | On::Users(account, _) => Some(account.as_str()),
             // Cairn's (AWS's) policies are no account's: as the principal's own.
             On::Policy(account, _) if account != "aws" => Some(account.as_str()),
             // The operator account's (an unknown one, if it wasn't loaded:
@@ -251,6 +275,7 @@ impl Access {
         // anonymously, the one the request was made in).
         let resource_account = owner.or(self.account());
         let mut context = self.context.clone();
+        context.extend(extra);
         if let Some(account) = resource_account {
             context.set("aws:ResourceAccount", account);
             context.set("s3:ResourceAccount", account);
@@ -265,7 +290,8 @@ impl Access {
             (Some((account, _, _)), Some(owner)) => account != owner,
             _ => false,
         };
-        crate::policy::verdict_across(self.identity.iter().map(|p| &**p), bucket, &request, cross)
+        let boundary = self.boundary.as_ref().map(|(policy, _)| &**policy);
+        crate::policy::verdict_across(self.identity.iter().map(|p| &**p), boundary, bucket, &request, cross)
     }
 
     /// The account the principal acts in; `None` if anonymous.
@@ -298,20 +324,15 @@ impl Access {
     /// S3's 403 for `check`, denied by `verdict`: to a user, it says what
     /// was denied and why (probed); anonymously, just that it was.
     pub fn denied(&self, check: &Check, verdict: Verdict) -> Response<Full<Bytes>> {
-        let Some((account, name, _)) = &self.user else {
+        let Some(arn) = &self.arn else {
             return format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied");
         };
         let on = match &check.on {
             On::Account => String::new(),
             on => format!(" on resource: \"{}\"", on.arn()),
         };
-        let why = match verdict {
-            Verdict::ExplicitDeny { identity: true } => "with an explicit deny in an identity-based policy".to_owned(),
-            Verdict::ExplicitDeny { identity: false } => "with an explicit deny in a resource-based policy".to_owned(),
-            _ => format!("because no identity-based policy allows the {} action", check.action),
-        };
-        let message =
-            format!("User: arn:aws:iam::{account}:user/{name} is not authorized to perform: {}{on} {why}", check.action);
+        let why = verdict.why(check.action, self.boundary());
+        let message = format!("User: {arn} is not authorized to perform: {}{on} {why}", check.action);
         format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", &message)
     }
 }
@@ -391,7 +412,10 @@ fn context(
         Some(principal) => {
             context.set("aws:username", &principal.name);
             context.set("aws:userid", principal.id.to_string());
-            context.set("aws:PrincipalArn", format!("arn:aws:iam::{}:user/{}", principal.account, principal.name));
+            context.set("aws:PrincipalArn", principal.arn());
+            for (key, value) in &principal.tags {
+                context.set(&format!("aws:PrincipalTag/{key}"), value);
+            }
             context.set("aws:PrincipalAccount", &principal.account);
             context.set("aws:PrincipalType", "User");
             context.set("aws:PrincipalIsAWSService", "false");

@@ -710,6 +710,86 @@ mod e2e {
         assert!(!users.as_array().unwrap().iter().any(|u| u["name"] == "stranger"));
     }
 
+    /// A delegated admin, as AWS's guide has it: the console makes and
+    /// manages users under its path only, with the permissions boundary its
+    /// policy names, and can't take the boundary off; what it may list is
+    /// those users. The admin sees paths, tags and boundaries, and changes
+    /// them.
+    #[tokio::test]
+    async fn a_delegated_admin_makes_users_only_within_its_boundary() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = Arc::new(Console { app: app.clone(), party: party() });
+        let client = app.pool.get().await.unwrap();
+        let account = crate::roles::account(&client).await.unwrap();
+        let mut admin = signed_in(&console, "root-ish", true).await;
+        let mut boss = signed_in(&console, "boss", false).await;
+
+        let bound = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:*","s3:ListAllMyBuckets"],"Resource":"*"}]}"#;
+        let (status, err) = admin
+            .send("POST", "/api/policies", Some(json!({ "name": "bound", "path": "/bounds/", "document": bound })))
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{err}");
+        let arn = format!("arn:aws:iam::{account}:policy/bounds/bound");
+        let users = format!("arn:aws:iam::{account}:user/team/*");
+        let delegated = json!({ "Version": "2012-10-17", "Statement": [
+            { "Effect": "Allow", "Action": ["iam:CreateUser", "iam:PutUserPolicy", "iam:TagUser"], "Resource": users,
+              "Condition": { "StringEquals": { "iam:PermissionsBoundary": arn } } },
+            { "Effect": "Allow", "Action": ["iam:ListUsers", "iam:GetUser", "iam:DeleteUser", "iam:CreateAccessKey"], "Resource": users },
+            { "Effect": "Deny", "Action": "iam:DeleteUserPermissionsBoundary", "Resource": "*" },
+        ]});
+        let (status, err) = admin
+            .send("PUT", "/api/roles/boss/policies/delegated", Some(json!({ "document": delegated.to_string() })))
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        let (status, err) = admin.send("PATCH", "/api/roles/boss", Some(json!({ "path": "/team/" }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        let (status, err) = admin.send("PUT", "/api/roles/boss/boundary", Some(json!({ "arn": arn }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+
+        // It lists the users under its path (itself), not the others.
+        let (status, listed) = boss.send("GET", "/api/roles", None).await;
+        assert_eq!(status, StatusCode::OK, "{listed}");
+        let names: Vec<_> = listed.as_array().unwrap().iter().map(|u| u["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["boss"]);
+        assert_eq!(listed[0]["arn"], format!("arn:aws:iam::{account}:user/team/boss"));
+        assert_eq!(listed[0]["boundary"], arn);
+
+        // Under its path, with the boundary (and tags), not without.
+        let new = |name: &str, path: &str, boundary: Option<&str>| {
+            json!({ "name": name, "path": path, "boundary": boundary, "tags": [{ "key": "team", "value": "a" }] })
+        };
+        let (status, err) = boss.send("POST", "/api/roles", Some(new("made", "/team/", None))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("iam:CreateUser"), "{err}");
+        let (status, _) = boss.send("POST", "/api/roles", Some(new("made", "/", Some(&arn)))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, err) = boss.send("POST", "/api/roles", Some(new("made", "/team/", Some(&arn)))).await;
+        assert_eq!(status, StatusCode::CREATED, "{err}");
+        let (status, err) = boss.send("DELETE", "/api/roles/made/boundary", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("explicit deny in an identity-based policy"), "{err}");
+        // Its own s3 permissions are its boundary's at most: none.
+        let (status, _) = boss.send("POST", "/api/buckets", Some(json!({ "name": "boss-bucket" }))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        // The admin sees it all, and changes tags; the boundary stays until
+        // it's taken off, and can't be deleted till then.
+        let (status, err) = admin.send("PUT", "/api/roles/made/tags", Some(json!({ "tags": [{ "key": "Team", "value": "b" }] }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        let (_, listed) = admin.send("GET", "/api/roles", None).await;
+        let made = listed.as_array().unwrap().iter().find(|u| u["name"] == "made").unwrap();
+        assert_eq!(made["path"], "/team/");
+        assert_eq!(made["boundary"], arn);
+        assert_eq!(made["tags"], json!([{ "key": "Team", "value": "b" }]));
+        let (_, policies) = admin.send("GET", "/api/policies", None).await;
+        let p = policies.as_array().unwrap().iter().find(|p| p["arn"] == arn).unwrap();
+        assert_eq!(p["bounds"], json!(["boss", "made"]));
+        let (status, _) = admin.send("DELETE", "/api/policies/bound", None).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = admin.send("PATCH", "/api/roles/made", Some(json!({ "name": "BOSS" }))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "names are unique regardless of case");
+    }
+
     /// One login (one passkey) acts in several accounts: as a user of one,
     /// the root of another, and a superadmin of the operator account, which
     /// takes a fresh passkey to switch into. Each account's buckets are its

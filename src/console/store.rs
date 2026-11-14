@@ -55,6 +55,8 @@ pub struct User {
     pub id: Uuid,
     pub name: String,
     pub admin: bool,
+    /// Its path, which its ARN has before its name.
+    pub path: String,
 }
 
 /// An identity: who a session acts as in an account.
@@ -72,7 +74,7 @@ impl Identity {
     /// Its ARN.
     pub fn arn(&self) -> String {
         match &self.user {
-            Some(user) => format!("arn:aws:iam::{}:user/{}", self.account_id, user.name),
+            Some(user) => crate::roles::user_arn(&self.account_id, &user.path, &user.name),
             None => format!("arn:aws:iam::{}:root", self.account_id),
         }
     }
@@ -86,13 +88,14 @@ impl Identity {
 
 /// The columns an identity is read from, as `identity_of` takes them, from
 /// `a` (accounts) and `r` (roles, left joined).
-const IDENTITY: &str = "a.id, a.name, a.operator, r.id, r.name, r.admin";
+const IDENTITY: &str = "a.id, a.name, a.operator, r.id, r.name, r.admin, coalesce(r.path, '/')";
 
 fn identity_of(row: &tokio_postgres::Row, at: usize) -> Identity {
     let user = row.get::<_, Option<Uuid>>(at + 3).map(|id| User {
         id,
         name: row.get(at + 4),
         admin: row.get(at + 5),
+        path: row.get(at + 6),
     });
     Identity { account_id: row.get(at), account: row.get(at + 1), operator: row.get(at + 2), user }
 }
@@ -103,7 +106,7 @@ pub async fn create_enrollment(client: &Object, account: &str, user: &str) -> an
     let (token, hash) = token()?;
     let made = client
         .execute_cached(
-            "WITH r AS (SELECT id, account_id FROM roles WHERE name = $1 AND account_id = $4),
+            "WITH r AS (SELECT id, account_id FROM roles WHERE lower(name) = lower($1) AND account_id = $4),
                   d AS (DELETE FROM console_enrollments e USING r WHERE e.role_id = r.id)
              INSERT INTO console_enrollments (token_hash, role_id, account_id, expires_at)
              SELECT $2, r.id, r.account_id, now() + make_interval(secs => $3) FROM r",
@@ -444,18 +447,18 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
         )
         .await?;
     let Some(row) = row else { return Ok(None) };
-    if row.get::<_, bool>(10) {
+    if row.get::<_, bool>(11) {
         client
             .execute_cached("UPDATE console_sessions SET last_seen_at = now() WHERE token_hash = $1", &[&hash(token)])
             .await?;
     }
     Ok(Some(Session {
         identity: identity_of(&row, 0),
-        login: row.get(6),
-        login_name: row.get(7),
-        credential_id: row.get(8),
-        fresh: row.get(9),
-        oidc_provider: row.get(11),
+        login: row.get(7),
+        login_name: row.get(8),
+        credential_id: row.get(9),
+        fresh: row.get(10),
+        oidc_provider: row.get(12),
     }))
 }
 

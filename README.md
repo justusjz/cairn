@@ -245,8 +245,14 @@ shards are waiting to move.
 ## Users and permissions
 
 A **user** (called a role before; `cairn role` still works) is who makes S3
-requests. Its name is unique in its [account](#users-and-permissions), as in
-IAM: two accounts may each have an `ada`. It has **access keys**: up to two,
+requests. Its name is unique in its [account](#users-and-permissions)
+regardless of case, as in IAM (an account can't have both `Ada` and `ada`,
+and looks either up as the other), but two accounts may each have an `ada`.
+It may have a **path** (`/team-a/`, say; `/` if not), which its ARN has
+before its name (`arn:aws:iam::<account>:user/team-a/ada`), and up to 50
+**tags** (keys unique regardless of case), which policies see as
+`aws:ResourceTag/<key>` (IAM's actions on the user) and
+`aws:PrincipalTag/<key>` (the user's own requests). It has **access keys**: up to two,
 as in IAM, each an access key ID and a secret. IDs are random, 20
 characters, as IAM's (`cairn user create` prints the first); only a role
 migrated from before access keys keeps a key named as it. Access key IDs are unique across the
@@ -293,15 +299,29 @@ allows; else it's denied. They are:
   before doesn't know managed policies, and denies what they allow.)
 - its **inline policies**: identity policies of its own, for anything finer
   (per key prefix, by condition, ...), set with `cairn user policy`;
+- its **permissions boundary**, if it has one: a managed policy (the
+  account's own, or Cairn's) that caps what its identity policies (managed
+  and inline) allow: they allow only what the boundary allows too, and a
+  `Deny` in it denies, as in AWS. A bucket policy that names the user (or
+  everyone) still allows it within the account, beyond the boundary; one
+  that names the account doesn't. That's how a non-admin can be let manage
+  users: a policy that allows `iam:CreateUser` and the like only under a path
+  of theirs and with a boundary (the condition key `iam:PermissionsBoundary`),
+  and denies changing that policy or taking boundaries off, lets them make
+  users who can never do more than the boundary (the console's Policies page
+  writes such a "delegated admin" policy). Older Cairns know no boundaries:
+  to them, a user with one has an inline policy that denies it everything,
+  and they can't change users, keys or policies at all; upgrade every node.
 - each bucket's **bucket policy**, set with PutBucketPolicy (by an admin), as
   in S3. A bucket policy can allow other users, or anyone: unsigned requests
   are **anonymous**, and only a bucket policy with `"Principal": "*"` can
   allow them (a public bucket, say). Users are named in policies as
-  `arn:aws:iam::<account>:user/<name>`; their account's ID is in
+  `arn:aws:iam::<account>:user/<path…/name>`; their account's ID is in
   `cairn user list`. As in S3, a bucket policy names the user that
   had the name when the policy was set: a user deleted and created again
   under the same name isn't allowed what the first was, and the policy then
-  shows the first by its ID.
+  shows the first by its ID; one renamed or moved since still is, and the
+  policy shows its ARN as it is now.
 
 **Accounts**, as AWS's: every user and bucket belongs to one (a 12-digit ID,
 and a name). The users and buckets from before accounts are the `default`
@@ -415,16 +435,22 @@ checked as IAM's actions on the user's ARN (`iam:CreateUser`,
 `iam:CreateAccessKey`, `iam:PutUserPolicy`, ...): an admin may do all of it,
 another user what its policies allow (its own keys, with a policy on
 `arn:aws:iam::*:user/${aws:username}`, say). There are users (CreateUser,
-GetUser, ListUsers, DeleteUser, which refuses while keys or policies are
-left, as IAM does), access keys (Create, List, Update, Delete), inline
-policies (Put, Get, List, Delete), and managed policies: CreatePolicy,
-GetPolicy, ListPolicies, DeletePolicy (refused while attached),
+with a path, tags and a permissions boundary; GetUser; ListUsers, by path
+prefix; UpdateUser, which renames or moves one; DeleteUser, which refuses
+while keys or policies are left, as IAM does), their tags (TagUser,
+UntagUser, ListUserTags) and permissions boundaries
+(PutUserPermissionsBoundary, DeleteUserPermissionsBoundary), access keys
+(Create, List, Update, Delete), inline policies (Put, Get, List, Delete),
+and managed policies: CreatePolicy (with a path), GetPolicy, ListPolicies,
+DeletePolicy (refused while attached, or a boundary),
 ListEntitiesForPolicy, and AttachUserPolicy, DetachUserPolicy and
 ListAttachedUserPolicies, of Cairn's (AWS's ARNs) or the account's own.
-Cairn keeps one version of a policy, the default (`v1`, `v2`, ...):
-CreatePolicyVersion replaces it, and must set it as the default;
-GetPolicyVersion and ListPolicyVersions show it. Groups, roles, paths, tags
-and permissions boundaries are NotImplemented. STS's
+Condition keys are IAM's: `iam:PermissionsBoundary`, `iam:PolicyARN`,
+`aws:ResourceTag/…` (and `iam:ResourceTag/…`), `aws:RequestTag/…` and
+`aws:TagKeys`, decided as AWS decides them (probed). Cairn keeps one version
+of a policy, the default (`v1`, `v2`, ...): CreatePolicyVersion replaces it,
+and must set it as the default; GetPolicyVersion and ListPolicyVersions show
+it. Groups, roles and policies' tags are NotImplemented. STS's
 `GetCallerIdentity` answers too (signed for `sts`), which Terraform's AWS
 provider calls as it starts. The AWS CLI refuses access key IDs shorter than
 16 characters as parameters (`--access-key-id`): the keys Cairn makes are

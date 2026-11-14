@@ -43,11 +43,21 @@ export default function Policies() {
                       <Show when={p.aws}>
                         <Badge>Cairn's (AWS)</Badge>
                       </Show>
+                      <Show when={p.path !== "/"}>
+                        <div class="subtle small" title={p.arn}>
+                          path {p.path}
+                        </div>
+                      </Show>
                     </td>
                     <td class="small">{p.description || <span class="subtle">–</span>}</td>
                     <td>
-                      <Show when={p.users.length} fallback={<span class="subtle">no one</span>}>
+                      <Show when={p.users.length} fallback={<Show when={!p.bounds.length}><span class="subtle">no one</span></Show>}>
                         <For each={p.users}>{(u) => <span class="chip mono">{u}</span>}</For>
+                      </Show>
+                      <Show when={p.bounds.length}>
+                        <div class="small" title="Users whose permissions boundary it is: it caps what their policies allow">
+                          boundary of <For each={p.bounds}>{(u) => <span class="chip mono">{u}</span>}</For>
+                        </div>
                       </Show>
                     </td>
                     <td class="small">
@@ -61,8 +71,14 @@ export default function Policies() {
                       <Show when={!p.aws}>
                         <button
                           class="small danger"
-                          disabled={p.users.length > 0}
-                          title={p.users.length ? "Detach it from its users first" : ""}
+                          disabled={p.users.length > 0 || p.bounds.length > 0}
+                          title={
+                            p.users.length
+                              ? "Detach it from its users first"
+                              : p.bounds.length
+                                ? "It's users' permissions boundary: take it off them first"
+                                : ""
+                          }
                           onClick={() => remove(p)}
                         >
                           Delete
@@ -80,6 +96,7 @@ export default function Policies() {
         {(o) => (
           <ManagedPolicyDialog
             policy={o().policy}
+            policies={data.data()?.[0] ?? []}
             buckets={buckets()}
             onClose={() => setOpen(undefined)}
             changed={data.refresh}
@@ -93,6 +110,7 @@ export default function Policies() {
 /** A managed policy to view (Cairn's), edit, or make (`policy` not given). */
 function ManagedPolicyDialog(props: {
   policy?: ManagedPolicy;
+  policies: ManagedPolicy[];
   buckets: string[];
   onClose: () => void;
   changed: () => void;
@@ -103,6 +121,9 @@ function ManagedPolicyDialog(props: {
   const [description, setDescription] = createSignal(p?.description ?? "");
   const [document, setDocument] = createSignal(p ? pretty(p.document) : EMPTY);
   const [error, setError] = createSignal<string>();
+  const [path, setPath] = createSignal("");
+  const [delegateBoundary, setDelegateBoundary] = createSignal("");
+  const [delegatePath, setDelegatePath] = createSignal("/team/");
   onMount(() => dialog.showModal());
   const save = async (e: SubmitEvent) => {
     e.preventDefault();
@@ -113,7 +134,7 @@ function ManagedPolicyDialog(props: {
         if (description() !== p.description) change.description = description();
         await api.updatePolicy(p.name, change);
       } else {
-        await api.createPolicy(name().trim(), document(), description());
+        await api.createPolicy(name().trim(), document(), description(), path().trim());
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -146,6 +167,47 @@ function ManagedPolicyDialog(props: {
             value={name()}
             onInput={(e) => setName(e.currentTarget.value)}
           />
+          <input
+            type="text"
+            placeholder="/path/ (optional)"
+            aria-label="Path"
+            title="Its ARN has the path before its name (arn:aws:iam::…:policy/team/name), which policies can name"
+            autocomplete="off"
+            value={path()}
+            onInput={(e) => setPath(e.currentTarget.value)}
+          />
+          <div class="form-row template">
+            <span class="small">Delegated admin:</span>
+            <select
+              aria-label="Their users' permissions boundary"
+              value={delegateBoundary()}
+              onChange={(e) => setDelegateBoundary(e.currentTarget.value)}
+            >
+              <option value="">their users' boundary…</option>
+              <For each={props.policies}>{(b) => <option value={b.arn}>{b.name}</option>}</For>
+            </select>
+            <input
+              type="text"
+              aria-label="Their users' path"
+              title="The path their users are made under, and the only users they may manage"
+              value={delegatePath()}
+              onInput={(e) => setDelegatePath(e.currentTarget.value)}
+            />
+            <button
+              type="button"
+              class="small"
+              disabled={!delegateBoundary() || !delegatePath().startsWith("/") || !delegatePath().endsWith("/")}
+              onClick={() => setDocument(delegatedAdmin(delegateBoundary(), delegatePath()))}
+            >
+              Write
+            </button>
+          </div>
+          <p class="subtle small">
+            A delegated admin manages users under a path, and makes them only with a permissions boundary, so they can never
+            give anyone more than the boundary allows; they can't change the boundary or take it off. Give them this policy,
+            and a boundary of their own that allows what it does (the same, if it allows managing those users), so that
+            they can't give themselves more either.
+          </p>
         </Show>
         <input
           type="text"
@@ -177,5 +239,78 @@ function ManagedPolicyDialog(props: {
         </div>
       </form>
     </dialog>
+  );
+}
+
+/** A delegated admin's policy (as AWS's guide has it): users under `path`
+ * may be made and given policies only with the permissions boundary
+ * `boundary`, managed otherwise (their keys, console links, tags), but not
+ * moved elsewhere; and the boundary can't be changed, nor taken off anyone.
+ * (CreateAccessKey and CreateLoginProfile take no boundary: the path is
+ * what keeps them to those users.) */
+function delegatedAdmin(boundary: string, path: string): string {
+  const users = `arn:aws:iam::*:user${path}*`;
+  return JSON.stringify(
+    {
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Sid: "MakeAndChangeUsersOnlyWithTheBoundary",
+          Effect: "Allow",
+          Action: [
+            "iam:CreateUser",
+            "iam:PutUserPermissionsBoundary",
+            "iam:PutUserPolicy",
+            "iam:DeleteUserPolicy",
+            "iam:AttachUserPolicy",
+            "iam:DetachUserPolicy",
+          ],
+          Resource: users,
+          Condition: { StringEquals: { "iam:PermissionsBoundary": boundary } },
+        },
+        {
+          Sid: "ManageTheirUsers",
+          Effect: "Allow",
+          Action: [
+            "iam:GetUser",
+            "iam:ListUsers",
+            "iam:UpdateUser",
+            "iam:DeleteUser",
+            "iam:TagUser",
+            "iam:UntagUser",
+            "iam:ListUserTags",
+            "iam:CreateAccessKey",
+            "iam:ListAccessKeys",
+            "iam:UpdateAccessKey",
+            "iam:DeleteAccessKey",
+            "iam:CreateLoginProfile",
+            "iam:ListUserPolicies",
+            "iam:GetUserPolicy",
+            "iam:ListAttachedUserPolicies",
+          ],
+          Resource: users,
+        },
+        {
+          Sid: "SeePolicies",
+          Effect: "Allow",
+          Action: ["iam:ListPolicies", "iam:GetPolicy", "iam:GetPolicyVersion", "iam:ListEntitiesForPolicy"],
+          Resource: "*",
+        },
+        {
+          Sid: "NoChangingTheBoundary",
+          Effect: "Deny",
+          Action: ["iam:CreatePolicyVersion", "iam:DeletePolicy", "iam:DeletePolicyVersion", "iam:SetDefaultPolicyVersion"],
+          Resource: boundary,
+        },
+        {
+          Sid: "NoTakingBoundariesOff",
+          Effect: "Deny",
+          Action: "iam:DeleteUserPermissionsBoundary",
+          Resource: "*",
+        },
+      ],
+    },
+    null,
+    2,
   );
 }

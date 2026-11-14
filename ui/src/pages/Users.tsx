@@ -1,5 +1,5 @@
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type AccessKey, type Cluster, type ConsoleAccess, type ManagedPolicy, type User, api, isOperator } from "../api";
+import { type AccessKey, type Cluster, type ConsoleAccess, type ManagedPolicy, type Tag, type User, api, isOperator } from "../api";
 import { Badge, Loading, Panel, SecretDialog, Table, act, poll, toast } from "../components/ui";
 import { ago, date, pretty } from "../format";
 import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
@@ -28,16 +28,22 @@ function TenantUsers() {
   const [secret, setSecret] = createSignal<NewSecret>();
   const [editing, setEditing] = createSignal<{ user: string; policy?: string }>();
   const [attaching, setAttaching] = createSignal<User>();
+  const [details, setDetails] = createSignal<User>();
   const [enrollment, setEnrollment] = createSignal<Enrollment>();
   const [name, setName] = createSignal("");
   const [kind, setKind] = createSignal<"person" | "service">("person");
   const [admin, setAdmin] = createSignal(false);
+  const [path, setPath] = createSignal("");
+  const [boundary, setBoundary] = createSignal("");
 
   const create = async (e: SubmitEvent) => {
     e.preventDefault();
     const n = name().trim();
     const service = kind() === "service";
-    const res = await act(() => api.createRole(n, { accessKey: service, admin: admin() }), `Created ${n}`);
+    const res = await act(
+      () => api.createRole(n, { accessKey: service, admin: admin(), path: path().trim(), boundary: boundary() }),
+      `Created ${n}`,
+    );
     if (!res) return;
     setName("");
     setAdmin(false);
@@ -62,6 +68,7 @@ function TenantUsers() {
           showSecret={setSecret}
           editPolicy={(policy) => setEditing({ user: user.name, policy })}
           showEnrollment={(e) => setEnrollment({ user: user.name, ...e })}
+          details={() => setDetails(user)}
         />
       )}
     </For>
@@ -95,6 +102,24 @@ function TenantUsers() {
             <input type="checkbox" checked={admin()} onChange={(e) => setAdmin(e.currentTarget.checked)} />
             Admin
           </label>
+          <input
+            type="text"
+            placeholder="/path/ (optional)"
+            aria-label="Path"
+            title="Where the user is: its ARN has the path before its name (arn:aws:iam::…:user/team/name), which policies can name"
+            autocomplete="off"
+            value={path()}
+            onInput={(e) => setPath(e.currentTarget.value)}
+          />
+          <select
+            aria-label="Permissions boundary"
+            title="A managed policy that caps what the user's policies may allow"
+            value={boundary()}
+            onChange={(e) => setBoundary(e.currentTarget.value)}
+          >
+            <option value="">No boundary</option>
+            <For each={data.data()?.[2] ?? []}>{(p) => <option value={p.arn}>Boundary: {p.name}</option>}</For>
+          </select>
           <button class="primary" type="submit">
             {kind() === "person" ? "Create and get link" : "Create with access key"}
           </button>
@@ -103,7 +128,9 @@ function TenantUsers() {
           A person gets a one-time console link to set up a passkey (or sign in with a provider), and no access key. A
           service gets an access key, whose secret is shown once; a user may have {MAX_KEYS}, to rotate them. What a user
           may do is what its policies allow: managed ones attached to it (see Policies; an admin has AdministratorAccess,
-          everything in the account), and inline ones of its own. A Deny wins over any Allow.
+          everything in the account), and inline ones of its own. A Deny wins over any Allow. A permissions boundary caps
+          that: a user with one may do only what both its policies and the boundary allow, so a non-admin can be let make
+          users only with a boundary (its condition key iam:PermissionsBoundary), under a path of theirs.
         </p>
       </Panel>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
@@ -139,6 +166,16 @@ function TenantUsers() {
             policy={e().policy}
             buckets={(data.data()?.[1] ?? []).map((b) => b.name)}
             onClose={() => setEditing(undefined)}
+            changed={data.refresh}
+          />
+        )}
+      </Show>
+      <Show when={details()}>
+        {(u) => (
+          <DetailsDialog
+            user={u()}
+            policies={data.data()?.[2] ?? []}
+            onClose={() => setDetails(undefined)}
             changed={data.refresh}
           />
         )}
@@ -384,6 +421,7 @@ function UserRow(props: {
   showSecret: (s: NewSecret) => void;
   editPolicy: (policy?: string) => void;
   showEnrollment: (e: { url?: string | null; path: string }) => void;
+  details: () => void;
 }) {
   const r = () => props.user;
   const detach = async (name: string, arn: string) => {
@@ -413,6 +451,29 @@ function UserRow(props: {
         {r().name}{" "}
         <Show when={r().admin}>
           <Badge tone="accent">admin</Badge>
+        </Show>
+        <Show when={r().path !== "/"}>
+          <div class="subtle small" title={r().arn}>
+            path {r().path}
+          </div>
+        </Show>
+        <Show when={r().boundary}>
+          {(b) => (
+            <div class="small" title={`Permissions boundary: ${b()}. Its policies allow only what this allows too.`}>
+              <Badge tone="warn">bounded by {b().split("/").pop()}</Badge>
+            </div>
+          )}
+        </Show>
+        <Show when={r().tags.length}>
+          <div class="small">
+            <For each={r().tags}>
+              {(t) => (
+                <span class="chip" title="A tag (aws:ResourceTag, and aws:PrincipalTag in its own requests)">
+                  {t.key}={t.value}
+                </span>
+              )}
+            </For>
+          </div>
         </Show>
         <div class="subtle small" title="The user's name (alias) in the KMS's auth mount for Cairn">
           id {r().id}
@@ -504,6 +565,9 @@ function UserRow(props: {
             Access key
           </button>
         </Show>
+        <button class="small" title="Its name, path, permissions boundary and tags" onClick={props.details}>
+          Details…
+        </button>
         <button class="small danger" onClick={remove}>
           Delete
         </button>
@@ -705,6 +769,105 @@ function AttachDialog(props: { user: User; policies: ManagedPolicy[]; onClose: (
           </button>
           <button class="primary" type="submit" disabled={!chosen()}>
             Attach
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+/** A user's name and path (renamed or moved, as IAM's UpdateUser),
+ * permissions boundary and tags. */
+function DetailsDialog(props: { user: User; policies: ManagedPolicy[]; onClose: () => void; changed: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const [name, setName] = createSignal(props.user.name);
+  const [path, setPath] = createSignal(props.user.path);
+  const [boundary, setBoundary] = createSignal(props.user.boundary ?? "");
+  const [tags, setTags] = createSignal<Tag[]>(props.user.tags.map((t) => ({ ...t })));
+  const setTag = (i: number, change: Partial<Tag>) => setTags(tags().map((t, j) => (j === i ? { ...t, ...change } : t)));
+  const save = async (e: SubmitEvent) => {
+    e.preventDefault();
+    let user = props.user.name;
+    if (name().trim() !== user || path().trim() !== props.user.path) {
+      const change = { name: name().trim() !== user ? name().trim() : undefined, path: path().trim() || "/" };
+      if (!(await act(() => api.updateRole(user, change), `Changed ${user}`))) return;
+      user = change.name ?? user;
+    }
+    if (boundary() !== (props.user.boundary ?? "")) {
+      const done = boundary()
+        ? await act(() => api.setBoundary(user, boundary()), `Set ${user}'s permissions boundary`)
+        : await act(() => api.deleteBoundary(user), `Removed ${user}'s permissions boundary`);
+      if (!done) return;
+    }
+    const wanted = tags().filter((t) => t.key.trim()).map((t) => ({ key: t.key.trim(), value: t.value }));
+    if (JSON.stringify(wanted) !== JSON.stringify(props.user.tags)) {
+      if (!(await act(() => api.setRoleTags(user, wanted), `Set ${user}'s tags`))) return;
+    }
+    props.changed();
+    dialog.close();
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={save}>
+        <h2>
+          <span class="mono">{props.user.name}</span>
+        </h2>
+        <p class="subtle small mono">{props.user.arn}</p>
+        <label>
+          Name
+          <input type="text" autocomplete="off" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+        </label>
+        <label>
+          Path
+          <input type="text" autocomplete="off" value={path()} onInput={(e) => setPath(e.currentTarget.value)} />
+        </label>
+        <p class="subtle small">
+          Renaming or moving a user changes its ARN: policies that name it by its ARN (but buckets' policies, which keep
+          naming it) need changing too.
+        </p>
+        <label>
+          Permissions boundary
+          <select value={boundary()} onChange={(e) => setBoundary(e.currentTarget.value)}>
+            <option value="">None</option>
+            <For each={props.policies}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
+          </select>
+        </label>
+        <p class="subtle small">
+          With a boundary, the user may do only what both its policies and the boundary allow (a bucket's policy that names
+          the user itself still allows it).
+        </p>
+        <div>Tags</div>
+        <For each={tags()}>
+          {(t, i) => (
+            <div class="form-row">
+              <input type="text" placeholder="key" aria-label="Tag key" value={t.key} onInput={(e) => setTag(i(), { key: e.currentTarget.value })} />
+              <input
+                type="text"
+                placeholder="value"
+                aria-label="Tag value"
+                value={t.value}
+                onInput={(e) => setTag(i(), { value: e.currentTarget.value })}
+              />
+              <button type="button" class="small" onClick={() => setTags(tags().filter((_, j) => j !== i()))}>
+                Remove
+              </button>
+            </div>
+          )}
+        </For>
+        <button type="button" class="small" disabled={tags().length >= 50} onClick={() => setTags([...tags(), { key: "", value: "" }])}>
+          Add tag
+        </button>
+        <p class="subtle small">
+          Policies see a user's tags as aws:ResourceTag/… (in IAM actions on it) and aws:PrincipalTag/… (in its own
+          requests). Keys are unique regardless of case.
+        </p>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit">
+            Save
           </button>
         </div>
       </form>

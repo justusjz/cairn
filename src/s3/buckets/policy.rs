@@ -61,9 +61,14 @@ pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<
             return invalid_principal();
         }
     }
+    // A user by its ARN: its path, then its name (as `db::BOUNDARIES`'s
+    // `cairn_policy_principals` finds it).
     for (account, user) in policy.users() {
         let exists = client
-            .query_opt_cached("SELECT 1 FROM roles WHERE name = $1 AND account_id = $2", &[&user, &account])
+            .query_opt_cached(
+                "SELECT 1 FROM roles WHERE substring(path FROM 2) || name = $1 AND account_id = $2",
+                &[&user, &account],
+            )
             .await?
             .is_some();
         if !exists {
@@ -83,15 +88,20 @@ async fn stored(client: &Object, bucket: &str) -> anyhow::Result<Option<Option<S
 /// The bucket's policy as GetBucketPolicy shows it: as it's kept, but each
 /// user it names that's gone since it was set named by its ID, as S3 shows
 /// one (a user made with the name since isn't the one it names: see
-/// `db::PRINCIPAL_IDS`). `None` if there's no such bucket, `Some(None)` if
-/// it has none.
+/// `db::PRINCIPAL_IDS`), and each that's been renamed or moved since by its
+/// ARN now (probed). `None` if there's no such bucket, `Some(None)` if it
+/// has none.
 pub async fn shown(client: &Object, bucket: &str) -> anyhow::Result<Option<Option<String>>> {
     let row = client
         .query_opt_cached(
             "SELECT b.policy,
-                    (SELECT coalesce(jsonb_object_agg(p.key, p.value), '{}'::jsonb)
+                    (SELECT coalesce(jsonb_object_agg(p.key, coalesce(
+                                'arn:aws:iam::' || r.account_id || ':user/' || substring(r.path FROM 2) || r.name,
+                                p.value)), '{}'::jsonb)
                      FROM jsonb_each_text(b.policy_principals) p
-                     WHERE NOT EXISTS (SELECT 1 FROM roles r WHERE r.id::text = p.value))::text
+                     LEFT JOIN roles r ON r.id::text = p.value
+                     WHERE r.id IS NULL
+                        OR p.key <> 'arn:aws:iam::' || r.account_id || ':user/' || substring(r.path FROM 2) || r.name)::text
              FROM buckets b WHERE b.name = $1",
             &[&bucket],
         )

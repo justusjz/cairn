@@ -48,6 +48,11 @@ pub async fn connect(url: &str) -> anyhow::Result<Pool> {
 /// the new version.
 pub(crate) const PROTOCOL: &str = "6";
 
+/// What this Cairn's sessions declare as `cairn.users`, which the users'
+/// gate (`cairn_require_users`, last raised by `BOUNDARIES`) requires of
+/// every session that changes users, their keys or policies.
+pub(crate) const USERS_GATE: &str = "3";
+
 /// The catalog's transactions, as functions (see `catalog.sql`).
 const CATALOG_FUNCTIONS: &str = include_str!("catalog.sql");
 
@@ -67,7 +72,7 @@ async fn install_functions(client: &tokio_postgres::Client) -> Result<(), tokio_
         .batch_execute(&format!(
             "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED;
              SET cairn.protocol = '{PROTOCOL}';
-             SET cairn.users = '2'"
+             SET cairn.users = '{USERS_GATE}'"
         ))
         .await?;
     client.batch_execute(CATALOG_FUNCTIONS).await
@@ -211,6 +216,7 @@ const MIGRATIONS: &[&str] = &[
     OPERATOR_MEMBERS,
     MANAGED_POLICIES,
     ACCOUNT_PUBLIC_ACCESS_BLOCK,
+    BOUNDARIES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -246,20 +252,25 @@ async fn init(pool: &Pool) -> anyhow::Result<()> {
         // Cairn's protocol. That's the protocol the step raises the gate to,
         // if it does (it does so first), else the gate's as the steps before
         // left it. For this transaction only.
-        match gate_of(sql) {
-            Some(protocol) => {
-                tx.execute("SELECT set_config('cairn.protocol', $1, true)", &[&protocol]).await?;
-            }
-            None => {
-                tx.execute(
-                    "SELECT set_config('cairn.protocol', coalesce(
-                         (SELECT substring(p.prosrc FROM 'IS DISTINCT FROM ''([0-9]+)''')
-                          FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-                          WHERE p.proname = 'cairn_require_protocol' AND n.nspname = 'public'),
-                         $1), true)",
-                    &[&PROTOCOL],
-                )
-                .await?;
+        // Likewise the users' gate (`cairn.users`; see `USERS`).
+        for (setting, function, ours) in
+            [("cairn.protocol", "cairn_require_protocol", PROTOCOL), ("cairn.users", "cairn_require_users", USERS_GATE)]
+        {
+            match gate_of(sql, function) {
+                Some(value) => {
+                    tx.execute("SELECT set_config($1, $2, true)", &[&setting, &value]).await?;
+                }
+                None => {
+                    tx.execute(
+                        "SELECT set_config($1, coalesce(
+                             (SELECT substring(p.prosrc FROM 'IS DISTINCT FROM ''([0-9]+)''')
+                              FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                              WHERE p.proname = $2 AND n.nspname = 'public'),
+                             $3), true)",
+                        &[&setting, &function, &ours],
+                    )
+                    .await?;
+                }
             }
         }
         tx.batch_execute(sql).await?;
@@ -274,10 +285,10 @@ async fn init(pool: &Pool) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The protocol a migration step raises the gate to, if it defines the
-/// gate's function.
-fn gate_of(sql: &str) -> Option<String> {
-    let (_, rest) = sql.split_once("FUNCTION cairn_require_protocol() RETURNS")?;
+/// The value a migration step raises a gate to, if it defines the gate's
+/// function (`cairn_require_protocol`, `cairn_require_users`).
+fn gate_of(sql: &str, function: &str) -> Option<String> {
+    let (_, rest) = sql.split_once(&format!("FUNCTION {function}() RETURNS"))?;
     let (_, rest) = rest.split_once("IS DISTINCT FROM '")?;
     Some(rest.split('\'').next()?.to_owned())
 }
@@ -1704,6 +1715,136 @@ UPDATE accounts SET public_access_block =
 WHERE NOT operator
   AND EXISTS (SELECT 1 FROM settings WHERE name IN ('block-public-policy', 'restrict-public-buckets') AND value <> '0');
 DELETE FROM settings WHERE name IN ('block-public-policy', 'restrict-public-buckets');
+"#;
+
+/// Migration 42: IAM's permissions boundaries, user paths and tags, and
+/// managed policies' paths (see `iam`, `plans/boundaries.md`), and user
+/// names unique regardless of case, as IAM's are.
+///
+/// A user's boundary is a managed policy (the account's own, which can't be
+/// deleted while it's one, or Cairn's), which caps what its identity
+/// policies allow. An older Cairn knows no boundaries, and would allow a
+/// bounded user what the boundary doesn't: so a bounded user also has an
+/// inline policy that denies everything, `cairn:boundary` (kept by a
+/// trigger), which only older Cairns read (this one leaves out the inline
+/// policies named `cairn:…`, which IAM's names can't be). And older Cairns
+/// may no longer change users, policies or keys at all (`cairn.users` 3),
+/// which could undo that.
+const BOUNDARIES: &str = r#"
+DO $$
+DECLARE
+    v_clashes text;
+BEGIN
+    SELECT string_agg(format('%s in account %s', names, account_id), '; ') INTO v_clashes
+    FROM (SELECT account_id, string_agg(name, ', ' ORDER BY name) AS names
+          FROM roles GROUP BY account_id, lower(name) HAVING count(*) > 1) c;
+    IF v_clashes IS NOT NULL THEN
+        RAISE EXCEPTION 'user names must differ in more than case now, as IAM''s do: delete one of each of %, with the Cairn you have, before upgrading', v_clashes
+            USING ERRCODE = 'unique_violation';
+    END IF;
+END $$;
+CREATE UNIQUE INDEX roles_account_lower_name ON roles (account_id, lower(name));
+
+ALTER TABLE roles ADD COLUMN path text NOT NULL DEFAULT '/'
+    CHECK (length(path) <= 512 AND path ~ '^/([A-Za-z0-9+=,.@_/-]*/)?$' AND path <> '//');
+ALTER TABLE roles ADD COLUMN boundary_policy_id uuid REFERENCES managed_policies (id);
+ALTER TABLE roles ADD COLUMN boundary_aws text;
+ALTER TABLE roles ADD CONSTRAINT roles_one_boundary CHECK (boundary_policy_id IS NULL OR boundary_aws IS NULL);
+CREATE INDEX roles_boundary ON roles (boundary_policy_id) WHERE boundary_policy_id IS NOT NULL;
+
+ALTER TABLE managed_policies ADD COLUMN path text NOT NULL DEFAULT '/'
+    CHECK (length(path) <= 512 AND path ~ '^/([A-Za-z0-9+=,.@_/-]*/)?$' AND path <> '//');
+
+-- A user's tags: at most 50 (see catalog.sql's I10), keys unique regardless
+-- of case. `seq` orders them as IAM lists them: newest first.
+CREATE TABLE role_tags (
+    role_id uuid NOT NULL REFERENCES roles (id) ON DELETE CASCADE,
+    key     text NOT NULL CHECK (length(key) BETWEEN 1 AND 128),
+    value   text NOT NULL CHECK (length(value) <= 256),
+    seq     bigint GENERATED ALWAYS AS IDENTITY
+);
+CREATE UNIQUE INDEX role_tags_key ON role_tags (role_id, lower(key));
+
+-- A user's boundary is its own account's.
+CREATE FUNCTION cairn_boundary_account() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.boundary_policy_id IS NOT NULL AND (SELECT account_id FROM managed_policies WHERE id = NEW.boundary_policy_id)
+        IS DISTINCT FROM NEW.account_id THEN
+        RAISE EXCEPTION 'a user''s permissions boundary is its own account''s' USING ERRCODE = 'check_violation';
+    END IF;
+    IF (NEW.boundary_policy_id IS NOT NULL OR NEW.boundary_aws IS NOT NULL)
+        AND (SELECT operator FROM accounts WHERE id = NEW.account_id) THEN
+        RAISE EXCEPTION 'the operator account''s users are superadmins, with no permissions boundaries'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER roles_boundary_account BEFORE INSERT OR UPDATE OF boundary_policy_id, account_id ON roles
+    FOR EACH ROW EXECUTE FUNCTION cairn_boundary_account();
+
+-- What older Cairns read in place of a boundary: deny all.
+CREATE FUNCTION cairn_boundary_for_older() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.boundary_policy_id IS NOT NULL OR NEW.boundary_aws IS NOT NULL THEN
+        INSERT INTO role_policies (role_id, name, document)
+        VALUES (NEW.id, 'cairn:boundary', '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}')
+        ON CONFLICT DO NOTHING;
+    ELSE
+        DELETE FROM role_policies WHERE role_id = NEW.id AND name = 'cairn:boundary';
+    END IF;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER roles_boundary_for_older AFTER INSERT OR UPDATE OF boundary_policy_id, boundary_aws ON roles
+    FOR EACH ROW EXECUTE FUNCTION cairn_boundary_for_older();
+
+-- Bucket policies name users by their ARNs, paths and all.
+CREATE OR REPLACE FUNCTION cairn_policy_principals() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.policy_principals := CASE WHEN NEW.policy IS NOT NULL THEN (
+        SELECT coalesce(jsonb_object_agg(p.arn, r.id::text), '{}'::jsonb)
+        FROM (
+            SELECT DISTINCT a #>> '{}' AS arn
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].Principal.AWS[*]') a
+            UNION
+            SELECT a #>> '{}'
+            FROM jsonb_path_query(NEW.policy::jsonb, 'lax $.Statement[*].NotPrincipal.AWS[*]') a
+        ) p
+        JOIN roles r ON r.account_id = substring(p.arn FROM '^arn:aws:iam::([0-9]{12}):user/')
+                    AND substring(r.path FROM 2) || r.name = substring(p.arn FROM '^arn:aws:iam::[0-9]{12}:user/(.+)$')
+    ) END;
+    RETURN NEW;
+END
+$$;
+
+CREATE OR REPLACE FUNCTION cairn_require_users() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.users', true) IS DISTINCT FROM '3' THEN
+        RAISE EXCEPTION 'this Cairn is too old to change users, which have permissions boundaries now; upgrade it'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+DROP TRIGGER roles_users ON roles;
+CREATE TRIGGER roles_users BEFORE INSERT OR DELETE OR TRUNCATE
+    OR UPDATE OF name, secret, account_id, path, boundary_policy_id, boundary_aws ON roles
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER role_policies_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON role_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER role_attached_policies_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON role_attached_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER managed_policies_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON managed_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER access_keys_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON access_keys
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER role_tags_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON role_tags
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER role_tags_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON role_tags
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER role_tags_operator BEFORE INSERT OR UPDATE OF role_id ON role_tags
+    FOR EACH ROW EXECUTE FUNCTION cairn_operator_members();
 "#;
 
 #[cfg(test)]

@@ -230,7 +230,7 @@ async fn grant_policy(client: &Object, account: &str, bucket: &str, permission: 
                     continue;
                 }
                 let description = format!("{} on bucket {bucket} (a grant)", permission.as_str());
-                match managed::create(client, account, &name, &document, &description).await {
+                match managed::create(client, account, &name, "/", &document, &description).await {
                     Ok(_) => return Ok(Some(name)),
                     // Made meanwhile (by another node): as it is now.
                     Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => {
@@ -263,7 +263,7 @@ pub async fn change(client: &Object, account: &str, user: &str, bucket: &str, pe
     }
     for permission in permissions {
         let Some(name) = grant_policy(client, account, bucket, *permission, grant).await? else { continue };
-        let arn = crate::managed::arn(account, &name);
+        let arn = crate::managed::get(client, account, &name).await?.arn(account);
         match crate::managed::attach(client, account, user, &arn, grant).await {
             Ok(()) => {}
             // Revoking what wasn't granted.
@@ -294,7 +294,7 @@ pub async fn to_managed(client: &Object) -> anyhow::Result<usize> {
         let grants = in_policy(&policy);
         for (arn, permission) in &grants {
             let Some(user) = arn.strip_prefix(&prefix) else { continue };
-            if client.query_opt_cached("SELECT 1 FROM roles WHERE account_id = $1 AND name = $2", &[&account, &user]).await?.is_none() {
+            if client.query_opt_cached("SELECT 1 FROM roles WHERE account_id = $1 AND lower(name) = lower($2)", &[&account, &user]).await?.is_none() {
                 continue;
             }
             change(client, &account, user, &bucket, &[*permission], true).await?;

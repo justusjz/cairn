@@ -2749,6 +2749,53 @@
             }
           }
         }
+      },
+      "patch": {
+        "summary": "Renames or moves a user, as IAM's UpdateUser: allowed on it, and on\nwhere it goes (its new ARN; moved only, its new path: see `iam`).",
+        "operationId": "update_role",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoleChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/roles/{role}/admin": {
@@ -2872,6 +2919,92 @@
         "responses": {
           "204": {
             "description": "Detached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role}/boundary": {
+      "put": {
+        "summary": "Sets a user's permissions boundary, as IAM's\nPutUserPermissionsBoundary (decided by the boundary asked for).",
+        "operationId": "set_boundary",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BoundaryArn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a user's permissions boundary.",
+        "operationId": "delete_boundary",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
           },
           "4XX": {
             "content": {
@@ -3272,6 +3405,55 @@
                 }
               }
             }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/roles/{role}/tags": {
+      "put": {
+        "summary": "Sets a user's tags, as IAM's TagUser and UntagUser would.",
+        "operationId": "set_role_tags",
+        "parameters": [
+          {
+            "name": "role",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RoleTags"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
           },
           "4XX": {
             "content": {
@@ -3703,6 +3885,18 @@
           },
           "restrict_public_buckets": {
             "type": "boolean"
+          }
+        }
+      },
+      "BoundaryArn": {
+        "type": "object",
+        "required": [
+          "arn"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string",
+            "description": "A managed policy's ARN: the account's own, or one of Cairn's."
           }
         }
       },
@@ -5418,6 +5612,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its path (`/`, or `/…/`); `/` if not given."
           }
         }
       },
@@ -5447,8 +5648,22 @@
           "admin": {
             "type": "boolean"
           },
+          "boundary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its permissions boundary: a managed policy's ARN."
+          },
           "name": {
             "type": "string"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its path (`/`, or `/…/`); `/` if not given."
           },
           "secret": {
             "type": [
@@ -5456,6 +5671,13 @@
               "null"
             ],
             "description": "The access key's secret: at least 8 characters; one is generated if\nnot given. Implies `access_key`."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags."
           }
         }
       },
@@ -6111,7 +6333,9 @@
           "description",
           "document",
           "version",
-          "users"
+          "users",
+          "path",
+          "bounds"
         ],
         "properties": {
           "arn": {
@@ -6121,6 +6345,13 @@
             "type": "boolean",
             "description": "Whether it's one of Cairn's (AWS's), which can't be changed."
           },
+          "bounds": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The account's users whose permissions boundary it is."
+          },
           "description": {
             "type": "string"
           },
@@ -6129,6 +6360,10 @@
           },
           "name": {
             "type": "string"
+          },
+          "path": {
+            "type": "string",
+            "description": "Its path (`/`, or `/…/`)."
           },
           "updated_at": {
             "type": [
@@ -6250,6 +6485,25 @@
           }
         }
       },
+      "RoleChange": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its new name (unique in the account regardless of case)."
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its new path (`/`, or `/…/`)."
+          }
+        }
+      },
       "RoleSummary": {
         "type": "object",
         "description": "A role, never with its secret.",
@@ -6260,11 +6514,18 @@
           "created_at",
           "attached",
           "keys",
-          "policies"
+          "policies",
+          "path",
+          "arn",
+          "tags"
         ],
         "properties": {
           "admin": {
             "type": "boolean"
+          },
+          "arn": {
+            "type": "string",
+            "description": "Its ARN."
           },
           "attached": {
             "type": "array",
@@ -6272,6 +6533,13 @@
               "$ref": "#/components/schemas/AttachedPolicy"
             },
             "description": "Its attached managed policies (AdministratorAccess, if it's an admin)."
+          },
+          "boundary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its permissions boundary's ARN, which caps what its policies allow."
           },
           "console": {
             "oneOf": [
@@ -6309,12 +6577,38 @@
           "name": {
             "type": "string"
           },
+          "path": {
+            "type": "string",
+            "description": "Its path (`/`, or `/…/`), which its ARN has before its name."
+          },
           "policies": {
             "type": "array",
             "items": {
               "type": "string"
             },
             "description": "The names of its inline policies."
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "Its tags, newest first."
+          }
+        }
+      },
+      "RoleTags": {
+        "type": "object",
+        "required": [
+          "tags"
+        ],
+        "properties": {
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            },
+            "description": "All of its tags: those it has of other keys go (UntagUser), the\nrest are set (TagUser)."
           }
         }
       },
@@ -6582,7 +6876,7 @@
       },
       "Tag": {
         "type": "object",
-        "description": "A tag of a bucket or an object version (see `s3::tags`).",
+        "description": "A tag of a bucket, an object version (see `s3::tags`) or a user (whose\nkeys are unique regardless of case).",
         "required": [
           "key",
           "value"
