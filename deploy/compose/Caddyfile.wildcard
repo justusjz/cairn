@@ -1,0 +1,44 @@
+# As Caddyfile, with wildcard certificates for buckets (<bucket>.S3_DOMAIN)
+# and websites (<bucket>.WEBSITE_DOMAIN), got by ACME's DNS challenge, so
+# that there's one certificate for each, however many buckets there are.
+# Custom domains, and buckets with dots in their names (which a wildcard
+# doesn't cover), still get theirs on demand. See compose.wildcard.yaml.
+{
+	on_demand_tls {
+		ask http://cairn:9431/tls/ask
+	}
+}
+
+# The DNS challenge, by the provider's API (Cloudflare's: see
+# caddy/Dockerfile for others).
+(dns) {
+	tls {
+		dns cloudflare {env.CLOUDFLARE_API_TOKEN}
+	}
+}
+
+# The S3 API, and buckets virtual-hosted.
+{$S3_DOMAIN}, *.{$S3_DOMAIN} {
+	import dns
+	reverse_proxy cairn:9000
+}
+
+# Buckets' websites.
+*.{$WEBSITE_DOMAIN} {
+	import dns
+	reverse_proxy cairn:9000
+}
+
+# The console, an origin of its own.
+{$CONSOLE_DOMAIN} {
+	reverse_proxy cairn:9480
+}
+
+# Everything else: websites' custom domains, and hosts with more labels than
+# a wildcard covers (buckets with dots in their names).
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy cairn:9000
+}

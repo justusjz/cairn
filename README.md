@@ -92,8 +92,27 @@ Encrypt as they're needed. Only Caddy is published, on ports 80 and 443.
 
 Caddy gets a certificate for `s3.example.com` and `console.example.com` as
 it starts, and one for any other host the first time a client asks for it,
-if Cairn [serves something there](#https-for-websites-and-buckets). Back up
-the `postgres` and `cairn` volumes: the database, and the data.
+if Cairn [serves something there](#https-for-websites-and-buckets); plain
+HTTP is redirected to HTTPS. Back up the `postgres` and `cairn` volumes: the
+database, and the data.
+
+**Wildcard certificates.** A certificate per bucket is fine for a few, but
+Let's Encrypt issues at most 50 a week per registered domain. With more
+buckets (or websites) than that, have Caddy get one wildcard certificate for
+`*.s3.example.com` and one for `*.s3-website.example.com`, by ACME's DNS
+challenge: `compose.wildcard.yaml` builds Caddy with a DNS provider's module
+(Cloudflare's; for another, see `caddy/Dockerfile`), and serves
+`Caddyfile.wildcard`. Set its two lines in `.env`, the token one that may
+edit DNS records in the domains' zones, and start it with `--build`:
+
+```sh
+# in .env
+COMPOSE_FILE=compose.yaml:compose.wildcard.yaml
+CLOUDFLARE_API_TOKEN=...
+```
+
+Custom domains, and buckets with dots in their names (which a wildcard
+covers one label of), still get certificates on demand.
 
 ## Running a single node
 
@@ -1226,13 +1245,14 @@ https:// {
 }
 ```
 
-([`deploy/compose`](#docker-compose) has the whole configuration.) A
-certificate is got the first time a host is asked for, which takes a few
-seconds. Let's Encrypt issues at most 50 certificates a week per registered
-domain, so a cluster with more buckets than that at the website domain (or
-virtual-hosted) should have Caddy get a wildcard certificate for those
-instead, by a DNS challenge, which takes a Caddy built with the module for
-the DNS provider. Custom domains are registered domains of their own.
+Caddy redirects plain HTTP to HTTPS by itself. A certificate is got the
+first time a host is asked for, which takes a few seconds. Let's Encrypt
+issues at most 50 certificates a week per registered domain, so a cluster
+with more buckets than that at the website domain (or virtual-hosted)
+should have Caddy get a wildcard certificate for each instead, by a DNS
+challenge, and on-demand ones only for the rest (custom domains, which are
+registered domains of their own). [`deploy/compose`](#docker-compose) has
+both configurations.
 
 What a website serves, as S3's website endpoints do:
 

@@ -10,6 +10,9 @@
 #
 # Only Caddy is published (80 and 443). The peer endpoint (9431), which is
 # unauthenticated, stays on the network of the three.
+#
+# compose.wildcard.yaml, over this, gets wildcard certificates for buckets
+# and websites instead, by the DNS challenge.
 
 name: cairn
 
