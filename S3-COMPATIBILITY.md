@@ -125,7 +125,7 @@ With `--domain` set, any host that is not the domain, a subdomain of it, an IP l
 | --- | --- | --- |
 | the S3 API, over HTTP | ✅ A CNAME to a bucket named after the host. | ❌ The host is a website. |
 | a website, over HTTP | ✅ A CNAME to the website endpoint. | ❌ in [`deploy/compose`](deploy/compose), whose Caddy redirects HTTP to HTTPS. Cairn itself serves it, if a proxy passes HTTP through. |
-| the S3 API, over HTTPS | 🟡 Needs CloudFront in front. | 🟡 Needs a reverse proxy that maps the name to the API's domain. The signature covers `Host`, so clients must sign for the host Cairn sees. |
+| the S3 API, over HTTPS | 🟡 Needs CloudFront in front, which serves public reads; client-signed requests don't pass through it. | ❌ A custom host is a website. A reverse proxy could rewrite the name to the API's domain, but the signature covers `Host`, so clients would have to sign for a host they don't use. |
 | a website, over HTTPS | 🟡 Needs CloudFront in front. | ✅ Certificates are fetched on demand: the proxy asks the peer endpoint's `/tls/ask` whether Cairn serves the host. `deploy/compose` sets this up with Caddy. |
 
 ### Regions
