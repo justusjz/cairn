@@ -1,0 +1,37 @@
+# Caddy in front of Cairn (see compose.yaml): TLS for every host Cairn
+# serves, with requests passed on with their Host as the client sent it,
+# which is how Cairn tells the S3 API, buckets and websites apart.
+{
+	# Certificates for hosts not named below are got as a TLS handshake
+	# first asks for one, if Cairn says it serves something there: a
+	# bucket (virtual-hosted), or a bucket's website, at the website domain
+	# or a custom domain.
+	on_demand_tls {
+		ask http://cairn:9431/tls/ask
+	}
+}
+
+# The S3 API.
+{$S3_DOMAIN} {
+	reverse_proxy cairn:9000
+}
+
+# The console, an origin of its own.
+{$CONSOLE_DOMAIN} {
+	reverse_proxy cairn:9480
+}
+
+# Everything else: buckets at <bucket>.S3_DOMAIN, websites at
+# <bucket>.WEBSITE_DOMAIN, and websites' custom domains.
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy cairn:9000
+}
+
+# Plain HTTP, for any host, is redirected to HTTPS. (Caddy answers ACME's
+# HTTP challenges before this.)
+http:// {
+	redir https://{host}{uri} permanent
+}

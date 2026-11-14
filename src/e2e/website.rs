@@ -234,3 +234,56 @@ async fn redirects() {
     let response = request(&app, Method::GET, "/", &[("x-forwarded-proto", "https")]).await;
     assert_eq!(response.headers()[header::LOCATION], "https://www.example.com/");
 }
+
+/// What the peer endpoint tells Caddy's on-demand TLS (`/tls/ask`): a
+/// certificate for each host Cairn serves something at, and none other.
+#[tokio::test]
+async fn certificates_only_for_what_is_served() {
+    use tower::ServiceExt;
+    let Some(app) = node().await else { return };
+    let mut app = Arc::try_unwrap(app).ok().expect("the test's node is its own");
+    app.domain = Some("s3.example.com".to_owned());
+    app.website_domain = Some("s3-website.example.com".to_owned());
+    let app = Arc::new(app);
+    // The bucket `www.example.com`, with a website; `bucket` has none.
+    app.pool.get().await.unwrap().execute("INSERT INTO buckets (name) VALUES ('www.example.com')", &[]).await.unwrap();
+    let document = "<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument></WebsiteConfiguration>";
+    let response = put_bucket_website(&app, "www.example.com", Bytes::from(document)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let ask = |query: &str| {
+        let request = hyper::Request::get(format!("/tls/ask{query}"))
+            .header(header::HOST, "127.0.0.1:9431")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let router = crate::peer::router(app.clone());
+        async move { router.oneshot(request).await.unwrap().status() }
+    };
+    for allowed in [
+        "s3.example.com",
+        "S3.Example.com.",
+        // A bucket, virtual-hosted.
+        "bucket.s3.example.com",
+        // Websites: at the website domain, and a custom domain.
+        "www.example.com.s3-website.example.com",
+        "www.example.com",
+    ] {
+        assert_eq!(ask(&format!("?domain={allowed}")).await, StatusCode::OK, "{allowed}");
+    }
+    for refused in [
+        // No such bucket, or no website.
+        "nope.s3.example.com",
+        "bucket.s3-website.example.com",
+        "bucket",
+        "example.org",
+        // The website domain names no bucket itself.
+        "s3-website.example.com",
+        "127.0.0.1",
+        "localhost",
+        "www.example.com:443",
+        "a/b",
+    ] {
+        assert_eq!(ask(&format!("?domain={refused}")).await, StatusCode::NOT_FOUND, "{refused}");
+    }
+    assert_eq!(ask("").await, StatusCode::BAD_REQUEST);
+}

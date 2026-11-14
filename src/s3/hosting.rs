@@ -42,20 +42,42 @@ impl Route {
     /// The route of a request to `path` with `headers`, under `domain` and
     /// `website_domain` (see `parse_domain`), if there are any.
     pub fn of(domain: Option<&str>, website_domain: Option<&str>, headers: &HeaderMap, path: &str) -> Route {
-        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-        // The websites' first: their domain may be a subdomain of the API's.
-        if let Some(bucket) = website_domain.zip(host).and_then(|(domain, host)| bucket_of(domain, host)) {
-            return Route { path: in_bucket(&bucket, path), virtual_host: true, website: true };
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+        match Host::of(domain, website_domain, host) {
+            Host::PathStyle => Route { path: path.to_owned(), virtual_host: false, website: false },
+            Host::Bucket(bucket) => Route { path: in_bucket(&bucket, path), virtual_host: true, website: false },
+            Host::Website(bucket) => Route { path: in_bucket(&bucket, path), virtual_host: true, website: true },
         }
-        let Some((domain, host)) = domain.zip(host) else {
-            return Route { path: path.to_owned(), virtual_host: false, website: false };
-        };
+    }
+}
+
+/// What a request's host names.
+#[derive(Debug, PartialEq)]
+pub enum Host {
+    /// Nothing: the request is path-style (to the domain itself, an IP
+    /// address, `localhost`, or any host without `--domain`).
+    PathStyle,
+    /// A bucket, virtual-hosted, on the S3 API.
+    Bucket(String),
+    /// A bucket's website: at the website domain, or a custom domain.
+    Website(String),
+}
+
+impl Host {
+    /// What `host` (a `Host` header, maybe with a port) names, under
+    /// `domain` and `website_domain`.
+    pub fn of(domain: Option<&str>, website_domain: Option<&str>, host: &str) -> Host {
+        // The websites' first: their domain may be a subdomain of the API's.
+        if let Some(bucket) = website_domain.and_then(|domain| bucket_of(domain, host)) {
+            return Host::Website(bucket);
+        }
+        let Some(domain) = domain else { return Host::PathStyle };
         if let Some(bucket) = bucket_of(domain, host) {
-            return Route { path: in_bucket(&bucket, path), virtual_host: true, website: false };
+            return Host::Bucket(bucket);
         }
         match custom_domain(domain, host) {
-            Some(bucket) => Route { path: in_bucket(&bucket, path), virtual_host: true, website: true },
-            None => Route { path: path.to_owned(), virtual_host: false, website: false },
+            Some(bucket) => Host::Website(bucket),
+            None => Host::PathStyle,
         }
     }
 }

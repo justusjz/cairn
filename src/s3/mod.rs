@@ -51,6 +51,7 @@ use crate::{
 };
 
 pub(crate) mod buckets;
+pub(crate) mod certificates;
 pub(crate) mod checksums;
 pub(crate) mod access;
 pub(crate) mod acl;

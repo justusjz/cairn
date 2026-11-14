@@ -57,6 +57,44 @@ docker exec cairn cairn user create admin --admin
 For a cluster, also set `CAIRN_PEER_URL` to an address the other nodes can
 reach this container at, and `CAIRN_REPLICATION_FACTOR`.
 
+### Docker Compose
+
+[`deploy/compose`](deploy/compose) runs Cairn on one host, ready to use:
+Postgres, Cairn, and [Caddy](https://caddyserver.com) in front of it, which
+serves the S3 API, the [console](#console) and buckets'
+[websites](#websites) over HTTPS, with certificates it gets from Let's
+Encrypt as they're needed. Only Caddy is published, on ports 80 and 443.
+
+1. Point DNS at the host, for the three domains in `.env` (the examples'
+   here):
+
+   | Record | For |
+   | --- | --- |
+   | `s3.example.com`, `*.s3.example.com` | The S3 API, and buckets virtual-hosted. |
+   | `console.example.com` | The console. |
+   | `*.s3-website.example.com` | Buckets' websites. |
+
+2. Configure it, and start it:
+
+   ```sh
+   cd deploy/compose
+   cp .env.example .env      # set the domains, and POSTGRES_PASSWORD
+   docker compose up -d
+   ```
+
+3. Make the first admin, and enroll a passkey for the console with the link
+   it prints:
+
+   ```sh
+   docker compose exec cairn cairn user create admin --admin
+   docker compose exec cairn cairn user enroll admin
+   ```
+
+Caddy gets a certificate for `s3.example.com` and `console.example.com` as
+it starts, and one for any other host the first time a client asks for it,
+if Cairn [serves something there](#https-for-websites-and-buckets). Back up
+the `postgres` and `cairn` volumes: the database, and the data.
+
 ## Running a single node
 
 The simplest deployment — one node, replication factor 1, no redundancy:
@@ -1146,9 +1184,55 @@ how Cairn tells a website's request from the API's:
 
 Nothing has to be set up per website in the proxy, as long as it passes on
 requests for any host to Cairn, with their `Host` as the client sent it (a
-catch-all, or default, server). Websites are served over whatever the proxy
-serves them over: S3's are plain HTTP, and HTTPS for a custom domain takes a
-certificate for it, in the proxy (as on AWS, where CloudFront serves it).
+catch-all, or default, server).
+
+### HTTPS for websites and buckets
+
+Websites are served over whatever the proxy in front of Cairn serves them
+over. S3's are plain HTTP (on AWS, CloudFront serves them over HTTPS); in
+Cairn, the proxy needs a certificate for each host: a website's, at the
+website domain or a custom domain, and a bucket's, virtual-hosted. A
+wildcard certificate covers the website domain's and the API's (but buckets
+with dots in their names), but no custom domain.
+
+So the proxy may get them as they're needed, as
+[Caddy's on-demand TLS](https://caddyserver.com/on-demand-tls) does: when a
+TLS handshake asks for a host it has no certificate for, it asks Cairn's peer
+endpoint whether to get one, at `/tls/ask?domain=<host>`. That answers 200
+for exactly the hosts Cairn serves something at, and 404 for any other:
+
+- the S3 API's domain (`--domain`);
+- `<bucket>.<domain>`, if the bucket exists;
+- `<bucket>.<website domain>`, and a custom domain, if the bucket has a
+  website configuration.
+
+That keeps anyone from having the proxy ask for certificates for names of
+their own, which would use up the CA's rate limits. The proxy has to reach
+the peer endpoint for it, by an IP address or the node's peer URL's host (as
+the CLI does). In Caddy's global options:
+
+```caddyfile
+{
+	on_demand_tls {
+		ask http://cairn:9431/tls/ask
+	}
+}
+
+https:// {
+	tls {
+		on_demand
+	}
+	reverse_proxy cairn:9000
+}
+```
+
+([`deploy/compose`](#docker-compose) has the whole configuration.) A
+certificate is got the first time a host is asked for, which takes a few
+seconds. Let's Encrypt issues at most 50 certificates a week per registered
+domain, so a cluster with more buckets than that at the website domain (or
+virtual-hosted) should have Caddy get a wildcard certificate for those
+instead, by a DNS challenge, which takes a Caddy built with the module for
+the DNS provider. Custom domains are registered domains of their own.
 
 What a website serves, as S3's website endpoints do:
 

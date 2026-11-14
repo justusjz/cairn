@@ -1,0 +1,88 @@
+# Cairn on one host, behind Caddy, with Postgres: the S3 API, the console,
+# and buckets' websites (at the website domain and at custom domains), all
+# over HTTPS, with certificates Caddy gets from Let's Encrypt as they're
+# needed. See README.md, "Docker Compose".
+#
+#   cp .env.example .env    # and fill it in
+#   docker compose up -d
+#   docker compose exec cairn cairn user create admin --admin
+#   docker compose exec cairn cairn user enroll admin
+#
+# Only Caddy is published (80 and 443). The peer endpoint (9431), which is
+# unauthenticated, stays on the network of the three.
+
+name: cairn
+
+services:
+  postgres:
+    image: docker.io/library/postgres:18
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cairn
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: cairn
+    volumes:
+      # Postgres 18's images keep their data under it, by major version.
+      - postgres:/var/lib/postgresql
+    networks:
+      - cairn
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "cairn", "-d", "cairn"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  cairn:
+    image: ghcr.io/justusjz/cairn:${CAIRN_VERSION:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CAIRN_DATABASE: postgres://cairn:${POSTGRES_PASSWORD}@postgres:5432/cairn
+      # Where the CLI (`docker compose exec cairn cairn ...`) and Caddy's
+      # certificate questions reach the peer endpoint.
+      CAIRN_PEER_URL: http://cairn:9431
+      CAIRN_DOMAIN: ${S3_DOMAIN:?set S3_DOMAIN in .env}
+      CAIRN_WEBSITE_DOMAIN: ${WEBSITE_DOMAIN:?set WEBSITE_DOMAIN in .env}
+      CAIRN_LISTEN_CONSOLE: 0.0.0.0:9480
+      CAIRN_CONSOLE_URL: https://${CONSOLE_DOMAIN:?set CONSOLE_DOMAIN in .env}
+      # Caddy, whose X-Forwarded-For and X-Forwarded-Proto bucket policies
+      # believe (aws:SourceIp, aws:SecureTransport).
+      CAIRN_TRUSTED_PROXIES: 172.30.0.10
+    volumes:
+      - cairn:/var/lib/cairn
+    networks:
+      - cairn
+
+  caddy:
+    image: docker.io/library/caddy:2.10
+    restart: unless-stopped
+    depends_on:
+      - cairn
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      S3_DOMAIN: ${S3_DOMAIN}
+      CONSOLE_DOMAIN: ${CONSOLE_DOMAIN}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    networks:
+      cairn:
+        ipv4_address: 172.30.0.10
+
+networks:
+  cairn:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  postgres:
+  cairn:
+  caddy-data:
+  caddy-config:

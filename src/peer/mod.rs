@@ -11,6 +11,9 @@
 //! endpoint never allows) must be a POST with the `x-cairn-cli` header,
 //! which a page can't send either: the CLI's commands, and the jobs an
 //! operator (or a test) may start now.
+//!
+//! Besides, it tells a TLS-terminating proxy in front of the S3 API which
+//! hosts it may get certificates for (`/tls/ask`, see `s3::certificates`).
 
 use std::net::{IpAddr, Ipv6Addr};
 use std::{sync::Arc, time::Duration};
@@ -117,6 +120,7 @@ pub fn router(app: Arc<App>) -> Router {
         .merge(jobs)
         .route("/admin", post(crate::admin::serve))
         .route("/stats", get(stats))
+        .route("/tls/ask", get(tls_ask))
         .route(
             "/blobs/{blob_id}",
             get(get_blob).put(put_blob).delete(delete_blob),
@@ -222,6 +226,20 @@ async fn move_shards(State(app): State<Arc<App>>) -> Result<Response, Failed> {
 /// This node's own metrics, for the console of whichever node it's open on.
 async fn stats(State(app): State<Arc<App>>) -> axum::Json<stats::NodeStats> {
     axum::Json(stats::node_stats(&app).await)
+}
+
+/// Caddy's on-demand TLS's question: may it get a certificate for the host
+/// `?domain=` names? 200 if so, 404 if not, 400 without a host (see
+/// `s3::certificates`).
+async fn tls_ask(State(app): State<Arc<App>>, RawQuery(query): RawQuery) -> Result<StatusCode, Failed> {
+    let domain = crate::s3::util::query_param(query.as_deref().unwrap_or(""), "domain").unwrap_or_default();
+    if domain.is_empty() {
+        return Ok(StatusCode::BAD_REQUEST);
+    }
+    Ok(match crate::s3::certificates::allowed(&app, &domain).await? {
+        true => StatusCode::OK,
+        false => StatusCode::NOT_FOUND,
+    })
 }
 
 /// Dumb data plane: streams whatever bytes we hold of a blob from disk (our
