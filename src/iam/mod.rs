@@ -17,12 +17,15 @@
 //! `plans/boundaries.md`, probed), access keys, inline policies, and managed
 //! policies (see `managed`): Cairn's, which have AWS's names, and an
 //! account's own, with paths and tags, of which Cairn keeps one version,
-//! the default; and roles (see `roles`, `plans/roles.md`). Groups aren't
-//! (NotImplemented).
+//! the default; roles (see `roles`, `plans/roles.md`); and groups (see
+//! `groups`), whose policies apply to their members.
 
+mod groups;
 mod oidc;
 mod roles;
 mod sts;
+#[cfg(test)]
+mod groups_tests;
 #[cfg(test)]
 mod web_identity_tests;
 
@@ -379,6 +382,21 @@ async fn respond(
         (_, "AttachRolePolicy") => iam.attach_role_policy(&params, true).await?,
         (_, "DetachRolePolicy") => iam.attach_role_policy(&params, false).await?,
         (_, "ListAttachedRolePolicies") => iam.list_attached_role_policies(&params).await?,
+        (_, "CreateGroup") => iam.create_group(&params).await?,
+        (_, "GetGroup") => iam.get_group(&params).await?,
+        (_, "ListGroups") => iam.list_groups(&params).await?,
+        (_, "UpdateGroup") => iam.update_group(&params).await?,
+        (_, "DeleteGroup") => iam.delete_group(&params).await?,
+        (_, "AddUserToGroup") => iam.add_user_to_group(&params, true).await?,
+        (_, "RemoveUserFromGroup") => iam.add_user_to_group(&params, false).await?,
+        (_, "ListGroupsForUser") => iam.list_groups_for_user(&params).await?,
+        (_, "PutGroupPolicy") => iam.put_group_policy(&params).await?,
+        (_, "GetGroupPolicy") => iam.get_group_policy(&params).await?,
+        (_, "ListGroupPolicies") => iam.list_group_policies(&params).await?,
+        (_, "DeleteGroupPolicy") => iam.delete_group_policy(&params).await?,
+        (_, "AttachGroupPolicy") => iam.attach_group_policy(&params, true).await?,
+        (_, "DetachGroupPolicy") => iam.attach_group_policy(&params, false).await?,
+        (_, "ListAttachedGroupPolicies") => iam.list_attached_group_policies(&params).await?,
         (_, "CreateOpenIDConnectProvider") => iam.create_open_id_connect_provider(&params).await?,
         (_, "GetOpenIDConnectProvider") => iam.get_open_id_connect_provider(&params).await?,
         (_, "ListOpenIDConnectProviders") => iam.list_open_id_connect_providers().await?,
@@ -393,7 +411,7 @@ async fn respond(
             return Err(error(
                 StatusCode::NOT_IMPLEMENTED,
                 "NotImplemented",
-                format!("Cairn's IAM has users and roles (with paths, tags and permissions boundaries), access keys, inline and managed policies, and OpenID Connect providers; not {other}"),
+                format!("Cairn's IAM has users and roles (with paths, tags and permissions boundaries), groups, access keys, inline and managed policies, and OpenID Connect providers; not {other}"),
             ));
         }
     };
@@ -483,6 +501,8 @@ enum Shown {
     User(String),
     /// A role, by its name (`role NAME`: probed).
     Role(String),
+    /// A group, by its name (`group NAME`).
+    Group(String),
     /// A policy, by its ARN, or (one to make) its name.
     Policy(String),
 }
@@ -655,6 +675,7 @@ impl Iam<'_> {
             Shown::Arn => check.on.arn(),
             Shown::User(name) => format!("user {name}"),
             Shown::Role(name) => format!("role {name}"),
+            Shown::Group(name) => format!("group {name}"),
             Shown::Policy(name) => format!("policy {name}"),
         };
         Err(error(
@@ -861,6 +882,9 @@ impl Iam<'_> {
         }
         if user.admin || count("SELECT count(*) FROM user_attached_policies WHERE user_id = $1").await? > 0 {
             return Err(conflict("detach all policies"));
+        }
+        if count("SELECT count(*) FROM iam_group_members WHERE user_id = $1").await? > 0 {
+            return Err(conflict("remove user from all groups"));
         }
         users::delete(self.client, self.account(), &user.name).await?;
         Ok(None)
@@ -1168,6 +1192,7 @@ impl Iam<'_> {
                     bounds,
                     roles,
                     role_bounds,
+                    groups: crate::groups::of_policy(self.client, self.account(), &arn).await?,
                     arn,
                     id: managed::policy_id(None, p.name),
                     name: p.name.to_owned(),
@@ -1209,6 +1234,7 @@ impl Iam<'_> {
                     bounds: row.get(7),
                     roles,
                     role_bounds,
+                    groups: crate::groups::of_policy(self.client, self.account(), &arn).await?,
                     arn,
                     id: managed::policy_id(Some(row.get(0)), &name),
                     name: row.get(1),
@@ -1240,7 +1266,7 @@ impl Iam<'_> {
             policy.id,
             xml_escape(&policy.path),
             xml_escape(&policy.arn),
-            policy.users.len() + policy.roles.len(),
+            policy.users.len() + policy.roles.len() + policy.groups.len(),
             policy.bounds.len() + policy.role_bounds.len(),
             policy.created,
             policy.updated
@@ -1362,7 +1388,7 @@ impl Iam<'_> {
                 policies.push(self.load_policy(Named::Own { path: p.path, name: p.name }).await?);
             }
         }
-        policies.retain(|p| p.path.starts_with(&prefix) && (!only_attached || !p.users.is_empty() || !p.roles.is_empty()));
+        policies.retain(|p| p.path.starts_with(&prefix) && (!only_attached || !p.users.is_empty() || !p.roles.is_empty() || !p.groups.is_empty()));
         // Paged by ARN.
         policies.sort_by(|a, b| a.arn.cmp(&b.arn));
         if let Some(after) = params.get("Marker") {
@@ -1500,9 +1526,9 @@ impl Iam<'_> {
         Ok(None)
     }
 
-    /// ListEntitiesForPolicy: the users it's attached to, and those whose
-    /// permissions boundary it is (`PolicyUsageFilter`: one or the other;
-    /// probed).
+    /// ListEntitiesForPolicy: the users, roles and groups it's attached to,
+    /// and the users and roles whose permissions boundary it is
+    /// (`PolicyUsageFilter`: one or the other; probed).
     async fn list_entities_for_policy(&mut self, params: &Params) -> Result<Option<String>> {
         let policy = self.policy(params, "iam:ListEntitiesForPolicy").await?;
         let (attached, bounded) = match params.get("PolicyUsageFilter") {
@@ -1552,8 +1578,20 @@ impl Iam<'_> {
                 format!("<member><RoleName>{}</RoleName><RoleId>{}</RoleId></member>", xml_escape(name), crate::roles::unique_id(*id))
             })
             .collect();
+        // Groups have no boundaries.
+        let groups = match matches!(entities, None | Some("Group")) && attached {
+            true => policy.groups.as_slice(),
+            false => &[],
+        };
+        let group_members: String = groups
+            .iter()
+            .map(|(id, name)| {
+                format!("<member><GroupName>{}</GroupName><GroupId>{}</GroupId></member>", xml_escape(name), crate::groups::unique_id(*id))
+            })
+            .collect();
         Ok(Some(format!(
-            "<PolicyGroups/><PolicyUsers>{members}</PolicyUsers><PolicyRoles>{role_members}</PolicyRoles><IsTruncated>false</IsTruncated>"
+            "<PolicyGroups>{group_members}</PolicyGroups><PolicyUsers>{members}</PolicyUsers><PolicyRoles>{role_members}</PolicyRoles>\
+             <IsTruncated>false</IsTruncated>"
         )))
     }
 }
@@ -1578,6 +1616,8 @@ struct Policy {
     /// IDs and names.
     roles: Vec<(uuid::Uuid, String)>,
     role_bounds: Vec<(uuid::Uuid, String)>,
+    /// The groups it's attached to: their IDs and names.
+    groups: Vec<(uuid::Uuid, String)>,
     /// Whether it's one of Cairn's (AWS's).
     aws: bool,
     /// Its tags, oldest first.

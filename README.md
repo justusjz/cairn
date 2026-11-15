@@ -381,6 +381,17 @@ allows; else it's denied. They are:
   before doesn't know managed policies, and denies what they allow.)
 - its **inline policies**: identity policies of its own, for anything finer
   (per key prefix, by condition, ...), set with `cairn user policy`;
+- its **groups'** policies, as if they were its own: a **group** has inline
+  policies (at most 5,120 characters together) and managed ones (at most
+  10) as a user has, and members, the account's users, each in at most 10
+  groups, as in IAM. So `invoices-read` is attached to the group of those
+  who read invoices, not to each of them. A group has a path and a name
+  (`arn:aws:iam::<account>:group/<path…/name>`, unique regardless of case),
+  but no tags or boundary, and it's no principal: policies name it only as
+  the resource of IAM's actions on it. A member's permissions boundary caps
+  what its groups' policies allow too, as its own. Older Cairns know no
+  groups: to them, a user in any has an inline policy that denies it
+  everything; upgrade every node.
 - its **permissions boundary**, if it has one: a managed policy (the
   account's own, or Cairn's) that caps what its identity policies (managed
   and inline) allow: they allow only what the boundary allows too, and a
@@ -563,7 +574,15 @@ if there are five already, as Terraform does. [Roles](#roles-and-temporary-crede
 are there too (CreateRole, GetRole, ListRoles, UpdateRole,
 UpdateRoleDescription, UpdateAssumeRolePolicy, DeleteRole, and their
 policies, boundaries and tags, as users'), and OpenID Connect providers
-(CreateOpenIDConnectProvider and the rest). Groups are NotImplemented. STS
+(CreateOpenIDConnectProvider and the rest), and groups: CreateGroup (with a
+path), GetGroup (with its members), ListGroups (by path prefix), UpdateGroup
+(which renames or moves one, checked on where it goes too), DeleteGroup
+(which refuses while members or policies are left, as IAM does),
+AddUserToGroup and RemoveUserFromGroup (checked on the group),
+ListGroupsForUser (on the user), their inline policies (PutGroupPolicy,
+GetGroupPolicy, ListGroupPolicies, DeleteGroupPolicy) and managed ones
+(AttachGroupPolicy, DetachGroupPolicy, ListAttachedGroupPolicies); a user in
+a group isn't deleted, nor a managed policy attached to one. STS
 answers on the same endpoint (requests signed for `sts`): GetCallerIdentity,
 which Terraform's AWS provider calls as it starts, and the actions that issue
 temporary credentials. The AWS CLI refuses access key IDs shorter than

@@ -240,6 +240,8 @@ pub struct Managed {
     pub roles: Vec<String>,
     /// The roles whose permissions boundary it is, by name.
     pub role_bounds: Vec<String>,
+    /// The groups it's attached to, by name.
+    pub groups: Vec<String>,
     /// Its tags, oldest first.
     pub tags: Vec<(String, String)>,
 }
@@ -261,7 +263,9 @@ const COLUMNS: &str = "m.id, m.name, m.description, m.document, m.version,
      ARRAY(SELECT t.value FROM managed_policy_tags t WHERE t.policy_id = m.id ORDER BY t.seq),
      ARRAY(SELECT r.name FROM iam_role_attached_policies x JOIN iam_roles r ON r.id = x.role_id
            WHERE x.policy_id = m.id ORDER BY r.name),
-     ARRAY(SELECT r.name FROM iam_roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name)";
+     ARRAY(SELECT r.name FROM iam_roles r WHERE r.boundary_policy_id = m.id ORDER BY r.name),
+     ARRAY(SELECT g.name FROM iam_group_attached_policies x JOIN iam_groups g ON g.id = x.group_id
+           WHERE x.policy_id = m.id ORDER BY g.name)";
 
 fn managed_of(row: &tokio_postgres::Row) -> Managed {
     Managed {
@@ -277,6 +281,7 @@ fn managed_of(row: &tokio_postgres::Row) -> Managed {
         tags: crate::users::tags_of(row.get(9), row.get(10)),
         roles: row.get(11),
         role_bounds: row.get(12),
+        groups: row.get(13),
     }
 }
 
@@ -504,11 +509,16 @@ pub async fn describe(client: &Object, account: &str, name: &str, description: &
 }
 
 /// Deletes the account's managed policy `name`, unless it's attached (to a
-/// user or a role), or a user's or role's permissions boundary (whose
-/// foreign key keeps it, too).
+/// user, a role or a group), or a user's or role's permissions boundary
+/// (whose foreign key keeps it, too).
 pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Result<()> {
     let policy = get(client, account, name).await?;
-    if !policy.users.is_empty() || !policy.bounds.is_empty() || !policy.roles.is_empty() || !policy.role_bounds.is_empty() {
+    if !policy.users.is_empty()
+        || !policy.bounds.is_empty()
+        || !policy.roles.is_empty()
+        || !policy.role_bounds.is_empty()
+        || !policy.groups.is_empty()
+    {
         return refused(Refused::Conflict("Cannot delete a policy attached to entities.".into()));
     }
     // Its other versions go first, as in IAM (probed). (One made meanwhile
@@ -524,7 +534,8 @@ pub async fn delete(client: &Object, account: &str, name: &str) -> anyhow::Resul
         .execute_cached(
             "DELETE FROM managed_policies m WHERE m.id = $1
              AND NOT EXISTS (SELECT 1 FROM user_attached_policies x WHERE x.policy_id = m.id)
-             AND NOT EXISTS (SELECT 1 FROM iam_role_attached_policies x WHERE x.policy_id = m.id)",
+             AND NOT EXISTS (SELECT 1 FROM iam_role_attached_policies x WHERE x.policy_id = m.id)
+             AND NOT EXISTS (SELECT 1 FROM iam_group_attached_policies x WHERE x.policy_id = m.id)",
             &[&policy.id],
         )
         .await;

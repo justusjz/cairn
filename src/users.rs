@@ -131,6 +131,18 @@ pub const BOUNDARY_ARN: &str = "(SELECT coalesce(
          FROM managed_policies m WHERE m.id = r.boundary_policy_id),
         'arn:aws:iam::aws:policy/' || r.boundary_aws))";
 
+/// The SQL of the policies user `r`'s groups have (see `groups`), which
+/// apply to it as its own: their inline policies' documents, their
+/// attached policies' documents (the account's), and the names of Cairn's
+/// attached to them.
+const GROUP_POLICIES: &str = "
+    ARRAY(SELECT p.document FROM iam_group_members g JOIN iam_group_policies p ON p.group_id = g.group_id
+          WHERE g.user_id = r.id ORDER BY g.group_id, p.name),
+    ARRAY(SELECT m.document FROM iam_group_members g JOIN iam_group_attached_policies x ON x.group_id = g.group_id
+          JOIN managed_policies m ON m.id = x.policy_id WHERE g.user_id = r.id ORDER BY g.group_id, m.name),
+    ARRAY(SELECT x.aws_policy FROM iam_group_members g JOIN iam_group_attached_policies x ON x.group_id = g.group_id
+          WHERE g.user_id = r.id AND x.aws_policy IS NOT NULL ORDER BY g.group_id, x.aws_policy)";
+
 /// The SQL of a user `r`'s tags: keys, then values, newest first.
 pub const TAG_KEYS: &str = "ARRAY(SELECT t.key FROM user_tags t WHERE t.user_id = r.id ORDER BY t.seq DESC)";
 pub const TAG_VALUES: &str = "ARRAY(SELECT t.value FROM user_tags t WHERE t.user_id = r.id ORDER BY t.seq DESC)";
@@ -310,7 +322,8 @@ impl Principal {
                               WHERE x.user_id = r.id AND x.aws_policy IS NOT NULL ORDER BY x.aws_policy),
                         r.path, {TAG_KEYS}, {TAG_VALUES}, {BOUNDARY_ARN},
                         (SELECT m.document FROM managed_policies m WHERE m.id = r.boundary_policy_id),
-                        r.boundary_aws
+                        r.boundary_aws,
+                        {GROUP_POLICIES}
                  {from}"),
                 &[param],
             )
@@ -321,6 +334,11 @@ impl Principal {
                 policies.extend(r.get::<_, Vec<String>>(6));
                 // Cairn's, by their names (none that isn't one of them).
                 let aws: Vec<String> = r.get(7);
+                policies.extend(aws.iter().filter_map(|name| crate::managed::aws(name)).map(|p| p.document.to_owned()));
+                // Its groups', as its own (see `groups`).
+                policies.extend(r.get::<_, Vec<String>>(14));
+                policies.extend(r.get::<_, Vec<String>>(15));
+                let aws: Vec<String> = r.get(16);
                 policies.extend(aws.iter().filter_map(|name| crate::managed::aws(name)).map(|p| p.document.to_owned()));
                 policies
             },

@@ -204,9 +204,10 @@ IAM's Query API (`aws iam`, Terraform, SDKs), for:
 | Access keys | Create, list, update, delete |
 | Policies | Inline user and role policies; managed policies with versions, tags and attachments; ListEntitiesForPolicy |
 | Roles | Create, get, list, update, delete; trust policies; tags; permissions boundaries |
+| Groups | Create, get, list, update, delete; members; inline and managed policies |
 | OpenID Connect providers | All actions |
 
-Not implemented (`501`): groups, login profiles and passwords, MFA devices,
+Not implemented (`501`): login profiles and passwords, MFA devices,
 SAML providers, instance profiles and service-linked roles, account settings
 (aliases, password policy, summary), GetAccountAuthorizationDetails, policy
 simulation, certificates, SSH keys, service-specific credentials, credential
@@ -218,7 +219,8 @@ Differences:
 - Access key IDs have no `AKIA` prefix.
 - These list actions return everything at once and ignore paging:
   ListAccessKeys, ListUserPolicies, ListAttachedUserPolicies,
-  ListRolePolicies, ListAttachedRolePolicies, ListEntitiesForPolicy.
+  ListRolePolicies, ListAttachedRolePolicies, ListGroupPolicies,
+  ListAttachedGroupPolicies, ListEntitiesForPolicy.
   ListPolicies ignores `PolicyUsageFilter`.
 - `iam:PassRole` is never checked, since there are no services to pass roles to.
 - `RoleLastUsed` and `PasswordLastUsed` are never reported.
