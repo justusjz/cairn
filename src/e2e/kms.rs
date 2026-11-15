@@ -247,7 +247,7 @@ async fn put_part(app: &Arc<App>, role: Uuid, upload_id: Uuid, key: &str, part_n
 }
 
 async fn create(app: &Arc<App>, role: Uuid, key: &str, wanted: Wanted<'_>) -> (Uuid, Headers) {
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, Some(role), None, Default::default()).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, Some(role), None, Default::default(), None).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let headers = Headers::of(response.headers());
     let body = response.into_body().collect().await.unwrap().to_bytes();

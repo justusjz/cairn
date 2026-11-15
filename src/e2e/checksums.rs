@@ -149,7 +149,7 @@ async fn an_sse_c_objects_checksum_is_sealed() {
 /// it's given. Its ID.
 async fn create(app: &Arc<App>, key: &str, checksum: Option<(Algorithm, Type)>, customer: Option<&CustomerKey>) -> String {
     let wanted = sse::Wanted::new(customer, None);
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, None, checksum, Default::default()).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, None, checksum, Default::default(), None).await.unwrap();
     let (status, headers, body) = text(response).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(

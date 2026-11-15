@@ -14,6 +14,30 @@ use crate::{
     s3::sse::Stored,
 };
 
+/// An upload's `<Initiator>`, as S3 tells it (probed): the ARN of the
+/// principal that began it, and its name: a user's name, or a role
+/// session's `<role>/<session>`. An upload of an anonymous request's, or one
+/// from before Cairn kept who began it, names the account (`owner_id`, its
+/// canonical ID), as its `<Owner>` does.
+pub(crate) fn initiator_xml(initiator: Option<&str>, owner_id: &str) -> String {
+    use crate::s3::util::xml_escape;
+    let Some(arn) = initiator else { return format!("<Initiator><ID>{owner_id}</ID></Initiator>") };
+    // `arn:aws:<service>::<account>:<resource>`
+    let resource = arn.splitn(6, ':').nth(5).unwrap_or("");
+    let name = match resource.split_once('/') {
+        // A user's path isn't part of its name.
+        Some(("user", rest)) => rest.rsplit('/').next().unwrap_or(rest),
+        // `assumed-role/<role>/<session>`, `federated-user/<name>`.
+        Some((_, rest)) => rest,
+        None => resource,
+    };
+    format!(
+        "<Initiator><ID>{}</ID><DisplayName>{}</DisplayName></Initiator>",
+        xml_escape(arn),
+        xml_escape(name)
+    )
+}
+
 /// An upload in progress, as its parts and its completion need it.
 pub(crate) struct Upload {
     /// How it's encrypted (see `s3::sse`).
@@ -111,4 +135,25 @@ pub(crate) async fn upload_encryption(
     key: &str,
 ) -> anyhow::Result<Option<Stored>> {
     Ok(upload(app, upload_id, bucket, key).await?.map(|upload| upload.encryption))
+}
+
+#[cfg(test)]
+mod initiator_tests {
+    use super::initiator_xml;
+
+    /// As S3 names them (probed, `plans/probes/expiration_probe.py`).
+    #[test]
+    fn initiators_are_named_as_in_s3() {
+        assert_eq!(
+            initiator_xml(Some("arn:aws:iam::258167966071:user/demo"), "c"),
+            "<Initiator><ID>arn:aws:iam::258167966071:user/demo</ID><DisplayName>demo</DisplayName></Initiator>"
+        );
+        assert_eq!(
+            initiator_xml(Some("arn:aws:sts::258167966071:assumed-role/probe/sess-1"), "c"),
+            "<Initiator><ID>arn:aws:sts::258167966071:assumed-role/probe/sess-1</ID>\
+             <DisplayName>probe/sess-1</DisplayName></Initiator>"
+        );
+        assert!(initiator_xml(Some("arn:aws:iam::1:user/team/alice"), "c").contains("<DisplayName>alice</DisplayName>"));
+        assert_eq!(initiator_xml(None, "c"), "<Initiator><ID>c</ID></Initiator>");
+    }
 }

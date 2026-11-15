@@ -195,7 +195,7 @@ async fn locks_need_object_lock() {
     )
     .await;
     assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "InvalidRequest"));
-    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", "", Wanted::Plain, None, None, lock).await.unwrap();
+    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", "", Wanted::Plain, None, None, lock, None).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let (status, _, body) = text(get_object_retention(&app, BUCKET, "plain", None).await.unwrap()).await;
     assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "InvalidRequest"));
@@ -350,7 +350,7 @@ async fn uploads_and_copies_take_their_own_locks() {
     lock_bucket(&app).await;
     // An upload completes with what it asked for.
     let lock = Lock { retention: Some((Mode::Governance, in_days(3))), legal_hold: Some(true) };
-    let response = create_multipart_upload(&app, BUCKET, "m", "x", "", "", Wanted::Plain, None, None, lock).await.unwrap();
+    let response = create_multipart_upload(&app, BUCKET, "m", "x", "", "", Wanted::Plain, None, None, lock, None).await.unwrap();
     let (status, _, body) = text(response).await;
     assert_eq!(status, StatusCode::OK);
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();

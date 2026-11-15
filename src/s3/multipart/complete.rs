@@ -278,6 +278,9 @@ pub async fn complete_multipart_upload_at(
                     Some(encryption) => encryption.clone(),
                     None => completed_encryption(&client, &bucket, &key, &upload_id).await?,
                 };
+                // When a lifecycle rule expires it, as S3 tells it.
+                let expiration = crate::s3::expiration::of_completed(&client, &bucket, &key, &upload_id).await?;
+                let response = crate::s3::expiration::onto(response, expiration);
                 return Ok(sse::echo_onto(response, &encryption, customer_key));
             }
             Ok(CompleteOutcome::NoSuchUpload) => {

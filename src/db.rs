@@ -233,6 +233,7 @@ const MIGRATIONS: &[&str] = &[
     IAM_OIDC_PROVIDERS,
     BUCKET_WEBSITE,
     BUCKET_ABAC,
+    UPLOAD_INITIATORS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2432,6 +2433,16 @@ ALTER TABLE buckets ADD COLUMN website text;
 /// know it doesn't evaluate tag keys in S3's policies at all.)
 const BUCKET_ABAC: &str = r#"
 ALTER TABLE buckets ADD COLUMN abac boolean NOT NULL DEFAULT false;
+"#;
+
+/// Migration 53: who began an upload: the ARN of the principal that sent
+/// CreateMultipartUpload, as ListParts and ListMultipartUploads tell it in
+/// `Initiator` (see `s3::multipart::initiator`). Set once, by the upload's
+/// INSERT, so no new lock protocol. NULL for an anonymous request's upload,
+/// and for one begun before this migration or by a Cairn that doesn't know
+/// it: those name the account.
+const UPLOAD_INITIATORS: &str = r#"
+ALTER TABLE multipart_uploads ADD COLUMN initiator text;
 "#;
 #[cfg(test)]
 mod tests {

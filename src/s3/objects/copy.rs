@@ -19,6 +19,7 @@ use crate::{
     s3::{
         conditional::{Precondition, Preconditions},
         checksums::{self, Algorithm, Checksum, Type},
+        expiration,
         multipart::upload,
         sse::{self, Stored, Wanted},
         sse_c::CustomerKey,
@@ -324,7 +325,9 @@ pub async fn copy_object(
             let stored = sealing.as_ref().map_or(Stored::Plain, |sealing| sealing.stored.clone());
             match stream_object_copy(app, &source, &dest, source_key, sealing).await {
                 Ok(Ok((etag, checksum, version_id, last_modified))) => {
-                    return Ok(respond(&etag, checksum.as_ref(), version_id.as_deref(), &last_modified, &stored));
+                    let resp = respond(&etag, checksum.as_ref(), version_id.as_deref(), &last_modified, &stored);
+                    let expiration = expiration::of_write(app, dest_bucket, dest_key, version.size, tags, &last_modified).await?;
+                    return Ok(expiration::onto(resp, expiration));
                 }
                 Ok(Err(refused)) => return Ok(refused),
                 // Its data went with it: copy what it is now.
@@ -410,7 +413,9 @@ pub async fn copy_object(
                 ObjectCopy::SourceChanged => continue, // copy what it is now
                 ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
             };
-        return Ok(respond(&etag, Some(&copied.checksum), version_id.as_deref(), &last_modified, &stored));
+        let resp = respond(&etag, Some(&copied.checksum), version_id.as_deref(), &last_modified, &stored);
+        let expiration = expiration::of_write(app, dest_bucket, dest_key, version.size, tags, &last_modified).await?;
+        return Ok(expiration::onto(resp, expiration));
     }
     Err(Contended("the copy source kept changing".to_owned()).into())
 }

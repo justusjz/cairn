@@ -61,7 +61,7 @@ pub async fn list_multipart_uploads(
             "SELECT name AS key, is_prefix, upload_id,
                     to_char(initiated_at AT TIME ZONE 'UTC',
                             'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS initiated,
-                    checksum_algorithm, checksum_type
+                    checksum_algorithm, checksum_type, initiator
              FROM pg_temp.cairn_list_uploads($1, $2, $3, $4, $5, $6)",
             &[&bucket, &prefix, &delim, &key_marker, &marker_id, &limit],
         )
@@ -73,7 +73,7 @@ pub async fn list_multipart_uploads(
     let truncated = rows.len() as i64 > max_uploads && max_uploads > 0;
     let kept = &rows[..(max_uploads as usize).min(rows.len())];
 
-    // The account's, as the ACL stub has it; Cairn doesn't keep who began each.
+    // The account's, as the ACL stub has it.
     let owner_id = crate::s3::util::canonical_id(&crate::users::account(&app.pool.get().await?).await?);
     let mut uploads = String::new();
     let mut prefixes = String::new();
@@ -89,9 +89,10 @@ pub async fn list_multipart_uploads(
         let initiated: &str = row.get("initiated");
         let checksum = crate::s3::checksums::listed(row, 4);
         uploads.push_str(&format!(
-            "<Upload><Key>{}</Key><UploadId>{upload_id}</UploadId><Initiator><ID>{owner_id}</ID></Initiator><Owner><ID>{owner_id}</ID></Owner>\
+            "<Upload><Key>{}</Key><UploadId>{upload_id}</UploadId>{}<Owner><ID>{owner_id}</ID></Owner>\
              <StorageClass>STANDARD</StorageClass><Initiated>{initiated}</Initiated>{checksum}</Upload>",
             encoding.xml(row.get("key")),
+            crate::s3::multipart::initiator_xml(row.get("initiator"), &owner_id),
         ));
     }
 

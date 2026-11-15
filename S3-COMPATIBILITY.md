@@ -101,7 +101,6 @@ S3 reports a bucket that doesn't use it:
   There are no Organizations, so no SCPs, RCPs or organization condition keys.
 - **No root user.** Every principal, admins included, is subject to policies.
   Admins have `AdministratorAccess`.
-- An upload's `Initiator` is the account, not the principal that started it.
 
 ### Endpoints and domains
 
@@ -148,8 +147,6 @@ and refuses too. The difference is that ACLs can't be enabled:
 
 - Rules are applied by a daily background sweep of each bucket, so an expired
   object can stay readable for up to a day after it expires.
-- Responses never carry `x-amz-expiration`, `x-amz-abort-date` or
-  `x-amz-abort-rule-id`.
 
 ### POST Object
 
@@ -263,7 +260,6 @@ Differences that are open, and should be fixed:
   checked against S3).
 - Signature and clock-skew errors have no detail elements (`StringToSign`,
   `CanonicalRequest`, `RequestTime`, `ServerTime`).
-- `x-amz-expiration` and the abort headers are never sent ([Lifecycle](#lifecycle)).
 
 ---
 

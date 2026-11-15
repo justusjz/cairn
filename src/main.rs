@@ -1528,6 +1528,8 @@ enum UploadResult {
         sent: Option<s3::checksums::Checksum>,
         version_id: Option<String>,
         last_modified: Option<String>,
+        /// Its size, as clients know it (before encryption).
+        size: i64,
     },
     /// The body wasn't what the request claimed it to be (see `Payload`).
     Rejected(Rejection),
@@ -1779,7 +1781,8 @@ where
                 Ok(CommitResult::Committed { reap, version_id, last_modified }) => {
                     // Reap the blobs this overwrite displaced; their rows are gone.
                     reap_blobs(app, reap);
-                    return Ok(UploadResult::Committed { etag, checksum, sent, version_id, last_modified });
+                    let size = encrypted.as_ref().map_or(written.size() as i64, |e| e.plain_size as i64);
+                    return Ok(UploadResult::Committed { etag, checksum, sent, version_id, last_modified, size });
                 }
                 // Another write landed since it was decided: decide again.
                 Ok(CommitResult::Stale) => continue,

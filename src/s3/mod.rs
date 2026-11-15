@@ -58,6 +58,7 @@ pub(crate) mod access;
 pub(crate) mod acl;
 pub(crate) mod actions;
 pub(crate) mod conditional;
+pub(crate) mod expiration;
 pub(crate) mod hosting;
 pub(crate) mod metadata;
 pub(crate) mod sse;
@@ -1076,8 +1077,10 @@ async fn handle_request(
             match (metadata, tags) {
                 (Ok(metadata), Ok(tags)) => match checksums::requested_upload(req.headers()) {
                     Ok(checksum) => {
+                        let initiator = principal.as_ref().map(Principal::arn);
                         create_multipart_upload(
                             &app, &bucket, &key, &content_type, &metadata, &tags, wanted, role, checksum, lock,
+                            initiator.as_deref(),
                         )
                         .await?
                     }

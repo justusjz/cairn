@@ -42,15 +42,20 @@ pub async fn list_parts(
         .await?;
     // It must belong to the request's bucket and key: authorization only
     // checked the bucket.
-    let Some((encryption, checksum)) = tx
+    let Some((encryption, checksum, initiator, initiated, lifecycle)) = tx
         .query_opt_cached(
-            "SELECT sse_c_key, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
-                    checksum_algorithm, checksum_type
-             FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
+            "SELECT u.sse_c_key, u.sse_kms_key_id, u.sse_kms_data_key, u.sse_kms_sealed, u.sse_kms_context,
+                    u.sse_s3, u.checksum_algorithm, u.checksum_type, u.initiator,
+                    extract(epoch FROM u.initiated_at)::float8, b.lifecycle
+             FROM multipart_uploads u JOIN buckets b ON b.name = u.bucket
+             WHERE u.upload_id = $1 AND u.bucket = $2 AND u.key = $3",
             &[&upload, &bucket, &key],
         )
         .await?
-        .map(|row| (Stored::from_row(&row, 0), checksum_columns(&row, 6)))
+        .map(|row| {
+            let initiated = crate::s3::expiration::from_epoch(row.get(9));
+            (Stored::from_row(&row, 0), checksum_columns(&row, 6), row.get::<_, Option<String>>(8), initiated, row.get::<_, Option<String>>(10))
+        })
     else {
         return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
     };
@@ -105,14 +110,16 @@ pub async fn list_parts(
     // nothing (probed).
     let truncated = rows.len() as i64 > max_parts && max_parts > 0;
     let kept = kept_rows(&rows, max_parts);
-    // The account's, as the ACL stub has it; Cairn doesn't keep who began it.
+    // The account's, as the ACL stub has it.
     let account = crate::users::account(&app.pool.get().await?).await?;
-    let owner = format!("<ID>{}</ID>", crate::s3::util::canonical_id(&account));
+    let owner_id = crate::s3::util::canonical_id(&account);
+    let owner = format!("<ID>{owner_id}</ID>");
+    let initiator = crate::s3::multipart::initiator_xml(initiator.as_deref(), &owner_id);
     let mut body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Bucket>{}</Bucket><Key>{}</Key><UploadId>{upload}</UploadId>\
-         <Initiator>{owner}</Initiator><Owner>{owner}</Owner>\
+         {initiator}<Owner>{owner}</Owner>\
          <StorageClass>STANDARD</StorageClass>{}\
          <PartNumberMarker>{part_number_marker}</PartNumberMarker>",
         xml_escape(bucket),
@@ -167,7 +174,8 @@ pub async fn list_parts(
         ));
     }
     body.push_str("</ListPartsResult>");
-    Ok(xml_ok(body))
+    // When a lifecycle rule aborts it, as S3 tells it.
+    Ok(crate::s3::expiration::abort_onto(xml_ok(body), lifecycle.as_deref(), key, initiated))
 }
 
 /// The rows of a page of `max_parts`, of the one more that were read.

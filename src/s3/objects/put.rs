@@ -89,7 +89,7 @@ where
         lock,
     };
     match crate::upload_part(app, body, &attach, payload).await? {
-        UploadResult::Committed { etag, checksum, version_id, .. } => {
+        UploadResult::Committed { etag, checksum, version_id, last_modified, size, .. } => {
             let builder = Response::builder()
                 .status(StatusCode::OK)
                 .header(header::ETAG, format!("\"{etag}\""));
@@ -98,7 +98,11 @@ where
                 None => builder,
             };
             let builder = sse::echo(builder, &stored, customer_key);
-            Ok(with_version_id(builder.body(Full::new(Bytes::new())).unwrap(), version_id.as_deref()))
+            // When a lifecycle rule expires it, as S3 tells it.
+            let last_modified = last_modified.expect("an object write reports its last-modified time");
+            let expiration = crate::s3::expiration::of_write(app, bucket, key, size, tags, &last_modified).await?;
+            let response = crate::s3::expiration::onto(builder.body(Full::new(Bytes::new())).unwrap(), expiration);
+            Ok(with_version_id(response, version_id.as_deref()))
         }
         UploadResult::Rejected(rejection) => Ok(rejection_response(&rejection)),
         // A concurrent writer won the race between the fast-fail check and commit.

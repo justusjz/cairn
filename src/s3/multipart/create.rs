@@ -15,7 +15,9 @@ use crate::{
 /// hands back its UploadId. Nothing about the live object changes until
 /// CompleteMultipartUpload. `tags` are the object's, stored form (see
 /// `s3::tags`): an upload's tags are fixed now, as in S3, as is the Object
-/// Lock it asks for (`lock`, see `s3::object_lock`).
+/// Lock it asks for (`lock`, see `s3::object_lock`). `initiator` is the ARN
+/// of the principal that begins it (`None`: anonymous), as `Initiator`
+/// tells it.
 #[allow(clippy::too_many_arguments)]
 pub async fn create_multipart_upload(
     app: &App,
@@ -28,19 +30,19 @@ pub async fn create_multipart_upload(
     role: Option<Uuid>,
     checksum: Option<(Algorithm, Type)>,
     lock: Lock,
+    initiator: Option<&str>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
-    if client
-        .query_opt_cached("SELECT 1 FROM buckets WHERE name = $1", &[&bucket])
+    let Some(bucket_row) = client
+        .query_opt_cached("SELECT lifecycle FROM buckets WHERE name = $1", &[&bucket])
         .await?
-        .is_none()
-    {
+    else {
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
             "The specified bucket does not exist",
         ));
-    }
+    };
     drop(client);
     // A lock only where there's Object Lock.
     if let Some(refused) = object_lock::check_write(app, bucket, &lock).await? {
@@ -56,16 +58,18 @@ pub async fn create_multipart_upload(
         Err(refused) => return Ok(refused),
     };
     let sse = stored.columns();
-    app.pool
+    let initiated = app
+        .pool
         .get()
         .await?
-        .execute_cached(
+        .query_one_cached(
             "INSERT INTO multipart_uploads (upload_id, bucket, key, content_type, metadata,
                                             sse_c_key, sse_kms_key_id, sse_kms_data_key,
                                             sse_kms_sealed, sse_kms_context, sse_s3,
                                             checksum_algorithm, checksum_type, tags, initiated_at,
-                                            retain_mode, retain_until, legal_hold)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17)",
+                                            retain_mode, retain_until, legal_hold, initiator)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17, $18)
+             RETURNING extract(epoch FROM initiated_at)::float8",
             &[
                 &upload_id,
                 &bucket,
@@ -84,9 +88,11 @@ pub async fn create_multipart_upload(
                 &lock_mode,
                 &lock_until,
                 &legal_hold,
+                &initiator,
             ],
         )
         .await?;
+    let initiated = crate::s3::expiration::from_epoch(initiated.get(0));
     let body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -103,5 +109,7 @@ pub async fn create_multipart_upload(
         response.headers_mut().insert(checksums::ALGORITHM, algorithm.name().parse().unwrap());
         response.headers_mut().insert(checksums::TYPE, kind.name().parse().unwrap());
     }
-    Ok(response)
+    // When a lifecycle rule aborts it, as S3 tells it.
+    let lifecycle: Option<&str> = bucket_row.get(0);
+    Ok(crate::s3::expiration::abort_onto(response, lifecycle, key, initiated))
 }

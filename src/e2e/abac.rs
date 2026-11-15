@@ -312,7 +312,7 @@ async fn object_tags_decide() {
     let upload = |stored: String| {
         let (app, bucket) = (&app, &bucket);
         async move {
-            let response = create_multipart_upload(app, bucket, "m", "x", "", &stored, Wanted::Plain, None, None, Default::default())
+            let response = create_multipart_upload(app, bucket, "m", "x", "", &stored, Wanted::Plain, None, None, Default::default(), None)
                 .await
                 .unwrap();
             let (_, body) = text(response).await;

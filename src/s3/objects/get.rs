@@ -51,6 +51,10 @@ pub(crate) struct ObjectVersion {
     pub tags: String,
     /// Its Object Lock (see `s3::object_lock`).
     pub lock: crate::s3::object_lock::Stored,
+    /// The `x-amz-expiration` to report, if a lifecycle rule expires it:
+    /// only for the current version read without naming it, as in S3
+    /// (see `s3::expiration`).
+    pub expiration: Option<hyper::header::HeaderValue>,
 }
 
 /// Why a read found nothing to read. Each read reports it differently.
@@ -119,7 +123,9 @@ pub(crate) async fn lookup_version<C: GenericClient>(
                     floor(extract(epoch FROM o.last_modified))::bigint,
                     o.version_id, o.is_delete_marker, b.versioning, o.metadata, o.sse_c_key,
                     o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed, o.sse_kms_context,
-                    o.sse_s3, o.checksum_algorithm, o.checksum_type, o.checksum, o.tags, {}
+                    o.sse_s3, o.checksum_algorithm, o.checksum_type, o.checksum, o.tags, {},
+                    CASE WHEN $3::text IS NULL THEN b.lifecycle END,
+                    extract(epoch FROM o.last_modified)::float8
              FROM objects o JOIN buckets b ON b.name = o.bucket
              WHERE o.bucket = $1 AND o.key = $2
                AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",
@@ -155,6 +161,17 @@ pub(crate) async fn lookup_version<C: GenericClient>(
         checksum: StoredChecksum::from_row(&row, 17),
         tags: row.get(20),
         lock: crate::s3::object_lock::Stored::from_row(&row, 21),
+        expiration: {
+            // After `object_lock::COLUMNS`, which are three.
+            let at = 24;
+            crate::s3::expiration::expiration(
+                row.get(at),
+                key,
+                row.get(3),
+                row.get(20),
+                crate::s3::expiration::from_epoch(row.get(at + 1)),
+            )
+        },
     }))
 }
 
@@ -213,6 +230,7 @@ pub async fn get_object(
         checksum,
         tags,
         lock,
+        expiration,
         ..
     } = version;
     // An SSE-C object only with its key; before the conditions, which would
@@ -238,6 +256,7 @@ pub async fn get_object(
         Precondition::Proceed => {}
         Precondition::NotModified => {
             let response = PartRead::count_onto(part.as_ref(), not_modified(&etag, &last_modified));
+            let response = crate::s3::expiration::onto(response, expiration);
             return Ok(box_response(with_version_id(response, version_id.as_deref())));
         }
         Precondition::Failed => {
@@ -313,7 +332,8 @@ pub async fn get_object(
     } else {
         builder.status(StatusCode::OK)
     };
-    Ok(with_version_id(builder.body(body).unwrap(), version_id.as_deref()))
+    let response = crate::s3::expiration::onto(builder.body(body).unwrap(), expiration);
+    Ok(with_version_id(response, version_id.as_deref()))
 }
 
 /// One part of an object for streaming: where its bytes live (a blob, the
@@ -735,6 +755,7 @@ pub async fn head_object(
         checksum,
         tags,
         lock,
+        expiration,
         ..
     } = match lookup_version(&client, bucket, key, version_id).await? {
         Ok(version) => version,
@@ -761,6 +782,7 @@ pub async fn head_object(
         Precondition::Proceed => {}
         Precondition::NotModified => {
             let response = PartRead::count_onto(part.as_ref(), not_modified(&etag, &last_modified));
+            let response = crate::s3::expiration::onto(response, expiration);
             return Ok(with_version_id(response, version_id.as_deref()));
         }
         Precondition::Failed => {
@@ -820,7 +842,8 @@ pub async fn head_object(
     } else {
         builder.status(StatusCode::OK)
     };
-    Ok(with_version_id(builder.body(Full::new(Bytes::new())).unwrap(), version_id.as_deref()))
+    let response = crate::s3::expiration::onto(builder.body(Full::new(Bytes::new())).unwrap(), expiration);
+    Ok(with_version_id(response, version_id.as_deref()))
 }
 
 /// A read of one part of an object (GET or HEAD `?partNumber=N`), as S3

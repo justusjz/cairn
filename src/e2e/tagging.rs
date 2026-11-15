@@ -283,7 +283,7 @@ async fn copies_keep_or_replace_tags() {
 async fn an_upload_gives_its_tags_to_its_object() {
     let Some(app) = node().await else { return };
     let response =
-        create_multipart_upload(&app, BUCKET, "m", "x", "", &stored("m=1"), Wanted::Plain, None, None, Default::default()).await.unwrap();
+        create_multipart_upload(&app, BUCKET, "m", "x", "", &stored("m=1"), Wanted::Plain, None, None, Default::default(), None).await.unwrap();
     let (_, _, body) = text(response).await;
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
     let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();

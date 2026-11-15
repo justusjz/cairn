@@ -2962,7 +2962,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_list_uploads(
     p_bucket text, p_prefix text, p_delimiter text, p_key_marker text, p_upload_marker uuid,
     p_limit int,
     OUT name text, OUT is_prefix boolean, OUT upload_id uuid, OUT initiated_at timestamptz,
-    OUT checksum_algorithm text, OUT checksum_type text
+    OUT checksum_algorithm text, OUT checksum_type text, OUT initiator text
 ) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_pfx text COLLATE "C" := p_prefix;
@@ -2979,7 +2979,7 @@ BEGIN
        AND pg_temp.cairn_common_prefix(v_marker, v_pfx, v_delim) IS NULL THEN
         RETURN QUERY
             SELECT u.key::text, false, u.upload_id, u.initiated_at, u.checksum_algorithm,
-                   u.checksum_type
+                   u.checksum_type, u.initiator
             FROM multipart_uploads u
             WHERE u.bucket = p_bucket COLLATE "default" AND u.key = v_marker
               AND u.upload_id > p_upload_marker
@@ -2989,13 +2989,15 @@ BEGIN
     WHILE v_count < p_limit LOOP
         IF v_end IS NULL THEN
             OPEN c FOR
-                SELECT u.key, u.upload_id, u.initiated_at, u.checksum_algorithm, u.checksum_type
+                SELECT u.key, u.upload_id, u.initiated_at, u.checksum_algorithm, u.checksum_type,
+                       u.initiator
                 FROM multipart_uploads u
                 WHERE u.bucket = p_bucket COLLATE "default" AND u.key >= v_from
                 ORDER BY u.key, u.upload_id LIMIT p_limit - v_count;
         ELSE
             OPEN c FOR
-                SELECT u.key, u.upload_id, u.initiated_at, u.checksum_algorithm, u.checksum_type
+                SELECT u.key, u.upload_id, u.initiated_at, u.checksum_algorithm, u.checksum_type,
+                       u.initiator
                 FROM multipart_uploads u
                 WHERE u.bucket = p_bucket COLLATE "default" AND u.key >= v_from AND u.key < v_end
                 ORDER BY u.key, u.upload_id LIMIT p_limit - v_count;
@@ -3012,6 +3014,7 @@ BEGIN
             initiated_at := r.initiated_at;
             checksum_algorithm := r.checksum_algorithm;
             checksum_type := r.checksum_type;
+            initiator := r.initiator;
             RETURN NEXT;
             v_count := v_count + 1;
         END LOOP;
@@ -3024,6 +3027,7 @@ BEGIN
             initiated_at := NULL;
             checksum_algorithm := NULL;
             checksum_type := NULL;
+            initiator := NULL;
             RETURN NEXT;
             v_count := v_count + 1;
         END IF;

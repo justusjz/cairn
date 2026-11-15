@@ -138,6 +138,26 @@ impl Day {
         Day(seconds(time).div_euclid(SECS_PER_DAY))
     }
 
+    /// The first day to start at or after `time`: the one after the day it
+    /// falls on, unless it's at midnight. The day `n` days after `time` by
+    /// a rule is `n` after this one.
+    pub fn after(time: SystemTime) -> Day {
+        let day = Day::of(time);
+        if day.midnight() < time { Day(day.0 + 1) } else { day }
+    }
+
+    /// As an HTTP date (`Thu, 26 Nov 2026 00:00:00 GMT`), at its midnight.
+    pub fn to_http(self) -> String {
+        const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+        const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+        let (year, month, day) = self.civil();
+        format!(
+            "{}, {day:02} {} {year:04} 00:00:00 GMT",
+            WEEKDAYS[self.0.rem_euclid(7) as usize],
+            MONTHS[month as usize - 1]
+        )
+    }
+
     /// The midnight it starts with.
     pub fn midnight(self) -> SystemTime {
         let secs = self.0 * SECS_PER_DAY;
@@ -458,6 +478,51 @@ impl Configuration {
             key.starts_with(&r.filter.prefix) && r.abort_upload_days.is_some_and(|days| initiated <= today.cutoff(days))
         })
     }
+
+    /// When the current version of `key`, of `size` and `tags` (stored
+    /// form), written at `written`, expires, and the rule that expires it:
+    /// as S3 tells it in `x-amz-expiration` (probed). The earliest of the
+    /// rules that would, the first of them listed on a tie; the day the
+    /// sweep takes it on (see `due`).
+    pub fn expiry(&self, key: &str, size: i64, tags: &str, written: SystemTime) -> Option<(Day, &str)> {
+        let version = Version {
+            id: 0,
+            version_id: String::new(),
+            is_latest: true,
+            delete_marker: false,
+            size,
+            last_modified: written,
+            tags: tags.to_owned(),
+        };
+        let after = Day::after(written);
+        earliest(self.enabled().filter(|r| r.filter.matches(key, &version)).filter_map(|r| {
+            let e = r.expiration.as_ref()?;
+            let day = match (e.days, e.date) {
+                (Some(days), _) => Day(after.0 + i64::from(days)),
+                (None, Some(date)) => date,
+                (None, None) => return None,
+            };
+            Some((day, r.id.as_str()))
+        }))
+    }
+
+    /// When the upload of `key` begun at `initiated` is aborted, and the
+    /// rule that aborts it: as S3 tells it in `x-amz-abort-date` and
+    /// `x-amz-abort-rule-id` (probed). As `expiry`.
+    pub fn abort_date(&self, key: &str, initiated: SystemTime) -> Option<(Day, &str)> {
+        let after = Day::after(initiated);
+        earliest(self.enabled().filter(|r| key.starts_with(&r.filter.prefix)).filter_map(|r| {
+            r.abort_upload_days.map(|days| (Day(after.0 + i64::from(days)), r.id.as_str()))
+        }))
+    }
+}
+
+/// The earliest day of `days`, the first of them on a tie.
+fn earliest<'a>(days: impl Iterator<Item = (Day, &'a str)>) -> Option<(Day, &'a str)> {
+    days.fold(None, |best, (day, id)| match best {
+        Some((best_day, _)) if best_day <= day => best,
+        _ => Some((day, id)),
+    })
 }
 
 impl Rule {
@@ -1329,5 +1394,84 @@ mod tests {
         assert!(rules.aborts("tmp/a", at(first, 1), Day(first.0 + 2)));
         assert!(!rules.aborts("a", at(first, 1), Day(first.0 + 2)));
         assert!(rules.aborts_uploads() && !rules.expires_objects());
+    }
+
+    /// As S3 tells them (probed, `plans/probes/expiration_probe.py`).
+    #[test]
+    fn expiry_is_the_earliest_rules() {
+        let expire = |id: &str, filter: &str, action: &str| {
+            format!("<Rule><ID>{id}</ID>{filter}<Status>Enabled</Status>{action}</Rule>")
+        };
+        let days = |n: u32| format!("<Expiration><Days>{n}</Days></Expiration>");
+        let abort = |n: u32| {
+            format!("<AbortIncompleteMultipartUpload><DaysAfterInitiation>{n}</DaysAfterInitiation></AbortIncompleteMultipartUpload>")
+        };
+        let rules = parse(
+            &[
+                expire("d", "<Prefix>d/</Prefix>", &format!("{}{}", days(10), abort(6))),
+                expire("d-short", "<Prefix>d/short/</Prefix>", &days(3)),
+                expire("d-long", "<Prefix>d/long/</Prefix>", &days(30)),
+                expire("tie-b", "<Prefix>tie/</Prefix>", &days(5)),
+                expire("tie-a", "<Prefix>tie/</Prefix>", &days(5)),
+                expire("date", "<Prefix>date/</Prefix>", "<Expiration><Date>2031-01-01T00:00:00Z</Date></Expiration>"),
+                expire("tag", "<Filter><Tag><Key>k</Key><Value>v</Value></Tag></Filter>", &days(5)),
+                expire(
+                    "size",
+                    "<Filter><And><Prefix>s/</Prefix><ObjectSizeGreaterThan>100</ObjectSizeGreaterThan></And></Filter>",
+                    &days(7),
+                ),
+                "<Rule><ID>off</ID><Prefix>off/</Prefix><Status>Disabled</Status><Expiration><Days>1</Days></Expiration></Rule>"
+                    .to_owned(),
+                expire("m", "<Prefix>m/</Prefix>", "<Expiration><ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker></Expiration>"),
+                expire("nc", "<Prefix>nc/</Prefix>", "<NoncurrentVersionExpiration><NoncurrentDays>3</NoncurrentDays></NoncurrentVersionExpiration>"),
+                expire("u", "<Prefix>u/</Prefix>", &abort(2)),
+                expire("u-x", "<Prefix>u/x/</Prefix>", &abort(4)),
+                expire("u-y", "<Prefix>u/y/</Prefix>", &abort(1)),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        // Written at 17:37 on the 15th.
+        let written = day(2026, 11, 15).midnight() + Duration::from_secs(17 * 3600 + 37 * 60);
+        let expiry = |key: &str, size: i64, tags: &str| {
+            rules.expiry(key, size, tags, written).map(|(day, id)| (day.to_http(), id.to_owned()))
+        };
+        let told = |date: &str, id: &str| Some((format!("{date} 00:00:00 GMT"), id.to_owned()));
+        assert_eq!(expiry("d/x", 5, ""), told("Thu, 26 Nov 2026", "d"));
+        assert_eq!(expiry("d/short/x", 5, ""), told("Thu, 19 Nov 2026", "d-short"));
+        assert_eq!(expiry("d/long/x", 5, ""), told("Thu, 26 Nov 2026", "d"));
+        assert_eq!(expiry("tie/x", 5, ""), told("Sat, 21 Nov 2026", "tie-b"));
+        assert_eq!(expiry("date/x", 5, ""), told("Wed, 01 Jan 2031", "date"));
+        let tagged = "k=v";
+        assert_eq!(expiry("t", 5, tagged), told("Sat, 21 Nov 2026", "tag"));
+        assert_eq!(expiry("d/tagged", 5, tagged), told("Sat, 21 Nov 2026", "tag"));
+        assert_eq!(expiry("s/small", 5, ""), None);
+        assert_eq!(expiry("s/big", 200, ""), told("Mon, 23 Nov 2026", "size"));
+        for key in ["off/x", "m/x", "nc/x", "none/x"] {
+            assert_eq!(expiry(key, 5, ""), None, "{key}");
+        }
+        let abort = |key: &str| rules.abort_date(key, written).map(|(day, id)| (day.to_http(), id.to_owned()));
+        assert_eq!(abort("u/a"), told("Wed, 18 Nov 2026", "u"));
+        assert_eq!(abort("u/x/a"), told("Wed, 18 Nov 2026", "u"));
+        assert_eq!(abort("u/y/a"), told("Tue, 17 Nov 2026", "u-y"));
+        assert_eq!(abort("d/up"), told("Sun, 22 Nov 2026", "d"));
+        assert_eq!(abort("none/up"), None);
+        // The day told is the one the sweep takes it on.
+        let (due, _) = rules.expiry("d/x", 5, "", written).unwrap();
+        let version = Version {
+            id: 1,
+            version_id: String::new(),
+            is_latest: true,
+            delete_marker: false,
+            size: 5,
+            last_modified: written,
+            tags: String::new(),
+        };
+        assert!(rules.due("d/x", std::slice::from_ref(&version), Day(due.0 - 1)).is_empty());
+        assert_eq!(rules.due("d/x", std::slice::from_ref(&version), due).len(), 1);
+        // At midnight exactly, the days count from it.
+        let midnight = day(2026, 11, 15).midnight();
+        assert_eq!(rules.expiry("d/x", 5, "", midnight).unwrap().0, day(2026, 11, 25));
+        assert_eq!(Day(0).to_http(), "Thu, 01 Jan 1970 00:00:00 GMT");
     }
 }

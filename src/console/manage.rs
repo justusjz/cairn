@@ -1958,6 +1958,7 @@ async fn create_upload(
         actor.kms_role(),
         None,
         Default::default(),
+        Some(&actor.0.principal.arn()),
     )
     .await?;
     if resp.status() != StatusCode::OK {
