@@ -84,9 +84,9 @@ pub const TEMPLATES: &[Template] = &[
     Template {
         id: "team",
         title: "Team",
-        description: "A team sharing the account: a permissions boundary for everything the team has, a policy for its \
-                      admins (attach it to a user or a role), and one for its members. The team has the buckets whose \
-                      names start with its prefix, and the users, roles and policies at its path (`/<team>/`); its \
+        description: "A team sharing the account: a policy for everything the team may do, which is both its admins' \
+                      policy (attach it to a user or a role) and the permissions boundary of everyone in the team, and \
+                      one for its members. The team has the buckets whose names start with its prefix, and the users, roles and policies at its path (`/<team>/`); its \
                       admins manage those, and every user or role they make or change has the team's boundary, so \
                       nothing the team does reaches past it. Made at `/cairn/teams/<team>/`, which the team can't change.",
         version: 1,
@@ -191,11 +191,10 @@ impl Use {
                 Ok(vec![
                     made(
                         &path,
-                        format!("{}-boundary", team.team),
-                        format!("The permissions boundary of team {}'s users and roles", team.team),
-                        team.boundary(),
+                        team.policy_name(),
+                        format!("Everything team {} may do: its admins' policy, and its users' and roles' permissions boundary", team.team),
+                        team.policy(),
                     ),
-                    made(&path, format!("{}-admin", team.team), format!("An admin of team {}", team.team), team.admin()),
                     made(&path, format!("{}-member", team.team), format!("A member of team {}", team.team), team.member()),
                 ])
             }
@@ -290,20 +289,25 @@ impl Team<'_> {
         format!("/cairn/teams/{}/", self.team)
     }
 
+    /// The team's policy's name: `<team>-team`.
+    fn policy_name(&self) -> String {
+        format!("{}-team", self.team)
+    }
+
+    /// The team's policy's ARN, the boundary every one of its users and
+    /// roles has.
     fn boundary_arn(&self) -> String {
-        crate::managed::arn(self.account, &self.path(), &format!("{}-boundary", self.team))
+        crate::managed::arn(self.account, &self.path(), &self.policy_name())
     }
 
-    /// What the team may ever do, and the guardrails. The boundary holds
-    /// the guardrails (not only the admin policy), as a member the admin
-    /// gave AdministratorAccess has only the boundary to stop it.
-    fn boundary(&self) -> String {
-        json!({ "Version": "2012-10-17", "Statement": self.statements() }).to_string()
-    }
-
-    /// The same: an admin may do everything the team may, and the
-    /// guardrails hold for an admin without the boundary too.
-    fn admin(&self) -> String {
+    /// Everything the team may do, and the guardrails: both its admins'
+    /// policy and its boundary. The two can't usefully differ: an admin
+    /// may attach anything to the team's users and roles (a new one, if
+    /// not its own), up to the boundary, so a narrower admin policy would
+    /// only look narrower. The guardrails hold as either: for a member an
+    /// admin gave AdministratorAccess (the boundary has them), and for an
+    /// admin without the boundary (its policy has them).
+    fn policy(&self) -> String {
         json!({ "Version": "2012-10-17", "Statement": self.statements() }).to_string()
     }
 

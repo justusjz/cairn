@@ -142,7 +142,7 @@ mod e2e {
     /// The team template: its admin manages the team's users, roles,
     /// policies and buckets, and can't get out of them; nor can a member it
     /// made an admin of everything (AdministratorAccess, capped by the
-    /// boundary), nor an admin with the team's admin policy and no boundary.
+    /// boundary), nor an admin with the team's policy and no boundary.
     #[tokio::test]
     async fn a_team_stays_in_its_sandbox() {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
@@ -157,12 +157,14 @@ mod e2e {
         let (status, preview) = root.send("POST", "/api/templates/preview", Some(team.clone())).await;
         assert_eq!(status, StatusCode::OK, "{preview}");
         let names: Vec<&str> = preview.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["oneai-boundary", "oneai-admin", "oneai-member"]);
+        assert_eq!(names, ["oneai-team", "oneai-member"]);
         allowed(&mut root, "POST", "/api/templates", Some(team.clone())).await;
         let (status, _) = root.send("POST", "/api/templates", Some(team)).await;
         assert_eq!(status, StatusCode::CONFLICT);
         let policy = |name: &str| format!("arn:aws:iam::{account}:policy/cairn/teams/oneai/{name}");
-        let (boundary, admin, member) = (policy("oneai-boundary"), policy("oneai-admin"), policy("oneai-member"));
+        // The team's policy is its admins' and everyone's boundary.
+        let (boundary, member) = (policy("oneai-team"), policy("oneai-member"));
+        let admin = boundary.clone();
         let administrator = managed::aws_arn(managed::ADMINISTRATOR_ACCESS);
 
         let mut lead = signed_in(&console, "lead", false).await;
@@ -213,7 +215,7 @@ mod e2e {
             denied(who, "PUT", "/api/users/dev/boundary", Some(json!({ "arn": s3_full }))).await;
             denied(who, "DELETE", "/api/roles/ci/boundary", None).await;
             // The team's own policies, and grants'.
-            for name in ["oneai-boundary", "oneai-admin"] {
+            for name in ["oneai-team", "oneai-member"] {
                 let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
                 denied(who, "PUT", &format!("/api/policies/{name}"), Some(json!({ "document": document }))).await;
                 denied(who, "DELETE", &format!("/api/policies/{name}"), None).await;
@@ -259,7 +261,7 @@ mod e2e {
         let (status, policies) = lead.send("GET", "/api/policies", None).await;
         assert_eq!(status, StatusCode::OK, "{policies}");
         let names: Vec<&str> = policies.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
-        assert!(names.contains(&"oneai-admin") && names.contains(&"oneai-dev-data-read"), "{names:?}");
+        assert!(names.contains(&"oneai-team") && names.contains(&"oneai-dev-data-read"), "{names:?}");
         assert!(!names.contains(&"other-admin"), "{names:?}");
 
         // A member reads and writes the team's buckets, and its own keys.

@@ -34,14 +34,15 @@ fn makes_valid_policies() {
 fn teams_policies_are_out_of_their_reach() {
     let made = team(false, false).make(ACCOUNT).unwrap();
     assert!(made.iter().all(|m| m.path == "/cairn/teams/oneai/"));
-    let boundary = format!("arn:aws:iam::{ACCOUNT}:policy/cairn/teams/oneai/oneai-boundary");
+    let boundary = format!("arn:aws:iam::{ACCOUNT}:policy/cairn/teams/oneai/oneai-team");
+    assert_eq!(made.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["oneai-team", "oneai-member"]);
     assert!(made[0].document.contains(&boundary));
     assert!(made.iter().all(|m| !m.document.contains("ListAllMyBuckets") && !m.document.contains("iam:ListPolicies")));
     let made = team(true, true).make(ACCOUNT).unwrap();
     assert!(made[0].document.contains("s3:ListAllMyBuckets") && made[0].document.contains("iam:ListPolicies"));
     // Members see all buckets' names if the team does; they don't list
     // policies.
-    assert!(made[2].document.contains("s3:ListAllMyBuckets") && !made[2].document.contains("iam:ListPolicies"));
+    assert!(made[1].document.contains("s3:ListAllMyBuckets") && !made[1].document.contains("iam:ListPolicies"));
     // No cluster, and nothing at another path.
     assert!(made.iter().all(|m| !m.document.contains("cairn:")));
 }

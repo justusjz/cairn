@@ -1,8 +1,9 @@
 // Policy templates (see `src/templates.rs`): managed policies for common
 // setups, made as IAM's CreatePolicy by the signed-in identity (so a team's
 // admin may use them within its team). Above all the team: an account
-// shared by teams, each with a boundary, an admin policy and a member
-// policy, made where the team can't change them.
+// shared by teams, each with a policy for everything it may do (its admins'
+// policy, and everyone's boundary) and a member policy, made where the team
+// can't change them.
 
 import { For, Show, createResource, createSignal, onMount } from "solid-js";
 import { type Level, type MadePolicy, type TemplateUse, api } from "../api";
@@ -90,10 +91,9 @@ export function TemplateDialog(props: { onClose: () => void; changed: () => void
             <Show when={id() === "team"}>
               <p class="subtle small">
                 Give a team's admin (a user or a role at <span class="mono">/{team().trim()}/</span>) the{" "}
-                <span class="mono">{team().trim()}-admin</span> policy, and <span class="mono">{team().trim()}-boundary</span>{" "}
-                as its permissions boundary. Its admins then make the team's users and roles (with that boundary: they
-                can't make any without it) and give them <span class="mono">{team().trim()}-member</span>, or what else
-                they need.
+                <span class="mono">{team().trim()}-team</span> policy, both attached and as its permissions boundary.
+                Its admins then make the team's users and roles (with that boundary: they can't make any without it)
+                and give them <span class="mono">{team().trim()}-member</span>, or what else they need.
               </p>
             </Show>
             <div class="buttons">

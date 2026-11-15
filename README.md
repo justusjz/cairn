@@ -632,19 +632,21 @@ and nothing outside it. Their documents work as they are with `aws iam
 create-policy` too.
 
 - **Team** (the account's admins make it): for team `T` with bucket prefix
-  `p-` (default: `t-`, the name in lowercase), three policies at
+  `p-` (default: `t-`, the name in lowercase), two policies at
   `/cairn/teams/T/`, where the team can't change them:
-  - `T-boundary`, the permissions boundary of everything the team has:
-    `s3:*` on the buckets `p-*` (making them too), `iam:*` on the users,
-    roles and policies at `/T/`, reading Cairn's policies and the team's,
-    `sts:AssumeRole` on the team's roles; and the guardrails: no user or
-    role made or bounded without `T-boundary`, no permissions given to or
-    taken from one that hasn't it, no boundary taken off. The guardrails
-    are in the boundary, so a member the team's admin gave
-    AdministratorAccess has them too.
-  - `T-admin`, for the team's admins: the same, so it holds for an admin
-    without the boundary too. Attach it to a user or a role at `/T/`, and
-    give that `T-boundary` as its permissions boundary.
+  - `T-team`, everything the team may do: `s3:*` on the buckets `p-*`
+    (making them too), `iam:*` on the users, roles and policies at `/T/`,
+    reading Cairn's policies and the team's, `sts:AssumeRole` on the team's
+    roles; and the guardrails: no user or role made or bounded without
+    `T-team` as its permissions boundary, no permissions given to or taken
+    from one that hasn't it, no boundary taken off. It's both the team
+    admins' policy and everyone's boundary: attach it to a user or a role at
+    `/T/` and make it that one's boundary too, and it's an admin of the
+    team. (An admin policy narrower than the boundary would only look
+    narrower: an admin may give the team's users and roles anything up to
+    the boundary.) The guardrails hold either way: for a member the admin
+    gave AdministratorAccess (the boundary has them), and for an admin
+    without the boundary.
   - `T-member`: reading and writing the team's buckets, and one's own
     access keys.
 
