@@ -3,7 +3,8 @@
 A simple, reliable S3-compatible object storage system. Run it on one machine,
 or spread it across several for redundancy. Cairn keeps your data safe and
 serves it through the familiar S3 API, using PostgreSQL to keep everything
-consistent.
+consistent. [S3-COMPATIBILITY.md](S3-COMPATIBILITY.md) describes exactly which
+parts of the S3, IAM and STS APIs it implements, and how they differ from AWS's.
 
 ## Requirements
 
