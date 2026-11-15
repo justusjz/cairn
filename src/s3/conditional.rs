@@ -96,11 +96,18 @@ impl Preconditions {
     /// S3's 501 for a write's If-None-Match other than `*` (probed): it only
     /// writes if there's no object, not if there's another.
     pub fn unsupported_on_write(&self) -> Option<Response<Full<Bytes>>> {
+        self.if_none_match
+            .as_deref()
+            .filter(|value| value.trim() != "*")
+            .map(|_| crate::s3::util::header_not_implemented("If-None-Match", None))
+    }
+
+    /// Likewise CompleteMultipartUpload's, whose 501 says why (probed).
+    pub fn unsupported_on_complete(&self) -> Option<Response<Full<Bytes>>> {
         self.if_none_match.as_deref().filter(|value| value.trim() != "*").map(|_| {
-            crate::s3::util::format_s3_error(
-                StatusCode::NOT_IMPLEMENTED,
-                "NotImplemented",
-                "A header you provided implies functionality that is not implemented",
+            crate::s3::util::header_not_implemented(
+                "If-None-Match",
+                Some("We don't accept the provided value of If-None-Match header for this API"),
             )
         })
     }
@@ -174,7 +181,7 @@ fn etag_matches(header: &str, etag: &str) -> bool {
 /// seconds. Returns None for any other/malformed input, so the caller can ignore
 /// an unparseable date as RFC 7232 requires. The zone is assumed GMT (as HTTP
 /// mandates); any trailing token is ignored.
-fn parse_http_date(s: &str) -> Option<i64> {
+pub(crate) fn parse_http_date(s: &str) -> Option<i64> {
     // Drop the leading "Wkd, " day-of-week.
     let rest = s.trim().split_once(", ")?.1;
     let mut fields = rest.split(' ');

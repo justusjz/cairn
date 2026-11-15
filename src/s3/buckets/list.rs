@@ -84,10 +84,10 @@ pub async fn list_buckets(
     let more = listed.len() > max;
     listed.truncate(max);
 
-    let mut body = String::from(
+    let mut body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-             <ListAllMyBucketsResult><Owner><ID>cairn</ID>\
-             <DisplayName>cairn</DisplayName></Owner><Buckets>",
+             <ListAllMyBucketsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Owner><ID>{}</ID></Owner><Buckets>",
+        crate::s3::util::canonical_id(&principal.account),
     );
     for bucket in &listed {
         body.push_str(&format!(

@@ -382,25 +382,23 @@ pub fn requested(
     Ok(Some(ServerSide::Kms(KmsRequest { key_id, context })))
 }
 
-/// A 400 for a read (GET, HEAD) with SSE-S3's or SSE-KMS's headers, as MinIO
-/// refuses it: they apply to writes only.
-pub fn refuse_on_read(headers: &HeaderMap) -> Option<Response<Full<Bytes>>> {
-    names_server_keys(headers).then(|| {
-        bad_request("BadRequest", "x-amz-server-side-encryption applies to writes, not reads")
-    })
-}
-
-/// A 501 for the writes that take no SSE-S3 or SSE-KMS headers (UploadPart,
-/// UploadPartCopy, CompleteMultipartUpload and the like), as MinIO refuses
-/// them: an upload's encryption is its CreateMultipartUpload's.
-pub fn refuse_on_other_writes(headers: &HeaderMap) -> Option<Response<Full<Bytes>>> {
-    names_server_keys(headers).then(|| {
-        format_s3_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            "x-amz-server-side-encryption applies to PutObject, CopyObject and CreateMultipartUpload only",
-        )
-    })
+/// S3's 400 for a request with SSE-S3's or SSE-KMS's headers that takes
+/// none (probed: GET and HEAD, UploadPart, UploadPartCopy,
+/// CompleteMultipartUpload): they apply to the writes that make an object, an
+/// upload's encryption being its CreateMultipartUpload's. Names the first of
+/// them.
+pub fn refuse_where_unsupported(headers: &HeaderMap) -> Option<Response<Full<Bytes>>> {
+    let (name, value) = [ENCRYPTION, KMS_KEY_ID, KMS_CONTEXT]
+        .into_iter()
+        .find_map(|name| headers.get(name).map(|value| (name, value)))?;
+    let mut rejection = crate::auth::Rejection::new(
+        StatusCode::BAD_REQUEST,
+        "InvalidArgument",
+        format!("{name} header is not supported for this operation."),
+    );
+    rejection.details.push(("ArgumentName", name.to_owned()));
+    rejection.details.push(("ArgumentValue", String::from_utf8_lossy(value.as_bytes()).into_owned()));
+    Some(crate::s3::util::rejection_response(&rejection))
 }
 
 /// Whether a stored object, at `bucket`/`key`, may be read with the SSE-C key

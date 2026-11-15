@@ -112,7 +112,7 @@ fn retained(mode: Mode, until: SystemTime) -> Lock {
 }
 
 async fn delete_version(app: &Arc<App>, key: &str, version: &str, bypass: bool) -> (StatusCode, String) {
-    let (status, _, body) = text(delete_object(app, BUCKET, key, Some(version), bypass).await.unwrap()).await;
+    let (status, _, body) = text(delete_object(app, BUCKET, key, Some(version), bypass, None).await.unwrap()).await;
     (status, code(&body).to_owned())
 }
 
@@ -219,7 +219,7 @@ async fn governance_mode_can_be_bypassed() {
     assert!(body.contains("<Mode>GOVERNANCE</Mode><RetainUntilDate>"), "{body}");
     // Not deleted, but a delete marker goes on top, as ever.
     assert_eq!(delete_version(&app, "g", &version, false).await, (StatusCode::FORBIDDEN, "AccessDenied".to_owned()));
-    assert_eq!(delete_object(&app, BUCKET, "g", None, false).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(delete_object(&app, BUCKET, "g", None, false, None).await.unwrap().status(), StatusCode::NO_CONTENT);
     assert_eq!(versions(&app, "g").await, 2);
     // Not shortened or removed, but lengthened, or made COMPLIANCE.
     assert_eq!(set_retention(&app, "g", &version, "GOVERNANCE", in_days(5), false).await.0, StatusCode::FORBIDDEN);
@@ -399,7 +399,7 @@ async fn deleted_markers_and_missing_versions_have_no_lock() {
     assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "NoSuchObjectLockConfiguration"));
     let (status, _, body) = text(get_object_retention(&app, BUCKET, "nope", None).await.unwrap()).await;
     assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "NoSuchKey"));
-    assert_eq!(delete_object(&app, BUCKET, "k", None, false).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(delete_object(&app, BUCKET, "k", None, false, None).await.unwrap().status(), StatusCode::NO_CONTENT);
     assert_eq!(set_hold(&app, "k", None, "ON").await, StatusCode::METHOD_NOT_ALLOWED);
     // A retention must lie ahead.
     let past = put_object_retention(

@@ -290,7 +290,7 @@ async fn a_version_marker_may_be_gone() {
     let delete_version = |v: String| {
         let app = app.clone();
         async move {
-            let response = delete_object(&app, BUCKET, "k", Some(&v), false).await.unwrap();
+            let response = delete_object(&app, BUCKET, "k", Some(&v), false, None).await.unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
         }
     };
@@ -348,8 +348,12 @@ async fn uploads_page(
     );
     // Stable, so each key's uploads keep their order.
     entries.sort_by(|a, b| a.split('@').next().cmp(&b.split('@').next()));
-    let next = between(&body, "<NextKeyMarker>", "</NextKeyMarker>")
-        .map(|key| (key, between(&body, "<NextUploadIdMarker>", "</NextUploadIdMarker>")));
+    // The markers are there truncated or not, as in S3; an upload's is empty
+    // after a common prefix.
+    let truncated = body.contains("<IsTruncated>true</IsTruncated>");
+    let next = between(&body, "<NextKeyMarker>", "</NextKeyMarker>").filter(|_| truncated).map(|key| {
+        (key, between(&body, "<NextUploadIdMarker>", "</NextUploadIdMarker>").filter(|u| !u.is_empty()))
+    });
     (entries, next)
 }
 
@@ -452,14 +456,14 @@ async fn lists_as_s3_writes_listings() {
         "{listed}"
     );
     assert!(listed.contains("<Key>asdf%2Bb</Key>"), "{listed}");
-    for prefix in ["foo%2B1/", "foo/", "quux%20ab/"] {
+    for prefix in ["foo%2B1/", "foo/", "quux+ab/"] {
         assert!(
             listed.contains(&format!("<Prefix>{prefix}</Prefix>")),
             "{prefix}: {listed}"
         );
     }
     assert!(
-        listed.contains("<Owner><ID>cairn</ID>"),
+        listed.contains("<Owner><ID>") && !listed.contains("<DisplayName>"),
         "v1 lists owners: {listed}"
     );
     let listed = body(
@@ -479,7 +483,7 @@ async fn lists_as_s3_writes_listings() {
             .unwrap(),
     )
     .await;
-    assert!(listed.contains("<Owner><ID>cairn</ID>"), "{listed}");
+    assert!(listed.contains("<Owner><ID>") && !listed.contains("<DisplayName>"), "{listed}");
     let listed = body(
         list_objects(
             &app,

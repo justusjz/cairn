@@ -412,9 +412,6 @@ where
         Ok(payload) => payload.at_least(min),
         Err(rejection) => return Ok(rejection_response(&rejection)),
     };
-    if let Err(refused) = checksums::check_put_type(&headers, payload.declared_algorithm()) {
-        return Ok(refused);
-    }
     // Its Object Lock, as a PutObject's headers ask for it.
     let lock = match object_lock::Lock::from_headers(&headers) {
         Ok(lock) => lock,
@@ -504,7 +501,7 @@ const QUERY_ESCAPES: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').rem
 /// The URL of `bucket`, as the client reached it, if it said how (`Host`):
 /// the host itself if it's the bucket's (`virtual_host`), else the bucket's
 /// path on it. The object's is this and its key.
-fn object_location(headers: &HeaderMap, bucket: &str, virtual_host: bool) -> Option<String> {
+pub(crate) fn object_location(headers: &HeaderMap, bucket: &str, virtual_host: bool) -> Option<String> {
     let host = headers.get(header::HOST)?.to_str().ok()?;
     let scheme = if sse_c::secure(headers, false) { "https" } else { "http" };
     Some(match virtual_host {

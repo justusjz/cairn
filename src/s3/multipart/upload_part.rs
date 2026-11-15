@@ -37,21 +37,13 @@ where
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
         Err(_) => {
-            return Ok(format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchUpload",
-                "the specified multipart upload does not exist",
-            ));
+            return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
         }
     };
     let part_number: i32 = match part_number.parse() {
         Ok(n) if (1..=10_000).contains(&n) => n,
         _ => {
-            return Ok(format_s3_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                "partNumber must be an integer in 1..=10000",
-            ));
+            return Ok(crate::s3::util::invalid_part_number(part_number));
         }
     };
     // Reject up front if the upload is gone, so we don't replicate a part we'd
@@ -59,11 +51,7 @@ where
     // belong to the request's bucket/key: authorization only checked that bucket.
     // Its encryption never changes, so it's checked here, once.
     let Some(upload) = upload(app, &upload_id, bucket, key).await? else {
-        return Ok(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "the specified multipart upload does not exist",
-        ));
+        return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
     };
     if let Some(mismatch) = upload.mismatch(payload.declared_algorithm()) {
         return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidRequest", &mismatch));
@@ -112,11 +100,7 @@ where
         }
         UploadResult::Rejected(rejection) => Ok(rejection_response(&rejection)),
         // The upload was completed or aborted while the body streamed.
-        UploadResult::NoSuchUpload => Ok(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "the specified multipart upload does not exist",
-        )),
+        UploadResult::NoSuchUpload => Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string())),
         // UploadPart carries no conditional-write guard, and has no bucket to
         // check (its upload is checked instead), so these can't occur.
         UploadResult::PreconditionFailed

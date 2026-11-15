@@ -96,6 +96,10 @@ pub struct CopyKeys<'a> {
     /// Its conditions on the destination (If-Match, If-None-Match), as a
     /// PutObject's; `None`, none.
     pub conditions: Option<&'a Preconditions>,
+    /// Whether it names a storage class or a website redirect, either of which
+    /// makes a copy onto itself one that changes something, as S3 has it
+    /// (probed).
+    pub restates: bool,
 }
 
 impl CopyKeys<'_> {
@@ -215,7 +219,10 @@ pub async fn copy_object(
         if let Err(refused) = sse::check(encryption, keys.source, &src_bucket, &src_key) {
             return Ok(refused);
         }
-        if same_object && !replace && request_tags.is_none() && keys.keeps(encryption) {
+        // A checksum algorithm, a storage class or a website redirect named
+        // counts as a change too (probed).
+        let changes = replace || request_tags.is_some() || keys.checksum.is_some() || keys.restates;
+        if same_object && !changes && keys.keeps(encryption) {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
@@ -258,8 +265,14 @@ pub async fn copy_object(
                 ),
             ));
         }
+        // Under COPY, a website redirect the request names is the copy's
+        // still (probed: it isn't metadata the directive copies).
+        let copied;
         let (content_type, metadata) = if replace {
             (request_content_type, request_metadata)
+        } else if let Some(redirect) = crate::s3::metadata::redirect_location(request_metadata) {
+            copied = crate::s3::metadata::with_redirect(&version.metadata, redirect);
+            (version.content_type.as_str(), copied.as_str())
         } else {
             (version.content_type.as_str(), version.metadata.as_str())
         };
@@ -271,7 +284,7 @@ pub async fn copy_object(
             let resp = with_version_id(
                 xml_ok(format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                     <CopyObjectResult>\
+                     <CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
                      <LastModified>{last_modified}</LastModified>\
                      <ETag>\"{etag}\"</ETag>{checksum}\
                      </CopyObjectResult>"
@@ -689,16 +702,12 @@ pub async fn copy_part(
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
-        Err(_) => return Ok(no_such_upload()),
+        Err(_) => return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string())),
     };
     let part_number: i32 = match part_number.parse() {
         Ok(n) if (1..=10_000).contains(&n) => n,
         _ => {
-            return Ok(format_s3_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                "partNumber must be an integer in 1..=10000",
-            ));
+            return Ok(crate::s3::util::invalid_part_number(part_number));
         }
     };
     let (src_bucket, src_key, src_version) = match parse_copy_source(copy_source) {
@@ -718,7 +727,7 @@ pub async fn copy_part(
     // Reject up front if the upload is gone, and require it to belong to the
     // request's bucket/key, and its key if it's SSE-C — as put_part does.
     let Some(upload) = upload(app, &upload_id, bucket, key).await? else {
-        return Ok(no_such_upload());
+        return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
     };
     let upload_encryption = upload.encryption.clone();
     // The new part's checksum is of its upload's algorithm (see `Upload`).
@@ -781,7 +790,7 @@ pub async fn copy_part(
             };
             let resp = xml_ok(format!(
                 "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-                 <CopyPartResult>\
+                 <CopyPartResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
                  <LastModified>{}</LastModified>\
                  <ETag>\"{etag}\"</ETag>{checksum}\
                  </CopyPartResult>",
@@ -800,7 +809,7 @@ pub async fn copy_part(
             return Ok(
                 match stream_part_copy(app, &source, start, end, upload_id, part_number, keys, upload.part_checksum()).await {
                     Ok(Some((etag, checksum))) => respond(&etag, checksum.as_ref()),
-                    Ok(None) => no_such_upload(),
+                    Ok(None) => crate::s3::multipart::no_such_upload(&upload_id.to_string()),
                     // Its data went with it: copy what it is now.
                     Err(_) if source.changed(app).await? => continue,
                     Err(e) => return Err(e),
@@ -849,7 +858,7 @@ pub async fn copy_part(
         };
         match commit_part_copy(app, &source, &new_part, upload_id, part_number).await? {
             PartCopy::Committed => return Ok(respond(&etag, checksum.as_ref())),
-            PartCopy::NoSuchUpload => return Ok(no_such_upload()),
+            PartCopy::NoSuchUpload => return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string())),
             PartCopy::SourceChanged => continue,
         }
     }
@@ -1204,13 +1213,6 @@ fn no_such_bucket() -> Response<Full<Bytes>> {
     )
 }
 
-fn no_such_upload() -> Response<Full<Bytes>> {
-    format_s3_error(
-        StatusCode::NOT_FOUND,
-        "NoSuchUpload",
-        "the specified multipart upload does not exist",
-    )
-}
 
 /// The S3 error for a copy source with nothing to copy. Unlike a GET, naming a
 /// delete marker by version ID is a 400: a copy source may not refer to one.

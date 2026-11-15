@@ -256,13 +256,7 @@ pub async fn get_object(
         (Some(part), _) => (part.start, part.end, part.end > part.start),
         (None, Ok(Some((start, end)))) => (start, end, true),
         (None, Ok(None)) => (0, size, false),
-        (None, Err(())) => {
-            return Ok(box_response(format_s3_error(
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                "InvalidRange",
-                "the requested range is not satisfiable",
-            )));
-        }
+        (None, Err(())) => return Ok(box_response(invalid_range(range_header.unwrap_or(""), size))),
     };
     // Resolve the ordered parts and each part's candidate locations (freshest
     // first) from this same snapshot.
@@ -652,42 +646,55 @@ async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSli
     }))
 }
 
+/// S3's 416 for a range past an object's end (probed), which, as S3's, has no
+/// `Content-Range`.
+fn invalid_range(range: &str, size: u64) -> Response<Full<Bytes>> {
+    let mut rejection =
+        crate::auth::Rejection::new(StatusCode::RANGE_NOT_SATISFIABLE, "InvalidRange", "The requested range is not satisfiable");
+    rejection.details.push(("RangeRequested", range.to_owned()));
+    rejection.details.push(("ActualObjectSize", size.to_string()));
+    crate::s3::util::rejection_response(&rejection)
+}
+
 /// Parses a single-range `Range: bytes=…` header against the object `size` into a
 /// half-open [start, end). `Ok(None)` = no usable range (serve the whole object,
 /// 200); `Err(())` = a syntactically valid but unsatisfiable range (416).
-/// Malformed and multi-range headers are ignored (treated as `None`).
+/// What S3 ignores is ignored (probed): malformed and multi-range headers, a
+/// space after `=`, a last byte before the first, and a suffix range of an
+/// empty object.
 pub(crate) fn parse_range(header: Option<&str>, size: u64) -> Result<Option<(u64, u64)>, ()> {
     let Some(spec) = header.and_then(|h| h.strip_prefix("bytes=")) else {
         return Ok(None);
     };
-    let spec = spec.trim();
-    if spec.contains(',') {
-        return Ok(None); // multi-range unsupported — serve the whole object
-    }
+    let spec = spec.trim_end();
     let Some((start_s, end_s)) = spec.split_once('-') else {
-        return Ok(None); // malformed
+        return Ok(None); // malformed, or several ranges
     };
-    let (start, end) = if start_s.trim().is_empty() {
+    let number = |s: &str| (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then(|| s.parse::<u64>().ok()).flatten();
+    let (start, end) = if start_s.is_empty() {
         // bytes=-N: the last N bytes.
-        let Ok(suffix) = end_s.trim().parse::<u64>() else {
+        let Some(suffix) = number(end_s) else {
             return Ok(None);
         };
         if suffix == 0 {
             return Err(());
         }
+        if size == 0 {
+            return Ok(None);
+        }
         (size.saturating_sub(suffix), size)
     } else {
-        let Ok(start) = start_s.trim().parse::<u64>() else {
+        let Some(start) = number(start_s) else {
             return Ok(None);
         };
-        let end = if end_s.trim().is_empty() {
+        let end = if end_s.is_empty() {
             size // bytes=start-
         } else {
-            let Ok(last) = end_s.trim().parse::<u64>() else {
+            let Some(last) = number(end_s) else {
                 return Ok(None);
             };
             if last < start {
-                return Err(());
+                return Ok(None);
             }
             last.saturating_add(1) // inclusive end → half-open
         };
@@ -771,13 +778,7 @@ pub async fn head_object(
         (Some(part), _) => (part.start, part.end, part.end > part.start),
         (None, Ok(Some((start, end)))) => (start, end, true),
         (None, Ok(None)) => (0, size, false),
-        (None, Err(())) => {
-            return Ok(format_s3_error(
-                StatusCode::RANGE_NOT_SATISFIABLE,
-                "InvalidRange",
-                "the requested range is not satisfiable",
-            ));
-        }
+        (None, Err(())) => return Ok(invalid_range(range_header.unwrap_or(""), size)),
     };
     let builder = Response::builder()
         .header(header::ACCEPT_RANGES, "bytes")

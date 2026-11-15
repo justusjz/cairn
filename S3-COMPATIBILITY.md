@@ -133,7 +133,7 @@ With `--domain` set, any host that is not the domain, a subdomain of it, an IP l
 - Cairn has no regions. **Any region in a SigV4 credential scope is accepted.** The signing key is derived from whatever region the client used, and that region becomes `aws:RequestedRegion`.
 - `GetBucketLocation` always answers an empty `LocationConstraint`, which means `us-east-1`.
 - A `CreateBucketConfiguration` body is never read.
-- No response carries `x-amz-bucket-region` or `BucketRegion`.
+- HeadBucket and ListObjects (v1 and v2) send `x-amz-bucket-region: us-east-1`, as S3 sends a bucket's region with them (probed). ListBuckets has no `BucketRegion`.
 
 ### Trusted proxies
 
@@ -169,19 +169,21 @@ Checks run in this order:
    - unknown or inactive access key, or a temporary key without a token: `403 InvalidAccessKeyId`;
    - malformed token, or a token sent with a long-term key: `400 InvalidToken`;
    - expired session: `400 ExpiredToken`.
-2. **Two auth mechanisms:** both an `Authorization` header and `X-Amz-Algorithm` in the query is `400 InvalidArgument` "Only one auth mechanism allowed".
-3. **Request time:** `x-amz-date` is **required**. The `Date` header is never accepted in its place. If it is missing, malformed, or on a different day than the credential scope: `403 AccessDenied`.
-4. **Payload hash:** `x-amz-content-sha256` is **required**. If missing: `400 InvalidRequest`. Accepted values are in [§10](#10-checksums-and-payload-integrity). Any other value: `400 InvalidArgument`.
-5. **Signed headers:** `host` and every `x-amz-*` header must be signed. Otherwise `403 AccessDenied` "There were headers present in the request which were not signed", with a `<HeadersNotSigned>` element. Other headers (`Content-Type`, `Content-MD5`, …) may stay unsigned.
-6. **Clock skew:** more than ±15 minutes from the server's clock is `403 RequestTimeTooSkewed`. There are no `RequestTime`/`ServerTime` detail elements.
-7. **Signature:** a wrong one is `403 SignatureDoesNotMatch`, with no `StringToSign`/`CanonicalRequest` detail elements.
+2. **Malformed header:** a `AWS4-HMAC-SHA256` header without `Credential`, `SignedHeaders` and `Signature`, a credential that isn't five parts, or one whose last part isn't `aws4_request`: `400 AuthorizationHeaderMalformed`, with S3's messages (probed). One signed for a service that isn't `s3` (`iam` and `sts` go to IAM and STS): `400 AuthorizationHeaderMalformed` "…incorrect service "sqs". This endpoint belongs to "s3".".
+3. **Two auth mechanisms:** both an `Authorization` header and `X-Amz-Algorithm` in the query is `400 InvalidArgument` "Only one auth mechanism allowed".
+4. **Request time:** `x-amz-date`, or else `Date`, as S3 takes it (probed). A `Date` may be RFC 1123 or shaped like an `x-amz-date`; the string to sign has the value as sent. Neither, or one that isn't a time: `403 AccessDenied` "AWS authentication requires a valid Date or x-amz-date header". On a different day than the credential scope: `400 AuthorizationHeaderMalformed` "…Invalid credential date. Date is not the same as X-Amz-Date.".
+5. **Payload hash:** `x-amz-content-sha256` is **required**. If missing: `400 InvalidRequest`. Accepted values are in [§10](#10-checksums-and-payload-integrity). Any other value: `400 InvalidArgument`.
+6. **Signed headers:** `host` and every `x-amz-*` header must be signed. Otherwise `403 AccessDenied` "There were headers present in the request which were not signed", with a `<HeadersNotSigned>` element. Other headers (`Content-Type`, `Content-MD5`, …) may stay unsigned.
+7. **Clock skew:** more than ±15 minutes from the server's clock is `403 RequestTimeTooSkewed`. There are no `RequestTime`/`ServerTime` detail elements.
+8. **Signature:** a wrong one is `403 SignatureDoesNotMatch`, with no `StringToSign`/`CanonicalRequest` detail elements.
 
 Canonicalization details:
 
 - **Path:** the canonical URI is the path exactly as received, not normalized or re-encoded (S3's rule).
 - **Query:** the canonical query string uses the parameters **as encoded on the wire**, sorted, without re-encoding them. A client whose wire encoding differs from SigV4's canonical encoding fails to verify.
-- **Service:** the credential scope's service is not validated for S3. `iam` and `sts` route to IAM/STS; anything else is treated as S3.
-- **Errors never returned:** `AuthorizationHeaderMalformed`, `MissingSecurityHeader` and `SignatureVersionNotSupported`.
+- **Header values:** signed as the bytes sent, ASCII or not, as S3 signs them (probed).
+- **Region:** 🟡 any region is accepted ([Regions](#regions)). S3 answers another region's with `400 AuthorizationHeaderMalformed`.
+- **Errors never returned:** `MissingSecurityHeader` and `SignatureVersionNotSupported`.
 
 ### Presigned URLs
 
@@ -216,7 +218,7 @@ Canonicalization details:
 
 S3 picks an operation by a query parameter (a *subresource*: `?tagging`, `?acl`, …).
 
-- Cairn knows 37 of them: `accelerate`, `acl`, `analytics`, `attributes`, `cors`, `delete`, `encryption`, `intelligent-tiering`, `inventory`, `legal-hold`, `lifecycle`, `location`, `logging`, `metadataConfiguration`, `metadataTable`, `metrics`, `notification`, `object-lock`, `ownershipControls`, `partNumber`, `policy`, `policyStatus`, `publicAccessBlock`, `renameObject`, `replication`, `requestPayment`, `restore`, `retention`, `select`, `session`, `tagging`, `torrent`, `uploadId`, `uploads`, `versioning`, `versions`, `website`.
+- Cairn knows 38 of them: `abac`, `accelerate`, `acl`, `analytics`, `attributes`, `cors`, `delete`, `encryption`, `intelligent-tiering`, `inventory`, `legal-hold`, `lifecycle`, `location`, `logging`, `metadataConfiguration`, `metadataTable`, `metrics`, `notification`, `object-lock`, `ownershipControls`, `partNumber`, `policy`, `policyStatus`, `publicAccessBlock`, `renameObject`, `replication`, `requestPayment`, `restore`, `retention`, `select`, `session`, `tagging`, `torrent`, `uploadId`, `uploads`, `versioning`, `versions`, `website`.
 - A request naming one that isn't implemented **for its method** gets `501 NotImplemented` "the X subresource is not implemented for M requests". It is never served as the plain operation, which could overwrite or delete data.
 - This check runs after authentication and before authorization, so anonymous requests get the 501 too. Names are percent-decoded first.
 - Other query parameters (such as the SDKs' `x-id`) are ignored.
@@ -231,7 +233,8 @@ S3 picks an operation by a query parameter (a *subresource*: `?tagging`, `?acl`,
 ### Missing buckets and keys (403 vs 404)
 
 - **Missing bucket:** if the caller is denied and the bucket doesn't exist, the answer is `404 NoSuchBucket`; bucket names aren't secret. The exception is CreateBucket.
-- **Missing key or version on GetObject, HeadObject or GetObjectAttributes:** `403 AccessDenied` to a caller not allowed `s3:ListBucket` on the bucket, so keys can't be discovered by guessing (probed). Callers allowed `s3:ListBucket` get `404`. Tagging, ACL and DeleteObject do not hide missing keys.
+- **Missing key or version on GetObject, HeadObject or GetObjectAttributes:** `403 AccessDenied` to a caller not allowed `s3:ListBucket` on the bucket, so keys can't be discovered by guessing (probed). Callers allowed `s3:ListBucket` get `404`. Tagging, GetObjectAcl (a missing key's `404 NoSuchKey`, probed) and DeleteObject do not hide missing keys.
+- **Expected owner:** `x-amz-expected-bucket-owner` (and a copy's `x-amz-source-expected-bucket-owner`) is checked against the account, which owns every bucket (probed): not 12 digits is `400 InvalidBucketOwnerAWSAccountID`, another account `403 AccessDenied`.
 - **Cross-account:** a request from another account that the bucket policy allows on an operation reserved to the bucket's own account (its policy) is `405 MethodNotAllowed`, as in S3.
 
 ### Request bodies handled whole
@@ -254,7 +257,7 @@ XML and JSON bodies (configurations, DeleteObjects, CompleteMultipartUpload, …
 | --- | --- | --- |
 | CreateBucket | 🟡 | [§6](#createbucket) |
 | DeleteBucket | ✅ | [§6](#deletebucket) |
-| HeadBucket | 🟡 | No `x-amz-bucket-region`. |
+| HeadBucket | ✅ | [§6](#headbucket) |
 | GetBucketLocation | 🔹 | Always empty, which means `us-east-1`. |
 | Get/PutBucketVersioning | 🟡 | No MFA delete. [§12](#12-versioning) |
 | Get/Put/DeleteBucketEncryption | 🟡 | [§17](#bucket-default-encryption) |
@@ -268,9 +271,10 @@ XML and JSON bodies (configurations, DeleteObjects, CompleteMultipartUpload, …
 | Get/Put/DeletePublicAccessBlock (account, S3 Control) | ✅ | |
 | Get/PutObjectLockConfiguration | ✅ | [§13](#13-object-lock) |
 | GetBucketAcl | 🔹 | Fixed answer. |
-| PutBucketAcl | 🔹 | Only `private`. |
+| PutBucketAcl | 🔹 | Always `AccessControlListNotSupported`, as in S3. |
 | GetBucketOwnershipControls | 🔹 | Always `BucketOwnerEnforced`. |
-| Put/DeleteBucketOwnershipControls | ❌ | 501 |
+| PutBucketOwnershipControls | 🔹 | Only `BucketOwnerEnforced` (others: 501). |
+| DeleteBucketOwnershipControls | ❌ | 501 |
 | GetBucketAccelerateConfiguration | 🔹 | Empty. PUT is 501. |
 | GetBucketRequestPayment | 🔹 | `BucketOwner`. PUT is 501. |
 | GetBucketLogging | 🔹 | Empty. PUT is 501. |
@@ -279,7 +283,7 @@ XML and JSON bodies (configurations, DeleteObjects, CompleteMultipartUpload, …
 | Analytics, inventory, metrics, Intelligent-Tiering configurations | ❌ | 501 for every method. |
 | Metadata table and metadata configurations | ❌ | 501 |
 | CreateSession (S3 Express) | ❌ | 501 |
-| ABAC (Get/PutBucketAbac) | ❌ | `?abac` isn't a recognized subresource, so it is handled as the plain request: GET lists the bucket, PUT is CreateBucket. |
+| GetBucketAbac | 🔹 | Always `Disabled` (probed). PutBucketAbac is 501. |
 
 ### Listings
 
@@ -298,14 +302,14 @@ XML and JSON bodies (configurations, DeleteObjects, CompleteMultipartUpload, …
 | PutObject | 🟡 | [§8](#putobject) |
 | GetObject | 🟡 | [§8](#getobject-and-headobject) |
 | HeadObject | 🟡 | |
-| DeleteObject | 🟡 | No conditional deletes. |
+| DeleteObject | ✅ | `If-Match` only, as in S3. |
 | DeleteObjects | ✅ | |
 | CopyObject | 🟡 | |
-| GetObjectAttributes | 🟡 | Ignores conditional headers. |
+| GetObjectAttributes | ✅ | |
 | POST Object (browser form) | 🟡 | |
 | Get/Put/DeleteObjectTagging | ✅ | |
 | GetObjectAcl | 🔹 | Fixed answer. |
-| PutObjectAcl | 🔹 | Only `bucket-owner-full-control`. |
+| PutObjectAcl | 🔹 | Always `AccessControlListNotSupported`, as in S3. |
 | Get/PutObjectRetention | ✅ | |
 | Get/PutObjectLegalHold | ✅ | |
 | RestoreObject | ❌ | 501 |
@@ -350,8 +354,8 @@ XML and JSON bodies (configurations, DeleteObjects, CompleteMultipartUpload, …
   - `prefix`.
   - `bucket-region` and `encoding-type` are ignored.
 - **Response:**
-  - `<ListAllMyBucketsResult>`, **without an XML namespace**, unlike every other listing.
-  - `Owner` (the fixed `cairn`), then `Buckets/Bucket/{Name, CreationDate}` sorted by name.
+  - `<ListAllMyBucketsResult>`.
+  - `Owner` (see [Owners](#common-behavior)), then `Buckets/Bucket/{Name, CreationDate}` sorted by name.
   - `ContinuationToken` when more buckets remain, and `Prefix` when one was given.
   - No `BucketRegion`.
 - Methods other than GET on `/` are `405`.
@@ -399,7 +403,7 @@ XML and JSON bodies (configurations, DeleteObjects, CompleteMultipartUpload, …
 `HEAD /bucket`
 
 - `200` or `404`. It needs `s3:ListBucket`.
-- It sends no `x-amz-bucket-region` and no `x-amz-access-point-alias`.
+- It sends `x-amz-bucket-region: us-east-1` and `x-amz-access-point-alias: false` (probed headers).
 
 ---
 
@@ -414,11 +418,12 @@ XML and JSON bodies (configurations, DeleteObjects, CompleteMultipartUpload, …
 - **`delimiter`:** any string, **multi-character delimiters included**. An empty delimiter means none.
 - **`encoding-type`:**
   - Only `url` (case-insensitive). Anything else is `400 InvalidArgument`.
-  - It encodes keys, prefixes, delimiters and markers, leaving unreserved characters and `/`.
+  - It encodes keys, prefixes (the echoed one too), delimiters and markers as S3 does (probed): letters, digits, `-`, `_`, `.`, `*` and `/` stay, a space becomes `+`, and everything else (`~` too) is `%XX`.
   - ListParts and ListBuckets don't take it.
 - **Markers follow MinIO's rule:** an entry is listed only if it sorts after the marker. A marker that names a common prefix therefore resumes **after all of that prefix's keys**.
 - **Fixed fields:**
-  - `Owner` and `Initiator` are always `<ID>cairn</ID><DisplayName>cairn</DisplayName>`.
+  - **Owners:** `Owner` is the account's canonical ID: 64 hex digits, a hash of the account ID. There is no `DisplayName`, as S3 no longer sends one.
+  - 🟡 `Initiator` is the same. S3's is the initiating principal's ARN, with its name as `DisplayName`.
   - `StorageClass` is always `STANDARD`.
   - `RestoreStatus` is never returned; `x-amz-optional-object-attributes` is ignored.
 
@@ -427,11 +432,11 @@ XML and JSON bodies (configurations, DeleteObjects, CompleteMultipartUpload, …
 - **Dialect:** a request is v2 only when `list-type=2`. **Any other `list-type` value gives a v1 listing.**
 - **v1:**
   - `marker`.
-  - `NextMarker` is returned **whenever the listing is truncated**, with or without a delimiter. S3 returns it only with one.
-  - The echoed `Prefix` is not URL-encoded, even with `encoding-type=url`.
+  - `NextMarker` is returned only when the listing is truncated and has a delimiter, as in S3 (probed). Without one, the next marker is the page's last key.
+  - Any `list-type` other than `2` gives v1, as in S3 (probed).
 - **v2:**
   - `continuation-token` takes precedence over `start-after`. `start-after` is still echoed.
-  - The token is base64url of the last returned key or prefix. It is **not opaque**, and an invalid one is `400 InvalidArgument`.
+  - 🟡 The token is base64url of the last returned key or prefix, so it is **not opaque**. An invalid one is `400 InvalidArgument` "The continuation token provided is incorrect", as in S3 (probed).
   - `fetch-owner` adds `Owner` only for the exact value `true`.
   - `KeyCount` counts keys plus common prefixes.
 - **Contents:**
@@ -462,22 +467,22 @@ XML and JSON bodies (configurations, DeleteObjects, CompleteMultipartUpload, …
 - **Parameters:** `prefix`, `delimiter`, `key-marker`, `upload-id-marker`, `max-uploads`, `encoding-type`.
 - **`upload-id-marker`:** ignored without `key-marker`. Otherwise it must be an upload ID (a UUID); if not, `400 InvalidArgument`.
 - **Order:** by key, then by upload creation time.
+- **Markers:** `NextKeyMarker` and `NextUploadIdMarker` are always present (the last entry's; empty if none), as in S3 (probed).
 - **Upload entries:** `Key`, `UploadId`, `Initiator`, `Owner`, `StorageClass` and `Initiated`. `ChecksumAlgorithm`/`ChecksumType` appear only if the upload was created with an explicit algorithm.
 
 ### ListParts
 
 `GET /bucket/key?uploadId=…`
 
-- **`max-parts`:** 1–1000.
-- **`part-number-marker`:** a non-integer value is **silently read as 0**.
+- **`max-parts`** (at most 1000) **and `part-number-marker`:** non-negative `int`s. Otherwise `400 InvalidArgument`, with S3's messages and `ArgumentName`/`ArgumentValue` (probed).
 - **No `encoding-type`.**
 - **Response:**
-  - `ChecksumAlgorithm`/`ChecksumType` whenever the upload has an object checksum, **including the default CRC64NVME FULL_OBJECT**. ListMultipartUploads omits these for the same upload.
+  - `ChecksumAlgorithm`/`ChecksumType` only if the upload was created with an explicit algorithm, as in S3 (probed).
   - `NextPartNumberMarker` is always present.
   - Each part has `PartNumber`, `LastModified`, `ETag`, `Size` and, if available, `Checksum<ALG>`.
-- **Deviation:** with `max-parts=0`, a non-empty upload answers `IsTruncated=true` with the same marker, so a client paging that way would loop.
+- **`max-parts=0`:** an empty page with `IsTruncated=false`, as in S3 (probed).
 - **SSE-C uploads:** the key is optional. Without it, part checksums are left out.
-- **Errors:** a missing or foreign upload is `404 NoSuchUpload`.
+- **Errors:** a missing or foreign upload is `404 NoSuchUpload`, naming its `UploadId`.
 
 ---
 
@@ -495,8 +500,12 @@ These request headers are stored with the object and returned verbatim on GET/HE
 
 Validation:
 
-- **ASCII only:** values must be printable US-ASCII. **Non-ASCII values are refused** with `400 InvalidArgument`. S3 accepts some and sets `x-amz-missing-meta`.
-- **Size limit:** user metadata may total **2048 bytes**, else `400 MetadataTooLarge`. This counts each name *after* `x-amz-meta-` plus its value. The standard headers above don't count.
+- **Non-ASCII user metadata** (probed):
+  - A value's bytes are read as Latin-1, as S3 reads them (so raw UTF-8 comes back mangled, as from S3).
+  - RFC 2047 encoded words in it (`=?UTF-8?B?…?=`, `=?ISO-8859-1?Q?…?=`; B or Q; UTF-8, US-ASCII or Latin-1) are decoded, and the space between two of them dropped. 🟡 A word that doesn't decode is kept as sent (S3 answers `500`).
+  - A value that isn't ASCII is returned as one Q-encoded word, `=?UTF-8?Q?x_caf=C3=A9_y?=`, as S3 returns it.
+  - Other stored headers must be printable US-ASCII, else `400 InvalidArgument`.
+- **Size limit:** user metadata may total **2048 bytes**, else `400 MetadataTooLarge`. This counts each name *after* `x-amz-meta-` plus its value as sent (in UTF-8, read as Latin-1), as S3 counts it (probed). The standard headers above don't count.
 
 ### PutObject
 
@@ -504,25 +513,27 @@ Validation:
 
 | Request header | Status |
 | --- | --- |
-| `Content-Length` | ✅ At most 5 GiB, else `400 EntityTooLarge` before the body is read. 🟡 A body without one (chunked transfer encoding) is accepted, and refused as soon as it passes 5 GiB. S3 answers `411`. |
+| `Content-Length` | ✅ At most 5 GiB, else `400 EntityTooLarge` before the body is read. |
+| `Transfer-Encoding` | ❌ Any request with one (a chunked body without a length) is `501 NotImplemented`, `<Header>Transfer-Encoding</Header>`, as in S3 (probed). Streaming uploads are aws-chunked. |
 | `Content-Type`, `Cache-Control`, `Content-Disposition`, `Content-Encoding`, `Content-Language`, `Expires`, `x-amz-meta-*`, `x-amz-website-redirect-location` | ✅ Stored (see above). |
 | `Content-MD5` | ✅ Verified. Malformed: `400 InvalidDigest`. Mismatch: `400 BadDigest`. Becomes the ETag. |
 | `x-amz-content-sha256`, `x-amz-decoded-content-length`, `x-amz-trailer` | ✅ [§10](#10-checksums-and-payload-integrity) |
 | `x-amz-checksum-{crc32,crc32c,crc64nvme,sha1,sha256}` | ✅ Verified and stored as the object's full-object checksum. |
 | `x-amz-sdk-checksum-algorithm` | ✅ Must match the checksum header or trailer sent. |
-| `x-amz-checksum-type` | 🟡 `FULL_OBJECT` only with no checksum or a CRC checksum. `COMPOSITE` is accepted and ignored. Anything else: `400 InvalidArgument` (MinIO's rule; S3 documents none). |
+| `x-amz-checksum-type` | ⚪ Ignored, whatever it is, as S3 ignores it (probed). |
 | `x-amz-checksum-algorithm` | ⚪ Not read on PutObject. |
 | `x-amz-tagging` | ✅ [§11](#11-tags). Also needs `s3:PutObjectTagging`. |
-| `If-None-Match` | ✅ Only `*` (create only if absent). An existing object: `412 PreconditionFailed`. Any other value: `501 NotImplemented` (probed). |
+| `If-None-Match` | ✅ Only `*` (create only if absent). An existing object: `412 PreconditionFailed`. Any other value: `501 NotImplemented`, `<Header>If-None-Match</Header>` (probed). |
 | `If-Match` | ✅ Compare-and-swap against the current ETag. Lists, `W/` and `*` are accepted. No current object: `404 NoSuchKey`. Mismatch: `412`. |
 | `If-Modified-Since`, `If-Unmodified-Since` | ⚪ Ignored on writes. |
-| `x-amz-acl` | 🔹 Only `bucket-owner-full-control`. **`private` is refused.** Others: `400 AccessControlListNotSupported`. |
+| `x-amz-acl` | 🔹 `private`, `bucket-owner-read` and `bucket-owner-full-control`, which give no one else anything. Other canned ACLs: `400 AccessControlListNotSupported`. One S3 doesn't have (case-sensitive): `400 InvalidArgument` (probed). |
 | `x-amz-grant-*` | ❌ `400 AccessControlListNotSupported`. |
 | `x-amz-storage-class` | ⚪ **Any value is accepted and ignored**. Every object is STANDARD. Policies can test it (`s3:x-amz-storage-class`). |
 | `x-amz-server-side-encryption*`, `x-amz-server-side-encryption-customer-*` | ✅ [§17](#17-server-side-encryption) |
 | `x-amz-object-lock-mode`, `-retain-until-date`, `-legal-hold` | ✅ [§13](#13-object-lock) |
 | `x-amz-write-offset-bytes` | ⚪ Ignored: the object is overwritten whole. |
-| `x-amz-expected-bucket-owner`, `x-amz-request-payer` | ⚪ |
+| `x-amz-expected-bucket-owner` | ✅ [§4](#missing-buckets-and-keys-403-vs-404) |
+| `x-amz-request-payer` | ⚪ |
 
 Conditional writes are checked before the body streams, and again atomically when the write commits. A write that lands in between makes Cairn re-decide, answering 412 or succeeding. **S3's `409 ConditionalRequestConflict` is never returned.**
 
@@ -546,12 +557,13 @@ Response:
 | `versionId` | ✅ `null` or a 32-character ID, else `400 InvalidArgument`. Unknown: `404 NoSuchVersion`. |
 | `partNumber` | ✅ 1–10000, else `400 InvalidArgument` (probed format). With `Range`: `400 InvalidRequest`. See below. |
 | `response-content-type`, `-content-language`, `-expires`, `-cache-control`, `-content-disposition`, `-content-encoding` | ✅ Replace those headers on 2xx answers (GET and HEAD). Anonymous requests with any of them: `400 InvalidRequest` (probed). |
-| `Range` | 🟡 One range: `bytes=a-b`, `bytes=a-` or `bytes=-n`. **Multiple ranges, or a malformed header, are ignored: the whole object, 200.** `bytes=b-a` with b < a is `416` (RFC 9110 says ignore). A start beyond the end, or any range of an empty object: `416 InvalidRange`, without `Content-Range: bytes */size`. An end past the object is clamped. |
+| `Range` | ✅ One range: `bytes=a-b`, `bytes=a-` or `bytes=-n`. As in S3 (probed), these are ignored, giving the whole object (200): multiple ranges, a malformed header, a space after `=`, `bytes=b-a` with b < a, and `bytes=-n` of an empty object. A start beyond the end, `bytes=-0`, or `bytes=a-` of an empty object: `416 InvalidRange` with `RangeRequested` and `ActualObjectSize`, and no `Content-Range` (as S3). An end past the object is clamped. |
 | `If-Match`, `If-None-Match`, `If-Modified-Since`, `If-Unmodified-Since` | ✅ RFC 9110 precedence, as S3 documents: a true `If-Match` overrides a false `If-Unmodified-Since`, and `If-None-Match` overrides `If-Modified-Since`. Failures are `412` or `304`. Dates must be RFC 1123, others are ignored, and comparison is to the second. ETag lists, `W/` and `*` are accepted. |
 | `x-amz-checksum-mode` | ✅ Exactly `ENABLED` returns the checksum headers. |
 | `x-amz-server-side-encryption-customer-*` | ✅ Required for SSE-C objects. |
-| `x-amz-server-side-encryption`, `-aws-kms-key-id`, `-context` | ❌ `400 BadRequest` (MinIO's answer). |
-| `x-amz-expected-bucket-owner`, `x-amz-request-payer` | ⚪ |
+| `x-amz-server-side-encryption`, `-aws-kms-key-id`, `-context` | ❌ `400 InvalidArgument` "… header is not supported for this operation.", with `ArgumentName`/`ArgumentValue` (probed). |
+| `x-amz-expected-bucket-owner` | ✅ |
+| `x-amz-request-payer` | ⚪ |
 
 Part reads (`?partNumber=N`), as probed:
 
@@ -604,10 +616,11 @@ HeadObject differences:
 - **Idempotent:** a missing key or version is still `204`. A missing bucket is `404`.
 - **Object Lock:** a locked version is `403 AccessDenied` "Access Denied because object protected by object lock.". [Governance bypass](#13-object-lock) applies.
 - **Response:** `204`, with `x-amz-version-id` (once the bucket has been versioned) and `x-amz-delete-marker: true` when a marker was made or removed.
-- **Ignored ⚪:**
-  - `If-Match`, `x-amz-if-match-last-modified-time` and `x-amz-if-match-size` (S3's conditional deletes);
-  - `x-amz-mfa`, `x-amz-expected-bucket-owner`, `x-amz-request-payer`;
-  - SSE headers.
+- **Conditional deletes** (probed):
+  - `If-Match`: the key's current version must have that ETag, quoted (weak ETags and lists never match), or exist at all (`*`). Otherwise `412 PreconditionFailed`, `<Condition>If-Match</Condition>`. No current version (or a delete marker): `404 NoSuchKey`. Checked atomically with the delete.
+  - An empty `If-Match`: `400 InvalidArgument`. With a `versionId`: `501 NotImplemented`.
+  - `If-None-Match`, `x-amz-if-match-size` and `x-amz-if-match-last-modified-time`: `501 NotImplemented`, naming the header.
+- **Ignored ⚪:** `x-amz-mfa`, `x-amz-request-payer`, SSE headers.
 
 ### DeleteObjects
 
@@ -617,14 +630,14 @@ HeadObject differences:
 - **Body:**
   - Up to **1000** `<Object>` entries, else `400 MalformedXML`. Each needs a `<Key>` and may have a `<VersionId>`.
   - `<Quiet>true</Quiet>` is supported.
-  - The per-object `<ETag>`, `<LastModifiedTime>` and `<Size>` (conditional deletes) are **ignored**.
+  - A per-object `<ETag>` is a condition, as DeleteObject's `If-Match`: reported as an `Error` `PreconditionFailed`, or `NoSuchKey` without a current version (probed). `<LastModifiedTime>` or `<Size>`: `400 MalformedXML` for the whole request (probed).
   - Invalid XML, no objects, or an empty key: `400 MalformedXML`.
 - **Per-key authorization** (`s3:DeleteObject` or `s3:DeleteObjectVersion`):
   - A denied key is reported as `<Error><Code>AccessDenied</Code>`, and the rest proceed.
   - A malformed version ID is reported as `NoSuchVersion`.
   - A locked version is reported as `AccessDenied`. The bypass header is checked per key.
 - **Response:** `<DeleteResult>`, with `Deleted` entries (`Key`, `VersionId`, `DeleteMarker`, `DeleteMarkerVersionId`) and `Error` entries. Errors are listed even in quiet mode. Missing keys count as deleted.
-- **Ignored:** `x-amz-mfa`, `x-amz-expected-bucket-owner`, `x-amz-request-payer`.
+- **Ignored:** `x-amz-mfa`, `x-amz-request-payer`.
 
 ### CopyObject
 
@@ -642,16 +655,17 @@ HeadObject differences:
 | `x-amz-checksum-*` values, `Content-MD5`, the body | ⚪ |
 | `x-amz-copy-source-range` | ⚪ Only UploadPartCopy uses it. |
 | `x-amz-storage-class` | ⚪ |
-| `x-amz-website-redirect-location` | ✅ Only with `REPLACE` (it is metadata). |
+| `x-amz-website-redirect-location` | ✅ The copy's, under `COPY` too (probed). |
 | `x-amz-acl` / `x-amz-grant-*` | 🔹 As on PutObject. |
 | `x-amz-object-lock-*` | ✅ The copy's own lock. A copy never inherits the source's. |
 | SSE headers, `x-amz-copy-source-server-side-encryption-customer-*` | ✅ [§17](#17-server-side-encryption) |
-| `x-amz-source-expected-bucket-owner`, `x-amz-expected-bucket-owner`, `x-amz-request-payer` | ⚪ |
+| `x-amz-source-expected-bucket-owner`, `x-amz-expected-bucket-owner` | ✅ |
+| `x-amz-request-payer` | ⚪ |
 
 Behavior:
 
 - **Source size:** a source over 5 GiB is `400 InvalidRequest`. Larger objects must be copied with UploadPartCopy.
-- **Copying an object onto itself** (no source version) is `400 InvalidRequest` unless the metadata directive is `REPLACE`, the tagging directive is `REPLACE`, or the encryption changes. **A change of storage class or redirect location alone does not count** (S3 accepts those). Copying a named version onto its own key works; that is how a version is restored.
+- **Copying an object onto itself** (no source version) is `400 InvalidRequest` unless the metadata directive is `REPLACE`, the tagging directive is `REPLACE`, the encryption changes, or the request names a checksum algorithm, a storage class or a redirect location (probed). An encrypted object, or one copied to a bucket default's encryption, always changes encryption. S3 encrypts every bucket by default, so it allowed even an unchanged self-copy (probed). Copying a named version onto its own key works; that is how a version is restored.
 - **Shared data:** where encryption allows, the copy shares the source's data instead of copying it.
 - **ETag:**
   - Copies of plain and SSE-S3 objects get the MD5 of the content. A multipart source becomes a single-part copy.
@@ -660,7 +674,7 @@ Behavior:
 
 Response:
 
-- `<CopyObjectResult>`, **without an XML namespace**, with `LastModified`, `ETag` and the checksum elements.
+- `<CopyObjectResult>` with `LastModified`, `ETag` and the checksum elements.
 - `x-amz-version-id`, `x-amz-copy-source-version-id` (when the source bucket is versioned) and the destination's encryption headers.
 - No `x-amz-checksum-*` headers.
 
@@ -674,7 +688,7 @@ Response:
 - **`x-amz-max-parts`** (default 1000) **and `x-amz-part-number-marker`:** integers.
 - **`?partNumber`** as well: `400 InvalidArgument` "Conflicting query string parameters".
 - **Permissions:** `s3:GetObjectAttributes` *and* `s3:GetObject`; with `versionId`, their Version variants.
-- **Conditional headers are ignored** ⚪. S3 documents them for this operation.
+- **Conditional headers are ignored** ⚪, as S3 ignores them, although it documents them (probed).
 - **Response:**
   - `ETag`, unquoted.
   - `Checksum`, with the type. A composite value loses its `-N`.
@@ -718,7 +732,7 @@ Recognized fields:
 - `key` (required), `content-type`, `cache-control`, `content-disposition`, `content-encoding`, `content-language`, `expires`, `x-amz-meta-*`.
 - `content-md5` and `x-amz-checksum-*`. `x-amz-checksum-algorithm` maps to `x-amz-sdk-checksum-algorithm`. `x-amz-checksum-type`.
 - The SSE and SSE-C fields, and the Object Lock fields.
-- `acl` (only `bucket-owner-full-control`).
+- `acl` (as `x-amz-acl` on PutObject).
 - `tagging`: an XML `<Tagging>` document.
 - `x-amz-storage-class` (ignored).
 - `success_action_redirect` / `redirect` and `success_action_status`.
@@ -747,8 +761,8 @@ Response:
 
 | Limit | Value |
 | --- | --- |
-| Upload IDs | Lowercase UUIDv7 (time-ordered). A non-UUID ID, or one belonging to another bucket or key: `404 NoSuchUpload`. |
-| Part numbers | 1–10000, else `400 InvalidArgument` "partNumber must be an integer in 1..=10000". Unlike GET `?partNumber`, this error has no `ArgumentName`/`ArgumentValue`. |
+| Upload IDs | Lowercase UUIDv7 (time-ordered). A non-UUID ID, or one belonging to another bucket or key: `404 NoSuchUpload`, naming it in `UploadId`. |
+| Part numbers | 1–10000, else `400 InvalidArgument` "Part number must be an integer between 1 and 10000, inclusive", with `ArgumentName`/`ArgumentValue` (probed). |
 | Part size | At most 5 GiB (`400 EntityTooLarge`). At least 5 MiB, except the last (`400 EntityTooSmall`, checked at completion). Sizes are of the plaintext. |
 | Object size | At most 5 TiB (`400 EntityTooLarge`). |
 | Re-uploading a part number | Replaces the earlier part atomically; the last write wins. |
@@ -777,7 +791,7 @@ Response:
   - An upload without an algorithm accepts, verifies and echoes any part checksum.
 - **Refused headers:**
   - `x-amz-tagging`: `400 InvalidArgument` "The specified header is not valid in this context".
-  - `x-amz-server-side-encryption*`: `501 NotImplemented` (as MinIO). SSE-C uploads need the key on every part.
+  - `x-amz-server-side-encryption`, `-aws-kms-key-id`, `-context`: `400 InvalidArgument` (probed). SSE-C uploads need the key on every part.
 - **Response:**
   - `ETag`: the part's MD5 (or the verified `Content-MD5`); for SSE-C and SSE-KMS parts, a random value.
   - The part's checksum header (probed).
@@ -794,10 +808,10 @@ Response:
   - Without a range, the whole source is copied.
   - A range (or source) over 5 GiB: `400 InvalidArgument`.
 - **Source conditions:** `x-amz-copy-source-if-*` are checked against the source (`412`).
-- **Encryption:** SSE-C on either side is supported, with the source's key in the `x-amz-copy-source-…` headers.
+- **Encryption:** SSE-C on either side is supported, with the source's key in the `x-amz-copy-source-…` headers. SSE-S3/SSE-KMS headers: `400 InvalidArgument` (probed).
 - **Checksum:** the upload's algorithm is used, and the request's `x-amz-checksum-algorithm` is ignored. The result shows it only if the upload was created with an explicit algorithm.
 - **Response:**
-  - `<CopyPartResult>`, **without an XML namespace**, with `LastModified` (the source version's), `ETag` and an optional checksum.
+  - `<CopyPartResult>` with `LastModified` (the source version's), `ETag` and an optional checksum.
   - `x-amz-copy-source-version-id`.
 
 ### CompleteMultipartUpload
@@ -809,7 +823,7 @@ Response:
   - Every `Part` needs `PartNumber` and `ETag`; quotes are trimmed.
   - Per-part `Checksum<ALG>` elements are read.
   - Unparsable or empty: `400 MalformedXML`.
-- **Order:** parts must be in strictly ascending order, so duplicates are refused too: `400 InvalidPartOrder`. 🟡 This is checked before the upload is looked up, so a missing upload with misordered parts gets InvalidPartOrder, not NoSuchUpload.
+- **Order:** parts must be in strictly ascending order, so duplicates are refused too: `400 InvalidPartOrder`. A missing upload is `404 NoSuchUpload` first (probed).
 - **Part matching:** each listed part must exist with exactly that ETag, else `400 InvalidPart`. Parts staged but not listed are discarded.
 - **Part checksums:**
   - A COMPOSITE upload needs every part's checksum, else `400 InvalidRequest`.
@@ -820,12 +834,13 @@ Response:
   - FULL_OBJECT checksums are combined from the part CRCs without re-reading data. COMPOSITE is `base64(H(part checksums))-N`.
 - **`x-amz-mp-object-size`:** validated, and must equal the actual size, else `400 InvalidRequest` (probed messages).
 - **Size limits:** a non-last part under 5 MiB is `EntityTooSmall`. A total over 5 TiB is `EntityTooLarge`.
-- **Conditional writes:** `If-Match` and `If-None-Match` are honored (`412`; `If-Match` with no object: `404`). 🟡 Unlike PutObject, an `If-None-Match` with an ETag (not `*`) is accepted and evaluated.
+- **Conditional writes:** `If-Match` and `If-None-Match: *` are honored (`412`; `If-Match` with no object: `404`). An `If-None-Match` with an ETag is `501 NotImplemented`, as in S3 (probed).
 - **SSE-C:** the key is needed only if the upload is SSE-C *and* has an explicit checksum algorithm.
-- **Refused:** `x-amz-tagging` gets `400`. SSE headers get `501`.
+- **Refused:** `x-amz-tagging` gets `400`. SSE-S3/SSE-KMS headers get `400 InvalidArgument` (probed).
 - **ETag:** `"hex(MD5(binary part ETags))-N"`.
 - **Response:**
-  - `<CompleteMultipartUploadResult>` with `Bucket`, `Key`, `ETag` and the checksum elements (by default `ChecksumCRC64NVME` and `ChecksumType FULL_OBJECT`). **There is no `<Location>` element.**
+  - `<CompleteMultipartUploadResult>` with `Location`, `Bucket`, `Key`, `ETag` and the checksum elements (by default `ChecksumCRC64NVME` and `ChecksumType FULL_OBJECT`).
+  - `Location` is the object's URL as the client reached the bucket (`Host`, and `https` behind a trusted proxy saying so), its key encoded as S3 encodes it there: `/` as `%2F`, a space as `+` (probed).
   - `x-amz-version-id` and the encryption headers.
 - **Retries:** a retry after success returns the original result, if the version it made is still current.
 
@@ -1201,8 +1216,7 @@ Supported elements:
 ### Where encryption headers are accepted
 
 - **Object writes:** PutObject, POST Object, CopyObject (the destination) and CreateMultipartUpload.
-- **Reads:** on GET and HEAD, `x-amz-server-side-encryption`, `-aws-kms-key-id` and `-context` are `400 BadRequest`. S3 answers `400 InvalidArgument`.
-- **Other writes:** on UploadPart, UploadPartCopy, CompleteMultipartUpload and `PUT ?acl`, they are `501 NotImplemented` (as MinIO).
+- **Elsewhere:** on GET and HEAD, UploadPart, UploadPartCopy, CompleteMultipartUpload and `PUT ?acl`, `x-amz-server-side-encryption`, `-aws-kms-key-id` and `-context` are `400 InvalidArgument` "… header is not supported for this operation.", with `ArgumentName`/`ArgumentValue`, as in S3 (probed).
 - **Deletes:** on DELETE they are ignored.
 - **Echoed:** the encryption headers are echoed on PUT, GET, HEAD, CopyObject, CreateMultipartUpload, UploadPart, UploadPartCopy and CompleteMultipartUpload. GetObjectAttributes echoes none.
 
@@ -1231,14 +1245,14 @@ Cairn has no ACLs. Every bucket behaves as S3's `BucketOwnerEnforced`, and acces
 
 | Request | Answer |
 | --- | --- |
-| GetBucketAcl, GetObjectAcl | 🔹 A fixed `AccessControlPolicy`: owner and grantee `cairn`, `FULL_CONTROL`. GetObjectAcl answers even for missing keys. |
-| PutBucketAcl | 🔹 `200` only with `x-amz-acl: private`, no grant headers and no body. Otherwise `400 AccessControlListNotSupported`. |
-| PutObjectAcl | 🔹 `200` only with `x-amz-acl: bucket-owner-full-control`, no grant headers and no body. Otherwise `400 AccessControlListNotSupported`. The version must exist. |
-| `x-amz-acl` on object writes | 🔹 Only `bucket-owner-full-control`; **`private` is refused**. |
+| GetBucketAcl, GetObjectAcl | 🔹 A fixed `AccessControlPolicy`: owner and grantee the account's canonical ID, `FULL_CONTROL`. GetObjectAcl of a missing key or delete marker is `404 NoSuchKey` (probed). |
+| PutBucketAcl, PutObjectAcl | 🔹 Always `400 AccessControlListNotSupported`, even for the owner-only canned ACLs, as in S3 (probed). PutObjectAcl's version must exist. |
+| `x-amz-acl` on object writes | 🔹 `private`, `bucket-owner-read`, `bucket-owner-full-control` (probed). |
 | `x-amz-acl` on CreateBucket | 🔹 Only `private`. |
 | `x-amz-grant-*` anywhere | ❌ `400 AccessControlListNotSupported` (objects), or `400 InvalidBucketAclWithObjectOwnership` (CreateBucket). |
 | GetBucketOwnershipControls | 🔹 Always `BucketOwnerEnforced`. |
-| Put/DeleteBucketOwnershipControls | ❌ `501` |
+| PutBucketOwnershipControls | 🔹 `200` for `BucketOwnerEnforced` (no checksum needed); `ObjectWriter`, `BucketOwnerPreferred`: `501`; anything else `400 MalformedXML` (probed). |
+| DeleteBucketOwnershipControls | ❌ `501` |
 | `x-amz-object-ownership` | ⚪ |
 
 ---
@@ -1480,7 +1494,8 @@ GET and HEAD of objects also check `s3:GetObjectRetention` and `s3:GetObjectLega
 - **Responses:** XML in IAM's namespace, `text/xml`, with an `x-amzn-requestid` header. Errors use `<ErrorResponse>` with `Type`, `Code` and `Message`.
 - **Signatures:** SigV4, header or presigned, with the body's SHA-256 bound into the signature.
 - **Credential errors:** `403 InvalidClientTokenId` and `403 ExpiredToken`.
-- **Unknown or unimplemented action:** 🟡 `501 NotImplemented`. IAM answers `400 InvalidAction`.
+- **Unknown action:** `404 InvalidAction` "Could not find operation X for version 2010-05-08", before the signature is checked, as IAM answers (probed).
+- **Unimplemented action** (one IAM has): 🟡 `501 NotImplemented`.
 - **Authorization:** every action is authorized as `iam:<Action>` on its resource, by the same engine as S3.
 - **Session restrictions:** sessions from GetSessionToken or GetFederationToken can't call IAM at all (`403 InvalidClientTokenId`, probed). Role sessions can.
 
@@ -1663,18 +1678,19 @@ The status of every S3 request header, across operations. "Writes" means PutObje
 | --- | --- |
 | `Authorization` | ✅ SigV4 only ([§3](#3-authentication)). |
 | `Host` | ✅ Must be signed. Virtual-hosted and website routing use it. |
-| `Content-Length` | ✅ Up to 5 GiB per request body. 🟡 Optional (chunked transfer encoding works). |
+| `Content-Length` | ✅ Up to 5 GiB per request body. |
+| `Transfer-Encoding` | ❌ `501 NotImplemented`, as in S3. |
 | `Content-Type` | ✅ Stored on writes; default `binary/octet-stream`. |
 | `Content-MD5` | ✅ Verified everywhere a body is read. Becomes the ETag of a PUT or part. |
 | `Content-Encoding` | ✅ Stored, without `aws-chunked`. |
 | `Content-Disposition`, `Content-Language`, `Cache-Control`, `Expires` | ✅ Stored. |
 | `Range` | 🟡 Single ranges only ([§8](#getobject-and-headobject)). |
-| `If-Match` | ✅ On reads, PutObject, CopyObject and CompleteMultipartUpload. ⚪ On DeleteObject. ⚪ On GetObjectAttributes. |
-| `If-None-Match` | ✅ On reads. On PutObject and CopyObject, `*` only (else 501). Any value on CompleteMultipartUpload. ⚪ On GetObjectAttributes. |
+| `If-Match` | ✅ On reads, PutObject, CopyObject, CompleteMultipartUpload and DeleteObject. ⚪ On GetObjectAttributes, as in S3. |
+| `If-None-Match` | ✅ On reads. On PutObject, CopyObject and CompleteMultipartUpload, `*` only (else 501). ❌ On DeleteObject (501). ⚪ On GetObjectAttributes. |
 | `If-Modified-Since`, `If-Unmodified-Since` | ✅ On reads. ⚪ On writes and GetObjectAttributes. |
 | `Expect` | ✅ `100-continue` is answered by the HTTP server. |
 | `Origin`, `Access-Control-Request-Method`, `Access-Control-Request-Headers` | ✅ CORS ([§15](#15-cors)). |
-| `Date` | ⚪ Never the request time; `x-amz-date` is required. |
+| `Date` | ✅ The request time, without `x-amz-date`. |
 | `X-Forwarded-For`, `X-Forwarded-Proto`, `Forwarded` | ✅ From trusted proxies only ([§2](#trusted-proxies)). |
 | `User-Agent`, `Referer` | ✅ Policy keys only. |
 
@@ -1682,16 +1698,16 @@ The status of every S3 request header, across operations. "Writes" means PutObje
 
 | Header | Status |
 | --- | --- |
-| `x-amz-date` | ✅ Required for header auth. |
+| `x-amz-date` | ✅ The request time for header auth (else `Date`). |
 | `x-amz-content-sha256` | ✅ Required for header auth ([§10](#10-checksums-and-payload-integrity)). |
 | `x-amz-decoded-content-length` | ✅ Required with streaming. |
 | `x-amz-trailer` | ✅ Trailer modes. |
 | `x-amz-security-token` | ✅ |
-| `x-amz-meta-*` | ✅ Stored. 2 KiB. ASCII only. |
+| `x-amz-meta-*` | ✅ Stored. 2 KiB. Latin-1 and RFC 2047. |
 | `x-amz-checksum-crc32`, `-crc32c`, `-crc64nvme`, `-sha1`, `-sha256` | ✅ |
 | `x-amz-sdk-checksum-algorithm` | ✅ |
 | `x-amz-checksum-algorithm` | ✅ CreateMultipartUpload and CopyObject. ⚪ PutObject and UploadPartCopy. |
-| `x-amz-checksum-type` | 🟡 PutObject (MinIO's rule), CreateMultipartUpload and CompleteMultipartUpload. |
+| `x-amz-checksum-type` | ✅ CreateMultipartUpload and CompleteMultipartUpload. ⚪ PutObject. |
 | `x-amz-checksum-mode` | ✅ `ENABLED` on GET and HEAD. |
 | `x-amz-copy-source` | ✅ |
 | `x-amz-copy-source-range` | ✅ UploadPartCopy. ⚪ CopyObject. |
@@ -1701,9 +1717,9 @@ The status of every S3 request header, across operations. "Writes" means PutObje
 | `x-amz-tagging` | ✅ Writes. ❌ UploadPart and Complete (400). |
 | `x-amz-website-redirect-location` | ✅ Stored. ⚪ As a POST form field. |
 | `x-amz-storage-class` | ⚪ Any value. Policy key only. |
-| `x-amz-acl` | 🔹 Owner-only values only ([§18](#18-acls-and-object-ownership)). |
+| `x-amz-acl` | 🔹 Owner-only values on writes; refused on `PUT ?acl` ([§18](#18-acls-and-object-ownership)). |
 | `x-amz-grant-read`, `-write`, `-read-acp`, `-write-acp`, `-full-control` | ❌ 400 |
-| `x-amz-server-side-encryption` | ✅ `aws:kms` or `AES256` on writes. ❌ `aws:kms:dsse`. ❌ On reads (400) and other writes (501). |
+| `x-amz-server-side-encryption` | ✅ `aws:kms` or `AES256` on writes. ❌ `aws:kms:dsse`. ❌ On reads and other writes (400). |
 | `x-amz-server-side-encryption-aws-kms-key-id`, `-context` | ✅ Writes ([§17](#sse-kms)). |
 | `x-amz-server-side-encryption-bucket-key-enabled` | 🔹 Validated, then ignored. |
 | `x-amz-server-side-encryption-customer-algorithm`, `-key`, `-key-MD5` | ✅ |
@@ -1715,11 +1731,12 @@ The status of every S3 request header, across operations. "Writes" means PutObje
 | `x-amz-mp-object-size` | ✅ CompleteMultipartUpload. |
 | `x-amz-object-attributes`, `x-amz-max-parts`, `x-amz-part-number-marker` | ✅ GetObjectAttributes. |
 | `x-amz-account-id` | ✅ S3 Control. |
-| `x-amz-expected-bucket-owner`, `x-amz-source-expected-bucket-owner` | ⚪ Never checked: a mismatch is never a 403. |
+| `x-amz-expected-bucket-owner`, `x-amz-source-expected-bucket-owner` | ✅ Checked against the account (400, 403). |
 | `x-amz-request-payer` | ⚪ No requester pays. |
 | `x-amz-mfa` | ⚪ No MFA delete. |
 | `x-amz-write-offset-bytes` | ⚪ No appends: the PUT overwrites. |
-| `x-amz-if-match-last-modified-time`, `x-amz-if-match-size`, `x-amz-if-match-initiated-time` | ⚪ |
+| `x-amz-if-match-last-modified-time`, `x-amz-if-match-size` | ❌ 501 on DeleteObject, as in S3. |
+| `x-amz-if-match-initiated-time` | ⚪ |
 | `x-amz-optional-object-attributes` | ⚪ No `RestoreStatus`. |
 | `x-amz-transition-default-minimum-object-size` | ⚪ |
 | `x-amz-restore-*`, `x-amz-select-*`, `x-amz-confirm-remove-self-bucket-access`, `x-amz-sdk-*` (other than above) | ⚪ |
@@ -1745,9 +1762,11 @@ The status of every S3 request header, across operations. "Writes" means PutObje
 | `x-amz-object-lock-mode`, `-retain-until-date`, `-legal-hold` | GET and HEAD, to permitted callers. |
 | `x-amz-server-side-encryption`, `-aws-kms-key-id`, `-context`, `-customer-algorithm`, `-customer-key-MD5` | Encrypted writes and reads ([§17](#17-server-side-encryption)). |
 | `Location` | CreateBucket (`/bucket`), POST Object. |
+| `x-amz-bucket-region` | HeadBucket and ListObjects (`us-east-1`). |
+| `x-amz-access-point-alias` | HeadBucket (`false`). |
 | `Access-Control-*`, `Vary` | CORS. |
 | `x-amz-error-code`, `x-amz-error-message`, `x-amz-error-detail-*` | Website error pages. |
-| **Never sent** | `x-amz-id-2`, `x-amz-storage-class`, `x-amz-expiration`, `x-amz-restore`, `x-amz-replication-status`, `x-amz-missing-meta`, `x-amz-request-charged`, `x-amz-abort-date`, `x-amz-abort-rule-id`, `x-amz-bucket-region`, `x-amz-access-point-alias`, `x-amz-server-side-encryption-bucket-key-enabled`, `x-amz-object-size` |
+| **Never sent** | `x-amz-id-2`, `x-amz-storage-class`, `x-amz-expiration`, `x-amz-restore`, `x-amz-replication-status`, `x-amz-missing-meta`, `x-amz-request-charged`, `x-amz-abort-date`, `x-amz-abort-rule-id`, `x-amz-server-side-encryption-bucket-key-enabled`, `x-amz-object-size` |
 
 ---
 
@@ -1788,42 +1807,32 @@ The most significant differences, for quick reference. Each is described in its 
 **Transport and authentication**
 - **TLS and HTTP/2:** HTTP/1.1 only, without TLS. A TLS proxy is needed.
 - **Signatures:** SigV2 and SigV4A are unsupported. SigV2 presigned URLs are treated as anonymous.
-- **Request time:** `Date` is not accepted in place of `x-amz-date`.
-- **Scope:** the region and service in the credential scope aren't validated.
-- **Error codes:** `AuthorizationHeaderMalformed` is never returned. Signature and skew errors have no detail elements.
+- **Scope:** the region in the credential scope isn't validated.
+- **Error codes:** signature and skew errors have no detail elements.
 - **Canonicalization:** the canonical query string uses the wire encoding as-is.
 - **Host names:** only one `--domain` is possible. A custom host name is always a website, never a bucket's S3 API ([custom domains](#custom-domains)).
 
 **Buckets and listings**
 - **CreateBucket:** for the caller's own existing bucket it answers `200`, never `BucketAlreadyOwnedByYou`. `LocationConstraint` is ignored.
-- **Regions:** none. `GetBucketLocation` is empty, and no region headers or fields are sent.
-- **ListBuckets:** it has no XML namespace and no `BucketRegion`.
+- **Regions:** none. `GetBucketLocation` is empty, `x-amz-bucket-region` is `us-east-1`, and ListBuckets has no `BucketRegion`.
+- **Owners:** canonical IDs are hashes of the account ID. An upload's `Initiator` is the account, not the principal that began it.
 - **Tokens and markers:** ListObjectsV2 tokens are transparent. A marker naming a common prefix skips it (as MinIO).
-- **ListObjects v1:** `NextMarker` is sent without a delimiter, and `Prefix` isn't URL-encoded. An unknown `list-type` gives v1.
-- **ListParts:** an invalid marker is read as 0. `max-parts=0` can report truncation forever.
 
 **Objects**
 - **Storage classes:** STANDARD only. `x-amz-storage-class` is accepted and ignored. There are no transitions or restore.
 - **ETags:** SSE-C and SSE-KMS ETags are random.
-- **Ranges:** multiple or malformed ranges return the whole object. `bytes=b-a` is 416. 416s carry no `Content-Range`.
-- **Conditional writes:** there is no `409 ConditionalRequestConflict`. Date conditions on writes are ignored. There are no conditional deletes.
-- **Ignored headers:** `x-amz-expected-bucket-owner`, `x-amz-request-payer`, `x-amz-mfa` and `x-amz-write-offset-bytes` are all ignored.
-- **Metadata:** non-ASCII values are refused. The 2 KiB limit doesn't count the `x-amz-meta-` prefix.
-- **GetObjectAttributes:** ignores conditional headers.
-- **Content-Length:** a PutObject without it is accepted.
-- **CopyObject:** a self-copy changing only the storage class or redirect is refused. The copy's checksum is always FULL_OBJECT. `CopyObjectResult` and `CopyPartResult` have no XML namespace.
+- **Conditional writes:** there is no `409 ConditionalRequestConflict`.
+- **Ignored headers:** `x-amz-request-payer`, `x-amz-mfa` and `x-amz-write-offset-bytes` are all ignored.
+- **Metadata:** an RFC 2047 word that doesn't decode is kept (S3 fails with 500).
+- **CopyObject:** an unchanged self-copy of an unencrypted object in a bucket without default encryption is refused (S3 encrypts every bucket). The copy's checksum is always FULL_OBJECT.
 - **POST Object:** there is no clock-skew check. `x-amz-website-redirect-location` and a field named `x-amz-acl` are dropped. The SSE-C fields are exempt from policy conditions, and `content-length-range` bounds may be strings (as MinIO).
 
 **Multipart**
-- **CompleteMultipartUpload:**
-  - There is no `<Location>`.
-  - InvalidPartOrder is checked before NoSuchUpload.
-  - `If-None-Match` with an ETag is evaluated, not answered with 501.
 - **Checksums:** CRC64NVME COMPOSITE becomes FULL_OBJECT. Uploads get a CRC64NVME checksum by default.
-- **Refused and missing headers:** SSE headers on part and complete requests get 501. There is no `x-amz-abort-date`.
+- **Missing headers:** there is no `x-amz-abort-date`.
 
 **Features**
-- **ACLs:** only owner-only ACLs, and `private` is refused on objects. Ownership is fixed at `BucketOwnerEnforced`.
+- **ACLs:** only owner-only canned ACLs on writes. Ownership is fixed at `BucketOwnerEnforced`.
 - **Unimplemented features:** MFA delete, lifecycle transitions, replication, logging, notifications, inventory, analytics, metrics, Intelligent-Tiering, Select, torrents, S3 Express, metadata tables, access points and Object Lambda.
 - **Lifecycle:** rules run in a daily, rate-limited sweep. `x-amz-expiration` is never sent.
 - **Versioning:** writes to the null version in a suspended bucket report no version ID.
@@ -1837,7 +1846,6 @@ The most significant differences, for quick reference. Each is described in its 
   - There is no default `aws/s3` key.
   - Access is decided by OpenBao's policies, not `kms:` actions.
   - Bucket keys are ignored. DSSE-KMS is refused.
-- **Misplaced headers:** SSE headers on reads are `400 BadRequest`.
 
 **Policies**
 - **Unsupported condition keys:** 13 `s3:` keys are refused with 501, including the object-tag and bucket-tag keys and `s3:TlsVersion`.
@@ -1846,7 +1854,7 @@ The most significant differences, for quick reference. Each is described in its 
 - **Missing keys:** they are hidden as 403 only on GetObject, HeadObject and GetObjectAttributes.
 
 **IAM and STS**
-- **Unknown IAM actions:** `501`, not `400 InvalidAction`.
+- **Unimplemented IAM actions:** `501`.
 - **Missing features:** groups, MFA devices, login profiles, SAML, instance profiles and policy simulation.
 - **Identifiers:** access key IDs have no `AKIA` prefix. User names and paths allow fewer characters.
 - **Paging:** several IAM list actions ignore paging.

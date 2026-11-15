@@ -17,8 +17,20 @@ pub async fn head_bucket(app: &App, bucket: &str) -> anyhow::Result<Response<Ful
     } else {
         StatusCode::NOT_FOUND
     };
-    Ok(Response::builder()
-        .status(status)
-        .body(Full::new(Bytes::new()))
-        .unwrap())
+    let builder = Response::builder().status(status);
+    // Its region, as S3 tells it (probed): Cairn has none, which S3 clients
+    // take as us-east-1 (see GetBucketLocation's stub). And that the bucket
+    // isn't an access point's alias.
+    let builder = match exists {
+        true => builder.header(REGION_HEADER, REGION).header("x-amz-access-point-alias", "false"),
+        false => builder,
+    };
+    Ok(builder.body(Full::new(Bytes::new())).unwrap())
 }
+
+/// The header S3 tells a bucket's region in, on HeadBucket and listings.
+pub const REGION_HEADER: &str = "x-amz-bucket-region";
+
+/// The region Cairn's buckets are told to be in: none, which S3 clients take
+/// as us-east-1, as an empty LocationConstraint is.
+pub const REGION: &str = "us-east-1";

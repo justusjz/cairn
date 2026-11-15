@@ -93,7 +93,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
             );
         }
         9 | 10 => {
-            let status = delete_object(app, BUCKET, &a, None, false).await?.status();
+            let status = delete_object(app, BUCKET, &a, None, false, None).await?.status();
             anyhow::ensure!(status == StatusCode::NO_CONTENT, "delete {a}: {status}");
         }
         // A DeleteObjects of a few keys (locked one by one) or of many

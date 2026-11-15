@@ -1,14 +1,14 @@
 //! ACLs, as modern S3 takes them: disabled. New S3 buckets default to Object
 //! Ownership "bucket owner enforced" (since April 2023), under which the bucket
-//! owner owns everything in it, and access is a matter of policies (here, of
-//! roles' grants), never ACLs. Cairn answers as such a bucket does:
+//! owner owns everything in it, and access is a matter of policies, never
+//! ACLs. Cairn answers as such a bucket does (probed):
 //!
-//! - A write may ask for no ACL, or for one that grants only the bucket owner
-//!   full control: `bucket-owner-full-control` for an object, `private` for a
-//!   bucket. Anything else, a canned ACL or `x-amz-grant-*` grants, is refused,
-//!   rather than ignored.
-//! - Setting an ACL (`PUT ?acl`) is the same: a no-op if it's the owner's
-//!   only, refused otherwise.
+//! - An object write may ask for no ACL, or a canned one that gives no one
+//!   but the bucket owner anything: `private`, `bucket-owner-read`,
+//!   `bucket-owner-full-control`. Another canned ACL, or `x-amz-grant-*`
+//!   grants, is refused, rather than ignored; a canned ACL S3 doesn't have is
+//!   an `InvalidArgument`. CreateBucket takes `private` only.
+//! - Setting an ACL (`PUT ?acl`) is always refused.
 //! - Reading one shows the owner with full control (`util::stub_acl`).
 
 use http_body_util::Full;
@@ -23,32 +23,42 @@ pub enum On {
     Bucket,
 }
 
+/// S3's canned ACLs.
+const CANNED: &[&str] = &[
+    "private",
+    "public-read",
+    "public-read-write",
+    "authenticated-read",
+    "aws-exec-read",
+    "bucket-owner-read",
+    "bucket-owner-full-control",
+    "log-delivery-write",
+];
+
 impl On {
-    /// The canned ACL that grants only the bucket owner full control.
-    fn owner_only(self) -> &'static str {
+    /// The canned ACLs that give no one but the bucket owner anything.
+    fn owner_only(self) -> &'static [&'static str] {
         match self {
-            On::Object => "bucket-owner-full-control",
-            On::Bucket => "private",
+            On::Object => &["private", "bucket-owner-read", "bucket-owner-full-control"],
+            On::Bucket => &["private"],
         }
     }
-}
-
-/// Whether the request asks for an ACL other than the owner's only, which
-/// a bucket without ACLs refuses.
-fn asks_for_other_acl(headers: &HeaderMap, on: On) -> bool {
-    let grants = headers
-        .keys()
-        .any(|name| name.as_str().starts_with("x-amz-grant-"));
-    let canned = headers
-        .get("x-amz-acl")
-        .map(|v| v.to_str().unwrap_or("").trim());
-    grants || canned.is_some_and(|acl| acl != on.owner_only())
 }
 
 /// Refuses a write (PutObject, CreateMultipartUpload, CopyObject, or, `On::Bucket`,
 /// CreateBucket) that asks for an ACL other than the owner's only.
 pub fn check_write(headers: &HeaderMap, on: On) -> Result<(), Response<Full<Bytes>>> {
-    if !asks_for_other_acl(headers, on) {
+    let grants = headers.keys().any(|name| name.as_str().starts_with("x-amz-grant-"));
+    let canned = headers.get("x-amz-acl").map(|v| String::from_utf8_lossy(v.as_bytes()).trim().to_owned());
+    if on == On::Object
+        && let Some(acl) = canned.as_deref().filter(|acl| !CANNED.contains(acl))
+    {
+        let mut rejection = crate::auth::Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", "");
+        rejection.details.push(("ArgumentName", "x-amz-acl".to_owned()));
+        rejection.details.push(("ArgumentValue", acl.to_owned()));
+        return Err(crate::s3::util::rejection_response(&rejection));
+    }
+    if !grants && canned.as_deref().is_none_or(|acl| on.owner_only().contains(&acl)) {
         return Ok(());
     }
     Err(match on {
@@ -61,23 +71,9 @@ pub fn check_write(headers: &HeaderMap, on: On) -> Result<(), Response<Full<Byte
     })
 }
 
-/// PutObjectAcl / PutBucketAcl: a no-op for the owner's only ACL (in
-/// `x-amz-acl`, and nothing else), refused for anything else, which includes
-/// an ACL in the body.
-pub fn put(headers: &HeaderMap, on: On) -> Response<Full<Bytes>> {
-    let has_body = headers
-        .get(hyper::header::CONTENT_LENGTH)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim() != "0");
-    let canned = headers
-        .get("x-amz-acl")
-        .map(|v| v.to_str().unwrap_or("").trim());
-    if canned == Some(on.owner_only()) && !asks_for_other_acl(headers, on) && !has_body {
-        return Response::builder()
-            .status(StatusCode::OK)
-            .body(Full::new(Bytes::new()))
-            .unwrap();
-    }
+/// PutObjectAcl / PutBucketAcl: refused, whatever ACL they ask for, as S3
+/// refuses them with ACLs disabled (probed: the owner's only ones too).
+pub fn put(_headers: &HeaderMap, _on: On) -> Response<Full<Bytes>> {
     not_supported()
 }
 
@@ -93,6 +89,25 @@ pub async fn put_object_acl(
     Ok(
         match crate::s3::objects::get::lookup_version(&client, bucket, key, version_id).await? {
             Ok(_) => put(headers, On::Object),
+            Err(missing) => missing.read_response(),
+        },
+    )
+}
+
+/// GetObjectAcl: the owner's full control (see `util::stub_acl`), of an object
+/// version that exists; a missing one's 404, or a delete marker's, as S3's
+/// (probed).
+pub async fn get_object_acl(
+    app: &crate::App,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    let client = app.pool.get().await?;
+    let owner_id = crate::s3::util::canonical_id(&crate::users::account(&client).await?);
+    Ok(
+        match crate::s3::objects::get::lookup_version(&client, bucket, key, version_id).await? {
+            Ok(_) => crate::s3::util::stub_acl(&owner_id),
             Err(missing) => missing.read_response(),
         },
     )
@@ -139,8 +154,53 @@ pub fn ownership_controls() -> Response<Full<Bytes>> {
     )
 }
 
+/// PutBucketOwnershipControls: a no-op for BucketOwnerEnforced, which every
+/// bucket is; the others, which have ACLs, aren't implemented; anything
+/// else is S3's MalformedXML (probed).
+pub fn put_ownership_controls(body: &[u8]) -> Response<Full<Bytes>> {
+    let ownership = std::str::from_utf8(body).ok().and_then(|text| {
+        let doc = roxmltree::Document::parse(text).ok()?;
+        let root = doc.root_element();
+        if root.tag_name().name() != "OwnershipControls" {
+            return None;
+        }
+        let rules: Vec<_> = root.children().filter(|n| n.is_element()).collect();
+        let [rule] = rules[..] else { return None };
+        let values: Vec<_> = rule.children().filter(|n| n.is_element()).collect();
+        match (rule.tag_name().name(), &values[..]) {
+            ("Rule", [value]) if value.tag_name().name() == "ObjectOwnership" => value.text().map(str::to_owned),
+            _ => None,
+        }
+    });
+    match ownership.as_deref() {
+        Some("BucketOwnerEnforced") => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+        Some("ObjectWriter" | "BucketOwnerPreferred") => format_s3_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "NotImplemented",
+            "Cairn has no ACLs: every bucket's object ownership is BucketOwnerEnforced",
+        ),
+        _ => format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema",
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn takes_bucket_owner_enforced_only() {
+        let put = |rule: &str| {
+            let body = format!("<OwnershipControls xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Rule>{rule}</Rule></OwnershipControls>");
+            super::put_ownership_controls(body.as_bytes()).status().as_u16()
+        };
+        assert_eq!(put("<ObjectOwnership>BucketOwnerEnforced</ObjectOwnership>"), 200);
+        assert_eq!(put("<ObjectOwnership>ObjectWriter</ObjectOwnership>"), 501);
+        assert_eq!(put("<ObjectOwnership>Nope</ObjectOwnership>"), 400);
+        assert_eq!(put(""), 400);
+    }
+
     use super::*;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -155,17 +215,14 @@ mod tests {
     fn takes_no_acl_or_the_owners_only() {
         for on in [On::Object, On::Bucket] {
             assert!(check_write(&HeaderMap::new(), on).is_ok());
-            assert!(check_write(&headers(&[("x-amz-acl", on.owner_only())]), on).is_ok());
+            assert!(check_write(&headers(&[("x-amz-acl", "private")]), on).is_ok());
             for other in [
                 headers(&[("x-amz-acl", "public-read")]),
                 headers(&[(
                     "x-amz-grant-read",
                     "uri=\"http://acs.amazonaws.com/groups/global/AllUsers\"",
                 )]),
-                headers(&[
-                    ("x-amz-acl", on.owner_only()),
-                    ("x-amz-grant-full-control", "id=other"),
-                ]),
+                headers(&[("x-amz-acl", "private"), ("x-amz-grant-full-control", "id=other")]),
             ] {
                 assert_eq!(
                     check_write(&other, on).unwrap_err().status(),
@@ -174,31 +231,21 @@ mod tests {
                 );
             }
         }
-        // `private` is a bucket's owner-only ACL, not an object's.
-        assert!(check_write(&headers(&[("x-amz-acl", "private")]), On::Object).is_err());
-        assert!(
-            check_write(
-                &headers(&[("x-amz-acl", "bucket-owner-full-control")]),
-                On::Bucket
-            )
-            .is_err()
-        );
+        for owners in ["bucket-owner-read", "bucket-owner-full-control"] {
+            assert!(check_write(&headers(&[("x-amz-acl", owners)]), On::Object).is_ok());
+            assert!(check_write(&headers(&[("x-amz-acl", owners)]), On::Bucket).is_err());
+        }
+        // One S3 doesn't have (case-sensitive) isn't refused as an ACL.
+        for unknown in ["PRIVATE", "nonsense"] {
+            let refused = check_write(&headers(&[("x-amz-acl", unknown)]), On::Object).unwrap_err();
+            assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        }
     }
 
     #[test]
-    fn setting_the_owners_only_acl_is_a_no_op() {
-        let owner = headers(&[("x-amz-acl", "bucket-owner-full-control")]);
-        assert_eq!(put(&owner, On::Object).status(), StatusCode::OK);
-        assert_eq!(
-            put(&headers(&[("x-amz-acl", "public-read")]), On::Object).status(),
-            StatusCode::BAD_REQUEST
-        );
-        // An ACL in the body (an AccessControlPolicy) isn't looked into.
-        let body = headers(&[("content-length", "300")]);
-        assert_eq!(put(&body, On::Object).status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            put(&headers(&[("x-amz-acl", "private")]), On::Bucket).status(),
-            StatusCode::OK
-        );
+    fn setting_an_acl_is_refused() {
+        for (acl, on) in [("bucket-owner-full-control", On::Object), ("private", On::Bucket), ("public-read", On::Object)] {
+            assert_eq!(put(&headers(&[("x-amz-acl", acl)]), on).status(), StatusCode::BAD_REQUEST);
+        }
     }
 }

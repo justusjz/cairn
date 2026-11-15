@@ -81,7 +81,7 @@ impl StreamingChunkVerifier {
     /// the `Authorization` / `x-amz-date` we need (e.g. an unsigned request).
     pub fn from_headers(headers: &HeaderMap, secret: &str) -> Option<Self> {
         let auth = Authorization::from_headers(headers)?;
-        let datetime = headers.get("x-amz-date").and_then(|v| v.to_str().ok())?;
+        let (datetime, _) = request_time(headers)?;
         Some(Self {
             signing_key: derive_signing_key(secret, &auth.date, &auth.region, &auth.service),
             datetime: datetime.to_owned(),
@@ -176,8 +176,16 @@ struct Authorization {
 
 impl Authorization {
     fn from_headers(headers: &HeaderMap) -> Option<Self> {
-        let value = headers.get("authorization").and_then(|v| v.to_str().ok())?;
-        let rest = value.strip_prefix("AWS4-HMAC-SHA256 ")?;
+        let value = headers.get("authorization")?;
+        Self::parse(value.as_bytes()).ok()
+    }
+
+    /// A SigV4 `Authorization` header's fields, or why it's malformed, as S3
+    /// says it (probed), if it's SigV4's at all (`None` if not).
+    fn parse(value: &[u8]) -> Result<Self, Option<String>> {
+        let rest = value.strip_prefix(b"AWS4-HMAC-SHA256 ").ok_or(None)?;
+        let three = || Some("the authorization header requires three components: Credential, SignedHeaders, and Signature.".to_owned());
+        let rest = std::str::from_utf8(rest).map_err(|_| three())?;
         let (mut credential, mut signed, mut signature) = (None, None, None);
         for part in rest.split(',') {
             let part = part.trim();
@@ -189,20 +197,24 @@ impl Authorization {
                 signature = Some(s);
             }
         }
-        let mut cred = credential?.split('/');
-        let access_key = cred.next()?.to_owned();
-        let date = cred.next()?.to_owned();
-        let region = cred.next()?.to_owned();
-        let service = cred.next()?.to_owned();
-        let terminator = cred.next()?; // aws4_request
-        Some(Authorization {
-            access_key,
+        let (Some(credential), Some(signed), Some(signature)) = (credential, signed, signature) else {
+            return Err(three());
+        };
+        let parts: Vec<&str> = credential.split('/').collect();
+        let [access_key, date, region, service, terminator] = parts[..] else {
+            return Err(Some(format!("the Credential is mal-formed; expecting \"<YOUR-AKID>/YYYYMMDD/REGION/SERVICE/aws4_request\".")));
+        };
+        if terminator != "aws4_request" {
+            return Err(Some(format!("incorrect terminal \"{terminator}\". This endpoint uses \"aws4_request\".")));
+        }
+        Ok(Authorization {
+            access_key: access_key.to_owned(),
             scope: format!("{date}/{region}/{service}/{terminator}"),
-            date,
-            region,
-            service,
-            signed_headers: signed?.split(';').map(str::to_owned).collect(),
-            signature: signature?.to_owned(),
+            date: date.to_owned(),
+            region: region.to_owned(),
+            service: service.to_owned(),
+            signed_headers: signed.split(';').map(str::to_owned).collect(),
+            signature: signature.to_owned(),
         })
     }
 
@@ -254,6 +266,33 @@ fn presigned(query: &str) -> bool {
     query_value(query, "X-Amz-Algorithm").is_some()
 }
 
+/// S3's 400 for an `Authorization` header that's malformed, saying how.
+fn malformed(how: &str) -> Rejection {
+    Rejection::new(
+        StatusCode::BAD_REQUEST,
+        "AuthorizationHeaderMalformed",
+        format!("The authorization header is malformed; {how}"),
+    )
+}
+
+/// S3's 400 for a SigV4 `Authorization` header that doesn't parse (see
+/// `signed`), or `None` if it does, or isn't SigV4's.
+pub fn malformed_authorization(headers: &HeaderMap) -> Option<Rejection> {
+    let value = headers.get("authorization")?;
+    match Authorization::parse(value.as_bytes()) {
+        Err(Some(how)) => Some(malformed(&how)),
+        _ => None,
+    }
+}
+
+/// S3's 400 for a request header-signed for a service the endpoint isn't
+/// (probed), which S3 is unless IAM or STS took it.
+pub fn wrong_service(signed: &Signed) -> Option<Rejection> {
+    (!signed.presigned && signed.service != "s3").then(|| {
+        malformed(&format!("incorrect service \"{}\". This endpoint belongs to \"s3\".", signed.service))
+    })
+}
+
 /// What a signed request says about its signature, as policies' condition
 /// keys see it (see `s3::access`).
 #[derive(Clone, Debug)]
@@ -281,7 +320,7 @@ pub fn signed(headers: &HeaderMap, query: &str) -> Option<Signed> {
         true => Authorization::from_query(query)?,
     };
     let date = match presigned {
-        false => headers.get("x-amz-date").and_then(|v| v.to_str().ok()).map(str::to_owned),
+        false => request_time(headers).map(|(date, _)| date.to_owned()),
         true => query_value(query, "X-Amz-Date"),
     };
     let token = match presigned {
@@ -333,28 +372,25 @@ fn canonical_request(
     headers: &HeaderMap,
     auth: &Authorization,
     payload_hash: &str,
-) -> String {
+) -> Vec<u8> {
     let uri = if path.is_empty() { "/" } else { path };
-    let mut canonical_headers = String::new();
+    let mut canonical = format!("{method}\n{uri}\n{}\n", canonical_query(query)).into_bytes();
     for name in &auth.signed_headers {
         // Trim and collapse internal whitespace runs, per the SigV4 spec; a
-        // header sent more than once is its values, joined by commas.
-        let value = headers
+        // header sent more than once is its values, joined by commas. Its
+        // bytes as sent, ASCII or not, as S3 signs them (probed).
+        let values: Vec<Vec<u8>> = headers
             .get_all(name)
             .iter()
-            .map(|v| v.to_str().unwrap_or("").split_whitespace().collect::<Vec<_>>().join(" "))
-            .collect::<Vec<_>>()
-            .join(",");
-        canonical_headers.push_str(name);
-        canonical_headers.push(':');
-        canonical_headers.push_str(&value);
-        canonical_headers.push('\n');
+            .map(|v| v.as_bytes().split(|b| b.is_ascii_whitespace()).filter(|w| !w.is_empty()).collect::<Vec<_>>().join(&b' '))
+            .collect();
+        canonical.extend_from_slice(name.as_bytes());
+        canonical.push(b':');
+        canonical.extend_from_slice(&values.join(&b','));
+        canonical.push(b'\n');
     }
-    let signed_headers = auth.signed_headers.join(";");
-    format!(
-        "{method}\n{uri}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
-        canonical_query(query),
-    )
+    canonical.extend_from_slice(format!("\n{}\n{payload_hash}", auth.signed_headers.join(";")).as_bytes());
+    canonical
 }
 
 /// How far a request's `x-amz-date` may be from the server clock, either way.
@@ -392,19 +428,46 @@ pub(crate) fn parse_amz_date(s: &str) -> Option<i64> {
     Some(days * 86_400 + hour * 3_600 + min * 60 + sec)
 }
 
-/// Checks a request's `x-amz-date` against the server clock (`now`, Unix
-/// seconds) and its credential scope date, as S3 does: a malformed timestamp or a
-/// scope dated another day is `AccessDenied`, and one outside the allowed skew is
-/// `RequestTimeTooSkewed`.
-fn check_request_time(datetime: &str, scope_date: &str, now: i64) -> Result<(), &'static str> {
-    let t = parse_amz_date(datetime).ok_or("AccessDenied")?;
-    if datetime[..8] != *scope_date {
-        return Err("AccessDenied");
+/// Checks a header-signed request's time (`signed_at`, Unix seconds) against
+/// the server clock (`now`) and its credential scope date, as S3 does: a scope
+/// dated another day is `AuthorizationHeaderMalformed` (probed), and a time
+/// outside the allowed skew `RequestTimeTooSkewed`.
+fn check_request_time(signed_at: i64, scope_date: &str, now: i64) -> Result<(), &'static str> {
+    if day_of(signed_at) != scope_date {
+        return Err("AuthorizationHeaderMalformed");
     }
-    if (now - t).abs() > MAX_CLOCK_SKEW_SECS {
+    if (now - signed_at).abs() > MAX_CLOCK_SKEW_SECS {
         return Err("RequestTimeTooSkewed");
     }
     Ok(())
+}
+
+/// The day of a Unix time, as a credential scope names it (`YYYYMMDD`).
+fn day_of(t: i64) -> String {
+    // Howard Hinnant's civil_from_days.
+    let z = t.div_euclid(86_400) + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}")
+}
+
+/// When a header-signed request says it was made, as S3 takes it (probed):
+/// its `x-amz-date`, else its `Date` (RFC 1123, or like an `x-amz-date`).
+/// The value as sent, which its string to sign has, and its Unix time; `None`
+/// if it has neither, or the one it has isn't a time.
+fn request_time(headers: &HeaderMap) -> Option<(&str, i64)> {
+    if let Some(value) = headers.get("x-amz-date") {
+        let value = value.to_str().ok()?;
+        return Some((value, parse_amz_date(value)?));
+    }
+    let value = headers.get(hyper::header::DATE)?.to_str().ok()?;
+    Some((value, parse_amz_date(value).or_else(|| crate::s3::conditional::parse_http_date(value))?))
 }
 
 /// The values `x-amz-content-sha256` may take besides a hex SHA-256, as S3
@@ -507,10 +570,8 @@ fn verify_sigv4_at(
     let access_denied = |message: &str| Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", message);
     let auth = Authorization::from_headers(headers)
         .ok_or_else(|| access_denied("the Authorization header is malformed"))?;
-    let datetime = headers
-        .get("x-amz-date")
-        .and_then(|v| v.to_str().ok())
-        .ok_or_else(|| access_denied("the request has no valid x-amz-date header"))?;
+    let (datetime, signed_at) = request_time(headers)
+        .ok_or_else(|| access_denied("AWS authentication requires a valid Date or x-amz-date header"))?;
     let payload_hash = match headers.get("x-amz-content-sha256").map(|v| v.to_str()) {
         // The body's, as the service signs it.
         Some(Ok(value)) if body_hash.is_some_and(|hash| hash == value) => value,
@@ -547,14 +608,13 @@ fn verify_sigv4_at(
         rejection.details.push(("HeadersNotSigned", unsigned.join(", ")));
         return Err(rejection);
     }
-    check_request_time(datetime, &auth.date, now).map_err(|code| {
-        let message = match code {
-            "RequestTimeTooSkewed" => {
-                "The difference between the request time and the server's time is too large."
-            }
-            _ => "the request's x-amz-date is malformed or doesn't match its credential scope",
-        };
-        Rejection::new(StatusCode::FORBIDDEN, code, message)
+    check_request_time(signed_at, &auth.date, now).map_err(|code| match code {
+        "RequestTimeTooSkewed" => Rejection::new(
+            StatusCode::FORBIDDEN,
+            code,
+            "The difference between the request time and the current time is too large.",
+        ),
+        _ => malformed("Invalid credential date. Date is not the same as X-Amz-Date."),
     })?;
     check_signature(
         method,
@@ -774,7 +834,7 @@ fn check_signature(
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{datetime}\n{}\n{}",
         auth.scope,
-        sha256_hex(canonical.as_bytes()),
+        sha256_hex(&canonical),
     );
     let key = derive_signing_key(secret, &auth.date, &auth.region, &auth.service);
     let mismatch = || {
@@ -836,7 +896,7 @@ pub(crate) mod tests {
             .map_or("UNSIGNED-PAYLOAD", |v| v.to_str().unwrap())
             .to_owned();
         let canonical = canonical_request("PUT", "/b/k", "", &h, &auth, &payload_hash);
-        let sts = format!("AWS4-HMAC-SHA256\n{DATE}\n{scope}\n{}", sha256_hex(canonical.as_bytes()));
+        let sts = format!("AWS4-HMAC-SHA256\n{DATE}\n{scope}\n{}", sha256_hex(&canonical));
         let key = derive_signing_key(SECRET, &auth.date, &auth.region, &auth.service);
         let signature: String =
             hmac_sha256(&key, sts.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
@@ -890,6 +950,7 @@ pub(crate) mod tests {
             signature: String::new(),
         };
         let canonical = canonical_request("GET", "/b/k", "attributes", &headers, &auth, EMPTY_SHA256);
+        let canonical = String::from_utf8(canonical).unwrap();
         assert!(canonical.contains("\nx-amz-object-attributes:ETag,Object Size\n"), "{canonical}");
     }
 
@@ -944,7 +1005,7 @@ pub(crate) mod tests {
         );
         let auth = Authorization::from_query(&format!("{query}&X-Amz-Signature=x")).unwrap();
         let canonical = canonical_request("POST", "/", &query, &headers, &auth, EMPTY_SHA256);
-        let sts = format!("AWS4-HMAC-SHA256\n{DATE}\n{}\n{}", auth.scope, sha256_hex(canonical.as_bytes()));
+        let sts = format!("AWS4-HMAC-SHA256\n{DATE}\n{}\n{}", auth.scope, sha256_hex(&canonical));
         let key = derive_signing_key(SECRET, &auth.date, &auth.region, &auth.service);
         let signature: String = hmac_sha256(&key, sts.as_bytes()).iter().map(|b| format!("{b:02x}")).collect();
         let query = format!("{query}&X-Amz-Signature={signature}");
@@ -1099,18 +1160,38 @@ pub(crate) mod tests {
     #[test]
     fn request_time_skew() {
         let t = parse_amz_date("20260613T120000Z").unwrap();
-        let check = |now| check_request_time("20260613T120000Z", "20260613", now);
+        let check = |now| check_request_time(t, "20260613", now);
         assert_eq!(check(t), Ok(()));
         assert_eq!(check(t + MAX_CLOCK_SKEW_SECS), Ok(()));
         assert_eq!(check(t - MAX_CLOCK_SKEW_SECS), Ok(()));
         assert_eq!(check(t + MAX_CLOCK_SKEW_SECS + 1), Err("RequestTimeTooSkewed"));
         assert_eq!(check(t - MAX_CLOCK_SKEW_SECS - 1), Err("RequestTimeTooSkewed"));
-        // the credential scope must be dated the same day as x-amz-date
-        assert_eq!(
-            check_request_time("20260613T120000Z", "20260612", t),
-            Err("AccessDenied"),
-        );
-        assert_eq!(check_request_time("garbage", "20260613", t), Err("AccessDenied"));
+        // the credential scope must be dated the same day as the request
+        assert_eq!(check_request_time(t, "20260612", t), Err("AuthorizationHeaderMalformed"));
+        assert_eq!(day_of(0), "19700101");
+        assert_eq!(day_of(951_827_696), "20000229");
+        assert_eq!(day_of(t), "20260613");
+    }
+
+    #[test]
+    fn a_date_header_may_time_a_request() {
+        let mut h = HeaderMap::new();
+        h.insert("date", "Sat, 13 Jun 2026 12:00:00 GMT".parse().unwrap());
+        assert_eq!(request_time(&h), Some(("Sat, 13 Jun 2026 12:00:00 GMT", parse_amz_date("20260613T120000Z").unwrap())));
+        h.insert("x-amz-date", "20260613T120001Z".parse().unwrap());
+        assert_eq!(request_time(&h).unwrap().0, "20260613T120001Z");
+        h.insert("x-amz-date", "garbage".parse().unwrap());
+        assert_eq!(request_time(&h), None);
+    }
+
+    #[test]
+    fn says_how_an_authorization_header_is_malformed() {
+        let how = |value: &str| Authorization::parse(value.as_bytes()).err().flatten().unwrap_or_default();
+        assert!(how("AWS4-HMAC-SHA256 garbage").contains("three components"));
+        assert!(how("AWS4-HMAC-SHA256 Credential=a/20260613/r/s3/aws4_request, SignedHeaders=host").contains("three components"));
+        assert!(how("AWS4-HMAC-SHA256 Credential=a/20260613/r/s3/aws5_request, SignedHeaders=host, Signature=00")
+            .contains("incorrect terminal \"aws5_request\""));
+        assert_eq!(Authorization::parse(b"AWS a:b").err(), Some(None));
     }
 
     #[test]

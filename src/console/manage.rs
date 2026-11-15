@@ -1752,7 +1752,7 @@ async fn delete_object(
 ) -> Result<StatusCode> {
     let action = crate::s3::actions::delete(params.version.is_some());
     actor.check(&app, action, On::Object(bucket.clone(), params.key.clone())).await?;
-    let resp = crate::s3::objects::delete::delete_object(&app, &bucket, &params.key, params.version.as_deref(), false).await?;
+    let resp = crate::s3::objects::delete::delete_object(&app, &bucket, &params.key, params.version.as_deref(), false, None).await?;
     match resp.status() {
         StatusCode::NO_CONTENT | StatusCode::OK => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),

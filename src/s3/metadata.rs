@@ -46,17 +46,22 @@ pub fn from_request(headers: &HeaderMap) -> Result<String, Response<Full<Bytes>>
         if user.is_none() && !STORED.contains(&name) {
             continue;
         }
-        // Repeated headers are one, their values joined (RFC 9110, 5.3).
+        // Repeated headers are one, their values joined (RFC 9110, 5.3). A
+        // user-defined one's bytes are Latin-1, as S3 reads them (probed).
         let mut values = Vec::new();
         for value in headers.get_all(name) {
-            let Ok(value) = value.to_str() else {
-                return Err(format_s3_error(
-                    StatusCode::BAD_REQUEST,
-                    "InvalidArgument",
-                    &format!("the {name} header must be printable US-ASCII"),
-                ));
+            let value = match (value.to_str(), user) {
+                (Ok(value), _) => value.to_owned(),
+                (Err(_), Some(_)) => value.as_bytes().iter().map(|&b| char::from(b)).collect(),
+                (Err(_), None) => {
+                    return Err(format_s3_error(
+                        StatusCode::BAD_REQUEST,
+                        "InvalidArgument",
+                        &format!("the {name} header must be printable US-ASCII"),
+                    ));
+                }
             };
-            values.push(value.trim());
+            values.push(value.trim().to_owned());
         }
         let mut value = values.join(", ");
         // `aws-chunked` describes the request's body, not the object's.
@@ -71,8 +76,11 @@ pub fn from_request(headers: &HeaderMap) -> Result<String, Response<Full<Bytes>>
                 continue;
             }
         }
+        // Counted as sent (in UTF-8), then any RFC 2047 encoded words in it
+        // decoded, as S3 does (probed).
         if let Some(user) = user {
             user_size += user.len() + value.len();
+            value = decode_words(&value).unwrap_or(value);
         }
         if name == REDIRECT && !["/", "http://", "https://"].iter().any(|prefix| value.starts_with(prefix)) {
             return Err(format_s3_error(
@@ -161,19 +169,157 @@ pub fn redirect_location(metadata: &str) -> Option<&str> {
     metadata.lines().find_map(|line| line.strip_prefix(REDIRECT)?.strip_prefix(": "))
 }
 
-/// Adds the stored `metadata`'s headers to a response.
+/// The stored `metadata`, with `location` its website redirect location.
+pub fn with_redirect(metadata: &str, location: &str) -> String {
+    let mut stored: String =
+        metadata.lines().filter(|line| !line.starts_with(REDIRECT)).map(|line| format!("{line}\n")).collect();
+    stored.push_str(&format!("{REDIRECT}: {location}\n"));
+    stored
+}
+
+/// Adds the stored `metadata`'s headers to a response: one that isn't ASCII
+/// as an RFC 2047 encoded word, as S3 sends it (probed).
 pub fn apply(mut builder: Builder, metadata: &str) -> Builder {
     for line in metadata.lines() {
         if let Some((name, value)) = line.split_once(": ") {
-            builder = builder.header(name, value);
+            builder = match value.is_ascii() {
+                true => builder.header(name, value),
+                false => builder.header(name, encode_word(value)),
+            };
         }
     }
     builder
 }
 
+/// `value` as one RFC 2047 encoded word, Q-encoded UTF-8, as S3 writes it:
+/// `=?UTF-8?Q?x_caf=C3=A9_y?=`.
+fn encode_word(value: &str) -> String {
+    let mut word = String::from("=?UTF-8?Q?");
+    for byte in value.bytes() {
+        match byte {
+            b' ' => word.push('_'),
+            b if b.is_ascii_alphanumeric() => word.push(char::from(b)),
+            b => word.push_str(&format!("={b:02X}")),
+        }
+    }
+    word.push_str("?=");
+    word
+}
+
+/// `value` with its RFC 2047 encoded words (`=?charset?B|Q?text?=`) decoded,
+/// and the white space between two of them dropped; `None` if it has none,
+/// or one can't be decoded (S3 fails on one with a 500), or what they decode
+/// to has control characters, which a header can't carry.
+fn decode_words(value: &str) -> Option<String> {
+    use base64::Engine;
+    let mut out = String::new();
+    let mut rest = value;
+    let mut decoded_any = false;
+    // White space after an encoded word, held until it's known whether
+    // another follows.
+    let mut pending = String::new();
+    let mut after_word = false;
+    while !rest.is_empty() {
+        let Some(start) = rest.find("=?") else {
+            out.push_str(&pending);
+            out.push_str(rest);
+            break;
+        };
+        let (before, word) = rest.split_at(start);
+        // `=?charset?encoding?text?=`.
+        let mut fields = word[2..].splitn(3, '?');
+        let (Some(charset), Some(encoding), Some(text_end)) = (fields.next(), fields.next(), fields.next()) else {
+            out.push_str(&pending);
+            out.push_str(rest);
+            break;
+        };
+        let Some(end) = text_end.find("?=") else {
+            out.push_str(&pending);
+            out.push_str(rest);
+            break;
+        };
+        let text = &text_end[..end];
+        let bytes = match encoding {
+            "B" | "b" => base64::engine::general_purpose::STANDARD.decode(text).ok()?,
+            "Q" | "q" => {
+                let mut bytes = Vec::new();
+                let mut chars = text.bytes();
+                while let Some(b) = chars.next() {
+                    match b {
+                        b'_' => bytes.push(b' '),
+                        b'=' => {
+                            let hex = [chars.next()?, chars.next()?];
+                            bytes.push(u8::from_str_radix(std::str::from_utf8(&hex).ok()?, 16).ok()?);
+                        }
+                        b => bytes.push(b),
+                    }
+                }
+                bytes
+            }
+            _ => return None,
+        };
+        let decoded = match charset.to_ascii_lowercase().as_str() {
+            "utf-8" | "utf8" | "us-ascii" => String::from_utf8(bytes).ok()?,
+            "iso-8859-1" | "latin1" => bytes.iter().map(|&b| char::from(b)).collect(),
+            _ => return None,
+        };
+        if !(after_word && before.chars().all(char::is_whitespace)) {
+            out.push_str(before);
+        }
+        pending.clear();
+        out.push_str(&decoded);
+        decoded_any = true;
+        after_word = true;
+        rest = &text_end[end + 2..];
+        // White space up to a next word is dropped then; else it's kept.
+        let spaces = rest.len() - rest.trim_start().len();
+        pending.push_str(&rest[..spaces]);
+        rest = &rest[spaces..];
+        if !rest.starts_with("=?") {
+            out.push_str(&pending);
+            pending.clear();
+            after_word = false;
+        }
+    }
+    let clean = out.chars().all(|c| c == '\t' || !c.is_control());
+    (decoded_any && clean).then_some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decodes_and_encodes_words_as_s3_does() {
+        assert_eq!(decode_words("=?UTF-8?B?YWJj?=").as_deref(), Some("abc"));
+        assert_eq!(decode_words("=?UTF-8?Q?caf=C3=A9?=").as_deref(), Some("caf\u{e9}"));
+        assert_eq!(decode_words("x =?UTF-8?Q?caf=C3=A9?= y").as_deref(), Some("x caf\u{e9} y"));
+        assert_eq!(decode_words("=?ISO-8859-1?Q?caf=E9?=").as_deref(), Some("caf\u{e9}"));
+        assert_eq!(decode_words("=?utf-8?b?Y2Fmw6k=?=").as_deref(), Some("caf\u{e9}"));
+        assert_eq!(decode_words("=?UTF-8?Q?a?= =?UTF-8?Q?b?=").as_deref(), Some("ab"));
+        assert_eq!(decode_words("a?=b"), None);
+        assert_eq!(decode_words("plain"), None);
+        assert_eq!(decode_words("=?UTF-8?B?!!!?="), None);
+        assert_eq!(decode_words("=?UTF-8?Q?a=0Ab?="), None);
+        assert_eq!(encode_word("x caf\u{e9} y"), "=?UTF-8?Q?x_caf=C3=A9_y?=");
+        assert_eq!(encode_word("caf\u{c3}\u{a9}"), "=?UTF-8?Q?caf=C3=83=C2=A9?=");
+    }
+
+    #[test]
+    fn takes_user_metadata_as_latin_1() {
+        let mut map = HeaderMap::new();
+        map.insert("x-amz-meta-m", hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        assert_eq!(from_request(&map).unwrap(), "x-amz-meta-m: caf\u{e9}\n");
+        let mut map = HeaderMap::new();
+        map.insert("cache-control", hyper::header::HeaderValue::from_bytes(b"caf\xe9").unwrap());
+        assert!(from_request(&map).is_err());
+        // Counted as sent: two bytes of UTF-8 are four once read as Latin-1.
+        let mut map = HeaderMap::new();
+        let mut value = vec![b'v'; 2045];
+        value.extend_from_slice("\u{e9}".as_bytes());
+        map.insert("x-amz-meta-m", hyper::header::HeaderValue::from_bytes(&value).unwrap());
+        assert!(from_request(&map).is_err());
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut map = HeaderMap::new();

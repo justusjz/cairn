@@ -1072,7 +1072,8 @@ oversized_body_rejected() {
     { cat "$doc"; head -c $((9 * 1024 * 1024)) /dev/zero | tr '\0' ' '; } >"$big"
     [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$doc")" = 404 ] || return 1
     [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$big")" = 400 ] || return 1
-    [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$big" "Transfer-Encoding: chunked")" = 400 ]
+    # A body without a length (chunked transfer encoding) S3 doesn't take.
+    [ "$(scurl PUT "$path" UNSIGNED-PAYLOAD "$big" "Transfer-Encoding: chunked")" = 501 ]
 }
 
 # Content-MD5 and x-amz-checksum-* headers are checked against an upload's
@@ -1189,7 +1190,10 @@ list_v1_keys() {  # list_v1_keys <prefix> <max-keys>
         resp="$(scurl_get "$q")" || return 1
         printf '%s' "$resp" | grep -oP '(?<=<Key>).*?(?=</Key>)'
         printf '%s' "$resp" | grep -q '<IsTruncated>true</IsTruncated>' || break
-        marker="$(printf '%s' "$resp" | grep -oP '(?<=<NextMarker>).*?(?=</NextMarker>)')"
+        # Without a delimiter there's no NextMarker (as in S3): the page's
+        # last key is the next marker.
+        if printf '%s' "$resp" | grep -q '<NextMarker>'; then return 1; fi
+        marker="$(printf '%s' "$resp" | grep -oP '(?<=<Key>).*?(?=</Key>)' | tail -n 1)"
         [ -n "$marker" ] || return 1
     done
 }
@@ -1238,7 +1242,9 @@ v2_prefixes_ok() {
 # ACL stub: get-object-acl reports owner cairn, and s3cmd info (which queries the
 # ACL) completes instead of choking on object bytes.
 acl_ok() {
-    awss3 s3api get-object-acl --bucket "$BUCKET" --key big.bin 2>/dev/null | grep -q cairn || return 1
+    # The owner, by a canonical ID (64 hex digits), as S3 names it.
+    awss3 s3api get-object-acl --bucket "$BUCKET" --key big.bin --query Owner.ID --output text 2>/dev/null \
+        | grep -qE '^[0-9a-f]{64}$' || return 1
     s3 info "s3://${BUCKET}/big.bin" >/dev/null 2>&1
 }
 
@@ -1529,8 +1535,12 @@ acls_disabled_ok() {
         >/dev/null 2>&1 || return 1
     awss3 s3api put-object --bucket "$BUCKET" --key acl/x.txt --body "$SMALL" \
         --acl bucket-owner-full-control >/dev/null 2>&1 || return 1
-    awss3 s3api put-object-acl --bucket "$BUCKET" --key acl/x.txt --acl bucket-owner-full-control \
+    # `private` gives no one else anything either (probed).
+    awss3 s3api put-object --bucket "$BUCKET" --key acl/x.txt --body "$SMALL" --acl private \
         >/dev/null 2>&1 || return 1
+    # Setting an ACL is refused, even the owner's only, as S3 refuses it (probed).
+    awss3 s3api put-object-acl --bucket "$BUCKET" --key acl/x.txt --acl bucket-owner-full-control 2>&1 \
+        | grep -q AccessControlListNotSupported || return 1
     awss3 s3api put-object-acl --bucket "$BUCKET" --key acl/x.txt --acl public-read 2>&1 \
         | grep -q AccessControlListNotSupported || return 1
     awss3 s3api put-object-acl --bucket "$BUCKET" --key acl/missing --acl bucket-owner-full-control 2>&1 \
@@ -1551,7 +1561,7 @@ listing_parameters_ok() {
     local listed tok
     s3 put "$SMALL" "s3://${BUCKET}/enc/a+b c" >/dev/null 2>&1 || return 1
     listed=$(scurl_get "/${BUCKET}?list-type=2&prefix=enc%2F&encoding-type=url&delimiter=") || return 1
-    echo "$listed" | grep -q '<Key>enc/a%2Bb%20c</Key>' || return 1
+    echo "$listed" | grep -q '<Key>enc/a%2Bb+c</Key>' || return 1
     echo "$listed" | grep -q '<EncodingType>url</EncodingType>' || return 1
     ! echo "$listed" | grep -q '<Delimiter>' || return 1
     [ "$(scurl GET "/${BUCKET}?max-keys=blah" "$EMPTY_SHA256" -)" = 400 ] || return 1
@@ -1563,15 +1573,13 @@ listing_parameters_ok() {
 }
 
 # Smaller things S3 does: If-Match on a key without an object is a 404, an
-# upload in chunked transfer encoding is fine, a copy range out of the source
+# upload in chunked transfer encoding a 501 (probed), a copy range out of the source
 # a 416 (and a malformed one a 400), and a bucket name like an IP address a 400.
 s3_details_ok() {
     local hash uid code
     hash=$(sha256sum "$SMALL" | cut -d' ' -f1)
     [ "$(scurl PUT "/${BUCKET}/no-such-key" "$hash" "$SMALL" "If-Match: *")" = 404 ] || return 1
-    [ "$(scurl PUT "/${BUCKET}/chunked" UNSIGNED-PAYLOAD "$SMALL" "Transfer-Encoding: chunked")" = 200 ] || return 1
-    check_roundtrip "$SMALL" "s3://${BUCKET}/chunked" || return 1
-    s3 del "s3://${BUCKET}/chunked" >/dev/null 2>&1
+    [ "$(scurl PUT "/${BUCKET}/chunked" UNSIGNED-PAYLOAD "$SMALL" "Transfer-Encoding: chunked")" = 501 ] || return 1
     uid=$(awss3 s3api create-multipart-upload --bucket "$BUCKET" --key range-copy \
         --query UploadId --output text 2>/dev/null) || return 1
     code=$(scurl PUT "/${BUCKET}/range-copy?partNumber=1&uploadId=${uid}" "$EMPTY_SHA256" - \

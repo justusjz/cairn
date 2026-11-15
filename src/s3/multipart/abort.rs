@@ -9,7 +9,7 @@ use crate::{
     App,
     blobs::{reap_blobs, reap_columns},
     db,
-    s3::util::{format_s3_error, slow_down},
+    s3::util::slow_down,
 };
 
 /// AbortMultipartUpload: `DELETE /{bucket}/{key}?uploadId=U`. Drops the upload
@@ -24,11 +24,7 @@ pub async fn abort_multipart_upload(
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
         Err(_) => {
-            return Ok(format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchUpload",
-                "the specified multipart upload does not exist",
-            ));
+            return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
         }
     };
     // Delete the staged parts, the upload, and the freed blobs in one
@@ -58,11 +54,7 @@ pub async fn abort_multipart_upload(
     let reap = reap_columns(&row, 1);
     reap_blobs(app, reap);
     if !existed {
-        return Ok(format_s3_error(
-            StatusCode::NOT_FOUND,
-            "NoSuchUpload",
-            "the specified multipart upload does not exist",
-        ));
+        return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
     }
     Ok(Response::builder()
         .status(StatusCode::NO_CONTENT)

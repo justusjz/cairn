@@ -1,3 +1,4 @@
+use percent_encoding::utf8_percent_encode;
 use std::sync::Arc;
 
 use deadpool_postgres::Object;
@@ -144,7 +145,8 @@ fn parse_complete_request(body: &str) -> Option<Listed> {
 /// CompleteMultipartUpload: `POST /{bucket}/{key}?uploadId=U` with a part-list
 /// body. Assembles the listed parts into the object atomically. A retry of a
 /// completion that went through (its response lost, say) is answered as it
-/// was, as long as the version it made is still there.
+/// was, as long as the version it made is still there. (Without a
+/// `<Location>`: see `complete_multipart_upload_at`.)
 #[allow(clippy::too_many_arguments)]
 pub async fn complete_multipart_upload(
     app: &Arc<App>,
@@ -158,14 +160,32 @@ pub async fn complete_multipart_upload(
     expected_size: Option<u64>,
     claimed: Claimed,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
+    complete_multipart_upload_at(
+        app, bucket, key, upload_id, body, preconditions, customer_key, role, expected_size, claimed, None,
+    )
+    .await
+}
+
+/// CompleteMultipartUpload, whose result's `<Location>` is the object's URL
+/// at `location`, the URL of its bucket as the client reached it.
+#[allow(clippy::too_many_arguments)]
+pub async fn complete_multipart_upload_at(
+    app: &Arc<App>,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    body: Bytes,
+    preconditions: &Preconditions,
+    customer_key: Option<&CustomerKey>,
+    role: Option<Uuid>,
+    expected_size: Option<u64>,
+    claimed: Claimed,
+    location: Option<&str>,
+) -> anyhow::Result<Response<Full<Bytes>>> {
     let upload_id = match Uuid::parse_str(upload_id) {
         Ok(id) => id,
         Err(_) => {
-            return Ok(format_s3_error(
-                StatusCode::NOT_FOUND,
-                "NoSuchUpload",
-                "the specified multipart upload does not exist",
-            ));
+            return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
         }
     };
     let Ok(body_str) = std::str::from_utf8(&body) else {
@@ -186,12 +206,18 @@ pub async fn complete_multipart_upload(
         }
     };
     let requested = &listed.numbers_and_etags;
-    // S3 requires the parts in ascending (and thus distinct) part-number order.
+    let upload = upload(app, &upload_id, bucket, key).await?;
+    // S3 requires the parts in ascending (and thus distinct) part-number
+    // order, of an upload that's there (probed: a missing one's 404 comes
+    // first).
     if !requested.windows(2).all(|w| w[0].0 < w[1].0) {
+        if upload.is_none() {
+            return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
+        }
         return Ok(format_s3_error(
             StatusCode::BAD_REQUEST,
             "InvalidPartOrder",
-            "parts must be listed in ascending part-number order",
+            "The list of parts was not in ascending order. Parts must be ordered by part number.",
         ));
     }
 
@@ -199,7 +225,6 @@ pub async fn complete_multipart_upload(
     // unless the upload has an algorithm, whose checksums are sealed under
     // it (S3 needs it then; MinIO's 400). One given must be the upload's (a
     // retry, whose upload is gone, isn't checked).
-    let upload = upload(app, &upload_id, bucket, key).await?;
     if let Some(upload) = &upload {
         if matches!(upload.encryption, Stored::Customer { .. }) && upload.checksum.is_some() && customer_key.is_none() {
             return Ok(format_s3_error(
@@ -235,8 +260,13 @@ pub async fn complete_multipart_upload(
                 let body = format!(
                     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
                      <CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-                     <Bucket>{}</Bucket><Key>{}</Key><ETag>\"{}\"</ETag>{}\
+                     {}<Bucket>{}</Bucket><Key>{}</Key><ETag>\"{}\"</ETag>{}\
                      </CompleteMultipartUploadResult>",
+                    location.map_or(String::new(), |bucket_url| format!(
+                        "<Location>{}/{}</Location>",
+                        xml_escape(bucket_url),
+                        utf8_percent_encode(&key, LOCATION_KEY_KEEPS).to_string().replace(' ', "+")
+                    )),
                     xml_escape(&bucket),
                     xml_escape(&key),
                     xml_escape(&etag),
@@ -251,11 +281,7 @@ pub async fn complete_multipart_upload(
                 return Ok(sse::echo_onto(response, &encryption, customer_key));
             }
             Ok(CompleteOutcome::NoSuchUpload) => {
-                return Ok(format_s3_error(
-                    StatusCode::NOT_FOUND,
-                    "NoSuchUpload",
-                    "the specified multipart upload does not exist",
-                ));
+                return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
             }
             Ok(CompleteOutcome::InvalidPart) => {
                 return Ok(format_s3_error(
@@ -319,6 +345,12 @@ pub async fn complete_multipart_upload(
     }
     Ok(slow_down())
 }
+
+/// What of a key its `<Location>` keeps, as S3 writes it (probed): letters,
+/// digits, `-`, `_`, `.`, `*`, and a space, which becomes `+`; `/` too is
+/// escaped.
+const LOCATION_KEY_KEEPS: &percent_encoding::AsciiSet =
+    &percent_encoding::NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'.').remove(b'*').remove(b' ');
 
 /// The ETag S3 gives a multipart object of the `listed` parts: the MD5 of
 /// their ETags' bytes (each an MD5, or another 16 bytes in hex), then the part

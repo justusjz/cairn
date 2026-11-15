@@ -1161,9 +1161,14 @@ $$;
 -- version ID per target, for a delete marker in an enabled bucket. A named
 -- version that Object Lock keeps (`cairn_locked`, bypassing governance mode
 -- where `p_bypass` says so) isn't deleted, and is `locked` instead (with no
--- version ID or delete marker to report).
+-- version ID or delete marker to report). A conditional delete (If-Match,
+-- checked by the caller against the version it read) names that version's
+-- row in `p_expected`: unless it's still its key's current version, under
+-- K(b,k), nothing is deleted and the status is 'stale', for the caller to
+-- check again.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_objects(
     p_bucket text, p_keys text[], p_version_ids text[], p_marker_ids text[], p_bypass boolean[],
+    p_expected bigint[] DEFAULT '{}',
     OUT status text, OUT version_ids text[], OUT delete_markers boolean[], OUT locked boolean[],
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -1187,6 +1192,16 @@ BEGIN
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_lock_keys(p_bucket, p_keys);
+    FOR i IN 1 .. coalesce(cardinality(p_expected), 0) LOOP
+        CONTINUE WHEN p_expected[i] IS NULL;
+        PERFORM 1 FROM objects o
+        WHERE o.id = p_expected[i] AND o.bucket = p_bucket AND o.key = p_keys[i]
+          AND o.is_latest AND NOT o.is_delete_marker;
+        IF NOT FOUND THEN
+            status := 'stale';
+            RETURN;
+        END IF;
+    END LOOP;
     -- Every version the targets name or may remove exists now, under the
     -- keys' locks; the deletes only add delete markers, which have no parts.
     FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP

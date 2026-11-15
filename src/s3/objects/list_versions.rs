@@ -88,6 +88,10 @@ pub async fn list_object_versions(
     let truncated = rows.len() as i64 > max_keys && max_keys > 0;
     let kept = &rows[..(max_keys as usize).min(rows.len())];
 
+    let owner = format!(
+        "<Owner><ID>{}</ID></Owner>",
+        crate::s3::util::canonical_id(&crate::users::account(&app.pool.get().await?).await?)
+    );
     let mut entries = String::new();
     let mut prefixes = String::new();
     for row in kept {
@@ -109,7 +113,7 @@ pub async fn list_object_versions(
             xml_escape(version_id),
         );
         if row.get::<_, bool>("is_delete_marker") {
-            entries.push_str(&format!("<DeleteMarker>{common}{OWNER}</DeleteMarker>"));
+            entries.push_str(&format!("<DeleteMarker>{common}{owner}</DeleteMarker>"));
         } else {
             // As clients know it (an SSE-S3 one's is stored sealed).
             let etag = crate::s3::objects::list::listed_etag(app, bucket, key, row, 6, 8).await?;
@@ -118,7 +122,7 @@ pub async fn list_object_versions(
             let checksum = crate::s3::checksums::listed(row, 12);
             entries.push_str(&format!(
                 "<Version>{common}<ETag>\"{}\"</ETag>{checksum}<Size>{size}</Size>\
-                 <StorageClass>STANDARD</StorageClass>{OWNER}</Version>",
+                 <StorageClass>STANDARD</StorageClass>{owner}</Version>",
                 xml_escape(etag),
             ));
         }
@@ -138,12 +142,6 @@ pub async fn list_object_versions(
         "<VersionIdMarker>{}</VersionIdMarker>",
         xml_escape(version_id_marker.unwrap_or(""))
     ));
-    if let Some(d) = delimiter {
-        body.push_str(&format!("<Delimiter>{}</Delimiter>", encoding.xml(d)));
-    }
-    body.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
-    body.push_str(encoding.element());
-    body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
     // The next page resumes after the last entry kept: after that version of its
     // key, or past a whole common prefix, which is then the key marker. An empty
     // page (max_keys == 0) can't advance on its own, so it hands back the
@@ -165,14 +163,19 @@ pub async fn list_object_versions(
             ));
         }
     }
+    // In S3's order (probed).
+    body.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    if let Some(d) = delimiter {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", encoding.xml(d)));
+    }
+    body.push_str(encoding.element());
+    body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
     body.push_str(&entries);
     body.push_str(&prefixes);
     body.push_str("</ListVersionsResult>");
     Ok(xml_ok(body))
 }
 
-/// The fixed owner Cairn reports, matching the ACL stub.
-const OWNER: &str = "<Owner><ID>cairn</ID><DisplayName>cairn</DisplayName></Owner>";
 
 fn invalid_argument(message: &str) -> Response<Full<Bytes>> {
     format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message)

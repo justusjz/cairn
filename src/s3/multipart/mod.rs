@@ -63,6 +63,17 @@ impl Upload {
     }
 }
 
+/// S3's 404 for an upload that isn't there (probed), naming it.
+pub(crate) fn no_such_upload(upload_id: &str) -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
+    let mut rejection = crate::auth::Rejection::new(
+        hyper::StatusCode::NOT_FOUND,
+        "NoSuchUpload",
+        "The specified upload does not exist. The upload ID may be invalid, or the upload may have been aborted or completed.",
+    );
+    rejection.details.push(("UploadId", upload_id.to_owned()));
+    crate::s3::util::rejection_response(&rejection)
+}
+
 /// The upload `upload_id`, or `None` if there's no such upload of
 /// `bucket`/`key` (authorization only checked the bucket).
 pub(crate) async fn upload(app: &App, upload_id: &Uuid, bucket: &str, key: &str) -> anyhow::Result<Option<Upload>> {

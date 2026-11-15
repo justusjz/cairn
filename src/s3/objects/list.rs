@@ -227,8 +227,11 @@ pub async fn list_objects(
         ListVersion::V1
         | ListVersion::V2 {
             fetch_owner: true, ..
-        } => "<Owner><ID>cairn</ID><DisplayName>cairn</DisplayName></Owner>",
-        ListVersion::V2 { .. } => "",
+        } => {
+            let account = crate::users::account(&app.pool.get().await?).await?;
+            format!("<Owner><ID>{}</ID></Owner>", crate::s3::util::canonical_id(&account))
+        }
+        ListVersion::V2 { .. } => String::new(),
     };
 
     // Split the sorted stream into the two output lists (each stays sorted).
@@ -263,24 +266,15 @@ pub async fn list_objects(
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
     body.push_str(&format!("<Name>{}</Name>", xml_escape(bucket)));
-    // ListObjects (v1) doesn't encode the prefix it echoes, as S3 doesn't (nor
-    // do SDKs decode it); v2 does.
-    let echoed_prefix = match &version {
-        ListVersion::V1 => xml_escape(prefix),
-        ListVersion::V2 { .. } => encoding.xml(prefix),
-    };
-    body.push_str(&format!("<Prefix>{echoed_prefix}</Prefix>"));
-    if let Some(d) = delimiter {
-        body.push_str(&format!("<Delimiter>{}</Delimiter>", encoding.xml(d)));
-    }
-    body.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
-    body.push_str(encoding.element());
-    // Version-specific cursor elements. v1 speaks markers; v2 speaks opaque
-    // continuation tokens and reports KeyCount.
+    body.push_str(&format!("<Prefix>{}</Prefix>", encoding.xml(prefix)));
+    // Version-specific cursor elements, in S3's order (probed). v1 speaks
+    // markers, and tells the next one only with a delimiter, as S3 does
+    // (without one, it's the page's last key); v2 speaks opaque continuation
+    // tokens and reports KeyCount.
     match &version {
         ListVersion::V1 => {
             body.push_str(&format!("<Marker>{}</Marker>", encoding.xml(marker)));
-            if let Some(nm) = &next_marker {
+            if let Some(nm) = next_marker.as_ref().filter(|_| delimiter.is_some()) {
                 body.push_str(&format!("<NextMarker>{}</NextMarker>", encoding.xml(nm)));
             }
         }
@@ -289,15 +283,14 @@ pub async fn list_objects(
             start_after,
             ..
         } => {
-            body.push_str(&format!("<KeyCount>{key_count}</KeyCount>"));
+            if let Some(sa) = start_after {
+                body.push_str(&format!("<StartAfter>{}</StartAfter>", encoding.xml(sa)));
+            }
             if let Some(token) = continuation_token {
                 body.push_str(&format!(
                     "<ContinuationToken>{}</ContinuationToken>",
                     xml_escape(token)
                 ));
-            }
-            if let Some(sa) = start_after {
-                body.push_str(&format!("<StartAfter>{}</StartAfter>", encoding.xml(sa)));
             }
             if let Some(nm) = &next_marker {
                 body.push_str(&format!(
@@ -305,11 +298,23 @@ pub async fn list_objects(
                     encode_continuation_token(nm)
                 ));
             }
+            body.push_str(&format!("<KeyCount>{key_count}</KeyCount>"));
         }
     }
+    body.push_str(&format!("<MaxKeys>{max_keys}</MaxKeys>"));
+    if let Some(d) = delimiter {
+        body.push_str(&format!("<Delimiter>{}</Delimiter>", encoding.xml(d)));
+    }
+    body.push_str(encoding.element());
     body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
     body.push_str(&contents);
     body.push_str(&prefixes);
     body.push_str("</ListBucketResult>");
-    Ok(xml_ok(body))
+    // Its bucket's region, as S3 tells it with a listing (probed).
+    let mut response = xml_ok(body);
+    response.headers_mut().insert(
+        crate::s3::buckets::head::REGION_HEADER,
+        hyper::header::HeaderValue::from_static(crate::s3::buckets::head::REGION),
+    );
+    Ok(response)
 }

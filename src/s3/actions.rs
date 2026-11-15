@@ -238,6 +238,12 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
     if key.is_empty() {
         let configuration = CONFIGURATION.iter().find(|(name, _, _)| has(name));
         return match (method.clone(), configuration) {
+            // Not configuration grants and templates have (see `manage_actions`):
+            // a stub, and a setting that can't change.
+            (Method::GET, None) if has("abac") => one("GetBucketAbac", "s3:GetBucketAbac", on_bucket()),
+            (Method::PUT, Some(("ownershipControls", _, _))) => {
+                one("PutBucketOwnershipControls", "s3:PutBucketOwnershipControls", on_bucket())
+            }
             (Method::GET, Some((_, (name, action), _))) => one(name, action, on_bucket()),
             (Method::GET, None) if has("versions") => one("ListObjectVersions", "s3:ListBucketVersions", on_bucket()),
             (Method::GET, None) if has("uploads") => {

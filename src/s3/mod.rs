@@ -25,7 +25,7 @@ use crate::{
         },
         conditional::Preconditions,
         multipart::{
-            abort::abort_multipart_upload, complete::{self, complete_multipart_upload},
+            abort::abort_multipart_upload, complete,
             create::create_multipart_upload,
             list::list_multipart_uploads,
             list_parts::{MAX_PARTS, list_parts},
@@ -43,7 +43,7 @@ use crate::{
         },
         util::{
             bucket_subresource_stub, decode_continuation_token, decode_path_param, format_s3_error,
-            query_param, stub_acl,
+            query_param,
         },
         hosting::Route,
         versions::{invalid_version_id, is_version_id},
@@ -162,6 +162,10 @@ async fn handle_request(
     if let Some(signed) = signed.as_ref().filter(|s| crate::iam::wants(s)) {
         return Ok(box_response(crate::iam::handle(&app, req, signed.clone(), peer).await));
     }
+    // Signed for a service this endpoint isn't (probed).
+    if let Some(rejection) = signed.as_ref().and_then(crate::auth::wrong_service) {
+        return Ok(box_response(util::rejection_response(&rejection)));
+    }
     let principal = match &signed {
         Some(signed) => {
             let client = app.pool.get().await?;
@@ -183,7 +187,13 @@ async fn handle_request(
             }
             Some(principal)
         }
-        // A signature that isn't one (not SigV4, or malformed).
+        // A SigV4 Authorization header that doesn't parse: S3's 400, saying how
+        // (probed).
+        None if crate::auth::malformed_authorization(req.headers()).is_some() => {
+            let rejection = crate::auth::malformed_authorization(req.headers()).expect("just checked");
+            return Ok(box_response(util::rejection_response(&rejection)));
+        }
+        // A signature that isn't one (not SigV4).
         None if req.headers().contains_key(hyper::header::AUTHORIZATION)
             || query_param(req.uri().query().unwrap_or(""), "X-Amz-Signature").is_some() =>
         {
@@ -195,6 +205,11 @@ async fn handle_request(
         }
         None => None,
     };
+    // A body without a length, in HTTP's chunked transfer encoding: S3 has none
+    // (probed). Its streaming uploads are aws-chunked, which has a length.
+    if req.headers().contains_key(hyper::header::TRANSFER_ENCODING) {
+        return Ok(box_response(util::header_not_implemented("Transfer-Encoding", None)));
+    }
     let account = crate::users::account(&app.pool.get().await?).await?;
     let origin = access::Origin {
         peer: Some(peer),
@@ -355,6 +370,10 @@ async fn handle_request(
             "The specified method is not allowed against this resource.",
         )));
     }
+    // The bucket's owner, if the request says whom it expects.
+    if let Some(refused) = util::unexpected_owner(req.headers(), &account) {
+        return Ok(box_response(refused));
+    }
     // A key (or version) that isn't there is a 403 to whom may not list the
     // bucket, as in S3 (probed), so that keys can't be found by guessing.
     let hides_missing = |status: StatusCode| {
@@ -407,7 +426,7 @@ async fn handle_request(
             if operation.name == "GetBucketOwnershipControls" {
                 return Ok(box_response(acl::ownership_controls()));
             }
-            if let Some(resp) = bucket_subresource_stub(&query) {
+            if let Some(resp) = bucket_subresource_stub(&query, &util::canonical_id(&account)) {
                 return Ok(box_response(resp));
             }
         }
@@ -479,11 +498,13 @@ async fn handle_request(
                         Some(token) => match decode_continuation_token(&token) {
                             Some(marker) => marker,
                             None => {
-                                return Ok(box_response(format_s3_error(
+                                let mut rejection = Rejection::new(
                                     StatusCode::BAD_REQUEST,
                                     "InvalidArgument",
-                                    "the continuation token is not valid",
-                                )));
+                                    "The continuation token provided is incorrect",
+                                );
+                                rejection.details.push(("ArgumentName", "continuation-token".to_owned()));
+                                return Ok(box_response(util::rejection_response(&rejection)));
                             }
                         },
                         None => query_param(&query, "start-after").unwrap_or_default(),
@@ -608,6 +629,14 @@ async fn handle_request(
                 }
                 match read_body(req, &secret, true).await? {
                     Ok(body) => object_lock::put_object_lock_configuration(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
+            // PutBucketOwnershipControls: every bucket is BucketOwnerEnforced
+            // (`acl`). No checksum is needed (probed).
+            hyper::Method::PUT if operation.name == "PutBucketOwnershipControls" => {
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => acl::put_ownership_controls(&body),
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
@@ -785,11 +814,7 @@ async fn handle_request(
                 Err(refused) => return Ok(box_response(refused)),
             }
         }
-        Method::GET | Method::HEAD => match sse::refuse_on_read(req.headers()) {
-            Some(refused) => return Ok(box_response(refused)),
-            None => None,
-        },
-        Method::PUT | Method::POST => match sse::refuse_on_other_writes(req.headers()) {
+        Method::GET | Method::HEAD | Method::PUT | Method::POST => match sse::refuse_where_unsupported(req.headers()) {
             Some(refused) => return Ok(box_response(refused)),
             None => None,
         },
@@ -852,18 +877,20 @@ async fn handle_request(
         // ACL is stubbed; otherwise a `?acl` GET would stream object bytes and
         // break XML-parsing clients like `s3cmd info`.
         if query_param(&query, "acl").is_some() {
-            return Ok(box_response(stub_acl()));
+            return Ok(box_response(acl::get_object_acl(&app, &bucket, &key, version_id.as_deref()).await?));
         }
         // ListParts: GET /{bucket}/{key}?uploadId=U, paginated by
         // part-number-marker.
         if let Some(upload_id) = query_param(&query, "uploadId") {
-            let max_parts = match util::page_size(&query, "max-parts", MAX_PARTS, MAX_PARTS) {
+            // Each an `int`, not negative, as S3 has them (probed).
+            let max_parts = match util::part_parameter(&query, "max-parts", MAX_PARTS as i32, MAX_PARTS as i32) {
+                Ok(n) => i64::from(n),
+                Err(refused) => return Ok(box_response(refused)),
+            };
+            let marker = match util::part_parameter(&query, "part-number-marker", 0, i32::MAX) {
                 Ok(n) => n,
                 Err(refused) => return Ok(box_response(refused)),
             };
-            let marker = query_param(&query, "part-number-marker")
-                .and_then(|v| v.parse::<i32>().ok())
-                .unwrap_or(0);
             let resp =
                 list_parts(&app, &bucket, &key, &upload_id, marker, max_parts, customer_key.as_ref(), role).await?;
             return Ok(box_response(resp));
@@ -969,7 +996,11 @@ async fn handle_request(
             abort_multipart_upload(&app, &bucket, &key, &upload_id).await?
         }
         hyper::Method::DELETE => {
-            delete_object(&app, &bucket, &key, version_id.as_deref(), bypass).await?
+            if let Some(refused) = objects::delete::refuse_conditions(req.headers(), version_id.as_deref()) {
+                return Ok(box_response(refused));
+            }
+            let if_match = req.headers().get(hyper::header::IF_MATCH).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
+            delete_object(&app, &bucket, &key, version_id.as_deref(), bypass, if_match.as_deref()).await?
         }
         // CreateMultipartUpload
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {
@@ -1000,12 +1031,17 @@ async fn handle_request(
                 Ok(size) => size,
                 Err(refused) => return Ok(box_response(refused)),
             };
+            if let Some(refused) = preconditions.unsupported_on_complete() {
+                return Ok(box_response(refused));
+            }
+            let location = objects::post::object_location(req.headers(), &bucket, route.virtual_host);
             match read_body(req, &secret, false).await? {
                 Ok(body) => {
                     let upload_id = query_param(&query, "uploadId").unwrap_or_default();
                     let customer_key = customer_key.as_ref();
-                    complete_multipart_upload(
+                    complete::complete_multipart_upload_at(
                         &app, &bucket, &key, &upload_id, body, &preconditions, customer_key, role, expected_size, claimed,
+                        location.as_deref(),
                     )
                     .await?
                 }
@@ -1098,15 +1134,24 @@ async fn handle_request(
                 &metadata,
                 tags.as_deref(),
                 &copy_source_preconditions,
-                CopyKeys { source: source_key.as_ref(), dest: wanted, role, checksum, lock, conditions: Some(&preconditions) },
+                CopyKeys {
+                    source: source_key.as_ref(),
+                    dest: wanted,
+                    role,
+                    checksum,
+                    lock,
+                    conditions: Some(&preconditions),
+                    restates: ["x-amz-storage-class", "x-amz-website-redirect-location"]
+                        .iter()
+                        .any(|name| req.headers().contains_key(*name)),
+                },
             )
             .await?
         }
         hyper::Method::PUT => match (payload.and_then(|payload| payload.at_most(util::MAX_UPLOAD)), metadata, tags) {
             (Ok(payload), Ok(metadata), Ok(tags)) => {
-                if let Err(refused) = checksums::check_put_type(req.headers(), payload.declared_algorithm()) {
-                    return Ok(box_response(refused));
-                }
+                // Its x-amz-checksum-type is ignored, whatever it is, as S3
+                // ignores it (probed).
                 // A retained object's body must declare a checksum, as in S3.
                 if !object_lock::declares_checksum(req.headers()) && object_lock::needs_checksum(&app, &bucket, &lock).await? {
                     return Ok(box_response(object_lock::missing_checksum()));

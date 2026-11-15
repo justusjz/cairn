@@ -284,6 +284,17 @@ async fn respond(
         .map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body is too large, or broken"))?
         .to_bytes();
     let query = parts.uri.query().unwrap_or("");
+    let mut params = HashMap::new();
+    Params::parse(query, &mut params)?;
+    if !body.is_empty() {
+        let text = std::str::from_utf8(&body).map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body isn't UTF-8"))?;
+        Params::parse(text, &mut params)?;
+    }
+    let params = Params(params);
+    let action = params.required("Action")?.to_owned();
+    if signed.service == "iam" && !IAM_ACTIONS.contains(&action.as_str()) {
+        return Err(invalid_action(&action));
+    }
     let client = app.pool.get().await?;
     let invalid_token = || error(StatusCode::FORBIDDEN, "InvalidClientTokenId", "The security token included in the request is invalid.");
     let principal = match Principal::authenticate(&client, &app.sessions, &signed.access_key, signed.token.as_deref()).await? {
@@ -299,14 +310,6 @@ async fn respond(
     };
     crate::auth::verify_sigv4_with_body(parts.method.as_str(), parts.uri.path(), query, &parts.headers, &principal.secret, &body)
         .map_err(|r| error(r.status, if r.code == "SignatureDoesNotMatch" { "SignatureDoesNotMatch" } else { "AccessDenied" }, r.message))?;
-    let mut params = HashMap::new();
-    Params::parse(query, &mut params)?;
-    if !body.is_empty() {
-        let text = std::str::from_utf8(&body).map_err(|_| error(StatusCode::BAD_REQUEST, "MalformedQueryString", "the request's body isn't UTF-8"))?;
-        Params::parse(text, &mut params)?;
-    }
-    let params = Params(params);
-    let action = params.required("Action")?.to_owned();
     let origin = Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: Some(signed), form: false };
     let mut access = Access::new(Some(&principal), &principal.account, &parts.method, &parts.headers, "", &origin)?;
     let mut iam = Iam { app, client: &client, principal: &principal, access: &mut access };
@@ -396,6 +399,65 @@ async fn respond(
     };
     Ok((action, inner))
 }
+
+/// IAM's 404 for an action it doesn't have (probed), which it answers before
+/// it checks the request's signature.
+fn invalid_action(action: &str) -> Error {
+    error(StatusCode::NOT_FOUND, "InvalidAction", format!("Could not find operation {action} for version 2010-05-08"))
+}
+
+/// IAM's actions (botocore's model of API version 2010-05-08): one Cairn
+/// doesn't implement is a 501, one IAM doesn't have its 404.
+const IAM_ACTIONS: &[&str] = &[
+    "AcceptDelegationRequest", "AcquireRole", "AddClientIDToOpenIDConnectProvider",
+    "AddRoleToInstanceProfile", "AddUserToGroup", "AssociateDelegationRequest", "AttachGroupPolicy",
+    "AttachRolePolicy", "AttachUserPolicy", "ChangePassword", "CreateAccessKey", "CreateAccountAlias",
+    "CreateDelegationRequest", "CreateGroup", "CreateInstanceProfile", "CreateLoginProfile",
+    "CreateOpenIDConnectProvider", "CreatePolicy", "CreatePolicyVersion", "CreateRole", "CreateSAMLProvider",
+    "CreateServiceLinkedRole", "CreateServiceSpecificCredential", "CreateUser", "CreateVirtualMFADevice",
+    "DeactivateMFADevice", "DeleteAccessKey", "DeleteAccountAlias", "DeleteAccountPasswordPolicy",
+    "DeleteGroup", "DeleteGroupPolicy", "DeleteInstanceProfile", "DeleteLoginProfile",
+    "DeleteOpenIDConnectProvider", "DeletePolicy", "DeletePolicyVersion", "DeleteRole",
+    "DeleteRolePermissionsBoundary", "DeleteRolePolicy", "DeleteSAMLProvider", "DeleteSSHPublicKey",
+    "DeleteServerCertificate", "DeleteServiceLinkedRole", "DeleteServiceSpecificCredential",
+    "DeleteSigningCertificate", "DeleteUser", "DeleteUserPermissionsBoundary", "DeleteUserPolicy",
+    "DeleteVirtualMFADevice", "DetachGroupPolicy", "DetachRolePolicy", "DetachUserPolicy",
+    "DisableOrganizationsRootCredentialsManagement", "DisableOrganizationsRootSessions",
+    "DisableOutboundWebIdentityFederation", "EnableMFADevice",
+    "EnableOrganizationsRootCredentialsManagement", "EnableOrganizationsRootSessions",
+    "EnableOutboundWebIdentityFederation", "GenerateCredentialReport", "GenerateOrganizationsAccessReport",
+    "GenerateServiceLastAccessedDetails", "GetAccessKeyLastUsed", "GetAccountAuthorizationDetails",
+    "GetAccountPasswordPolicy", "GetAccountProperties", "GetAccountSummary", "GetContextKeysForCustomPolicy",
+    "GetContextKeysForPrincipalPolicy", "GetCredentialReport", "GetDelegationRequest", "GetGroup",
+    "GetGroupPolicy", "GetHumanReadableSummary", "GetInstanceProfile", "GetLoginProfile", "GetMFADevice",
+    "GetOpenIDConnectProvider", "GetOrganizationsAccessReport", "GetOutboundWebIdentityFederationInfo",
+    "GetPolicy", "GetPolicyVersion", "GetRole", "GetRolePolicy", "GetRoleTemplateVersion", "GetSAMLProvider",
+    "GetSSHPublicKey", "GetServerCertificate", "GetServiceLastAccessedDetails",
+    "GetServiceLastAccessedDetailsWithEntities", "GetServiceLinkedRoleDeletionStatus", "GetUser",
+    "GetUserPolicy", "ListAccessKeys", "ListAccountAliases", "ListAttachedGroupPolicies",
+    "ListAttachedRolePolicies", "ListAttachedUserPolicies", "ListDelegationRequests",
+    "ListEntitiesForPolicy", "ListGroupPolicies", "ListGroups", "ListGroupsForUser",
+    "ListInstanceProfileTags", "ListInstanceProfiles", "ListInstanceProfilesForRole", "ListMFADeviceTags",
+    "ListMFADevices", "ListOpenIDConnectProviderTags", "ListOpenIDConnectProviders",
+    "ListOrganizationsFeatures", "ListPolicies", "ListPoliciesGrantingServiceAccess", "ListPolicyTags",
+    "ListPolicyVersions", "ListRolePolicies", "ListRoleTags", "ListRoles", "ListSAMLProviderTags",
+    "ListSAMLProviders", "ListSSHPublicKeys", "ListServerCertificateTags", "ListServerCertificates",
+    "ListServiceSpecificCredentials", "ListSigningCertificates", "ListUserPolicies", "ListUserTags",
+    "ListUsers", "ListVirtualMFADevices", "PutAccountProperties", "PutGroupPolicy",
+    "PutRolePermissionsBoundary", "PutRolePolicy", "PutUserPermissionsBoundary", "PutUserPolicy",
+    "RejectDelegationRequest", "RemoveClientIDFromOpenIDConnectProvider", "RemoveRoleFromInstanceProfile",
+    "RemoveUserFromGroup", "ResetServiceSpecificCredential", "ResyncMFADevice", "SendDelegationToken",
+    "SetDefaultPolicyVersion", "SetSecurityTokenServicePreferences", "SimulateCustomPolicy",
+    "SimulatePrincipalPolicy", "TagInstanceProfile", "TagMFADevice", "TagOpenIDConnectProvider", "TagPolicy",
+    "TagRole", "TagSAMLProvider", "TagServerCertificate", "TagUser", "UntagInstanceProfile",
+    "UntagMFADevice", "UntagOpenIDConnectProvider", "UntagPolicy", "UntagRole", "UntagSAMLProvider",
+    "UntagServerCertificate", "UntagUser", "UpdateAccessKey", "UpdateAccountPasswordPolicy",
+    "UpdateAssumeRolePolicy", "UpdateDelegationRequest", "UpdateGroup", "UpdateLoginProfile",
+    "UpdateOpenIDConnectProviderThumbprint", "UpdateRole", "UpdateRoleDescription", "UpdateSAMLProvider",
+    "UpdateSSHPublicKey", "UpdateServerCertificate", "UpdateServiceSpecificCredential",
+    "UpdateSigningCertificate", "UpdateUser", "UploadSSHPublicKey", "UploadServerCertificate",
+    "UploadSigningCertificate",
+];
 
 /// A user's ID as IAM shows one (`AIDA`, then 17 characters), from its
 /// Cairn ID, which never changes or comes back.

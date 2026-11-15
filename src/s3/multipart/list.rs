@@ -73,6 +73,8 @@ pub async fn list_multipart_uploads(
     let truncated = rows.len() as i64 > max_uploads && max_uploads > 0;
     let kept = &rows[..(max_uploads as usize).min(rows.len())];
 
+    // The account's, as the ACL stub has it; Cairn doesn't keep who began each.
+    let owner_id = crate::s3::util::canonical_id(&crate::users::account(&app.pool.get().await?).await?);
     let mut uploads = String::new();
     let mut prefixes = String::new();
     for row in kept {
@@ -87,7 +89,7 @@ pub async fn list_multipart_uploads(
         let initiated: &str = row.get("initiated");
         let checksum = crate::s3::checksums::listed(row, 4);
         uploads.push_str(&format!(
-            "<Upload><Key>{}</Key><UploadId>{upload_id}</UploadId>{INITIATOR}{OWNER}\
+            "<Upload><Key>{}</Key><UploadId>{upload_id}</UploadId><Initiator><ID>{owner_id}</ID></Initiator><Owner><ID>{owner_id}</ID></Owner>\
              <StorageClass>STANDARD</StorageClass><Initiated>{initiated}</Initiated>{checksum}</Upload>",
             encoding.xml(row.get("key")),
         ));
@@ -106,40 +108,32 @@ pub async fn list_multipart_uploads(
         "<UploadIdMarker>{}</UploadIdMarker>",
         xml_escape(upload_id_marker.unwrap_or(""))
     ));
-    body.push_str(&format!("<Prefix>{}</Prefix>", encoding.xml(prefix)));
+    // The next page resumes after the last entry kept: after that upload of its
+    // key, or past a whole common prefix, which is then the key marker. S3
+    // tells them truncated or not (probed); an empty page (max_uploads == 0)
+    // can't advance on its own, so it hands back the incoming markers.
+    let (next_key, next_upload) = match kept.last() {
+        Some(row) if row.get::<_, bool>("is_prefix") => (row.get::<_, String>("key"), None),
+        Some(row) => (row.get::<_, String>("key"), Some(row.get::<_, Uuid>("upload_id").to_string())),
+        None if max_uploads == 0 => (key_marker.to_owned(), upload_id_marker.map(str::to_owned)),
+        None => (String::new(), None),
+    };
+    body.push_str(&format!("<NextKeyMarker>{}</NextKeyMarker>", encoding.xml(&next_key)));
+    body.push_str(&format!(
+        "<NextUploadIdMarker>{}</NextUploadIdMarker>",
+        xml_escape(next_upload.as_deref().unwrap_or(""))
+    ));
+    // In S3's order (probed).
     if let Some(d) = delimiter {
         body.push_str(&format!("<Delimiter>{}</Delimiter>", encoding.xml(d)));
     }
+    body.push_str(&format!("<Prefix>{}</Prefix>", encoding.xml(prefix)));
     body.push_str(&format!("<MaxUploads>{max_uploads}</MaxUploads>"));
     body.push_str(encoding.element());
     body.push_str(&format!("<IsTruncated>{truncated}</IsTruncated>"));
-    // The next page resumes after the last entry kept: after that upload of its
-    // key, or past a whole common prefix, which is then the key marker. An empty
-    // page (max_uploads == 0) can't advance on its own, so it hands back the
-    // incoming markers.
-    if truncated {
-        let (next_key, next_upload) = match kept.last() {
-            Some(row) if row.get::<_, bool>("is_prefix") => (row.get::<_, String>("key"), None),
-            Some(row) => (
-                row.get::<_, String>("key"),
-                Some(row.get::<_, Uuid>("upload_id").to_string()),
-            ),
-            None => (key_marker.to_owned(), upload_id_marker.map(str::to_owned)),
-        };
-        body.push_str(&format!(
-            "<NextKeyMarker>{}</NextKeyMarker>",
-            encoding.xml(&next_key)
-        ));
-        if let Some(u) = next_upload {
-            body.push_str(&format!("<NextUploadIdMarker>{}</NextUploadIdMarker>", xml_escape(&u)));
-        }
-    }
     body.push_str(&uploads);
     body.push_str(&prefixes);
     body.push_str("</ListMultipartUploadsResult>");
     Ok(xml_ok(body))
 }
 
-/// The fixed initiator and owner Cairn reports, matching the ACL stub.
-const INITIATOR: &str = "<Initiator><ID>cairn</ID><DisplayName>cairn</DisplayName></Initiator>";
-const OWNER: &str = "<Owner><ID>cairn</ID><DisplayName>cairn</DisplayName></Owner>";

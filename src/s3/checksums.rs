@@ -276,21 +276,6 @@ pub fn invalid() -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
     crate::s3::util::format_s3_error(hyper::StatusCode::BAD_REQUEST, "InvalidArgument", "Invalid checksum provided.")
 }
 
-/// Checks a PutObject's `x-amz-checksum-type`, as MinIO does (S3 documents
-/// none): FULL_OBJECT only with a CRC, COMPOSITE taken and ignored, and
-/// nothing else. `sent` is the algorithm of the checksum the body comes with.
-pub fn check_put_type(
-    headers: &hyper::HeaderMap,
-    sent: Option<Algorithm>,
-) -> Result<(), hyper::Response<http_body_util::Full<hyper::body::Bytes>>> {
-    let Some(value) = headers.get(TYPE) else { return Ok(()) };
-    match value.to_str().ok().and_then(Type::from_name) {
-        Some(Type::Composite) => Ok(()),
-        Some(Type::FullObject) if sent.is_none_or(Algorithm::combines) => Ok(()),
-        _ => Err(invalid()),
-    }
-}
-
 /// What a CreateMultipartUpload asks for (`x-amz-checksum-algorithm`,
 /// `x-amz-checksum-type`), as MinIO takes it (S3 documents only that
 /// CRC64NVME is always FULL_OBJECT): an algorithm's type defaults to

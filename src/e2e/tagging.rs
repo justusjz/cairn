@@ -195,7 +195,7 @@ async fn each_version_has_its_own_tags() {
     assert_eq!(tags_of(&app, "v", Some(&old)).await.2, "v=a2");
     assert_eq!(tags_of(&app, "v", None).await, (StatusCode::OK, Some(new.clone()), "v=b".to_owned()));
     // A delete marker has none: 405, named or current, as S3 answers.
-    let deleted = delete_object(&app, BUCKET, "v", None, false).await.unwrap();
+    let deleted = delete_object(&app, BUCKET, "v", None, false, None).await.unwrap();
     let marker = header(deleted.headers(), "x-amz-version-id").unwrap().to_owned();
     for version in [None, Some(marker.as_str())] {
         for response in [

@@ -124,7 +124,7 @@ async fn a_retried_completion_succeeds_again() {
     assert_eq!(complete(&app, "v", &upload_id, &parts).await, first);
     super::put(&app, "v", b"newer".to_vec()).await;
     assert_eq!(complete(&app, "v", &upload_id, &parts).await, first);
-    let response = delete_object(&app, BUCKET, "v", Some(&version_id), false).await.unwrap();
+    let response = delete_object(&app, BUCKET, "v", Some(&version_id), false, None).await.unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
     assert_eq!(complete(&app, "v", &upload_id, &parts).await, not_found);
 }

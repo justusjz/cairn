@@ -33,23 +33,31 @@ pub fn xml_ok(body: String) -> Response<Full<Bytes>> {
         .unwrap()
 }
 
+/// The canonical user ID S3 would name `account`'s owner by (64 hex digits,
+/// as S3's are): a hash of its ID, since Cairn has no other. S3 no longer
+/// sends display names with it.
+pub fn canonical_id(account: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(format!("cairn canonical user {account}")).iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// A fixed AccessControlPolicy. Cairn doesn't model ACLs, so every bucket and
-/// object reports owner "cairn" with FULL_CONTROL. This lets clients that probe
-/// ACLs (e.g. `s3cmd info`, which issues a `?acl` GET) parse a valid response
-/// instead of choking on object bytes.
-pub fn stub_acl() -> Response<Full<Bytes>> {
-    xml_ok(
+/// object reports its owner, the account (by `owner_id`, its canonical ID),
+/// with FULL_CONTROL, as S3 does with ACLs disabled. This lets clients that
+/// probe ACLs (e.g. `s3cmd info`, which issues a `?acl` GET) parse a valid
+/// response instead of choking on object bytes.
+pub fn stub_acl(owner_id: &str) -> Response<Full<Bytes>> {
+    xml_ok(format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <AccessControlPolicy xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <Owner><ID>cairn</ID><DisplayName>cairn</DisplayName></Owner>\
+         <Owner><ID>{owner_id}</ID></Owner>\
          <AccessControlList><Grant>\
          <Grantee xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:type=\"CanonicalUser\">\
-         <ID>cairn</ID><DisplayName>cairn</DisplayName></Grantee>\
+         <ID>{owner_id}</ID></Grantee>\
          <Permission>FULL_CONTROL</Permission>\
          </Grant></AccessControlList>\
          </AccessControlPolicy>"
-            .to_string(),
-    )
+    ))
 }
 
 const XML: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>";
@@ -65,10 +73,10 @@ const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 ///
 /// Existence-agnostic, like [`stub_acl`] — clients probe these on buckets they're
 /// already using.
-pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
+pub fn bucket_subresource_stub(query: &str, owner_id: &str) -> Option<Response<Full<Bytes>>> {
     let present = |name| query_param(query, name).is_some();
     if present("acl") {
-        Some(stub_acl())
+        Some(stub_acl(owner_id))
     } else if present("location") {
         Some(xml_ok(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
@@ -96,6 +104,11 @@ pub fn bucket_subresource_stub(query: &str) -> Option<Response<Full<Bytes>>> {
         )))
     } else if present("logging") {
         Some(xml_ok(format!("{XML}<BucketLoggingStatus xmlns=\"{S3_XMLNS}\"/>")))
+    } else if present("abac") {
+        // Attribute-based access control by the bucket's tags, which Cairn's
+        // policies don't do (see `s3::access`): disabled, as a bucket's is by
+        // default (probed).
+        Some(xml_ok(format!("{XML}<AbacStatus xmlns=\"{S3_XMLNS}\"><Status>Disabled</Status></AbacStatus>")))
     } else if present("notification") {
         Some(xml_ok(format!("{XML}<NotificationConfiguration xmlns=\"{S3_XMLNS}\"/>")))
     } else {
@@ -119,6 +132,39 @@ pub fn invalid_part_number(text: &str) -> Response<Full<Bytes>> {
     rejection.details.push(("ArgumentName", "partNumber".to_owned()));
     rejection.details.push(("ArgumentValue", text.to_owned()));
     rejection_response(&rejection)
+}
+
+/// S3's 501 for a request header asking for what it doesn't do (probed),
+/// naming the header, and saying why if `additional` does.
+pub fn header_not_implemented(header: &str, additional: Option<&str>) -> Response<Full<Bytes>> {
+    let mut rejection = Rejection::new(
+        StatusCode::NOT_IMPLEMENTED,
+        "NotImplemented",
+        "A header you provided implies functionality that is not implemented",
+    );
+    rejection.details.push(("Header", header.to_owned()));
+    if let Some(additional) = additional {
+        rejection.details.push(("additionalMessage", additional.to_owned()));
+    }
+    rejection_response(&rejection)
+}
+
+/// S3's refusal of a request whose `x-amz-expected-bucket-owner` (or, for a
+/// copy's source, `x-amz-source-expected-bucket-owner`) isn't the bucket's
+/// owner, `account`, which owns every bucket (probed): 400 for one that isn't
+/// an account ID, 403 for another account's.
+pub fn unexpected_owner(headers: &hyper::HeaderMap, account: &str) -> Option<Response<Full<Bytes>>> {
+    ["x-amz-expected-bucket-owner", "x-amz-source-expected-bucket-owner"].into_iter().find_map(|name| {
+        let value = String::from_utf8_lossy(headers.get(name)?.as_bytes()).into_owned();
+        if value.len() != 12 || !value.bytes().all(|b| b.is_ascii_digit()) {
+            return Some(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidBucketOwnerAWSAccountID",
+                &format!("The value of the expected bucket owner parameter must be an AWS Account ID... [{value}]"),
+            ));
+        }
+        (value != account).then(|| format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"))
+    })
 }
 
 /// Sets `x-amz-version-id` on a response, if there's a version ID to report.
@@ -250,6 +296,7 @@ pub const MAX_OBJECT: u64 = 5 << 40;
 /// delete it, or a bucket. Other parameters are ignored, as S3 ignores them
 /// (SDKs add some, like `x-id`).
 const SUBRESOURCES: &[&str] = &[
+    "abac",
     "accelerate",
     "acl",
     "analytics",
@@ -317,6 +364,7 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "logging",
             "notification",
             "publicAccessBlock",
+            "abac",
             // Ignored, as S3 ignores it on a bucket (probed): a listing.
             "attributes",
         ],
@@ -334,6 +382,7 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "publicAccessBlock",
             "object-lock",
             "website",
+            "ownershipControls",
         ],
         (true, &Method::POST) => &["delete"],
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
@@ -402,14 +451,16 @@ pub enum Encoding {
     Url,
 }
 
-/// What `encoding-type=url` leaves as it is, as S3 does: unreserved characters
-/// and `/`.
+/// What `encoding-type=url` leaves as it is, as S3 does (probed): letters,
+/// digits, `-`, `_`, `.`, `*` and `/`. A space becomes `+` (see
+/// `Encoding::xml`), and everything else, `~` too, is percent-encoded.
 const URL_KEEPS: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'-')
     .remove(b'_')
     .remove(b'.')
-    .remove(b'~')
-    .remove(b'/');
+    .remove(b'*')
+    .remove(b'/')
+    .remove(b' ');
 
 impl Encoding {
     /// `encoding-type`, or the error to refuse a listing with.
@@ -429,7 +480,7 @@ impl Encoding {
     pub fn xml(self, s: &str) -> String {
         match self {
             Encoding::Plain => xml_escape(s),
-            Encoding::Url => utf8_percent_encode(s, URL_KEEPS).to_string(),
+            Encoding::Url => utf8_percent_encode(s, URL_KEEPS).to_string().replace(' ', "+"),
         }
     }
 
@@ -455,13 +506,36 @@ pub fn page_size(
         None => Ok(default),
         Some(v) => match v.trim().parse::<i64>() {
             Ok(n) if n >= 0 => Ok(n.min(max)),
-            _ => Err(format_s3_error(
-                StatusCode::BAD_REQUEST,
-                "InvalidArgument",
-                &format!("Provided {name} not an integer or within integer range"),
-            )),
+            _ => Err(invalid_integer(name, &v, false)),
         },
     }
+}
+
+/// ListParts' `max-parts` or `part-number-marker`: `default` if absent, at
+/// most `max`, or S3's 400 for one that isn't an `int` (probed), whose
+/// message says which way it's wrong.
+pub fn part_parameter(query: &str, name: &str, default: i32, max: i32) -> Result<i32, Response<Full<Bytes>>> {
+    match query_param(query, name) {
+        None => Ok(default),
+        Some(v) => match v.parse::<i32>() {
+            Ok(n) if n >= 0 => Ok(n.min(max)),
+            Ok(_) => Err(invalid_integer(name, &v, true)),
+            Err(_) => Err(invalid_integer(name, &v, false)),
+        },
+    }
+}
+
+/// S3's 400 for a parameter that should be a whole number: one that isn't (or
+/// is too big), or a `negative` one.
+fn invalid_integer(name: &str, value: &str, negative: bool) -> Response<Full<Bytes>> {
+    let message = match negative {
+        true => format!("Argument {name} must be an integer between 0 and 2147483647"),
+        false => format!("Provided {name} not an integer or within integer range"),
+    };
+    let mut rejection = Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", &message);
+    rejection.details.push(("ArgumentName", name.to_owned()));
+    rejection.details.push(("ArgumentValue", value.to_owned()));
+    rejection_response(&rejection)
 }
 
 /// A listing's delimiter: none if absent or empty, as S3 takes an empty one.
@@ -525,8 +599,8 @@ mod tests {
     #[test]
     fn listings_encode_and_page_as_s3_does() {
         assert_eq!(
-            Encoding::Url.xml("foo+1/quux ab/a&b~-_."),
-            "foo%2B1/quux%20ab/a%26b~-_."
+            Encoding::Url.xml("foo+1/quux ab/a&b~-_.*\u{e9}"),
+            "foo%2B1/quux+ab/a%26b%7E-_.*%C3%A9"
         );
         assert_eq!(Encoding::Plain.xml("a&b"), "a&amp;b");
         assert_eq!(

@@ -370,7 +370,7 @@ pub async fn get_sealed(
 }
 
 pub async fn delete(app: &Arc<App>, key: &str) {
-    let response = objects::delete::delete_object(app, BUCKET, key, None, false)
+    let response = objects::delete::delete_object(app, BUCKET, key, None, false, None)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);

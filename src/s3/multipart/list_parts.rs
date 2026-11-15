@@ -1,5 +1,5 @@
 use http_body_util::Full;
-use hyper::{Response, StatusCode, body::Bytes};
+use hyper::{Response, body::Bytes};
 use uuid::Uuid;
 
 use crate::db::Cached;
@@ -9,7 +9,7 @@ use crate::{
     s3::multipart::{Upload, checksum_columns},
     s3::sse::{self, Stored},
     s3::sse_c::CustomerKey,
-    s3::util::{format_s3_error, xml_escape, xml_ok},
+    s3::util::{xml_escape, xml_ok},
 };
 
 /// The most parts a page lists, as in S3.
@@ -31,7 +31,7 @@ pub async fn list_parts(
     role: Option<Uuid>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let Ok(upload) = Uuid::parse_str(upload_id) else {
-        return Ok(no_such_upload());
+        return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
     };
     let mut client = app.pool.get().await?;
     // The upload and its parts as of one moment.
@@ -52,7 +52,7 @@ pub async fn list_parts(
         .await?
         .map(|row| (Stored::from_row(&row, 0), checksum_columns(&row, 6)))
     else {
-        return Ok(no_such_upload());
+        return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
     };
     let upload_info = Upload { encryption, checksum };
     // One more than a page, to tell whether there's more.
@@ -101,9 +101,13 @@ pub async fn list_parts(
         (None, _) => None,
     };
 
-    let truncated = rows.len() as i64 > max_parts;
+    // A page of none tells nothing about what's left, so S3 says there's
+    // nothing (probed).
+    let truncated = rows.len() as i64 > max_parts && max_parts > 0;
     let kept = kept_rows(&rows, max_parts);
-    let owner = "<ID>cairn</ID><DisplayName>cairn</DisplayName>";
+    // The account's, as the ACL stub has it; Cairn doesn't keep who began it.
+    let account = crate::users::account(&app.pool.get().await?).await?;
+    let owner = format!("<ID>{}</ID>", crate::s3::util::canonical_id(&account));
     let mut body = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
@@ -113,7 +117,10 @@ pub async fn list_parts(
          <PartNumberMarker>{part_number_marker}</PartNumberMarker>",
         xml_escape(bucket),
         xml_escape(key),
-        upload_info.object_checksum().map_or(String::new(), |(algorithm, kind)| format!(
+        // Only for an upload its client asked a checksum of, as
+        // ListMultipartUploads tells it, and S3 does (probed): not the
+        // default CRC64NVME.
+        upload_info.checksum.map_or(String::new(), |(algorithm, kind)| format!(
             "<ChecksumAlgorithm>{}</ChecksumAlgorithm><ChecksumType>{}</ChecksumType>",
             algorithm.name(),
             kind.name()
@@ -168,10 +175,3 @@ fn kept_rows(rows: &[tokio_postgres::Row], max_parts: i64) -> &[tokio_postgres::
     &rows[..(max_parts as usize).min(rows.len())]
 }
 
-fn no_such_upload() -> Response<Full<Bytes>> {
-    format_s3_error(
-        StatusCode::NOT_FOUND,
-        "NoSuchUpload",
-        "the specified multipart upload does not exist",
-    )
-}
