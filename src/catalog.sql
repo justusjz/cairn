@@ -1622,13 +1622,50 @@ END
 $$;
 
 -- T23: PutBucketTagging and DeleteBucketTagging: sets (or, with NULL,
--- removes) the bucket's tags. A plain UPDATE of the bucket's row, as T21's.
--- Returns whether the bucket exists.
+-- removes) the bucket's tags, unless its ABAC is enabled (then only T56
+-- changes them, as in S3). A plain UPDATE of the bucket's row, as T21's;
+-- ABAC is a column of the same row, which the UPDATE re-checks after any
+-- wait (F2), so a concurrent T55 is never missed. Returns 'ok', 'abac' (not
+-- set), or 'missing' (no such bucket).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_set_bucket_tags(p_bucket text, p_tags text)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE buckets SET tags = p_tags WHERE name = p_bucket AND NOT abac;
+    IF FOUND THEN
+        RETURN 'ok';
+    END IF;
+    PERFORM 1 FROM buckets WHERE name = p_bucket;
+    RETURN CASE WHEN FOUND THEN 'abac' ELSE 'missing' END;
+END
+$$;
+
+-- T55: PutBucketAbac: enables or disables the bucket's ABAC (whether its tags
+-- are its `aws:ResourceTag`s, see `s3::access`). A plain UPDATE of the
+-- bucket's row, as T21's. Returns whether the bucket exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_bucket_abac(p_bucket text, p_abac boolean)
 RETURNS boolean LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE buckets SET tags = p_tags WHERE name = p_bucket;
+    UPDATE buckets SET abac = p_abac WHERE name = p_bucket;
     RETURN FOUND;
+END
+$$;
+
+-- T56: S3 Control's TagResource and UntagResource on a bucket: replaces its
+-- tags `p_old` (as the caller read them, NULL for none) with `p_new`, which
+-- the caller computed from them, whatever its ABAC. A compare-and-swap: a
+-- plain UPDATE of the bucket's row whose WHERE re-checks the row's own
+-- `tags` after any wait (F2), so of two concurrent changes the second finds
+-- the tags moved, and the caller reads them again. Returns 'ok', 'moved' or
+-- 'missing' (no such bucket).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_swap_bucket_tags(p_bucket text, p_old text, p_new text)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE buckets SET tags = p_new WHERE name = p_bucket AND tags IS NOT DISTINCT FROM p_old;
+    IF FOUND THEN
+        RETURN 'ok';
+    END IF;
+    PERFORM 1 FROM buckets WHERE name = p_bucket;
+    RETURN CASE WHEN FOUND THEN 'moved' ELSE 'missing' END;
 END
 $$;
 

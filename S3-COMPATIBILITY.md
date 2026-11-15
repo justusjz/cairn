@@ -43,7 +43,7 @@ supported.
 | Multipart uploads, including UploadPartCopy | ✅ | |
 | ListObjects (v1, v2), ListObjectVersions, ListMultipartUploads, ListParts | ✅ | |
 | User-defined metadata | ✅ | |
-| Object and bucket tags | ✅ | Not usable in policy conditions: [Policies](#policies). |
+| Object and bucket tags | ✅ | Bucket tags through S3 Control's TagResource too. |
 | Checksums: CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256, full-object and composite | ✅ | |
 | Checksums: MD5, SHA-512, XXHash | ❌ | |
 | Versioning | ✅ | Without MFA delete. |
@@ -68,7 +68,7 @@ supported.
 | Block Public Access, for buckets and the account | ✅ | |
 | ACLs | 🟡 | Disabled, as on new S3 buckets: [ACLs](#acls) |
 | Object Ownership | 🟡 | Always `BucketOwnerEnforced`: [ACLs](#acls) |
-| Bucket ABAC (bucket tags in policies) | ❌ | Always reported `Disabled`. |
+| Bucket ABAC (bucket tags in policies) | ✅ | |
 | MFA delete | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
@@ -89,11 +89,13 @@ S3 reports a bucket that doesn't use it:
 
 ### Regions and accounts
 
-- **No regions.** A credential scope may name any region. Buckets report
-  `us-east-1`: GetBucketLocation answers an empty `LocationConstraint`, and
-  `x-amz-bucket-region` is `us-east-1`. CreateBucket ignores its
-  `LocationConstraint`, and creating a bucket you already own answers `200`,
-  as in `us-east-1`. ListBuckets has no `BucketRegion`.
+- **No regions.** A credential scope may name any region. Every bucket is in
+  `us-east-1`, and behaves as S3's buckets there do: GetBucketLocation
+  answers an empty `LocationConstraint`, and `x-amz-bucket-region` is
+  `us-east-1`. (So creating a bucket you already own answers `200`, as in
+  `us-east-1`, not `409 BucketAlreadyOwnedByYou`, as in other regions.)
+  CreateBucket ignores its `LocationConstraint`. ListBuckets has no
+  `BucketRegion`.
 - **One account.** A cluster has one account, which owns every bucket, user,
   role and policy. Its canonical user ID is derived from the account ID.
   There are no Organizations, so no SCPs, RCPs or organization condition keys.
@@ -168,6 +170,8 @@ and refuses too. The difference is that ACLs can't be enabled:
   upload is always FULL_OBJECT, even if COMPOSITE is asked for (as in MinIO).
 - **Metadata:** an RFC 2047 encoded word that doesn't decode is stored as
   sent. S3 fails such a request with a `500`.
+- **CreateBucket's tags:** a key given twice is `400 InvalidTag`, as in
+  PutBucketTagging. S3 fails such a request with a `500`.
 - **ListObjectsV2 continuation tokens** aren't opaque: they encode the key to
   continue after. A marker that names a common prefix continues after all of
   its keys (as in MinIO).
@@ -178,11 +182,8 @@ The policy language and its evaluation are IAM's: identity policies (inline
 and managed), permissions boundaries, session policies, bucket policies and
 trust policies.
 
-- **Tags can't be used in S3 conditions.** `aws:ResourceTag`,
-  `aws:RequestTag` and `aws:TagKeys` are never present on S3 requests (they
-  are on IAM and STS requests). Policies using `s3:ExistingObjectTag`,
-  `s3:RequestObjectTag`, `s3:RequestObjectTagKeys` or `s3:BucketTag` are
-  refused with `501`.
+- **ABAC takes effect at once.** A bucket's tags and its ABAC setting
+  decide the next request. S3 takes a minute or more to apply them.
 - **Other unsupported S3 keys,** refused with `501`: `s3:TlsVersion`,
   `s3:locationconstraint`, the event-hold keys, `s3:ObjectCreationOperation`,
   `s3:x-amz-object-ownership`, `s3:x-amz-object-if-match`,

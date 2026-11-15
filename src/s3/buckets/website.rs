@@ -114,12 +114,10 @@ impl Invalid {
     /// The response S3 refuses a PutBucketWebsite with.
     pub fn response(&self) -> Response<Full<Bytes>> {
         match self {
-            Invalid::Malformed(why) => format_s3_error(
+            Invalid::Malformed(_) => format_s3_error(
                 StatusCode::BAD_REQUEST,
                 "MalformedXML",
-                &format!(
-                    "The XML you provided was not well-formed or did not validate against our published schema ({why})"
-                ),
+                "The XML you provided was not well-formed or did not validate against our published schema",
             ),
             Invalid::Argument(message, name, value) => {
                 let mut rejection = Rejection::new(StatusCode::BAD_REQUEST, "InvalidArgument", message.clone());
@@ -522,7 +520,7 @@ async fn set(app: &App, bucket: &str, config: Option<&str>) -> anyhow::Result<bo
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
+    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
 }
 
 #[cfg(test)]

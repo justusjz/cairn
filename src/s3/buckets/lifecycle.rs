@@ -44,14 +44,11 @@ pub async fn put_bucket_lifecycle(app: &App, bucket: &str, body: Bytes) -> anyho
         .and_then(Configuration::parse);
     let config = match parsed {
         Ok(config) => config,
-        Err(Invalid::Malformed(why)) => {
+        Err(Invalid::Malformed(_)) => {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
                 "MalformedXML",
-                &format!(
-                    "The XML you provided was not well-formed or did not validate against our \
-                     published schema ({why})"
-                ),
+                "The XML you provided was not well-formed or did not validate against our published schema",
             ));
         }
         Err(Invalid::Argument(why)) => {
@@ -91,5 +88,5 @@ pub(crate) async fn set(app: &App, bucket: &str, config: Option<&str>) -> anyhow
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
+    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
 }

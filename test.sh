@@ -1344,6 +1344,31 @@ tagging_roles_ok() {
     "${w[@]}" s3api delete-object --bucket "$OBUCKET" --key tag/w.bin >/dev/null 2>&1
 }
 
+# ABAC: off by default; on, the bucket's tags are only S3 Control's to change
+# (PutBucketTagging and DeleteBucketTagging are 400s), and `DELETE ?abac` is
+# no DeleteBucket. Who it lets in is the e2e tests' and the probes' (see
+# plans/abac.md).
+abac_ok() {
+    local out="$WORK_DIR/abac-out"
+    [ "$(awss3 s3api get-bucket-abac --bucket "$BUCKET" --query AbacStatus.Status --output text 2>/dev/null)" \
+        = Disabled ] || return 1
+    awss3 s3api put-bucket-tagging --bucket "$BUCKET" --tagging 'TagSet=[{Key=team,Value=red}]' \
+        >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-abac --bucket "$BUCKET" --abac-status Status=Enabled >/dev/null 2>&1 || return 1
+    [ "$(awss3 s3api get-bucket-abac --bucket "$BUCKET" --query AbacStatus.Status --output text 2>/dev/null)" \
+        = Enabled ] || return 1
+    ! awss3 s3api put-bucket-tagging --bucket "$BUCKET" --tagging 'TagSet=[{Key=team,Value=blue}]' \
+        >"$out" 2>&1 || return 1
+    grep -q "initiate a TagResource request" "$out" || return 1
+    ! awss3 s3api delete-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    ! awss3 s3api put-bucket-abac --bucket "$BUCKET" --abac-status Status=enabled >"$out" 2>&1 || return 1
+    grep -q MalformedXML "$out" || return 1
+    [ "$(scurl DELETE "/${BUCKET}?abac" "$EMPTY_SHA256" -)" = 405 ] || return 1
+    awss3 s3api head-bucket --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+    awss3 s3api put-bucket-abac --bucket "$BUCKET" --abac-status Status=Disabled >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket-tagging --bucket "$BUCKET" >/dev/null 2>&1 || return 1
+}
+
 # Bucket sub-resource stubs: location/versioning/accelerate/request payment/
 # logging/notification succeed (200, empty or default config);
 # replication is "not configured" (the client errors on 404), and so are
@@ -2950,6 +2975,7 @@ run_test    "ListMultipartUploads (aws-cli)"         list_uploads_ok
 run_test    "Create second bucket, grant roles"     setup_role_buckets
 run_test    "Read-only role can read, not write"    reader_permissions_ok
 run_test    "Tags: read with read, changed with write" tagging_roles_ok
+run_test    "Bucket ABAC"                           abac_ok
 run_test    "ListBuckets needs ListAllMyBuckets"    list_buckets_denied_ok
 run_test    "Admin has AdministratorAccess"          admin_scope_ok
 run_test    "IAM API: users, keys, inline policies"  iam_api_ok

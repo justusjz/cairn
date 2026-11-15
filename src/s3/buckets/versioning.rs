@@ -155,6 +155,6 @@ fn no_such_bucket() -> Response<Full<Bytes>> {
     format_s3_error(
         StatusCode::NOT_FOUND,
         "NoSuchBucket",
-        "the specified bucket does not exist",
+        "The specified bucket does not exist",
     )
 }

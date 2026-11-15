@@ -173,7 +173,7 @@ pub const BLOCKED: &str = "public policies are blocked by the BlockPublicPolicy 
                            (the bucket's, or its account's)";
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
+    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
 }
 
 fn no_such_policy() -> Response<Full<Bytes>> {

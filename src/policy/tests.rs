@@ -400,9 +400,9 @@ fn refuses_what_s3_refuses() {
     bucket_policy(&format!("{}{}", statement(""), " ".repeat(21 << 10)));
     // What Cairn can't decide yet is refused as not implemented, not ignored;
     // but only once S3 would take the policy.
-    let tags = condition(r#"{"StringEquals":{"s3:ExistingObjectTag/team":"x"}}"#);
-    assert_eq!(refused(&tags, bucket).code, "NotImplemented");
-    let both = condition(r#"{"StringEquals":{"s3:ExistingObjectTag/team":"x","s3:prefix":"x"}}"#);
+    let tls = condition(r#"{"NumericGreaterThan":{"s3:TlsVersion":"1.2"}}"#);
+    assert_eq!(refused(&tls, bucket).code, "NotImplemented");
+    let both = condition(r#"{"NumericGreaterThan":{"s3:TlsVersion":"1.2"},"StringEquals":{"s3:prefix":"x"}}"#);
     assert_eq!(refused(&both, bucket).code, "MalformedPolicy");
     // Statement IDs must be unique in identity policies (IAM's rule).
     let twice = r#"{"Statement":[{"Sid":"a","Effect":"Allow","Action":"s3:GetObject","Resource":"*"},

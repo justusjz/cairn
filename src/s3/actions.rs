@@ -239,8 +239,12 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
         let configuration = CONFIGURATION.iter().find(|(name, _, _)| has(name));
         return match (method.clone(), configuration) {
             // Not configuration grants and templates have (see `manage_actions`):
-            // a stub, and a setting that can't change.
+            // ABAC, which decides what policies testing the bucket's tags
+            // allow, and a setting that can't change.
             (Method::GET, None) if has("abac") => one("GetBucketAbac", "s3:GetBucketAbac", on_bucket()),
+            (Method::PUT, None) if has("abac") => one("PutBucketAbac", "s3:PutBucketAbac", on_bucket()),
+            // Not a DeleteBucket (S3's 405, probed).
+            (_, None) if has("abac") => None,
             (Method::PUT, Some(("ownershipControls", _, _))) => {
                 one("PutBucketOwnershipControls", "s3:PutBucketOwnershipControls", on_bucket())
             }
@@ -281,7 +285,8 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
     let on_object = || On::Object(bucket.to_owned(), key.to_owned());
     let version = has("versionId");
     let versioned = |plain, of_version| if version { of_version } else { plain };
-    let tags = headers.contains_key("x-amz-tagging");
+    // An empty `x-amz-tagging` sets none (probed: no `s3:PutObjectTagging`).
+    let tags = headers.get("x-amz-tagging").is_some_and(|v| !v.is_empty());
     // A write that makes an object: its tags, ACL and Object Lock are
     // actions of their own.
     let writes = |name| {
@@ -502,6 +507,8 @@ mod tests {
             (Method::PUT, "b", "k", "legal-hold", none()),
             (Method::PUT, "b", "k", "", headers(&[("x-amz-object-lock-legal-hold", "ON")])),
             (Method::PUT, "b", "", "", headers(&[("x-amz-bucket-object-lock-enabled", "true")])),
+            (Method::GET, "b", "", "abac", none()),
+            (Method::PUT, "b", "", "abac", none()),
         ]);
         requests
     }
@@ -537,6 +544,7 @@ mod tests {
             operation.checks.into_iter().map(|c| (c.action, c.on.arn())).collect::<Vec<_>>()
         };
         assert_eq!(actions(Method::GET, "k", "versionId=v", &[]), [("s3:GetObjectVersion", "arn:aws:s3:::b/k".to_owned())]);
+        assert_eq!(actions(Method::PUT, "k", "", &[("x-amz-tagging", "")]), [("s3:PutObject", "arn:aws:s3:::b/k".to_owned())]);
         assert_eq!(
             actions(Method::PUT, "k", "", &[("x-amz-tagging", "a=b"), ("x-amz-acl", "private")]),
             [
@@ -557,6 +565,7 @@ mod tests {
             [("s3:DeleteBucketWebsite", "arn:aws:s3:::b".to_owned())]
         );
         assert!(operation(&Method::DELETE, "b", "", "versioning", &HeaderMap::new()).is_none());
+        assert!(operation(&Method::DELETE, "b", "", "abac", &HeaderMap::new()).is_none());
         assert!(operation(&Method::PATCH, "b", "k", "", &HeaderMap::new()).is_none());
     }
 
@@ -644,10 +653,13 @@ mod tests {
         // HeadBucket is `s3:ListBucket`: only `read` (and not a writer, who
         // could HEAD any bucket they could see) may; the bucket policy is
         // for admins only, not everyone who sees the bucket; and setting
-        // a version's Object Lock is no writer's.
+        // a version's Object Lock is no writer's. Nor is reading the
+        // bucket's ABAC (which was a stub, as any configuration a grant
+        // may read) any grant's: what it says decides what policies allow.
         assert_eq!(
             differences,
             [
+                ("GetBucketAbac", true, false),
                 ("GetBucketPolicy", true, false),
                 ("GetBucketPolicyStatus", true, false),
                 ("HeadBucket", true, false),

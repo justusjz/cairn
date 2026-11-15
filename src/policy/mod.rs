@@ -81,9 +81,16 @@ impl Context {
         let keys = name
             .and_then(|name| ACTIONS.iter().find(|(a, _, _)| a.eq_ignore_ascii_case(name)))
             .map_or(&[][..], |(_, _, keys)| *keys);
-        self.values.retain(|key, _| !key.starts_with("s3:") || takes_key(keys, key));
+        self.values.retain(|key, _| !key.starts_with("s3:") || is_bucket_tag(key) || takes_key(keys, key));
         self
     }
+}
+
+/// Whether `key` is an `s3:BucketTag/…`: a key of the bucket (and its
+/// objects), which only checks on those carry (see `s3::access`), rather
+/// than of an action.
+fn is_bucket_tag(key: &str) -> bool {
+    key.get(..13).is_some_and(|prefix| prefix.eq_ignore_ascii_case("s3:buckettag/")) && key.len() > 13
 }
 
 /// Who makes a request.
@@ -881,7 +888,13 @@ impl Statement {
         {
             let s3_keys = conditions.iter().map(|c| c.key()).filter(|k| k.to_ascii_lowercase().starts_with("s3:"));
             for key in s3_keys {
-                if named.iter().any(|actions| !actions.iter().any(|(_, _, keys)| takes_key(keys, key))) {
+                // `s3:BucketTag/…` is the bucket's (and its objects'), not an
+                // action's: any action on either takes it (probed).
+                let takes = |(_, applies, keys): &&(&str, Applies, &[&str])| match is_bucket_tag(key) {
+                    true => matches!(applies, Applies::Bucket | Applies::Object),
+                    false => takes_key(keys, key),
+                };
+                if named.iter().any(|actions| !actions.iter().any(|a| takes(&a))) {
                     return Err(Invalid::malformed(
                         "Conditions do not apply to combination of actions and resources in statement",
                     ));

@@ -153,7 +153,7 @@ const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const CONTROL_XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
+    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
 }
 
 /// GetPublicAccessBlock.
@@ -251,7 +251,7 @@ pub async fn control(
             set_account(app, account, None).await?;
             empty()
         }
-        _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
+        _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
     })
 }
 

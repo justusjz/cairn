@@ -33,7 +33,7 @@ pub async fn list_object_versions(
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
-            "the specified bucket does not exist",
+            "The specified bucket does not exist",
         ));
     }
     // A version-id-marker only means something within a key-marker; resolve it

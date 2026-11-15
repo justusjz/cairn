@@ -171,7 +171,7 @@ async fn object_lock_needs_and_keeps_versioning() {
 async fn a_bucket_can_be_created_with_object_lock() {
     let Some(app) = node().await else { return };
     let account: String = app.pool.get().await.unwrap().query_one("SELECT id FROM accounts WHERE NOT operator LIMIT 1", &[]).await.unwrap().get(0);
-    let response = crate::s3::buckets::create::create_bucket(&app, "locked-bucket", &account, true).await.unwrap();
+    let response = crate::s3::buckets::create::create_bucket(&app, "locked-bucket", &account, true, None).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let (status, _, body) = text(get_object_lock_configuration(&app, "locked-bucket").await.unwrap()).await;
     assert_eq!(status, StatusCode::OK, "{body}");

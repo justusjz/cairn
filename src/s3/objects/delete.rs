@@ -167,7 +167,7 @@ pub async fn delete_object(
             DeleteStatus::NoSuchBucket => format_s3_error(
                 StatusCode::NOT_FOUND,
                 "NoSuchBucket",
-                "the specified bucket does not exist",
+                "The specified bucket does not exist",
             ),
             // Its version changed since it was checked: again.
             DeleteStatus::Stale => continue,
@@ -389,7 +389,7 @@ pub async fn delete_objects(
                 return Ok(format_s3_error(
                     StatusCode::NOT_FOUND,
                     "NoSuchBucket",
-                    "the specified bucket does not exist",
+                    "The specified bucket does not exist",
                 ));
             }
             DeleteStatus::Stale => continue,

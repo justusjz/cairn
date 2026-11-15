@@ -2,7 +2,9 @@
 //! policies that apply (see `policy`): the user's (its grants and admin flag
 //! as their built-in policies, and its inline ones) and the buckets'. An
 //! anonymous (unsigned) request has only the buckets' policies to allow it.
-//! See `plans/policies.md`.
+//! See `plans/policies.md`. Checks on a bucket with ABAC enabled, and on its
+//! objects, carry its tags; those on an object the version's tags it was
+//! looked up with (see `s3::abac`, and `plans/abac.md`).
 
 use std::{
     collections::HashMap,
@@ -22,6 +24,7 @@ use crate::{
     users::Principal,
     s3::{
         actions::{self, Check, On},
+        tags::Tags,
         util::{format_s3_error, query_param},
     },
 };
@@ -84,6 +87,9 @@ struct Loaded {
     /// nothing to anyone outside the bucket's account, anonymous or not, not
     /// even what it allows another account by name (as in S3).
     restricted: bool,
+    /// Its tags, if its ABAC is enabled (see `s3::buckets::abac`): then its
+    /// and its objects' `aws:ResourceTag`s and `s3:BucketTag`s (probed).
+    abac_tags: Option<Tags>,
 }
 
 /// Where a request comes from, as condition keys say it.
@@ -113,6 +119,9 @@ pub struct Access {
     pub context: Context,
     /// Each bucket loaded: whether it exists, and its policy (see `Loaded`).
     buckets: HashMap<String, Loaded>,
+    /// The tags of the versions the request is on, by bucket and key, as
+    /// they were looked up (see `s3::abac`): their `s3:ExistingObjectTag`s.
+    object_tags: HashMap<(String, String), Tags>,
 }
 
 /// Who makes a request, as policies see it (an owned `policy::Principal`).
@@ -205,6 +214,7 @@ impl Access {
             boundary,
             context: context(principal, account, method, headers, query, origin),
             buckets: HashMap::new(),
+            object_tags: HashMap::new(),
         })
     }
 
@@ -224,7 +234,8 @@ impl Access {
             .await?
             .query_opt_cached(
                 "SELECT b.policy, b.policy_principals::text, b.account_id,
-                        coalesce(b.public_access_block, 0) & 8 <> 0 OR coalesce(a.public_access_block, 0) & 8 <> 0
+                        coalesce(b.public_access_block, 0) & 8 <> 0 OR coalesce(a.public_access_block, 0) & 8 <> 0,
+                        CASE WHEN b.abac THEN coalesce(b.tags, '') END
                  FROM buckets b JOIN accounts a ON a.id = b.account_id WHERE b.name = $1",
                 &[&bucket],
             )
@@ -241,8 +252,28 @@ impl Access {
         let restrict = row.as_ref().and_then(|row| row.get::<_, Option<bool>>(3)).unwrap_or(false);
         let account = row.as_ref().map(|row| row.get::<_, String>(2));
         let restricted = restrict && policy.as_ref().is_some_and(|policy| policy.is_public());
-        self.buckets.insert(bucket.to_owned(), Loaded { exists: row.is_some(), account, policy, restricted });
+        let abac_tags = row.as_ref().and_then(|row| row.get::<_, Option<&str>>(4)).map(Tags::from_stored);
+        self.buckets.insert(bucket.to_owned(), Loaded { exists: row.is_some(), account, policy, restricted, abac_tags });
         Ok(row.is_some())
+    }
+
+    /// Whether a policy that could decide a check on `bucket` (or one on no
+    /// bucket) tests `key`, a condition key's name or prefix (lowercase):
+    /// what's only worth looking up then (see `s3::abac`). Load the bucket
+    /// first.
+    pub fn tests(&self, bucket: Option<&str>, key: &str) -> bool {
+        let tests = |policy: &Policy| policy.normalized().to_ascii_lowercase().contains(key);
+        let bucket_policy = bucket.and_then(|b| self.buckets.get(b)).and_then(|l| l.policy.as_deref());
+        self.identity.iter().any(|p| tests(p))
+            || self.session.iter().flatten().any(|p| tests(p))
+            || self.boundary.as_ref().is_some_and(|(p, _)| tests(p))
+            || bucket_policy.is_some_and(tests)
+    }
+
+    /// Sets the tags of the version of `key` in `bucket` the request is on:
+    /// its checks on the key carry them as `s3:ExistingObjectTag`s.
+    pub fn set_object_tags(&mut self, bucket: &str, key: &str, tags: Tags) {
+        self.object_tags.insert((bucket.to_owned(), key.to_owned()), tags);
     }
 
     /// Loads the policies of the buckets `checks` are on.
@@ -288,6 +319,21 @@ impl Access {
         let resource_account = owner.or(self.account());
         let mut context = self.context.clone();
         context.extend(extra);
+        // The bucket's tags, with its ABAC enabled: not to create it, as it's
+        // not there yet (whoever has its name).
+        if let Some(tags) = loaded.and_then(|l| l.abac_tags.as_ref()).filter(|_| check.action != "s3:CreateBucket") {
+            for (key, value) in tags.iter() {
+                context.set(&format!("aws:ResourceTag/{key}"), value);
+                context.set(&format!("s3:BucketTag/{key}"), value);
+            }
+        }
+        if let On::Object(bucket, key) = &check.on
+            && let Some(tags) = self.object_tags.get(&(bucket.clone(), key.clone()))
+        {
+            for (key, value) in tags.iter() {
+                context.set(&format!("s3:ExistingObjectTag/{key}"), value);
+            }
+        }
         if let Some(account) = resource_account {
             context.set("aws:ResourceAccount", account);
             context.set("s3:ResourceAccount", account);

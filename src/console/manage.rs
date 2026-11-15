@@ -3870,11 +3870,11 @@ mod e2e {
     async fn s3_refuses_invalid_bucket_names() {
         let Some(app) = node().await else { return };
         let account = users::account(&app.pool.get().await.unwrap()).await.unwrap();
-        let resp = crate::s3::buckets::create::create_bucket(&app, "Bad_Name", &account, false)
+        let resp = crate::s3::buckets::create::create_bucket(&app, "Bad_Name", &account, false, None)
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        let resp = crate::s3::buckets::create::create_bucket(&app, BUCKET, &account, false)
+        let resp = crate::s3::buckets::create::create_bucket(&app, BUCKET, &account, false, None)
             .await
             .unwrap();
         assert_eq!(

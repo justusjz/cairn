@@ -168,14 +168,11 @@ pub async fn put_bucket_encryption(
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let requested = match std::str::from_utf8(&body).map_err(|_| "not UTF-8").and_then(parse) {
         Ok(requested) => requested,
-        Err(why) => {
+        Err(_) => {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
                 "MalformedXML",
-                &format!(
-                    "The XML you provided was not well-formed or did not validate against our \
-                     published schema ({why})"
-                ),
+                "The XML you provided was not well-formed or did not validate against our published schema",
             ));
         }
     };
@@ -263,7 +260,7 @@ fn not_found() -> Response<Full<Bytes>> {
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
+    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
 }
 
 #[cfg(test)]

@@ -212,7 +212,7 @@ where
 {
     let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
     if bucket.is_empty() || !key.is_empty() {
-        return Ok(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""));
+        return Ok(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."));
     }
     if !util::is_well_formed(bucket) {
         return Ok(util::unsupported_characters());
@@ -364,7 +364,7 @@ where
     if let Some((check, verdict)) = access.first_denied(&operation.checks) {
         return Ok(match exists {
             true => access.denied(check, verdict),
-            false => format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist"),
+            false => format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist"),
         });
     }
     let customer_key = match sse_c::requested(&headers, &sse_c::HEADERS, secure) {

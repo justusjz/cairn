@@ -78,7 +78,7 @@ pub async fn delete_bucket(app: &Arc<App>, bucket: &str) -> anyhow::Result<Respo
         DeleteStatus::NoSuchBucket => Ok(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
-            "the specified bucket does not exist",
+            "The specified bucket does not exist",
         )),
         DeleteStatus::NotEmpty => Ok(format_s3_error(
             StatusCode::CONFLICT,

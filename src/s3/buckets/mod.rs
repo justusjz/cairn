@@ -1,3 +1,4 @@
+pub mod abac;
 pub mod cors;
 pub mod create;
 pub mod delete;
@@ -7,6 +8,7 @@ pub mod lifecycle;
 pub mod list;
 pub mod policy;
 pub mod public_access;
+pub mod resource_tags;
 pub mod tagging;
 pub mod versioning;
 pub mod website;

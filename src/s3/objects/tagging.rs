@@ -102,7 +102,7 @@ async fn set(
             "no_such_version" => no_such_version(),
             "no_such_key" => no_such_key(),
             "no_such_bucket" => {
-                format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
+                format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
             }
             other => anyhow::bail!("cairn_set_tags: unexpected status {other}"),
         });

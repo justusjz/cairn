@@ -423,10 +423,10 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
     ("aws:sourcevpce", Support::Absent),
 
     ("aws:vpcsourceip", Support::Absent),
-    // A user's tags, and those IAM's requests set (see `iam`). Never on
-    // S3's: a bucket's tags are its `aws:ResourceTag`s only with its ABAC
-    // enabled, which it's not by default (probed), and Cairn has no
-    // PutBucketAbac; nor does Cairn's CreateBucket take tags.
+    // A resource's tags, and those a request sets: IAM's (see `iam`), and
+    // S3's. A bucket's tags are its (and its objects') `aws:ResourceTag`s
+    // only with its ABAC enabled (probed, see `s3::access`); CreateBucket
+    // and TagResource set `aws:RequestTag`s.
     ("aws:requesttag/", Support::Evaluated),
     ("aws:resourcetag/", Support::Evaluated),
     ("aws:tagkeys", Support::Evaluated),
@@ -436,7 +436,12 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
 /// any suffix (a tag key).
 const S3_EVALUATED: &[&str] = &[
     "s3:authtype",
+    // A bucket's tags, with its ABAC enabled (see `s3::access`).
+    "s3:buckettag/",
     "s3:delimiter",
+    // The tags of the version a request is on, and those it sets (see
+    // `s3::abac`).
+    "s3:existingobjecttag/",
     "s3:if-match",
     "s3:if-none-match",
     "s3:max-keys",
@@ -445,6 +450,8 @@ const S3_EVALUATED: &[&str] = &[
     "s3:object-lock-remaining-retention-days",
     "s3:object-lock-retain-until-date",
     "s3:prefix",
+    "s3:requestobjecttag/",
+    "s3:requestobjecttagkeys",
     "s3:resourceaccount",
     "s3:signatureage",
     "s3:signatureversion",
@@ -510,9 +517,8 @@ pub fn support(key: &str) -> Option<Support> {
     if S3_ABSENT.iter().any(|entry| named(entry)) {
         return Some(Support::Absent);
     }
-    // The rest of S3's keys (existing object and bucket tags, event holds,
-    // TLS versions, the tags a request sets: PutObjectTagging's are in its
-    // body, which is read after it's authorized, ...) aren't evaluated yet.
+    // The rest of S3's keys (event holds, TLS versions, ...) aren't
+    // evaluated yet.
     let known = super::s3_actions::CONDITION_KEYS.iter().any(|entry| {
         let entry = entry.to_ascii_lowercase();
         let entry = entry.split_once('/').map_or(entry.clone(), |(prefix, _)| format!("{prefix}/"));
@@ -675,9 +681,11 @@ mod tests {
         assert_eq!(support("aws:SourceIp"), Some(Support::Evaluated));
         assert_eq!(support("AWS:SOURCEVPCE"), Some(Support::Absent));
         assert_eq!(support("s3:prefix"), Some(Support::Evaluated));
-        assert_eq!(support("s3:RequestObjectTag/Project"), Some(Support::Unsupported));
+        assert_eq!(support("s3:RequestObjectTag/Project"), Some(Support::Evaluated));
         assert_eq!(support("s3:RequestObjectTag/"), None);
-        assert_eq!(support("s3:ExistingObjectTag/Project"), Some(Support::Unsupported));
+        assert_eq!(support("s3:ExistingObjectTag/Project"), Some(Support::Evaluated));
+        assert_eq!(support("s3:BucketTag/team"), Some(Support::Evaluated));
+        assert_eq!(support("s3:TlsVersion"), Some(Support::Unsupported));
         assert_eq!(support("s3:object-lock-mode"), Some(Support::Evaluated));
         assert_eq!(support("s3:object-lock-event-hold"), Some(Support::Unsupported));
         assert_eq!(support("s3:DataAccessPointArn"), Some(Support::Absent));

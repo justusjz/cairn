@@ -38,7 +38,7 @@ pub async fn create_multipart_upload(
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
-            "the specified bucket does not exist",
+            "The specified bucket does not exist",
         ));
     }
     drop(client);

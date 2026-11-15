@@ -130,7 +130,7 @@ pub async fn put_bucket_acl(
         false => format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
-            "the specified bucket does not exist",
+            "The specified bucket does not exist",
         ),
     })
 }

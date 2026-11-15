@@ -43,7 +43,13 @@ const ESCAPED: &AsciiSet = &NON_ALPHANUMERIC.remove(b'-').remove(b'_').remove(b'
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum On {
     Object,
+    /// A bucket's, by PutBucketTagging.
     Bucket,
+    /// A bucket's, by CreateBucket (probed: as PutBucketTagging's, but for
+    /// the message refusing an `aws:` key, which is TagResource's).
+    NewBucket,
+    /// A bucket's, by S3 Control's TagResource (see `resource_tags`).
+    Resource,
 }
 
 /// A tag set: unique keys, sorted.
@@ -87,12 +93,65 @@ impl Tags {
         }
         let (max, message) = match on {
             On::Object => (MAX_OBJECT_TAGS, "Object tags cannot be greater than 10"),
-            On::Bucket => (MAX_BUCKET_TAGS, "Bucket tag count cannot be greater than 50"),
+            On::Bucket | On::NewBucket => (MAX_BUCKET_TAGS, "Bucket tag count cannot be greater than 50"),
+            On::Resource => return Ok(Tags(pairs)),
         };
         if pairs.len() > max {
             return Err(format_s3_error(StatusCode::BAD_REQUEST, "BadRequest", message));
         }
         Ok(Tags(pairs))
+    }
+
+    /// Tags from `<Tag><Key/><Value/></Tag>` elements (CreateBucket's
+    /// `<Tags>`, TagResource's), checked as `on`'s: a duplicate key is
+    /// PutBucketTagging's InvalidTag (CreateBucket's is a 500 in S3, probed).
+    /// TagResource's count is checked with the tags they're added to (see
+    /// `too_many`).
+    pub fn from_elements(parent: roxmltree::Node, on: On) -> Result<Tags, Response<Full<Bytes>>> {
+        let pairs = tag_elements(parent).map_err(|why| malformed(&why))?;
+        Tags::checked(pairs, on, || {
+            format_s3_error(StatusCode::BAD_REQUEST, "InvalidTag", "Cannot provide multiple Tags with the same key")
+        })
+    }
+
+    /// These tags with `other`'s set over them (TagResource's merge).
+    pub fn merged(&self, other: &Tags) -> Tags {
+        let mut pairs = self.0.clone();
+        for (key, value) in &other.0 {
+            match pairs.binary_search_by(|(k, _)| k.cmp(key)) {
+                Ok(i) => pairs[i].1 = value.clone(),
+                Err(i) => pairs.insert(i, (key.clone(), value.clone())),
+            }
+        }
+        Tags(pairs)
+    }
+
+    /// These tags without `keys` (UntagResource's).
+    pub fn without(&self, keys: &[String]) -> Tags {
+        Tags(self.0.iter().filter(|(k, _)| !keys.contains(k)).cloned().collect())
+    }
+
+    /// S3 Control's refusal of more than a bucket may have, if these are.
+    pub fn too_many(&self) -> Option<Response<Full<Bytes>>> {
+        (self.0.len() > MAX_BUCKET_TAGS).then(|| {
+            format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "TooManyTags",
+                "The number of tags exceeds the limit of 50 tags. Remove some tags and try again.",
+            )
+        })
+    }
+
+    /// Sets `prefix/<key>` to each tag's value in `context`, and, if
+    /// `keys`, `keys` to their keys: `aws:RequestTag/…` and `aws:TagKeys`,
+    /// say.
+    pub fn set_context(&self, context: &mut crate::policy::Context, prefix: &str, keys: Option<&str>) {
+        for (key, value) in self.iter() {
+            context.set(&format!("{prefix}/{key}"), value);
+        }
+        if let Some(name) = keys {
+            context.set_all(name, self.0.iter().map(|(k, _)| k.clone()).collect());
+        }
     }
 
     /// An object's tags from an `x-amz-tagging` header: URL query parameters
@@ -124,16 +183,7 @@ impl Tags {
     /// PutBucketTagging's body, a POST form's `tagging` field). Every `<Tag>`
     /// has a `<Key>` and a `<Value>`; no `<TagSet>` is no tags.
     pub fn from_xml(body: &[u8], on: On) -> Result<Tags, Response<Full<Bytes>>> {
-        let pairs = parse_xml(body).map_err(|why| {
-            format_s3_error(
-                StatusCode::BAD_REQUEST,
-                "MalformedXML",
-                &format!(
-                    "The XML you provided was not well-formed or did not validate against our published schema \
-                     ({why})"
-                ),
-            )
-        })?;
+        let pairs = parse_xml(body).map_err(|why| malformed(&why))?;
         Tags::checked(pairs, on, || {
             format_s3_error(StatusCode::BAD_REQUEST, "InvalidTag", "Cannot provide multiple Tags with the same key")
         })
@@ -185,6 +235,15 @@ impl Tags {
     }
 }
 
+/// S3's MalformedXML. `_why` isn't told, as S3 tells nothing more.
+pub fn malformed(_why: &str) -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::BAD_REQUEST,
+        "MalformedXML",
+        "The XML you provided was not well-formed or did not validate against our published schema",
+    )
+}
+
 /// The number of tags in their stored form, for `x-amz-tagging-count`.
 pub fn count(stored: &str) -> usize {
     stored.split('&').filter(|pair| !pair.is_empty()).count()
@@ -233,6 +292,10 @@ fn check(key: &str, value: &str, on: On) -> Result<(), Response<Full<Bytes>>> {
         return Err(invalid(match on {
             On::Object => "Your TagKey cannot be prefixed with aws:",
             On::Bucket => "System tags cannot be added/updated by requester",
+            On::NewBucket | On::Resource => {
+                "User-defined tag keys can't start with \"aws:\". This prefix is reserved for system tags. \
+                 Remove \"aws:\" from your tag keys and try again."
+            }
         }));
     }
     Ok(())
@@ -256,26 +319,33 @@ fn parse_xml(body: &[u8]) -> Result<Vec<(String, String)>, String> {
         if set.tag_name().name() != "TagSet" {
             return Err(format!("unknown element {}", set.tag_name().name()));
         }
-        for tag in elements(set) {
-            if tag.tag_name().name() != "Tag" {
-                return Err(format!("unknown element {}", tag.tag_name().name()));
+        pairs.extend(tag_elements(set)?);
+    }
+    Ok(pairs)
+}
+
+/// The pairs of `parent`'s `<Tag>` elements, unchecked, or why they aren't.
+fn tag_elements(parent: roxmltree::Node) -> Result<Vec<(String, String)>, String> {
+    let mut pairs = Vec::new();
+    for tag in elements(parent) {
+        if tag.tag_name().name() != "Tag" {
+            return Err(format!("unknown element {}", tag.tag_name().name()));
+        }
+        let (mut key, mut value) = (None, None);
+        for field in elements(tag) {
+            let slot = match field.tag_name().name() {
+                "Key" => &mut key,
+                "Value" => &mut value,
+                other => return Err(format!("unknown element {other}")),
+            };
+            if slot.is_some() {
+                return Err(format!("a Tag has one {}", field.tag_name().name()));
             }
-            let (mut key, mut value) = (None, None);
-            for field in elements(tag) {
-                let slot = match field.tag_name().name() {
-                    "Key" => &mut key,
-                    "Value" => &mut value,
-                    other => return Err(format!("unknown element {other}")),
-                };
-                if slot.is_some() {
-                    return Err(format!("a Tag has one {}", field.tag_name().name()));
-                }
-                *slot = Some(field.text().unwrap_or_default().to_owned());
-            }
-            match (key, value) {
-                (Some(key), Some(value)) => pairs.push((key, value)),
-                _ => return Err("a Tag has a Key and a Value".to_owned()),
-            }
+            *slot = Some(field.text().unwrap_or_default().to_owned());
+        }
+        match (key, value) {
+            (Some(key), Some(value)) => pairs.push((key, value)),
+            _ => return Err("a Tag has a Key and a Value".to_owned()),
         }
     }
     Ok(pairs)

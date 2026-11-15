@@ -50,6 +50,7 @@ use crate::{
     },
 };
 
+pub(crate) mod abac;
 pub(crate) mod buckets;
 pub(crate) mod certificates;
 pub(crate) mod checksums;
@@ -228,13 +229,18 @@ async fn handle_request(
     // The secret the request's body (aws-chunked, trailers) is signed with;
     // none for an anonymous one, whose body can't be signed.
     let secret = principal.as_ref().map(|p| p.secret.clone()).unwrap_or_default();
+    // S3 Control's, on a bucket's tags (see `resource_tags`).
+    if buckets::resource_tags::is_control(req.uri().path(), req.headers()) {
+        let response = buckets::resource_tags::handle(&app, req, principal.as_ref(), &mut access, &secret).await?;
+        return Ok(box_response(response));
+    }
     // S3 Control's, on an account's public access block: the signer's own
     // account's only, as an account's resources are (another's, or none, is
     // a 403).
     if public_access::is_control(req.uri().path(), req.headers()) {
         use public_access::{control, control_operation};
         let Some((_, action)) = control_operation(req.method()) else {
-            return Ok(box_response(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "")));
+            return Ok(box_response(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource.")));
         };
         let named = req.headers().get("x-amz-account-id").and_then(|v| v.to_str().ok());
         let Some(principal) = principal.as_ref().filter(|p| named == Some(p.account.as_str())) else {
@@ -277,7 +283,7 @@ async fn handle_request(
                 }
             }
             (&hyper::Method::GET, None) => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
-            _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
+            _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
         };
         return Ok(box_response(resp));
     }
@@ -309,9 +315,9 @@ async fn handle_request(
         return Ok(box_response(resp));
     }
     // What the request does, as policies see it, and whether they allow it.
-    let Some(operation) = actions::operation(req.method(), &bucket, &key, query, req.headers()) else {
+    let Some(mut operation) = actions::operation(req.method(), &bucket, &key, query, req.headers()) else {
         return Ok(box_response(match principal {
-            Some(_) => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
+            Some(_) => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
             None => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
         }));
     };
@@ -322,6 +328,32 @@ async fn handle_request(
         let header = |name| req.headers().get(name).and_then(|v| v.to_str().ok());
         let (mode, until, hold) = (header(object_lock::MODE), header(object_lock::RETAIN_UNTIL), header(object_lock::LEGAL_HOLD));
         object_lock::set_context(&mut access.context, mode, until, hold);
+    }
+    // The tags its checks may test (see `abac`).
+    abac::prepare(&app, &mut access, &operation, &bucket, &key, query, req.headers()).await?;
+    // PutObjectTagging: the tags it sets are in its body, which policies may
+    // test, so it's read before the request is authorized.
+    if operation.name == "PutObjectTagging" {
+        let version_id = query_param(query, "versionId");
+        let headers = req.headers().clone();
+        if let Some(v) = version_id.as_deref().filter(|v| !is_version_id(v)) {
+            return Ok(box_response(invalid_version_id("versionId", v)));
+        }
+        let body = match read_body(req, &secret, true).await? {
+            Ok(body) => body,
+            Err(rejection) => return Ok(box_response(util::rejection_response(&rejection))),
+        };
+        if let Ok(tags) = tags::Tags::from_xml(&body, tags::On::Object) {
+            abac::request_tags(&mut access, &tags);
+        }
+        if let Some(refused) = refusal(&access, &operation, exists) {
+            return Ok(box_response(refused));
+        }
+        if let Some(refused) = util::unexpected_owner(&headers, &account) {
+            return Ok(box_response(refused));
+        }
+        let resp = put_object_tagging(&app, &bucket, &key, version_id.as_deref(), body).await?;
+        return Ok(box_response(resp));
     }
     // PutObjectRetention and PutObjectLegalHold: what they ask for is in
     // their bodies, which policies may test, so they're read before the
@@ -358,7 +390,44 @@ async fn handle_request(
         };
         return Ok(box_response(resp));
     }
+    // CreateBucket: the tags its body gives the bucket are in it, and need
+    // `s3:TagResource` too (after `s3:CreateBucket`: probed), so it's read
+    // before the request is authorized.
+    if operation.name == "CreateBucket" {
+        let headers = req.headers().clone();
+        let body = match read_body(req, &secret, true).await? {
+            Ok(body) => body,
+            Err(rejection) => return Ok(box_response(util::rejection_response(&rejection))),
+        };
+        let tags = match buckets::create::tags(&body) {
+            Ok(tags) => tags,
+            Err(refused) => return Ok(box_response(refused)),
+        };
+        if let Some(tags) = &tags {
+            tags.set_context(&mut access.context, "aws:RequestTag", Some("aws:TagKeys"));
+            let check = actions::Check { action: "s3:TagResource", on: actions::On::Bucket(bucket.clone()) };
+            operation.checks.insert(1, check);
+        }
+        if let Some(refused) = refusal(&access, &operation, exists) {
+            return Ok(box_response(refused));
+        }
+        if let Some(refused) = util::unexpected_owner(&headers, &account) {
+            return Ok(box_response(refused));
+        }
+        let resp = match (acl::check_write(&headers, acl::On::Bucket), &principal) {
+            (Err(refused), _) => refused,
+            (Ok(()), Some(principal)) => {
+                let object_lock = object_lock::asks_for_bucket(&headers);
+                create_bucket(&app, &bucket, &principal.account, object_lock, tags.as_ref()).await?
+            }
+            (Ok(()), None) => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
+        };
+        return Ok(box_response(resp));
+    }
     if let Some(refused) = refusal(&access, &operation, exists) {
+        if exists && let Some(missing) = missing_to_lister(&app, &access, &operation, &bucket, &key, query).await? {
+            return Ok(box_response(missing));
+        }
         return Ok(box_response(refused));
     }
     // A bucket's policy is its account's alone: another account's request
@@ -419,6 +488,9 @@ async fn handle_request(
             }
             if operation.name == "GetBucketTagging" {
                 return Ok(box_response(get_bucket_tagging(&app, &bucket).await?));
+            }
+            if operation.name == "GetBucketAbac" {
+                return Ok(box_response(buckets::abac::get_bucket_abac(&app, &bucket).await?));
             }
             if operation.name == "GetObjectLockConfiguration" {
                 return Ok(box_response(object_lock::get_object_lock_configuration(&app, &bucket).await?));
@@ -601,6 +673,12 @@ async fn handle_request(
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
+            // PutBucketAbac: PUT /{bucket}?abac with an <AbacStatus> body; no
+            // checksum is needed (probed).
+            hyper::Method::PUT if operation.name == "PutBucketAbac" => match read_body(req, &secret, true).await? {
+                Ok(body) => buckets::abac::put_bucket_abac(&app, &bucket, body).await?,
+                Err(rejection) => util::rejection_response(&rejection),
+            },
             // PutBucketPolicy: PUT /{bucket}?policy with the policy (JSON).
             hyper::Method::PUT if operation.name == "PutBucketPolicy" => {
                 match read_body(req, &secret, true).await? {
@@ -644,16 +722,6 @@ async fn handle_request(
             hyper::Method::PUT if operation.name == "PutBucketAcl" => {
                 acl::put_bucket_acl(&app, &bucket, req.headers()).await?
             }
-            hyper::Method::PUT if operation.name == "CreateBucket" => match acl::check_write(req.headers(), acl::On::Bucket) {
-                Ok(()) => match &principal {
-                    Some(principal) => {
-                        let object_lock = object_lock::asks_for_bucket(req.headers());
-                        create_bucket(&app, &bucket, &principal.account, object_lock).await?
-                    }
-                    None => format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"),
-                },
-                Err(refused) => refused,
-            },
             // DeleteObjects (batch): POST /{bucket}?delete with a <Delete> body,
             // which must declare a checksum.
             hyper::Method::POST if query_param(&query, "delete").is_some() => {
@@ -696,7 +764,7 @@ async fn handle_request(
                 delete_bucket_tagging(&app, &bucket).await?
             }
             hyper::Method::DELETE if operation.name == "DeleteBucket" => delete_bucket(&app, &bucket).await?,
-            _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
+            _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
         };
         return Ok(box_response(resp));
     }
@@ -760,8 +828,9 @@ async fn handle_request(
         },
         _ => None,
     };
-    // GetObjectTagging, PutObjectTagging (with a <Tagging> body) and
-    // DeleteObjectTagging: an SSE-C object's tags need no key, as in S3.
+    // GetObjectTagging and DeleteObjectTagging: an SSE-C object's tags need
+    // no key, as in S3. (PutObjectTagging was handled before it was
+    // authorized, above.)
     if tagging {
         let version_id = version_id.as_deref();
         let resp = match req.method().clone() {
@@ -1166,7 +1235,7 @@ async fn handle_request(
             (Err(rejection), _, _) => util::rejection_response(&rejection),
             (_, Err(refused), _) | (_, _, Err(refused)) => refused,
         },
-        _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", ""),
+        _ => format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."),
     };
     Ok(box_response(resp))
 }
@@ -1258,9 +1327,30 @@ fn refusal(
 ) -> Option<hyper::Response<http_body_util::Full<hyper::body::Bytes>>> {
     let (check, verdict) = access.first_denied(&operation.checks)?;
     if !exists && operation.name != "CreateBucket" {
-        return Some(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist"));
+        return Some(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist"));
     }
     Some(access.denied(check, verdict))
+}
+
+/// A refused GetObject's or HeadObject's 404, if its key has no current
+/// version (none, or a delete marker) and the request may list the bucket:
+/// S3 tells whoever may list it that a key isn't there, whether or not they
+/// may read it (probed, see `plans/abac.md`), as listing would tell them.
+async fn missing_to_lister(
+    app: &App,
+    access: &access::Access,
+    operation: &actions::Operation,
+    bucket: &str,
+    key: &str,
+    query: &str,
+) -> anyhow::Result<Option<hyper::Response<http_body_util::Full<hyper::body::Bytes>>>> {
+    let list = actions::Check { action: "s3:ListBucket", on: actions::On::Bucket(bucket.to_owned()) };
+    let reads = matches!(operation.name, "GetObject" | "HeadObject") && query_param(query, "versionId").is_none();
+    if !reads || !access.allows(&list) {
+        return Ok(None);
+    }
+    let client = app.pool.get().await?;
+    Ok(objects::get::lookup_version(&client, bucket, key, None).await?.err().map(|missing| missing.read_response()))
 }
 
 /// The check of bypassing a GOVERNANCE retention of a version of `key`.

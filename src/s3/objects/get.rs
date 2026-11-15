@@ -90,7 +90,7 @@ impl Missing {
                     let mut resp = format_s3_error(
                         StatusCode::METHOD_NOT_ALLOWED,
                         "MethodNotAllowed",
-                        "the specified method is not allowed against this resource",
+                        "The specified method is not allowed against this resource.",
                     );
                     resp.headers_mut()
                         .insert(header::LAST_MODIFIED, last_modified.parse().unwrap());
@@ -164,7 +164,7 @@ fn no_such_key() -> Response<Full<Bytes>> {
     format_s3_error(
         StatusCode::NOT_FOUND,
         "NoSuchKey",
-        "the specified key does not exist",
+        "The specified key does not exist.",
     )
 }
 
@@ -172,7 +172,7 @@ pub(crate) fn no_such_version() -> Response<Full<Bytes>> {
     format_s3_error(
         StatusCode::NOT_FOUND,
         "NoSuchVersion",
-        "the specified version does not exist",
+        "The specified version does not exist.",
     )
 }
 

@@ -314,7 +314,7 @@ pub fn locked() -> Response<Full<Bytes>> {
 pub const LOCKED_MESSAGE: &str = "Access Denied because object protected by object lock.";
 
 fn no_such_bucket() -> Response<Full<Bytes>> {
-    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "the specified bucket does not exist")
+    format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
 }
 
 fn no_such_key() -> Response<Full<Bytes>> {

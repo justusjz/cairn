@@ -326,7 +326,7 @@ pub async fn complete_multipart_upload_at(
                 return Ok(format_s3_error(
                     StatusCode::NOT_FOUND,
                     "NoSuchKey",
-                    "the specified key does not exist",
+                    "The specified key does not exist.",
                 ));
             }
             Ok(CompleteOutcome::PreconditionFailed) => {

@@ -50,7 +50,7 @@ pub async fn list_multipart_uploads(
         return Ok(format_s3_error(
             StatusCode::NOT_FOUND,
             "NoSuchBucket",
-            "the specified bucket does not exist",
+            "The specified bucket does not exist",
         ));
     }
     // One page, plus one entry to tell whether there's more.

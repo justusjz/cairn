@@ -159,6 +159,11 @@ aws iam put-user-policy --user-name app --policy-name my-bucket --policy-documen
 aws iam create-access-key --user-name app   # prints its access key ID and secret
 ```
 
+Cairn has no regions: every bucket is in `us-east-1`, whatever region a
+client names, and behaves as S3's buckets there do. Creating a bucket you
+already own succeeds again and changes nothing (other regions answer
+`409 BucketAlreadyOwnedByYou`).
+
 And use it as the application:
 
 ```sh
@@ -1212,6 +1217,50 @@ S3. Tags are stored in plaintext, whatever an object's
 [encryption](#encryption), as S3 keeps them: an SSE-C object's are read and
 changed without its key, and lifecycle sweeps, which have no keys, read them.
 Don't put secrets in them. The console shows both.
+
+### Tags in policies (ABAC)
+
+Policies can decide by tags, as in S3:
+
+- `s3:ExistingObjectTag/<key>`: the tags of the object version a request reads
+  or annotates (GetObject, HeadObject, the tagging and ACL requests), and of a
+  copy's source.
+- `s3:RequestObjectTag/<key>` and `s3:RequestObjectTagKeys`: the tags a write
+  gives its object (`x-amz-tagging`, PutObjectTagging's), and an upload's, for
+  its parts and its completion.
+- `aws:ResourceTag/<key>` and `s3:BucketTag/<key>`: a bucket's tags, on
+  requests on the bucket and its objects, but only with the bucket's ABAC
+  enabled. It's disabled by default, as in S3:
+
+```sh
+aws s3api put-bucket-abac --bucket my-bucket --abac-status Status=Enabled
+aws s3api get-bucket-abac --bucket my-bucket
+```
+
+With ABAC enabled, PutBucketTagging and DeleteBucketTagging are refused: only
+S3 Control's TagResource and UntagResource change the bucket's tags, and they
+carry `aws:RequestTag/<key>` and `aws:TagKeys`, so a policy can say who may
+tag what. CreateBucket can tag the new bucket too, which takes
+`s3:TagResource` as well. (S3 Control's clients need a host name that
+resolves for any subdomain, as for the account's public access block.)
+
+```sh
+aws s3control tag-resource --account-id 123456789012 --resource-arn arn:aws:s3:::my-bucket \
+    --tags Key=team,Value=storage
+aws s3control untag-resource --account-id 123456789012 --resource-arn arn:aws:s3:::my-bucket --tag-keys team
+aws s3control list-tags-for-resource --account-id 123456789012 --resource-arn arn:aws:s3:::my-bucket
+```
+
+A user may then use every bucket of its team, without a policy per bucket:
+
+```json
+{"Effect": "Allow", "Action": "s3:*", "Resource": ["arn:aws:s3:::*", "arn:aws:s3:::*/*"],
+ "Condition": {"StringEquals": {"aws:ResourceTag/team": "${aws:PrincipalTag/team}"}}}
+```
+
+Whoever may tag a bucket, or enable its ABAC, decides who such policies let
+in: keep `s3:TagResource`, `s3:PutBucketTagging` and `s3:PutBucketAbac` to
+admins, or condition them on `aws:RequestTag`.
 
 ## CORS
 

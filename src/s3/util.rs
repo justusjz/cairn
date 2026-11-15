@@ -104,11 +104,6 @@ pub fn bucket_subresource_stub(query: &str, owner_id: &str) -> Option<Response<F
         )))
     } else if present("logging") {
         Some(xml_ok(format!("{XML}<BucketLoggingStatus xmlns=\"{S3_XMLNS}\"/>")))
-    } else if present("abac") {
-        // Attribute-based access control by the bucket's tags, which Cairn's
-        // policies don't do (see `s3::access`): disabled, as a bucket's is by
-        // default (probed).
-        Some(xml_ok(format!("{XML}<AbacStatus xmlns=\"{S3_XMLNS}\"><Status>Disabled</Status></AbacStatus>")))
     } else if present("notification") {
         Some(xml_ok(format!("{XML}<NotificationConfiguration xmlns=\"{S3_XMLNS}\"/>")))
     } else {
@@ -383,12 +378,14 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "object-lock",
             "website",
             "ownershipControls",
+            "abac",
         ],
         (true, &Method::POST) => &["delete"],
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
         // DeleteBucketTagging, DeleteBucketPolicy, DeleteBucketWebsite.
+        // And `abac`, which `actions::operation` routes nowhere: S3's 405.
         (true, &Method::DELETE) => {
-            &["encryption", "lifecycle", "cors", "tagging", "policy", "publicAccessBlock", "website"]
+            &["encryption", "lifecycle", "cors", "tagging", "policy", "publicAccessBlock", "website", "abac"]
         }
         // GetObjectAcl (stubbed), ListParts, GetObjectTagging, a part of
         // the object, GetObjectAttributes.

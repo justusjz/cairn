@@ -22,6 +22,7 @@ use crate::{
     writing::WritingSet,
 };
 
+mod abac;
 mod checksums;
 mod concurrency;
 mod cleanup;

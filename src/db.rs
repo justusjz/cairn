@@ -232,6 +232,7 @@ const MIGRATIONS: &[&str] = &[
     SESSIONS,
     IAM_OIDC_PROVIDERS,
     BUCKET_WEBSITE,
+    BUCKET_ABAC,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2422,6 +2423,15 @@ CREATE TRIGGER iam_oidc_provider_tags_users BEFORE INSERT OR UPDATE OR DELETE OR
 /// it serves no websites.
 const BUCKET_WEBSITE: &str = r#"
 ALTER TABLE buckets ADD COLUMN website text;
+"#;
+
+/// Migration 52: whether a bucket's tags are its (and its objects')
+/// `aws:ResourceTag`s and `s3:BucketTag`s, as PutBucketAbac sets it (see
+/// `s3::buckets::abac`): not by default, as in S3. Set by a plain UPDATE of
+/// the bucket's row (T55), so no new lock protocol. (A Cairn that doesn't
+/// know it doesn't evaluate tag keys in S3's policies at all.)
+const BUCKET_ABAC: &str = r#"
+ALTER TABLE buckets ADD COLUMN abac boolean NOT NULL DEFAULT false;
 "#;
 #[cfg(test)]
 mod tests {
