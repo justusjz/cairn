@@ -1788,6 +1788,17 @@ BEGIN
 END
 $$;
 
+-- T64: PutBucketLogging: sets (or, with NULL, removes) the bucket's server
+-- access logging configuration. A plain UPDATE of the bucket's row, as T54's.
+-- Returns whether the bucket exists.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_logging(p_bucket text, p_config text)
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE buckets SET logging = p_config WHERE name = p_bucket;
+    RETURN FOUND;
+END
+$$;
+
 -- T27: PutBucketPolicy and DeleteBucketPolicy: sets (or, with NULL, removes)
 -- the bucket's policy, unless it's public (`p_public`) and the bucket's
 -- public access block, or its account's, blocks public policies ('blocked')

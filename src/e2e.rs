@@ -35,6 +35,7 @@ mod kms;
 mod limits;
 mod listing;
 mod locking;
+mod logging;
 mod metadata;
 mod multipart;
 mod object_lock;
@@ -132,6 +133,7 @@ async fn node_on(
         website_domain: None,
         kms: None,
         sessions: Default::default(),
+        access_logs: Default::default(),
         pack_hook: hook,
     })
 }

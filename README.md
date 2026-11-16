@@ -1322,6 +1322,49 @@ inside the cluster's network, set `cairn config set
 notification-private-endpoints 1`. See [S3 compatibility](S3-COMPATIBILITY.md#event-notifications)
 for what's not supported (SQS, Lambda, EventBridge, filter policies).
 
+## Server access logs
+
+A bucket's logging configuration (`PutBucketLogging`, `aws s3api
+put-bucket-logging`) has Cairn record every request to it, as S3 records
+them: a line per request, in S3's format, in log objects written to the
+target bucket under the target prefix, so tools that read S3's access logs
+(Athena, GoAccess, scripts) read Cairn's. The target must be a bucket of the
+same account, and, as in S3, its policy must let the
+`logging.s3.amazonaws.com` service write the logs:
+
+```sh
+aws s3api put-bucket-logging --bucket photos --bucket-logging-status \
+    '{"LoggingEnabled":{"TargetBucket":"logs","TargetPrefix":"photos/"}}'
+```
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "logging.s3.amazonaws.com" },
+    "Action": "s3:PutObject",
+    "Resource": "arn:aws:s3:::logs/photos/*",
+    "Condition": {
+      "ArnLike": { "aws:SourceArn": "arn:aws:s3:::photos" },
+      "StringEquals": { "aws:SourceAccount": "<account ID>" }
+    }
+  }]
+}
+```
+
+Each node appends its requests' records to a spool in its data dir
+(`access-logs/`), and every five minutes (or 64 MiB) closes the file, whose
+records it writes, a log object per bucket, within a minute. So logs arrive
+within about six minutes, and a node's spool costs a request a write to a
+file, not to the database; requests to buckets that don't log cost nothing.
+The spool isn't synced: a crash of Cairn loses nothing written to it, a
+crash of the machine may lose its last records. As in S3, delivery is best
+effort: records are dropped, and Cairn logs why, if the target is gone or
+doesn't allow them, or would keep them under SSE-KMS or a default Object Lock
+retention (SSE-S3 is fine). Records that fail otherwise (the storage nodes
+down, say) are tried again each minute, for a day.
+
 ## Tags
 
 Objects and buckets have tags, as in S3: key-value pairs for your own use, and

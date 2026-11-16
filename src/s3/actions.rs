@@ -206,7 +206,11 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
     ("replication", ("GetBucketReplication", "s3:GetReplicationConfiguration"), None),
     ("accelerate", ("GetBucketAccelerateConfiguration", "s3:GetAccelerateConfiguration"), None),
     ("requestPayment", ("GetBucketRequestPayment", "s3:GetBucketRequestPayment"), None),
-    ("logging", ("GetBucketLogging", "s3:GetBucketLogging"), None),
+    (
+        "logging",
+        ("GetBucketLogging", "s3:GetBucketLogging"),
+        Some(("PutBucketLogging", "s3:PutBucketLogging", "", "")),
+    ),
     (
         "notification",
         ("GetBucketNotificationConfiguration", "s3:GetBucketNotification"),

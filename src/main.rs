@@ -25,6 +25,7 @@ use crate::writing::WritingSet;
 
 mod peer;
 
+mod access_log;
 mod accounts;
 mod admin;
 mod auth;
@@ -108,6 +109,8 @@ pub struct App {
     /// The keys temporary credentials' tokens are sealed with (see
     /// `sessions`), as this node last read them.
     sessions: sessions::Keys,
+    /// This node's server access logging (see `access_log`).
+    access_logs: access_log::Logs,
     /// Lets a test step in at set points of a packing job.
     #[cfg(test)]
     pack_hook: Option<packer::Hook>,
@@ -360,6 +363,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     // Register this node before serving traffic, then keep its heartbeat fresh in
     // the background.
     let node = register_node(&pool, &store, &peer_url).await?;
+    let access_logs = access_log::Logs::start(store.data_dir().join("access-logs"), Default::default())?;
     let app = Arc::new(App {
         pool,
         store,
@@ -382,6 +386,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         website_domain: args.website_domain,
         kms,
         sessions: sessions::Keys::default(),
+        access_logs,
         #[cfg(test)]
         pack_hook: None,
     });
@@ -392,6 +397,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(scrub::run(app.clone()));
     tokio::spawn(mover::run(app.clone()));
     tokio::spawn(notifications::delivery::run(app.clone()));
+    tokio::spawn(access_log::run(app.clone()));
     // The users' identities in the KMS, now rather than in a minute.
     let identifying = app.clone();
     tokio::spawn(async move {
@@ -633,7 +639,7 @@ impl std::error::Error for Contended {}
 /// Serves the S3 API (and buckets' websites, see `s3::hosting`), counting
 /// every request in the node's metrics, until `shutdown` resolves; then
 /// waits for the requests in flight to finish.
-async fn serve_client(
+pub(crate) async fn serve_client(
     addr: SocketAddr,
     max_connections: usize,
     app: Arc<App>,

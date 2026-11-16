@@ -67,7 +67,7 @@ const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// `info`, minio-go's `cp` preflight, Terraform's refresh of a bucket). Cairn
 /// implements none of these features, so we answer exactly as S3 does for an
 /// unconfigured bucket (and as MinIO's stubs do): `location`, `versioning`,
-/// `accelerate`, `requestPayment`, `logging` and `notification` return a 200
+/// `accelerate`, `requestPayment` and `notification` return a 200
 /// empty (or default) config; the rest return their "not configured" 404.
 /// Returns `None` for a normal listing GET (no recognised sub-resource).
 ///
@@ -102,8 +102,6 @@ pub fn bucket_subresource_stub(query: &str, owner_id: &str) -> Option<Response<F
             "{XML}<RequestPaymentConfiguration xmlns=\"{S3_XMLNS}\"><Payer>BucketOwner</Payer>\
              </RequestPaymentConfiguration>"
         )))
-    } else if present("logging") {
-        Some(xml_ok(format!("{XML}<BucketLoggingStatus xmlns=\"{S3_XMLNS}\"/>")))
     } else if present("notification") {
         Some(xml_ok(format!("{XML}<NotificationConfiguration xmlns=\"{S3_XMLNS}\"/>")))
     } else {
@@ -205,6 +203,11 @@ pub fn rejection_response(rejection: &Rejection) -> Response<Full<Bytes>> {
     error_document(rejection.status, rejection.code, &rejection.message, &rejection.details)
 }
 
+/// An error response's code (`NoSuchKey`), as its document says it, for
+/// its request's access log record (see `access_log`).
+#[derive(Clone, Debug)]
+pub struct ErrorCode(pub String);
+
 /// An S3 error document: its code and message, and any further elements.
 pub(crate) fn error_document(
     status: StatusCode,
@@ -229,6 +232,7 @@ pub(crate) fn error_document(
     Response::builder()
         .status(status)
         .header("content-type", "application/xml")
+        .extension(ErrorCode(code.to_owned()))
         .body(Full::new(Bytes::from(body)))
         .unwrap()
 }
@@ -366,8 +370,10 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
         ],
         // PutBucketVersioning, PutBucketEncryption,
         // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketTagging,
-        // PutBucketPolicy, PutBucketAcl (`acl`), PutBucketWebsite.
+        // PutBucketPolicy, PutBucketAcl (`acl`), PutBucketWebsite,
+        // PutBucketLogging.
         (true, &Method::PUT) => &[
+            "logging",
             "notification",
             "versioning",
             "encryption",

@@ -228,6 +228,15 @@ async fn website_waits_only_for_bucket_changes() {
     waits_only_for_bucket_changes("SELECT pg_temp.cairn_set_website($1, '{\"index_document\":\"index.html\"}')").await;
 }
 
+/// T64: setting a bucket's logging configuration, likewise.
+#[tokio::test]
+async fn logging_waits_only_for_bucket_changes() {
+    waits_only_for_bucket_changes(
+        "SELECT pg_temp.cairn_set_logging($1, '{\"target_bucket\":\"logs\",\"target_prefix\":\"\"}')",
+    )
+    .await;
+}
+
 /// That `set` (a statement setting a bucket's configuration by a plain
 /// UPDATE of its row) doesn't wait for writes, but waits for changes of the
 /// versioning state, and finds no missing bucket.

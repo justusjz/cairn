@@ -58,6 +58,7 @@ supported.
 | Inventory | 🟡 | CSV and Parquet, not ORC: [Inventory](#inventory) |
 | Event notifications, to SNS topics | 🟡 | Over HTTP(S) subscriptions: [Event notifications](#event-notifications) |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
+| Server access logging | 🟡 | [Server access logging](#server-access-logging) |
 
 ### Security
 
@@ -81,7 +82,7 @@ supported.
 These answer `501 NotImplemented`, or report the feature as unconfigured, as
 S3 reports a bucket that doesn't use it:
 
-- Replication, server access logging.
+- Replication.
 - Analytics, metrics, Intelligent-Tiering, Storage Lens.
 - S3 Select, torrents, S3 Batch Operations.
 - S3 Express's metadata tables, access points for directory buckets.
@@ -167,6 +168,27 @@ and refuses too. The difference is that ACLs can't be enabled:
   within 48 hours, and reports go at the cluster's `lifecycle-rate`, which
   they share with lifecycle sweeps (see the [README](README.md#inventory)).
 - **Failed deliveries** are tried again hourly. S3 skips that day's report.
+
+### Server access logging
+
+- **Timing.** Logs arrive within about six minutes, not hours (see the
+  [README](README.md#server-access-logs)).
+- **What's logged.** Every S3 request to the bucket, and to its website
+  endpoint (`WEBSITE.GET.OBJECT`). Not yet: lifecycle's expirations
+  (`S3.EXPIRE.OBJECT`, …) and DeleteObjects' keys (`BATCH.DELETE.OBJECT`),
+  only the request itself (`REST.POST.MULTI_OBJECT_DELETE`). The requester
+  of a POST Object (a browser upload) is left out.
+- **Fields.** Host ID, cipher suite and TLS version are always `-` (TLS ends
+  at the proxy in front of Cairn), as are the access point ARN and
+  `aclRequired`. The turn-around time includes reading the request's body.
+  The operations of the commoner requests are named as S3 names them; those
+  of the rarer subresources follow its pattern (`REST.GET.OWNERSHIP_CONTROLS`),
+  unchecked against S3.
+- **Targets** must exist and belong to the bucket's account, as in S3.
+  `TargetGrants` are refused with `AccessControlListNotSupported`, as S3
+  refuses them for a target bucket whose ACLs are disabled ([ACLs](#acls)).
+  Grant the `logging.s3.amazonaws.com` service `s3:PutObject` in the target's
+  bucket policy instead, as S3's user guide does.
 
 ### POST Object
 
