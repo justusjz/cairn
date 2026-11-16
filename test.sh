@@ -66,7 +66,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=114
+TOTAL=115
 STEP=0
 PASS=0
 FAIL=0
@@ -1253,6 +1253,40 @@ acl_ok() {
 # per version; kept or replaced by a copy (a lowercase directive is refused,
 # as in S3); given by an upload, but refused on its parts; a bucket's; and
 # S3's errors for tags it doesn't take.
+# Directory buckets (S3 Express One Zone's, see `s3::directory`): made,
+# listed apart, used through sessions (aws-cli makes them), and refused what
+# they don't have.
+directory_buckets_ok() {
+    local dir="dir$(date +%s)--use1-az4--x-s3" out="$WORK_DIR/dir-out"
+    awss3 s3api create-bucket --bucket "$dir" --create-bucket-configuration \
+        'Location={Type=AvailabilityZone,Name=use1-az4},Bucket={DataRedundancy=SingleAvailabilityZone,Type=Directory}' \
+        >/dev/null 2>&1 || return 1
+    awss3 s3api list-directory-buckets --query 'Buckets[].Name' --output text 2>/dev/null | grep -qw "$dir" || return 1
+    awss3 s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null | grep -qw "$dir" && return 1
+    [ "$(awss3 s3api head-bucket --bucket "$dir" --query BucketLocationName --output text 2>/dev/null)" = use1-az4 ] \
+        || return 1
+    awss3 s3api put-object --bucket "$dir" --key a/b.txt --body "$SMALL" >/dev/null 2>&1 || return 1
+    awss3 s3api get-object --bucket "$dir" --key a/b.txt "$WORK_DIR/dir.dl" >/dev/null 2>&1 || return 1
+    cmp -s "$SMALL" "$WORK_DIR/dir.dl" || return 1
+    [ "$(awss3 s3api head-object --bucket "$dir" --key a/b.txt --query StorageClass --output text 2>/dev/null)" \
+        = EXPRESS_ONEZONE ] || return 1
+    [ "$(awss3 s3api list-objects-v2 --bucket "$dir" --prefix a/ --delimiter / --query 'Contents[].Key' \
+        --output text 2>/dev/null)" = a/b.txt ] || return 1
+    # Only prefixes ending in `/`; no versioning, nor tags.
+    ! awss3 s3api list-objects-v2 --bucket "$dir" --prefix a >"$out" 2>&1 || return 1
+    grep -q InvalidArgument "$out" || return 1
+    ! awss3 s3api put-bucket-versioning --bucket "$dir" --versioning-configuration Status=Enabled >"$out" 2>&1 \
+        || return 1
+    grep -q NotImplemented "$out" || return 1
+    ! awss3 s3api put-object --bucket "$dir" --key t --body "$SMALL" --tagging a=b >"$out" 2>&1 || return 1
+    grep -q NotImplemented "$out" || return 1
+    # A session of its own, read-only.
+    awss3 s3api create-session --bucket "$dir" --session-mode ReadOnly --query Credentials.AccessKeyId \
+        --output text 2>/dev/null | grep -q '^ASIA' || return 1
+    awss3 s3api delete-object --bucket "$dir" --key a/b.txt >/dev/null 2>&1 || return 1
+    awss3 s3api delete-bucket --bucket "$dir" >/dev/null 2>&1 || return 1
+}
+
 tagging_ok() {
     local tags etag version newer out="$WORK_DIR/tag-out"
     tags_of() { awss3 s3api get-object-tagging --bucket "$1" --key "$2" ${3:+--version-id "$3"} \
@@ -3013,6 +3047,7 @@ run_test    "Bucket sub-resource stubs"             subresource_stubs_ok
 run_test    "CORS configuration and preflights"     cors_ok
 run_test    "Bucket websites"                       website_ok
 run_test    "Object and bucket tags"                tagging_ok
+run_test    "Directory buckets (S3 Express)"        directory_buckets_ok
 run_test    "Unimplemented operations refused (501)" unsupported_subresources_refused
 run_test    "Parts, attributes and expected sizes"   parts_and_attributes_ok
 run_test    "ACLs disabled, as in modern S3"        acls_disabled_ok

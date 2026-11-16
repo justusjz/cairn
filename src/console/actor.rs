@@ -82,7 +82,7 @@ impl Actor {
     /// The verdicts on `checks`, with the buckets' policies loaded.
     async fn verdicts(&self, app: &Arc<App>, checks: &[Check]) -> Result<Vec<Verdict>, ApiError> {
         let access = self.access(app, checks).await?;
-        Ok(checks.iter().map(|c| access.verdict(c)).collect())
+        Ok(checks.iter().map(|c| if on_directory(c) { Verdict::ImplicitDeny } else { access.verdict(c) }).collect())
     }
 
     /// The actor's access, with the buckets of `checks` loaded.
@@ -106,7 +106,7 @@ impl Actor {
     pub async fn allows_each(&self, app: &Arc<App>, checks: &[(Check, Context)]) -> Result<Vec<bool>, ApiError> {
         let plain: Vec<Check> = checks.iter().map(|(c, _)| c.clone()).collect();
         let access = self.access(app, &plain).await?;
-        Ok(checks.iter().map(|(c, extra)| access.verdict_with(c, extra) == Verdict::Allow).collect())
+        Ok(checks.iter().map(|(c, extra)| !on_directory(c) && access.verdict_with(c, extra) == Verdict::Allow).collect())
     }
 
     /// Whether `action` on `on` is allowed.
@@ -124,6 +124,7 @@ impl Actor {
     /// IAM request's: see `Access::verdict_with`).
     pub async fn check_with(&self, app: &Arc<App>, action: &'static str, on: On, extra: &Context) -> Result<(), ApiError> {
         let check = Check { action, on };
+        refuse_directory(std::slice::from_ref(&check))?;
         let access = self.access(app, std::slice::from_ref(&check)).await?;
         match access.verdict_with(&check, extra) {
             Verdict::Allow => Ok(()),
@@ -134,6 +135,7 @@ impl Actor {
     /// Refuses the request unless every one of `checks` is allowed.
     /// A bucket's policy is its account's alone (see `Access::foreign`).
     pub async fn check_all(&self, app: &Arc<App>, checks: &[Check]) -> Result<(), ApiError> {
+        refuse_directory(checks)?;
         let access = self.access(app, checks).await?;
         if let Some((check, verdict)) = checks.iter().map(|c| (c, access.verdict(c))).find(|(_, v)| *v != Verdict::Allow) {
             return Err(ApiError::Forbidden(denied(&self.0, check, verdict, access.boundary())));
@@ -145,6 +147,25 @@ impl Actor {
             )));
         }
         Ok(())
+    }
+}
+
+/// Whether `check` is on a directory bucket (see `s3::directory`), which
+/// the console doesn't manage: what it does to buckets (versioning, tags,
+/// Object Lock, ...) a directory bucket can't have, and its own operations
+/// are S3 Express's, which only the S3 API has.
+fn on_directory(check: &Check) -> bool {
+    check.on.bucket().is_some_and(crate::s3::directory::is_directory)
+}
+
+/// Refuses `checks` if any is on a directory bucket (see `on_directory`).
+fn refuse_directory(checks: &[Check]) -> Result<(), ApiError> {
+    match checks.iter().find(|c| on_directory(c)) {
+        Some(check) => Err(ApiError::Forbidden(format!(
+            "{} is a directory bucket, which the console doesn't manage: use the S3 API",
+            check.on.bucket().unwrap_or_default()
+        ))),
+        None => Ok(()),
     }
 }
 

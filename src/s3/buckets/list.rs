@@ -77,6 +77,8 @@ pub async fn list_buckets(
     let mut listed: Vec<BucketInfo> = all_buckets
         .into_iter()
         .filter(|b| b.account == principal.account)
+        // Directory buckets are ListDirectoryBuckets' (see `s3::directory`).
+        .filter(|b| !crate::s3::directory::is_directory(&b.name))
         .filter(|b| b.name.starts_with(&prefix))
         .filter(|b| after.as_ref().is_none_or(|after| b.name > *after))
         .take(max + 1)

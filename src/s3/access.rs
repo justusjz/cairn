@@ -122,6 +122,13 @@ pub struct Access {
     /// The tags of the versions the request is on, by bucket and key, as
     /// they were looked up (see `s3::abac`): their `s3:ExistingObjectTag`s.
     object_tags: HashMap<(String, String), Tags>,
+    /// The directory bucket whose zonal operations the request may make,
+    /// its session (or its checks) having said so (see `s3::directory`):
+    /// every check on it is allowed but regional operations'.
+    granted: Option<String>,
+    /// The directory bucket the request writes to, if it does: its session
+    /// must be a `ReadWrite` one.
+    writes: Option<String>,
 }
 
 /// Who makes a request, as policies see it (an owned `policy::Principal`).
@@ -215,7 +222,29 @@ impl Access {
             context: context(principal, account, method, headers, query, origin),
             buckets: HashMap::new(),
             object_tags: HashMap::new(),
+            granted: None,
+            writes: None,
         })
+    }
+
+    /// Allows the request every check on directory bucket `bucket` but
+    /// those of regional operations: it may make the bucket's zonal
+    /// operations (see `s3::directory`).
+    pub fn grant(&mut self, bucket: &str) {
+        self.granted = Some(bucket.to_owned());
+    }
+
+    /// Says the request writes to directory bucket `bucket`: its
+    /// `s3express:CreateSession` on it is checked in `ReadWrite` mode.
+    pub fn writes(&mut self, bucket: &str) {
+        self.writes = Some(bucket.to_owned());
+    }
+
+    /// Whether `check` is on the bucket `grant` allowed, and not a regional
+    /// operation's.
+    fn granted(&self, check: &Check) -> bool {
+        let regional = check.action.starts_with("s3express:") && check.action != crate::s3::directory::CREATE_SESSION;
+        self.granted.is_some() && check.on.bucket() == self.granted.as_deref() && !regional
     }
 
     /// The ARN of the user's permissions boundary, if it has one.
@@ -227,6 +256,11 @@ impl Access {
     pub async fn load(&mut self, app: &App, bucket: &str) -> anyhow::Result<bool> {
         if let Some(loaded) = self.buckets.get(bucket) {
             return Ok(loaded.exists);
+        }
+        // A granted bucket's checks need no policy; whether it's there, its
+        // operations tell.
+        if self.granted.as_deref() == Some(bucket) {
+            return Ok(true);
         }
         let row = app
             .pool
@@ -294,13 +328,41 @@ impl Access {
     /// resource (a user's tags, say) and of what an IAM request asks for
     /// (see `iam`).
     pub fn verdict_with(&self, check: &Check, extra: &Context) -> Verdict {
+        if self.granted(check) {
+            return Verdict::Allow;
+        }
+        // A zonal operation of a directory bucket needs a session's creation
+        // to be allowed: in `ReadWrite` mode to write, in either to read
+        // (see `s3::directory`). CreateSession says its mode itself.
+        use crate::s3::directory::{CREATE_SESSION, SESSION_MODE};
+        if check.action == CREATE_SESSION && self.context.get(SESSION_MODE).is_none() && extra.get(SESSION_MODE).is_none() {
+            let in_mode = |mode: &str| {
+                let mut extra = extra.clone();
+                extra.set(SESSION_MODE, mode);
+                self.verdict_with(check, &extra)
+            };
+            if check.on.bucket().is_some() && check.on.bucket() == self.writes.as_deref() {
+                return in_mode("ReadWrite");
+            }
+            return match in_mode("ReadOnly") {
+                Verdict::Allow => Verdict::Allow,
+                verdict => match in_mode("ReadWrite") {
+                    Verdict::Allow => Verdict::Allow,
+                    _ => verdict,
+                },
+            };
+        }
         let resource = check.on.arn();
         let principal = self.user.as_ref().map_or(Who::Anonymous, Who_::as_policy);
         let loaded = check.on.bucket().and_then(|b| self.buckets.get(b));
         // A restricted bucket's public policy is none to anyone outside its
         // account.
+        // A directory bucket's regional operations are allowed by identity
+        // policies only, never by its own (see `s3::directory`).
+        let regional = check.action.starts_with("s3express:") && check.action != CREATE_SESSION;
         let bucket = loaded
             .filter(|loaded| !(loaded.restricted && loaded.account.as_deref() != self.account()))
+            .filter(|_| !regional)
             .and_then(|loaded| loaded.policy.as_deref());
         // Whose the resource is: a bucket's owner; else (no bucket, or none
         // by its name) the principal's own account's. A bucket to create is
@@ -312,7 +374,9 @@ impl Access {
             // The account's, whose operators' policies allow them `cairn:`
             // actions (see `plans/single-account.md`); never anonymously.
             On::Cluster => Some(self.account().unwrap_or("")),
-            _ => loaded.and_then(|loaded| loaded.account.as_deref()).filter(|_| check.action != "s3:CreateBucket"),
+            _ => loaded
+                .and_then(|loaded| loaded.account.as_deref())
+                .filter(|_| !matches!(check.action, "s3:CreateBucket" | "s3express:CreateBucket")),
         };
         // `aws:ResourceAccount` is that account (else the principal's own;
         // anonymously, the one the request was made in).
@@ -321,7 +385,10 @@ impl Access {
         context.extend(extra);
         // The bucket's tags, with its ABAC enabled: not to create it, as it's
         // not there yet (whoever has its name).
-        if let Some(tags) = loaded.and_then(|l| l.abac_tags.as_ref()).filter(|_| check.action != "s3:CreateBucket") {
+        if let Some(tags) = loaded
+            .and_then(|l| l.abac_tags.as_ref())
+            .filter(|_| !matches!(check.action, "s3:CreateBucket" | "s3express:CreateBucket"))
+        {
             for (key, value) in tags.iter() {
                 context.set(&format!("aws:ResourceTag/{key}"), value);
                 context.set(&format!("s3:BucketTag/{key}"), value);
@@ -337,6 +404,9 @@ impl Access {
         if let Some(account) = resource_account {
             context.set("aws:ResourceAccount", account);
             context.set("s3:ResourceAccount", account);
+            if check.action.starts_with("s3express:") {
+                context.set("s3express:ResourceAccount", account);
+            }
         }
         // Only the `s3:` keys this action takes (see `Context::for_action`).
         let context = context.for_action(check.action);

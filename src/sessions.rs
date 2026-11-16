@@ -101,6 +101,38 @@ pub struct Session {
     /// (AssumeRoleWithWebIdentity), passed on to roles it assumes.
     #[serde(rename = "f", default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// A directory bucket's session (S3 Express's CreateSession), if it is
+    /// one: then it's good for that bucket's zonal operations only, and
+    /// its token is taken as `x-amz-s3session-token` only (see
+    /// `s3::directory`).
+    #[serde(rename = "d", default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<Directory>,
+}
+
+/// What a directory bucket's session is for: the bucket, in a mode, as
+/// CreateSession authorized it, and who made it, so that its requests need
+/// neither their principal's policies nor the bucket's (see
+/// `s3::directory`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Directory {
+    #[serde(rename = "b")]
+    pub bucket: String,
+    /// `ReadOnly`, rather than `ReadWrite`.
+    #[serde(rename = "r", default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
+    /// Authorized before the bucket existed (CreateSession on a bucket
+    /// about to be created, as SDKs make one): then each request is
+    /// authorized as if it had no session.
+    #[serde(rename = "u", default, skip_serializing_if = "std::ops::Not::not")]
+    pub unauthorized: bool,
+    /// Whose it is: its principal's account, path and name (its role's,
+    /// for a role's session), as its ARN names it.
+    #[serde(rename = "a")]
+    pub account: String,
+    #[serde(rename = "p")]
+    pub path: String,
+    #[serde(rename = "n")]
+    pub name: String,
 }
 
 /// Why a token isn't one.
@@ -358,6 +390,7 @@ mod tests {
             source_identity: None,
             chained: false,
             provider: None,
+            directory: None,
         };
         let token = keys.seal(&client, &mut session).await.unwrap();
         // The secret is AWS's shape, derived, not in the token.

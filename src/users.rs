@@ -254,7 +254,7 @@ impl Principal {
         access_key: &str,
         token: Option<&str>,
     ) -> anyhow::Result<Result<Self, Unknown>> {
-        use crate::sessions::{Bad, Who};
+        use crate::sessions::Bad;
         if !crate::sessions::is_temporary(access_key) {
             if token.is_some() {
                 return Ok(Err(Unknown::Token));
@@ -270,6 +270,19 @@ impl Principal {
         if session.key_id != access_key {
             return Ok(Err(Unknown::Key));
         }
+        // A directory bucket's session is good for its bucket's zonal
+        // operations only, taken as `x-amz-s3session-token` (see
+        // `s3::directory`), never as an STS session's.
+        if session.directory.is_some() {
+            return Ok(Err(Unknown::Token));
+        }
+        Self::of_session(client, session).await
+    }
+
+    /// The principal whose session `session` is, as its credentials make
+    /// it: its role's (or user's) policies, capped by the session's.
+    pub async fn of_session(client: &Object, session: crate::sessions::Session) -> anyhow::Result<Result<Self, Unknown>> {
+        use crate::sessions::Who;
         let principal = match &session.who {
             Who::Role { id, .. } => crate::roles::principal(client, *id).await?,
             Who::User { id } | Who::Federated { id, .. } => Self::load_user(client, *id).await?,
@@ -303,6 +316,36 @@ impl Principal {
     /// signs nothing), or `None` if there's none.
     pub async fn load_user(client: &Object, id: uuid::Uuid) -> anyhow::Result<Option<Self>> {
         Self::load_where(client, "FROM users r WHERE r.id = $1", "''::text", &id).await
+    }
+
+    /// The principal of a directory bucket's session (see
+    /// `s3::directory`), as far as its token says, without a look at the
+    /// database: who it is, but none of its policies, as the session's
+    /// requests are authorized by the session alone. `None` if `session`
+    /// isn't a directory bucket's.
+    pub fn of_directory_session(session: crate::sessions::Session) -> Option<Self> {
+        let directory = session.directory.as_ref()?;
+        let id = match &session.who {
+            crate::sessions::Who::Role { id, .. } | crate::sessions::Who::User { id } | crate::sessions::Who::Federated { id, .. } => *id,
+        };
+        Some(Principal {
+            id,
+            name: directory.name.clone(),
+            account: directory.account.clone(),
+            secret: session.secret.clone(),
+            admin: false,
+            policies: Vec::new(),
+            path: directory.path.clone(),
+            tags: session.tags.clone(),
+            boundary: None,
+            session: Some(SessionOf { session, policies: Vec::new(), restricted: false }),
+            #[cfg(test)]
+            read: HashSet::new(),
+            #[cfg(test)]
+            write: HashSet::new(),
+            #[cfg(test)]
+            delete_version: HashSet::new(),
+        })
     }
 
     async fn load_where(

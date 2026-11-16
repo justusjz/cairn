@@ -919,4 +919,59 @@ fn a_service_is_let_in_by_name_or_as_everyone() {
     assert_eq!(check(&denied, service, "s3:PutObject", &object("a"), &context), Decision::Deny);
     // Naming a service doesn't make a policy public.
     assert!(!policy.is_public());
+
+/// A directory bucket's policy is about S3 Express's actions on the bucket
+/// (by its `s3express` ARN), and may test a session's mode; S3's actions,
+/// and its objects, are none of it (see `s3::directory`).
+#[test]
+fn directory_bucket_policies_take_s3express_actions() {
+    const DIRECTORY: &str = "data--use1-az4--x-s3";
+    let arn = format!("arn:aws:s3express:us-east-1:{ACCOUNT}:bucket/{DIRECTORY}");
+    let statement = |action: &str, resource: &str, condition: &str| {
+        format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{ACCOUNT}:root"}},
+                "Action":{action},"Resource":{resource}{condition}}}]}}"#
+        )
+    };
+    let read_only = r#","Condition":{"StringEquals":{"s3express:SessionMode":"ReadOnly"}}"#;
+    let quoted = format!("\"{arn}\"");
+    for (action, resource, condition) in [
+        ("\"s3express:CreateSession\"", quoted.as_str(), ""),
+        ("\"s3express:*\"", quoted.as_str(), read_only),
+        ("\"*\"", quoted.as_str(), ""),
+        ("[\"s3express:CreateSession\",\"s3express:Get*\"]", "\"arn:aws:s3express:*:*:bucket/data--use1-az4--x-s3\"", ""),
+    ] {
+        let json = statement(action, resource, condition);
+        Policy::parse(&json, Kind::Bucket(DIRECTORY)).unwrap_or_else(|e| panic!("{json}: {e:?}"));
+    }
+    for (action, resource, condition, message) in [
+        ("\"s3:GetObject\"", quoted.as_str(), "", "Policy has invalid action"),
+        ("\"s3express:Frobnicate\"", quoted.as_str(), "", "Policy has invalid action"),
+        ("\"s3express:CreateSession\"", "\"arn:aws:s3:::data--use1-az4--x-s3\"", "", "Policy has invalid resource"),
+        ("\"s3express:CreateSession\"", &format!("\"{arn}/*\""), "", "Policy has invalid resource"),
+        ("\"s3express:CreateSession\"", "\"arn:aws:s3express:us-east-1:123456789012:bucket/other--use1-az4--x-s3\"", "", "Policy has invalid resource"),
+        ("\"s3express:CreateSession\"", "[]", "", "Action does not apply to any resource(s) in statement"),
+    ] {
+        let invalid = refused(&statement(action, resource, condition), Kind::Bucket(DIRECTORY));
+        assert_eq!((invalid.code, invalid.message.as_str()), ("MalformedPolicy", message), "{action} {resource}");
+    }
+    // Keys S3 Express has that Cairn doesn't decide.
+    let location = r#","Condition":{"StringEquals":{"s3express:LocationName":"use1-az4"}}"#;
+    let invalid = refused(&statement("\"s3express:CreateSession\"", &quoted, location), Kind::Bucket(DIRECTORY));
+    assert_eq!(invalid.code, "NotImplemented");
+
+    // A session's mode decides.
+    let policy = Policy::parse(&statement("\"s3express:CreateSession\"", &quoted, read_only).replace(":root", ":user/a"), Kind::Bucket(DIRECTORY))
+        .unwrap()
+        .with_ids([(user_arn(ACCOUNT, "a"), "a".to_owned())].into());
+    let mut context = Context::default();
+    context.set("s3express:SessionMode", "ReadOnly");
+    assert_eq!(check(&policy, user("a"), "s3express:CreateSession", &arn, &context), Decision::Allow);
+    context.set("s3express:SessionMode", "ReadWrite");
+    assert_eq!(check(&policy, user("a"), "s3express:CreateSession", &arn, &context), Decision::NotApplicable);
+    // An identity policy may name S3 Express's actions too.
+    let identity = identity_policy(&format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3express:CreateSession","Resource":"{arn}"}}]}}"#
+    ));
+    assert_eq!(check(&identity, user("a"), "s3express:CreateSession", &arn, &context), Decision::Allow);
 }
