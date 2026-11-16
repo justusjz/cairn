@@ -133,6 +133,7 @@ async fn node_on(
         website_domain: None,
         kms: None,
         sessions: Default::default(),
+        access_logs: Default::default(),
         pack_hook: hook,
     })
 }

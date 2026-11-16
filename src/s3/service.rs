@@ -45,6 +45,12 @@ impl Destination {
         Ok(Some(Destination { name: name.to_owned(), owner: row.get(2), policy }))
     }
 
+    /// A bucket without a policy, for tests that need one but no database.
+    #[cfg(test)]
+    pub fn detached(name: &str, owner: &str) -> Destination {
+        Destination { name: name.to_owned(), owner: owner.to_owned(), policy: None }
+    }
+
     /// Whether its policy lets `service` write `key` to it (`s3:PutObject`)
     /// for the bucket `source`, of the account `source_account`. `context`
     /// has the condition keys of the write itself that S3's would have

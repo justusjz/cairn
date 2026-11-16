@@ -203,6 +203,11 @@ pub fn rejection_response(rejection: &Rejection) -> Response<Full<Bytes>> {
     error_document(rejection.status, rejection.code, &rejection.message, &rejection.details)
 }
 
+/// An error response's code (`NoSuchKey`), as its document says it, for
+/// its request's access log record (see `access_log`).
+#[derive(Clone, Debug)]
+pub struct ErrorCode(pub String);
+
 /// An S3 error document: its code and message, and any further elements.
 pub(crate) fn error_document(
     status: StatusCode,
@@ -227,6 +232,7 @@ pub(crate) fn error_document(
     Response::builder()
         .status(status)
         .header("content-type", "application/xml")
+        .extension(ErrorCode(code.to_owned()))
         .body(Full::new(Bytes::from(body)))
         .unwrap()
 }

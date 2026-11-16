@@ -224,6 +224,11 @@ impl Store {
         }
     }
 
+    /// The node's data dir.
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.data_dir
+    }
+
     /// The path of directory `dir` (`0..DIRS`), named by its four hex
     /// digits like a blob's (see `get_blob_dir`).
     fn dir_path(&self, dir: u32) -> PathBuf {
@@ -282,8 +287,9 @@ impl Store {
         let mut blobs = Vec::new();
         let mut level1 = fs::read_dir(&self.data_dir).await?;
         while let Some(e1) = level1.next_entry().await? {
-            // Skip non-directories at the top level (e.g. the node_id file).
-            if !e1.file_type().await?.is_dir() {
+            // Skip what isn't a blob directory at the top level (the
+            // node_id file, the access log spool).
+            if !e1.file_type().await?.is_dir() || e1.file_name().len() != 2 {
                 continue;
             }
             let mut level2 = fs::read_dir(e1.path()).await?;

@@ -102,15 +102,16 @@ pub async fn handle(
     // A request from another origin gets CORS headers on its response,
     // whatever the response is, if its bucket allows it (see `cors`).
     let cross = cors::Cross::of(req.method(), req.headers(), &bucket_of(&route.path));
-    let mut response = REQUEST_ID
+    let logged = logged(&app, &req, route, peer);
+    let (mut response, requester) = REQUEST_ID
         .scope(
             id.clone(),
-            crate::notifications::scope(async {
+            crate::access_log::scope(crate::notifications::scope(async {
                 handle_request(req, app.clone(), route, peer).await.unwrap_or_else(|e| {
                     eprintln!("{what} failed (request {id}): {e:#}");
                     error_response(&e)
                 })
-            }),
+            })),
         )
         .await;
     response.headers_mut().insert(
@@ -122,7 +123,42 @@ pub async fn handle(
     {
         eprintln!("{what}: CORS headers failed (request {id}): {e:#}");
     }
-    response
+    match logged {
+        Some(pending) => pending.finish(response, requester, &id),
+        None => response,
+    }
+}
+
+/// The access log record of a request, if it's to a bucket that logs (see
+/// `access_log`): not S3 Control's, which only name buckets.
+fn logged<B>(
+    app: &Arc<App>,
+    req: &Request<B>,
+    route: &Route,
+    peer: std::net::IpAddr,
+) -> Option<crate::access_log::Pending> {
+    let path = route.path.trim_start_matches('/');
+    let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
+    if bucket.is_empty()
+        || buckets::resource_tags::is_control(req.uri().path(), req.headers())
+        || public_access::is_control(req.uri().path(), req.headers())
+    {
+        return None;
+    }
+    let bucket = decode_path_param(bucket);
+    crate::access_log::Pending::begin(
+        app,
+        crate::access_log::Received {
+            method: req.method(),
+            uri: req.uri(),
+            version: req.version(),
+            headers: req.headers(),
+            bucket: &bucket,
+            key,
+            website: route.website,
+            peer,
+        },
+    )
 }
 
 /// The bucket a request's path names, decoded; empty if it names none.
@@ -246,6 +282,9 @@ async fn handle_request(
     }
     let account = crate::users::account(&app.pool.get().await?).await?;
     // Who makes it, as its writes' events say (see `notifications`).
+    if let Some(principal) = &principal {
+        crate::access_log::set_requester(principal.arn());
+    }
     crate::notifications::set_requester(
         principal.as_ref().map(|p| p.unique_id()),
         access::client_address(req.headers(), Some(peer), &app.trusted_proxies),
