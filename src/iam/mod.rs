@@ -27,6 +27,8 @@ mod sts;
 #[cfg(test)]
 mod groups_tests;
 #[cfg(test)]
+mod paging_tests;
+#[cfg(test)]
 mod web_identity_tests;
 
 use std::collections::HashMap;
@@ -35,6 +37,7 @@ use std::sync::Arc;
 
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Request, Response, StatusCode, body::Bytes};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 
 use crate::{
@@ -987,24 +990,29 @@ impl Iam<'_> {
         let rows = self
             .client
             .query_cached(
-                &format!("SELECT access_key_id, active, {ISO} FROM access_keys WHERE user_id = $1 ORDER BY created_at, access_key_id"),
+                &format!(
+                    "SELECT access_key_id, active, {ISO}, to_char(created_at AT TIME ZONE 'UTC', 'YYYYMMDDHH24MISSUS')
+                     FROM access_keys WHERE user_id = $1"
+                ),
                 &[&user.id],
             )
             .await?;
-        let members: String = rows
+        let keys: Vec<(String, bool, String, String)> = rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect();
+        // Oldest first, to the microsecond.
+        let (keys, end) = page(params, keys, |(id, _, _, made)| format!("{made} {id}"))?;
+        let members: String = keys
             .iter()
-            .map(|r| {
-                let status = if r.get::<_, bool>(1) { "Active" } else { "Inactive" };
+            .map(|(id, active, created, _)| {
+                let status = if *active { "Active" } else { "Inactive" };
                 format!(
                     "<member><UserName>{}</UserName><AccessKeyId>{}</AccessKeyId><Status>{status}</Status>\
-                     <CreateDate>{}</CreateDate></member>",
+                     <CreateDate>{created}</CreateDate></member>",
                     xml_escape(&user.name),
-                    xml_escape(r.get::<_, &str>(0)),
-                    r.get::<_, String>(2)
+                    xml_escape(id),
                 )
             })
             .collect();
-        Ok(Some(format!("<AccessKeyMetadata>{members}</AccessKeyMetadata><IsTruncated>false</IsTruncated>")))
+        Ok(Some(format!("<AccessKeyMetadata>{members}</AccessKeyMetadata>{end}")))
     }
 
     /// The access key a request names, of `user`.
@@ -1093,8 +1101,7 @@ impl Iam<'_> {
                 &[&user.id],
             )
             .await?;
-        let members: String = rows.iter().map(|r| format!("<member>{}</member>", xml_escape(r.get::<_, &str>(0)))).collect();
-        Ok(Some(format!("<PolicyNames>{members}</PolicyNames><IsTruncated>false</IsTruncated>")))
+        Ok(Some(names_page(params, rows.iter().map(|r| r.get(0)).collect())?))
     }
 
     async fn delete_user_policy(&mut self, params: &Params) -> Result<Option<String>> {
@@ -1123,18 +1130,7 @@ impl Iam<'_> {
     async fn list_attached_user_policies(&mut self, params: &Params) -> Result<Option<String>> {
         params.required("UserName")?;
         let user = self.user(params, "iam:ListAttachedUserPolicies").await?;
-        let members: String = managed::attached(self.client, self.account(), &user.name)
-            .await?
-            .iter()
-            .map(|p| {
-                format!(
-                    "<member><PolicyName>{}</PolicyName><PolicyArn>{}</PolicyArn></member>",
-                    xml_escape(&p.name),
-                    xml_escape(&p.arn)
-                )
-            })
-            .collect();
-        Ok(Some(format!("<AttachedPolicies>{members}</AttachedPolicies><IsTruncated>false</IsTruncated>")))
+        Ok(Some(attached_page(params, managed::attached(self.client, self.account(), &user.name).await?)?))
     }
 
     /// The policy a request names (`PolicyArn`), allowed `action` on it.
@@ -1543,8 +1539,20 @@ impl Iam<'_> {
             }
         };
         let entities = params.get("EntityFilter");
-        let mut users = Vec::new();
+        // One list of them all, paged together (see `page`): groups, users,
+        // then roles, each by name, as IAM's result has them.
+        enum Entity {
+            Group(uuid::Uuid),
+            User(uuid::Uuid),
+            Role(uuid::Uuid),
+        }
+        let mut listed: Vec<(Entity, String)> = Vec::new();
+        // Groups have no boundaries.
+        if matches!(entities, None | Some("Group")) && attached {
+            listed.extend(policy.groups.iter().map(|(id, name)| (Entity::Group(*id), name.clone())));
+        }
         if matches!(entities, None | Some("User")) {
+            let mut users: Vec<uuid::Uuid> = Vec::new();
             if attached {
                 users.extend(policy.users.iter().copied());
             }
@@ -1552,18 +1560,13 @@ impl Iam<'_> {
                 let more: Vec<uuid::Uuid> = policy.bounds.iter().copied().filter(|id| !users.contains(id)).collect();
                 users.extend(more);
             }
+            for id in users {
+                let name: String = self.client.query_one_cached("SELECT name FROM users WHERE id = $1", &[&id]).await?.get(0);
+                listed.push((Entity::User(id), name));
+            }
         }
-        let mut members = String::new();
-        for id in users {
-            let name: String = self.client.query_one_cached("SELECT name FROM users WHERE id = $1", &[&id]).await?.get(0);
-            members.push_str(&format!(
-                "<member><UserName>{}</UserName><UserId>{}</UserId></member>",
-                xml_escape(&name),
-                user_id(id)
-            ));
-        }
-        let mut roles: Vec<(uuid::Uuid, String)> = Vec::new();
         if matches!(entities, None | Some("Role")) {
+            let mut roles: Vec<(uuid::Uuid, String)> = Vec::new();
             if attached {
                 roles.extend(policy.roles.iter().cloned());
             }
@@ -1571,28 +1574,30 @@ impl Iam<'_> {
                 let more: Vec<_> = policy.role_bounds.iter().filter(|(id, _)| !roles.iter().any(|(r, _)| r == id)).cloned().collect();
                 roles.extend(more);
             }
+            listed.extend(roles.into_iter().map(|(id, name)| (Entity::Role(id), name)));
         }
-        let role_members: String = roles
-            .iter()
-            .map(|(id, name)| {
-                format!("<member><RoleName>{}</RoleName><RoleId>{}</RoleId></member>", xml_escape(name), crate::roles::unique_id(*id))
-            })
-            .collect();
-        // Groups have no boundaries.
-        let groups = match matches!(entities, None | Some("Group")) && attached {
-            true => policy.groups.as_slice(),
-            false => &[],
-        };
-        let group_members: String = groups
-            .iter()
-            .map(|(id, name)| {
-                format!("<member><GroupName>{}</GroupName><GroupId>{}</GroupId></member>", xml_escape(name), crate::groups::unique_id(*id))
-            })
-            .collect();
-        Ok(Some(format!(
-            "<PolicyGroups>{group_members}</PolicyGroups><PolicyUsers>{members}</PolicyUsers><PolicyRoles>{role_members}</PolicyRoles>\
-             <IsTruncated>false</IsTruncated>"
-        )))
+        let (listed, end) = page(params, listed, |(entity, name)| {
+            let kind = match entity {
+                Entity::Group(_) => '0',
+                Entity::User(_) => '1',
+                Entity::Role(_) => '2',
+            };
+            format!("{kind}{name}")
+        })?;
+        let (mut groups, mut users, mut roles) = (String::new(), String::new(), String::new());
+        for (entity, name) in &listed {
+            let name = xml_escape(name);
+            match entity {
+                Entity::Group(id) => {
+                    groups.push_str(&format!("<member><GroupName>{name}</GroupName><GroupId>{}</GroupId></member>", crate::groups::unique_id(*id)))
+                }
+                Entity::User(id) => users.push_str(&format!("<member><UserName>{name}</UserName><UserId>{}</UserId></member>", user_id(*id))),
+                Entity::Role(id) => {
+                    roles.push_str(&format!("<member><RoleName>{name}</RoleName><RoleId>{}</RoleId></member>", crate::roles::unique_id(*id)))
+                }
+            }
+        }
+        Ok(Some(format!("<PolicyGroups>{groups}</PolicyGroups><PolicyUsers>{users}</PolicyUsers><PolicyRoles>{roles}</PolicyRoles>{end}")))
     }
 }
 
@@ -1624,6 +1629,62 @@ struct Policy {
     tags: Vec<(String, String)>,
     /// Its ID in Cairn (none for Cairn's own).
     uuid: Option<uuid::Uuid>,
+}
+
+/// A page of `items`, as IAM pages its lists: in the order of `key`, those
+/// after the request's `Marker`, at most its `MaxItems`. With the end of
+/// the result, as IAM writes it: `<IsTruncated>`, and, if it is, the
+/// `<Marker>` that asks for the next page: the page's last key, encoded,
+/// which clients take as opaque (as IAM's are). Paged by key, not by count,
+/// so that the next page neither skips nor repeats any item when one before
+/// it is added or removed in between.
+fn page<T>(params: &Params, items: Vec<T>, key: impl Fn(&T) -> String) -> Result<(Vec<T>, String)> {
+    let max = max_items(params)?;
+    let mut keyed: Vec<(String, T)> = items.into_iter().map(|item| (key(&item), item)).collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    if let Some(marker) = params.get("Marker") {
+        let after = URL_SAFE_NO_PAD
+            .decode(marker)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .ok_or_else(|| invalid("Invalid Marker."))?;
+        keyed.retain(|(key, _)| *key > after);
+    }
+    let truncated = keyed.len() > max;
+    keyed.truncate(max);
+    let end = match (truncated, keyed.last()) {
+        (true, Some((last, _))) => format!("<IsTruncated>true</IsTruncated><Marker>{}</Marker>", URL_SAFE_NO_PAD.encode(last)),
+        _ => "<IsTruncated>false</IsTruncated>".to_owned(),
+    };
+    Ok((keyed.into_iter().map(|(_, item)| item).collect(), end))
+}
+
+/// A page of attached managed policies (see `page`), as the
+/// ListAttached…Policies actions answer: Cairn's, by name, then the
+/// account's, by path and name.
+fn attached_page(params: &Params, attached: Vec<managed::Attached>) -> Result<String> {
+    let (listed, end) = page(params, attached, |a| match a.arn.strip_prefix("arn:aws:iam::aws:policy/") {
+        Some(_) => format!("0{}", a.name),
+        // `<path> <name>`: a path's `/`s and characters sort after the
+        // space, so a path's own policies come before its subpaths'.
+        None => {
+            let path = a.arn.split_once(":policy").map_or("", |(_, rest)| rest);
+            let path = &path[..path.len() - a.name.len()];
+            format!("1{path} {}", a.name)
+        }
+    })?;
+    let members: String = listed
+        .iter()
+        .map(|p| format!("<member><PolicyName>{}</PolicyName><PolicyArn>{}</PolicyArn></member>", xml_escape(&p.name), xml_escape(&p.arn)))
+        .collect();
+    Ok(format!("<AttachedPolicies>{members}</AttachedPolicies>{end}"))
+}
+
+/// A page of policy names (see `page`), as the List…Policies actions answer.
+fn names_page(params: &Params, names: Vec<String>) -> Result<String> {
+    let (listed, end) = page(params, names, String::clone)?;
+    let members: String = listed.iter().map(|n| format!("<member>{}</member>", xml_escape(n))).collect();
+    Ok(format!("<PolicyNames>{members}</PolicyNames>{end}"))
 }
 
 /// `MaxItems`: 1 to 1000, 100 if not given, as IAM's.

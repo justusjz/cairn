@@ -212,12 +212,7 @@ impl Iam<'_> {
 
     pub(super) async fn list_group_policies(&mut self, params: &Params) -> Result<Option<String>> {
         let group = self.group(params, "iam:ListGroupPolicies").await?;
-        let members: String = groups::policy_names(self.client, group.id)
-            .await?
-            .iter()
-            .map(|n| format!("<member>{}</member>", xml_escape(n)))
-            .collect();
-        Ok(Some(format!("<PolicyNames>{members}</PolicyNames><IsTruncated>false</IsTruncated>")))
+        Ok(Some(super::names_page(params, groups::policy_names(self.client, group.id).await?)?))
     }
 
     pub(super) async fn delete_group_policy(&mut self, params: &Params) -> Result<Option<String>> {
@@ -243,13 +238,6 @@ impl Iam<'_> {
 
     pub(super) async fn list_attached_group_policies(&mut self, params: &Params) -> Result<Option<String>> {
         let group = self.group(params, "iam:ListAttachedGroupPolicies").await?;
-        let members: String = groups::attached(self.client, group.id)
-            .await?
-            .iter()
-            .map(|p| {
-                format!("<member><PolicyName>{}</PolicyName><PolicyArn>{}</PolicyArn></member>", xml_escape(&p.name), xml_escape(&p.arn))
-            })
-            .collect();
-        Ok(Some(format!("<AttachedPolicies>{members}</AttachedPolicies><IsTruncated>false</IsTruncated>")))
+        Ok(Some(super::attached_page(params, groups::attached(self.client, group.id).await?)?))
     }
 }

@@ -217,11 +217,10 @@ Differences:
 
 - User names may only use `[A-Za-z0-9._-]`, and paths only `[\w+=,.@/-]`.
 - Access key IDs have no `AKIA` prefix.
-- These list actions return everything at once and ignore paging:
-  ListAccessKeys, ListUserPolicies, ListAttachedUserPolicies,
-  ListRolePolicies, ListAttachedRolePolicies, ListGroupPolicies,
-  ListAttachedGroupPolicies, ListEntitiesForPolicy.
-  ListPolicies ignores `PolicyUsageFilter`.
+- ListAttachedUserPolicies, ListAttachedRolePolicies,
+  ListAttachedGroupPolicies and ListEntitiesForPolicy ignore `PathPrefix`,
+  and ListPolicies ignores `PolicyUsageFilter`. (Every list pages, with
+  `MaxItems` and `Marker`, as IAM's do.)
 - `iam:PassRole` is never checked, since there are no services to pass roles to.
 - `RoleLastUsed` and `PasswordLastUsed` are never reported.
 - **OpenID Connect providers:** Cairn fetches the issuer's discovery document

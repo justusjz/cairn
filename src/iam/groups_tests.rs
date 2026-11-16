@@ -18,10 +18,10 @@ use crate::{
 };
 
 /// What a request answered: its result, or its error's code and message.
-type Answer = Result<String, (String, String)>;
+pub(super) type Answer = Result<String, (String, String)>;
 
 /// `action` with `params`, signed by the user whose key `key` is.
-async fn call(app: &Arc<App>, key: &str, action: &str, params: &[(&str, &str)]) -> Answer {
+pub(super) async fn call(app: &Arc<App>, key: &str, action: &str, params: &[(&str, &str)]) -> Answer {
     let client = app.pool.get().await.unwrap();
     let principal = Principal::load(&client, key).await.unwrap().unwrap();
     let trusted = Vec::new();
@@ -49,6 +49,17 @@ async fn call(app: &Arc<App>, key: &str, action: &str, params: &[(&str, &str)]) 
         "GetPolicy" => iam.get_policy(&params).await,
         "ListEntitiesForPolicy" => iam.list_entities_for_policy(&params).await,
         "CreatePolicy" => iam.create_policy(&params).await,
+        "AttachUserPolicy" => iam.attach_user_policy(&params, true).await,
+        "PutUserPolicy" => iam.put_user_policy(&params).await,
+        "DeleteUserPolicy" => iam.delete_user_policy(&params).await,
+        "CreateAccessKey" => iam.create_access_key(&params).await,
+        "ListAccessKeys" => iam.list_access_keys(&params).await,
+        "ListUserPolicies" => iam.list_user_policies(&params).await,
+        "ListAttachedUserPolicies" => iam.list_attached_user_policies(&params).await,
+        "PutRolePolicy" => iam.put_role_policy(&params).await,
+        "AttachRolePolicy" => iam.attach_role_policy(&params, true).await,
+        "ListRolePolicies" => iam.list_role_policies(&params).await,
+        "ListAttachedRolePolicies" => iam.list_attached_role_policies(&params).await,
         "DeletePolicy" => iam.delete_policy(&params).await,
         other => panic!("no action {other} here"),
     };
@@ -58,11 +69,11 @@ async fn call(app: &Arc<App>, key: &str, action: &str, params: &[(&str, &str)]) 
     }
 }
 
-fn ok(answer: Answer) -> String {
+pub(super) fn ok(answer: Answer) -> String {
     answer.unwrap_or_else(|(code, message)| panic!("{code}: {message}"))
 }
 
-fn refused(answer: Answer, code: &str) -> String {
+pub(super) fn refused(answer: Answer, code: &str) -> String {
     match answer {
         Ok(xml) => panic!("not refused: {xml}"),
         Err((c, message)) => {
