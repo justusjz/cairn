@@ -58,6 +58,7 @@ supported.
 | Inventory | 🟡 | CSV and Parquet, not ORC: [Inventory](#inventory) |
 | Event notifications, to SNS topics | 🟡 | Over HTTP(S) subscriptions: [Event notifications](#event-notifications) |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
+| Server access logging | 🟡 | Configuration only, for now: [Server access logging](#server-access-logging) |
 
 ### Security
 
@@ -81,7 +82,7 @@ supported.
 These answer `501 NotImplemented`, or report the feature as unconfigured, as
 S3 reports a bucket that doesn't use it:
 
-- Replication, server access logging.
+- Replication.
 - Analytics, metrics, Intelligent-Tiering, Storage Lens.
 - S3 Select, torrents, S3 Batch Operations.
 - S3 Express's metadata tables, access points for directory buckets.
@@ -167,6 +168,16 @@ and refuses too. The difference is that ACLs can't be enabled:
   within 48 hours, and reports go at the cluster's `lifecycle-rate`, which
   they share with lifecycle sweeps (see the [README](README.md#inventory)).
 - **Failed deliveries** are tried again hourly. S3 skips that day's report.
+
+### Server access logging
+
+- **Not delivered yet.** PutBucketLogging and GetBucketLogging take and answer
+  a bucket's configuration as S3 does, but Cairn doesn't write any logs yet.
+- **Targets** must exist and belong to the bucket's account, as in S3.
+  `TargetGrants` are refused with `AccessControlListNotSupported`, as S3
+  refuses them for a target bucket whose ACLs are disabled ([ACLs](#acls)).
+  Grant the `logging.s3.amazonaws.com` service `s3:PutObject` in the target's
+  bucket policy instead, as S3's user guide does.
 
 ### POST Object
 

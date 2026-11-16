@@ -237,6 +237,7 @@ const MIGRATIONS: &[&str] = &[
     IAM_GROUPS,
     INVENTORY,
     NOTIFICATIONS,
+    BUCKET_LOGGING,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2751,6 +2752,14 @@ CREATE INDEX sns_deliveries_subscription ON sns_deliveries (subscription_id);
 CREATE TRIGGER sns_deliveries_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sns_deliveries
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
+/// Migration 57: a bucket's server access logging configuration (see
+/// `s3::buckets::logging`), as PutBucketLogging sets it, as JSON; NULL if it
+/// logs nothing. As its website configuration (migration 51): no new lock
+/// protocol, as it's set by a plain UPDATE of the bucket's row (T64).
+const BUCKET_LOGGING: &str = r#"
+ALTER TABLE buckets ADD COLUMN logging text;
+"#;
+
 #[cfg(test)]
 mod tests {
     #[test]

@@ -64,10 +64,11 @@ use crate::{
     body::{FrameSender, channel_body},
     lifecycle::rules::{self as lifecycle_rules, Day},
     payload::Payload,
-    policy::{Context, Decision, Kind, Principal, Request},
+    policy::Context,
     s3::{
         conditional::Preconditions,
         object_lock::Lock,
+        service::Destination,
         sse::{KmsRequest, ServerSide, Wanted},
         util::{Encoding, MAX_UPLOAD},
     },
@@ -947,38 +948,19 @@ async fn refusal(response: hyper::Response<http_body_util::Full<Bytes>>) -> Stri
 
 /// Whether the destination bucket's policy allows the report's write of
 /// `key`, as S3 checks it: `s3:PutObject` by the `s3.amazonaws.com`
-/// service, with the source account and bucket in `aws:SourceAccount` and
-/// `aws:SourceArn`, and `s3:x-amz-acl` `bucket-owner-full-control`. Why
-/// not, if it doesn't.
+/// service (see `s3::service`), with `s3:x-amz-acl`
+/// `bucket-owner-full-control`. Why not, if it doesn't.
 async fn authorized(app: &App, target: &Target<'_>, key: &str) -> anyhow::Result<Result<(), String>> {
     let dest = &target.config.destination.bucket;
-    let row = app
-        .pool
-        .get()
-        .await?
-        .query_opt_cached(
-            "SELECT policy, policy_principals::text, account_id FROM buckets WHERE name = $1",
-            &[&dest],
-        )
-        .await?;
-    let Some(row) = row else { return Ok(Err(format!("the destination bucket {dest} doesn't exist"))) };
-    let owner: String = row.get(2);
+    let Some(destination) = Destination::load(app, dest).await? else {
+        return Ok(Err(format!("the destination bucket {dest} doesn't exist")));
+    };
     if let Some(expected) = &target.config.destination.account
-        && *expected != owner
+        && *expected != destination.owner
     {
         return Ok(Err(format!("the destination bucket {dest} isn't account {expected}'s")));
     }
-    let denied = || format!("the policy of bucket {dest} doesn't allow {SERVICE} to write {key} (see S3's inventory destination policy)");
-    let Some(text) = row.get::<_, Option<String>>(0) else { return Ok(Err(denied())) };
-    let ids: Option<String> = row.get(1);
-    let policy = crate::s3::access::parsed(&text, Kind::Bucket(dest), Some(ids.as_deref().unwrap_or("{}")))?;
     let mut context = Context::default();
-    context.set("aws:SourceAccount", target.account.clone());
-    context.set("aws:SourceArn", format!("arn:aws:s3:::{}", target.report.bucket));
-    context.set("aws:PrincipalIsAWSService", "true");
-    context.set("aws:SecureTransport", "true");
-    context.set("aws:ResourceAccount", owner.clone());
-    context.set("s3:ResourceAccount", owner);
     context.set("s3:x-amz-acl", "bucket-owner-full-control");
     match &target.config.destination.encryption {
         Some(Encryption::S3) => context.set("s3:x-amz-server-side-encryption", "AES256"),
@@ -988,12 +970,11 @@ async fn authorized(app: &App, target: &Target<'_>, key: &str) -> anyhow::Result
         }
         None => {}
     }
-    let context = context.for_action("s3:PutObject");
-    let resource = format!("arn:aws:s3:::{dest}/{key}");
-    let request = Request { principal: Principal::Service { name: SERVICE }, action: "s3:PutObject", resource: &resource, context: &context };
-    Ok(match policy.evaluate(&request) {
-        Decision::Allow => Ok(()),
-        Decision::Deny | Decision::NotApplicable => Err(denied()),
+    Ok(match destination.allows_put(SERVICE, &target.report.bucket, &target.account, key, context) {
+        true => Ok(()),
+        false => Err(format!(
+            "the policy of bucket {dest} doesn't allow {SERVICE} to write {key} (see S3's inventory destination policy)"
+        )),
     })
 }
 

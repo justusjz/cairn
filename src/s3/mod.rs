@@ -69,6 +69,7 @@ pub(crate) mod multipart;
 pub(crate) mod object_lock;
 pub(crate) mod objects;
 pub(crate) mod post_policy;
+pub(crate) mod service;
 pub(crate) mod util;
 pub(crate) mod versions;
 pub(crate) mod website;
@@ -598,7 +599,7 @@ async fn handle_request(
         // below — instead of borrowing `req` across the arms.
         let query = req.uri().query().unwrap_or("").to_owned();
         // Bucket sub-resource GETs: versioning, encryption, lifecycle, CORS,
-        // policy, tagging, website and Object Lock are real; the rest (acl,
+        // policy, tagging, website, logging and Object Lock are real; the rest (acl,
         // location, ...) are stubbed — Cairn implements none of
         // them, so answer as S3 does for an unconfigured bucket before
         // falling through to a listing. Each goes where `operation` says,
@@ -643,6 +644,9 @@ async fn handle_request(
             }
             if operation.name == "GetBucketOwnershipControls" {
                 return Ok(box_response(acl::ownership_controls()));
+            }
+            if operation.name == "GetBucketLogging" {
+                return Ok(box_response(buckets::logging::get_bucket_logging(&app, &bucket).await?));
             }
             if operation.name == "GetBucketNotificationConfiguration" {
                 return Ok(box_response(buckets::notification::get(&app, &bucket).await?));
@@ -805,6 +809,18 @@ async fn handle_request(
             hyper::Method::PUT if operation.name == "PutBucketNotificationConfiguration" => {
                 match read_body(req, &secret, true).await? {
                     Ok(body) => buckets::notification::put(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
+            // PutBucketLogging: PUT /{bucket}?logging with a
+            // <BucketLoggingStatus> body, which must declare a checksum, as
+            // in S3 (see `buckets::logging`).
+            hyper::Method::PUT if operation.name == "PutBucketLogging" => {
+                if !payload::has_body_checksum(req.headers()) {
+                    return Ok(box_response(missing_checksum()));
+                }
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => buckets::logging::put_bucket_logging(&app, &bucket, body).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }

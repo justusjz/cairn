@@ -35,6 +35,7 @@ mod kms;
 mod limits;
 mod listing;
 mod locking;
+mod logging;
 mod metadata;
 mod multipart;
 mod object_lock;
