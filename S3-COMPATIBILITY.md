@@ -54,6 +54,7 @@ supported.
 | CORS | ✅ | |
 | Static website hosting | ✅ | [Endpoints](#endpoints-and-domains) |
 | RenameObject, appends (S3 Express) | ❌ | |
+| Inventory | 🟡 | CSV only: [Inventory](#inventory) |
 
 ### Security
 
@@ -78,7 +79,7 @@ These answer `501 NotImplemented`, or report the feature as unconfigured, as
 S3 reports a bucket that doesn't use it:
 
 - Replication, server access logging, event notifications.
-- Inventory, analytics, metrics, Intelligent-Tiering, Storage Lens.
+- Analytics, metrics, Intelligent-Tiering, Storage Lens.
 - S3 Select, torrents, S3 Batch Operations.
 - S3 Express (directory buckets, `CreateSession`), metadata tables.
 - Requester pays, Transfer Acceleration.
@@ -148,6 +149,20 @@ and refuses too. The difference is that ACLs can't be enabled:
 - Rules are applied by a daily background sweep of each bucket, so an expired
   object can stay readable for up to a day after it expires.
 
+### Inventory
+
+- **CSV only.** A configuration asking for ORC or Parquet is refused with
+  `501 NotImplemented`.
+- **Configuration IDs** are 1 to 64 letters, digits, `.`, `-` and `_`.
+- **Data files** list keys in order, each key's versions newest first. S3
+  promises no order.
+- **Event holds, replication, Intelligent-Tiering and bucket keys** don't
+  exist, so their fields are always empty.
+- **Timing.** A configuration's first report starts within minutes, not
+  within 48 hours, and reports go at the cluster's `lifecycle-rate`, which
+  they share with lifecycle sweeps (see the [README](README.md#inventory)).
+- **Failed deliveries** are tried again hourly. S3 skips that day's report.
+
 ### POST Object
 
 - There's no clock-skew check; only the policy's `expiration` limits a form.
@@ -187,9 +202,12 @@ trust policies.
   `s3:x-amz-bucket-namespace` and `s3:resourceArnBeingAuthorized`.
 - **Keys that are never present,** because what they describe doesn't exist:
   VPC, organization, service, access point, access grant, replication and
-  batch job keys.
-- **Principals:** `Service` principals never match. `CanonicalUser`
-  principals are refused.
+  batch job keys. `aws:SourceAccount` and `aws:SourceArn` are present only
+  in what Cairn does as `s3.amazonaws.com`.
+- **Principals:** `Service` principals match only what Cairn does as that
+  service: `s3.amazonaws.com` delivering inventory reports. Only a statement
+  naming the service allows it (not `"*"`). `CanonicalUser` principals are
+  refused.
 - **Managed policies:** of AWS's, only `AdministratorAccess`,
   `AmazonS3FullAccess` and `AmazonS3ReadOnlyAccess` exist, plus Cairn's
   `CairnOperatorAccess`.

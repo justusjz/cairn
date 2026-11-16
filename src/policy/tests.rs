@@ -882,3 +882,41 @@ fn trust_policies_decide_who_assumes_a_role() {
     assert!(!decide(&account, &[&may_assume], Caps { boundary: Some(&s3_only), session: None }));
     assert!(!decide(&other, &[&may_assume], Caps::default()));
 }
+
+#[test]
+fn a_service_is_let_in_only_by_name() {
+    // S3's inventory destination policy (its user guide's).
+    let policy = bucket_policy(&format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"Service":"s3.amazonaws.com"}},
+            "Action":"s3:PutObject","Resource":["arn:aws:s3:::examplebucket/*"],
+            "Condition":{{"ArnLike":{{"aws:SourceArn":"arn:aws:s3:::source"}},
+                "StringEquals":{{"aws:SourceAccount":"{ACCOUNT}","s3:x-amz-acl":"bucket-owner-full-control"}}}}}}]}}"#
+    ));
+    let service = Principal::Service { name: "s3.amazonaws.com" };
+    let mut context = Context::default();
+    context.set("aws:SourceArn", "arn:aws:s3:::source");
+    context.set("aws:SourceAccount", ACCOUNT);
+    context.set("s3:x-amz-acl", "bucket-owner-full-control");
+    assert_eq!(check(&policy, service, "s3:PutObject", &object("inv/a"), &context), Decision::Allow);
+    // Not for another source, another service, or anyone else.
+    let mut elsewhere = context.clone();
+    elsewhere.set("aws:SourceArn", "arn:aws:s3:::other");
+    assert_eq!(check(&policy, service, "s3:PutObject", &object("inv/a"), &elsewhere), Decision::NotApplicable);
+    let other = Principal::Service { name: "logging.s3.amazonaws.com" };
+    assert_eq!(check(&policy, other, "s3:PutObject", &object("inv/a"), &context), Decision::NotApplicable);
+    assert_eq!(check(&policy, Principal::Anonymous, "s3:PutObject", &object("inv/a"), &context), Decision::NotApplicable);
+    assert_eq!(check(&policy, user("alice"), "s3:PutObject", &object("inv/a"), &context), Decision::NotApplicable);
+    // Everyone (`*`) doesn't let a service in, but does keep it out.
+    let everyone = bucket_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject",
+            "Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
+    );
+    assert_eq!(check(&everyone, service, "s3:PutObject", &object("a"), &context), Decision::NotApplicable);
+    let denied = bucket_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject",
+            "Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
+    );
+    assert_eq!(check(&denied, service, "s3:PutObject", &object("a"), &context), Decision::Deny);
+    // Naming a service doesn't make a policy public.
+    assert!(!policy.is_public());
+}

@@ -1156,7 +1156,8 @@ under the prefixes of the rules that expire anything, and expires what's due.
 
 Sweeps go at a rate you set for the whole cluster, in object versions read
 per hour (1,000,000 by default; 0 pauses them), so that however much there is
-to sweep, they never take more of the database than that:
+to sweep, they never take more of the database than that. [Inventory
+reports](#inventory) share it with them:
 
 ```sh
 cairn config set lifecycle-rate 2000000
@@ -1183,6 +1184,61 @@ anything early.
 
 Not supported, and refused with `501 NotImplemented`: transitions to other
 storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one).
+
+## Inventory
+
+S3 Inventory: a bucket's inventory configurations
+(`PutBucketInventoryConfiguration`, `aws s3api put-bucket-inventory-configuration`)
+have Cairn write a report of its objects, daily or weekly, into a bucket, as
+S3 writes it: gzipped CSV data files, a `manifest.json` listing them (with
+`manifest.checksum`), and a Hive `symlink.txt`, under
+`<prefix>/<bucket>/<id>/`, so tools that read S3's reports (Athena, Spark,
+scripts) read Cairn's. A report lists the current objects, or every version
+and delete marker, under a prefix, with the optional fields asked for: size,
+last-modified date, ETag, encryption status, Object Lock, checksum algorithm,
+lifecycle expiration date and the rest. Only CSV is written; ORC and Parquet
+are refused.
+
+As in S3, the destination bucket's policy must let the `s3.amazonaws.com`
+service write the reports; S3's user guide gives the policy:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "s3.amazonaws.com" },
+    "Action": "s3:PutObject",
+    "Resource": "arn:aws:s3:::reports/*",
+    "Condition": {
+      "ArnLike": { "aws:SourceArn": "arn:aws:s3:::photos" },
+      "StringEquals": {
+        "aws:SourceAccount": "<account ID>",
+        "s3:x-amz-acl": "bucket-owner-full-control"
+      }
+    }
+  }]
+}
+```
+
+Without it, nothing is written; Cairn logs why, shows it on the console's
+Jobs page among its events, and tries again an hour later. Reports are
+otherwise ordinary writes: the destination's versioning, Object Lock and
+default encryption apply, and a configuration's `SSE-S3` or `SSE-KMS`
+encrypts them.
+
+A configuration's first report starts within minutes of setting it; the next
+a day later (`Daily`), or on the Sunday after (`Weekly`). Reports take turns
+with [lifecycle sweeps](#lifecycle-rules) and share their rate
+(`lifecycle-rate`, versions read per hour across the cluster): when only one
+of them has work, it gets the whole rate. A report is written a data file
+at a time, each about ten minutes of the rate (between 10,000 and 1,000,000
+versions), and where it has got to is saved after each, so if its node dies,
+another carries on from there; a bucket of a billion versions at the
+default rate takes about six weeks, so raise the rate for buckets that
+large. A report is streamed as it's read, so it takes the same little memory
+however large the bucket is. Like S3's, it's as of no single moment: what's
+written or deleted while it's made may or may not be in it.
 
 ## Tags
 

@@ -65,6 +65,11 @@ Done:
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes
   history safe from admin credentials too. Implemented, with governance
   and compliance modes.
+- **Inventory and Batch Operations.** S3 Inventory: daily or weekly reports
+  of a bucket's objects, as S3 writes them (CSV only so far), paced by the
+  rate lifecycle sweeps go at, which they share. Implemented. Batch
+  Operations (tagging, Object Lock retention, copies, over an inventory's
+  objects) come next; see `plans/inventory.md`.
 - **Lifecycle transitions.** Moving objects between storage classes by
   lifecycle rules, once Cairn has more than one (erasure-coded storage, say).
   Expiration rules are done.

@@ -174,7 +174,7 @@ impl Day {
     }
 
     /// Its date, as (year, month, day). Howard Hinnant's `civil_from_days`.
-    fn civil(self) -> (i64, u32, u32) {
+    pub(crate) fn civil(self) -> (i64, u32, u32) {
         let z = self.0 + 719_468;
         let era = z.div_euclid(146_097);
         let doe = z.rem_euclid(146_097);
@@ -241,7 +241,7 @@ impl Day {
     }
 
     /// As S3 writes a rule's `Date`.
-    fn to_iso(self) -> String {
+    pub(crate) fn to_iso(self) -> String {
         let (year, month, day) = self.civil();
         format!("{year:04}-{month:02}-{day:02}T00:00:00.000Z")
     }

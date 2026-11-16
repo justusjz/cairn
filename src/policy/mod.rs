@@ -109,6 +109,10 @@ pub enum Principal<'a> {
     /// A web identity (AssumeRoleWithWebIdentity's caller), by its OIDC
     /// provider's ARN (`arn:aws:iam::<account>:oidc-provider/<url>`).
     WebIdentity { provider: &'a str },
+    /// An AWS service, by its name (`s3.amazonaws.com`): Cairn itself,
+    /// delivering what S3 delivers as that service (an inventory report:
+    /// see `inventory`). No request a client sends is ever this.
+    Service { name: &'a str },
 }
 
 /// How a statement is about a principal.
@@ -396,6 +400,9 @@ struct Principals {
     /// Identity providers (`Federated`), by their ARNs: web identities of
     /// an OIDC provider of the account.
     federated: Vec<String>,
+    /// AWS services (`Service`), by their names (`s3.amazonaws.com`), as
+    /// Cairn acts as them (see `Principal::Service`).
+    services: Vec<String>,
 }
 
 impl Principals {
@@ -429,6 +436,15 @@ impl Principals {
             // everyone (`*`) only denies it. (Probe: whether `*` allows.)
             Principal::WebIdentity { provider } => {
                 let named = self.federated.iter().any(|f| f == provider);
+                match self.not {
+                    true => direct(!(self.everyone || named)),
+                    false => direct(named || (self.everyone && !allow)),
+                }
+            }
+            // As a web identity: only a statement naming the service lets
+            // it in; everyone (`*`) only denies it.
+            Principal::Service { name } => {
+                let named = self.services.iter().any(|s| s == name);
                 match self.not {
                     true => direct(!(self.everyone || named)),
                     false => direct(named || (self.everyone && !allow)),
@@ -977,6 +993,7 @@ fn parse_principals(
         roles: Vec::new(),
         sessions: Vec::new(),
         federated: Vec::new(),
+        services: Vec::new(),
     };
     let entries = match value {
         Json::String(s) if s == "*" => {
@@ -1046,15 +1063,17 @@ fn parse_principals(
                     ids.sort();
                 }
             }
-            // AWS services never call Cairn: they're named, and never
-            // match. Identity providers are: an OIDC provider's web
-            // identities (AssumeRoleWithWebIdentity), by its ARN.
+            // AWS services never call Cairn: they only match what Cairn
+            // does as them (see `Principal::Service`). Identity providers
+            // do: an OIDC provider's web identities
+            // (AssumeRoleWithWebIdentity), by its ARN.
             "Service" | "Federated" => {
                 if let Some(id) = ids.iter().find(|id| id.is_empty() || id.contains('*')) {
                     return Err(invalid_one(kind, id));
                 }
-                if kind == "Federated" {
-                    principals.federated.extend(ids.iter().cloned());
+                match kind.as_str() {
+                    "Federated" => principals.federated.extend(ids.iter().cloned()),
+                    _ => principals.services.extend(ids.iter().cloned()),
                 }
             }
             // There are no canonical user IDs in Cairn.

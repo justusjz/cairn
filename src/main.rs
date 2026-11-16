@@ -42,6 +42,7 @@ mod gc;
 mod grants;
 mod iam;
 mod iam_oidc;
+mod inventory;
 mod kms;
 mod managed;
 mod lifecycle;

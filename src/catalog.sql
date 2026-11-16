@@ -2145,6 +2145,80 @@ BEGIN
 END
 $$;
 
+-- T57: PutBucketInventoryConfiguration: sets the bucket's inventory
+-- configuration `p_id`, with a new generation, and starts a new report of
+-- it, due now (the last whole report stays), unless the bucket has
+-- `p_max` others already. Takes the bucket's row as a plain UPDATE does
+-- (FOR NO KEY UPDATE, as T18's UPDATE does), which serializes the
+-- bucket's configuration changes, so that two can't both find room for
+-- one more; it doesn't conflict with B(b) shared. No invariant involves
+-- the configuration, which a report checks itself (T58, T59). Returns
+-- 'set', 'too_many' or 'no_such_bucket'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_put_inventory(
+    p_bucket text, p_id text, p_config text, p_enabled boolean, p_setter uuid, p_max int)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM buckets WHERE name = p_bucket FOR NO KEY UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_bucket';
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM inventories WHERE bucket = p_bucket AND id = p_id)
+       AND (SELECT count(*) FROM inventories WHERE bucket = p_bucket) >= p_max THEN
+        RETURN 'too_many';
+    END IF;
+    INSERT INTO inventories (bucket, id, config, enabled, setter, due)
+    VALUES (p_bucket, p_id, p_config, p_enabled, p_setter, now())
+    ON CONFLICT (bucket, id) DO UPDATE SET config = p_config, enabled = p_enabled, setter = p_setter,
+        generation = nextval('inventory_generations'), due = now(), started = NULL,
+        cursor_key = NULL, cursor_id = NULL, seen = 0, files = 0, failure = NULL, failed_at = NULL;
+    DELETE FROM inventory_files WHERE bucket = p_bucket AND id = p_id;
+    RETURN 'set';
+END
+$$;
+
+-- T58: a report's data file, written: records it, and where the report has
+-- got to (the last version in it), and how many versions it has read, as
+-- long as the configuration is still of `p_generation`. Plain writes,
+-- keyed by the configuration (see T57). Returns whether it was.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_inventory_file(
+    p_bucket text, p_id text, p_generation bigint, p_started timestamptz, p_key text,
+    p_size bigint, p_md5 text, p_cursor_key text, p_cursor_id bigint, p_seen bigint)
+RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE
+    v_seq int;
+BEGIN
+    UPDATE inventories SET started = p_started, cursor_key = p_cursor_key, cursor_id = p_cursor_id,
+        seen = seen + p_seen, files = files + 1, failure = NULL, failed_at = NULL
+    WHERE bucket = p_bucket AND id = p_id AND generation = p_generation
+    RETURNING files INTO v_seq;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    INSERT INTO inventory_files (bucket, id, generation, seq, key, size, md5)
+    VALUES (p_bucket, p_id, p_generation, v_seq, p_key, p_size, p_md5);
+    RETURN true;
+END
+$$;
+
+-- T59: a report, done (its manifest written): records it as the last whole
+-- one, makes the next one due at `p_due`, and drops its data files, as
+-- long as the configuration is still of `p_generation`. Plain writes, as
+-- T58's. Returns whether it was.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_inventory_done(
+    p_bucket text, p_id text, p_generation bigint, p_last text, p_due timestamptz)
+RETURNS boolean LANGUAGE plpgsql AS $$
+BEGIN
+    UPDATE inventories SET started = NULL, cursor_key = NULL, cursor_id = NULL, seen = 0, files = 0,
+        failure = NULL, failed_at = NULL, last = p_last, due = p_due
+    WHERE bucket = p_bucket AND id = p_id AND generation = p_generation;
+    IF NOT FOUND THEN
+        RETURN false;
+    END IF;
+    DELETE FROM inventory_files WHERE bucket = p_bucket AND id = p_id AND generation = p_generation;
+    RETURN true;
+END
+$$;
+
 -- Deletes a user (by its ID): takes R (by deleting the row), and its keys,
 -- policies and console identities go with it (cascades). (Its grants are
 -- statements of buckets' policies, which `grants` removes first.) Returns

@@ -325,6 +325,18 @@ impl Metrics {
         self.maintenance.lock().unwrap().event("lifecycle", true, message);
     }
 
+    /// A turn of an inventory report (see `inventory`): a data file
+    /// written, a report delivered, or a delivery that failed.
+    pub fn inventory_done(&self, turn: &crate::inventory::Turn) {
+        if turn.finished || turn.failure.is_some() || turn.interrupted {
+            self.maintenance.lock().unwrap().event("inventory", turn.failure.is_some(), turn.to_string());
+        }
+    }
+
+    pub fn inventory_failed(&self, message: String) {
+        self.maintenance.lock().unwrap().event("inventory", true, message);
+    }
+
     /// The scrubber checked a copy of `bytes`, and found `damage`, if any.
     pub fn scrub_checked(&self, bytes: u64, damage: Option<String>) {
         let mut m = self.maintenance.lock().unwrap();

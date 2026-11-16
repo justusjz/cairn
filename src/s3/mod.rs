@@ -391,6 +391,37 @@ async fn handle_request(
         };
         return Ok(box_response(resp));
     }
+    // PutBucketInventoryConfiguration: the optional fields it asks for are
+    // in its body, which policies may test
+    // (`s3:InventoryAccessibleOptionalFields`), so it's read before the
+    // request is authorized.
+    if operation.name == "PutBucketInventoryConfiguration" {
+        let headers = req.headers().clone();
+        let query = query.to_owned();
+        let body = match read_body(req, &secret, true).await? {
+            Ok(body) => body,
+            Err(rejection) => return Ok(box_response(util::rejection_response(&rejection))),
+        };
+        if let Some(fields) = buckets::inventory::requested_fields(&body) {
+            access.context.set_all("s3:InventoryAccessibleOptionalFields", fields);
+        }
+        if let Some(refused) = refusal(&access, &operation, exists) {
+            return Ok(box_response(refused));
+        }
+        // A bucket's configuration is its account's alone (see below).
+        if operation.checks.iter().any(|c| access.foreign(c)) {
+            return Ok(box_response(format_s3_error(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+            )));
+        }
+        if let Some(refused) = util::unexpected_owner(&headers, &account) {
+            return Ok(box_response(refused));
+        }
+        let setter = principal.as_ref().map(|p| p.id);
+        return Ok(box_response(buckets::inventory::put(&app, &bucket, &query, body, setter).await?));
+    }
     // CreateBucket: the tags its body gives the bucket are in it, and need
     // `s3:TagResource` too (after `s3:CreateBucket`: probed), so it's read
     // before the request is authorized.
@@ -495,6 +526,9 @@ async fn handle_request(
             }
             if operation.name == "GetObjectLockConfiguration" {
                 return Ok(box_response(object_lock::get_object_lock_configuration(&app, &bucket).await?));
+            }
+            if matches!(operation.name, "GetBucketInventoryConfiguration" | "ListBucketInventoryConfigurations") {
+                return Ok(box_response(buckets::inventory::get(&app, &bucket, &query).await?));
             }
             if operation.name == "GetBucketOwnershipControls" {
                 return Ok(box_response(acl::ownership_controls()));
@@ -760,6 +794,9 @@ async fn handle_request(
             }
             hyper::Method::DELETE if operation.name == "DeletePublicAccessBlock" => {
                 public_access::delete_public_access_block(&app, &bucket).await?
+            }
+            hyper::Method::DELETE if operation.name == "DeleteBucketInventoryConfiguration" => {
+                buckets::inventory::delete(&app, &bucket, &query).await?
             }
             hyper::Method::DELETE if operation.name == "DeleteBucketTagging" => {
                 delete_bucket_tagging(&app, &bucket).await?
