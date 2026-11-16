@@ -55,7 +55,7 @@ supported.
 | Static website hosting | ✅ | [Endpoints](#endpoints-and-domains) |
 | Directory buckets (S3 Express One Zone), `CreateSession` | 🟡 | [Directory buckets](#directory-buckets) |
 | RenameObject, appends (S3 Express) | ❌ | |
-| Inventory | 🟡 | CSV only: [Inventory](#inventory) |
+| Inventory | 🟡 | CSV and Parquet, not ORC: [Inventory](#inventory) |
 
 ### Security
 
@@ -152,8 +152,10 @@ and refuses too. The difference is that ACLs can't be enabled:
 
 ### Inventory
 
-- **CSV only.** A configuration asking for ORC or Parquet is refused with
+- **CSV and Parquet only.** A configuration asking for ORC is refused with
   `501 NotImplemented`.
+- **Parquet files** have one row group per about 16 MiB of rows,
+  Snappy-compressed (as S3's are) and PLAIN-encoded; fields Cairn has no value for are null.
 - **Configuration IDs** are 1 to 64 letters, digits, `.`, `-` and `_`.
 - **Data files** list keys in order, each key's versions newest first. S3
   promises no order.

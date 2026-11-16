@@ -6,7 +6,9 @@
 //! A report is a walk over the bucket's versions (or its current objects)
 //! under the configuration's prefix, in key order, each key's versions
 //! newest first. It's written as data files, each one object of gzipped CSV,
-//! `<prefix>/<bucket>/<id>/data/<uuid>.csv.gz`; once the last is written,
+//! `<prefix>/<bucket>/<id>/data/<uuid>.csv.gz`, or of Parquet (see
+//! `parquet`), `….parquet`, as the configuration says; once the last is
+//! written,
 //! the files are listed in `<prefix>/<bucket>/<id>/<time>/manifest.json`
 //! (with `manifest.checksum` beside it) and in a Hive symlink file,
 //! `<prefix>/<bucket>/<id>/hive/dt=<time>/symlink.txt`.
@@ -23,9 +25,10 @@
 //! commits, and the garbage collector cleans up after it).
 //!
 //! Nothing of a report is ever held whole in memory: a turn holds a page of
-//! versions, the gzip encoder's window, and a few chunks on their way into
-//! the write (a bounded channel). The manifest and symlink files are
-//! streamed from the data files' rows the same way.
+//! versions, the gzip encoder's window (or a Parquet row group, of up to
+//! `ROW_GROUP_BYTES`), and a few chunks on their way into the write (a
+//! bounded channel). The manifest and symlink files are streamed from the
+//! data files' rows the same way.
 //!
 //! Its files are written as S3 writes them, as the `s3.amazonaws.com`
 //! service: the destination bucket's policy must allow that, as in S3 (see
@@ -36,6 +39,8 @@
 //! while it's made may or may not be in it.
 
 pub mod config;
+pub mod parquet;
+mod snappy;
 
 use std::{
     io,
@@ -68,13 +73,17 @@ use crate::{
     },
 };
 
-use config::{Column, Configuration, Encryption, Field, Frequency};
+use config::{Column, Configuration, Encryption, Field, Format, Frequency};
+use parquet::Value;
 
 /// The most versions read at a time.
 const PAGE: i64 = 1000;
 /// The fewest and most versions a data file holds (but the last).
 const MIN_FILE_ROWS: i64 = 10_000;
 const MAX_FILE_ROWS: i64 = 1_000_000;
+/// About how many bytes (uncompressed) a Parquet data file's row groups
+/// hold, but its last.
+const ROW_GROUP_BYTES: usize = 16 << 20;
 /// How long after a failed delivery it's tried again.
 const RETRY: Duration = Duration::from_secs(3600);
 const DAY: Duration = Duration::from_secs(24 * 3600);
@@ -221,10 +230,14 @@ pub(crate) async fn turn(app: &Arc<App>, client: &Object, report: Report, now: S
     // The first page first: none, and there's no file to write.
     let first = page(client, &report.bucket, &config, &after, PAGE.min(rows)).await?;
     if !first.is_empty() {
-        let key = format!("{}data/{}.csv.gz", target.base(), uuid::Uuid::new_v4());
+        let (extension, content_type) = match config.destination.format {
+            Format::Csv => ("csv.gz", "application/x-gzip"),
+            Format::Parquet => ("parquet", "application/octet-stream"),
+        };
+        let key = format!("{}data/{}.{extension}", target.base(), uuid::Uuid::new_v4());
         let (sender, body) = channel_body();
         let writing = write_rows(app, client, &target, &source, first, after, rows, sender);
-        let delivering = deliver(app, &target, &key, "application/x-gzip", body);
+        let delivering = deliver(app, &target, &key, content_type, body);
         let (written, delivered) = tokio::join!(writing, delivering);
         match delivered {
             // A delivery that failed is why the rows stopped, if they did.
@@ -316,13 +329,11 @@ impl Source {
     }
 }
 
-/// The columns a page has (see `row`).
+/// The columns a page has (see `values`).
 const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, etag,
-    sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed,
-    to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-    sse_c_key IS NOT NULL, checksum_algorithm, retain_mode,
-    to_char(retain_until AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'),
-    legal_hold, upload_id IS NOT NULL, tags, last_modified";
+    sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, last_modified,
+    sse_c_key IS NOT NULL, checksum_algorithm, retain_mode, retain_until,
+    legal_hold, upload_id IS NOT NULL, tags";
 
 /// The next page of up to `limit` of the bucket's versions (or current
 /// objects) under the configuration's prefix, after `after`: a key, and
@@ -398,26 +409,57 @@ struct Written {
     md5: String,
 }
 
-/// Gzipped bytes on their way into a write, counted and hashed.
-struct Gzipped {
-    encoder: GzEncoder<Vec<u8>>,
+/// A data file on its way into a write: its bytes, as they're made,
+/// counted and hashed.
+struct DataFile {
+    encoder: Encoder,
     md5: Md5,
     size: u64,
     sender: FrameSender,
 }
 
-impl Gzipped {
-    fn new(sender: FrameSender) -> Gzipped {
-        Gzipped { encoder: GzEncoder::new(Vec::new(), Compression::default()), md5: Md5::new(), size: 0, sender }
+enum Encoder {
+    /// A line at a time, gzipped.
+    Csv { gzip: GzEncoder<Vec<u8>>, line: String },
+    /// A row group at a time.
+    Parquet(parquet::Writer),
+}
+
+impl DataFile {
+    fn new(format: Format, columns: &[Column], sender: FrameSender) -> DataFile {
+        let encoder = match format {
+            Format::Csv => Encoder::Csv { gzip: GzEncoder::new(Vec::new(), Compression::default()), line: String::new() },
+            Format::Parquet => Encoder::Parquet(parquet::Writer::new(columns.iter().map(|c| c.parquet()).collect())),
+        };
+        DataFile { encoder, md5: Md5::new(), size: 0, sender }
     }
 
-    fn write(&mut self, data: &[u8]) -> io::Result<()> {
-        self.encoder.write_all(data)
+    /// Adds a version's row: a value of each of `columns`.
+    fn push(&mut self, columns: &[Column], values: &[Value]) -> io::Result<()> {
+        match &mut self.encoder {
+            Encoder::Csv { gzip, line } => {
+                line.clear();
+                for (column, value) in columns.iter().zip(values) {
+                    push_value(line, &csv_value(*column, value));
+                }
+                line.push('\n');
+                gzip.write_all(line.as_bytes())
+            }
+            Encoder::Parquet(writer) => {
+                writer.push(values);
+                Ok(())
+            }
+        }
     }
 
-    /// Sends what the encoder has put out so far.
+    /// Sends what's made so far: what the gzip encoder has put out, or a
+    /// row group, once it's big enough.
     async fn flush(&mut self) -> anyhow::Result<()> {
-        let out = std::mem::take(self.encoder.get_mut());
+        let out = match &mut self.encoder {
+            Encoder::Csv { gzip, .. } => std::mem::take(gzip.get_mut()),
+            Encoder::Parquet(writer) if writer.buffered() >= ROW_GROUP_BYTES => writer.row_group(),
+            Encoder::Parquet(_) => return Ok(()),
+        };
         self.send(out).await
     }
 
@@ -432,12 +474,14 @@ impl Gzipped {
     }
 
     /// Ends the stream, and the write with it: its size and MD5.
-    async fn finish(self) -> anyhow::Result<(u64, String)> {
-        let Gzipped { encoder, md5, size, sender } = self;
-        let out = encoder.finish()?;
-        let mut rest = Gzipped { encoder: GzEncoder::new(Vec::new(), Compression::none()), md5, size, sender };
-        rest.send(out).await?;
-        Ok((rest.size, hex(&rest.md5.finalize())))
+    async fn finish(mut self) -> anyhow::Result<(u64, String)> {
+        let encoder = std::mem::replace(&mut self.encoder, Encoder::Parquet(parquet::Writer::new(Vec::new())));
+        let out = match encoder {
+            Encoder::Csv { gzip, .. } => gzip.finish()?,
+            Encoder::Parquet(writer) => writer.finish(),
+        };
+        self.send(out).await?;
+        Ok((self.size, hex(&self.md5.finalize())))
     }
 }
 
@@ -460,7 +504,9 @@ async fn write_rows(
     sender: FrameSender,
 ) -> anyhow::Result<Written> {
     let fault = sender.clone();
-    let written = write_rows_into(app, client, target, source, first, after, limit, Gzipped::new(sender)).await;
+    let columns = target.config.columns();
+    let out = DataFile::new(target.config.destination.format, &columns, sender);
+    let written = write_rows_into(app, client, target, source, &columns, first, after, limit, out).await;
     if let Err(e) = &written {
         let _ = fault.send(Err(io::Error::other(format!("{e:#}")))).await;
     }
@@ -473,23 +519,23 @@ async fn write_rows_into(
     client: &Object,
     target: &Target<'_>,
     source: &Source,
+    columns: &[Column],
     first: Vec<tokio_postgres::Row>,
     mut after: (String, Option<i64>),
     limit: i64,
-    mut out: Gzipped,
+    mut out: DataFile,
 ) -> anyhow::Result<Written> {
-    let columns = target.config.columns();
     let owner = crate::s3::util::canonical_id(&target.account);
     let mut rows = 0;
     let mut page_rows = first;
-    let mut line = String::new();
+    let mut row_values = Vec::new();
     let end = loop {
         let asked = PAGE.min(limit - rows);
         let got = page_rows.len() as i64;
         for row in &page_rows {
-            line.clear();
-            write_row(app, target, source, &columns, &owner, row, &mut line).await?;
-            out.write(line.as_bytes())?;
+            row_values.clear();
+            values(app, target, source, columns, &owner, row, &mut row_values).await?;
+            out.push(columns, &row_values)?;
         }
         out.flush().await?;
         rows += got;
@@ -523,72 +569,109 @@ fn push_value(line: &mut String, value: &str) {
     line.push('"');
 }
 
-/// A version's line of the report, from a row of `page`.
-async fn write_row(
+/// A value as CSV has it: keys URL-encoded (as S3's are, and as
+/// `encoding-type=url` writes them), times in ISO 8601, to the millisecond;
+/// nothing for none.
+fn csv_value(column: Column, value: &Value) -> String {
+    match value {
+        Value::Null => String::new(),
+        Value::Text(text) if column == Column::Key => Encoding::Url.xml(text),
+        Value::Text(text) => text.clone(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(n) => n.to_string(),
+        Value::Millis(ms) => iso_millis(*ms),
+    }
+}
+
+/// Milliseconds since the epoch, as `2026-11-16T05:00:00.000Z`.
+fn iso_millis(ms: i64) -> String {
+    let day = Day(ms.div_euclid(DAY_MILLIS));
+    let (year, month, date) = day.civil();
+    let of_day = ms.rem_euclid(DAY_MILLIS);
+    let (h, m, s, ms) = (of_day / 3_600_000, of_day / 60_000 % 60, of_day / 1000 % 60, of_day % 1000);
+    format!("{year:04}-{month:02}-{date:02}T{h:02}:{m:02}:{s:02}.{ms:03}Z")
+}
+
+const DAY_MILLIS: i64 = 24 * 3600 * 1000;
+
+/// Milliseconds since the epoch.
+fn millis(time: SystemTime) -> i64 {
+    match time.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(d) => d.as_millis() as i64,
+        Err(e) => -(e.duration().as_millis() as i64),
+    }
+}
+
+/// A version's row of the report, from a row of `page`: a value of each
+/// of `columns`, into `values`.
+async fn values(
     app: &App,
     target: &Target<'_>,
     source: &Source,
     columns: &[Column],
     owner: &str,
     row: &tokio_postgres::Row,
-    line: &mut String,
+    values: &mut Vec<Value>,
 ) -> anyhow::Result<()> {
     let bucket = &target.report.bucket;
     let key: &str = row.get(0);
     let version_id: &str = row.get(2);
     let is_latest: bool = row.get(3);
     let marker: bool = row.get(4);
+    let text = |s: &str| Value::Text(s.to_owned());
+    let optional = |s: Option<String>| s.map_or(Value::Null, Value::Text);
     for column in columns {
-        let value: String = match column {
-            Column::Bucket => bucket.clone(),
-            // URL-encoded, as S3's CSV has it, and as `encoding-type=url`
-            // writes keys.
-            Column::Key => Encoding::Url.xml(key),
-            Column::VersionId if version_id == "null" => String::new(),
-            Column::VersionId => version_id.to_owned(),
-            Column::IsLatest => is_latest.to_string(),
-            Column::IsDeleteMarker => marker.to_string(),
-            Column::Field(Field::LastModifiedDate) => row.get(11),
-            Column::Field(Field::ObjectOwner) => owner.to_owned(),
+        let value = match column {
+            Column::Bucket => text(bucket),
+            Column::Key => text(key),
+            Column::VersionId if version_id == "null" => Value::Null,
+            Column::VersionId => text(version_id),
+            Column::IsLatest => Value::Bool(is_latest),
+            Column::IsDeleteMarker => Value::Bool(marker),
+            Column::Field(Field::LastModifiedDate) => Value::Millis(millis(row.get(11))),
+            Column::Field(Field::ObjectOwner) => text(owner),
             // A delete marker has nothing else.
-            _ if marker => String::new(),
+            _ if marker => Value::Null,
             Column::Field(field) => match field {
-                Field::Size => row.get::<_, i64>(5).to_string(),
-                Field::ETag => crate::s3::objects::list::listed_etag(app, bucket, key, row, 6, 7).await?.unwrap_or_default(),
-                Field::StorageClass => "STANDARD".to_owned(),
-                Field::IsMultipartUploaded => row.get::<_, bool>(17).to_string(),
+                Field::Size => Value::Int(row.get(5)),
+                Field::ETag => optional(crate::s3::objects::list::listed_etag(app, bucket, key, row, 6, 7).await?),
+                Field::StorageClass => text("STANDARD"),
+                Field::IsMultipartUploaded => Value::Bool(row.get(17)),
                 Field::EncryptionStatus => {
                     let sse_s3: bool = row.get(7);
                     let kms: Option<&str> = row.get(8);
                     let sse_c: bool = row.get(12);
-                    match (sse_s3, kms, sse_c) {
+                    text(match (sse_s3, kms, sse_c) {
                         (true, _, _) => "SSE-S3",
                         (false, Some(_), _) => "SSE-KMS",
                         (false, None, true) => "SSE-C",
                         _ => "NOT-SSE",
-                    }
-                    .to_owned()
+                    })
                 }
-                Field::ObjectLockRetainUntilDate => row.get::<_, Option<String>>(15).unwrap_or_default(),
-                Field::ObjectLockMode => row.get::<_, Option<String>>(14).unwrap_or_default(),
+                Field::ObjectLockRetainUntilDate => {
+                    row.get::<_, Option<SystemTime>>(15).map_or(Value::Null, |t| Value::Millis(millis(t)))
+                }
+                Field::ObjectLockMode => optional(row.get(14)),
                 Field::ObjectLockLegalHoldStatus => match row.get::<_, Option<bool>>(16) {
-                    Some(true) => "ON".to_owned(),
-                    Some(false) => "OFF".to_owned(),
-                    None if source.object_lock => "OFF".to_owned(),
-                    None => String::new(),
+                    Some(true) => text("ON"),
+                    Some(false) => text("OFF"),
+                    None if source.object_lock => text("OFF"),
+                    None => Value::Null,
                 },
-                Field::ChecksumAlgorithm => row.get::<_, Option<String>>(13).unwrap_or_default(),
+                Field::ChecksumAlgorithm => optional(row.get(13)),
                 // The owner's full control: ACLs are always disabled.
-                Field::ObjectAccessControlList => acl(owner),
+                Field::ObjectAccessControlList => Value::Text(acl(owner)),
                 // Of the current version only: what a rule's expiration
                 // says.
                 Field::LifecycleExpirationDate => match (&source.lifecycle, is_latest) {
                     (Some(rules), true) => {
                         let tags: &str = row.get(18);
-                        let written: SystemTime = row.get(19);
-                        rules.expiry(key, row.get(5), tags, written).map(|(day, _)| day.to_iso()).unwrap_or_default()
+                        let written: SystemTime = row.get(11);
+                        rules
+                            .expiry(key, row.get(5), tags, written)
+                            .map_or(Value::Null, |(day, _)| Value::Millis(millis(day.midnight())))
                     }
-                    _ => String::new(),
+                    _ => Value::Null,
                 },
                 // What Cairn has none of: replication, storage tiers,
                 // bucket keys, event holds.
@@ -598,13 +681,12 @@ async fn write_row(
                 | Field::ObjectLockEventHoldStatus
                 | Field::ObjectLockEventHoldDuration
                 | Field::LastModifiedDate
-                | Field::ObjectOwner => String::new(),
+                | Field::ObjectOwner => Value::Null,
             },
-            Column::EventHoldDurationUnit => String::new(),
+            Column::EventHoldDurationUnit => Value::Null,
         };
-        push_value(line, &value);
+        values.push(value);
     }
-    line.push('\n');
     Ok(())
 }
 
@@ -642,13 +724,19 @@ async fn finish(
     // The manifest, and its MD5.
     let manifest = format!("{base}{date}T{}Z/manifest.json", time.replace(':', "-"));
     let created = target.started.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis());
-    let schema: Vec<&str> = target.config.columns().iter().map(|c| c.name()).collect();
+    let columns = target.config.columns();
+    let format = target.config.destination.format;
+    let schema = match format {
+        Format::Csv => columns.iter().map(|c| c.name()).collect::<Vec<_>>().join(", "),
+        Format::Parquet => parquet::schema(&columns.iter().map(|c| c.parquet()).collect::<Vec<_>>()),
+    };
     let head = format!(
         "{{\"sourceBucket\":{},\"destinationBucket\":{},\"version\":\"2016-11-30\",\
-         \"creationTimestamp\":\"{created}\",\"fileFormat\":\"CSV\",\"fileSchema\":{},\"files\":[",
+         \"creationTimestamp\":\"{created}\",\"fileFormat\":\"{}\",\"fileSchema\":{},\"files\":[",
         serde_json::to_string(&report.bucket)?,
         serde_json::to_string(&target.config.destination.arn())?,
-        serde_json::to_string(&schema.join(", "))?,
+        format.name(),
+        serde_json::to_string(&schema)?,
     );
     let mut first = true;
     let entry = move |file: &File| {
@@ -936,6 +1024,18 @@ mod tests {
         // Late, it's due right away.
         let late = monday + 30 * DAY;
         assert_eq!(next_due(Frequency::Daily, monday, late), late);
+    }
+
+    #[test]
+    fn times_are_iso_to_the_millisecond() {
+        assert_eq!(iso_millis(0), "1970-01-01T00:00:00.000Z");
+        assert_eq!(iso_millis(1_763_269_323_045), "2025-11-16T05:02:03.045Z");
+        assert_eq!(iso_millis(-1), "1969-12-31T23:59:59.999Z");
+        // As lifecycle expiration dates were.
+        assert_eq!(iso_millis(millis(Day(20_773).midnight())), Day(20_773).to_iso());
+        let key = csv_value(Column::Key, &Value::Text("a b/ü".to_owned()));
+        assert_eq!(key, Encoding::Url.xml("a b/ü"));
+        assert_eq!(csv_value(Column::Bucket, &Value::Null), "");
     }
 
     #[test]

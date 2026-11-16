@@ -117,6 +117,18 @@ fn md5_hex(data: &[u8]) -> String {
 /// against the manifest's sizes and MD5s, its checksum file and its symlink
 /// file.
 async fn delivered(app: &Arc<App>) -> (String, serde_json::Value, Vec<String>) {
+    let (key, manifest, files) = delivered_files(app).await;
+    let mut lines = Vec::new();
+    for data in files {
+        let mut text = String::new();
+        flate2::read::MultiGzDecoder::new(&data[..]).read_to_string(&mut text).unwrap();
+        lines.extend(text.lines().map(str::to_owned));
+    }
+    (key, manifest, lines)
+}
+
+/// As `delivered`, with the data files as they are.
+async fn delivered_files(app: &Arc<App>) -> (String, serde_json::Value, Vec<Vec<u8>>) {
     let keys = reports(app).await;
     let manifest_key = keys.iter().find(|k| k.ends_with("/manifest.json")).expect("a manifest").clone();
     let manifest = read(app, &manifest_key).await;
@@ -125,20 +137,18 @@ async fn delivered(app: &Arc<App>) -> (String, serde_json::Value, Vec<String>) {
     let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
     let symlink_key = keys.iter().find(|k| k.ends_with("/symlink.txt")).expect("a symlink file");
     let symlink = String::from_utf8(read(app, symlink_key).await).unwrap();
-    let mut lines = Vec::new();
+    let mut files = Vec::new();
     let mut urls = Vec::new();
     for file in manifest["files"].as_array().unwrap() {
         let key = file["key"].as_str().unwrap();
         let data = read(app, key).await;
         assert_eq!(data.len() as u64, file["size"].as_u64().unwrap());
         assert_eq!(md5_hex(&data), file["MD5checksum"].as_str().unwrap());
-        let mut text = String::new();
-        flate2::read::MultiGzDecoder::new(&data[..]).read_to_string(&mut text).unwrap();
-        lines.extend(text.lines().map(str::to_owned));
+        files.push(data);
         urls.push(format!("s3://{REPORTS}/{key}"));
     }
     assert_eq!(symlink.lines().collect::<Vec<_>>(), urls);
-    (manifest_key, manifest, lines)
+    (manifest_key, manifest, files)
 }
 
 #[tokio::test]
@@ -154,9 +164,13 @@ async fn configurations_are_set_read_listed_and_deleted() {
     assert!(got.contains("<Bucket>arn:aws:s3:::reports</Bucket>"), "{got}");
     // The request's ID must be the body's.
     assert_eq!(configure(&app, "other", body).await, StatusCode::BAD_REQUEST);
-    // Only CSV.
+    // CSV and Parquet, not ORC.
+    let orc = configuration("o", "All", "").replace("<Format>CSV</Format>", "<Format>ORC</Format>");
+    assert_eq!(configure(&app, "o", orc).await, StatusCode::NOT_IMPLEMENTED);
     let parquet = configuration("p", "All", "").replace("<Format>CSV</Format>", "<Format>Parquet</Format>");
-    assert_eq!(configure(&app, "p", parquet).await, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(configure(&app, "p", parquet).await, StatusCode::OK);
+    let got = body_of(inventory::get(&app, BUCKET, "inventory&id=p").await.unwrap()).await;
+    assert!(got.contains("<Format>Parquet</Format>"), "{got}");
     assert_eq!(configure(&app, "weekly", configuration("weekly", "All", "")).await, StatusCode::OK);
     let listed = body_of(inventory::get(&app, BUCKET, "inventory").await.unwrap()).await;
     assert!(listed.contains("<Id>daily</Id>") && listed.contains("<Id>weekly</Id>"), "{listed}");
@@ -240,6 +254,77 @@ async fn a_report_is_delivered_as_s3_delivers_it() {
     let before = reports(&app).await;
     step_at(&app, MINUTE * 2).await;
     assert_eq!(reports(&app).await, before);
+}
+
+#[tokio::test]
+async fn a_parquet_report_is_delivered_as_s3_delivers_it() {
+    let Some(app) = node().await else { return };
+    allow_delivery(&app).await;
+    put(&app, "photos/a b é.jpg", b"hello".to_vec()).await;
+    // A key's older version and its delete marker, straight in the catalog.
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO objects (bucket, key, version_id, is_latest, is_delete_marker, size, etag,
+                                  content_type, last_modified)
+             VALUES ($1, 'z', 'v1', false, false, 7, 'e', 'text/plain', '2026-01-02T03:04:05.678Z'),
+                    ($1, 'z', 'v2', true, true, 0, NULL, NULL, '2026-02-03T04:05:06.789Z')",
+            &[&BUCKET],
+        )
+        .await
+        .unwrap();
+    let rule = "<LifecycleConfiguration><Rule><ID>r</ID><Filter><Prefix>photos/</Prefix></Filter>\
+                <Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>";
+    assert_eq!(put_bucket_lifecycle(&app, BUCKET, Bytes::from(rule)).await.unwrap().status(), StatusCode::OK);
+    let fields = "<OptionalFields><Field>Size</Field><Field>LastModifiedDate</Field><Field>ETag</Field>\
+                  <Field>ObjectLockRetainUntilDate</Field><Field>ObjectLockEventHoldDuration</Field>\
+                  <Field>LifecycleExpirationDate</Field><Field>EncryptionStatus</Field></OptionalFields>";
+    let body = configuration("pq", "All", fields).replace("<Format>CSV</Format>", "<Format>Parquet</Format>");
+    assert_eq!(configure(&app, "pq", body).await, StatusCode::OK);
+    step_at(&app, Duration::ZERO).await;
+    let (_, manifest, files) = delivered_files(&app).await;
+    assert_eq!(manifest["fileFormat"], "Parquet");
+    assert_eq!(
+        manifest["fileSchema"],
+        "message s3.inventory { required binary bucket (UTF8); required binary key (UTF8); \
+         optional binary version_id (UTF8); optional boolean is_latest; optional boolean is_delete_marker; \
+         optional int64 size; optional int64 last_modified_date (TIMESTAMP_MILLIS); optional binary e_tag (UTF8); \
+         optional binary encryption_status (UTF8); optional int64 object_lock_retain_until_date (TIMESTAMP_MILLIS); \
+         optional int32 object_lock_event_hold_duration; optional binary object_lock_event_hold_duration_unit (UTF8); \
+         optional int64 lifecycle_expiration_date (TIMESTAMP_MILLIS);}"
+    );
+    let keys: Vec<&str> = manifest["files"].as_array().unwrap().iter().map(|f| f["key"].as_str().unwrap()).collect();
+    assert_eq!(keys.len(), 1);
+    assert!(keys[0].starts_with(&format!("inv/{BUCKET}/pq/data/")) && keys[0].ends_with(".parquet"), "{keys:?}");
+    // Keys as they are (only CSV's are URL-encoded); nothing is null.
+    let check = format!(
+        r#"
+import datetime
+utc = datetime.timezone.utc
+rows = pq.read_table(path).to_pylist()
+assert len(rows) == 3, rows
+a, z2, z1 = rows
+assert a["bucket"] == "{BUCKET}" and a["key"] == "photos/a b é.jpg", a
+assert a["version_id"] is None and a["is_latest"] and not a["is_delete_marker"], a
+assert a["size"] == 5 and a["e_tag"] == "{etag}" and a["encryption_status"] == "NOT-SSE", a
+assert a["last_modified_date"].tzinfo is not None, a
+assert abs(datetime.datetime.now(utc) - a["last_modified_date"]) < datetime.timedelta(hours=1), a
+expiry = a["lifecycle_expiration_date"]
+assert expiry is not None and (expiry.hour, expiry.minute) == (0, 0), a
+assert a["object_lock_retain_until_date"] is None and a["object_lock_event_hold_duration"] is None, a
+assert z2["key"] == "z" and z2["version_id"] == "v2" and z2["is_delete_marker"], z2
+assert z2["size"] is None and z2["e_tag"] is None and z2["lifecycle_expiration_date"] is None, z2
+assert z2["last_modified_date"] == datetime.datetime(2026, 2, 3, 4, 5, 6, 789000, utc), z2
+assert z1["version_id"] == "v1" and not z1["is_latest"] and z1["size"] == 7, z1
+assert z1["last_modified_date"] == datetime.datetime(2026, 1, 2, 3, 4, 5, 678000, utc), z1
+n = duckdb.connect().execute(f"SELECT count(*), sum(size) FROM '{{path}}'").fetchone()
+assert n == (3, 12), n
+"#,
+        etag = md5_hex(b"hello"),
+    );
+    crate::inventory::parquet::tests::read_back(&files[0], &check);
 }
 
 #[tokio::test]

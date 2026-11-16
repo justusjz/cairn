@@ -66,8 +66,8 @@ Done:
   history safe from admin credentials too. Implemented, with governance
   and compliance modes.
 - **Inventory and Batch Operations.** S3 Inventory: daily or weekly reports
-  of a bucket's objects, as S3 writes them (CSV only so far), paced by the
-  rate lifecycle sweeps go at, which they share. Implemented. Batch
+  of a bucket's objects, as S3 writes them (CSV or Parquet; not ORC),
+  paced by the rate lifecycle sweeps go at, which they share. Implemented. Batch
   Operations (tagging, Object Lock retention, copies, over an inventory's
   objects) come next.
 - **Lifecycle transitions.** Moving objects between storage classes by
