@@ -166,6 +166,23 @@ pub async fn members(client: &Object, id: Uuid, after: &str, max: i64) -> anyhow
     Ok(rows.iter().map(|r| Member { id: r.get(0), name: r.get(1) }).collect())
 }
 
+/// The groups each of `account`'s users is in (their names, by name), by
+/// user ID.
+pub async fn memberships(client: &Object, account: &str) -> anyhow::Result<std::collections::HashMap<Uuid, Vec<String>>> {
+    let rows = client
+        .query_cached(
+            "SELECT x.user_id, g.name FROM iam_group_members x JOIN iam_groups g ON g.id = x.group_id
+             WHERE g.account_id = $1 ORDER BY g.name",
+            &[&account],
+        )
+        .await?;
+    let mut all: std::collections::HashMap<Uuid, Vec<String>> = std::collections::HashMap::new();
+    for row in rows {
+        all.entry(row.get(0)).or_default().push(row.get(1));
+    }
+    Ok(all)
+}
+
 /// The groups user `user` is in, by name.
 pub async fn of_user(client: &Object, user: Uuid) -> anyhow::Result<Vec<Group>> {
     let rows = client

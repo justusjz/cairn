@@ -886,7 +886,11 @@ passkeys and sign-in providers, and signing out.
   both are IAM users, as in AWS, but a person signs in to the console (or
   has a link out to), with how, and when they last did; a service has only
   access keys. A new person gets a console link and no access key; a new
-  service, an access key.
+  service, an access key. Each user shows the groups it's in.
+- **Groups:** [groups](#users-and-permissions), as IAM's actions allow:
+  make one (with a path), add and remove members, attach and write
+  policies, rename or move it, and delete it once it has no members or
+  policies left. A group's members show to whom may `iam:GetGroup` it.
 - **Roles:** [roles](#roles-and-temporary-credentials), with who their
   trust policies let in, as IAM's actions allow: make one (the trust
   policy's templates write statements for the account, a user or role, or a
@@ -896,8 +900,8 @@ passkeys and sign-in providers, and signing out.
   [OpenID Connect providers](#web-identities): add one (checked against its
   issuer), change its client IDs, thumbprints and tags, see which roles
   trust it, and delete it.
-- **Policies:** the account's managed policies and Cairn's, which users and
-  roles have each attached, and making, changing (a new version) and
+- **Policies:** the account's managed policies and Cairn's, which users,
+  groups and roles have each attached, and making, changing (a new version) and
   deleting the account's own. *From a template* makes policies from one of
   the [templates](#teams-and-policy-templates), shown before they're made.
   The editor adds the bucket-access template's statement for a bucket (or a
