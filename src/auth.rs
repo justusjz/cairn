@@ -309,6 +309,9 @@ pub struct Signed {
     /// The session token of temporary credentials (`X-Amz-Security-Token`,
     /// a header, or a presigned URL's query parameter).
     pub token: Option<String>,
+    /// The token of a directory bucket's session (`X-Amz-S3session-Token`,
+    /// likewise; see `s3::directory`).
+    pub directory_token: Option<String>,
 }
 
 /// The signature a request claims to have (not checked), or `None` for an
@@ -323,9 +326,9 @@ pub fn signed(headers: &HeaderMap, query: &str) -> Option<Signed> {
         false => request_time(headers).map(|(date, _)| date.to_owned()),
         true => query_value(query, "X-Amz-Date"),
     };
-    let token = match presigned {
-        false => headers.get("x-amz-security-token").and_then(|v| v.to_str().ok()).map(str::to_owned),
-        true => query_value(query, "X-Amz-Security-Token"),
+    let token = |header: &str, parameter: &str| match presigned {
+        false => headers.get(header).and_then(|v| v.to_str().ok()).map(str::to_owned),
+        true => query_value(query, parameter),
     };
     Some(Signed {
         access_key: authorization.access_key,
@@ -333,7 +336,8 @@ pub fn signed(headers: &HeaderMap, query: &str) -> Option<Signed> {
         region: authorization.region,
         presigned,
         date,
-        token,
+        token: token("x-amz-security-token", "X-Amz-Security-Token"),
+        directory_token: token("x-amz-s3session-token", "X-Amz-S3session-Token"),
     })
 }
 
@@ -754,6 +758,7 @@ impl PostSignature {
             presigned: false,
             date: None,
             token: self.token.clone(),
+            directory_token: None,
         }
     }
 

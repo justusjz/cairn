@@ -850,7 +850,19 @@ impl Statement {
             if service.is_empty() || name.is_empty() || service.contains(['*', '?']) {
                 return Err(invalid());
             }
-            if service.eq_ignore_ascii_case("s3") {
+            // A directory bucket's policy is about S3 Express's actions only
+            // (see `s3::directory`).
+            if let Kind::Bucket(bucket) = kind
+                && crate::s3::directory::is_directory(bucket)
+            {
+                let pattern = Pattern::new(name, Syntax { wildcards: true, variables: None }).expect("no variables");
+                let express = action == "*"
+                    || (service.eq_ignore_ascii_case("s3express")
+                        && crate::s3::directory::ACTIONS.iter().any(|a| pattern.matches(a, true)));
+                if !express {
+                    return Err(invalid());
+                }
+            } else if service.eq_ignore_ascii_case("s3") {
                 let actions = s3_actions(name, kind);
                 if actions.is_empty() {
                     return Err(invalid());
@@ -878,6 +890,14 @@ impl Statement {
                 kinds.push(resource_kind(resource, kind)?);
             }
             out.push(format!("\"{}Resource\":{}", if resources.not { "Not" } else { "" }, one_or_list(&resources.patterns)));
+        }
+        // A directory bucket's statement is about the bucket.
+        if let Kind::Bucket(bucket) = kind
+            && crate::s3::directory::is_directory(bucket)
+            && !resources.not
+            && resources.patterns.is_empty()
+        {
+            return Err(Invalid::malformed("Action does not apply to any resource(s) in statement"));
         }
         // As S3 checks a bucket policy: each action must apply to one of the
         // statement's resources (an object action to an object, ...).
@@ -936,6 +956,17 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
     let [prefix, partition, service, region, account, path] = arn_parts(resource).ok_or_else(invalid)?;
     if prefix != "arn" || partition.is_empty() || service.is_empty() {
         return Err(invalid());
+    }
+    if let Kind::Bucket(bucket) = kind
+        && crate::s3::directory::is_directory(bucket)
+    {
+        // Only the bucket (S3 Express's actions are on it, not its objects),
+        // in any region and account its ARN may name.
+        let ours = service == "s3express" && partition == "aws" && !region.is_empty() && !account.is_empty();
+        if !ours || path.strip_prefix("bucket/") != Some(bucket) {
+            return Err(invalid());
+        }
+        return Ok(Some(Applies::Other));
     }
     if let Kind::Bucket(bucket) = kind {
         // Only the bucket, and its objects.
@@ -1110,6 +1141,14 @@ fn parse_conditions(
             let lower = key.to_ascii_lowercase();
             let invalid_key = || Invalid::malformed("Policy has an invalid condition key");
             match support(key) {
+                // S3 Express's: a session's mode is decided (see
+                // `s3::directory`), as is the resource's account; the rest
+                // not yet.
+                None if lower.starts_with("s3express:") => {
+                    if !matches!(lower.as_str(), "s3express:sessionmode" | "s3express:resourceaccount") {
+                        unsupported.get_or_insert_with(|| key.clone());
+                    }
+                }
                 Some(Support::Unsupported) => {
                     unsupported.get_or_insert_with(|| key.clone());
                 }

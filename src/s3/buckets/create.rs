@@ -62,6 +62,20 @@ pub async fn create_tagged(
     if !valid_bucket_name(name) {
         return Ok(Creation::InvalidName);
     }
+    insert(app, name, account, object_lock, tags).await
+}
+
+/// Creates directory bucket `name` (see `s3::directory`) of account
+/// `account`: without versioning, Object Lock or tags, which it can't have.
+pub async fn create_directory(app: &App, name: &str, account: &str) -> anyhow::Result<Creation> {
+    if !crate::s3::directory::valid_name(name) {
+        return Ok(Creation::InvalidName);
+    }
+    insert(app, name, account, false, None).await
+}
+
+/// Inserts bucket `name`, whose name is valid.
+async fn insert(app: &App, name: &str, account: &str, object_lock: bool, tags: Option<&Tags>) -> anyhow::Result<Creation> {
     let stored = tags.filter(|tags| !tags.is_empty()).map(Tags::stored);
     let client = app.pool.get().await?;
     let inserted = client
@@ -97,7 +111,12 @@ pub async fn create_bucket(
     object_lock: bool,
     tags: Option<&Tags>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    match create_tagged(app, bucket, account, object_lock, tags).await? {
+    let directory = crate::s3::directory::is_directory(bucket);
+    let creation = match directory {
+        true => create_directory(app, bucket, account).await?,
+        false => create_tagged(app, bucket, account, object_lock, tags).await?,
+    };
+    match creation {
         Creation::InvalidName => {
             return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidBucketName", "the specified bucket is not valid"));
         }
@@ -111,11 +130,12 @@ pub async fn create_bucket(
         }
         Creation::Created | Creation::Exists => {}
     }
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("location", format!("/{bucket}"))
-        .body(Full::new(Bytes::new()))
-        .unwrap())
+    let mut builder = Response::builder().status(StatusCode::OK).header("location", format!("/{bucket}"));
+    // A directory bucket's ARN, as S3 tells it.
+    if directory {
+        builder = builder.header("x-amz-bucket-arn", crate::s3::directory::arn(account, bucket));
+    }
+    Ok(builder.body(Full::new(Bytes::new())).unwrap())
 }
 
 /// The tags a CreateBucket's `<CreateBucketConfiguration>` gives its bucket

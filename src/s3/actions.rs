@@ -53,6 +53,9 @@ pub enum On {
     /// The cluster, for Cairn's actions (`cairn:`), which operators'
     /// policies allow: the account's.
     Cluster,
+    /// A directory bucket of an account (by its ID), for S3 Express's
+    /// actions on it (`s3express:`; see `s3::directory`).
+    Directory(String, String),
     /// Any other resource, by its ARN (STS's federated users, ...).
     Arn(String),
 }
@@ -74,6 +77,7 @@ impl On {
             On::Roles(account, prefix) => format!("arn:aws:iam::{account}:role/{prefix}"),
             On::Policy(account, name) => format!("arn:aws:iam::{account}:policy/{name}"),
             On::Cluster => CLUSTER_ARN.to_owned(),
+            On::Directory(account, bucket) => crate::s3::directory::arn(account, bucket),
             On::Arn(arn) => arn.clone(),
         }
     }
@@ -118,7 +122,7 @@ impl On {
     /// The bucket whose policy applies, if any.
     pub fn bucket(&self) -> Option<&str> {
         match self {
-            On::Bucket(bucket) | On::Object(bucket, _) => Some(bucket),
+            On::Bucket(bucket) | On::Object(bucket, _) | On::Directory(_, bucket) => Some(bucket),
             _ => None,
         }
     }

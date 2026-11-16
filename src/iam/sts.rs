@@ -182,6 +182,7 @@ impl Sts<'_> {
             source_identity: None,
             chained: false,
             provider: None,
+            directory: None,
         })
     }
 }

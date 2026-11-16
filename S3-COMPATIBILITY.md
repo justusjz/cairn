@@ -53,6 +53,7 @@ supported.
 | Storage classes other than STANDARD, restore | ❌ | [Storage classes](#storage-classes) |
 | CORS | ✅ | |
 | Static website hosting | ✅ | [Endpoints](#endpoints-and-domains) |
+| Directory buckets (S3 Express One Zone), `CreateSession` | 🟡 | [Directory buckets](#directory-buckets) |
 | RenameObject, appends (S3 Express) | ❌ | |
 | Inventory | 🟡 | CSV only: [Inventory](#inventory) |
 
@@ -81,7 +82,7 @@ S3 reports a bucket that doesn't use it:
 - Replication, server access logging, event notifications.
 - Analytics, metrics, Intelligent-Tiering, Storage Lens.
 - S3 Select, torrents, S3 Batch Operations.
-- S3 Express (directory buckets, `CreateSession`), metadata tables.
+- S3 Express's metadata tables, access points for directory buckets.
 - Requester pays, Transfer Acceleration.
 
 ---
@@ -187,6 +188,47 @@ and refuses too. The difference is that ACLs can't be enabled:
 - **ListObjectsV2 continuation tokens** aren't opaque: they encode the key to
   continue after. A marker that names a common prefix continues after all of
   its keys (as in MinIO).
+
+### Directory buckets
+
+Directory buckets (`<base>--<zone>--x-s3`) work as in S3 Express One Zone:
+sessions (`CreateSession`, `x-amz-s3session-token`), `s3express:` actions on
+`arn:aws:s3express:us-east-1:<account>:bucket/<name>` (only
+`s3express:CreateSession` from a bucket policy; regional operations from
+identity policies only), ListDirectoryBuckets apart from ListBuckets, and
+S3's limits: no versioning, Object Lock, tags, ACLs, SSE-C, CORS or websites;
+ListObjectsV2 only, with `/` the only delimiter and only prefixes ending in
+it; part numbers 1, 2, 3, … without gaps; storage class `EXPRESS_ONEZONE`.
+Requests under a session are authorized by the session alone, without
+looking up policies.
+
+- **No zones.** Cairn has no Availability Zones: the zone is whatever the
+  name and the `CreateBucketConfiguration` say (they must agree). Local Zones
+  are refused. Data is stored as any bucket's, with the cluster's redundancy,
+  not in one zone.
+- **One endpoint.** Regional and zonal operations are both served on the S3
+  endpoint, virtual-hosted or path-style, as SDKs address directory buckets
+  at a custom endpoint, and may be signed for `s3express` or `s3`.
+- **Sessions of buckets not created yet.** SDKs at a custom endpoint make a
+  session before CreateBucket, so CreateSession of a bucket that doesn't exist
+  succeeds (S3 answers `404`); that session's requests are authorized by its
+  principal's policies, as if it were none. Requests signed without a session
+  are authorized as a session's creation would be (`s3express:CreateSession`,
+  in `ReadWrite` mode to write).
+- **Not yet:** RenameObject, appends (`x-amz-write-offset-bytes`), bucket tags
+  and S3 Express's condition keys other than `s3express:SessionMode` and
+  `s3express:ResourceAccount`. Objects aren't encrypted by default, as in
+  other buckets ([Encryption](#encryption)), and a session's encryption
+  headers are ignored (its response tells the bucket's default).
+- **ETags** are MD5 digests, as in general purpose buckets; S3's aren't, and
+  clients don't rely on either.
+- **Refusals.** What a directory bucket doesn't have (an operation, a
+  feature's header, `Content-MD5` on zonal operations) is
+  `501 NotImplemented`, "This bucket does not support …", as S3 refuses
+  `Content-MD5`; whether S3 answers its other unsupported operations the
+  same wasn't probed. Neither were its errors for a listing's delimiter or
+  prefix, `start-after`, or a gap in part numbers (Cairn: `400`).
+- **The console** doesn't manage directory buckets; use the S3 API.
 
 ### Policies
 

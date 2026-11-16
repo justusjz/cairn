@@ -29,6 +29,7 @@ mod cleanup;
 mod copies;
 mod cors;
 mod deadlocks;
+mod directory;
 mod encrypted;
 mod kms;
 mod limits;
