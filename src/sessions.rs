@@ -61,6 +61,10 @@ pub enum Who {
     /// name.
     #[serde(rename = "f")]
     Federated { id: Uuid, name: String },
+    /// An account's root user's (`cairn account root-key`, on a node): the
+    /// account, by its ID. Older nodes don't know it, so refuse its token.
+    #[serde(rename = "root")]
+    Root { account: String },
 }
 
 /// Everything about a session, which its token holds.

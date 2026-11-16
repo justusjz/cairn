@@ -60,7 +60,7 @@ impl Actor {
     /// The user's ID, which the KMS knows it by (`None` for the account's
     /// root user, who has no identity in the KMS).
     pub fn kms_role(&self) -> Option<uuid::Uuid> {
-        (!self.0.principal.root).then_some(self.0.principal.id)
+        self.0.principal.kms_role()
     }
 
     /// The account the session acts in (its ID).

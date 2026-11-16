@@ -29,6 +29,8 @@ mod groups_tests;
 #[cfg(test)]
 mod paging_tests;
 #[cfg(test)]
+mod root_tests;
+#[cfg(test)]
 mod web_identity_tests;
 
 use std::collections::HashMap;
@@ -696,6 +698,14 @@ impl Iam<'_> {
     /// `action` on it (with its condition keys, and `extra`), and one of its
     /// account. `missing`: what a user that isn't there is.
     async fn target(&mut self, params: &Params, action: &'static str, extra: Context, missing: fn(&str) -> Error) -> Result<Target> {
+        // The root user is no user: its requests must name one.
+        if self.principal.root && params.get("UserName").is_none() {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "ValidationError",
+                "The root user has no access keys, policies or other user's things of its own here: name a user (UserName)".to_owned(),
+            ));
+        }
         // A role's session is a user of its session's name, to IAM (probed).
         let own = match self.principal.session.as_ref().map(|s| &s.session.who) {
             Some(crate::sessions::Who::Role { session, .. }) => session.as_str(),

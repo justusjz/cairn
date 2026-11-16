@@ -425,11 +425,21 @@ down to the names it may create (`s3:CreateBucket` on
 
 The account has a **root user**, as AWS's, for getting back in when
 policies lock everyone out. Only the command line on a node can make
-someone the root: it has no passkeys, keys or password, and signs in to the
-[console](#console) only with a one-time link that `cairn account root-link`
-prints (valid 15 minutes; its session lasts an hour at most, and 15 minutes
-unused). Whoever can run that could change the database anyway, so the root
-adds no way in. As in AWS:
+someone the root: it has no passkeys, long-term keys or password. Either of
+two commands on a node makes it, for a while:
+
+- `cairn account root-link` prints a one-time link to sign in to the
+  [console](#console) (valid 15 minutes; its session lasts an hour at most,
+  and 15 minutes unused);
+- `cairn account root-key` prints temporary credentials for the S3, IAM and
+  STS APIs, valid 15 minutes (as AWS's `AssumeRoot`'s at most), as shell
+  `export`s: `eval "$(cairn account root-key)"`, then `aws s3api
+  delete-bucket-policy ...`. `cairn sessions revoke-all` ends them sooner
+  (no policy can).
+
+Whoever can run those could change the database anyway, so the root adds no
+way in; each link and key made, and each sign-in, is logged on its node.
+As in AWS:
 
 - no identity policy restricts it: no policy can be attached to it, and no
   permissions boundary or group applies. It may do anything in the account,
@@ -443,7 +453,11 @@ adds no way in. As in AWS:
   policy itself). It has `aws:PrincipalType` `Account`, and its
   `aws:userid` is the account's ID;
 - Object Lock's compliance mode holds against it, and it assumes no
-  roles; the KMS doesn't know it, so it can't read SSE-KMS objects.
+  roles; the KMS doesn't know it, so it can't read SSE-KMS objects;
+- it's no user: IAM's actions on the signer's own user (CreateAccessKey or
+  ListAccessKeys without `UserName`, say) must name one, and STS makes no
+  sessions of it (GetSessionToken, GetFederationToken, AssumeRole), nor S3
+  Express of its directory buckets.
 
 The command line itself is the other way out (`cairn user update <name>
 --admin`, `cairn user detach`, `cairn user unbound`, `cairn bucket-policy

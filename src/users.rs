@@ -262,6 +262,12 @@ impl Principal {
         }
     }
 
+    /// Whom the KMS knows it as (see `kms`): its ID; `None` for the
+    /// account's root user, whom the KMS doesn't know.
+    pub fn kms_role(&self) -> Option<uuid::Uuid> {
+        (!self.root).then_some(self.id)
+    }
+
     /// Whether it's a role's session.
     pub fn is_role_session(&self) -> bool {
         matches!(self.session.as_ref().map(|s| &s.session.who), Some(crate::sessions::Who::Role { .. }))
@@ -308,6 +314,11 @@ impl Principal {
         let principal = match &session.who {
             Who::Role { id, .. } => crate::roles::principal(client, *id).await?,
             Who::User { id } | Who::Federated { id, .. } => Self::load_user(client, *id).await?,
+            // An account that's gone has no root.
+            Who::Root { account } => {
+                let exists = client.query_opt_cached("SELECT 1 FROM accounts WHERE id = $1", &[account]).await?.is_some();
+                exists.then(|| Principal::root(account))
+            }
         };
         let Some(mut principal) = principal else { return Ok(Err(Unknown::Key)) };
         principal.secret = session.secret.clone();
@@ -349,6 +360,8 @@ impl Principal {
         let directory = session.directory.as_ref()?;
         let id = match &session.who {
             crate::sessions::Who::Role { id, .. } | crate::sessions::Who::User { id } | crate::sessions::Who::Federated { id, .. } => *id,
+            // The root makes no directory bucket's sessions.
+            crate::sessions::Who::Root { .. } => return None,
         };
         Some(Principal {
             id,

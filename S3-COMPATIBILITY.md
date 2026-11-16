@@ -104,12 +104,14 @@ S3 reports a bucket that doesn't use it:
 - **One account.** A cluster has one account, which owns every bucket, user,
   role and policy. Its canonical user ID is derived from the account ID.
   There are no Organizations, so no SCPs, RCPs or organization condition keys.
-- **The root user signs in only with a link.** It has no password, access
-  keys or MFA devices: `cairn account root-link` on a node prints a one-time
-  link to the console, which is the only way to act as it (so no request to
-  the S3, IAM or STS APIs is ever the root's). As in AWS, identity policies
-  don't restrict it; resource policies' denies do, but for its own buckets'
-  policy actions. Its console session is never multi-factor. Admins have
+- **The root user is made on a node, for a while.** It has no password,
+  long-term access keys or MFA devices: `cairn account root-link` prints a
+  one-time link to the console, and `cairn account root-key` temporary
+  credentials (15 minutes, as `AssumeRoot`'s at most, but not scoped to a
+  task policy). As in AWS, identity policies don't restrict it; resource
+  policies' denies do, but for its own buckets' policy actions. It's never
+  multi-factor, has no user of its own to IAM (actions on the signer's own
+  user must name one), and STS makes no sessions of it. Admins have
   `AdministratorAccess`.
 
 ### Endpoints and domains

@@ -163,7 +163,7 @@ pub fn read_document(file: &str) -> anyhow::Result<String> {
 }
 
 #[cfg(test)]
-mod e2e {
+pub(crate) mod e2e {
     use clap::Parser;
     use tower::ServiceExt;
 
@@ -190,7 +190,7 @@ mod e2e {
     }
 
     /// Runs `cairn <args>` on node `app`, as the CLI sends it.
-    async fn cairn(app: &Arc<App>, args: &[&str]) -> Output {
+    pub(crate) async fn cairn(app: &Arc<App>, args: &[&str]) -> Output {
         let cli = crate::Cli::try_parse_from(std::iter::once("cairn").chain(args.iter().copied())).unwrap();
         let (_, command) = crate::remote_command(cli.command).unwrap();
         let body = serde_json::to_vec(&command).unwrap();
