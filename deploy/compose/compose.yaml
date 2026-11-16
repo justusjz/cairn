@@ -5,8 +5,7 @@
 #
 #   cp .env.example .env    # and fill it in
 #   docker compose up -d
-#   docker compose exec cairn cairn user create admin --admin
-#   docker compose exec cairn cairn user enroll admin
+#   docker compose exec cairn cairn user create admin --admin   # prints a console link
 #
 # Only Caddy is published (80 and 443). The peer endpoint (9431), which is
 # unauthenticated, stays on the network of the three.

@@ -52,7 +52,7 @@ docker run -d --name cairn -p 9000:9000 \
     -e CAIRN_DATABASE="postgres://user:pass@db.internal:5432/cairn" \
     -v cairn-data:/var/lib/cairn \
     ghcr.io/justusjz/cairn:<version>
-docker exec cairn cairn user create admin --admin
+docker exec cairn cairn user create admin --admin --key
 ```
 
 For a cluster, also set `CAIRN_PEER_URL` to an address the other nodes can
@@ -84,11 +84,10 @@ Encrypt as they're needed. Only Caddy is published, on ports 80 and 443.
    ```
 
 3. Make the first admin, and enroll a passkey for the console with the link
-   it prints:
+   it prints (the console's sign-in page says so too, until someone has):
 
    ```sh
    docker compose exec cairn cairn user create admin --admin
-   docker compose exec cairn cairn user enroll admin
    ```
 
 Caddy gets a certificate for `s3.example.com` and `console.example.com` as
@@ -131,7 +130,7 @@ the credentials of a user, and a fresh database has none. Create the first
 admin (see [Users and permissions](#users-and-permissions)):
 
 ```sh
-cairn user create admin --admin        # prints its access key ID and secret
+cairn user create admin --admin --key  # prints its access key ID and secret
 ```
 
 The `cairn` commands that manage the cluster (`user`, `account`, `oidc`,
@@ -332,7 +331,7 @@ before its name (`arn:aws:iam::<account>:user/team-a/ada`), and up to 50
 `aws:ResourceTag/<key>` (IAM's actions on the user) and
 `aws:PrincipalTag/<key>` (the user's own requests). It has **access keys**: up to two,
 as in IAM, each an access key ID and a secret. IDs are random, 20
-characters, as IAM's (`cairn user create` prints the first); only a role
+characters, as IAM's (`cairn user create --key` prints the first); only a role
 migrated from before access keys keeps a key named as it. Access key IDs are unique across the
 cluster. Users are stored in
 Postgres, so every node picks up a change on the very next request; there is
@@ -527,7 +526,7 @@ be removed, and print a warning when used:
 
 | Command | Description |
 | --- | --- |
-| `create <name> [--admin] [--id <ID>] [--secret <S>]` | Create a user, with an access key of a random 20-char ID (or `--id`). Prints the ID, and a generated 40-char secret unless `--secret` is given (min. 8 chars). |
+| `create <name> [--admin] [--key [--id <ID>] [--secret <S>]]` | Create a person: a user without access keys, and print a link for it to sign in to the [console](#console) with, as `enroll` does. With `--key` (or `--id`, `--secret`), a service instead: a user with an access key of a random 20-char ID (or `--id`), whose ID is printed, with a generated 40-char secret unless `--secret` is given (min. 8 chars). |
 | `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin. Deprecated: replace the secret of the key named as the user (`--rotate-secret` prints the new one); rotate a key by making a second one and deleting the first instead, as in IAM. |
 | `delete <name>` (deprecated) | Delete a user, with its keys and policies. |
 | `grant <name> <bucket> <read\|write\|delete-version>...` (deprecated) | Grant permissions on an existing bucket of the account: attaches its managed policy `/cairn/grants/<bucket>-<permission>`, made the first time. |
@@ -842,12 +841,13 @@ passwords, and access keys are for S3, never for the console.
 cairn serve ... --listen-console 0.0.0.0:9480 --console-url https://console.example.com
 ```
 
-The first person comes from the command line: an admin, with a link to
-enroll a passkey with. Everyone after that can be made in the console.
+The first person comes from the command line: an admin, and the link it
+prints to enroll a passkey with (the console's sign-in page shows the
+command until someone has enrolled). Everyone after that can be made in the
+console.
 
 ```sh
-cairn user create ada --admin
-cairn user enroll ada     # on a node that serves the console
+cairn user create ada --admin    # on a node that serves the console
 ```
 
 A **login** (a person, with passkeys or identities at OIDC providers) acts

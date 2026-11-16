@@ -442,6 +442,28 @@ mod e2e {
         browser.send("POST", "/api/login", Some(body)).await
     }
 
+    /// `cairn user create` makes a person: a user without access keys, with
+    /// a link that enrolls it; a second of the name is refused, and makes
+    /// no link.
+    #[tokio::test]
+    async fn creates_a_person_with_a_link() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let client = app.pool.get().await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
+        let token = store::create_person(&client, &account, "ada", true).await.unwrap();
+        let ada = users::list(&client).await.unwrap().into_iter().find(|u| u.name == "ada").unwrap();
+        assert!(ada.admin);
+        assert!(ada.keys.is_empty());
+        let err = store::create_person(&client, &account, "ADA", false).await.unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        let console = Arc::new(Console { app: app.clone(), party: party() });
+        let mut browser = Browser { console, cookie: None, origin: party().origin };
+        let (status, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
+        assert_eq!(status, StatusCode::OK, "{ceremony}");
+        assert_eq!(ceremony["identity"], "ada");
+    }
+
     /// A user enrolls its first passkey through a link, signs in with it,
     /// adds a second, can't remove its last, and signs out.
     #[tokio::test]
@@ -452,8 +474,9 @@ mod e2e {
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
 
-        // Not signed in.
+        // Not signed in, and no one could yet.
         assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(browser.send("GET", "/api/setup", None).await.1["enrolled"], false);
 
         // The link.
         let token = store::create_enrollment(&client, &crate::users::account(&client).await.unwrap(), "ada").await.unwrap();
@@ -468,6 +491,7 @@ mod e2e {
         let (status, me) = browser.send("POST", "/api/enroll", Some(body.clone())).await;
         assert_eq!(status, StatusCode::OK, "{me}");
         assert_eq!(me["name"], "ada");
+        assert_eq!(browser.send("GET", "/api/setup", None).await.1["enrolled"], true);
         assert_eq!(me["identity"]["user"], "ada");
         assert!(me["identity"]["arn"].as_str().unwrap().ends_with(":user/ada"));
         assert_eq!(me["passkeys"][0]["name"], "Laptop");

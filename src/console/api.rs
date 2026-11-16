@@ -53,6 +53,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
         .routes(routes!(add_passkey))
         .routes(routes!(rename_passkey, delete_passkey))
         .routes(routes!(oidc_providers))
+        .routes(routes!(setup))
         .routes(routes!(oidc_start))
         .routes(routes!(oidc_callback))
         .routes(routes!(oidc_unlink))
@@ -557,6 +558,24 @@ struct ProviderButton {
 async fn oidc_providers(State(console): ConsoleState) -> Result<Json<Vec<ProviderButton>>> {
     let providers = super::oidc::providers(&console.app.pool.get().await?).await?;
     Ok(Json(providers.into_iter().map(|p| ProviderButton { name: p.name, label: p.label }).collect()))
+}
+
+/// Whether the console is set up yet.
+#[derive(Serialize, ToSchema)]
+struct Setup {
+    /// Whether anyone has enrolled (and so can sign in). Until someone has,
+    /// the sign-in page says how to make the first person, on a node.
+    enrolled: bool,
+}
+
+/// Whether the console is set up yet (for the sign-in page).
+#[utoipa::path(get, path = "/setup", responses(
+    (status = 200, body = Setup),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn setup(State(console): ConsoleState) -> Result<Json<Setup>> {
+    let enrolled = store::anyone_enrolled(&console.app.pool.get().await?).await?;
+    Ok(Json(Setup { enrolled }))
 }
 
 /// Where providers send the browser back to: register it with them.

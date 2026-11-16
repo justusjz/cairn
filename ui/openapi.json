@@ -4187,6 +4187,32 @@
         }
       }
     },
+    "/setup": {
+      "get": {
+        "summary": "Whether the console is set up yet (for the sign-in page).",
+        "operationId": "setup",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Setup"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/storage": {
       "get": {
         "operationId": "get_storage",
@@ -8623,6 +8649,19 @@
               "type": "string"
             },
             "description": "What's wrong with the cluster's layouts now, if anything: too few\nnodes for them, say."
+          }
+        }
+      },
+      "Setup": {
+        "type": "object",
+        "description": "Whether the console is set up yet.",
+        "required": [
+          "enrolled"
+        ],
+        "properties": {
+          "enrolled": {
+            "type": "boolean",
+            "description": "Whether anyone has enrolled (and so can sign in). Until someone has,\nthe sign-in page says how to make the first person, on a node."
           }
         }
       },

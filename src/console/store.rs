@@ -105,6 +105,35 @@ pub async fn create_enrollment(client: &Object, account: &str, user: &str) -> an
     Ok(token)
 }
 
+/// Creates a person: a user of the account `account` without access keys
+/// (as `users::create_user`), an admin if `admin`, with an enrollment link,
+/// whose token it returns. One statement: both, or neither. `name` must be
+/// checked (`users::validate_name`).
+pub async fn create_person(client: &Object, account: &str, name: &str, admin: bool) -> anyhow::Result<String> {
+    let (token, hash) = token()?;
+    let made = client
+        .execute_cached(
+            "WITH r AS (
+                 INSERT INTO users (name, secret, admin, account_id)
+                 VALUES ($1, 'unusable:' || gen_random_uuid() || gen_random_uuid(), $2, $3)
+                 ON CONFLICT DO NOTHING RETURNING id, account_id
+             )
+             INSERT INTO console_enrollments (token_hash, user_id, account_id, expires_at)
+             SELECT $4, r.id, r.account_id, now() + make_interval(secs => $5) FROM r",
+            &[&name, &admin, &account, &hash, &secs(ENROLLMENT_TTL)],
+        )
+        .await?;
+    if made == 0 {
+        return Err(Invalid(format!("a user named {name:?} already exists")).into());
+    }
+    Ok(token)
+}
+
+/// Whether anyone can sign in to the console: a login acts as some user.
+pub async fn anyone_enrolled(client: &Object) -> anyhow::Result<bool> {
+    Ok(client.query_one_cached("SELECT EXISTS (SELECT 1 FROM login_identities)", &[]).await?.get(0))
+}
+
 /// How a user of an account signs in to the console, if it does: a person,
 /// as opposed to a service, which only has access keys.
 #[derive(Clone, Debug, Default, PartialEq)]

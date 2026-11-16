@@ -47,6 +47,8 @@ export const api = {
   enrollLink: (token: string) => ok(client.POST("/enroll/link", { body: { token } })),
   loginOptions: () => ok(client.POST("/login/options")),
   oidcProviders: () => ok(client.GET("/oidc/providers")),
+  /** Whether anyone has enrolled yet. */
+  setup: () => ok(client.GET("/setup")),
   /** Starts a sign-in at an OIDC provider: the URL to send the browser to. */
   oidcStart: (provider: string, purpose: "login" | "enroll" | "link", extra: { token?: string } = {}) =>
     ok(client.POST("/oidc/{provider}/start", { params: { path: { provider } }, body: { purpose, token: extra.token ?? null } })),

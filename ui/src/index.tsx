@@ -251,22 +251,44 @@ function Login() {
     }
     setBusy(false);
   };
+  const [setup] = createResource(() => api.setup().catch(() => ({ enrolled: true })));
   return (
     <div class="signin">
       <Panel title="Sign in to Cairn">
         <Show when={supported()} fallback={<NoPasskeys />}>
-          <p class="subtle">Sign in with a passkey: your device asks for your fingerprint, face, PIN or security key.</p>
-          <button class="primary" disabled={busy()} onClick={signIn}>
-            Sign in with a passkey
-          </button>
-          <ProviderButtons purpose="login" onError={setError} />
-          <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
-          <p class="subtle small">
-            New here? Ask an administrator for an enrollment link.
-          </p>
+          <Show when={setup()?.enrolled === false} fallback={
+            <>
+              <p class="subtle">Sign in with a passkey: your device asks for your fingerprint, face, PIN or security key.</p>
+              <button class="primary" disabled={busy()} onClick={signIn}>
+                Sign in with a passkey
+              </button>
+              <ProviderButtons purpose="login" onError={setError} />
+              <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+              <p class="subtle small">
+                New here? Ask an administrator for an enrollment link.
+              </p>
+            </>
+          }>
+            <FirstAdmin />
+          </Show>
         </Show>
       </Panel>
     </div>
+  );
+}
+
+/** How to make the first person, until anyone has enrolled. */
+function FirstAdmin() {
+  const command = "cairn user create admin --admin";
+  return (
+    <>
+      <p>No one can sign in yet. Make the first administrator on a node of the cluster, and open the link it prints to enroll a passkey:</p>
+      <pre class="command">{command}</pre>
+      <p class="subtle small">
+        In Docker Compose: <span class="mono">docker compose exec cairn {command}</span>. Everyone after that is made in
+        the console.
+      </p>
+    </>
   );
 }
 

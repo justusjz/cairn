@@ -466,16 +466,22 @@ pub struct UserArgs {
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum UserCommand {
-    /// Create a user, with an access key of a random ID. Prints the key's
-    /// ID and secret; a random secret is generated unless given.
+    /// Create a user: a person, who signs in to the console with the
+    /// one-time link printed (as `enroll` prints it), or with `--key` a
+    /// service, with an access key, whose ID and secret are printed.
     Create {
         /// The user's name.
         name: String,
+        /// Make a service: an access key of a random ID, and no console
+        /// link. A random secret is generated unless given.
+        #[arg(long)]
+        key: bool,
         /// Give the key this ID instead of a random one (for scripted
-        /// setups that need a known one).
+        /// setups that need a known one). Implies `--key`.
         #[arg(long)]
         id: Option<String>,
-        /// Use this secret instead of generating one (at least 8 characters).
+        /// Use this secret instead of generating one (at least 8
+        /// characters). Implies `--key`.
         #[arg(long)]
         secret: Option<String>,
         /// Give the user `AdministratorAccess`: everything in its account.
@@ -634,22 +640,29 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: UserArgs, out: &mut cra
     match args.command {
         UserCommand::Create {
             name,
+            key,
             id,
             secret,
             admin,
         } => {
-            let generated = secret.is_none();
-            let key = match id {
-                Some(id) => {
-                    validate_name(&id)?;
-                    id
+            if key || id.is_some() || secret.is_some() {
+                let generated = secret.is_none();
+                let key = match id {
+                    Some(id) => {
+                        validate_name(&id)?;
+                        id
+                    }
+                    None => generate_key_id()?,
+                };
+                let (key, secret) = create_with_key(&client, account_id, &name, key, secret, admin).await?;
+                outln!(out, "access key: {key}");
+                if generated {
+                    outln!(out, "secret key: {secret}");
                 }
-                None => generate_key_id()?,
-            };
-            let (key, secret) = create_with_key(&client, account_id, &name, key, secret, admin).await?;
-            outln!(out, "access key: {key}");
-            if generated {
-                outln!(out, "secret key: {secret}");
+            } else {
+                validate_name(&name)?;
+                let token = crate::console::store::create_person(&client, account_id, &name, admin).await?;
+                enrollment_link(app, &token, out);
             }
             // Its identity in the KMS, so that key owners can grant it keys
             // now; if the KMS can't be reached, the next maintenance pass
