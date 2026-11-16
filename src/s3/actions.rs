@@ -257,6 +257,22 @@ pub fn operation(method: &Method, bucket: &str, key: &str, query: &str, headers:
             (Method::PUT, None) if has("abac") => one("PutBucketAbac", "s3:PutBucketAbac", on_bucket()),
             // Not a DeleteBucket (S3's 405, probed).
             (_, None) if has("abac") => None,
+            // Inventory configurations, by their IDs (see
+            // `buckets::inventory`): not configuration grants and templates
+            // have, as they write reports of the bucket elsewhere.
+            (Method::GET, None) if has("inventory") && has("id") => {
+                one("GetBucketInventoryConfiguration", "s3:GetInventoryConfiguration", on_bucket())
+            }
+            (Method::GET, None) if has("inventory") => {
+                one("ListBucketInventoryConfigurations", "s3:GetInventoryConfiguration", on_bucket())
+            }
+            (Method::PUT, None) if has("inventory") => {
+                one("PutBucketInventoryConfiguration", "s3:PutInventoryConfiguration", on_bucket())
+            }
+            (Method::DELETE, None) if has("inventory") => {
+                one("DeleteBucketInventoryConfiguration", "s3:PutInventoryConfiguration", on_bucket())
+            }
+            (_, None) if has("inventory") => None,
             (Method::PUT, Some(("ownershipControls", _, _))) => {
                 one("PutBucketOwnershipControls", "s3:PutBucketOwnershipControls", on_bucket())
             }
@@ -547,6 +563,25 @@ mod tests {
             Policy::parse(&grant_policy(permission, "b"), Kind::Identity).unwrap();
         }
         Policy::parse(&admin_policy(), Kind::Identity).unwrap();
+    }
+
+    #[test]
+    fn inventory_configurations_are_their_own_operations() {
+        let named = |method: Method, query| {
+            let operation = operation(&method, "b", "", query, &headers(&[])).unwrap();
+            let checks: Vec<_> = operation.checks.into_iter().map(|c| (c.action, c.on.arn())).collect();
+            (operation.name, checks)
+        };
+        let on = |action| vec![(action, "arn:aws:s3:::b".to_owned())];
+        assert_eq!(named(Method::GET, "inventory&id=a"), ("GetBucketInventoryConfiguration", on("s3:GetInventoryConfiguration")));
+        assert_eq!(named(Method::GET, "inventory"), ("ListBucketInventoryConfigurations", on("s3:GetInventoryConfiguration")));
+        assert_eq!(named(Method::PUT, "inventory&id=a"), ("PutBucketInventoryConfiguration", on("s3:PutInventoryConfiguration")));
+        assert_eq!(
+            named(Method::DELETE, "inventory&id=a"),
+            ("DeleteBucketInventoryConfiguration", on("s3:PutInventoryConfiguration"))
+        );
+        // Not a DeleteObjects, or a CreateBucket.
+        assert!(operation(&Method::POST, "b", "", "inventory", &headers(&[])).is_none());
     }
 
     #[test]

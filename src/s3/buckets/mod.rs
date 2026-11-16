@@ -4,6 +4,7 @@ pub mod create;
 pub mod delete;
 pub mod encryption;
 pub mod head;
+pub mod inventory;
 pub mod lifecycle;
 pub mod list;
 pub mod policy;

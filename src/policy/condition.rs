@@ -413,8 +413,11 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
 
     ("aws:resourceorgid", Support::Absent),
     ("aws:resourceorgpaths", Support::Absent),
-    ("aws:sourceaccount", Support::Absent),
-    ("aws:sourcearn", Support::Absent),
+    // What Cairn does as a service, on a bucket's behalf (an inventory
+    // report's delivery: see `inventory`), has them; no request a client
+    // sends does.
+    ("aws:sourceaccount", Support::Evaluated),
+    ("aws:sourcearn", Support::Evaluated),
 
     ("aws:sourceorgid", Support::Absent),
     ("aws:sourceorgpaths", Support::Absent),
@@ -444,6 +447,8 @@ const S3_EVALUATED: &[&str] = &[
     "s3:existingobjecttag/",
     "s3:if-match",
     "s3:if-none-match",
+    // The optional fields a PutBucketInventoryConfiguration asks for.
+    "s3:inventoryaccessibleoptionalfields",
     "s3:max-keys",
     "s3:object-lock-legal-hold",
     "s3:object-lock-mode",
@@ -473,7 +478,7 @@ const S3_EVALUATED: &[&str] = &[
 ];
 
 /// The `s3:` keys of what Cairn doesn't have: access points, access grants,
-/// batch jobs, replication, inventory, log delivery, annotations.
+/// batch jobs, replication, log delivery, annotations.
 const S3_ABSENT: &[&str] = &[
     "s3:accessgrantscope",
     "s3:accessgrantsinstancearn",
@@ -487,7 +492,6 @@ const S3_ABSENT: &[&str] = &[
     "s3:destinationregion",
     "s3:existingjoboperation",
     "s3:existingjobpriority",
-    "s3:inventoryaccessibleoptionalfields",
     "s3:isreplicationpauserequest",
     "s3:jobsuspendedcause",
     "s3:logtype",

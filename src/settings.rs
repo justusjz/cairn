@@ -20,14 +20,16 @@ pub struct Setting {
     pub unset: Option<&'static str>,
 }
 
-/// How many object versions lifecycle sweeps may read an hour, across the
-/// whole cluster (see `lifecycle`).
+/// How many object versions lifecycle sweeps and inventory reports may
+/// read an hour, together, across the whole cluster (see `lifecycle`,
+/// `inventory`). Named before there were reports.
 pub const LIFECYCLE_RATE: Setting = Setting {
     name: "lifecycle-rate",
     default: 1_000_000,
     min: 0,
     max: i64::MAX,
-    help: "object versions lifecycle sweeps read per hour, across the cluster (0 pauses them)",
+    help: "object versions lifecycle sweeps and inventory reports read per hour, across the cluster \
+           (0 pauses them)",
     unset: None,
 };
 

@@ -235,6 +235,7 @@ const MIGRATIONS: &[&str] = &[
     BUCKET_ABAC,
     UPLOAD_INITIATORS,
     IAM_GROUPS,
+    INVENTORY,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2554,6 +2555,70 @@ CREATE TRIGGER iam_group_attached_policies_protocol BEFORE INSERT OR UPDATE OR D
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 CREATE TRIGGER iam_group_attached_policies_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_group_attached_policies
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+"#;
+
+/// Migration 55: S3 Inventory (see `inventory`, `plans/inventory.md`).
+///
+/// A bucket's inventory configurations, one row each, by their IDs: as
+/// JSON, whether it's enabled, the user that set it (as whom an SSE-KMS
+/// report asks the KMS for keys; NULL for none, or one since deleted), and a
+/// generation, from a sequence, so that it's never the same for two
+/// configurations of the same ID, deleted and set again: every change takes
+/// a new one, which reports check theirs against. The row is also the
+/// report's state, as `lifecycle_sweeps` is a sweep's: when it gets its next
+/// turn, when the report started (NULL between reports), the version it got
+/// to (its key, and for all versions its row ID), how many versions it has
+/// read and how many data files written, its last failure, and its last
+/// whole report, as JSON.
+///
+/// `inventory_files` are a report's data files, as they're written: the
+/// manifest lists them once the report is done, and they're dropped then.
+///
+/// `lifecycle_runs.debt` is what the steps that lifecycle sweeps and
+/// inventory reports share (see `lifecycle`) read beyond their shares,
+/// which the next steps pay off first.
+///
+/// Changed by plain writes, keyed by the configuration (T61, T62, T63): no
+/// new lock protocol.
+const INVENTORY: &str = r#"
+CREATE SEQUENCE inventory_generations;
+CREATE TABLE inventories (
+    bucket      text NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,
+    id          text COLLATE "C" NOT NULL,
+    config      text NOT NULL,
+    enabled     boolean NOT NULL,
+    setter      uuid,
+    generation  bigint NOT NULL DEFAULT nextval('inventory_generations'),
+    due         timestamptz NOT NULL,
+    started     timestamptz,
+    cursor_key  text COLLATE "C",
+    cursor_id   bigint,
+    seen        bigint NOT NULL DEFAULT 0,
+    files       int NOT NULL DEFAULT 0,
+    failure     text,
+    failed_at   timestamptz,
+    last        text,
+    PRIMARY KEY (bucket, id)
+);
+CREATE INDEX inventories_due ON inventories (due) WHERE enabled;
+CREATE TRIGGER inventories_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON inventories
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE inventory_files (
+    bucket      text NOT NULL,
+    id          text COLLATE "C" NOT NULL,
+    generation  bigint NOT NULL,
+    seq         int NOT NULL,
+    key         text NOT NULL,
+    size        bigint NOT NULL,
+    md5         text NOT NULL,
+    PRIMARY KEY (bucket, id, generation, seq),
+    FOREIGN KEY (bucket, id) REFERENCES inventories(bucket, id) ON DELETE CASCADE
+);
+CREATE TRIGGER inventory_files_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON inventory_files
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+ALTER TABLE lifecycle_runs ADD COLUMN debt bigint NOT NULL DEFAULT 0;
 "#;
 #[cfg(test)]
 mod tests {

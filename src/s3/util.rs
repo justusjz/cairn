@@ -360,6 +360,7 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "notification",
             "publicAccessBlock",
             "abac",
+            "inventory",
             // Ignored, as S3 ignores it on a bucket (probed): a listing.
             "attributes",
         ],
@@ -379,14 +380,24 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
             "website",
             "ownershipControls",
             "abac",
+            "inventory",
         ],
         (true, &Method::POST) => &["delete"],
         // DeleteBucketEncryption, DeleteBucketLifecycle, DeleteBucketCors,
-        // DeleteBucketTagging, DeleteBucketPolicy, DeleteBucketWebsite.
-        // And `abac`, which `actions::operation` routes nowhere: S3's 405.
-        (true, &Method::DELETE) => {
-            &["encryption", "lifecycle", "cors", "tagging", "policy", "publicAccessBlock", "website", "abac"]
-        }
+        // DeleteBucketTagging, DeleteBucketPolicy, DeleteBucketWebsite,
+        // DeleteBucketInventoryConfiguration. And `abac`, which
+        // `actions::operation` routes nowhere: S3's 405.
+        (true, &Method::DELETE) => &[
+            "encryption",
+            "lifecycle",
+            "cors",
+            "tagging",
+            "policy",
+            "publicAccessBlock",
+            "website",
+            "abac",
+            "inventory",
+        ],
         // GetObjectAcl (stubbed), ListParts, GetObjectTagging, a part of
         // the object, GetObjectAttributes.
         (false, &Method::GET) => &["acl", "uploadId", "tagging", "partNumber", "attributes", "retention", "legal-hold"],
@@ -675,8 +686,8 @@ mod tests {
         for (method, bucket_level, query) in [
             (Method::DELETE, false, "retention&versionId=null"),
             (Method::POST, false, "restore"),
-            (Method::GET, true, "inventory"),
-            (Method::GET, true, "prefix=a&%69nventory"),
+            (Method::GET, true, "analytics"),
+            (Method::GET, true, "prefix=a&%61nalytics"),
         ] {
             assert_eq!(
                 refused(method.clone(), bucket_level, query),

@@ -43,7 +43,7 @@ const MAX_PARSED: usize = 10_000;
 /// `text` parsed as a policy of `kind`, naming its users by `ids` (a bucket
 /// policy's `policy_principals`: ARN → ID), from `PARSED` if it's been
 /// parsed.
-fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Result<Arc<Policy>> {
+pub(crate) fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Result<Arc<Policy>> {
     let key = (
         match kind {
             Kind::Identity => None,

@@ -25,6 +25,12 @@
 //! is due a day after its last one started, or right away, if that took
 //! longer.
 //!
+//! The steps are inventory reports' too (see `inventory`), which share the
+//! rate: a step serves whichever sweep or report has waited longest, and a
+//! report's turn writes a whole data file, however little is left of the
+//! step's share; what it reads beyond that is a debt (`lifecycle_runs.debt`),
+//! which the next steps pay off before they read anything.
+//!
 //! Each step expires the due versions of its pages (`cairn_lifecycle_expire`),
 //! checking each again under the locks a delete takes: a version written
 //! meanwhile is never mistaken for one that was due. A sweep stops when the
@@ -127,6 +133,8 @@ pub struct LastSweep {
 /// A bucket's sweep, as a step gets to it.
 struct Sweep {
     bucket: String,
+    /// When its turn was due.
+    due: SystemTime,
     /// Its configuration, as stored, and its generation.
     config: String,
     generation: i64,
@@ -153,53 +161,91 @@ async fn take_step(app: &Arc<App>, now: SystemTime) -> anyhow::Result<Vec<Result
     if rate == 0 {
         return Ok(Vec::new());
     }
-    let Some(previous) = claim(&client, now).await? else { return Ok(Vec::new()) };
+    let Some((previous, debt)) = claim(&client, now).await? else { return Ok(Vec::new()) };
     let began = std::time::Instant::now();
     let share = previous.and_then(|previous| now.duration_since(previous).ok()).unwrap_or(STEP).min(MAX_SHARE);
-    let mut budget = (((rate as f64) * share.as_secs_f64() / 3600.0) as i64).max(1);
+    // What earlier steps read beyond their shares comes off this one's.
+    let full = (((rate as f64) * share.as_secs_f64() / 3600.0) as i64).max(1);
+    let mut budget = full - debt;
+    let rows = crate::inventory::rows_per_file(rate);
     let mut results = Vec::new();
     let mut visited = Vec::new();
+    let mut reports = Vec::new();
     let mut read = 0;
     // Whatever happens, the claim is let go of after, rather than holding up
     // every step until its lease runs out.
     let walked: anyhow::Result<()> = async {
         while budget > 0 {
-            let Some(sweep) = next_sweep(&client, now, &visited).await? else { break };
-            visited.push(sweep.bucket.clone());
-            let bucket = sweep.bucket.clone();
-            let result = turn(app, &client, sweep, now, &mut budget).await;
-            read += result.as_ref().map_or(0, |report| report.read);
-            results.push(result.map_err(|e| (bucket, e)));
+            // The lifecycle sweep or inventory report that has waited
+            // longest; a sweep first, of two due at once.
+            let sweep = next_sweep(&client, now, &visited).await?;
+            let report = crate::inventory::next(&client, now, &reports).await?;
+            let report = match (sweep, report) {
+                (None, None) => break,
+                (Some(sweep), Some((due, report))) if due < sweep.due => {
+                    drop(sweep);
+                    report
+                }
+                (Some(sweep), _) => {
+                    visited.push(sweep.bucket.clone());
+                    let bucket = sweep.bucket.clone();
+                    let result = turn(app, &client, sweep, now, &mut budget).await;
+                    read += result.as_ref().map_or(0, |report| report.read);
+                    results.push(result.map_err(|e| (bucket, e)));
+                    continue;
+                }
+                (None, Some((_, report))) => report,
+            };
+            reports.push(report.name());
+            let name = report.name();
+            // A whole data file, however little is left of the budget: what
+            // it reads beyond it is a debt the next steps pay off.
+            match crate::inventory::turn(app, &client, report, now, rows).await {
+                Ok(turn) => {
+                    read += turn.read;
+                    budget -= turn.read;
+                    if turn.file || turn.finished || turn.failure.is_some() || turn.interrupted {
+                        eprintln!("inventory: {turn}");
+                    }
+                    app.metrics.inventory_done(&turn);
+                }
+                Err(e) => {
+                    eprintln!("inventory: {name}: report failed: {e:#}");
+                    app.metrics.inventory_failed(format!("{name}: report failed: {e:#}"));
+                }
+            }
         }
         Ok(())
     }
     .await;
     // A step that had more to do than its share shows the rate steps reach:
     // its share, or less, if it took longer than the time it was the share of.
+    // (What a report's data file reads beyond the share is the next steps'.)
     let busy = budget <= 0;
     let secs = share.max(began.elapsed()).as_secs_f64();
-    release(&client, busy.then_some((read, secs)), now).await?;
+    release(&client, busy.then_some((read.min(full), secs)), (-budget).max(0), now).await?;
     walked?;
     Ok(results)
 }
 
-/// Lets go of the claim on the step, and if it was `busy` (the versions it
+/// Lets go of the claim on the step, leaving `debt` (what it read beyond
+/// its share) for the next ones, and if it was `busy` (the versions it
 /// read, and over how many seconds), counts it into the rate reached: an
 /// average weighted by time, which mostly forgets what was over an hour ago.
-async fn release(client: &Object, busy: Option<(i64, f64)>, now: SystemTime) -> anyhow::Result<()> {
-    let Some((read, secs)) = busy else {
-        client.execute_cached("UPDATE lifecycle_runs SET lease_until = NULL WHERE id", &[]).await?;
+async fn release(client: &Object, busy: Option<(i64, f64)>, debt: i64, now: SystemTime) -> anyhow::Result<()> {
+    let Some((read, secs)) = busy.filter(|(read, _)| *read > 0) else {
+        client.execute_cached("UPDATE lifecycle_runs SET lease_until = NULL, debt = $1 WHERE id", &[&debt]).await?;
         return Ok(());
     };
     let reached = read as f64 / secs * 3600.0;
     let weight = (secs / 3600.0).min(1.0);
     client
         .execute_cached(
-            "UPDATE lifecycle_runs SET lease_until = NULL, reached_at = $3,
+            "UPDATE lifecycle_runs SET lease_until = NULL, reached_at = $3, debt = $4,
                  reached_rate = CASE WHEN reached_rate IS NULL THEN $1::float8
                                      ELSE reached_rate * (1 - $2::float8) + $1::float8 * $2::float8 END
              WHERE id",
-            &[&reached, &weight, &now],
+            &[&reached, &weight, &now, &debt],
         )
         .await?;
     Ok(())
@@ -212,19 +258,24 @@ pub async fn database_time(app: &App) -> anyhow::Result<SystemTime> {
 
 /// Claims the cluster's next step (`cairn_lifecycle_claim`), if it's due as
 /// of `now`, and no other node holds it: when the last step began (`None`
-/// before the first). `None` if it didn't.
-async fn claim(client: &Object, now: SystemTime) -> anyhow::Result<Option<Option<SystemTime>>> {
+/// before the first), and the debt earlier steps left it. `None` if it
+/// didn't.
+async fn claim(client: &Object, now: SystemTime) -> anyhow::Result<Option<(Option<SystemTime>, i64)>> {
     let row = client
         .query_one_cached(
             "SELECT claimed, previous FROM pg_temp.cairn_lifecycle_claim($1, $2, $3)",
             &[&now, &LEASE.as_secs_f64(), &STEP.as_secs_f64()],
         )
         .await?;
-    Ok(row.get::<_, bool>(0).then(|| row.get(1)))
+    if !row.get::<_, bool>(0) {
+        return Ok(None);
+    }
+    let debt: i64 = client.query_one_cached("SELECT debt FROM lifecycle_runs WHERE id", &[]).await?.get(0);
+    Ok(Some((row.get(1), debt)))
 }
 
 /// Extends the claim on the step.
-async fn extend(client: &Object, now: SystemTime) -> anyhow::Result<()> {
+pub(crate) async fn extend(client: &Object, now: SystemTime) -> anyhow::Result<()> {
     client
         .execute_cached(
             "UPDATE lifecycle_runs SET lease_until = greatest(now(), $1) + make_interval(secs => $2) WHERE id",
@@ -240,7 +291,7 @@ async fn next_sweep(client: &Object, now: SystemTime, visited: &[String]) -> any
     let row = client
         .query_opt_cached(
             "SELECT b.name, b.lifecycle, s.started, s.cursor, s.seen, s.expired, s.removed, s.aborted,
-                    s.generation
+                    s.generation, s.due
              FROM lifecycle_sweeps s JOIN buckets b ON b.name = s.bucket
              WHERE s.due <= $1 AND NOT (s.bucket = ANY($2))
                AND b.lifecycle IS NOT NULL AND b.lifecycle_generation = s.generation
@@ -253,6 +304,7 @@ async fn next_sweep(client: &Object, now: SystemTime, visited: &[String]) -> any
         let cursor: Option<String> = row.get(3);
         Sweep {
             bucket: row.get(0),
+            due: row.get(9),
             config: row.get(1),
             generation: row.get(8),
             started: started.map(|started| (started, cursor.unwrap_or_default())),
