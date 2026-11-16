@@ -101,6 +101,17 @@ impl Actor {
         Ok(access)
     }
 
+    /// The actor's access, for checks a module of its own makes (see
+    /// `console::sns`).
+    pub async fn access_for(&self, app: &Arc<App>) -> Result<Access, ApiError> {
+        self.access(app, &[]).await
+    }
+
+    /// Its principal.
+    pub fn principal(&self) -> &crate::users::Principal {
+        &self.0.principal
+    }
+
     /// Whether each of `checks`, with its condition keys (a resource's tags,
     /// say: see `Access::verdict_with`), is allowed.
     pub async fn allows_each(&self, app: &Arc<App>, checks: &[(Check, Context)]) -> Result<Vec<bool>, ApiError> {

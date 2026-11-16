@@ -868,13 +868,21 @@ passkeys and sign-in providers, and signing out.
   upload (a file over 64 MiB in parts, so of any size S3 takes), download
   and delete objects and versions; see every version of a key, with how
   it's encrypted, its tags, and whether any of its data is lost. A bucket's
-  versioning, tags, CORS, [lifecycle rules](#lifecycle-rules), bucket policy
+  versioning, tags, CORS, [lifecycle rules](#lifecycle-rules),
+  [event notifications](#event-notifications), [inventory](#inventory)
+  configurations (with how their reports are going), bucket policy
   and public access block are edited there; the list shows which buckets
   are public. An admin creates buckets, but reads and writes objects only
   with a policy that allows it, as over S3. Downloads are always
   attachments, sandboxed, so that nothing of an object is shown in the
   console's origin; SSE-KMS objects open with the keys the user may use (an
   SSE-C object, whose key Cairn doesn't have, can't be downloaded).
+- **Topics:** SNS [topics](#event-notifications), as SNS's actions allow:
+  make and delete them, subscribe HTTP(S) endpoints (their confirmations'
+  links point to the console, at `/sns/`) and unsubscribe them, publish a
+  message to try them, and edit their policies (adding the statement that
+  lets S3 publish a bucket's events), delivery policies, signature
+  versions and tags.
 - **Users:** everything `cairn user` does, as IAM's actions allow (an admin
   may do all of it; others what their policies say, as `iam:CreateAccessKey`
   on their own user, say): create and delete users, attach and detach
@@ -1267,6 +1275,52 @@ large. A report is streamed as it's read, so it takes the same little memory
 however large the bucket is: a CSV report a page of versions, a Parquet one at
 most a row group (about 16 MiB of rows) besides. Like S3's, it's as of no single moment: what's
 written or deleted while it's made may or may not be in it.
+
+## Event notifications
+
+S3's event notifications, delivered through SNS topics, which Cairn has on
+the same endpoint: requests signed for the `sns` service are SNS's (`aws sns
+--endpoint-url …`, Terraform's `aws_sns_topic` and
+`aws_sns_topic_subscription`), as IAM's are. A bucket's notification
+configuration (`aws s3api put-bucket-notification-configuration`, or the
+console's *Notifications*) sends the events of the keys it matches (by
+prefix and suffix) to topics: objects created (put, POST, copy, multipart),
+deleted (and delete markers), tagged, and expired by lifecycle rules. A
+topic sends each to its subscriptions, HTTP(S) endpoints only, in SNS's
+envelope, signed as SNS signs it:
+
+```sh
+aws sns create-topic --name uploads
+aws sns subscribe --topic-arn arn:aws:sns:us-east-1:<account>:uploads \
+    --protocol https --notification-endpoint https://hooks.example.com/uploads
+aws sns set-topic-attributes --topic-arn arn:aws:sns:us-east-1:<account>:uploads \
+    --attribute-name Policy --attribute-value file://allow-s3.json
+aws s3api put-bucket-notification-configuration --bucket photos --notification-configuration \
+    '{"TopicConfigurations":[{"TopicArn":"arn:aws:sns:us-east-1:<account>:uploads","Events":["s3:ObjectCreated:*"]}]}'
+```
+
+As in AWS:
+
+- A subscription is first sent a confirmation, whose `SubscribeURL` the
+  endpoint visits (or whose token it gives ConfirmSubscription); only
+  confirmed subscriptions get messages.
+- The topic's policy must let S3 (`s3.amazonaws.com`) publish the bucket's
+  events (`aws:SourceArn`), or the configuration is refused; each
+  configuration's topic is sent S3's test event when it's set.
+- A failed delivery (a 5xx, a 429, no answer) is retried as the topic's or
+  subscription's delivery policy says: three times, 20 seconds apart, by
+  default. A 4xx is final.
+- Messages are signed (`SignatureVersion` 1, SHA1, or 2, SHA256) with keys
+  of Cairn's own, whose certificates its endpoint serves. AWS's SDK
+  validators take certificates from `sns.<region>.amazonaws.com` only:
+  check signatures with one whose host you can set, or yourself.
+
+Events are written in the same transaction as the change they report, so
+none is lost to a crash, and deliveries are retried from any node; writes
+never wait for them. Subscriptions reach public addresses only: to deliver
+inside the cluster's network, set `cairn config set
+notification-private-endpoints 1`. See [S3 compatibility](S3-COMPATIBILITY.md#event-notifications)
+for what's not supported (SQS, Lambda, EventBridge, filter policies).
 
 ## Tags
 

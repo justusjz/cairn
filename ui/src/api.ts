@@ -45,6 +45,12 @@ export type Level = Schemas["Level"];
 export type Role = Schemas["RoleSummary"];
 export type Group = Schemas["GroupSummary"];
 export type IdentityProvider = Schemas["IdentityProvider"];
+export type Topic = Schemas["TopicSummary"];
+export type TopicDetail = Schemas["TopicDetail"];
+export type Subscription = Schemas["SubscriptionSummary"];
+export type NotificationRule = Schemas["NotificationRule"];
+export type Inventory = Schemas["Inventory"];
+export type InventoryForm = Schemas["InventoryForm"];
 
 /** Where the API is (also in the spec's `servers`). */
 const BASE = "/api";
@@ -259,6 +265,32 @@ export const api = {
   updateIdentityProvider: (id: string, body: { client_ids: string[]; thumbprints: string[]; tags: Tag[] }) =>
     ok(client.PUT("/identity-providers/{id}", { params: { path: { id } }, body })),
   deleteIdentityProvider: (id: string) => ok(client.DELETE("/identity-providers/{id}", { params: { path: { id } } })),
+  topics: () => ok(client.GET("/topics")),
+  createTopic: (name: string, display_name = "") => ok(client.POST("/topics", { body: { name, display_name } })),
+  topic: (name: string) => ok(client.GET("/topics/{name}", { params: { path: { name } } })),
+  deleteTopic: (name: string) => ok(client.DELETE("/topics/{name}", { params: { path: { name } } })),
+  setTopicSettings: (name: string, display_name: string, signature_version: number) =>
+    ok(client.PUT("/topics/{name}/settings", { params: { path: { name } }, body: { display_name, signature_version } })),
+  setTopicPolicy: (name: string, document: string) =>
+    ok(client.PUT("/topics/{name}/policy", { params: { path: { name } }, body: { document } })),
+  /** Sets the topic's delivery policy; an empty one removes it. */
+  setTopicDeliveryPolicy: (name: string, document: string) =>
+    ok(client.PUT("/topics/{name}/delivery-policy", { params: { path: { name } }, body: { document } })),
+  setTopicTags: (name: string, tags: Tag[]) => ok(client.PUT("/topics/{name}/tags", { params: { path: { name } }, body: tags })),
+  subscribe: (name: string, protocol: string, endpoint: string) =>
+    ok(client.POST("/topics/{name}/subscriptions", { params: { path: { name } }, body: { protocol, endpoint } })),
+  unsubscribe: (name: string, arn: string) =>
+    ok(client.DELETE("/topics/{name}/subscriptions", { params: { path: { name }, query: { arn } } })),
+  publish: (name: string, message: string, subject = "") =>
+    ok(client.POST("/topics/{name}/publish", { params: { path: { name } }, body: { message, subject } })),
+  bucketNotifications: (bucket: string) => ok(client.GET("/buckets/{bucket}/notifications", { params: bucketPath(bucket) })),
+  setBucketNotifications: (bucket: string, rules: NotificationRule[]) =>
+    ok(client.PUT("/buckets/{bucket}/notifications", { params: bucketPath(bucket), body: { rules, events: [] } })),
+  inventories: (bucket: string) => ok(client.GET("/buckets/{bucket}/inventory", { params: bucketPath(bucket) })),
+  putInventory: (bucket: string, form: InventoryForm) =>
+    ok(client.PUT("/buckets/{bucket}/inventory/{id}", { params: { path: { bucket, id: form.id } }, body: form })),
+  deleteInventory: (bucket: string, id: string) =>
+    ok(client.DELETE("/buckets/{bucket}/inventory/{id}", { params: { path: { bucket, id } } })),
   lifecycle: () => ok(client.GET("/lifecycle")),
   bucketLifecycle: (bucket: string) => ok(client.GET("/buckets/{bucket}/lifecycle", { params: bucketPath(bucket) })),
   setBucketLifecycle: (bucket: string, configuration: LifecycleConfiguration) =>

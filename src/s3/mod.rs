@@ -230,7 +230,7 @@ async fn handle_request(
         // make, and its signing certificates: unsigned.
         // (Never a bucket's own host, whose GETs are its objects'.)
         None if !route.virtual_host && crate::sns::wants_unsigned(&req) => {
-            return Ok(box_response(crate::sns::handle_unsigned(&app, req).await));
+            return Ok(box_response(crate::sns::handle_unsigned(&app, req.uri(), req.headers()).await));
         }
         // STS's AssumeRoleWithWebIdentity, which is unsigned.
         None if crate::iam::wants_unsigned(&req) => {

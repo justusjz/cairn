@@ -382,6 +382,12 @@ export function BucketBrowser() {
         <A class="button" href={`/buckets/${enc(bucket())}/lifecycle`}>
           Lifecycle rules
         </A>
+        <A class="button" href={`/buckets/${enc(bucket())}/notifications`}>
+          Notifications
+        </A>
+        <A class="button" href={`/buckets/${enc(bucket())}/inventory`}>
+          Inventory
+        </A>
         <button onClick={() => setAccess(true)}>Access and policy</button>
         <button onClick={() => setEditing("tags")}>Tags{bucketTags().length ? ` (${bucketTags().length})` : ""}</button>
         <button onClick={() => setEditing("cors")}>CORS</button>

@@ -119,6 +119,45 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/buckets/{bucket}/inventory": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A bucket's inventory configurations, by their IDs, and their reports. */
+        get: operations["list_inventories"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/inventory/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets an inventory configuration, as S3's PutBucketInventoryConfiguration
+         *     does: its reports go to the destination as S3 writes them, so the
+         *     destination's policy must allow `s3.amazonaws.com` to write them.
+         */
+        put: operations["put_inventory"];
+        post?: never;
+        /** Deletes an inventory configuration; a report of it in progress stops. */
+        delete: operations["delete_inventory"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets/{bucket}/lifecycle": {
         parameters: {
             query?: never;
@@ -143,6 +182,27 @@ export interface paths {
          *     nothing expires from then on.
          */
         delete: operations["delete_bucket_lifecycle"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/buckets/{bucket}/notifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_bucket_notifications"];
+        /**
+         * Replaces a bucket's notification configurations, as S3's
+         *     PutBucketNotificationConfiguration does: each topic must let S3 publish
+         *     the bucket's events; each is sent S3's test event.
+         */
+        put: operations["put_bucket_notifications"];
+        post?: never;
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1275,6 +1335,153 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/topics": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The account's topics the session may see (`sns:ListTopics`), with what
+         *     `sns:GetTopicAttributes` shows of each (nothing, if it may not).
+         */
+        get: operations["list_topics"];
+        put?: never;
+        /** Makes a topic, as SNS's CreateTopic does. */
+        post: operations["create_topic"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/topics/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_topic"];
+        put?: never;
+        post?: never;
+        /**
+         * Deletes a topic, and its subscriptions, as SNS's DeleteTopic does.
+         *     Buckets' configurations naming it stay, and their events are dropped.
+         */
+        delete: operations["delete_topic"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/topics/{name}/delivery-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets (or, empty, removes) a topic's delivery policy. */
+        put: operations["set_topic_delivery_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/topics/{name}/policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a topic's policy, as SetTopicAttributes does. */
+        put: operations["set_topic_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/topics/{name}/publish": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Publishes a message to a topic's subscriptions (to try them). */
+        post: operations["publish"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/topics/{name}/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a topic's display name and signature version. */
+        put: operations["set_topic_settings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/topics/{name}/subscriptions": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Subscribes an endpoint to a topic: it's sent a confirmation, whose
+         *     `SubscribeURL` (under the console's origin) confirms it.
+         */
+        post: operations["subscribe"];
+        /** Unsubscribes a confirmed subscription, as SNS's Unsubscribe does. */
+        delete: operations["unsubscribe"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/topics/{name}/tags": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Sets a topic's tags to these: those it has that aren't are removed. */
+        put: operations["set_topic_tags"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/users": {
         parameters: {
             query?: never;
@@ -1574,9 +1781,19 @@ export interface components {
         BucketCors: {
             configuration?: components["schemas"]["Configuration"] | null;
         };
+        BucketInventories: {
+            /** @description The optional fields a configuration may ask for. */
+            fields: string[];
+            inventories: components["schemas"]["Inventory"][];
+        };
         /** @description A bucket's lifecycle rules, if it has any. */
         BucketLifecycle: {
             configuration?: components["schemas"]["LifecycleConfiguration"] | null;
+        };
+        BucketNotifications: {
+            /** @description The events a rule may name, in S3's order (in a response). */
+            events?: string[];
+            rules: components["schemas"]["NotificationRule"][];
         };
         BucketSummary: {
             /** @description The account that owns it. */
@@ -1800,6 +2017,10 @@ export interface components {
              */
             total: number;
         };
+        Document: {
+            /** @description JSON; for a delivery policy, empty to remove it. */
+            document: string;
+        };
         /** @description How an object version is encrypted (see `s3::sse`). */
         EncryptionInfo: {
             /**
@@ -2022,6 +2243,55 @@ export interface components {
              */
             recent: components["schemas"]["NodeFindings"][];
         };
+        /** @description A configuration, and how its reports are going. */
+        Inventory: {
+            configuration: components["schemas"]["InventoryForm"];
+            /**
+             * Format: double
+             * @description When its next report is due (seconds since the epoch).
+             */
+            due: number;
+            /** Format: double */
+            failed_at?: number | null;
+            /** @description Its last failure, and when, if it failed since its last report. */
+            failure?: string | null;
+            /** Format: int32 */
+            files: number;
+            last?: components["schemas"]["LastInventory"] | null;
+            /**
+             * Format: int64
+             * @description Versions the report in progress read, and data files it wrote.
+             */
+            seen: number;
+            /**
+             * Format: double
+             * @description When the report in progress started, if one is.
+             */
+            started?: number | null;
+        };
+        /** @description An inventory configuration, as the console edits it. */
+        InventoryForm: {
+            /** @description Every version and delete marker, or only the current objects. */
+            all_versions: boolean;
+            /** @description The account the destination must be owned by, if it's to be checked. */
+            destination_account?: string | null;
+            /** @description The bucket its reports go to (its name). */
+            destination_bucket: string;
+            /** @description What's put before the reports' keys, if anything. */
+            destination_prefix?: string;
+            enabled: boolean;
+            /** @description `SSE-S3`, or an SSE-KMS key's ARN; none for neither. */
+            encryption?: string | null;
+            /** @description Optional fields (S3's names: `Size`, `ETag`, ...). */
+            fields?: string[];
+            /** @description `CSV` or `Parquet`. */
+            format: string;
+            /** @description `Daily` or `Weekly`. */
+            frequency: string;
+            id: string;
+            /** @description Only keys with this prefix (empty: all). */
+            prefix?: string;
+        };
         KeyState: {
             active: boolean;
         };
@@ -2074,6 +2344,18 @@ export interface components {
             sse_s3_key?: string | null;
             standby?: boolean | null;
             version?: string | null;
+        };
+        LastInventory: {
+            /** Format: int32 */
+            files: number;
+            /** Format: double */
+            finished: number;
+            /** @description Its manifest's key, in the destination bucket. */
+            manifest: string;
+            /** Format: int64 */
+            read: number;
+            /** Format: double */
+            started: number;
         };
         /**
          * @description A bucket's last whole sweep, as `lifecycle_sweeps.last` keeps it. Times
@@ -2361,6 +2643,10 @@ export interface components {
             id: string;
             secret: string;
         };
+        NewMessage: {
+            message: string;
+            subject?: string;
+        };
         NewOidcProvider: {
             client_id: string;
             /**
@@ -2409,9 +2695,18 @@ export interface components {
             /** Format: int64 */
             value?: number | null;
         };
+        NewSubscription: {
+            endpoint: string;
+            /** @description `http` or `https`. */
+            protocol: string;
+        };
         NewTags: {
             /** @description The whole tag set (none: no tags). */
             tags: components["schemas"]["Tag"][];
+        };
+        NewTopic: {
+            display_name?: string;
+            name: string;
         };
         NewUpload: {
             content_type?: string | null;
@@ -2502,6 +2797,18 @@ export interface components {
              */
             scrub_rate: number;
             version: string;
+        };
+        /**
+         * @description One of a bucket's notification configurations: events (S3's names,
+         *     `s3:ObjectCreated:*`, ...) of keys with a prefix and suffix, to a topic.
+         */
+        NotificationRule: {
+            events: string[];
+            /** @description Empty, for one to be made. */
+            id?: string;
+            prefix?: string;
+            suffix?: string;
+            topic_arn: string;
         };
         /** @description Every version of a key (the newest 200). */
         ObjectInfo: {
@@ -2698,6 +3005,9 @@ export interface components {
             label: string;
             name: string;
         };
+        Published: {
+            message_id: string;
+        };
         Redirect: {
             /** @description The host redirected to; the request's own, if none. */
             host_name?: string | null;
@@ -2887,6 +3197,16 @@ export interface components {
             replicas: components["schemas"]["ReplicaGroup"][];
             replication_factor: number;
         };
+        /** @description A topic's subscription. */
+        SubscriptionSummary: {
+            /**
+             * @description Its ARN, once it's confirmed; else `PendingConfirmation`, or
+             *     `Deleted` (which an old token can still restore).
+             */
+            arn: string;
+            endpoint: string;
+            protocol: string;
+        };
         /** @description A sweep in progress. */
         SweepProgress: {
             /** Format: int64 */
@@ -2921,6 +3241,43 @@ export interface components {
              * @description Its version, which changes when what it makes does.
              */
             version: number;
+        };
+        /** @description A topic, and its subscriptions. */
+        TopicDetail: {
+            arn: string;
+            /** @description Its delivery policy, if it has one of its own (JSON). */
+            delivery_policy?: string | null;
+            display_name: string;
+            /** @description What applies: its own, or SNS's defaults (JSON). */
+            effective_delivery_policy: string;
+            name: string;
+            /** @description Its policy (JSON). */
+            policy: string;
+            /**
+             * Format: int32
+             * @description 1 (SHA1) or 2 (SHA256).
+             */
+            signature_version: number;
+            subscriptions: components["schemas"]["SubscriptionSummary"][];
+            tags: components["schemas"]["Tag"][];
+        };
+        TopicSettings: {
+            display_name: string;
+            /**
+             * Format: int32
+             * @description 1 (SHA1, SNS's default) or 2 (SHA256).
+             */
+            signature_version: number;
+        };
+        /** @description A topic, as lists show it. */
+        TopicSummary: {
+            arn: string;
+            display_name: string;
+            name: string;
+            /** Format: int32 */
+            subscriptions_confirmed: number;
+            /** Format: int32 */
+            subscriptions_pending: number;
         };
         UploadStarted: {
             upload_id: string;
@@ -3475,6 +3832,121 @@ export interface operations {
             };
         };
     };
+    list_inventories: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketInventories"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_inventory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["InventoryForm"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_inventory: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     get_bucket_lifecycle: {
         parameters: {
             query?: never;
@@ -3564,6 +4036,83 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_bucket_notifications: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BucketNotifications"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_bucket_notifications: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                bucket: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BucketNotifications"];
+            };
+        };
+        responses: {
+            /** @description Set */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -6767,6 +7316,432 @@ export interface operations {
                 };
             };
             "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_topics: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TopicSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_topic: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewTopic"];
+            };
+        };
+        responses: {
+            /** @description Made */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_topic: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TopicDetail"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_topic: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_topic_delivery_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Document"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_topic_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Document"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    publish: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewMessage"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Published"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_topic_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TopicSettings"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    subscribe: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewSubscription"];
+            };
+        };
+        responses: {
+            /** @description Pending its confirmation */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    unsubscribe: {
+        parameters: {
+            query: {
+                /** @description The subscription's ARN. */
+                arn: string;
+            };
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Unsubscribed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    set_topic_tags: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["Tag"][];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
                 headers: {
                     [name: string]: unknown;
                 };

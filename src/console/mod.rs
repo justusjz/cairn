@@ -44,8 +44,10 @@ mod api;
 pub mod cbor;
 mod groups;
 mod iam;
+mod inventory;
 mod limit;
 mod manage;
+mod sns;
 mod templates;
 pub mod oidc;
 pub mod store;
@@ -154,9 +156,34 @@ pub fn router(console: Arc<Console>) -> Router {
     Router::new()
         .nest("/api", api)
         .route("/api/openapi.json", get(|| async { Json(openapi()) }))
+        // SNS's unsigned URLs of subscriptions made here (see `sns`).
+        .route(sns::UNSIGNED_PREFIX, get(sns_unsigned))
+        .route(&format!("{}/", sns::UNSIGNED_PREFIX), get(sns_unsigned))
+        .route(&format!("{}/{{file}}", sns::UNSIGNED_PREFIX), get(sns_unsigned))
         .fallback(static_file)
         .layer(middleware::map_response(web::security_headers))
         .with_state(console)
+}
+
+/// SNS's confirmation, unsubscription and certificate URLs, under the
+/// console's origin (see `sns::UNSIGNED_PREFIX`), as the S3 endpoint
+/// answers them.
+async fn sns_unsigned(State(console): State<Arc<Console>>, req: Request) -> Response {
+    let (parts, _) = req.into_parts();
+    let path = parts.uri.path().strip_prefix(sns::UNSIGNED_PREFIX).filter(|p| !p.is_empty()).unwrap_or("/");
+    let path_and_query = match parts.uri.query() {
+        Some(query) => format!("{path}?{query}"),
+        None => path.to_owned(),
+    };
+    let Ok(uri) = path_and_query.parse::<hyper::Uri>() else {
+        return ApiError::NotFound("no such SNS URL".into()).into_response();
+    };
+    let wanted = hyper::Request::get(uri.clone()).body(()).expect("a GET");
+    if !crate::sns::wants_unsigned(&wanted) {
+        return ApiError::NotFound("no such SNS URL".into()).into_response();
+    }
+    let response = crate::sns::handle_unsigned(&console.app, &uri, &parts.headers).await;
+    response.map(axum::body::Body::new)
 }
 
 /// Refuses a start of signing in or enrolling (which writes a row before

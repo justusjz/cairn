@@ -458,6 +458,153 @@
         }
       }
     },
+    "/buckets/{bucket}/inventory": {
+      "get": {
+        "summary": "A bucket's inventory configurations, by their IDs, and their reports.",
+        "operationId": "list_inventories",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketInventories"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/inventory/{id}": {
+      "put": {
+        "summary": "Sets an inventory configuration, as S3's PutBucketInventoryConfiguration\ndoes: its reports go to the destination as S3 writes them, so the\ndestination's policy must allow `s3.amazonaws.com` to write them.",
+        "operationId": "put_inventory",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/InventoryForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes an inventory configuration; a report of it in progress stops.",
+        "operationId": "delete_inventory",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/buckets/{bucket}/lifecycle": {
       "get": {
         "summary": "A bucket's lifecycle rules, as S3's GetBucketLifecycleConfiguration\ngives them, but in the form they're stored in.",
@@ -565,6 +712,97 @@
         "responses": {
           "204": {
             "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/buckets/{bucket}/notifications": {
+      "get": {
+        "operationId": "get_bucket_notifications",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BucketNotifications"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Replaces a bucket's notification configurations, as S3's\nPutBucketNotificationConfiguration does: each topic must let S3 publish\nthe bucket's events; each is sent S3's test event.",
+        "operationId": "put_bucket_notifications",
+        "parameters": [
+          {
+            "name": "bucket",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BucketNotifications"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
           },
           "4XX": {
             "content": {
@@ -4352,6 +4590,511 @@
         }
       }
     },
+    "/topics": {
+      "get": {
+        "summary": "The account's topics the session may see (`sns:ListTopics`), with what\n`sns:GetTopicAttributes` shows of each (nothing, if it may not).",
+        "operationId": "list_topics",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TopicSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a topic, as SNS's CreateTopic does.",
+        "operationId": "create_topic",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTopic"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/topics/{name}": {
+      "get": {
+        "operationId": "get_topic",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TopicDetail"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a topic, and its subscriptions, as SNS's DeleteTopic does.\nBuckets' configurations naming it stay, and their events are dropped.",
+        "operationId": "delete_topic",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/topics/{name}/delivery-policy": {
+      "put": {
+        "summary": "Sets (or, empty, removes) a topic's delivery policy.",
+        "operationId": "set_topic_delivery_policy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Document"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/topics/{name}/policy": {
+      "put": {
+        "summary": "Sets a topic's policy, as SetTopicAttributes does.",
+        "operationId": "set_topic_policy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Document"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/topics/{name}/publish": {
+      "post": {
+        "summary": "Publishes a message to a topic's subscriptions (to try them).",
+        "operationId": "publish",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewMessage"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Published"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/topics/{name}/settings": {
+      "put": {
+        "summary": "Sets a topic's display name and signature version.",
+        "operationId": "set_topic_settings",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TopicSettings"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/topics/{name}/subscriptions": {
+      "post": {
+        "summary": "Subscribes an endpoint to a topic: it's sent a confirmation, whose\n`SubscribeURL` (under the console's origin) confirms it.",
+        "operationId": "subscribe",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewSubscription"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Pending its confirmation"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Unsubscribes a confirmed subscription, as SNS's Unsubscribe does.",
+        "operationId": "unsubscribe",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "arn",
+            "in": "query",
+            "description": "The subscription's ARN.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Unsubscribed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/topics/{name}/tags": {
+      "put": {
+        "summary": "Sets a topic's tags to these: those it has that aren't are removed.",
+        "operationId": "set_topic_tags",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Tag"
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/users": {
       "get": {
         "operationId": "list_users",
@@ -5389,6 +6132,28 @@
           }
         }
       },
+      "BucketInventories": {
+        "type": "object",
+        "required": [
+          "inventories",
+          "fields"
+        ],
+        "properties": {
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The optional fields a configuration may ask for."
+          },
+          "inventories": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Inventory"
+            }
+          }
+        }
+      },
       "BucketLifecycle": {
         "type": "object",
         "description": "A bucket's lifecycle rules, if it has any.",
@@ -5402,6 +6167,27 @@
                 "type": "null"
               }
             ]
+          }
+        }
+      },
+      "BucketNotifications": {
+        "type": "object",
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The events a rule may name, in S3's order (in a response)."
+          },
+          "rules": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NotificationRule"
+            }
           }
         }
       },
@@ -5958,6 +6744,18 @@
             "format": "int64",
             "description": "Bytes in all.",
             "minimum": 0
+          }
+        }
+      },
+      "Document": {
+        "type": "object",
+        "required": [
+          "document"
+        ],
+        "properties": {
+          "document": {
+            "type": "string",
+            "description": "JSON; for a delivery policy, empty to remove it."
           }
         }
       },
@@ -6529,6 +7327,133 @@
           }
         }
       },
+      "Inventory": {
+        "type": "object",
+        "description": "A configuration, and how its reports are going.",
+        "required": [
+          "configuration",
+          "due",
+          "seen",
+          "files"
+        ],
+        "properties": {
+          "configuration": {
+            "$ref": "#/components/schemas/InventoryForm"
+          },
+          "due": {
+            "type": "number",
+            "format": "double",
+            "description": "When its next report is due (seconds since the epoch)."
+          },
+          "failed_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "failure": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its last failure, and when, if it failed since its last report."
+          },
+          "files": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "last": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LastInventory",
+                "description": "Its last whole report, if it made one."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "seen": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Versions the report in progress read, and data files it wrote."
+          },
+          "started": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When the report in progress started, if one is."
+          }
+        }
+      },
+      "InventoryForm": {
+        "type": "object",
+        "description": "An inventory configuration, as the console edits it.",
+        "required": [
+          "id",
+          "enabled",
+          "destination_bucket",
+          "format",
+          "all_versions",
+          "frequency"
+        ],
+        "properties": {
+          "all_versions": {
+            "type": "boolean",
+            "description": "Every version and delete marker, or only the current objects."
+          },
+          "destination_account": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account the destination must be owned by, if it's to be checked."
+          },
+          "destination_bucket": {
+            "type": "string",
+            "description": "The bucket its reports go to (its name)."
+          },
+          "destination_prefix": {
+            "type": "string",
+            "description": "What's put before the reports' keys, if anything."
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "encryption": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`SSE-S3`, or an SSE-KMS key's ARN; none for neither."
+          },
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Optional fields (S3's names: `Size`, `ETag`, ...)."
+          },
+          "format": {
+            "type": "string",
+            "description": "`CSV` or `Parquet`."
+          },
+          "frequency": {
+            "type": "string",
+            "description": "`Daily` or `Weekly`."
+          },
+          "id": {
+            "type": "string"
+          },
+          "prefix": {
+            "type": "string",
+            "description": "Only keys with this prefix (empty: all)."
+          }
+        }
+      },
       "KeyState": {
         "type": "object",
         "required": [
@@ -6659,6 +7584,38 @@
               "string",
               "null"
             ]
+          }
+        }
+      },
+      "LastInventory": {
+        "type": "object",
+        "required": [
+          "started",
+          "finished",
+          "read",
+          "files",
+          "manifest"
+        ],
+        "properties": {
+          "files": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "finished": {
+            "type": "number",
+            "format": "double"
+          },
+          "manifest": {
+            "type": "string",
+            "description": "Its manifest's key, in the destination bucket."
+          },
+          "read": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "started": {
+            "type": "number",
+            "format": "double"
           }
         }
       },
@@ -7367,6 +8324,20 @@
           }
         }
       },
+      "NewMessage": {
+        "type": "object",
+        "required": [
+          "message"
+        ],
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          }
+        }
+      },
       "NewOidcProvider": {
         "type": "object",
         "required": [
@@ -7480,6 +8451,22 @@
           }
         }
       },
+      "NewSubscription": {
+        "type": "object",
+        "required": [
+          "protocol",
+          "endpoint"
+        ],
+        "properties": {
+          "endpoint": {
+            "type": "string"
+          },
+          "protocol": {
+            "type": "string",
+            "description": "`http` or `https`."
+          }
+        }
+      },
       "NewTags": {
         "type": "object",
         "required": [
@@ -7492,6 +8479,20 @@
               "$ref": "#/components/schemas/Tag"
             },
             "description": "The whole tag set (none: no tags)."
+          }
+        }
+      },
+      "NewTopic": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
           }
         }
       },
@@ -7714,6 +8715,35 @@
           }
         ],
         "description": "What a node reports about itself, for the console of any node (see\n`peer`'s `/stats`)."
+      },
+      "NotificationRule": {
+        "type": "object",
+        "description": "One of a bucket's notification configurations: events (S3's names,\n`s3:ObjectCreated:*`, ...) of keys with a prefix and suffix, to a topic.",
+        "required": [
+          "topic_arn",
+          "events"
+        ],
+        "properties": {
+          "events": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "id": {
+            "type": "string",
+            "description": "Empty, for one to be made."
+          },
+          "prefix": {
+            "type": "string"
+          },
+          "suffix": {
+            "type": "string"
+          },
+          "topic_arn": {
+            "type": "string"
+          }
+        }
       },
       "ObjectInfo": {
         "type": "object",
@@ -8245,6 +9275,17 @@
           }
         }
       },
+      "Published": {
+        "type": "object",
+        "required": [
+          "message_id"
+        ],
+        "properties": {
+          "message_id": {
+            "type": "string"
+          }
+        }
+      },
       "Redirect": {
         "type": "object",
         "properties": {
@@ -8733,6 +9774,27 @@
           }
         }
       },
+      "SubscriptionSummary": {
+        "type": "object",
+        "description": "A topic's subscription.",
+        "required": [
+          "arn",
+          "protocol",
+          "endpoint"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string",
+            "description": "Its ARN, once it's confirmed; else `PendingConfirmation`, or\n`Deleted` (which an old token can still restore)."
+          },
+          "endpoint": {
+            "type": "string"
+          },
+          "protocol": {
+            "type": "string"
+          }
+        }
+      },
       "SweepProgress": {
         "type": "object",
         "description": "A sweep in progress.",
@@ -8811,6 +9873,114 @@
             "type": "integer",
             "format": "int32",
             "description": "Its version, which changes when what it makes does.",
+            "minimum": 0
+          }
+        }
+      },
+      "TopicDetail": {
+        "type": "object",
+        "description": "A topic, and its subscriptions.",
+        "required": [
+          "name",
+          "arn",
+          "display_name",
+          "policy",
+          "effective_delivery_policy",
+          "signature_version",
+          "tags",
+          "subscriptions"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "delivery_policy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its delivery policy, if it has one of its own (JSON)."
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "effective_delivery_policy": {
+            "type": "string",
+            "description": "What applies: its own, or SNS's defaults (JSON)."
+          },
+          "name": {
+            "type": "string"
+          },
+          "policy": {
+            "type": "string",
+            "description": "Its policy (JSON)."
+          },
+          "signature_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "1 (SHA1) or 2 (SHA256).",
+            "minimum": 0
+          },
+          "subscriptions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubscriptionSummary"
+            }
+          },
+          "tags": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Tag"
+            }
+          }
+        }
+      },
+      "TopicSettings": {
+        "type": "object",
+        "required": [
+          "display_name",
+          "signature_version"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "signature_version": {
+            "type": "integer",
+            "format": "int32",
+            "description": "1 (SHA1, SNS's default) or 2 (SHA256).",
+            "minimum": 0
+          }
+        }
+      },
+      "TopicSummary": {
+        "type": "object",
+        "description": "A topic, as lists show it.",
+        "required": [
+          "name",
+          "arn",
+          "display_name",
+          "subscriptions_confirmed",
+          "subscriptions_pending"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "subscriptions_confirmed": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "subscriptions_pending": {
+            "type": "integer",
+            "format": "int32",
             "minimum": 0
           }
         }

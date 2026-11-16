@@ -119,6 +119,8 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .merge(super::iam::router())
         .merge(super::groups::router())
         .merge(super::templates::router())
+        .merge(super::sns::router())
+        .merge(super::inventory::router())
 }
 
 // ─── Cluster ─────────────────────────────────────────────────────────────────
@@ -1649,7 +1651,7 @@ async fn download(
 
 /// An S3 handler's error response as the API's: its status, and its
 /// message (or code).
-async fn s3_error(resp: hyper::Response<http_body_util::Full<hyper::body::Bytes>>) -> ApiError {
+pub(super) async fn s3_error(resp: hyper::Response<http_body_util::Full<hyper::body::Bytes>>) -> ApiError {
     let status = resp.status();
     let body = resp.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
     let text = String::from_utf8_lossy(&body);

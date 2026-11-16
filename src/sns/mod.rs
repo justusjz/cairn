@@ -165,9 +165,9 @@ pub fn wants(signed: &Signed) -> bool {
 
 /// A failed request: its status, code and message.
 pub struct Error {
-    status: StatusCode,
-    code: &'static str,
-    message: String,
+    pub(crate) status: StatusCode,
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 fn error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Error {
@@ -205,7 +205,7 @@ impl From<deadpool_postgres::PoolError> for Error {
 type Result<T> = std::result::Result<T, Error>;
 
 /// A request's parameters, form-decoded.
-pub(crate) struct Params(HashMap<String, String>);
+pub(crate) struct Params(pub(crate) HashMap<String, String>);
 
 impl Params {
     fn parse(text: &str, into: &mut HashMap<String, String>) -> Result<()> {
@@ -506,9 +506,9 @@ pub fn wants_unsigned<B>(req: &Request<B>) -> bool {
 }
 
 /// An unsigned SNS request (see `wants_unsigned`).
-pub async fn handle_unsigned(app: &Arc<App>, req: Request<crate::listen::ClientBody>) -> Response<Full<Bytes>> {
+pub async fn handle_unsigned(app: &Arc<App>, uri: &hyper::Uri, headers: &hyper::HeaderMap) -> Response<Full<Bytes>> {
     let request_id = Uuid::new_v4().to_string();
-    if let Some(id) = crate::notifications::signing::certificate_id(req.uri().path()) {
+    if let Some(id) = crate::notifications::signing::certificate_id(uri.path()) {
         let found = async { crate::notifications::signing::certificate(&app.pool.get().await?, id).await }.await;
         return match found {
             Ok(Some(pem)) => Response::builder()
@@ -523,10 +523,10 @@ pub async fn handle_unsigned(app: &Arc<App>, req: Request<crate::listen::ClientB
         };
     }
     let mut params = HashMap::new();
-    let result = match Params::parse(req.uri().query().unwrap_or(""), &mut params) {
+    let result = match Params::parse(uri.query().unwrap_or(""), &mut params) {
         Ok(()) => {
             let params = Params(params);
-            let base = base_url(req.headers());
+            let base = base_url(headers);
             match params.get("Action") {
                 Some("ConfirmSubscription") => subscriptions::confirm_unsigned(app, &params).await.map(|r| ("ConfirmSubscription".to_owned(), r)),
                 _ => subscriptions::unsubscribe_unsigned(app, &params, &base).await.map(|r| ("Unsubscribe".to_owned(), r)),

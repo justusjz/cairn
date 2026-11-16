@@ -13,12 +13,15 @@ import { api as manage, setOperatorMode } from "./api";
 import { BucketBrowser, BucketList, ObjectPage } from "./pages/Buckets";
 import Integrity from "./pages/Integrity";
 import Jobs from "./pages/Jobs";
+import Inventory from "./pages/Inventory";
 import Lifecycle from "./pages/Lifecycle";
+import Notifications from "./pages/Notifications";
 import Overview from "./pages/Overview";
 import Policies, { PolicyPage } from "./pages/Policies";
 import Groups, { GroupPage } from "./pages/Groups";
 import Roles, { RolePage } from "./pages/Roles";
 import Storage from "./pages/Storage";
+import Topics, { TopicPage } from "./pages/Topics";
 import SignIn from "./pages/SignIn";
 import Users, { UserPage } from "./pages/Users";
 import { userHref } from "./components/Iam";
@@ -109,6 +112,7 @@ function Layout(props: RouteSectionProps) {
  * shows what the identity's policies let it see). */
 const ACCOUNT_NAV: [string, string][] = [
   ["/buckets", "Buckets"],
+  ["/topics", "Topics"],
   ["/users", "Users"],
   ["/groups", "Groups"],
   ["/roles", "Roles"],
@@ -584,6 +588,10 @@ render(
       <Route path="/buckets/:bucket" component={Guarded(BucketBrowser)} />
       <Route path="/buckets/:bucket/object" component={Guarded(ObjectPage)} />
       <Route path="/buckets/:bucket/lifecycle" component={Guarded(Lifecycle)} />
+      <Route path="/buckets/:bucket/notifications" component={Guarded(Notifications)} />
+      <Route path="/buckets/:bucket/inventory" component={Guarded(Inventory)} />
+      <Route path="/topics" component={Guarded(Topics)} />
+      <Route path="/topics/:name" component={Guarded(TopicPage)} />
       <Route path="/login" component={Login} />
       <Route path="/enroll" component={Enroll} />
       <Route path="*" component={NotFound} />
