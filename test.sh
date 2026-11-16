@@ -66,7 +66,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=113
+TOTAL=114
 STEP=0
 PASS=0
 FAIL=0
@@ -2576,6 +2576,57 @@ iam_roles_ok() {
     echo "$out" | grep -q NoSuchEntity
 }
 
+# IAM groups over the IAM API, as the AWS CLI calls it: a user in a group
+# may do what the group's policies allow (inline and managed), and no more
+# once it's out of it; a group with members or policies isn't deleted, nor
+# a user in one; reader may change no group.
+iam_groups_ok() {
+    local g="group-$(date +%s)" u="member-$(date +%s)" b="groupb-$(date +%s)" acct key id secret out \
+        doc="$WORK_DIR/group-policy.json"
+    acct=$(awss3 sts get-caller-identity --query Account --output text 2>/dev/null) || return 1
+    awss3 iam create-group --group-name "$g" --path /team/ >/dev/null 2>&1 || return 1
+    [ "$(awss3 iam get-group --group-name "$g" --query Group.Arn --output text 2>/dev/null)" \
+        = "arn:aws:iam::$acct:group/team/$g" ] || return 1
+    out=$(awss3 iam create-group --group-name "$g" 2>&1) && return 1
+    echo "$out" | grep -q EntityAlreadyExists || return 1
+    awss3 iam create-user --user-name "$u" >/dev/null 2>&1 || return 1
+    key=$(awss3 iam create-access-key --user-name "$u" \
+        --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>/dev/null) || return 1
+    id=$(echo "$key" | cut -f1); secret=$(echo "$key" | cut -f2)
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 && return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::'"$b"'"}]}' > "$doc"
+    awss3 iam put-group-policy --group-name "$g" --policy-name list --policy-document "file://$doc" >/dev/null 2>&1 || return 1
+    awss3 iam add-user-to-group --group-name "$g" --user-name "$u" >/dev/null 2>&1 || return 1
+    awss3 iam list-groups-for-user --user-name "$u" --query 'Groups[].GroupName' --output text 2>/dev/null | grep -qw "$g" || return 1
+    awss3 iam get-group --group-name "$g" --query 'Users[].UserName' --output text 2>/dev/null | grep -qw "$u" || return 1
+    as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
+    out=$(echo x | as_role "$id" "$secret" s3 cp - "s3://$b/k" 2>&1) && return 1
+    awss3 iam attach-group-policy --group-name "$g" --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess >/dev/null 2>&1 || return 1
+    echo x | as_role "$id" "$secret" s3 cp - "s3://$b/k" >/dev/null 2>&1 || return 1
+    awss3 iam list-entities-for-policy --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess \
+        --query 'PolicyGroups[].GroupName' --output text 2>/dev/null | grep -qw "$g" || return 1
+    out=$(as_role reader readersecret iam add-user-to-group --group-name "$g" --user-name reader 2>&1) && return 1
+    echo "$out" | grep -q "not authorized to perform: iam:AddUserToGroup on resource: group $g" || return 1
+    out=$(awss3 iam delete-group --group-name "$g" 2>&1) && return 1
+    echo "$out" | grep -q 'must remove users from group first' || return 1
+    awss3 iam delete-access-key --user-name "$u" --access-key-id "$id" >/dev/null 2>&1 || return 1
+    out=$(awss3 iam delete-user --user-name "$u" 2>&1) && return 1
+    echo "$out" | grep -q 'must remove user from all groups first' || return 1
+    awss3 iam remove-user-from-group --group-name "$g" --user-name "$u" >/dev/null 2>&1 || return 1
+    awss3 iam delete-user --user-name "$u" >/dev/null 2>&1 || return 1
+    out=$(awss3 iam delete-group --group-name "$g" 2>&1) && return 1
+    echo "$out" | grep -q 'must delete policies first' || return 1
+    awss3 iam delete-group-policy --group-name "$g" --policy-name list >/dev/null 2>&1 || return 1
+    awss3 iam detach-group-policy --group-name "$g" --policy-arn arn:aws:iam::aws:policy/AmazonS3FullAccess >/dev/null 2>&1 || return 1
+    awss3 iam update-group --group-name "$g" --new-group-name "$g-old" >/dev/null 2>&1 || return 1
+    awss3 iam delete-group --group-name "$g-old" >/dev/null 2>&1 || return 1
+    out=$(awss3 iam get-group --group-name "$g-old" 2>&1) && return 1
+    echo "$out" | grep -q NoSuchEntity || return 1
+    awss3 s3 rm "s3://$b/k" >/dev/null 2>&1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
 # STS, as the AWS CLI calls it: a user assumes a role whose trust policy
 # names it, and its session lists a bucket as the role's policy allows, and
 # no more (a session policy narrows it); a tampered token is refused; the
@@ -2983,6 +3034,7 @@ run_test    "IAM API: managed policies"              iam_managed_ok
 run_test    "IAM API: boundaries, paths, tags"       iam_boundaries_ok
 run_test    "IAM API: policy versions and tags"      iam_versions_ok
 run_test    "IAM API: roles"                         iam_roles_ok
+run_test    "IAM API: groups"                        iam_groups_ok
 run_test    "STS: assumed roles, session tokens"     sts_ok
 run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Resume an upload with write alone"     resume_upload_ok

@@ -126,7 +126,8 @@ export default function Users() {
           A person gets a one-time console link to set up a passkey (or sign in with a provider), and no access key. A
           service gets an access key, whose secret is shown once; a user may have {MAX_KEYS}, to rotate them. What a user
           may do is what its policies allow: managed ones attached to it (see Policies; an admin has AdministratorAccess,
-          everything in the account), and inline ones of its own. A Deny wins over any Allow. A permissions boundary caps
+          everything in the account), inline ones of its own, and those of its groups (see Groups). A Deny wins over any
+          Allow. A permissions boundary caps
           that: a user with one may do only what both its policies and the boundary allow, so a non-admin can be let make
           users only with a boundary (its condition key iam:PermissionsBoundary), under a path of theirs.
         </p>
@@ -447,7 +448,14 @@ function UserRow(props: {
             </button>
           )}
         </For>
-        <Show when={!r().attached.length && !r().policies.length}>
+        <For each={r().groups}>
+          {(g) => (
+            <span class="chip mono" title={`In group ${g} (see Groups): its policies are this user's too`}>
+              group {g}
+            </span>
+          )}
+        </For>
+        <Show when={!r().attached.length && !r().policies.length && !r().groups.length}>
           <div class="subtle">none: may do nothing</div>
         </Show>
         <div class="key-actions">

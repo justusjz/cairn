@@ -1,6 +1,6 @@
 // An account's managed policies (see `src/managed.rs`): Cairn's, which have
 // AWS's names and say what AWS's do, and the account's own, which are
-// attached to users and roles on the Users and Roles pages. Making,
+// attached to users, roles and groups on the Users, Roles and Groups pages. Making,
 // changing (a new version) and deleting (once nothing has it attached) the
 // account's own.
 
@@ -12,7 +12,8 @@ import { ago, pretty } from "../format";
 import { TemplateDialog } from "./Templates";
 
 /** Whether anyone has the policy: attached, or as a boundary. */
-const used = (p: ManagedPolicy) => p.users.length + p.bounds.length + p.roles.length + p.role_bounds.length > 0;
+const used = (p: ManagedPolicy) =>
+  p.users.length + p.bounds.length + p.roles.length + p.role_bounds.length + p.groups.length > 0;
 
 export default function Policies() {
   const data = poll(() => Promise.all([api.policies(), api.buckets()]), 10000);
@@ -35,8 +36,9 @@ export default function Policies() {
         </div>
       </div>
       <p class="subtle small">
-        Managed policies are documents of their own, attached to any number of users and roles (on the Users and Roles
-        pages): what a user, or a role's session, may do is what its attached and inline policies allow, and its
+        Managed policies are documents of their own, attached to any number of users, groups and roles (on the Users,
+        Groups and Roles pages): what a user, or a role's session, may do is what its attached and inline policies (and a
+        user's groups') allow, and its
         buckets' policies, where they name it; a Deny wins over any Allow. Cairn's own have AWS's names and say what AWS's do, so policies and tools written for AWS
         work as they are. Templates make policies for common setups: above all a team sharing the account, whose admins
         manage its users, roles, policies and buckets and can't get past them.
@@ -83,6 +85,13 @@ export default function Policies() {
                           </span>
                         )}
                       </For>
+                      <For each={p.groups}>
+                        {(g) => (
+                          <span class="chip mono" title="A group: its members have it">
+                            group {g}
+                          </span>
+                        )}
+                      </For>
                       <Show when={p.bounds.length || p.role_bounds.length}>
                         <div class="small" title="Users and roles whose permissions boundary it is: it caps what their policies allow">
                           boundary of <For each={p.bounds}>{(u) => <span class="chip mono">{u}</span>}</For>
@@ -103,8 +112,8 @@ export default function Policies() {
                           class="small danger"
                           disabled={used(p)}
                           title={
-                            p.users.length || p.roles.length
-                              ? "Detach it from its users and roles first"
+                            p.users.length || p.roles.length || p.groups.length
+                              ? "Detach it from its users, roles and groups first"
                               : used(p)
                                 ? "It's a permissions boundary: take it off its users and roles first"
                                 : ""

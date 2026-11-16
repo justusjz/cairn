@@ -43,6 +43,7 @@ export type TemplateUse = Schemas["Use"];
 export type MadePolicy = Schemas["MadePolicy"];
 export type Level = Schemas["Level"];
 export type Role = Schemas["RoleSummary"];
+export type Group = Schemas["GroupSummary"];
 export type IdentityProvider = Schemas["IdentityProvider"];
 
 /** Where the API is (also in the spec's `servers`). */
@@ -94,6 +95,8 @@ const bucketPath = (bucket: string) => ({ path: { bucket } });
 const userPath = (user: string) => ({ path: { user } });
 /** A role's path. */
 const rolePath = (role: string) => ({ path: { role } });
+/** A group's path. */
+const groupPath = (group: string) => ({ path: { group } });
 
 export const api = {
   cluster: () => ok(client.GET("/cluster")),
@@ -231,6 +234,26 @@ export const api = {
     ok(client.DELETE("/roles/{role}/policies/{policy}", { params: { path: { role, policy } } })),
   /** Revokes the role's sessions issued until now (AWSRevokeOlderSessions). */
   revokeSessions: (role: string) => ok(client.POST("/roles/{role}/revoke-sessions", { params: rolePath(role) })),
+  groups: () => ok(client.GET("/groups")),
+  createGroup: (name: string, path?: string) => ok(client.POST("/groups", { body: { name, path: path || null } })),
+  /** Renames or moves a group (IAM's UpdateGroup). */
+  updateGroup: (group: string, change: { name?: string; path?: string }) =>
+    ok(client.PATCH("/groups/{group}", { params: groupPath(group), body: { name: change.name ?? null, path: change.path ?? null } })),
+  deleteGroup: (group: string) => ok(client.DELETE("/groups/{group}", { params: groupPath(group) })),
+  addToGroup: (group: string, user: string) =>
+    ok(client.PUT("/groups/{group}/members/{user}", { params: { path: { group, user } } })),
+  removeFromGroup: (group: string, user: string) =>
+    ok(client.DELETE("/groups/{group}/members/{user}", { params: { path: { group, user } } })),
+  attachToGroup: (group: string, arn: string) =>
+    ok(client.POST("/groups/{group}/attached", { params: groupPath(group), body: { arn } })),
+  detachFromGroup: (group: string, arn: string) =>
+    ok(client.DELETE("/groups/{group}/attached", { params: { path: { group }, query: { arn } } })),
+  groupPolicy: (group: string, policy: string) =>
+    ok(client.GET("/groups/{group}/policies/{policy}", { params: { path: { group, policy } } })),
+  putGroupPolicy: (group: string, policy: string, document: string) =>
+    ok(client.PUT("/groups/{group}/policies/{policy}", { params: { path: { group, policy } }, body: { document } })),
+  deleteGroupPolicy: (group: string, policy: string) =>
+    ok(client.DELETE("/groups/{group}/policies/{policy}", { params: { path: { group, policy } } })),
   identityProviders: () => ok(client.GET("/identity-providers")),
   createIdentityProvider: (body: { url: string; client_ids: string[]; thumbprints: string[]; tags: Tag[] }) =>
     ok(client.POST("/identity-providers", { body })),

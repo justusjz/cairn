@@ -118,6 +118,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_key, delete_key))
         .routes(routes!(get_policy, put_policy, delete_policy))
         .merge(super::iam::router())
+        .merge(super::groups::router())
         .merge(super::templates::router())
 }
 
@@ -2399,6 +2400,8 @@ pub(super) struct UserSummary {
     tags: Vec<Tag>,
     /// Its permissions boundary's ARN, which caps what its policies allow.
     boundary: Option<String>,
+    /// The groups it's in, by name, whose policies are its own too.
+    groups: Vec<String>,
 }
 
 
@@ -2440,6 +2443,7 @@ async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) ->
     let client = app.pool.get().await?;
     let mut console = super::store::console_access(&client, actor.account()).await?;
     let mut attached = crate::managed::attached_all(&client, actor.account()).await?;
+    let mut memberships = crate::groups::memberships(&client, actor.account()).await?;
     let mut listed = Vec::new();
     let mut paths: HashMap<String, bool> = HashMap::new();
     for r in users::list(&client).await?.into_iter().filter(|r| r.account_id == actor.account()) {
@@ -2466,6 +2470,7 @@ async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) ->
             path: r.path,
             tags: r.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
             boundary: r.boundary,
+            groups: memberships.remove(&r.id).unwrap_or_default(),
             console: console.remove(&r.id).map(|c| ConsoleAccess {
                 enrolled: c.enrolled,
                 passkeys: c.passkeys,
@@ -2823,6 +2828,8 @@ struct PolicySummary {
     roles: Vec<String>,
     /// The account's roles whose permissions boundary it is.
     role_bounds: Vec<String>,
+    /// The account's groups it's attached to.
+    groups: Vec<String>,
     /// Its tags (keys case-sensitive), oldest first.
     tags: Vec<Tag>,
 }
@@ -2870,6 +2877,7 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
     for p in crate::managed::AWS_POLICIES {
         let arn = crate::managed::aws_arn(p.name);
         let (roles, role_bounds) = crate::roles::of_policy(&client, account, &arn).await?;
+        let groups = crate::groups::of_policy(&client, account, &arn).await?;
         policies.push(PolicySummary {
             users: users_of(&arn),
             name: p.name.to_owned(),
@@ -2883,6 +2891,7 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
             bounds: aws_bounds.remove(p.name).unwrap_or_default(),
             roles: roles.into_iter().map(|(_, name)| name).collect(),
             role_bounds: role_bounds.into_iter().map(|(_, name)| name).collect(),
+            groups: groups.into_iter().map(|(_, name)| name).collect(),
             tags: Vec::new(),
         });
     }
@@ -2900,6 +2909,7 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
             bounds: p.bounds,
             roles: p.roles,
             role_bounds: p.role_bounds,
+            groups: p.groups,
             tags: p.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
         });
     }
@@ -2932,6 +2942,7 @@ async fn list_policies(State(app): AppState, Extension(actor): Extension<Actor>)
             policy.bounds.clear();
             policy.roles.clear();
             policy.role_bounds.clear();
+            policy.groups.clear();
         }
         shown.push(policy);
     }

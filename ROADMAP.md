@@ -57,8 +57,8 @@ Done:
   on a listener of its own, which replaced the dashboard; one account,
   whose operators are users with `cairn:` policies; IAM policies, inline
   and managed (Cairn's with AWS's names, and the account's own), bucket
-  policies, permissions boundaries, paths and tags, and the IAM API. Open:
-  policy templates (a team, a service user, the MFA guard), groups, tag
+  policies, permissions boundaries, paths and tags, groups, and the IAM
+  API. Open: policy templates (a team, a service user, the MFA guard), tag
   conditions, and STS with roles (`AssumeRoleWithWebIdentity`).
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
