@@ -1,37 +1,31 @@
 // An account's IAM groups (see `src/groups.rs`): users whose policies
 // include the group's, inline and managed, as if they were their own. So a
 // policy is attached once, to the group of those who need it, not to each
-// of them.
+// of them. The list, a new group, and a group's own page.
 
+import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
 import { type Group, type ManagedPolicy, api } from "../api";
+import {
+  AttachDialog,
+  Chip,
+  DetailHead,
+  Gone,
+  InlinePolicyDialog,
+  PermissionsPanel,
+  PolicyChips,
+  PolicySelect,
+  groupHref,
+  userHref,
+} from "../components/Iam";
 import { Loading, Panel, Table, act, poll, toast } from "../components/ui";
-import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
-import { pretty } from "../format";
 
 /** The most groups a user may be in (as in IAM). */
 const MAX_GROUPS_PER_USER = 10;
 
 export default function Groups() {
-  const data = poll(
-    () =>
-      Promise.all([
-        api.groups(),
-        api.policies(),
-        api.buckets(),
-        // Whom to add: the users the session may list (none, if it may list none).
-        api.users().catch(() => []),
-      ]),
-    10000,
-  );
+  const data = poll(() => Promise.all([api.groups(), api.policies()]), 10000);
   const [creating, setCreating] = createSignal(false);
-  const [renaming, setRenaming] = createSignal<Group>();
-  const [attaching, setAttaching] = createSignal<Group>();
-  const [adding, setAdding] = createSignal<Group>();
-  const [editing, setEditing] = createSignal<{ group: string; policy?: string }>();
-  const policies = () => data.data()?.[1] ?? [];
-  const buckets = () => (data.data()?.[2] ?? []).map((b) => b.name);
-  const users = () => data.data()?.[3] ?? [];
   return (
     <>
       <div class="page-head">
@@ -49,17 +43,27 @@ export default function Groups() {
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
         {(d) => (
           <Panel>
-            <Table count={d()[0].length} empty="No groups yet." columns={["Name", "Members", "Policies", ""]}>
+            <Table count={d()[0].length} empty="No groups yet." columns={["Name", "Members", "Permissions"]}>
               <For each={d()[0]}>
-                {(group) => (
-                  <GroupRow
-                    group={group}
-                    changed={data.refresh}
-                    rename={() => setRenaming(group)}
-                    attach={() => setAttaching(group)}
-                    add={() => setAdding(group)}
-                    editPolicy={(policy) => setEditing({ group: group.name, policy })}
-                  />
+                {(g) => (
+                  <tr>
+                    <td>
+                      <A class="mono" href={groupHref(g.name)}>
+                        {g.name}
+                      </A>
+                      <Show when={g.path !== "/"}>
+                        <div class="subtle small" title={g.arn}>
+                          path {g.path}
+                        </div>
+                      </Show>
+                    </td>
+                    <td>
+                      <Members group={g} />
+                    </td>
+                    <td>
+                      <PolicyChips attached={g.attached} inline={g.policies} none="none: it gives its members nothing" />
+                    </td>
+                  </tr>
                 )}
               </For>
             </Table>
@@ -67,138 +71,20 @@ export default function Groups() {
         )}
       </Show>
       <Show when={creating()}>
-        <NewGroupDialog policies={policies()} onClose={() => setCreating(false)} changed={data.refresh} />
-      </Show>
-      <Show when={renaming()}>
-        {(g) => <RenameDialog group={g()} onClose={() => setRenaming(undefined)} changed={data.refresh} />}
-      </Show>
-      <Show when={attaching()}>
-        {(g) => <AttachDialog group={g()} policies={policies()} onClose={() => setAttaching(undefined)} changed={data.refresh} />}
-      </Show>
-      <Show when={adding()}>
-        {(g) => (
-          <AddMemberDialog
-            group={g()}
-            users={users().map((u) => u.name)}
-            onClose={() => setAdding(undefined)}
-            changed={data.refresh}
-          />
-        )}
-      </Show>
-      <Show when={editing()}>
-        {(e) => (
-          <InlinePolicyDialog
-            group={e().group}
-            policy={e().policy}
-            buckets={buckets()}
-            onClose={() => setEditing(undefined)}
-            changed={data.refresh}
-          />
-        )}
+        <NewGroupDialog policies={data.data()?.[1] ?? []} onClose={() => setCreating(false)} changed={data.refresh} />
       </Show>
     </>
   );
 }
 
-function GroupRow(props: {
-  group: Group;
-  changed: () => void;
-  rename: () => void;
-  attach: () => void;
-  add: () => void;
-  editPolicy: (policy?: string) => void;
-}) {
-  const g = () => props.group;
-  const detach = async (name: string, arn: string) => {
-    if (!confirm(`Detach ${name} from group "${g().name}"? Its members lose what it allowed them (unless they have it otherwise).`))
-      return;
-    if (await act(() => api.detachFromGroup(g().name, arn), `Detached ${name}`)) props.changed();
-  };
-  const remove = async (user: string) => {
-    if (!confirm(`Remove ${user} from group "${g().name}"? They lose what its policies allowed them.`)) return;
-    if (await act(() => api.removeFromGroup(g().name, user), `Removed ${user} from ${g().name}`)) props.changed();
-  };
-  const del = async () => {
-    if (!confirm(`Delete group "${g().name}"?`)) return;
-    if (await act(() => api.deleteGroup(g().name), `Deleted group ${g().name}`)) props.changed();
-  };
-  const blocker = () =>
-    g().members.length
-      ? "Remove its members first"
-      : g().attached.length + g().policies.length
-        ? "Detach its managed policies and delete its inline ones first"
-        : "";
+/** A group's members, as links (if the session may see them). */
+function Members(props: { group: Group }) {
   return (
-    <tr>
-      <td>
-        <span class="mono">{g().name}</span>
-        <Show when={g().path !== "/"}>
-          <div class="subtle small" title={g().arn}>
-            path {g().path}
-          </div>
-        </Show>
-        <div class="subtle small mono" title="Its unique ID">
-          {g().id}
-        </div>
-      </td>
-      <td>
-        <Show when={g().members_shown} fallback={<span class="subtle" title="Its members show to whom may iam:GetGroup it">hidden</span>}>
-          <For each={g().members} fallback={<span class="subtle">no one</span>}>
-            {(u) => (
-              <span class="chip mono">
-                {u}
-                <button title="Remove from the group" aria-label={`Remove ${u}`} onClick={() => remove(u)}>
-                  ×
-                </button>
-              </span>
-            )}
-          </For>
-        </Show>
-        <div class="key-actions">
-          <button class="small" onClick={props.add}>
-            Add member…
-          </button>
-        </div>
-      </td>
-      <td>
-        <For each={g().attached}>
-          {(a) => (
-            <span class="chip" title={a.arn}>
-              {a.name}
-              <button title="Detach" aria-label={`Detach ${a.name}`} onClick={() => detach(a.name, a.arn)}>
-                ×
-              </button>
-            </span>
-          )}
-        </For>
-        <For each={g().policies}>
-          {(p) => (
-            <button class="chip policy" title="Its own (inline) policy: view or edit" onClick={() => props.editPolicy(p)}>
-              {p}
-            </button>
-          )}
-        </For>
-        <Show when={!g().attached.length && !g().policies.length}>
-          <div class="subtle">none: it gives its members nothing</div>
-        </Show>
-        <div class="key-actions">
-          <button class="small" onClick={props.attach}>
-            Attach…
-          </button>
-          <button class="small" title="A policy of this group's own" onClick={() => props.editPolicy()}>
-            Inline…
-          </button>
-        </div>
-      </td>
-      <td class="actions">
-        <button class="small" title="Rename or move it" onClick={props.rename}>
-          Rename…
-        </button>
-        <button class="small danger" disabled={!!blocker()} title={blocker()} onClick={del}>
-          Delete
-        </button>
-      </td>
-    </tr>
+    <Show when={props.group.members_shown} fallback={<span class="subtle" title="Its members show to whom may iam:GetGroup it">hidden</span>}>
+      <For each={props.group.members} fallback={<span class="subtle">no one</span>}>
+        {(u) => <Chip href={userHref(u)}>{u}</Chip>}
+      </For>
+    </Show>
   );
 }
 
@@ -263,25 +149,166 @@ function NewGroupDialog(props: { policies: ManagedPolicy[]; onClose: () => void;
   );
 }
 
-/** Managed policies to pick from: the account's, then Cairn's. */
-function PolicySelect(props: { policies: ManagedPolicy[]; value: string; setValue: (arn: string) => void; none?: string }) {
+// ─── A group's page ──────────────────────────────────────────────────────────
+
+export function GroupPage() {
+  const params = useParams();
+  const navigate = useNavigate();
+  const name = () => params.name!;
+  const data = poll(
+    () =>
+      Promise.all([
+        api.groups(),
+        api.policies(),
+        api.buckets(),
+        // Whom to add: the users the session may list (none, if it may list none).
+        api.users().catch(() => []),
+      ]),
+    10000,
+  );
+  const group = () => data.data()?.[0].find((g) => g.name === name());
+  const [renaming, setRenaming] = createSignal(false);
+  const [attaching, setAttaching] = createSignal(false);
+  const [adding, setAdding] = createSignal(false);
+  const [inline, setInline] = createSignal<{ policy?: string }>();
+
+  const detach = async (policy: string, arn: string) => {
+    if (!confirm(`Detach ${policy} from group "${name()}"? Its members lose what it allowed them (unless they have it otherwise).`))
+      return;
+    if (await act(() => api.detachFromGroup(name(), arn), `Detached ${policy}`)) data.refresh();
+  };
+  const removeMember = async (user: string) => {
+    if (!confirm(`Remove ${user} from group "${name()}"? They lose what its policies allowed them.`)) return;
+    if (await act(() => api.removeFromGroup(name(), user), `Removed ${user} from ${name()}`)) data.refresh();
+  };
+  const blocker = () => {
+    const g = group();
+    if (!g) return "";
+    return g.members.length
+      ? "Remove its members first"
+      : g.attached.length + g.policies.length
+        ? "Detach its managed policies and delete its inline ones first"
+        : "";
+  };
+  const remove = async () => {
+    if (!confirm(`Delete group "${name()}"?`)) return;
+    if (await act(() => api.deleteGroup(name()), `Deleted group ${name()}`)) navigate("/groups");
+  };
+
   return (
-    <select aria-label="Policy" value={props.value} onChange={(e) => props.setValue(e.currentTarget.value)}>
-      <Show when={props.none}>
-        <option value="">{props.none}</option>
+    <Show when={data.data()} fallback={<Loading error={data.error()} />}>
+      <Show when={group()} fallback={<Gone kind="Groups" href="/groups" name={name()} />}>
+        {(g) => (
+          <>
+            <DetailHead kind="Groups" href="/groups" name={g().name}>
+              <button title="Rename or move it" onClick={() => setRenaming(true)}>
+                Rename…
+              </button>
+              <button class="danger" disabled={!!blocker()} title={blocker()} onClick={remove}>
+                Delete
+              </button>
+            </DetailHead>
+            <Panel title="Summary">
+              <dl class="kv">
+                <dt>ARN</dt>
+                <dd class="mono">{g().arn}</dd>
+                <dt>Path</dt>
+                <dd class="mono">{g().path}</dd>
+                <dt>ID</dt>
+                <dd class="mono">{g().id}</dd>
+              </dl>
+            </Panel>
+            <Panel title="Members" note={g().members_shown ? `${g().members.length}` : undefined}>
+              <Show
+                when={g().members_shown}
+                fallback={<p class="subtle">Its members show to whom may iam:GetGroup it.</p>}
+              >
+                <Table count={g().members.length} empty="No one." columns={["User", ""]}>
+                  <For each={g().members}>
+                    {(u) => (
+                      <tr>
+                        <td>
+                          <A class="mono" href={userHref(u)}>
+                            {u}
+                          </A>
+                        </td>
+                        <td class="actions">
+                          <button class="small" onClick={() => removeMember(u)}>
+                            Remove
+                          </button>
+                        </td>
+                      </tr>
+                    )}
+                  </For>
+                </Table>
+              </Show>
+              <div class="key-actions">
+                <button class="small" onClick={() => setAdding(true)}>
+                  Add a member…
+                </button>
+              </div>
+            </Panel>
+            <PermissionsPanel
+              attached={g().attached}
+              inline={g().policies}
+              none="None: it gives its members nothing."
+              detach={detach}
+              editInline={(policy) => setInline({ policy })}
+              attach={() => setAttaching(true)}
+              note={<p class="subtle small">A group's inline policies hold at most 5,120 characters together (but whitespace).</p>}
+            />
+
+            <Show when={renaming()}>
+              <RenameDialog
+                group={g()}
+                onClose={() => setRenaming(false)}
+                changed={(renamed) => {
+                  if (renamed) navigate(groupHref(renamed), { replace: true });
+                  data.refresh();
+                }}
+              />
+            </Show>
+            <Show when={attaching()}>
+              <AttachDialog
+                target={g().name}
+                attached={g().attached.map((a) => a.arn)}
+                policies={data.data()?.[1] ?? []}
+                attach={(arn) => api.attachToGroup(g().name, arn)}
+                onClose={() => setAttaching(false)}
+                changed={data.refresh}
+              />
+            </Show>
+            <Show when={adding()}>
+              <AddMemberDialog
+                group={g()}
+                users={(data.data()?.[3] ?? []).map((u) => u.name)}
+                onClose={() => setAdding(false)}
+                changed={data.refresh}
+              />
+            </Show>
+            <Show when={inline()}>
+              {(i) => (
+                <InlinePolicyDialog
+                  owner={`group ${g().name}`}
+                  policy={i().policy}
+                  buckets={(data.data()?.[2] ?? []).map((b) => b.name)}
+                  load={(p) => api.groupPolicy(g().name, p)}
+                  save={(p, doc) => api.putGroupPolicy(g().name, p, doc)}
+                  remove={(p) => api.deleteGroupPolicy(g().name, p)}
+                  onClose={() => setInline(undefined)}
+                  changed={data.refresh}
+                />
+              )}
+            </Show>
+          </>
+        )}
       </Show>
-      <optgroup label="The account's">
-        <For each={props.policies.filter((p) => !p.aws)}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
-      </optgroup>
-      <optgroup label="Cairn's (AWS's)">
-        <For each={props.policies.filter((p) => p.aws)}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
-      </optgroup>
-    </select>
+    </Show>
   );
 }
 
-/** A group's new name or path. */
-function RenameDialog(props: { group: Group; onClose: () => void; changed: () => void }) {
+/** A group's new name or path. `changed` gets its new name if renamed. */
+function RenameDialog(props: { group: Group; onClose: () => void; changed: (renamed?: string) => void }) {
   let dialog!: HTMLDialogElement;
   onMount(() => dialog.showModal());
   const [name, setName] = createSignal(props.group.name);
@@ -294,7 +321,7 @@ function RenameDialog(props: { group: Group; onClose: () => void; changed: () =>
     };
     if (!change.name && !change.path) return dialog.close();
     if (await act(() => api.updateGroup(props.group.name, change), `Changed group ${props.group.name}`)) {
-      props.changed();
+      props.changed(change.name);
       dialog.close();
     }
   };
@@ -375,127 +402,6 @@ function AddMemberDialog(props: { group: Group; users: string[]; onClose: () => 
           </button>
           <button class="primary" type="submit" disabled={!user().trim()}>
             Add
-          </button>
-        </div>
-      </form>
-    </dialog>
-  );
-}
-
-/** Attaching a managed policy to a group: those it doesn't have yet. */
-function AttachDialog(props: { group: Group; policies: ManagedPolicy[]; onClose: () => void; changed: () => void }) {
-  let dialog!: HTMLDialogElement;
-  onMount(() => dialog.showModal());
-  const open = () => props.policies.filter((p) => !props.group.attached.some((a) => a.arn === p.arn));
-  const [arn, setArn] = createSignal(open().find((p) => !p.aws)?.arn ?? open()[0]?.arn ?? "");
-  const chosen = () => props.policies.find((p) => p.arn === arn());
-  const attach = async (e: SubmitEvent) => {
-    e.preventDefault();
-    const p = chosen();
-    if (!p) return;
-    if (await act(() => api.attachToGroup(props.group.name, p.arn), `Attached ${p.name} to ${props.group.name}`)) {
-      props.changed();
-      dialog.close();
-    }
-  };
-  return (
-    <dialog ref={dialog} onClose={() => props.onClose()}>
-      <form onSubmit={attach}>
-        <h2>
-          Attach a policy to <span class="mono">{props.group.name}</span>
-        </h2>
-        <Show when={open().length} fallback={<p class="subtle">Every policy is attached already.</p>}>
-          <PolicySelect policies={open()} value={arn()} setValue={setArn} />
-          <Show when={chosen()}>
-            {(p) => (
-              <>
-                <p class="subtle small">{p().description}</p>
-                <div class="pem">{pretty(p().document)}</div>
-              </>
-            )}
-          </Show>
-        </Show>
-        <div class="buttons">
-          <button type="button" onClick={() => dialog.close()}>
-            Cancel
-          </button>
-          <button class="primary" type="submit" disabled={!chosen()}>
-            Attach
-          </button>
-        </div>
-      </form>
-    </dialog>
-  );
-}
-
-/** A group's inline policy, to view, edit or delete (`policy`), or a new one. */
-function InlinePolicyDialog(props: { group: string; policy?: string; buckets: string[]; onClose: () => void; changed: () => void }) {
-  let dialog!: HTMLDialogElement;
-  const [name, setName] = createSignal(props.policy ?? "");
-  const [document, setDocument] = createSignal(props.policy ? "" : EMPTY);
-  const [loading, setLoading] = createSignal(!!props.policy);
-  const [error, setError] = createSignal<string>();
-  onMount(async () => {
-    dialog.showModal();
-    if (!props.policy) return;
-    try {
-      setDocument(pretty((await api.groupPolicy(props.group, props.policy)).document));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-    setLoading(false);
-  });
-  const save = async (e: SubmitEvent) => {
-    e.preventDefault();
-    const n = name().trim();
-    try {
-      await api.putGroupPolicy(props.group, n, document());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      return;
-    }
-    toast(`Saved policy ${n} of ${props.group}`);
-    props.changed();
-    dialog.close();
-  };
-  const remove = async () => {
-    if (!confirm(`Delete policy "${props.policy}" of group "${props.group}"?`)) return;
-    if (await act(() => api.deleteGroupPolicy(props.group, props.policy!), `Deleted policy ${props.policy}`)) {
-      props.changed();
-      dialog.close();
-    }
-  };
-  return (
-    <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
-      <form onSubmit={save}>
-        <h2>
-          {props.policy ? "Inline policy" : "New inline policy"} of <span class="mono">{props.group}</span>
-        </h2>
-        <Show when={!props.policy} fallback={<p class="mono">{props.policy}</p>}>
-          <input
-            type="text"
-            placeholder="policy-name"
-            aria-label="Policy name"
-            autocomplete="off"
-            required
-            value={name()}
-            onInput={(e) => setName(e.currentTarget.value)}
-          />
-        </Show>
-        <PolicyEditor document={document()} setDocument={setDocument} buckets={props.buckets} disabled={loading()} />
-        <p class="subtle small">A group's inline policies hold at most 5,120 characters together (but whitespace).</p>
-        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
-        <div class="buttons">
-          <Show when={props.policy}>
-            <button type="button" class="danger" onClick={remove}>
-              Delete
-            </button>
-          </Show>
-          <button type="button" onClick={() => dialog.close()}>
-            Cancel
-          </button>
-          <button class="primary" type="submit" disabled={loading()}>
-            Save
           </button>
         </div>
       </form>

@@ -953,7 +953,7 @@ restarts; everything else is read from the database.
   secure). Passkeys are bound to the console URL's host, so changing it
   makes everyone enroll again.
 - **Enrollment.** An identity gets a first passkey through a one-time link,
-  valid 24 hours: `cairn user enroll <name>`, or the Users page. Once signed in, people add more passkeys (at most 8; a second one,
+  valid 24 hours: `cairn user enroll <name>`, or the user's page in the console. Once signed in, people add more passkeys (at most 8; a second one,
   on another device, keeps them from being locked out) and remove them, but
   never their last. A lost passkey takes a new link.
 - **Sessions** last 12 hours at most, and end after an hour unused. They're a

@@ -695,13 +695,34 @@ mod e2e {
         let (status, err) = writer.send("GET", "/api/users", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(err["error"].as_str().unwrap().contains("iam:ListUsers"), "{err}");
-        let new_user = json!({ "name": "made-in-console", "admin": false });
+        let new_user = json!({ "name": "made-in-console" });
         assert_eq!(writer.send("POST", "/api/users", Some(new_user.clone())).await.0, StatusCode::FORBIDDEN);
         let (status, made) = admin.send("POST", "/api/users", Some(new_user)).await;
         assert_eq!(status, StatusCode::CREATED, "{made}");
         let (_, users) = admin.send("GET", "/api/users", None).await;
         let names: Vec<_> = users.as_array().unwrap().iter().map(|u| u["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"made-in-console") && names.contains(&"writer"), "{names:?}");
+        // Made with policies and in groups, all or nothing: each checked as
+        // IAM's AttachUserPolicy and AddUserToGroup.
+        let administrator = crate::managed::aws_arn(crate::managed::ADMINISTRATOR_ACCESS);
+        assert_eq!(admin.send("POST", "/api/groups", Some(json!({ "name": "ops" }))).await.0, StatusCode::CREATED);
+        let ready = json!({ "name": "made-ready", "policies": [administrator], "groups": ["ops"] });
+        assert_eq!(writer.send("POST", "/api/users", Some(ready.clone())).await.0, StatusCode::FORBIDDEN);
+        let (status, made) = admin.send("POST", "/api/users", Some(ready)).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        let account = crate::users::account(&client).await.unwrap();
+        let missing = format!("arn:aws:iam::{account}:policy/missing");
+        let half = json!({ "name": "made-half", "policies": [missing], "groups": ["ops"] });
+        let (status, err) = admin.send("POST", "/api/users", Some(half)).await;
+        assert!(status.is_client_error(), "{status} {err}");
+        let (_, users) = admin.send("GET", "/api/users", None).await;
+        let users = users.as_array().unwrap();
+        let made = users.iter().find(|u| u["name"] == "made-ready").unwrap();
+        assert_eq!(made["attached"][0]["name"], "AdministratorAccess", "{made}");
+        assert_eq!(made["groups"], json!(["ops"]), "{made}");
+        assert!(users.iter().all(|u| u["name"] != "made-half"), "{users:?}");
+        let (_, groups) = admin.send("GET", "/api/groups", None).await;
+        assert_eq!(groups[0]["members"], json!(["made-ready"]), "{groups}");
         let (status, _) = admin.send("POST", "/api/users/made-in-console/keys", None).await;
         assert_eq!(status, StatusCode::CREATED);
         // An inline policy may give a user IAM permissions on itself only,

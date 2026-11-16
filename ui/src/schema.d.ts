@@ -1294,23 +1294,6 @@ export interface paths {
         patch: operations["update_user"];
         trace?: never;
     };
-    "/users/{user}/admin": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        /** Makes a user an admin, or not. */
-        put: operations["set_admin"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/users/{user}/attached": {
         parameters: {
             query?: never;
@@ -1450,9 +1433,6 @@ export interface components {
             /** Format: double */
             created_at: number;
             id: string;
-        };
-        AdminFlag: {
-            admin: boolean;
         };
         /** @description What `navigator.credentials.get()` gave the page. */
         Assertion: {
@@ -1772,12 +1752,18 @@ export interface components {
              *     gets none, and signs in to the console through its link.
              */
             access_key?: boolean;
-            admin?: boolean;
             /** @description Its permissions boundary: a managed policy's ARN. */
             boundary?: string | null;
+            /** @description Groups to add it to, by name (each checked as IAM's AddUserToGroup). */
+            groups?: string[];
             name: string;
             /** @description Its path (`/`, or `/…/`); `/` if not given. */
             path?: string | null;
+            /**
+             * @description Managed policies to attach to it, by ARN (each checked as IAM's
+             *     AttachUserPolicy).
+             */
+            policies?: string[];
             /** @description Its tags. */
             tags?: components["schemas"]["Tag"][];
         };
@@ -1986,8 +1972,6 @@ export interface components {
         IdentitySummary: {
             account: string;
             account_id: string;
-            /** @description Whether the user has `AdministratorAccess`. */
-            admin: boolean;
             /** @description The user's ARN, which policies name it by. */
             arn: string;
             /** @description The user's name. */
@@ -2975,10 +2959,9 @@ export interface components {
         };
         /** @description A user, never with its secret. */
         UserSummary: {
-            admin: boolean;
             /** @description Its ARN. */
             arn: string;
-            /** @description Its attached managed policies (AdministratorAccess, if it's an admin). */
+            /** @description Its attached managed policies. */
             attached: components["schemas"]["AttachedPolicy"][];
             /** @description Its permissions boundary's ARN, which caps what its policies allow. */
             boundary?: string | null;
@@ -6855,46 +6838,6 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": components["schemas"]["UserChange"];
-            };
-        };
-        responses: {
-            /** @description Changed */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    set_admin: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                user: string;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AdminFlag"];
             };
         };
         responses: {

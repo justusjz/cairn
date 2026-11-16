@@ -192,7 +192,7 @@ mod e2e {
         allowed(&mut lead, "POST", "/api/roles", Some(new_role("ci", "/oneai/", Some(&boundary)))).await;
         allowed(&mut lead, "POST", "/api/roles/ci/attached", Some(json!({ "arn": administrator }))).await;
         // A member made an admin of everything: capped by the boundary.
-        allowed(&mut lead, "PUT", "/api/users/dev/admin", Some(json!({ "admin": true }))).await;
+        allowed(&mut lead, "POST", "/api/users/dev/attached", Some(json!({ "arn": administrator }))).await;
 
         // The ways out, which the team's admin, a member it made an admin,
         // and an admin with the team's policy and no boundary all lack.
@@ -232,7 +232,6 @@ mod e2e {
             denied(who, "PATCH", "/api/users/outsider", Some(json!({ "path": "/oneai/" }))).await;
             denied(who, "PATCH", "/api/users/dev", Some(json!({ "path": "/" }))).await;
             denied(who, "POST", "/api/users/outsider/attached", Some(json!({ "arn": administrator }))).await;
-            denied(who, "PUT", "/api/users/outsider/admin", Some(json!({ "admin": true }))).await;
             denied(who, "PUT", "/api/users/outsider/policies/p", Some(json!({ "document": anything }))).await;
             denied(who, "POST", "/api/users/outsider/keys", None).await;
             denied(who, "POST", "/api/users/outsider/enrollment", None).await;
@@ -269,7 +268,8 @@ mod e2e {
             let token = crate::console::store::create_enrollment(&client, &account, "dev").await.unwrap();
             super::super::e2e::enrolled(&console, &token).await
         };
-        allowed(&mut root, "PUT", "/api/users/dev/admin", Some(json!({ "admin": false }))).await;
+        let detach = format!("/api/users/dev/attached?arn={}", administrator.replace(':', "%3A").replace('/', "%2F"));
+        allowed(&mut root, "DELETE", &detach, None).await;
         allowed(&mut dev, "POST", "/api/users/dev/keys", None).await;
         denied(&mut dev, "POST", "/api/users/lead/keys", None).await;
         denied(&mut dev, "POST", "/api/buckets", Some(json!({ "name": "oneai-dev-mine" }))).await;

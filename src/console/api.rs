@@ -389,8 +389,6 @@ struct IdentitySummary {
     user: String,
     /// The user's ARN, which policies name it by.
     arn: String,
-    /// Whether the user has `AdministratorAccess`.
-    admin: bool,
 }
 
 impl IdentitySummary {
@@ -400,7 +398,6 @@ impl IdentitySummary {
             account: identity.account.clone(),
             user: identity.user.name.clone(),
             arn: identity.arn(),
-            admin: identity.user.admin,
         }
     }
 }

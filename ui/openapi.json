@@ -4481,55 +4481,6 @@
         }
       }
     },
-    "/users/{user}/admin": {
-      "put": {
-        "summary": "Makes a user an admin, or not.",
-        "operationId": "set_admin",
-        "parameters": [
-          {
-            "name": "user",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AdminFlag"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "204": {
-            "description": "Changed"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/users/{user}/attached": {
       "post": {
         "summary": "Attaches a managed policy to a user.",
@@ -5124,17 +5075,6 @@
           },
           "id": {
             "type": "string"
-          }
-        }
-      },
-      "AdminFlag": {
-        "type": "object",
-        "required": [
-          "admin"
-        ],
-        "properties": {
-          "admin": {
-            "type": "boolean"
           }
         }
       },
@@ -5922,15 +5862,19 @@
             "type": "boolean",
             "description": "Whether it gets an access key (a service's), of a random ID; a person\ngets none, and signs in to the console through its link."
           },
-          "admin": {
-            "type": "boolean"
-          },
           "boundary": {
             "type": [
               "string",
               "null"
             ],
             "description": "Its permissions boundary: a managed policy's ARN."
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Groups to add it to, by name (each checked as IAM's AddUserToGroup)."
           },
           "name": {
             "type": "string"
@@ -5941,6 +5885,13 @@
               "null"
             ],
             "description": "Its path (`/`, or `/…/`); `/` if not given."
+          },
+          "policies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Managed policies to attach to it, by ARN (each checked as IAM's\nAttachUserPolicy)."
           },
           "tags": {
             "type": "array",
@@ -6490,8 +6441,7 @@
           "account_id",
           "account",
           "user",
-          "arn",
-          "admin"
+          "arn"
         ],
         "properties": {
           "account": {
@@ -6499,10 +6449,6 @@
           },
           "account_id": {
             "type": "string"
-          },
-          "admin": {
-            "type": "boolean",
-            "description": "Whether the user has `AdministratorAccess`."
           },
           "arn": {
             "type": "string",
@@ -8993,7 +8939,6 @@
         "required": [
           "name",
           "id",
-          "admin",
           "created_at",
           "attached",
           "keys",
@@ -9004,9 +8949,6 @@
           "groups"
         ],
         "properties": {
-          "admin": {
-            "type": "boolean"
-          },
           "arn": {
             "type": "string",
             "description": "Its ARN."
@@ -9016,7 +8958,7 @@
             "items": {
               "$ref": "#/components/schemas/AttachedPolicy"
             },
-            "description": "Its attached managed policies (AdministratorAccess, if it's an admin)."
+            "description": "Its attached managed policies."
           },
           "boundary": {
             "type": [

@@ -113,24 +113,64 @@ function AccountBlock(props: { changed: () => void }) {
   );
 }
 
-export function BucketList() {
-  const buckets = poll(() => api.buckets());
+/** A new bucket: its name, and whether it has Object Lock. */
+function NewBucketDialog(props: { onClose: () => void; changed: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
   const [name, setName] = createSignal("");
   const [objectLock, setObjectLock] = createSignal(false);
+  const [error, setError] = createSignal<string>();
   const create = async (e: SubmitEvent) => {
     e.preventDefault();
     const n = name().trim();
-    if (
-      objectLock() &&
-      !confirm(`Create "${n}" with Object Lock? It can't be disabled again, and the bucket stays versioned.`)
-    )
+    try {
+      await api.createBucket(n, objectLock());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
       return;
-    if (await act(() => api.createBucket(n, objectLock()), `Created bucket ${n}`)) {
-      setName("");
-      setObjectLock(false);
-      buckets.refresh();
     }
+    toast(`Created bucket ${n}`);
+    props.changed();
+    dialog.close();
   };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={create}>
+        <h2>New bucket</h2>
+        <input
+          type="text"
+          placeholder="bucket-name"
+          aria-label="Bucket name"
+          autocomplete="off"
+          required
+          value={name()}
+          onInput={(e) => setName(e.currentTarget.value)}
+        />
+        <label class="check">
+          <input type="checkbox" checked={objectLock()} onChange={(e) => setObjectLock(e.currentTarget.checked)} />
+          Object Lock
+        </label>
+        <p class="subtle small">
+          Keeps versions from being deleted for a retention period, or under a legal hold, as S3's Object Lock. It can't be
+          disabled again, and the bucket stays versioned.
+        </p>
+        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit">
+            Create bucket
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+export function BucketList() {
+  const buckets = poll(() => api.buckets());
+  const [creating, setCreating] = createSignal(false);
   const remove = async (n: string) => {
     if (!confirm(`Delete bucket "${n}"? It must be empty.`)) return;
     if (await act(() => api.deleteBucket(n), `Deleted bucket ${n}`)) buckets.refresh();
@@ -139,17 +179,13 @@ export function BucketList() {
     <>
       <div class="page-head">
         <h1>Buckets</h1>
-        <form class="form-row" onSubmit={create}>
-          <input type="text" placeholder="new-bucket-name" aria-label="Bucket name" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
-          <label title="Keeps versions from being deleted for a retention period, or under a legal hold, as S3's Object Lock">
-            <input type="checkbox" checked={objectLock()} onChange={(e) => setObjectLock(e.currentTarget.checked)} />
-            Object Lock
-          </label>
-          <button class="primary" type="submit">
-            Create bucket
-          </button>
-        </form>
+        <button class="primary" onClick={() => setCreating(true)}>
+          New bucket
+        </button>
       </div>
+      <Show when={creating()}>
+        <NewBucketDialog onClose={() => setCreating(false)} changed={buckets.refresh} />
+      </Show>
       <AccountBlock changed={buckets.refresh} />
       <Show when={buckets.data()} fallback={<Loading error={buckets.error()} />}>
         {(list) => (

@@ -4,10 +4,26 @@
 // the ID tokens of an OpenID Connect provider such as a CI system's or a
 // Kubernetes cluster's). And those providers (see `src/iam_oidc.rs`).
 
+import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createResource, createSignal, onMount } from "solid-js";
 import { type IdentityProvider, type ManagedPolicy, type Role, type Tag, api, isOperator } from "../api";
+import {
+  AttachDialog,
+  Chip,
+  DetailHead,
+  Gone,
+  InlinePolicyDialog,
+  PermissionsPanel,
+  PolicyChips,
+  PolicySelect,
+  TagChips,
+  TagRows,
+  cleanTags,
+  policyHref,
+  roleHref,
+} from "../components/Iam";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
-import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
+import { EMPTY } from "../components/PolicyEditor";
 import { duration, pretty } from "../format";
 import { api as session } from "../session";
 
@@ -23,15 +39,9 @@ const [me] = createResource(() => session.me().catch(() => null));
 const accountId = () => me()?.identity.account_id ?? "";
 
 export default function Roles() {
-  const data = poll(() => Promise.all([api.roles(), api.policies(), api.buckets()]), 10000);
+  const data = poll(() => Promise.all([api.roles(), api.policies()]), 10000);
   const providers = poll(() => api.identityProviders(), 10000);
   const [creating, setCreating] = createSignal(false);
-  const [trust, setTrust] = createSignal<Role>();
-  const [details, setDetails] = createSignal<Role>();
-  const [attaching, setAttaching] = createSignal<Role>();
-  const [editing, setEditing] = createSignal<{ role: string; policy?: string }>();
-  const policies = () => data.data()?.[1] ?? [];
-  const buckets = () => (data.data()?.[2] ?? []).map((b) => b.name);
   const providerList = () => providers.data()?.providers ?? [];
   return (
     <>
@@ -55,18 +65,39 @@ export default function Roles() {
             <Table
               count={d()[0].length}
               empty="No roles yet."
-              columns={["Name", "Trusted by", "Policies", { label: "Longest session", num: true }, ""]}
+              columns={["Name", "Trusted by", "Permissions", { label: "Longest session", num: true }]}
             >
               <For each={d()[0]}>
-                {(role) => (
-                  <RoleRow
-                    role={role}
-                    changed={data.refresh}
-                    trust={() => setTrust(role)}
-                    details={() => setDetails(role)}
-                    attach={() => setAttaching(role)}
-                    editPolicy={(policy) => setEditing({ role: role.name, policy })}
-                  />
+                {(r) => (
+                  <tr>
+                    <td>
+                      <A class="mono" href={roleHref(r.name)}>
+                        {r.name}
+                      </A>
+                      <Show when={r.path !== "/"}>
+                        <div class="subtle small" title={r.arn}>
+                          path {r.path}
+                        </div>
+                      </Show>
+                      <Show when={r.description}>
+                        <div class="small">{r.description}</div>
+                      </Show>
+                      <Show when={r.boundary}>
+                        {(b) => (
+                          <div class="small" title={`Permissions boundary: ${b()}`}>
+                            <Badge tone="warn">bounded by {b().split("/").pop()}</Badge>
+                          </div>
+                        )}
+                      </Show>
+                    </td>
+                    <td>
+                      <TrustChips trust={r.trust} />
+                    </td>
+                    <td>
+                      <PolicyChips attached={r.attached} inline={r.policies} none="none: its sessions may do nothing" />
+                    </td>
+                    <td class="num">{duration(r.max_session_duration)}</td>
+                  </tr>
                 )}
               </For>
             </Table>
@@ -76,33 +107,175 @@ export default function Roles() {
       <ProvidersPanel providers={providerList()} error={providers.error()} private={providers.data()?.private_issuers ?? false} changed={providers.refresh} />
       <Show when={creating()}>
         <NewRoleDialog
-          policies={policies()}
+          policies={data.data()?.[1] ?? []}
           providers={providerList()}
           onClose={() => setCreating(false)}
           changed={data.refresh}
         />
       </Show>
-      <Show when={trust()}>
-        {(r) => <TrustDialog role={r()} providers={providerList()} onClose={() => setTrust(undefined)} changed={data.refresh} />}
-      </Show>
-      <Show when={details()}>
-        {(r) => <DetailsDialog role={r()} policies={policies()} onClose={() => setDetails(undefined)} changed={data.refresh} />}
-      </Show>
-      <Show when={attaching()}>
-        {(r) => <AttachDialog role={r()} policies={policies()} onClose={() => setAttaching(undefined)} changed={data.refresh} />}
-      </Show>
-      <Show when={editing()}>
-        {(e) => (
-          <InlinePolicyDialog
-            role={e().role}
-            policy={e().policy}
-            buckets={buckets()}
-            onClose={() => setEditing(undefined)}
-            changed={data.refresh}
-          />
+    </>
+  );
+}
+
+/** Who a trust policy lets in. */
+function TrustChips(props: { trust: string }) {
+  return (
+    <For each={trusted(props.trust)} fallback={<span class="subtle">no one</span>}>
+      {(t) => (
+        <span class="chip" classList={{ deny: t.deny }} title={t.title}>
+          {t.deny ? "denied: " : ""}
+          {t.label}
+        </span>
+      )}
+    </For>
+  );
+}
+
+// ─── A role's page ───────────────────────────────────────────────────────────
+
+export function RolePage() {
+  const params = useParams();
+  const navigate = useNavigate();
+  const name = () => params.name!;
+  const data = poll(() => Promise.all([api.roles(), api.policies(), api.buckets()]), 10000);
+  const providers = poll(() => api.identityProviders().catch(() => ({ providers: [] as IdentityProvider[], private_issuers: false })), 30000);
+  const role = () => data.data()?.[0].find((r) => r.name === name());
+  const policies = () => data.data()?.[1] ?? [];
+  const [trust, setTrust] = createSignal(false);
+  const [editing, setEditing] = createSignal(false);
+  const [attaching, setAttaching] = createSignal(false);
+  const [inline, setInline] = createSignal<{ policy?: string }>();
+  const detach = async (policy: string, arn: string) => {
+    if (!confirm(`Detach ${policy} from role "${name()}"?`)) return;
+    if (await act(() => api.detachFromRole(name(), arn), `Detached ${policy}`)) data.refresh();
+  };
+  const revoke = async () => {
+    if (
+      !confirm(
+        `Revoke every session of role "${name()}" issued until now? Programs using them get AccessDenied, and must assume the role again.`,
+      )
+    )
+      return;
+    if (await act(() => api.revokeSessions(name()), `Revoked ${name()}'s sessions`)) data.refresh();
+  };
+  const blocked = () => (role()?.attached.length ?? 0) + (role()?.policies.length ?? 0) > 0;
+  const remove = async () => {
+    if (!confirm(`Delete role "${name()}"? Its sessions stop working.`)) return;
+    if (await act(() => api.deleteRole(name()), `Deleted role ${name()}`)) navigate("/roles");
+  };
+  return (
+    <Show when={data.data()} fallback={<Loading error={data.error()} />}>
+      <Show when={role()} fallback={<Gone kind="Roles" href="/roles" name={name()} />}>
+        {(r) => (
+          <>
+            <DetailHead kind="Roles" href="/roles" name={r().name}>
+              <button title="Its description, longest session, permissions boundary and tags" onClick={() => setEditing(true)}>
+                Edit…
+              </button>
+              <button
+                title="Deny everything to the sessions issued until now (an inline policy, AWSRevokeOlderSessions), as AWS's console does"
+                onClick={revoke}
+              >
+                Revoke sessions
+              </button>
+              <button
+                class="danger"
+                disabled={blocked()}
+                title={blocked() ? "Detach its managed policies and delete its inline ones first" : ""}
+                onClick={remove}
+              >
+                Delete
+              </button>
+            </DetailHead>
+            <Panel title="Summary">
+              <dl class="kv">
+                <dt>ARN</dt>
+                <dd class="mono">{r().arn}</dd>
+                <dt>Description</dt>
+                <dd>{r().description || <span class="subtle">none</span>}</dd>
+                <dt>Path</dt>
+                <dd class="mono">{r().path}</dd>
+                <dt>Longest session</dt>
+                <dd>{duration(r().max_session_duration)}</dd>
+                <dt>Permissions boundary</dt>
+                <dd>
+                  <Show when={r().boundary} fallback={<span class="subtle">none</span>}>
+                    {(b) => (
+                      <A class="mono" href={policyHref(b())} title="Its policies allow only what this allows too">
+                        {b().split("/").pop()}
+                      </A>
+                    )}
+                  </Show>
+                </dd>
+                <dt>Tags</dt>
+                <dd>
+                  <TagChips tags={r().tags} title="A tag (aws:ResourceTag, and aws:PrincipalTag in its sessions' requests)" />
+                </dd>
+                <dt title="Its sessions' aws:userid is this, a colon and the session's name">ID</dt>
+                <dd class="mono">{r().id}</dd>
+              </dl>
+            </Panel>
+            <Panel title="Who may assume it">
+              <TrustChips trust={r().trust} />
+              <div class="pem">{pretty(r().trust)}</div>
+              <div class="key-actions">
+                <button class="small" onClick={() => setTrust(true)}>
+                  Edit trust policy…
+                </button>
+              </div>
+            </Panel>
+            <PermissionsPanel
+              attached={r().attached}
+              inline={r().policies}
+              none="None: its sessions may do nothing."
+              detach={detach}
+              editInline={(policy) => setInline({ policy })}
+              attach={() => setAttaching(true)}
+            />
+
+            <Show when={trust()}>
+              <TrustDialog role={r()} providers={providers.data()?.providers ?? []} onClose={() => setTrust(false)} changed={data.refresh} />
+            </Show>
+            <Show when={editing()}>
+              <DetailsDialog role={r()} policies={policies()} onClose={() => setEditing(false)} changed={data.refresh} />
+            </Show>
+            <Show when={attaching()}>
+              <AttachDialog
+                target={r().name}
+                attached={r().attached.map((a) => a.arn)}
+                policies={policies()}
+                attach={(arn) => api.attachToRole(r().name, arn)}
+                onClose={() => setAttaching(false)}
+                changed={data.refresh}
+              />
+            </Show>
+            <Show when={inline()}>
+              {(i) => (
+                <InlinePolicyDialog
+                  owner={`role ${r().name}`}
+                  policy={i().policy}
+                  buckets={(data.data()?.[2] ?? []).map((b) => b.name)}
+                  load={(p) => api.rolePolicy(r().name, p)}
+                  save={(p, doc) => api.putRolePolicy(r().name, p, doc)}
+                  remove={(p) => api.deleteRolePolicy(r().name, p)}
+                  removing={i().policy === "AWSRevokeOlderSessions" ? "The sessions it revoked work again (until they expire)." : undefined}
+                  note={
+                    <Show when={i().policy === "AWSRevokeOlderSessions"}>
+                      <p class="subtle small">
+                        This policy revokes the role's sessions issued before its time (Revoke sessions sets it). Delete it once
+                        those sessions have expired.
+                      </p>
+                    </Show>
+                  }
+                  onClose={() => setInline(undefined)}
+                  changed={data.refresh}
+                />
+              )}
+            </Show>
+          </>
         )}
       </Show>
-    </>
+    </Show>
   );
 }
 
@@ -137,137 +310,6 @@ function trusted(trust: string): { label: string; title: string; deny: boolean }
   } catch {
     return [];
   }
-}
-
-function RoleRow(props: {
-  role: Role;
-  changed: () => void;
-  trust: () => void;
-  details: () => void;
-  attach: () => void;
-  editPolicy: (policy?: string) => void;
-}) {
-  const r = () => props.role;
-  const detach = async (name: string, arn: string) => {
-    if (!confirm(`Detach ${name} from role "${r().name}"?`)) return;
-    if (await act(() => api.detachFromRole(r().name, arn), `Detached ${name}`)) props.changed();
-  };
-  const revoke = async () => {
-    if (
-      !confirm(
-        `Revoke every session of role "${r().name}" issued until now? Programs using them get AccessDenied, and must assume the role again.`,
-      )
-    )
-      return;
-    if (await act(() => api.revokeSessions(r().name), `Revoked ${r().name}'s sessions`)) props.changed();
-  };
-  const remove = async () => {
-    if (!confirm(`Delete role "${r().name}"? Its sessions stop working.`)) return;
-    if (await act(() => api.deleteRole(r().name), `Deleted role ${r().name}`)) props.changed();
-  };
-  const blocked = () => r().attached.length + r().policies.length > 0;
-  return (
-    <tr>
-      <td>
-        <span class="mono">{r().name}</span>
-        <Show when={r().path !== "/"}>
-          <div class="subtle small" title={r().arn}>
-            path {r().path}
-          </div>
-        </Show>
-        <Show when={r().description}>
-          <div class="small">{r().description}</div>
-        </Show>
-        <Show when={r().boundary}>
-          {(b) => (
-            <div class="small" title={`Permissions boundary: ${b()}. Its policies allow only what this allows too.`}>
-              <Badge tone="warn">bounded by {b().split("/").pop()}</Badge>
-            </div>
-          )}
-        </Show>
-        <Show when={r().tags.length}>
-          <div class="small">
-            <For each={r().tags}>
-              {(t) => (
-                <span class="chip" title="A tag (aws:ResourceTag, and aws:PrincipalTag in its sessions' requests)">
-                  {t.key}={t.value}
-                </span>
-              )}
-            </For>
-          </div>
-        </Show>
-        <div class="subtle small mono" title="Its unique ID; its sessions' aws:userid is this, a colon and the session's name">
-          {r().id}
-        </div>
-      </td>
-      <td>
-        <For each={trusted(r().trust)} fallback={<span class="subtle">no one</span>}>
-          {(t) => (
-            <span class="chip" classList={{ deny: t.deny }} title={t.title}>
-              {t.deny ? "denied: " : ""}
-              {t.label}
-            </span>
-          )}
-        </For>
-        <div class="key-actions">
-          <button class="small" onClick={props.trust}>
-            Trust policy…
-          </button>
-        </div>
-      </td>
-      <td>
-        <For each={r().attached}>
-          {(a) => (
-            <span class="chip" title={a.arn}>
-              {a.name}
-              <button title="Detach" aria-label={`Detach ${a.name}`} onClick={() => detach(a.name, a.arn)}>
-                ×
-              </button>
-            </span>
-          )}
-        </For>
-        <For each={r().policies}>
-          {(p) => (
-            <button class="chip policy" title="Its own (inline) policy: view or edit" onClick={() => props.editPolicy(p)}>
-              {p}
-            </button>
-          )}
-        </For>
-        <Show when={!r().attached.length && !r().policies.length}>
-          <div class="subtle">none: its sessions may do nothing</div>
-        </Show>
-        <div class="key-actions">
-          <button class="small" onClick={props.attach}>
-            Attach…
-          </button>
-          <button class="small" title="A policy of this role's own" onClick={() => props.editPolicy()}>
-            Inline…
-          </button>
-        </div>
-      </td>
-      <td class="num">{duration(r().max_session_duration)}</td>
-      <td class="actions">
-        <button class="small" title="Its description, longest session, permissions boundary and tags" onClick={props.details}>
-          Details…
-        </button>
-        <button
-          class="small"
-          title="Deny everything to the sessions issued until now (an inline policy, AWSRevokeOlderSessions), as AWS's console does"
-          onClick={revoke}
-        >
-          Revoke sessions
-        </button>
-        <button
-          class="small danger"
-          disabled={blocked()}
-          title={blocked() ? "Detach its managed policies and delete its inline ones first" : ""}
-          onClick={remove}
-        >
-          Delete
-        </button>
-      </td>
-    </tr>
-  );
 }
 
 // ─── Trust policies ──────────────────────────────────────────────────────────
@@ -406,6 +448,7 @@ function TrustEditor(props: { document: string; setDocument: (d: string) => void
 
 /** A new role: its name, who may assume it, and what it may do. */
 function NewRoleDialog(props: { policies: ManagedPolicy[]; providers: IdentityProvider[]; onClose: () => void; changed: () => void }) {
+  const navigate = useNavigate();
   let dialog!: HTMLDialogElement;
   onMount(() => dialog.showModal());
   const [name, setName] = createSignal("");
@@ -436,6 +479,7 @@ function NewRoleDialog(props: { policies: ManagedPolicy[]; providers: IdentityPr
     if (attach()) await act(() => api.attachToRole(n, attach()), `Attached ${attach().split("/").pop()}`);
     props.changed();
     dialog.close();
+    navigate(roleHref(n));
   };
   return (
     <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
@@ -477,24 +521,8 @@ function NewRoleDialog(props: { policies: ManagedPolicy[]; providers: IdentityPr
         <TrustEditor document={document()} setDocument={setDocument} providers={props.providers} />
         <h3>What it may do</h3>
         <div class="form-row">
-          <select aria-label="Policy to attach" value={attach()} onChange={(e) => setAttach(e.currentTarget.value)}>
-            <option value="">No policy yet (attach or write one later)</option>
-            <optgroup label="The account's">
-              <For each={props.policies.filter((p) => !p.aws)}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
-            </optgroup>
-            <optgroup label="Cairn's (AWS's)">
-              <For each={props.policies.filter((p) => p.aws)}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
-            </optgroup>
-          </select>
-          <select
-            aria-label="Permissions boundary"
-            title="A managed policy that caps what the role's policies may allow"
-            value={boundary()}
-            onChange={(e) => setBoundary(e.currentTarget.value)}
-          >
-            <option value="">No boundary</option>
-            <For each={props.policies}>{(p) => <option value={p.arn}>Boundary: {p.name}</option>}</For>
-          </select>
+          <PolicySelect policies={props.policies} value={attach()} setValue={setAttach} none="No policy yet (attach or write one later)" label="Policy to attach" />
+          <PolicySelect policies={props.policies} value={boundary()} setValue={setBoundary} none="No permissions boundary" label="Permissions boundary" />
         </div>
         <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
         <div class="buttons">
@@ -550,165 +578,6 @@ function TrustDialog(props: { role: Role; providers: IdentityProvider[]; onClose
 }
 
 // ─── A role's policies and details ───────────────────────────────────────────
-
-/** A role's inline policy, to view, edit or delete (`policy`), or a new one. */
-function InlinePolicyDialog(props: { role: string; policy?: string; buckets: string[]; onClose: () => void; changed: () => void }) {
-  let dialog!: HTMLDialogElement;
-  const [name, setName] = createSignal(props.policy ?? "");
-  const [document, setDocument] = createSignal(props.policy ? "" : EMPTY);
-  const [loading, setLoading] = createSignal(!!props.policy);
-  const [error, setError] = createSignal<string>();
-  onMount(async () => {
-    dialog.showModal();
-    if (!props.policy) return;
-    try {
-      setDocument(pretty((await api.rolePolicy(props.role, props.policy)).document));
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-    }
-    setLoading(false);
-  });
-  const save = async (e: SubmitEvent) => {
-    e.preventDefault();
-    const n = name().trim();
-    try {
-      await api.putRolePolicy(props.role, n, document());
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
-      return;
-    }
-    toast(`Saved policy ${n} of ${props.role}`);
-    props.changed();
-    dialog.close();
-  };
-  const remove = async () => {
-    const revoking = props.policy === "AWSRevokeOlderSessions" ? " The sessions it revoked work again (until they expire)." : "";
-    if (!confirm(`Delete policy "${props.policy}" of role "${props.role}"?${revoking}`)) return;
-    if (await act(() => api.deleteRolePolicy(props.role, props.policy!), `Deleted policy ${props.policy}`)) {
-      props.changed();
-      dialog.close();
-    }
-  };
-  return (
-    <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
-      <form onSubmit={save}>
-        <h2>
-          {props.policy ? "Inline policy" : "New inline policy"} of <span class="mono">{props.role}</span>
-        </h2>
-        <Show when={!props.policy} fallback={<p class="mono">{props.policy}</p>}>
-          <input
-            type="text"
-            placeholder="policy-name"
-            aria-label="Policy name"
-            autocomplete="off"
-            required
-            value={name()}
-            onInput={(e) => setName(e.currentTarget.value)}
-          />
-        </Show>
-        <Show when={props.policy === "AWSRevokeOlderSessions"}>
-          <p class="subtle small">
-            This policy revokes the role's sessions issued before its time (Revoke sessions sets it). Delete it once those
-            sessions have expired.
-          </p>
-        </Show>
-        <PolicyEditor document={document()} setDocument={setDocument} buckets={props.buckets} disabled={loading()} />
-        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
-        <div class="buttons">
-          <Show when={props.policy}>
-            <button type="button" class="danger" onClick={remove}>
-              Delete
-            </button>
-          </Show>
-          <button type="button" onClick={() => dialog.close()}>
-            Cancel
-          </button>
-          <button class="primary" type="submit" disabled={loading()}>
-            Save
-          </button>
-        </div>
-      </form>
-    </dialog>
-  );
-}
-
-/** Attaching a managed policy to a role: those it doesn't have yet. */
-function AttachDialog(props: { role: Role; policies: ManagedPolicy[]; onClose: () => void; changed: () => void }) {
-  let dialog!: HTMLDialogElement;
-  onMount(() => dialog.showModal());
-  const open = () => props.policies.filter((p) => !props.role.attached.some((a) => a.arn === p.arn));
-  const [arn, setArn] = createSignal(open().find((p) => !p.aws)?.arn ?? open()[0]?.arn ?? "");
-  const chosen = () => props.policies.find((p) => p.arn === arn());
-  const attach = async (e: SubmitEvent) => {
-    e.preventDefault();
-    const p = chosen();
-    if (!p) return;
-    if (await act(() => api.attachToRole(props.role.name, p.arn), `Attached ${p.name} to ${props.role.name}`)) {
-      props.changed();
-      dialog.close();
-    }
-  };
-  return (
-    <dialog ref={dialog} onClose={() => props.onClose()}>
-      <form onSubmit={attach}>
-        <h2>
-          Attach a policy to <span class="mono">{props.role.name}</span>
-        </h2>
-        <Show when={open().length} fallback={<p class="subtle">Every policy is attached already.</p>}>
-          <select aria-label="Policy" value={arn()} onChange={(e) => setArn(e.currentTarget.value)}>
-            <optgroup label="The account's">
-              <For each={open().filter((p) => !p.aws)}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
-            </optgroup>
-            <optgroup label="Cairn's (AWS's)">
-              <For each={open().filter((p) => p.aws)}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
-            </optgroup>
-          </select>
-          <Show when={chosen()}>
-            {(p) => (
-              <>
-                <p class="subtle small">{p().description}</p>
-                <div class="pem">{pretty(p().document)}</div>
-              </>
-            )}
-          </Show>
-        </Show>
-        <div class="buttons">
-          <button type="button" onClick={() => dialog.close()}>
-            Cancel
-          </button>
-          <button class="primary" type="submit" disabled={!chosen()}>
-            Attach
-          </button>
-        </div>
-      </form>
-    </dialog>
-  );
-}
-
-/** Tags, as rows to edit. */
-function TagRows(props: { tags: Tag[]; setTags: (t: Tag[]) => void }) {
-  const set = (i: number, change: Partial<Tag>) => props.setTags(props.tags.map((t, j) => (j === i ? { ...t, ...change } : t)));
-  return (
-    <>
-      <For each={props.tags}>
-        {(t, i) => (
-          <div class="form-row">
-            <input type="text" placeholder="key" aria-label="Tag key" value={t.key} onInput={(e) => set(i(), { key: e.currentTarget.value })} />
-            <input type="text" placeholder="value" aria-label="Tag value" value={t.value} onInput={(e) => set(i(), { value: e.currentTarget.value })} />
-            <button type="button" class="small" onClick={() => props.setTags(props.tags.filter((_, j) => j !== i()))}>
-              Remove
-            </button>
-          </div>
-        )}
-      </For>
-      <button type="button" class="small" disabled={props.tags.length >= 50} onClick={() => props.setTags([...props.tags, { key: "", value: "" }])}>
-        Add tag
-      </button>
-    </>
-  );
-}
-
-const cleanTags = (tags: Tag[]) => tags.filter((t) => t.key.trim()).map((t) => ({ key: t.key.trim(), value: t.value }));
 
 /** A role's description, longest session, permissions boundary and tags. */
 function DetailsDialog(props: { role: Role; policies: ManagedPolicy[]; onClose: () => void; changed: () => void }) {
@@ -766,10 +635,7 @@ function DetailsDialog(props: { role: Role; policies: ManagedPolicy[]; onClose: 
         </p>
         <label class="field">
           Permissions boundary
-          <select value={boundary()} onChange={(e) => setBoundary(e.currentTarget.value)}>
-            <option value="">None</option>
-            <For each={props.policies}>{(p) => <option value={p.arn}>{p.name}</option>}</For>
-          </select>
+          <PolicySelect policies={props.policies} value={boundary()} setValue={setBoundary} none="None" label="Permissions boundary" />
         </label>
         <div>Tags</div>
         <TagRows tags={tags()} setTags={setTags} />
@@ -801,19 +667,8 @@ const lines = (text: string) =>
 /** The account's OpenID Connect providers: issuers whose ID tokens STS takes
  * for roles that trust them. */
 function ProvidersPanel(props: { providers: IdentityProvider[]; error?: string; private: boolean; changed: () => void }) {
-  const [url, setUrl] = createSignal("");
-  const [clientIds, setClientIds] = createSignal(STS_AUDIENCE);
-  const [thumbprint, setThumbprint] = createSignal("");
+  const [adding, setAdding] = createSignal(false);
   const [editing, setEditing] = createSignal<IdentityProvider>();
-  const add = async (e: SubmitEvent) => {
-    e.preventDefault();
-    const body = { url: url().trim(), client_ids: lines(clientIds()), thumbprints: lines(thumbprint()), tags: [] };
-    if (await act(() => api.createIdentityProvider(body), `Added ${body.url}`)) {
-      setUrl("");
-      setThumbprint("");
-      props.changed();
-    }
-  };
   const remove = async (p: IdentityProvider) => {
     const roles = p.roles.length ? ` Roles that trust it (${p.roles.join(", ")}) can't be assumed with its tokens any more.` : "";
     if (!confirm(`Delete the provider ${p.url}?${roles}`)) return;
@@ -835,35 +690,11 @@ function ProvidersPanel(props: { providers: IdentityProvider[]; error?: string; 
           (its audience; AWS's SDKs ask for <span class="mono">{STS_AUDIENCE}</span>). These are not the providers people
           sign in to the console at.
         </p>
-        <form class="form-row" onSubmit={add}>
-          <input
-            type="text"
-            inputmode="url"
-            placeholder="https://issuer.example.com"
-            aria-label="Issuer URL"
-            required
-            value={url()}
-            onInput={(e) => setUrl(e.currentTarget.value)}
-          />
-          <input
-            type="text"
-            placeholder="client IDs (audiences), comma-separated"
-            aria-label="Client IDs"
-            value={clientIds()}
-            onInput={(e) => setClientIds(e.currentTarget.value)}
-          />
-          <input
-            type="text"
-            placeholder="certificate SHA-1 (optional)"
-            aria-label="Thumbprint"
-            title="For an issuer whose certificate isn't of a public CA: the SHA-1 of its certificate or its CA's, as openssl x509 -fingerprint -sha1 shows it"
-            value={thumbprint()}
-            onInput={(e) => setThumbprint(e.currentTarget.value)}
-          />
-          <button class="primary" type="submit">
-            Add provider
+        <div class="key-actions">
+          <button class="small" onClick={() => setAdding(true)}>
+            Add a provider…
           </button>
-        </form>
+        </div>
         <Table
           count={props.providers.length}
           empty="None: roles can be assumed with AssumeRole only."
@@ -895,7 +726,7 @@ function ProvidersPanel(props: { providers: IdentityProvider[]; error?: string; 
                 </td>
                 <td>
                   <For each={p.roles} fallback={<span class="subtle">no role</span>}>
-                    {(r) => <span class="chip mono">{r}</span>}
+                    {(r) => <Chip href={roleHref(r)}>{r}</Chip>}
                   </For>
                 </td>
                 <td class="actions">
@@ -923,6 +754,9 @@ function ProvidersPanel(props: { providers: IdentityProvider[]; error?: string; 
         </p>
       </Show>
       <Show when={editing()}>{(p) => <ProviderDialog provider={p()} onClose={() => setEditing(undefined)} changed={props.changed} />}</Show>
+      <Show when={adding()}>
+        <NewProviderDialog onClose={() => setAdding(false)} changed={props.changed} />
+      </Show>
     </Panel>
   );
 }
@@ -971,6 +805,72 @@ function ProviderDialog(props: { provider: IdentityProvider; onClose: () => void
           </button>
           <button class="primary" type="submit">
             Save
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+/** A new OpenID Connect provider: its issuer, client IDs and thumbprints. */
+function NewProviderDialog(props: { onClose: () => void; changed: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const [url, setUrl] = createSignal("");
+  const [clientIds, setClientIds] = createSignal(STS_AUDIENCE);
+  const [thumbprints, setThumbprints] = createSignal("");
+  const [error, setError] = createSignal<string>();
+  const add = async (e: SubmitEvent) => {
+    e.preventDefault();
+    const body = { url: url().trim(), client_ids: lines(clientIds()), thumbprints: lines(thumbprints()), tags: [] };
+    try {
+      await api.createIdentityProvider(body);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    toast(`Added ${body.url}`);
+    props.changed();
+    dialog.close();
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={add}>
+        <h2>New identity provider</h2>
+        <label class="field">
+          Issuer URL
+          <input
+            type="text"
+            inputmode="url"
+            placeholder="https://issuer.example.com"
+            required
+            value={url()}
+            onInput={(e) => setUrl(e.currentTarget.value)}
+          />
+        </label>
+        <label class="field">
+          Client IDs (audiences), one a line
+          <textarea rows={3} spellcheck={false} value={clientIds()} onInput={(e) => setClientIds(e.currentTarget.value)} />
+        </label>
+        <p class="subtle small">
+          A token is taken only if it's for one of these (its aud claim); AWS's SDKs ask for{" "}
+          <span class="mono">{STS_AUDIENCE}</span>.
+        </p>
+        <label class="field">
+          Thumbprints (optional), one a line
+          <textarea rows={2} spellcheck={false} value={thumbprints()} onInput={(e) => setThumbprints(e.currentTarget.value)} />
+        </label>
+        <p class="subtle small">
+          For an issuer whose certificate isn't of a public CA: the SHA-1 of its certificate or its CA's, as{" "}
+          <span class="mono">openssl x509 -fingerprint -sha1</span> shows it.
+        </p>
+        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit">
+            Add provider
           </button>
         </div>
       </form>

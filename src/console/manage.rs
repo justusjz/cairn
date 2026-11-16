@@ -105,7 +105,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(delete_user, update_user))
         .routes(routes!(set_boundary, delete_boundary))
         .routes(routes!(set_user_tags))
-        .routes(routes!(set_admin))
         .routes(routes!(list_policies, create_policy))
         .routes(routes!(update_policy, delete_policy_managed))
         .routes(routes!(set_policy_tags))
@@ -2381,9 +2380,8 @@ pub(super) struct UserSummary {
     /// Its identity (entity) in the KMS, which key owners grant keys to;
     /// none until Cairn has logged in as it, or without a KMS.
     kms_entity_id: Option<String>,
-    admin: bool,
     created_at: f64,
-    /// Its attached managed policies (AdministratorAccess, if it's an admin).
+    /// Its attached managed policies.
     attached: Vec<AttachedPolicy>,
     /// Its access keys, oldest first (never their secrets).
     keys: Vec<AccessKey>,
@@ -2481,7 +2479,6 @@ async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) ->
             name: r.name,
             id: r.id.to_string(),
             kms_entity_id: r.kms_entity_id,
-            admin: r.admin,
             created_at: r.created_at,
             attached: attached
                 .remove(&r.id)
@@ -2507,8 +2504,13 @@ struct CreateUser {
     /// gets none, and signs in to the console through its link.
     #[serde(default)]
     access_key: bool,
+    /// Managed policies to attach to it, by ARN (each checked as IAM's
+    /// AttachUserPolicy).
     #[serde(default)]
-    admin: bool,
+    policies: Vec<String>,
+    /// Groups to add it to, by name (each checked as IAM's AddUserToGroup).
+    #[serde(default)]
+    groups: Vec<String>,
     /// Its path (`/`, or `/…/`); `/` if not given.
     path: Option<String>,
     /// Its tags.
@@ -2571,10 +2573,14 @@ async fn create_user(
         actor.check_with(&app, "iam:TagUser", new.on(), &asked).await?;
     }
     let access_key = body.access_key;
-    if body.admin {
+    for arn in &body.policies {
         let mut context = new.context("iam:AttachUserPolicy");
-        context.extend(&key("iam:PolicyARN", &crate::managed::aws_arn(crate::managed::ADMINISTRATOR_ACCESS)));
+        context.extend(&key("iam:PolicyARN", arn));
         actor.check_with(&app, "iam:AttachUserPolicy", new.on(), &context).await?;
+    }
+    let mut groups = Vec::with_capacity(body.groups.len());
+    for name in &body.groups {
+        groups.push(super::groups::check_group(&app, &actor, "iam:AddUserToGroup", name, Context::default()).await?);
     }
     if access_key {
         actor.check_with(&app, "iam:CreateAccessKey", new.on(), &new.context("iam:CreateAccessKey")).await?;
@@ -2589,8 +2595,11 @@ async fn create_user(
         if !tags.is_empty() {
             users::tag(&client, id, &tags).await?;
         }
-        if body.admin {
-            users::update(&client, &account, &body.name, Some(true), None).await?;
+        for group in &groups {
+            crate::groups::add_member(&client, group, id, &body.name).await?;
+        }
+        for arn in &body.policies {
+            crate::managed::attach(&client, &account, &body.name, arn, true).await?;
         }
         anyhow::Ok(match access_key {
             true => {
@@ -2604,7 +2613,11 @@ async fn create_user(
         Ok(key) => key,
         Err(e) => {
             // All or nothing, as before (the user, then its key, were one
-            // statement).
+            // statement): out of the groups it got into first, as a user
+            // in a group isn't deleted.
+            for group in &groups {
+                let _ = crate::groups::remove_member(&client, group, id, &body.name).await;
+            }
             let _ = users::delete(&client, &account, &body.name).await;
             return Err(e.into());
         }
@@ -2775,32 +2788,6 @@ async fn set_user_tags(
     if !changed.is_empty() {
         users::tag(&client, user.id, &changed).await?;
     }
-    Ok(StatusCode::NO_CONTENT)
-}
-
-#[derive(Deserialize, ToSchema)]
-struct AdminFlag {
-    admin: bool,
-}
-
-/// Makes a user an admin, or not.
-#[utoipa::path(put, path = "/users/{user}/admin", params(("user" = String, Path)),
-    request_body = AdminFlag, responses(
-        (status = 204, description = "Changed"),
-        (status = "4XX", body = ErrorBody),
-        (status = "5XX", body = ErrorBody),
-    ))]
-async fn set_admin(
-    State(app): AppState,
-    Extension(actor): Extension<Actor>,
-    Path(name): Path<String>,
-    Json(body): Json<AdminFlag>,
-) -> Result<StatusCode> {
-    // AdministratorAccess, attached or detached.
-    let action = if body.admin { "iam:AttachUserPolicy" } else { "iam:DetachUserPolicy" };
-    let arn = crate::managed::aws_arn(crate::managed::ADMINISTRATOR_ACCESS);
-    let account = check_user_with(&app, &actor, action, &name, key("iam:PolicyARN", &arn)).await?.account;
-    users::update(&app.pool.get().await?, &account, &name, Some(body.admin), None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3749,7 +3736,7 @@ mod e2e {
         let uri = format!("/api/buckets/{BUCKET}/download?key=nope");
         assert_eq!(admin.send("GET", &uri, None).await.0, StatusCode::NOT_FOUND);
 
-        let new = json!({ "name": "ui-role", "admin": false, "access_key": true });
+        let new = json!({ "name": "ui-role", "access_key": true });
         let (status, created) = admin.send("POST", "/api/users", Some(new)).await;
         assert_eq!(status, StatusCode::CREATED);
         let key = created["access_key"]["name"].as_str().unwrap();

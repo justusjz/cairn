@@ -2,42 +2,15 @@
 // operators: any provider that follows the standard, by its issuer URL
 // and a client registered with it (see `src/console/oidc.rs`).
 
-import { For, Show, createSignal } from "solid-js";
+import { For, Show, createSignal, onMount } from "solid-js";
 import { type OidcProvider, api } from "../api";
-import { Loading, Panel, Table, act, poll } from "../components/ui";
+import { Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { num } from "../format";
 
 export default function SignIn() {
   const data = poll(() => api.oidcConfig(), 30000);
-  const [name, setName] = createSignal("");
-  const [label, setLabel] = createSignal("");
-  const [issuer, setIssuer] = createSignal("");
-  const [clientId, setClientId] = createSignal("");
-  const [secret, setSecret] = createSignal("");
-  const [scopes, setScopes] = createSignal("openid email profile");
-  const [editing, setEditing] = createSignal(false);
-  const edit = (p: OidcProvider) => {
-    setName(p.name);
-    setLabel(p.label);
-    setIssuer(p.issuer);
-    setClientId(p.client_id);
-    setSecret("");
-    setScopes(p.scopes);
-    setEditing(true);
-  };
-  const save = async (e: SubmitEvent) => {
-    e.preventDefault();
-    const body = { label: label(), issuer: issuer().trim(), client_id: clientId().trim(), client_secret: secret() || null, scopes: scopes() };
-    if (await act(() => api.setOidcProvider(name().trim(), body), `Saved ${label()}`)) {
-      setEditing(false);
-      setName("");
-      setLabel("");
-      setIssuer("");
-      setClientId("");
-      setSecret("");
-      data.refresh();
-    }
-  };
+  /** The provider being edited, or `null` for a new one. */
+  const [editing, setEditing] = createSignal<OidcProvider | null>();
   const remove = async (p: OidcProvider) => {
     if (!confirm(`Remove ${p.label}? The ${p.logins} logins it signs in then sign in only with their other ways in.`)) return;
     if (await act(() => api.deleteOidcProvider(p.name), `Removed ${p.label}`)) data.refresh();
@@ -46,6 +19,9 @@ export default function SignIn() {
     <>
       <div class="page-head">
         <h1>Sign-in</h1>
+        <button class="primary" onClick={() => setEditing(null)}>
+          New provider
+        </button>
       </div>
       <p class="subtle small">
         People sign in to the console with passkeys, and with any OpenID Connect provider you add here (Keycloak,
@@ -84,7 +60,7 @@ export default function SignIn() {
                       </td>
                       <td class="num">{num(p.logins)}</td>
                       <td class="actions">
-                        <button class="small" onClick={() => edit(p)}>
+                        <button class="small" onClick={() => setEditing(p)}>
                           Edit
                         </button>
                         <button class="small danger" onClick={() => remove(p)}>
@@ -99,45 +75,77 @@ export default function SignIn() {
           </>
         )}
       </Show>
-      <Panel title={editing() ? `Edit ${name()}` : "Add a provider"}>
-        <form class="stacked" onSubmit={save}>
-          <label class="field">
-            Name (lowercase, in URLs)
-            <input type="text" required disabled={editing()} value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="company" />
-          </label>
-          <label class="field">
-            Button label
-            <input type="text" required value={label()} onInput={(e) => setLabel(e.currentTarget.value)} placeholder="Company SSO" />
-          </label>
-          <label class="field">
-            Issuer URL
-            <input type="url" required value={issuer()} onInput={(e) => setIssuer(e.currentTarget.value)} placeholder="https://sso.example.com/realms/main" />
-          </label>
-          <label class="field">
-            Client ID
-            <input type="text" required value={clientId()} onInput={(e) => setClientId(e.currentTarget.value)} />
-          </label>
-          <label class="field">
-            Client secret {editing() ? "(empty: keep it)" : "(empty: a public client)"}
-            <input type="password" autocomplete="off" value={secret()} onInput={(e) => setSecret(e.currentTarget.value)} />
-          </label>
-          <label class="field">
-            Scopes
-            <input type="text" value={scopes()} onInput={(e) => setScopes(e.currentTarget.value)} />
-          </label>
-          <div class="form-row">
-            <button class="primary" type="submit">
-              {editing() ? "Save" : "Add provider"}
-            </button>
-            <Show when={editing()}>
-              <button type="button" onClick={() => setEditing(false)}>
-                Cancel
-              </button>
-            </Show>
-          </div>
-          <p class="subtle small">Saving checks the issuer's discovery document and keys.</p>
-        </form>
-      </Panel>
+      <Show when={editing() !== undefined}>
+        <ProviderDialog provider={editing() ?? undefined} onClose={() => setEditing(undefined)} changed={data.refresh} />
+      </Show>
     </>
+  );
+}
+
+/** A sign-in provider to add, or to change (`provider`). */
+function ProviderDialog(props: { provider?: OidcProvider; onClose: () => void; changed: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const p = props.provider;
+  const [name, setName] = createSignal(p?.name ?? "");
+  const [label, setLabel] = createSignal(p?.label ?? "");
+  const [issuer, setIssuer] = createSignal(p?.issuer ?? "");
+  const [clientId, setClientId] = createSignal(p?.client_id ?? "");
+  const [secret, setSecret] = createSignal("");
+  const [scopes, setScopes] = createSignal(p?.scopes ?? "openid email profile");
+  const [error, setError] = createSignal<string>();
+  const save = async (e: SubmitEvent) => {
+    e.preventDefault();
+    const body = { label: label(), issuer: issuer().trim(), client_id: clientId().trim(), client_secret: secret() || null, scopes: scopes() };
+    try {
+      await api.setOidcProvider(name().trim(), body);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    toast(`Saved ${label()}`);
+    props.changed();
+    dialog.close();
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={save}>
+        <h2>{p ? `Edit ${p.label}` : "New sign-in provider"}</h2>
+        <label class="field">
+          Name (lowercase, in URLs)
+          <input type="text" required disabled={!!p} value={name()} onInput={(e) => setName(e.currentTarget.value)} placeholder="company" />
+        </label>
+        <label class="field">
+          Button label
+          <input type="text" required value={label()} onInput={(e) => setLabel(e.currentTarget.value)} placeholder="Company SSO" />
+        </label>
+        <label class="field">
+          Issuer URL
+          <input type="url" required value={issuer()} onInput={(e) => setIssuer(e.currentTarget.value)} placeholder="https://sso.example.com/realms/main" />
+        </label>
+        <label class="field">
+          Client ID
+          <input type="text" required value={clientId()} onInput={(e) => setClientId(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          Client secret {p ? "(empty: keep it)" : "(empty: a public client)"}
+          <input type="password" autocomplete="off" value={secret()} onInput={(e) => setSecret(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          Scopes
+          <input type="text" value={scopes()} onInput={(e) => setScopes(e.currentTarget.value)} />
+        </label>
+        <p class="subtle small">Saving checks the issuer's discovery document and keys.</p>
+        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit">
+            {p ? "Save" : "Add provider"}
+          </button>
+        </div>
+      </form>
+    </dialog>
   );
 }

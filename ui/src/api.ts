@@ -119,14 +119,15 @@ export const api = {
    * service (`accessKey`: one, named as it, whose secret comes back once). */
   createUser: (
     name: string,
-    opts: { accessKey?: boolean; admin?: boolean; path?: string; boundary?: string; tags?: Tag[] } = {},
+    opts: { accessKey?: boolean; policies?: string[]; groups?: string[]; path?: string; boundary?: string; tags?: Tag[] } = {},
   ) =>
     ok(
       client.POST("/users", {
         body: {
           name,
           access_key: opts.accessKey ?? false,
-          admin: opts.admin ?? false,
+          policies: opts.policies ?? [],
+          groups: opts.groups ?? [],
           path: opts.path || null,
           boundary: opts.boundary || null,
           tags: opts.tags ?? [],
@@ -143,8 +144,6 @@ export const api = {
   /** Sets all of a user's tags. */
   setUserTags: (user: string, tags: Tag[]) =>
     ok(client.PUT("/users/{user}/tags", { params: userPath(user), body: { tags } })),
-  setAdmin: (user: string, admin: boolean) =>
-    ok(client.PUT("/users/{user}/admin", { params: userPath(user), body: { admin } })),
   policies: () => ok(client.GET("/policies")),
   /** The policy templates there are (see `src/templates.rs`). */
   templates: () => ok(client.GET("/templates")),

@@ -1,11 +1,13 @@
 // An account's managed policies (see `src/managed.rs`): Cairn's, which have
 // AWS's names and say what AWS's do, and the account's own, which are
-// attached to users, roles and groups on the Users, Roles and Groups pages. Making,
-// changing (a new version) and deleting (once nothing has it attached) the
-// account's own.
+// attached to users, roles and groups on their pages. The list, a policy's
+// own page (its document, and who has it), making, changing (a new version)
+// and deleting (once nothing has it attached) the account's own.
 
+import { A, useNavigate, useParams, useSearchParams } from "@solidjs/router";
 import { For, Show, createResource, createSignal, onMount } from "solid-js";
 import { type ManagedPolicy, type Tag, api } from "../api";
+import { Chip, DetailHead, Gone, TagChips, TagRows, cleanTags, groupHref, policyHref, roleHref, userHref } from "../components/Iam";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { EMPTY, PolicyEditor } from "../components/PolicyEditor";
 import { ago, pretty } from "../format";
@@ -17,12 +19,8 @@ const used = (p: ManagedPolicy) =>
 
 export default function Policies() {
   const data = poll(() => Promise.all([api.policies(), api.buckets()]), 10000);
-  const [open, setOpen] = createSignal<{ policy?: ManagedPolicy }>();
+  const [creating, setCreating] = createSignal(false);
   const [fromTemplate, setFromTemplate] = createSignal(false);
-  const remove = async (p: ManagedPolicy) => {
-    if (!confirm(`Delete policy "${p.name}"?`)) return;
-    if (await act(() => api.deleteManagedPolicy(p.name), `Deleted ${p.name}`)) data.refresh();
-  };
   const buckets = () => (data.data()?.[1] ?? []).map((b) => b.name);
   return (
     <>
@@ -30,28 +28,29 @@ export default function Policies() {
         <h1>Policies</h1>
         <div class="buttons">
           <button onClick={() => setFromTemplate(true)}>From a template</button>
-          <button class="primary" onClick={() => setOpen({})}>
+          <button class="primary" onClick={() => setCreating(true)}>
             New policy
           </button>
         </div>
       </div>
       <p class="subtle small">
-        Managed policies are documents of their own, attached to any number of users, groups and roles (on the Users,
-        Groups and Roles pages): what a user, or a role's session, may do is what its attached and inline policies (and a
-        user's groups') allow, and its
-        buckets' policies, where they name it; a Deny wins over any Allow. Cairn's own have AWS's names and say what AWS's do, so policies and tools written for AWS
-        work as they are. Templates make policies for common setups: above all a team sharing the account, whose admins
-        manage its users, roles, policies and buckets and can't get past them.
+        Managed policies are documents of their own, attached to any number of users, groups and roles: what a user, or a
+        role's session, may do is what its attached and inline policies (and a user's groups') allow, and its buckets'
+        policies, where they name it; a Deny wins over any Allow. Cairn's own have AWS's names and say what AWS's do, so
+        policies and tools written for AWS work as they are. Templates make policies for common setups: above all a team
+        sharing the account, whose admins manage its users, roles, policies and buckets and can't get past them.
       </p>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
         {(d) => (
           <Panel>
-            <Table count={d()[0].length} columns={["Name", "Description", "Attached to", "Version", ""]}>
+            <Table count={d()[0].length} columns={["Name", "Description", "Attached to", "Version"]}>
               <For each={d()[0]}>
                 {(p) => (
                   <tr>
                     <td>
-                      <span class="mono">{p.name}</span>{" "}
+                      <A class="mono" href={policyHref(p.arn)}>
+                        {p.name}
+                      </A>{" "}
                       <Show when={p.aws}>
                         <Badge>Cairn's (AWS)</Badge>
                       </Show>
@@ -60,69 +59,14 @@ export default function Policies() {
                           path {p.path}
                         </div>
                       </Show>
-                      <Show when={p.tags.length}>
-                        <div class="small">
-                          <For each={p.tags}>
-                            {(t) => (
-                              <span class="chip" title="A tag (aws:ResourceTag in IAM actions on the policy)">
-                                {t.key}={t.value}
-                              </span>
-                            )}
-                          </For>
-                        </div>
-                      </Show>
                     </td>
                     <td class="small">{p.description || <span class="subtle">–</span>}</td>
                     <td>
-                      <Show when={!used(p)}>
-                        <span class="subtle">no one</span>
-                      </Show>
-                      <For each={p.users}>{(u) => <span class="chip mono">{u}</span>}</For>
-                      <For each={p.roles}>
-                        {(r) => (
-                          <span class="chip mono" title="A role">
-                            role {r}
-                          </span>
-                        )}
-                      </For>
-                      <For each={p.groups}>
-                        {(g) => (
-                          <span class="chip mono" title="A group: its members have it">
-                            group {g}
-                          </span>
-                        )}
-                      </For>
-                      <Show when={p.bounds.length || p.role_bounds.length}>
-                        <div class="small" title="Users and roles whose permissions boundary it is: it caps what their policies allow">
-                          boundary of <For each={p.bounds}>{(u) => <span class="chip mono">{u}</span>}</For>
-                          <For each={p.role_bounds}>{(r) => <span class="chip mono">role {r}</span>}</For>
-                        </div>
-                      </Show>
+                      <UsedBy policy={p} />
                     </td>
                     <td class="small">
                       v{p.version}
                       <Show when={p.updated_at}>{(t) => <div class="subtle">{ago(t())}</div>}</Show>
-                    </td>
-                    <td class="actions">
-                      <button class="small" onClick={() => setOpen({ policy: p })}>
-                        {p.aws ? "View" : "Edit"}
-                      </button>
-                      <Show when={!p.aws}>
-                        <button
-                          class="small danger"
-                          disabled={used(p)}
-                          title={
-                            p.users.length || p.roles.length || p.groups.length
-                              ? "Detach it from its users, roles and groups first"
-                              : used(p)
-                                ? "It's a permissions boundary: take it off its users and roles first"
-                                : ""
-                          }
-                          onClick={() => remove(p)}
-                        >
-                          Delete
-                        </button>
-                      </Show>
                     </td>
                   </tr>
                 )}
@@ -134,18 +78,115 @@ export default function Policies() {
       <Show when={fromTemplate()}>
         <TemplateDialog onClose={() => setFromTemplate(false)} changed={data.refresh} />
       </Show>
-      <Show when={open()}>
-        {(o) => (
-          <ManagedPolicyDialog
-            policy={o().policy}
-            policies={data.data()?.[0] ?? []}
-            buckets={buckets()}
-            onClose={() => setOpen(undefined)}
-            changed={data.refresh}
-          />
-        )}
+      <Show when={creating()}>
+        <ManagedPolicyDialog policies={data.data()?.[0] ?? []} buckets={buckets()} onClose={() => setCreating(false)} changed={data.refresh} />
       </Show>
     </>
+  );
+}
+
+/** Who has a policy, as links: attached to users, groups and roles, and as
+ * their permissions boundary. */
+function UsedBy(props: { policy: ManagedPolicy }) {
+  const p = () => props.policy;
+  return (
+    <>
+      <Show when={!used(p())}>
+        <span class="subtle">no one</span>
+      </Show>
+      <For each={p().users}>{(u) => <Chip href={userHref(u)}>{u}</Chip>}</For>
+      <For each={p().groups}>{(g) => <Chip href={groupHref(g)} title="A group: its members have it">group {g}</Chip>}</For>
+      <For each={p().roles}>{(r) => <Chip href={roleHref(r)}>role {r}</Chip>}</For>
+      <Show when={p().bounds.length || p().role_bounds.length}>
+        <div class="small" title="Users and roles whose permissions boundary it is: it caps what their policies allow">
+          boundary of <For each={p().bounds}>{(u) => <Chip href={userHref(u)}>{u}</Chip>}</For>
+          <For each={p().role_bounds}>{(r) => <Chip href={roleHref(r)}>role {r}</Chip>}</For>
+        </div>
+      </Show>
+    </>
+  );
+}
+
+// ─── A policy's page ─────────────────────────────────────────────────────────
+
+export function PolicyPage() {
+  const params = useParams();
+  const [search] = useSearchParams();
+  const navigate = useNavigate();
+  const name = () => params.name!;
+  const aws = () => search.aws !== undefined;
+  const data = poll(() => Promise.all([api.policies(), api.buckets()]), 10000);
+  const policy = () => data.data()?.[0].find((p) => p.name === name() && p.aws === aws());
+  const [editing, setEditing] = createSignal(false);
+  const blocker = () => {
+    const p = policy();
+    if (!p || !used(p)) return "";
+    return p.users.length || p.roles.length || p.groups.length
+      ? "Detach it from its users, roles and groups first"
+      : "It's a permissions boundary: take it off its users and roles first";
+  };
+  const remove = async () => {
+    if (!confirm(`Delete policy "${name()}"?`)) return;
+    if (await act(() => api.deleteManagedPolicy(name()), `Deleted ${name()}`)) navigate("/policies");
+  };
+  return (
+    <Show when={data.data()} fallback={<Loading error={data.error()} />}>
+      <Show when={policy()} fallback={<Gone kind="Policies" href="/policies" name={name()} />}>
+        {(p) => (
+          <>
+            <DetailHead kind="Policies" href="/policies" name={p().name}>
+              <Show when={!p().aws}>
+                <button onClick={() => setEditing(true)}>Edit…</button>
+                <button class="danger" disabled={!!blocker()} title={blocker()} onClick={remove}>
+                  Delete
+                </button>
+              </Show>
+            </DetailHead>
+            <Panel title="Summary">
+              <dl class="kv">
+                <dt>ARN</dt>
+                <dd class="mono">{p().arn}</dd>
+                <dt>Description</dt>
+                <dd>{p().description || <span class="subtle">none</span>}</dd>
+                <Show when={!p().aws}>
+                  <dt>Path</dt>
+                  <dd class="mono">{p().path}</dd>
+                </Show>
+                <dt>Version</dt>
+                <dd>
+                  v{p().version}
+                  <Show when={p().updated_at}>{(t) => <span class="subtle"> · {ago(t())}</span>}</Show>
+                </dd>
+                <Show when={!p().aws}>
+                  <dt>Tags</dt>
+                  <dd>
+                    <TagChips tags={p().tags} title="A tag (aws:ResourceTag in IAM actions on the policy)" />
+                  </dd>
+                </Show>
+              </dl>
+              <Show when={p().aws}>
+                <p class="subtle small">Cairn's policies are AWS's, and can't be changed: make one of your own instead.</p>
+              </Show>
+            </Panel>
+            <Panel title="What it allows">
+              <div class="pem">{pretty(p().document)}</div>
+            </Panel>
+            <Panel title="Who has it">
+              <UsedBy policy={p()} />
+            </Panel>
+            <Show when={editing()}>
+              <ManagedPolicyDialog
+                policy={p()}
+                policies={data.data()?.[0] ?? []}
+                buckets={(data.data()?.[1] ?? []).map((b) => b.name)}
+                onClose={() => setEditing(false)}
+                changed={data.refresh}
+              />
+            </Show>
+          </>
+        )}
+      </Show>
+    </Show>
   );
 }
 
@@ -157,6 +198,7 @@ function ManagedPolicyDialog(props: {
   onClose: () => void;
   changed: () => void;
 }) {
+  const navigate = useNavigate();
   let dialog!: HTMLDialogElement;
   const p = props.policy;
   const [name, setName] = createSignal(p?.name ?? "");
@@ -179,8 +221,7 @@ function ManagedPolicyDialog(props: {
     if (!confirm(`Delete v${v} of "${p!.name}"?`)) return;
     if (await act(() => api.deletePolicyVersion(p!.name, v), `Deleted v${v}`)) refetchVersions();
   };
-  const setTag = (i: number, change: Partial<Tag>) => setTags(tags().map((t, j) => (j === i ? { ...t, ...change } : t)));
-  const wantedTags = () => tags().filter((t) => t.key.trim()).map((t) => ({ key: t.key.trim(), value: t.value }));
+  const wantedTags = () => cleanTags(tags());
   onMount(() => dialog.showModal());
   const save = async (e: SubmitEvent) => {
     e.preventDefault();
@@ -201,6 +242,7 @@ function ManagedPolicyDialog(props: {
     toast(`Saved ${p?.name ?? name().trim()}`);
     props.changed();
     dialog.close();
+    if (!p) navigate(policyHref(`/${name().trim()}`));
   };
   return (
     <dialog ref={dialog} class="wide" onClose={() => props.onClose()}>
@@ -246,26 +288,7 @@ function ManagedPolicyDialog(props: {
         <PolicyEditor document={document()} setDocument={setDocument} buckets={props.buckets} readOnly={p?.aws} />
         <Show when={!p?.aws}>
           <div class="small">Tags</div>
-          <For each={tags()}>
-            {(t, i) => (
-              <div class="form-row">
-                <input type="text" placeholder="key" aria-label="Tag key" value={t.key} onInput={(e) => setTag(i(), { key: e.currentTarget.value })} />
-                <input
-                  type="text"
-                  placeholder="value"
-                  aria-label="Tag value"
-                  value={t.value}
-                  onInput={(e) => setTag(i(), { value: e.currentTarget.value })}
-                />
-                <button type="button" class="small" onClick={() => setTags(tags().filter((_, j) => j !== i()))}>
-                  Remove
-                </button>
-              </div>
-            )}
-          </For>
-          <button type="button" class="small" disabled={tags().length >= 50} onClick={() => setTags([...tags(), { key: "", value: "" }])}>
-            Add tag
-          </button>
+          <TagRows tags={tags()} setTags={setTags} />
           <p class="subtle small">
             Policies see a policy's tags as aws:ResourceTag/… in IAM actions on it (a delegated admin may be let change only
             the policies tagged as theirs, say). Unlike users', a policy's tag keys are case-sensitive, as in IAM.

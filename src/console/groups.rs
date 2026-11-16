@@ -32,7 +32,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
 }
 
 /// The session's group `name`, allowed IAM's `action` on it (with `extra`).
-async fn check_group(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str, extra: Context) -> Result<Group> {
+pub(super) async fn check_group(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str, extra: Context) -> Result<Group> {
     let group = Group::load(&app.pool.get().await?, actor.account(), name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no group named {name:?}")))?;

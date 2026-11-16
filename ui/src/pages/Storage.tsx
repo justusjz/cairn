@@ -4,7 +4,7 @@ import { type Cluster, type Storage as StorageInfo, api, diskOf } from "../api";
 type ReplicaGroup = StorageInfo["replicas"][number];
 import { Badge, Bar, Card, LiveDot, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { bytes, num, pct, plural } from "../format";
-import { KmsPanel } from "./Users";
+import { KmsPanel } from "../components/Kms";
 
 export default function Storage() {
   // The catalog's numbers take a scan, so they're refreshed less often.

@@ -390,3 +390,20 @@ form.stacked { max-width: 560px; }
 .form-row.template input[type=text] { flex: 0 1 220px; }
 dialog form > input[type=text] { display: block; width: 100%; box-sizing: border-box; margin: 6px 0; }
 dialog select { max-width: 100%; }
+
+/* The IAM pages: links between users, groups, roles and policies, and a
+ * detail page's actions. */
+.page-head .buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+a.chip.link { color: var(--text); padding: 1px 8px; }
+a.chip.link:hover { border-color: var(--accent); text-decoration: none; }
+button.link { border: none; background: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; }
+button.link:hover { background: none; text-decoration: underline; }
+.panel > .key-actions { margin-top: 8px; }
+.panel > .pem { margin-top: 8px; }
+.checklist {
+  display: flex; flex-direction: column; gap: 2px;
+  max-height: 200px; overflow-y: auto;
+  padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+}
+.checklist label.check { display: flex; align-items: baseline; gap: 6px; }
+.checklist .subtle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

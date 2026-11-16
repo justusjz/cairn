@@ -15,12 +15,13 @@ import Integrity from "./pages/Integrity";
 import Jobs from "./pages/Jobs";
 import Lifecycle from "./pages/Lifecycle";
 import Overview from "./pages/Overview";
-import Policies from "./pages/Policies";
-import Groups from "./pages/Groups";
-import Roles from "./pages/Roles";
+import Policies, { PolicyPage } from "./pages/Policies";
+import Groups, { GroupPage } from "./pages/Groups";
+import Roles, { RolePage } from "./pages/Roles";
 import Storage from "./pages/Storage";
 import SignIn from "./pages/SignIn";
-import Users from "./pages/Users";
+import Users, { UserPage } from "./pages/Users";
+import { userHref } from "./components/Iam";
 import "./styles.css";
 import { ApiError, type Identity, type Me, type Passkey, api } from "./session";
 import { authenticate, deviceName, explain, register, supported } from "./webauthn";
@@ -159,9 +160,6 @@ function UserMenu(props: { me: Me; logout: () => void }) {
           {props.me.name.slice(0, 1).toUpperCase()}
         </span>
         <span class="mono">{label(props.me.identity)}</span>
-        <Show when={props.me.cluster}>
-          <Badge tone="warn">operator</Badge>
-        </Show>
         <span aria-hidden="true">▾</span>
       </button>
       <Show when={open()}>
@@ -384,21 +382,17 @@ function Home() {
             <Table count={1} columns={["As", "ARN"]}>
               <tr>
                 <td>
-                  {m.identity.user}{" "}
-                  <Show when={m.identity.admin}>
-                    <Badge tone="accent">admin</Badge>
-                  </Show>{" "}
-                  <Show when={m.cluster}>
-                    <Badge tone="warn">operator</Badge>
-                  </Show>
+                  <A class="mono" href={userHref(m.identity.user)}>
+                    {m.identity.user}
+                  </A>
                 </td>
                 <td class="mono small">{m.identity.arn}</td>
               </tr>
             </Table>
             <p class="subtle small">
               Policies name you by the ARN: what you may do here is what your policies allow, and what buckets'
-              policies don't deny you. You're an operator if your policies allow
-              you the cluster's actions (<span class="mono">cairn:*</span>). Signed in with a passkey, your session
+              policies don't deny you (your user's page shows its policies). The cluster's pages show if your
+              policies allow you its actions (<span class="mono">cairn:*</span>). Signed in with a passkey, your session
               counts as multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span>); at a provider, it
               doesn't.
             </p>
@@ -556,9 +550,13 @@ render(
       <Route path="/jobs" component={Guarded(Jobs)} />
       <Route path="/sign-in" component={Guarded(SignIn)} />
       <Route path="/users" component={Guarded(Users)} />
+      <Route path="/users/:name" component={Guarded(UserPage)} />
       <Route path="/groups" component={Guarded(Groups)} />
+      <Route path="/groups/:name" component={Guarded(GroupPage)} />
       <Route path="/roles" component={Guarded(Roles)} />
+      <Route path="/roles/:name" component={Guarded(RolePage)} />
       <Route path="/policies" component={Guarded(Policies)} />
+      <Route path="/policies/:name" component={Guarded(PolicyPage)} />
       <Route path="/account" component={Home} />
       <Route path="/buckets" component={Guarded(BucketList)} />
       <Route path="/buckets/:bucket" component={Guarded(BucketBrowser)} />
