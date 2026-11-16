@@ -1213,14 +1213,18 @@ storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one).
 S3 Inventory: a bucket's inventory configurations
 (`PutBucketInventoryConfiguration`, `aws s3api put-bucket-inventory-configuration`)
 have Cairn write a report of its objects, daily or weekly, into a bucket, as
-S3 writes it: gzipped CSV data files, a `manifest.json` listing them (with
-`manifest.checksum`), and a Hive `symlink.txt`, under
+S3 writes it: data files in gzipped CSV or Parquet, a `manifest.json` listing
+them (with `manifest.checksum`), and a Hive `symlink.txt`, under
 `<prefix>/<bucket>/<id>/`, so tools that read S3's reports (Athena, Spark,
-scripts) read Cairn's. A report lists the current objects, or every version
-and delete marker, under a prefix, with the optional fields asked for: size,
-last-modified date, ETag, encryption status, Object Lock, checksum algorithm,
-lifecycle expiration date and the rest. Only CSV is written; ORC and Parquet
-are refused.
+DuckDB, scripts) read Cairn's. A report lists the current objects, or every
+version and delete marker, under a prefix, with the optional fields asked for:
+size, last-modified date, ETag, encryption status, Object Lock, checksum
+algorithm, lifecycle expiration date and the rest. ORC is refused.
+
+Parquet files have S3's schema (`bucket`, `key`, `size`, `last_modified_date`
+and so on, with sizes as integers and dates as timestamps), so S3's Athena
+table for them reads Cairn's. They're cheaper to query than CSV: a query reads
+only the columns it needs.
 
 As in S3, the destination bucket's policy must let the `s3.amazonaws.com`
 service write the reports; S3's user guide gives the policy:
@@ -1260,7 +1264,8 @@ versions), and where it has got to is saved after each, so if its node dies,
 another carries on from there; a bucket of a billion versions at the
 default rate takes about six weeks, so raise the rate for buckets that
 large. A report is streamed as it's read, so it takes the same little memory
-however large the bucket is. Like S3's, it's as of no single moment: what's
+however large the bucket is: a CSV report a page of versions, a Parquet one at
+most a row group (about 16 MiB of rows) besides. Like S3's, it's as of no single moment: what's
 written or deleted while it's made may or may not be in it.
 
 ## Tags

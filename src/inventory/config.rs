@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::s3::util::xml_escape;
 
+use super::parquet;
+
 /// How many configurations a bucket may have, as in S3.
 pub const MAX_PER_BUCKET: i32 = 1000;
 
@@ -42,6 +44,29 @@ pub struct Destination {
     pub prefix: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<Encryption>,
+    /// What its reports' data files are (CSV, if it was kept before Cairn
+    /// had others).
+    #[serde(default)]
+    pub format: Format,
+}
+
+/// What a report's data files are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Format {
+    /// Gzipped CSV.
+    #[default]
+    Csv,
+    Parquet,
+}
+
+impl Format {
+    /// As `<Format>` and the manifest's `fileFormat` have it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Format::Csv => "CSV",
+            Format::Parquet => "Parquet",
+        }
+    }
 }
 
 /// How a report's files are encrypted, besides what the destination's
@@ -144,8 +169,7 @@ pub enum Invalid {
     Malformed(String),
     /// A value S3 refuses: `InvalidArgument`.
     Argument(String),
-    /// What S3 has and Cairn doesn't (another format than CSV):
-    /// `NotImplemented`.
+    /// What S3 has and Cairn doesn't (ORC): `NotImplemented`.
     Unsupported(String),
 }
 
@@ -366,20 +390,56 @@ impl Column {
             Column::EventHoldDurationUnit => "ObjectLockEventHoldDurationUnit",
         }
     }
+
+    /// Its column of a Parquet file: its name and type, as S3's schema has
+    /// them (the bucket and key are the only required ones).
+    pub fn parquet(self) -> parquet::Column {
+        use parquet::Type::{Boolean, Int32, Int64, Text, Timestamp};
+        let (name, ty) = match self {
+            Column::Bucket => ("bucket", Text),
+            Column::Key => ("key", Text),
+            Column::VersionId => ("version_id", Text),
+            Column::IsLatest => ("is_latest", Boolean),
+            Column::IsDeleteMarker => ("is_delete_marker", Boolean),
+            Column::EventHoldDurationUnit => ("object_lock_event_hold_duration_unit", Text),
+            Column::Field(field) => match field {
+                Field::Size => ("size", Int64),
+                Field::LastModifiedDate => ("last_modified_date", Timestamp),
+                Field::ETag => ("e_tag", Text),
+                Field::StorageClass => ("storage_class", Text),
+                Field::IsMultipartUploaded => ("is_multipart_uploaded", Boolean),
+                Field::ReplicationStatus => ("replication_status", Text),
+                Field::EncryptionStatus => ("encryption_status", Text),
+                Field::ObjectLockRetainUntilDate => ("object_lock_retain_until_date", Timestamp),
+                Field::ObjectLockMode => ("object_lock_mode", Text),
+                Field::ObjectLockLegalHoldStatus => ("object_lock_legal_hold_status", Text),
+                Field::IntelligentTieringAccessTier => ("intelligent_tiering_access_tier", Text),
+                Field::BucketKeyStatus => ("bucket_key_status", Text),
+                Field::ChecksumAlgorithm => ("checksum_algorithm", Text),
+                Field::ObjectAccessControlList => ("object_access_control_list", Text),
+                Field::ObjectOwner => ("object_owner", Text),
+                Field::ObjectLockEventHoldStatus => ("object_lock_event_hold_status", Text),
+                Field::ObjectLockEventHoldDuration => ("object_lock_event_hold_duration", Int32),
+                Field::LifecycleExpirationDate => ("lifecycle_expiration_date", Timestamp),
+            },
+        };
+        parquet::Column { name, ty, required: matches!(self, Column::Bucket | Column::Key) }
+    }
 }
 
 impl Destination {
     fn parse(node: Node) -> Result<Destination, Invalid> {
         only(node, &["AccountId", "Bucket", "Encryption", "Format", "Prefix"])?;
-        match required(node, "Format")?.as_str() {
-            "CSV" => {}
-            format @ ("ORC" | "Parquet") => {
-                return Err(Invalid::Unsupported(format!(
-                    "Inventory reports in {format} are not implemented; only CSV is"
-                )));
+        let format = match required(node, "Format")?.as_str() {
+            "CSV" => Format::Csv,
+            "Parquet" => Format::Parquet,
+            "ORC" => {
+                return Err(Invalid::Unsupported(
+                    "Inventory reports in ORC are not implemented; CSV and Parquet are".to_owned(),
+                ));
             }
             _ => return Err(Invalid::Malformed("Format is CSV, ORC or Parquet".to_owned())),
-        }
+        };
         let arn = required(node, "Bucket")?;
         let bucket = arn
             .strip_prefix("arn:aws:s3:::")
@@ -412,6 +472,7 @@ impl Destination {
             bucket: bucket.to_owned(),
             prefix: text(node, "Prefix")?.filter(|p| !p.is_empty()),
             encryption,
+            format,
         })
     }
 
@@ -429,7 +490,7 @@ impl Destination {
                 xml_escape(key)
             )),
         }
-        xml.push_str("<Format>CSV</Format>");
+        xml.push_str(&format!("<Format>{}</Format>", self.format.name()));
         if let Some(prefix) = &self.prefix {
             xml.push_str(&format!("<Prefix>{}</Prefix>", xml_escape(prefix)));
         }
@@ -484,6 +545,7 @@ mod tests {
                     bucket: "reports".to_owned(),
                     prefix: Some("inv".to_owned()),
                     encryption: Some(Encryption::S3),
+                    format: Format::Csv,
                 },
                 prefix: Some("photos/".to_owned()),
                 all_versions: true,
@@ -527,7 +589,7 @@ mod tests {
         assert!(malformed(&config(&format!("{DESTINATION}<IsEnabled>true</IsEnabled><Id>a</Id>"))));
         let unsupported = config(
             "<Destination><S3BucketDestination><Bucket>arn:aws:s3:::reports</Bucket>\
-             <Format>Parquet</Format></S3BucketDestination></Destination>\
+             <Format>ORC</Format></S3BucketDestination></Destination>\
              <IsEnabled>true</IsEnabled><Id>a</Id><IncludedObjectVersions>All</IncludedObjectVersions>\
              <Schedule><Frequency>Daily</Frequency></Schedule>",
         );
@@ -538,6 +600,18 @@ mod tests {
         assert!(matches!(Configuration::parse(&bad_id), Err(Invalid::Argument(_))));
         let twice = minimal("<OptionalFields><Field>Size</Field><Field>Size</Field></OptionalFields>");
         assert!(matches!(Configuration::parse(&twice), Err(Invalid::Argument(_))));
+    }
+
+    #[test]
+    fn parquet_is_a_format() {
+        let parsed = Configuration::parse(&minimal("").replace("<Format>CSV</Format>", "<Format>Parquet</Format>")).unwrap();
+        assert_eq!(parsed.destination.format, Format::Parquet);
+        assert!(parsed.to_xml().contains("<Format>Parquet</Format>"));
+        assert_eq!(Configuration::parse(&parsed.to_xml()).unwrap(), parsed);
+        assert_eq!(Configuration::from_json(&parsed.to_json()).unwrap(), parsed);
+        // Configurations kept before there was a format are CSV's.
+        let kept = r#"{"id":"a","enabled":true,"destination":{"bucket":"reports"},"all_versions":false,"frequency":"Daily"}"#;
+        assert_eq!(Configuration::from_json(kept).unwrap().destination.format, Format::Csv);
     }
 
     #[test]
