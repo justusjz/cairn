@@ -145,10 +145,10 @@ impl Sts<'_> {
         Ok(SessionPolicies { policy, arns: asked.arns })
     }
 
-    /// A new session's credentials, sealed, as STS shows them, and its
+    /// A new session's credentials (its secret set), sealed, as STS shows them, and its
     /// token's size and utilization (probed: STS's are of 4096 bytes, and
     /// AssumeRole's and GetFederationToken's PackedPolicySize is the same).
-    async fn issue(&self, session: &Session) -> Result<(String, String)> {
+    async fn issue(&self, session: &mut Session) -> Result<(String, String)> {
         let token = self.app.sessions.seal(self.client, session).await?;
         let credentials = format!(
             "<Credentials><AccessKeyId>{}</AccessKeyId><SecretAccessKey>{}</SecretAccessKey><SessionToken>{}</SessionToken>\
@@ -171,7 +171,7 @@ impl Sts<'_> {
         let now = sessions::now();
         Ok(Session {
             key_id: sessions::new_key_id()?,
-            secret: sessions::new_secret()?,
+            secret: String::new(),
             issued: now,
             expires: now + seconds as u64,
             who,
@@ -316,7 +316,7 @@ impl Iam<'_> {
         session.chained = chained;
         // A web identity's provider passes on down a chain.
         session.provider = caller.filter(|_| chained).and_then(|c| c.provider.clone());
-        let (mut xml, size) = self.sts().issue(&session).await?;
+        let (mut xml, size) = self.sts().issue(&mut session).await?;
         xml.push_str(&format!(
             "<AssumedRoleUser><AssumedRoleId>{}:{}</AssumedRoleId><Arn>arn:aws:sts::{}:assumed-role/{}/{}</Arn></AssumedRoleUser>",
             roles::unique_id(role.id),
@@ -342,8 +342,8 @@ impl Iam<'_> {
         if params.get("SerialNumber").is_some() || params.get("TokenCode").is_some() {
             return Err(mfa_refused());
         }
-        let session = self.sts().session(Who::User { id: self.principal.id }, seconds.unwrap_or(DEFAULT_LONG))?;
-        let (credentials, size) = self.sts().issue(&session).await?;
+        let mut session = self.sts().session(Who::User { id: self.principal.id }, seconds.unwrap_or(DEFAULT_LONG))?;
+        let (credentials, size) = self.sts().issue(&mut session).await?;
         Ok(Some(credentials + &size))
     }
 
@@ -380,7 +380,7 @@ impl Iam<'_> {
         session.policy = policies.policy;
         session.policy_arns = policies.arns;
         session.tags = tags;
-        let (mut xml, size) = self.sts().issue(&session).await?;
+        let (mut xml, size) = self.sts().issue(&mut session).await?;
         xml.push_str(&format!(
             "<FederatedUser><FederatedUserId>{}:{}</FederatedUserId><Arn>{}</Arn></FederatedUser>",
             self.account(),
@@ -595,7 +595,7 @@ impl Sts<'_> {
         session.transitive = transitive;
         session.source_identity = source;
         session.provider = Some(provider_arn);
-        let (mut xml, size) = self.issue(&session).await?;
+        let (mut xml, size) = self.issue(&mut session).await?;
         xml.push_str(&format!("<SubjectFromWebIdentityToken>{}</SubjectFromWebIdentityToken>", xml_escape(&subject)));
         xml.push_str(&format!(
             "<AssumedRoleUser><AssumedRoleId>{}:{}</AssumedRoleId><Arn>arn:aws:sts::{}:assumed-role/{}/{}</Arn></AssumedRoleUser>",
