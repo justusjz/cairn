@@ -238,6 +238,7 @@ const MIGRATIONS: &[&str] = &[
     INVENTORY,
     NOTIFICATIONS,
     BUCKET_LOGGING,
+    ROOT_SESSIONS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2758,6 +2759,34 @@ CREATE TRIGGER sns_deliveries_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUN
 /// protocol, as it's set by a plain UPDATE of the bucket's row (T64).
 const BUCKET_LOGGING: &str = r#"
 ALTER TABLE buckets ADD COLUMN logging text;
+"#;
+/// Migration 58: the account's root user's way into the console (see
+/// `console::store::create_root_link`): one-time links that the command line
+/// on a node makes, and the sessions they start. The root has no login,
+/// passkeys or keys of its own: a link is the only way in, so whoever can't
+/// run the command line can't be the root. Tokens are kept as their
+/// SHA-256, as enrollment links' and sessions' are.
+const ROOT_SESSIONS: &str = r#"
+CREATE TABLE console_root_links (
+    token_hash bytea PRIMARY KEY,
+    account_id text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL
+);
+CREATE INDEX console_root_links_account ON console_root_links (account_id);
+CREATE TRIGGER console_root_links_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_root_links
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE console_root_sessions (
+    token_hash   bytea PRIMARY KEY,
+    account_id   text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    last_seen_at timestamptz NOT NULL DEFAULT now(),
+    expires_at   timestamptz NOT NULL
+);
+CREATE INDEX console_root_sessions_account ON console_root_sessions (account_id);
+CREATE TRIGGER console_root_sessions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_root_sessions
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

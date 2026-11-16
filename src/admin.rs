@@ -203,7 +203,7 @@ mod e2e {
     #[tokio::test]
     async fn runs_the_clis_commands() {
         let Some(app) = node().await else { return };
-        let out = cairn(&app, &["user", "create", "cli-ada", "--admin"]).await;
+        let out = cairn(&app, &["user", "create", "cli-ada", "--admin", "--key"]).await;
         assert_eq!(out.error, None);
         // A random key ID, as IAM's, unless one is given.
         let key = out.stdout.strip_prefix("access key: ").and_then(|s| s.split_once('\n')).unwrap().0;
@@ -223,6 +223,10 @@ mod e2e {
         assert!(out.stderr.contains("serves no console"), "{}", out.stderr);
         let out = cairn(&app, &["account", "show"]).await;
         assert!(out.stdout.starts_with("account ") && out.stdout.contains(" users, "), "{}", out.stdout);
+        // The root user's link: again only the path.
+        let out = cairn(&app, &["account", "root-link"]).await;
+        assert!(out.stdout.starts_with("/root#"), "{}", out.stdout);
+        assert!(out.stderr.contains("15 minutes"), "{}", out.stderr);
         // What undoes policies that lock people out: attach and detach,
         // and taking a boundary off.
         let ops = "arn:aws:iam::aws:policy/CairnOperatorAccess";

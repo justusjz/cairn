@@ -55,6 +55,8 @@ export const api = {
   oidcUnlink: (provider: string) => ok(client.DELETE("/oidc/{provider}", { params: { path: { provider } } })),
   login: (challenge_id: string, credential: Assertion) => ok(client.POST("/login", { body: { challenge_id, credential } })),
   logout: () => ok(client.POST("/logout")),
+  /** Signs in as the account's root user, with a link from `cairn account root-link`. */
+  rootSignIn: (token: string) => ok(client.POST("/root/sign-in", { body: { token } })),
   passkeyOptions: () => ok(client.POST("/passkeys/options")),
   addPasskey: (challenge_id: string, name: string, credential: Registration) =>
     ok(client.POST("/passkeys", { body: { challenge_id, name, credential } })),

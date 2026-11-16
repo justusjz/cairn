@@ -8,7 +8,9 @@
 //!
 //! A session signed in with a passkey has `aws:MultiFactorAuthPresent` (and
 //! `aws:MultiFactorAuthAge`, since it was); one signed in at an OIDC
-//! provider has it `false`, as AWS's federated sessions without MFA.
+//! provider has it `false`, as AWS's federated sessions without MFA, and so
+//! does the account's root user's (signed in with a link the command line
+//! made: no second factor), as AWS's root without MFA.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -27,7 +29,8 @@ use crate::{
 };
 
 /// Who a request acts as (a request extension, which `as_user` sets): a
-/// console session's user, under the policies that apply to it.
+/// console session's user, under the policies that apply to it, or the
+/// account's root user (see `policy::root_verdict`).
 #[derive(Clone)]
 pub(crate) struct Actor(pub Arc<User>);
 
@@ -54,9 +57,10 @@ impl User {
 }
 
 impl Actor {
-    /// The user's ID, which the KMS knows it by.
+    /// The user's ID, which the KMS knows it by (`None` for the account's
+    /// root user, who has no identity in the KMS).
     pub fn kms_role(&self) -> Option<uuid::Uuid> {
-        Some(self.0.principal.id)
+        (!self.0.principal.root).then_some(self.0.principal.id)
     }
 
     /// The account the session acts in (its ID).

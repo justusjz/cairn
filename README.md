@@ -421,13 +421,35 @@ bucket and policy belongs to; `cairn account show` shows it. Teams are kept
 apart by IAM, as within an AWS account: users' paths (`/team-a/`),
 permissions boundaries, and policies that give each team its own buckets,
 down to the names it may create (`s3:CreateBucket` on
-`arn:aws:s3:::team-a-*`). There's no root user, which no policy restricts:
-the way out of policies that lock people out is the command line on a node
-(`cairn user update <name> --admin`, `cairn user detach`, `cairn user
-unbound`, `cairn bucket-policy delete`), which reaches the database anyway.
-In a bucket policy, `arn:aws:iam::<account>:root` (or the account's ID)
-still means what it does in AWS: the account, whose users' own policies
-then decide.
+`arn:aws:s3:::team-a-*`).
+
+The account has a **root user**, as AWS's, for getting back in when
+policies lock everyone out. Only the command line on a node can make
+someone the root: it has no passkeys, keys or password, and signs in to the
+[console](#console) only with a one-time link that `cairn account root-link`
+prints (valid 15 minutes; its session lasts an hour at most, and 15 minutes
+unused). Whoever can run that could change the database anyway, so the root
+adds no way in. As in AWS:
+
+- no identity policy restricts it: no policy can be attached to it, and no
+  permissions boundary or group applies. It may do anything in the account,
+  IAM and the cluster's `cairn:` actions included;
+- a bucket's (or topic's) policy that denies everyone (`"*"`), or the
+  account (`arn:aws:iam::<account>:root`, or its ID), denies it too; but it
+  may always get, set and delete its own buckets' policies, whatever they
+  say: that's the way out of a policy that denies everyone;
+- its session isn't multi-factor (`aws:MultiFactorAuthPresent` is false),
+  so a policy that denies requests without MFA denies it too (but for the
+  policy itself). It has `aws:PrincipalType` `Account`, and its
+  `aws:userid` is the account's ID;
+- Object Lock's compliance mode holds against it, and it assumes no
+  roles; the KMS doesn't know it, so it can't read SSE-KMS objects.
+
+The command line itself is the other way out (`cairn user update <name>
+--admin`, `cairn user detach`, `cairn user unbound`, `cairn bucket-policy
+delete`). In a bucket policy, `arn:aws:iam::<account>:root` (or the
+account's ID) means what it does in AWS: the account, whose users' own
+policies then decide, and its root user.
 
 **Operators** run the cluster: they're users whose policies allow Cairn's
 own actions, `cairn:` ones (`cairn:GetCluster`, `cairn:PutSetting`,
@@ -590,9 +612,9 @@ temporary credentials. The AWS CLI refuses access key IDs shorter than
 as it.
 
 A bucket policy can deny everyone everything, its admins too, as in S3. The
-command line on a node can always remove it, as an AWS account's root user
-can: `cairn bucket-policy delete <bucket>` (or `get`, or `put <bucket>
-<file>`).
+account's [root user](#users-and-permissions) can always change or remove it,
+as in AWS, and so can the command line on a node: `cairn bucket-policy
+delete <bucket>` (or `get`, or `put <bucket> <file>`).
 
 Secrets are stored in plaintext in the `access_keys` table: SigV4 is an HMAC scheme,
 so verifying a signature needs the secret itself. Restrict access to the
@@ -964,6 +986,12 @@ restarts; everything else is read from the database.
   valid 24 hours: `cairn user enroll <name>`, or the user's page in the console. Once signed in, people add more passkeys (at most 8; a second one,
   on another device, keeps them from being locked out) and remove them, but
   never their last. A lost passkey takes a new link.
+- **The root user** signs in with a link from `cairn account root-link`
+  (see [Users and permissions](#users-and-permissions)), opened at
+  `/root`: it works once, within 15 minutes, and a new one replaces the
+  last. Its session lasts an hour at most (15 minutes unused), and every
+  page says it's the root's. Each link made and each sign-in is logged on
+  its node.
 - **Sessions** last 12 hours at most, and end after an hour unused. They're a
   cookie (`__Host-`, Secure, HttpOnly, SameSite=Strict), kept in the database
   as a hash, so every node serves them. Removing a passkey or the user ends

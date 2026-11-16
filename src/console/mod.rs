@@ -192,6 +192,7 @@ async fn limit_sign_ins(State(console): State<Arc<Console>>, req: Request, next:
     let path = req.uri().path();
     let starts = path.ends_with("/login/options")
         || path.ends_with("/enroll/options")
+        || path.ends_with("/root/sign-in")
         || (path.contains("/oidc/") && path.ends_with("/start"));
     if req.method() == Method::POST && starts {
         let peer = req.extensions().get::<ConnectInfo<SocketAddr>>().map(|c| c.0.ip());
@@ -245,8 +246,25 @@ async fn user_of(
     let unauthorized = || ApiError::Unauthorized("sign in first".into());
     let token = session_token(&headers).ok_or_else(unauthorized)?;
     let client = console.app.pool.get().await?;
-    let session = store::session(&client, &token).await?.ok_or_else(unauthorized)?;
-    session_user(&client, &session, method, headers, query, peer).await?.ok_or_else(unauthorized)
+    if let Some(session) = store::session(&client, &token).await? {
+        return session_user(&client, &session, method, headers, query, peer).await?.ok_or_else(unauthorized);
+    }
+    let root = store::root_session(&client, &token).await?.ok_or_else(unauthorized)?;
+    Ok(root_user(&root, method, headers, query, peer))
+}
+
+/// The account's root user, as its session `root` acts, for a request
+/// (`method`, `headers`, `query`, from `peer`). It was signed in with a
+/// link, no second factor: `aws:MultiFactorAuthPresent` is false.
+fn root_user(
+    root: &store::RootSession,
+    method: Method,
+    headers: HeaderMap,
+    query: String,
+    peer: Option<std::net::IpAddr>,
+) -> actor::User {
+    let principal = Principal::root(&root.account_id);
+    actor::User { principal, account: root.account_id.clone(), method, headers, query, peer, mfa_age: None }
 }
 
 /// Who `session` acts as, for a request (`method`, `headers`, `query`, from
@@ -284,7 +302,16 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
 
 /// A `Set-Cookie` that starts a session.
 fn session_cookie(token: &str) -> HeaderValue {
-    let max_age = store::SESSION_TTL.as_secs();
+    cookie(token, store::SESSION_TTL)
+}
+
+/// A `Set-Cookie` that starts a session of the account's root user.
+fn root_cookie(token: &str) -> HeaderValue {
+    cookie(token, store::ROOT_SESSION_TTL)
+}
+
+fn cookie(token: &str, ttl: std::time::Duration) -> HeaderValue {
+    let max_age = ttl.as_secs();
     HeaderValue::from_str(&format!("{COOKIE}={token}; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age={max_age}"))
         .expect("tokens are URL-safe base64")
 }
@@ -295,7 +322,8 @@ fn cleared_cookie() -> HeaderValue {
 }
 
 /// The signed-in session of a request: handlers that take it answer 401
-/// without one.
+/// without one, and 403 to the account's root user, which has no login (no
+/// passkeys, providers or identities of its own).
 pub(crate) struct Signed {
     pub session: store::Session,
     /// The session's token (to switch it).
@@ -309,8 +337,13 @@ impl FromRequestParts<Arc<Console>> for Signed {
         let unauthorized = || ApiError::Unauthorized("sign in first".into());
         let token = session_token(&parts.headers).ok_or_else(unauthorized)?;
         let client = console.app.pool.get().await?;
-        let session = store::session(&client, &token).await?.ok_or_else(unauthorized)?;
-        Ok(Signed { session, token })
+        match store::session(&client, &token).await? {
+            Some(session) => Ok(Signed { session, token }),
+            None if store::root_session(&client, &token).await?.is_some() => {
+                Err(ApiError::Forbidden("the root user has no login: it has no passkeys or identities to manage".into()))
+            }
+            None => Err(unauthorized()),
+        }
     }
 }
 
@@ -869,8 +902,9 @@ mod e2e {
     }
 
     /// A bucket policy that denies everyone denies its admins too, as in
-    /// AWS (there's no root): the command line on a node takes it off.
-    /// Deleting a user ends the sessions acting as it.
+    /// AWS: the command line on a node takes it off (or the root user: see
+    /// `the_root_user_gets_back_in`). Deleting a user ends the sessions
+    /// acting as it.
     #[tokio::test]
     async fn a_policy_that_denies_everyone_takes_the_command_line() {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
@@ -895,6 +929,82 @@ mod e2e {
         assert_eq!(dora.send("GET", "/api/me", None).await.0, StatusCode::OK);
         users::delete(&client, &crate::users::account(&client).await.unwrap(), "dora").await.unwrap();
         assert_eq!(dora.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The account's root user signs in only with a link the command line
+    /// makes, once: no identity policy restricts it (a boundary, a group's
+    /// deny), a bucket policy that denies everyone denies it too, but never
+    /// its own getting, setting or deleting. It has no login to manage, no
+    /// MFA, and signs out as anyone does.
+    #[tokio::test]
+    async fn the_root_user_gets_back_in() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = Arc::new(Console { app: app.clone(), party: party() });
+        let client = app.pool.get().await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
+        let mut admin = signed_in(&console, "boss", true).await;
+        assert_eq!(admin.send("POST", "/api/buckets", Some(json!({ "name": "locked-out" }))).await.0, StatusCode::CREATED);
+        let deny = r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::locked-out","arn:aws:s3:::locked-out/*"]}]}"#;
+        assert_eq!(admin.send("PUT", "/api/buckets/locked-out/policy", Some(json!({ "document": deny }))).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("DELETE", "/api/buckets/locked-out/policy", None).await.0, StatusCode::FORBIDDEN);
+        // And the admin loses its admin: a boundary that allows reading S3 only.
+        let id = crate::users::id_of(&client, &account, "boss").await.unwrap();
+        let bound = crate::users::BoundaryRef::Aws("AmazonS3ReadOnlyAccess");
+        crate::users::set_boundary(&client, &account, id, Some(&bound)).await.unwrap();
+        assert_eq!(admin.send("GET", "/api/users", None).await.0, StatusCode::FORBIDDEN);
+
+        // A link, used once.
+        let token = store::create_root_link(&client, &account).await.unwrap();
+        let mut root = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let (status, me) = root.send("POST", "/api/root/sign-in", Some(json!({ "token": token }))).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!((me["root"].clone(), me["mfa"].clone(), me["cluster"].clone()), (json!(true), json!(false), json!(true)));
+        assert_eq!(me["identity"]["arn"], format!("arn:aws:iam::{account}:root"));
+        assert!(me["expires_at"].is_number(), "{me}");
+        assert_eq!(root.send("GET", "/api/me", None).await.1["root"], true);
+        // Signing in as the root ends the browser's session as a user.
+        let mut was_admin = signed_in(&console, "was-admin", true).await;
+        let session = was_admin.cookie.clone();
+        let token = store::create_root_link(&client, &account).await.unwrap();
+        assert_eq!(was_admin.send("POST", "/api/root/sign-in", Some(json!({ "token": token }))).await.0, StatusCode::OK);
+        was_admin.cookie = session;
+        assert_eq!(was_admin.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
+        let mut again = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let (status, _) = again.send("POST", "/api/root/sign-in", Some(json!({ "token": token }))).await;
+        assert_eq!((status, again.cookie.is_none()), (StatusCode::BAD_REQUEST, true));
+        // A new link replaces the last.
+        let first = store::create_root_link(&client, &account).await.unwrap();
+        let _second = store::create_root_link(&client, &account).await.unwrap();
+        assert_eq!(again.send("POST", "/api/root/sign-in", Some(json!({ "token": first }))).await.0, StatusCode::BAD_REQUEST);
+
+        // No identity policy restricts it; the bucket's deny does, but not
+        // of the policy itself.
+        assert_eq!(root.send("GET", "/api/users", None).await.0, StatusCode::OK);
+        assert_eq!(root.send("GET", "/api/cluster", None).await.0, StatusCode::OK);
+        let (status, err) = root.send("GET", "/api/buckets/locked-out/objects", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+        assert!(err["error"].as_str().unwrap().contains(&format!("arn:aws:iam::{account}:root")), "{err}");
+        let (status, access) = root.send("GET", "/api/buckets/locked-out/access", None).await;
+        assert_eq!(status, StatusCode::OK, "{access}");
+        assert_eq!((access["policy"].is_string(), access["public_access_block_hidden"].clone()), (true, json!(true)));
+        // What AWS guards against keys alone denies it too: it's no MFA.
+        let mfa = r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::locked-out","arn:aws:s3:::locked-out/*"],"Condition":{"BoolIfExists":{"aws:MultiFactorAuthPresent":"false"}}}]}"#;
+        let (status, err) = root.send("PUT", "/api/buckets/locked-out/policy", Some(json!({ "document": mfa }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        assert_eq!(root.send("GET", "/api/buckets/locked-out/objects", None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(root.send("DELETE", "/api/buckets/locked-out/policy", None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(root.send("GET", "/api/buckets/locked-out/objects", None).await.0, StatusCode::OK);
+        // It puts the admin back.
+        assert_eq!(root.send("DELETE", "/api/users/boss/boundary", None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("GET", "/api/users", None).await.0, StatusCode::OK);
+
+        // It has no login: no passkeys to add.
+        assert_eq!(root.send("POST", "/api/passkeys/options", None).await.0, StatusCode::FORBIDDEN);
+        // Signing out ends the session, not just the cookie.
+        let cookie = root.cookie.clone();
+        assert_eq!(root.send("POST", "/api/logout", None).await.0, StatusCode::NO_CONTENT);
+        root.cookie = cookie;
+        assert_eq!(root.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
     }
 
     /// The cluster is its operators': users whose policies allow `cairn:`

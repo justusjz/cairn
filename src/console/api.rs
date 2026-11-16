@@ -26,7 +26,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use super::{Console, Signed, cleared_cookie, session_cookie, session_token, store, webauthn};
+use super::{Console, Signed, cleared_cookie, root_cookie, session_cookie, session_token, store, webauthn};
 use super::web::{ApiError, ErrorBody};
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -48,6 +48,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
         .routes(routes!(login_options))
         .routes(routes!(login))
         .routes(routes!(logout))
+        .routes(routes!(root_sign_in))
         .routes(routes!(me))
         .routes(routes!(passkey_options))
         .routes(routes!(add_passkey))
@@ -353,6 +354,46 @@ async fn login(State(console): ConsoleState, Json(body): Json<Login>) -> Result<
     signed_in(&console, &client, login, &first.account_id, store::Way::Passkey(&credential)).await
 }
 
+#[derive(Deserialize, ToSchema)]
+struct RootSignIn {
+    /// The token of the root user's link (after its `#`).
+    token: String,
+}
+
+/// Signs in as the account's root user, with a link the command line on a
+/// node made (`cairn account root-link`), which it uses up. The session is
+/// short (an hour at most), and not multi-factor.
+#[utoipa::path(post, path = "/root/sign-in", request_body = RootSignIn, responses(
+    (status = 200, body = Me, description = "Signed in as the root user; the session's cookie is set"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn root_sign_in(
+    State(console): ConsoleState,
+    headers: HeaderMap,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    Json(body): Json<RootSignIn>,
+) -> Result<Response> {
+    let client = console.app.pool.get().await?;
+    let Some(token) = store::root_sign_in(&client, &body.token).await? else {
+        return Err(ApiError::BadRequest(
+            "this link has been used, or has expired: make another on a node (`cairn account root-link`)".into(),
+        ));
+    };
+    // It replaces the browser's session, if it had one.
+    if let Some(old) = session_token(&headers) {
+        store::end_session(&client, &old).await?;
+    }
+    let root = store::root_session(&client, &token).await?.ok_or_else(|| anyhow::anyhow!("a new session is gone"))?;
+    // Who was the root, and from where, is for the node's log.
+    let peer = peer.map(|p| p.0.0.ip());
+    let from = crate::s3::access::client_address(&headers, peer, &console.app.trusted_proxies);
+    let from = from.map(|ip| format!(" from {ip}")).unwrap_or_default();
+    eprintln!("console: signed in as the root user of account {}{from}", root.account_id);
+    let me = root_me(&console, &root).await?;
+    Ok(([(header::SET_COOKIE, root_cookie(&token))], Json(me)).into_response())
+}
+
 /// Signs out: ends the session.
 #[utoipa::path(post, path = "/logout", responses(
     (status = 204, description = "Signed out; the cookie is cleared"),
@@ -403,11 +444,18 @@ impl IdentitySummary {
     }
 }
 
-/// The signed-in login: who it acts as, its passkeys.
+/// The signed-in login: who it acts as, its passkeys. Or the account's
+/// root user (`root`), which has no login: no passkeys or providers.
 #[derive(Serialize, ToSchema)]
 struct Me {
-    /// The login's name.
+    /// The login's name (`root` for the root user).
     name: String,
+    /// Whether the session is the account's root user's, which no identity
+    /// policy restricts (only resource policies' denies do).
+    root: bool,
+    /// When the root user's session ends at the latest (seconds since the
+    /// epoch); a login's has none here.
+    expires_at: Option<f64>,
     /// Who the session acts as.
     identity: IdentitySummary,
     /// Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`;
@@ -459,6 +507,8 @@ async fn me_of(console: &Console, client: &deadpool_postgres::Object, session: &
         oidc: oidc.into_iter().map(|(provider, label, email)| LinkedProvider { provider, label, email }).collect(),
         signed_in_at: session.oidc_provider.clone(),
         name: session.login_name.clone(),
+        root: false,
+        expires_at: None,
         identity: IdentitySummary::of(&session.identity),
         mfa: session.mfa_age.is_some(),
         cluster,
@@ -481,9 +531,38 @@ async fn me_of(console: &Console, client: &deadpool_postgres::Object, session: &
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn me(State(console): ConsoleState, signed: Signed) -> Result<Json<Me>> {
+async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>> {
+    let unauthorized = || ApiError::Unauthorized("sign in first".into());
+    let token = session_token(&headers).ok_or_else(unauthorized)?;
     let client = console.app.pool.get().await?;
-    Ok(Json(me_of(&console, &client, &signed.session).await?))
+    if let Some(session) = store::session(&client, &token).await? {
+        return Ok(Json(me_of(&console, &client, &session).await?));
+    }
+    let root = store::root_session(&client, &token).await?.ok_or_else(unauthorized)?;
+    Ok(Json(root_me(&console, &root).await?))
+}
+
+/// Who the account's root user's session `root` is.
+async fn root_me(console: &Console, root: &store::RootSession) -> Result<Me> {
+    let user = super::root_user(root, axum::http::Method::GET, HeaderMap::new(), String::new(), None);
+    let actor = super::Actor(Arc::new(user));
+    let cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
+    Ok(Me {
+        name: "root".into(),
+        root: true,
+        expires_at: Some(root.expires_at),
+        identity: IdentitySummary {
+            account_id: root.account_id.clone(),
+            account: root.account.clone(),
+            user: "root".into(),
+            arn: actor.principal().arn(),
+        },
+        mfa: false,
+        cluster,
+        passkeys: Vec::new(),
+        oidc: Vec::new(),
+        signed_in_at: None,
+    })
 }
 
 /// Adds a passkey to the signed-in login.

@@ -4370,6 +4370,52 @@
         }
       }
     },
+    "/root/sign-in": {
+      "post": {
+        "summary": "Signs in as the account's root user, with a link the command line on a\nnode made (`cairn account root-link`), which it uses up. The session is\nshort (an hour at most), and not multi-factor.",
+        "operationId": "root_sign_in",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RootSignIn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Signed in as the root user; the session's cookie is set",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/settings/{name}": {
       "put": {
         "summary": "Sets one of the cluster's settings (`data-shards`, `parity-shards`,\n`repair-after`, `oidc-private-issuers`) for the whole cluster, as\n`cairn config set` does. The node answering goes by it right away, the\nothers within a heartbeat.",
@@ -6070,6 +6116,7 @@
         "description": "Who may get at a bucket, besides its users' grants and policies: its\npolicy, and its public access block (see `s3::buckets::public_access`).",
         "required": [
           "public",
+          "public_access_block_hidden",
           "users"
         ],
         "properties": {
@@ -6099,12 +6146,16 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/Block",
-                "description": "Its public access block; `null` if it has none."
+                "description": "Its public access block; `null` if it has none, or the actor may not\nsee it (`public_access_block_hidden`)."
               },
               {
                 "type": "null"
               }
             ]
+          },
+          "public_access_block_hidden": {
+            "type": "boolean",
+            "description": "Whether the actor may not see the bucket's public access block\n(`s3:GetBucketPublicAccessBlock`): its policy is shown all the same,\nso that whoever may change a policy that denies everything else (the\naccount's root user, say) can."
           },
           "users": {
             "type": "array",
@@ -8186,9 +8237,10 @@
       },
       "Me": {
         "type": "object",
-        "description": "The signed-in login: who it acts as, its passkeys.",
+        "description": "The signed-in login: who it acts as, its passkeys. Or the account's\nroot user (`root`), which has no login: no passkeys or providers.",
         "required": [
           "name",
+          "root",
           "identity",
           "mfa",
           "cluster",
@@ -8200,6 +8252,14 @@
             "type": "boolean",
             "description": "Whether it may see the cluster (`cairn:GetCluster`): it's an\noperator, and the console shows it the cluster's pages."
           },
+          "expires_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "When the root user's session ends at the latest (seconds since the\nepoch); a login's has none here."
+          },
           "identity": {
             "$ref": "#/components/schemas/IdentitySummary",
             "description": "Who the session acts as."
@@ -8210,7 +8270,7 @@
           },
           "name": {
             "type": "string",
-            "description": "The login's name."
+            "description": "The login's name (`root` for the root user)."
           },
           "oidc": {
             "type": "array",
@@ -8224,6 +8284,10 @@
             "items": {
               "$ref": "#/components/schemas/PasskeySummary"
             }
+          },
+          "root": {
+            "type": "boolean",
+            "description": "Whether the session is the account's root user's, which no identity\npolicy restricts (only resource policies' denies do)."
           },
           "signed_in_at": {
             "type": [
@@ -9540,6 +9604,18 @@
               "$ref": "#/components/schemas/Tag"
             },
             "description": "All of its tags: those it has of other keys go (UntagRole), the\nrest are set (TagRole)."
+          }
+        }
+      },
+      "RootSignIn": {
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "The token of the root user's link (after its `#`)."
           }
         }
       },

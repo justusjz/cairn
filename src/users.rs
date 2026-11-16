@@ -92,6 +92,9 @@ pub struct Principal {
     /// `sessions`): then `id`, `name`, `path`, policies, tags and boundary
     /// are its role's (or user's), and its tags the session's too.
     pub session: Option<SessionOf>,
+    /// Whether it's its account's root user (see `Principal::root`): then
+    /// it has no ID, name, keys or policies of its own.
+    pub root: bool,
     /// Grants, for tests of what they allowed before they were bucket
     /// policies (`s3::authorize`); grants are statements of buckets'
     /// policies now (see `grants`).
@@ -177,10 +180,25 @@ pub enum Unknown {
 }
 
 impl Principal {
+    /// The root user of `account` (its ID), as AWS's: the account itself,
+    /// whom identity policies don't restrict (see `policy::root_verdict`).
+    /// It has no keys, passkeys or policies: only a console session that a
+    /// link the command line made started acts as it (see
+    /// `console::store::create_root_link`).
+    pub fn root(account: &str) -> Principal {
+        let mut root = Principal::of_role(uuid::Uuid::nil(), "root".to_owned(), account.to_owned(), "/".to_owned(), Vec::new(), Vec::new(), None);
+        root.root = true;
+        root
+    }
+
     /// Its ARN: a role session's (`arn:aws:sts::…:assumed-role/<role>/<session>`)
-    /// or a federated user's, else the user's.
+    /// or a federated user's, the root's (`arn:aws:iam::…:root`), else the
+    /// user's.
     pub fn arn(&self) -> String {
         use crate::sessions::Who;
+        if self.root {
+            return format!("arn:aws:iam::{}:root", self.account);
+        }
         match self.session.as_ref().map(|s| &s.session.who) {
             Some(Who::Role { session, .. }) => format!("arn:aws:sts::{}:assumed-role/{}/{session}", self.account, self.name),
             Some(Who::Federated { name, .. }) => format!("arn:aws:sts::{}:federated-user/{name}", self.account),
@@ -199,9 +217,12 @@ impl Principal {
 
     /// Its unique ID, as `aws:userid` and GetCallerIdentity have it
     /// (probed): a user's `AIDA…`, a role session's `AROA…:<session>`, a
-    /// federated user's `<account>:<name>`.
+    /// federated user's `<account>:<name>`, the root's its account's ID.
     pub fn unique_id(&self) -> String {
         use crate::sessions::Who;
+        if self.root {
+            return self.account.clone();
+        }
         match self.session.as_ref().map(|s| &s.session.who) {
             Some(Who::Role { session, .. }) => format!("{}:{session}", crate::roles::unique_id(self.id)),
             Some(Who::Federated { name, .. }) => format!("{}:{name}", self.account),
@@ -231,6 +252,7 @@ impl Principal {
             tags,
             boundary,
             session: None,
+            root: false,
             #[cfg(test)]
             read: HashSet::new(),
             #[cfg(test)]
@@ -339,6 +361,7 @@ impl Principal {
             tags: session.tags.clone(),
             boundary: None,
             session: Some(SessionOf { session, policies: Vec::new(), restricted: false }),
+            root: false,
             #[cfg(test)]
             read: HashSet::new(),
             #[cfg(test)]
@@ -402,6 +425,7 @@ impl Principal {
             name: r.get(3),
             account: r.get(4),
             session: None,
+            root: false,
             #[cfg(test)]
             read: HashSet::new(),
             #[cfg(test)]
@@ -448,6 +472,7 @@ impl Principal {
             tags: Vec::new(),
             boundary: None,
             session: None,
+            root: false,
         }
     }
 
