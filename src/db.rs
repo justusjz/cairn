@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "6";
+pub(crate) const PROTOCOL: &str = "7";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -236,6 +236,7 @@ const MIGRATIONS: &[&str] = &[
     UPLOAD_INITIATORS,
     IAM_GROUPS,
     INVENTORY,
+    NOTIFICATIONS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2619,6 +2620,136 @@ CREATE TRIGGER inventory_files_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRU
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 
 ALTER TABLE lifecycle_runs ADD COLUMN debt bigint NOT NULL DEFAULT 0;
+"#;
+/// Migration 56: event notifications (see `notifications`, `sns`,
+/// `plans/notifications.md`): SNS's topics and their subscriptions, the
+/// tokens that confirm them, the keys messages are signed with, buckets'
+/// notification configurations, the outbox of events their writes make
+/// (written in the writes' own transactions, see `cairn_notify` in
+/// `catalog.sql`), and the deliveries still to make.
+///
+/// A topic's policy is a resource policy, whose users and roles are kept
+/// by ID as a bucket policy's are (`cairn_policy_principals`). A
+/// subscription's `state` is `pending` until confirmed, `confirmed`, or
+/// `deleted`: kept while a token of it is still good, which restores it, as
+/// SNS restores one (probed). A token is kept as its SHA-256.
+///
+/// `bucket_notifications` and `notification_events` have no foreign keys
+/// a write could wait on (lock protocol, rule B): a write reads the first,
+/// and appends to the second. The protocol goes to 7, so that no older node
+/// writes objects without their events.
+const NOTIFICATIONS: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '7' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE TABLE sns_topics (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id        text NOT NULL REFERENCES accounts (id),
+    name              text COLLATE "C" NOT NULL,
+    display_name      text NOT NULL DEFAULT '',
+    policy            text NOT NULL,
+    policy_principals jsonb,
+    delivery_policy   text,
+    signature_version smallint NOT NULL DEFAULT 1,
+    tags              jsonb NOT NULL DEFAULT '[]',
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (account_id, name)
+);
+CREATE TRIGGER sns_topics_principals BEFORE INSERT OR UPDATE OF policy ON sns_topics
+    FOR EACH ROW EXECUTE FUNCTION cairn_policy_principals();
+CREATE TRIGGER sns_topics_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sns_topics
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE sns_subscriptions (
+    id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    topic_id        uuid NOT NULL REFERENCES sns_topics (id) ON DELETE CASCADE,
+    protocol        text NOT NULL CHECK (protocol IN ('http', 'https')),
+    endpoint        text NOT NULL,
+    base_url        text NOT NULL,
+    state           text NOT NULL CHECK (state IN ('pending', 'confirmed', 'deleted')),
+    raw             boolean NOT NULL DEFAULT false,
+    delivery_policy text,
+    principal       text NOT NULL,
+    authenticated   boolean NOT NULL DEFAULT false,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    changed_at      timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX sns_subscriptions_endpoint ON sns_subscriptions (topic_id, protocol, endpoint);
+CREATE TRIGGER sns_subscriptions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sns_subscriptions
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE sns_tokens (
+    hash            bytea PRIMARY KEY,
+    subscription_id uuid NOT NULL REFERENCES sns_subscriptions (id) ON DELETE CASCADE,
+    expires         timestamptz NOT NULL
+);
+CREATE INDEX sns_tokens_subscription ON sns_tokens (subscription_id);
+CREATE TRIGGER sns_tokens_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sns_tokens
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE sns_signing_keys (
+    id          int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    private_key bytea NOT NULL,
+    certificate text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER sns_signing_keys_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sns_signing_keys
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE bucket_notifications (
+    bucket    text NOT NULL REFERENCES buckets (name) ON DELETE CASCADE,
+    position  int NOT NULL,
+    id        text NOT NULL,
+    topic_arn text NOT NULL,
+    events    text[] NOT NULL,
+    prefix    text NOT NULL DEFAULT '',
+    suffix    text NOT NULL DEFAULT '',
+    PRIMARY KEY (bucket, position)
+);
+CREATE TRIGGER bucket_notifications_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON bucket_notifications
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE SEQUENCE notification_sequencers;
+CREATE TABLE notification_events (
+    seq        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    bucket     text NOT NULL,
+    key        text NOT NULL,
+    event      text NOT NULL,
+    size       bigint,
+    etag       text,
+    version_id text,
+    sequencer  bigint,
+    context    jsonb NOT NULL,
+    config_id  text NOT NULL,
+    topic_arn  text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+CREATE TRIGGER notification_events_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON notification_events
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE sns_deliveries (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    subscription_id uuid NOT NULL REFERENCES sns_subscriptions (id) ON DELETE CASCADE,
+    message_type    text NOT NULL,
+    message_id      uuid NOT NULL,
+    topic_arn       text NOT NULL,
+    body            text NOT NULL,
+    raw             boolean NOT NULL DEFAULT false,
+    attempt         int NOT NULL DEFAULT 0,
+    next_at         timestamptz NOT NULL DEFAULT now(),
+    deadline        timestamptz NOT NULL
+);
+CREATE INDEX sns_deliveries_due ON sns_deliveries (next_at);
+CREATE INDEX sns_deliveries_subscription ON sns_deliveries (subscription_id);
+CREATE TRIGGER sns_deliveries_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON sns_deliveries
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 #[cfg(test)]
 mod tests {

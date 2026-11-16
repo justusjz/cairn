@@ -87,16 +87,17 @@ pub const TEMPLATES: &[Template] = &[
         description: "A team sharing the account: a policy for everything the team may do, which is both its admins' \
                       policy (attach it to a user or a role) and the permissions boundary of everyone in the team, and \
                       one for its members. The team has the buckets whose names start with its prefix, and the users, roles and policies at its path (`/<team>/`); its \
-                      admins manage those, and every user or role they make or change has the team's boundary, so \
+                      admins manage those, and the SNS topics named as its buckets are (for their event notifications), \
+                      and every user or role they make or change has the team's boundary, so \
                       nothing the team does reaches past it. Made at `/cairn/teams/<team>/`, which the team can't change.",
-        version: 1,
+        version: 2,
     },
     Template {
         id: "bucket-access",
         title: "Bucket access",
         description: "Access to a bucket, or to the buckets whose names match a pattern (`logs-*`): reading, writing, \
                       deleting versions for good, managing the bucket. What `cairn user grant` makes.",
-        version: 1,
+        version: 2,
     },
     Template {
         id: "mfa-guard",
@@ -354,9 +355,18 @@ impl Team<'_> {
                 "Resource": ["arn:aws:iam::aws:policy/*", format!("arn:aws:iam::{account}:policy/cairn/teams/{team}/*")],
             }),
             json!({ "Sid": "AssumeTeamRoles", "Effect": "Allow", "Action": "sts:AssumeRole", "Resource": iam("role") }),
+            // SNS's topics named as its buckets are, for their events (see
+            // `sns`): their subscriptions, policies, publishing.
+            json!({
+                "Sid": "TeamTopics",
+                "Effect": "Allow",
+                "Action": "sns:*",
+                "Resource": format!("arn:aws:sns:*:{account}:{}", self.buckets),
+            }),
         ];
         if self.list_all_buckets {
             statements.push(json!({ "Sid": "ListAllBuckets", "Effect": "Allow", "Action": "s3:ListAllMyBuckets", "Resource": "*" }));
+            statements.push(json!({ "Sid": "ListAllTopics", "Effect": "Allow", "Action": "sns:ListTopics", "Resource": "*" }));
         }
         if self.list_policies {
             statements.push(json!({ "Sid": "ListAllPolicies", "Effect": "Allow", "Action": "iam:ListPolicies", "Resource": "*" }));

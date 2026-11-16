@@ -206,7 +206,7 @@ pub fn rejection_response(rejection: &Rejection) -> Response<Full<Bytes>> {
 }
 
 /// An S3 error document: its code and message, and any further elements.
-fn error_document(
+pub(crate) fn error_document(
     status: StatusCode,
     code: &str,
     message: &str,
@@ -368,6 +368,7 @@ fn handled_subresources(method: &Method, bucket_level: bool) -> &'static [&'stat
         // PutBucketLifecycleConfiguration, PutBucketCors, PutBucketTagging,
         // PutBucketPolicy, PutBucketAcl (`acl`), PutBucketWebsite.
         (true, &Method::PUT) => &[
+            "notification",
             "versioning",
             "encryption",
             "lifecycle",

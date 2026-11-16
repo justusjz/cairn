@@ -6,6 +6,7 @@ pub mod encryption;
 pub mod head;
 pub mod inventory;
 pub mod lifecycle;
+pub mod notification;
 pub mod list;
 pub mod policy;
 pub mod public_access;

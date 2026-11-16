@@ -56,6 +56,8 @@ supported.
 | Directory buckets (S3 Express One Zone), `CreateSession` | 🟡 | [Directory buckets](#directory-buckets) |
 | RenameObject, appends (S3 Express) | ❌ | |
 | Inventory | 🟡 | CSV and Parquet, not ORC: [Inventory](#inventory) |
+| Event notifications, to SNS topics | 🟡 | Over HTTP(S) subscriptions: [Event notifications](#event-notifications) |
+| Event notifications to SQS, Lambda, EventBridge | ❌ | |
 
 ### Security
 
@@ -79,7 +81,7 @@ supported.
 These answer `501 NotImplemented`, or report the feature as unconfigured, as
 S3 reports a bucket that doesn't use it:
 
-- Replication, server access logging, event notifications.
+- Replication, server access logging.
 - Analytics, metrics, Intelligent-Tiering, Storage Lens.
 - S3 Select, torrents, S3 Batch Operations.
 - S3 Express's metadata tables, access points for directory buckets.
@@ -287,6 +289,46 @@ Differences:
 - **OpenID Connect providers:** Cairn fetches the issuer's discovery document
   when a provider is created, and refuses one it can't reach. Thumbprints are
   enforced as certificate pins, which lets issuers on private CAs work.
+
+### Event notifications
+
+A bucket's notification configuration (`?notification`) names SNS topics,
+which Cairn has: the SNS API is served on the S3 endpoint, for requests
+signed for the `sns` service (`aws sns --endpoint-url …`, Terraform's
+`aws_sns_topic`, `aws_sns_topic_policy` and `aws_sns_topic_subscription`).
+Validation, records, test events, subscriptions and their confirmation,
+message signatures and retries are as AWS's.
+
+| SNS action | |
+| --- | --- |
+| CreateTopic, DeleteTopic, ListTopics, Get/SetTopicAttributes, Add/RemovePermission | ✅ |
+| TagResource, UntagResource, ListTagsForResource | ✅ |
+| Subscribe, ConfirmSubscription, Unsubscribe, ListSubscriptions(ByTopic), Get/SetSubscriptionAttributes | 🟡 |
+| Publish | 🟡 |
+| PublishBatch, FIFO topics, platform applications, SMS, data protection | ❌ |
+
+- **HTTP(S) subscriptions only.** Other protocols (`sqs`, `lambda`,
+  `email`, …) are refused as AWS refuses an unknown one. A configuration's
+  queues and functions fail its destination validation, and EventBridge
+  is `501 NotImplemented`.
+- **Signatures:** messages are signed as SNS signs them (versions 1 and 2),
+  with Cairn's own keys. `SigningCertURL` is on Cairn's endpoint, so AWS's
+  SDK message validators, which only take certificates from
+  `sns.<region>.amazonaws.com`, refuse them: check signatures with a
+  validator whose certificate host is configurable, or yourself.
+- **Delivery** is never lost to a crash: events are written in their
+  object's own transaction, and deliveries are retried as their delivery
+  policies say (AWS's by default), then dropped. Writes never wait for
+  delivery.
+- **Private endpoints:** subscriptions deliver to public addresses only,
+  unless the `notification-private-endpoints` setting allows private ones.
+- **Not supported:** subscription filter policies, redrive policies (DLQs),
+  `MessageStructure`, topic encryption (`KmsMasterKeyId`) and delivery
+  status logging. They're refused, not ignored.
+- **Default topic policy:** AWS's, whose condition (`AWS:SourceOwner`) no
+  request to Cairn carries, so a topic's users need identity policies
+  allowing `sns:` actions, and S3 needs a statement allowing it to publish,
+  as on AWS.
 
 ### STS
 

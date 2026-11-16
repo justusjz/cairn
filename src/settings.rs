@@ -106,9 +106,24 @@ pub const OIDC_PRIVATE_ISSUERS: Setting = Setting {
     unset: None,
 };
 
+/// Whether SNS subscriptions (see `sns`) may deliver to private addresses.
+/// By default they're kept to public ones (see `oidc::is_public`), checked
+/// at every connection, as anyone allowed `sns:Subscribe` names where Cairn
+/// POSTs to: not into the cluster's own network (its nodes' peer ports, the
+/// KMS, a cloud's metadata service). Receivers inside it need this.
+pub const NOTIFICATION_PRIVATE_ENDPOINTS: Setting = Setting {
+    name: "notification-private-endpoints",
+    default: 0,
+    min: 0,
+    max: 1,
+    help: "1 lets SNS subscriptions deliver to private addresses (receivers in the cluster's network), \
+           0 keeps them to public ones",
+    unset: None,
+};
+
 /// Every setting.
 pub const ALL: &[&Setting] =
-    &[&LIFECYCLE_RATE, &DATA_SHARDS, &PARITY_SHARDS, &REPAIR_AFTER, &OIDC_PRIVATE_ISSUERS];
+    &[&LIFECYCLE_RATE, &DATA_SHARDS, &PARITY_SHARDS, &REPAIR_AFTER, &OIDC_PRIVATE_ISSUERS, &NOTIFICATION_PRIVATE_ENDPOINTS];
 
 /// The setting named `name`, if there's one.
 pub fn named(name: &str) -> Option<&'static Setting> {

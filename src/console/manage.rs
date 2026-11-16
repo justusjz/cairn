@@ -4039,13 +4039,14 @@ struct SettingChanged {
 }
 
 /// The settings that the console changes this way: those of how blobs are
-/// stored, and repaired, and whether IAM's OIDC providers may be at
-/// private addresses.
+/// stored, and repaired, and whether IAM's OIDC providers and SNS's
+/// subscriptions may be at private addresses.
 const REDUNDANCY: &[&crate::settings::Setting] = &[
     &crate::settings::DATA_SHARDS,
     &crate::settings::PARITY_SHARDS,
     &crate::settings::REPAIR_AFTER,
     &crate::settings::OIDC_PRIVATE_ISSUERS,
+    &crate::settings::NOTIFICATION_PRIVATE_ENDPOINTS,
 ];
 
 /// Sets one of the cluster's settings (`data-shards`, `parity-shards`,

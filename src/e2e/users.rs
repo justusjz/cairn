@@ -446,7 +446,7 @@ async fn the_operators_join_the_account() {
     let mut client = pool.get().await.unwrap();
     let tx = client.transaction().await.unwrap();
     tx.batch_execute(
-        "SET LOCAL cairn.users = '4';
+        "SET LOCAL cairn.users = '4'; SET LOCAL cairn.protocol = '6';
          INSERT INTO accounts (id, name) VALUES ('000000000042', 'spare');
          INSERT INTO roles (name, secret, admin, account_id)
              SELECT 'ada', 'secret123', false, id FROM accounts WHERE name = 'default';
@@ -515,7 +515,7 @@ async fn the_roots_login_becomes_an_admin() {
     let mut client = pool.get().await.unwrap();
     let tx = client.transaction().await.unwrap();
     tx.batch_execute(
-        "SET LOCAL cairn.users = '5';
+        "SET LOCAL cairn.users = '5'; SET LOCAL cairn.protocol = '6';
          INSERT INTO roles (name, secret, admin, account_id)
              SELECT 'Root', 'secret123', false, id FROM accounts WHERE NOT operator;
          INSERT INTO logins (id, name) VALUES ('00000000-0000-4000-8000-000000000001', 'rita');
@@ -573,7 +573,7 @@ async fn one_account_is_refused_while_two_are_used() {
         let Some(pool) = super::fresh_database_through(44).await else { return };
         let mut client = pool.get().await.unwrap();
         let tx = client.transaction().await.unwrap();
-        tx.batch_execute("SET LOCAL cairn.users = '4'").await.unwrap();
+        tx.batch_execute("SET LOCAL cairn.users = '4'; SET LOCAL cairn.protocol = '6'").await.unwrap();
         tx.batch_execute(setup).await.unwrap();
         tx.commit().await.unwrap();
         let err = crate::db::init(&pool, usize::MAX).await.unwrap_err();

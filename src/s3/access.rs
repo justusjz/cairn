@@ -50,6 +50,7 @@ pub(crate) fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Resul
             Kind::Bucket(bucket) => Some(bucket.to_owned()),
             // No bucket's name has a NUL.
             Kind::Trust => Some("\0trust".to_owned()),
+            Kind::Topic(arn) => Some(format!("\0topic {arn}")),
         },
         text.to_owned(),
         ids.map(str::to_owned),
@@ -129,6 +130,9 @@ pub struct Access {
     /// The directory bucket the request writes to, if it does: its session
     /// must be a `ReadWrite` one.
     writes: Option<String>,
+    /// The policies of the topics checks are on, by their ARNs (see
+    /// `set_topic_policy`).
+    topics: HashMap<String, Arc<Policy>>,
 }
 
 /// Who makes a request, as policies see it (an owned `policy::Principal`).
@@ -224,6 +228,7 @@ impl Access {
             object_tags: HashMap::new(),
             granted: None,
             writes: None,
+            topics: HashMap::new(),
         })
     }
 
@@ -310,6 +315,12 @@ impl Access {
         self.object_tags.insert((bucket.to_owned(), key.to_owned()), tags);
     }
 
+    /// Sets the policy of the topic `arn` (see `sns`), which checks on it
+    /// are decided by as their resource's.
+    pub fn set_topic_policy(&mut self, arn: &str, policy: Arc<Policy>) {
+        self.topics.insert(arn.to_owned(), policy);
+    }
+
     /// Loads the policies of the buckets `checks` are on.
     pub async fn load_all(&mut self, app: &App, checks: &[Check]) -> anyhow::Result<()> {
         for bucket in checks.iter().filter_map(|c| c.on.bucket()) {
@@ -364,11 +375,17 @@ impl Access {
             .filter(|loaded| !(loaded.restricted && loaded.account.as_deref() != self.account()))
             .filter(|_| !regional)
             .and_then(|loaded| loaded.policy.as_deref());
+        // A topic's policy is its resource policy, as a bucket's is.
+        let bucket = match &check.on {
+            On::Topic(..) => self.topics.get(&resource).map(|p| &**p),
+            _ => bucket,
+        };
         // Whose the resource is: a bucket's owner; else (no bucket, or none
         // by its name) the principal's own account's. A bucket to create is
         // the principal's, whoever has its name (that's BucketAlreadyExists).
         let owner = match &check.on {
             On::User(account, _) | On::Users(account, _) | On::Role(account, _) | On::Roles(account, _) => Some(account.as_str()),
+            On::Topic(account, _) => Some(account.as_str()),
             // Cairn's (AWS's) policies are no account's: as the principal's own.
             On::Policy(account, _) if account != "aws" => Some(account.as_str()),
             // The account's, whose operators' policies allow them `cairn:`

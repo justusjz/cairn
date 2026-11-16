@@ -671,7 +671,7 @@ async fn try_complete(
     let row = client
         .query_one_cached(
             "SELECT status, version_id, reap_blob, reap_node, reap_peer
-             FROM pg_temp.cairn_complete_upload($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)",
+             FROM pg_temp.cairn_complete_upload($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)",
             &[
                 upload_id,
                 &bucket,
@@ -685,6 +685,7 @@ async fn try_complete(
                 &expected.is_some(),
                 &expected.flatten(),
                 &new_version_id(),
+                &crate::notifications::context(Some("CompleteMultipartUpload"), Some(&combined)),
             ],
         )
         .await?;

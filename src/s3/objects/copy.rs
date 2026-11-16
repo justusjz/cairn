@@ -408,7 +408,7 @@ pub async fn copy_object(
             conditions: dest_conditions,
         };
         let (version_id, last_modified) =
-            match commit_object_copy(app, &source, &dest, &stored_etag, &stored, &copied, expected).await? {
+            match commit_object_copy(app, &source, &dest, &stored_etag, &etag, &stored, &copied, expected).await? {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
                 ObjectCopy::SourceChanged => continue, // copy what it is now
                 ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
@@ -602,6 +602,7 @@ async fn commit_object_copy(
     source: &Source,
     dest: &Dest<'_>,
     etag: &str,
+    plain_etag: &str,
     stored: &Stored,
     copied: &Copied,
     expected: Option<Option<i64>>,
@@ -618,7 +619,7 @@ async fn commit_object_copy(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                                                     $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                                                    $21, $22, $23, $24, $25, $26)",
+                                                    $21, $22, $23, $24, $25, $26, $27)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -646,6 +647,7 @@ async fn commit_object_copy(
                         &legal_hold,
                         &expected.is_some(),
                         &expected.flatten(),
+                        &crate::notifications::context(Some("Copy"), Some(plain_etag)),
                     ],
                 )
                 .await?;

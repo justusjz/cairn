@@ -355,6 +355,12 @@ where
     let operation = actions::operation(&Method::PUT, &bucket, &key, "", &tagged).expect("a PUT is an operation");
     let signature = signed.as_ref().map(|(signature, _, _)| signature.signed());
     let principal = signed.as_ref().map(|(_, principal, _)| principal);
+    // What it makes is a `Post`, as its events say (see `notifications`).
+    crate::notifications::set_requester(
+        principal.map(|p| p.unique_id()),
+        access::client_address(&headers, peer, &app.trusted_proxies),
+    );
+    crate::notifications::set_created("Post");
     let origin = access::Origin { peer, trusted_proxies: &app.trusted_proxies, signed: signature.as_ref(), form: true };
     let mut access = access::Access::new(principal, &account, &Method::POST, &headers, "", &origin)?;
     let header = |name| headers.get(name).and_then(|v| v.to_str().ok());

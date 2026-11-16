@@ -92,12 +92,12 @@ fn oidc() -> &'static Oidc {
     OIDC.get_or_init(Oidc::default)
 }
 
-fn provider() -> Arc<rustls::crypto::CryptoProvider> {
+pub(crate) fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
 /// The public roots (webpki-roots).
-fn public_roots() -> Arc<RootCertStore> {
+pub(crate) fn public_roots() -> Arc<RootCertStore> {
     static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
     ROOTS
         .get_or_init(|| Arc::new(RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned())))
@@ -217,6 +217,13 @@ pub fn check_url(url: &str, reach: &Reach) -> Result<(), BadUrl> {
 #[derive(Clone, Copy)]
 pub struct Resolver {
     public_only: bool,
+}
+
+impl Resolver {
+    /// One that resolves to public addresses only (`public_only`), or to any.
+    pub fn new(public_only: bool) -> Resolver {
+        Resolver { public_only }
+    }
 }
 
 type Resolving = std::pin::Pin<Box<dyn Future<Output = std::io::Result<std::vec::IntoIter<SocketAddr>>> + Send>>;

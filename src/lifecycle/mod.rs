@@ -670,8 +670,20 @@ async fn expire(
         let result = client
             .query_one_cached(
                 "SELECT status, applied, reap_blob, reap_node, reap_peer
-                 FROM pg_temp.cairn_lifecycle_expire($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-                &[&bucket, &generation, &keys, &ids, &version_ids, &kinds, &successors, &newer, &marker_ids, &tags],
+                 FROM pg_temp.cairn_lifecycle_expire($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                &[
+                    &bucket,
+                    &generation,
+                    &keys,
+                    &ids,
+                    &version_ids,
+                    &kinds,
+                    &successors,
+                    &newer,
+                    &marker_ids,
+                    &tags,
+                    &crate::notifications::lifecycle_context(),
+                ],
             )
             .await;
         let row = match result {

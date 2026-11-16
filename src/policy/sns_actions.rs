@@ -1,0 +1,50 @@
+//! SNS's actions (AWS's service authorization reference for SNS), which
+//! topics' policies name, and identity policies may. PublishBatch is
+//! authorized as `sns:Publish`.
+
+pub const ACTIONS: &[&str] = &[
+    "AddPermission",
+    "CheckIfPhoneNumberIsOptedOut",
+    "ConfirmSubscription",
+    "CreatePlatformApplication",
+    "CreatePlatformEndpoint",
+    "CreateSMSSandboxPhoneNumber",
+    "CreateTopic",
+    "DeleteEndpoint",
+    "DeletePlatformApplication",
+    "DeleteSMSSandboxPhoneNumber",
+    "DeleteTopic",
+    "GetDataProtectionPolicy",
+    "GetEndpointAttributes",
+    "GetPlatformApplicationAttributes",
+    "GetSMSAttributes",
+    "GetSMSSandboxAccountStatus",
+    "GetSubscriptionAttributes",
+    "GetTopicAttributes",
+    "ListEndpointsByPlatformApplication",
+    "ListOriginationNumbers",
+    "ListPhoneNumbersOptedOut",
+    "ListPlatformApplications",
+    "ListSMSSandboxPhoneNumbers",
+    "ListSubscriptions",
+    "ListSubscriptionsByTopic",
+    "ListTagsForResource",
+    "ListTopics",
+    "OptInPhoneNumber",
+    "Publish",
+    "PutDataProtectionPolicy",
+    "RemovePermission",
+    "SetEndpointAttributes",
+    "SetPlatformApplicationAttributes",
+    "SetSMSAttributes",
+    "SetSubscriptionAttributes",
+    "SetTopicAttributes",
+    "Subscribe",
+    "TagResource",
+    "Unsubscribe",
+    "UntagResource",
+    "VerifySMSSandboxPhoneNumber",
+];
+
+/// SNS's condition keys Cairn's requests carry (lowercase): Subscribe's.
+pub const EVALUATED_KEYS: &[&str] = &["sns:endpoint", "sns:protocol"];

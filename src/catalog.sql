@@ -216,6 +216,16 @@
 --     `next_version`). Every change of its versions (T44, T45, T46) holds
 --     M(m) exclusively, and reads them in a later statement. Its first
 --     version is made with its row, by a trigger (`db::POLICY_VERSIONS`).
+-- I14. A change to a key's versions or tags that commits has its events, in
+--     the outbox (`notification_events`), and one that doesn't has none; a
+--     key's events' sequencers grow with its changes' commit order. No guard
+--     of its own: each event is inserted by `cairn_notify`, in the change's
+--     own transaction, which holds the key's K (or its stripe's S) when it
+--     draws the sequencer. The bucket's notification configurations are read
+--     unlocked: a change racing a new configuration follows the old one or
+--     the new, whichever its statement sees, which S3 doesn't promise either.
+--     Neither table has foreign keys a change could wait on (rule B), and
+--     only the delivery worker locks the outbox's rows (`notifications`).
 --
 -- DEADLOCKS
 --
@@ -613,6 +623,67 @@ $$;
 -- row's id, and the version ID to report (NULL unless versioning is enabled).
 -- The caller holds B(b) shared (which gave it the versioning state), K(b,k), and
 -- X(x) on the blobs of the parts `cairn_freed_by_put` names.
+-- Records the event a change to key `p_key` makes, for each of the
+-- bucket's notification configurations it matches (see `notifications`), in
+-- the change's own transaction: so a change that commits has its events, and
+-- one that doesn't has none. What the change is comes from the caller, as
+-- `cairn.notify` (a JSON object, transaction-local, see `cairn_notify_start`):
+-- who made it and how, or nothing, for a change that makes no events.
+-- `p_event` is the event: `ObjectCreated` (made what `created` says: Put,
+-- Post, Copy or CompleteMultipartUpload), `ObjectRemoved:…`, or
+-- `ObjectTagging` (`tagging` says Put or Delete); a lifecycle's
+-- (`"source": "lifecycle"`) removals are `LifecycleExpiration:…`.
+--
+-- The configurations are read without a lock: a change racing a new
+-- configuration follows either the old one or the new, as its statement
+-- sees them, which is all S3 promises too. The sequencer is drawn under the
+-- key's K, so a key's events' sequencers grow with its changes' commit
+-- order. The outbox has no foreign keys (rule B).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_notify(
+    p_bucket text, p_key text, p_event text, p_size bigint, p_etag text, p_version_id text
+) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_context jsonb;
+    v_event text := p_event;
+    v_sequencer bigint;
+BEGIN
+    IF coalesce(current_setting('cairn.notify', true), '') = '' THEN
+        RETURN;
+    END IF;
+    PERFORM 1 FROM bucket_notifications n WHERE n.bucket = p_bucket LIMIT 1;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    v_context := current_setting('cairn.notify', true)::jsonb;
+    IF v_event = 'ObjectCreated' THEN
+        v_event := 'ObjectCreated:' || coalesce(v_context ->> 'created', 'Put');
+    ELSIF v_event = 'ObjectTagging' THEN
+        v_event := 'ObjectTagging:' || coalesce(v_context ->> 'tagging', 'Put');
+    ELSIF v_context ->> 'source' = 'lifecycle' AND v_event LIKE 'ObjectRemoved:%' THEN
+        v_event := 'LifecycleExpiration:' || substring(v_event FROM 15);
+    END IF;
+    v_sequencer := nextval('notification_sequencers');
+    INSERT INTO notification_events (bucket, key, event, size, etag, version_id, sequencer, context,
+                                     config_id, topic_arn)
+    SELECT p_bucket, p_key, v_event, p_size, p_etag, nullif(p_version_id, 'null'), v_sequencer,
+           v_context, n.id, n.topic_arn
+    FROM bucket_notifications n
+    WHERE n.bucket = p_bucket
+      AND ('s3:' || v_event = ANY (n.events) OR 's3:' || split_part(v_event, ':', 1) || ':*' = ANY (n.events))
+      AND starts_with(p_key, n.prefix)
+      AND (n.suffix = '' OR right(p_key, length(n.suffix)) = n.suffix)
+    ORDER BY n.position;
+END
+$$;
+
+-- Sets what the transaction's changes are, for their events (`cairn_notify`):
+-- `p_notify` (NULL or empty: they make none).
+CREATE OR REPLACE FUNCTION pg_temp.cairn_notify_start(p_notify text) RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM set_config('cairn.notify', coalesce(p_notify, ''), true);
+END
+$$;
+
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
     p_content_type text, p_metadata text, p_sse_c_key bytea, p_kms_key_id text,
@@ -654,6 +725,7 @@ BEGIN
     -- A write's version ID is reported only where it's a new one: S3 reports
     -- none for the null version (unversioned or suspended).
     version_id := CASE WHEN p_versioning = 'enabled' THEN v_version_id END;
+    PERFORM pg_temp.cairn_notify(p_bucket, p_key, 'ObjectCreated', p_size, p_etag, version_id);
 END
 $$;
 
@@ -684,11 +756,15 @@ BEGIN
             END IF;
         END IF;
         version_id := p_version_id;
+        PERFORM pg_temp.cairn_notify(p_bucket, p_key,
+            CASE WHEN delete_marker THEN 'ObjectRemoved:DeleteMarkerCreated' ELSE 'ObjectRemoved:Delete' END,
+            NULL, NULL, p_version_id);
         RETURN;
     END IF;
     IF p_versioning = 'unversioned' THEN
         PERFORM pg_temp.cairn_remove_null_version(p_bucket, p_key);
         version_id := NULL;
+        PERFORM pg_temp.cairn_notify(p_bucket, p_key, 'ObjectRemoved:Delete', NULL, NULL, NULL);
         RETURN;
     ELSIF p_versioning = 'enabled' THEN
         v_marker := p_marker_id;
@@ -702,6 +778,8 @@ BEGIN
     VALUES (p_bucket, p_key, v_marker, true, true, 0, NULL, NULL, NOW());
     version_id := v_marker;
     delete_marker := true;
+    PERFORM pg_temp.cairn_notify(p_bucket, p_key, 'ObjectRemoved:DeleteMarkerCreated', NULL,
+                                 '"d41d8cd98f00b204e9800998ecf8427e"', v_marker);
 END
 $$;
 
@@ -730,7 +808,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_commit_object(
     p_kms_key_id text, p_kms_data_key text, p_kms_sealed bytea, p_kms_context text,
     p_sse_s3 boolean, p_checksum_algorithm text, p_checksum_type text, p_checksum text,
     p_tags text, p_conditional boolean, p_expected bigint, p_new_version_id text,
-    p_lock_mode text, p_lock_until timestamptz, p_legal_hold boolean,
+    p_lock_mode text, p_lock_until timestamptz, p_legal_hold boolean, p_notify text DEFAULT NULL,
     OUT status text, OUT present bigint, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -741,6 +819,7 @@ DECLARE
     v_locked uuid[];
     v record;
 BEGIN
+    PERFORM pg_temp.cairn_notify_start(p_notify);
     reap_blob := '{}';
     reap_node := '{}';
     reap_peer := '{}';
@@ -903,7 +982,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean, p_checksum_algorithm text,
     p_checksum_type text, p_checksum text, p_tags text, p_part_checksums boolean,
     p_new_version_id text, p_lock_mode text, p_lock_until timestamptz, p_legal_hold boolean,
-    p_conditional boolean, p_expected bigint,
+    p_conditional boolean, p_expected bigint, p_notify text DEFAULT NULL,
     OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -916,6 +995,7 @@ DECLARE
     s record;
     v record;
 BEGIN
+    PERFORM pg_temp.cairn_notify_start(p_notify);
     reap_blob := '{}';
     reap_node := '{}';
     reap_peer := '{}';
@@ -1041,7 +1121,7 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_complete_upload(
     p_upload uuid, p_bucket text, p_key text, p_part_ids bigint[], p_part_numbers int[],
     p_etag text, p_checksum_algorithm text, p_checksum_type text, p_checksum text,
-    p_conditional boolean, p_expected bigint, p_new_version_id text,
+    p_conditional boolean, p_expected bigint, p_new_version_id text, p_notify text DEFAULT NULL,
     OUT status text, OUT version_id text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -1057,6 +1137,7 @@ DECLARE
     v_locked uuid[];
     v record;
 BEGIN
+    PERFORM pg_temp.cairn_notify_start(p_notify);
     reap_blob := '{}';
     reap_node := '{}';
     reap_peer := '{}';
@@ -1177,7 +1258,7 @@ $$;
 -- check again.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_objects(
     p_bucket text, p_keys text[], p_version_ids text[], p_marker_ids text[], p_bypass boolean[],
-    p_expected bigint[] DEFAULT '{}',
+    p_expected bigint[] DEFAULT '{}', p_notify text DEFAULT NULL,
     OUT status text, OUT version_ids text[], OUT delete_markers boolean[], OUT locked boolean[],
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -1189,6 +1270,7 @@ DECLARE
     d record;
     v_kept boolean;
 BEGIN
+    PERFORM pg_temp.cairn_notify_start(p_notify);
     reap_blob := '{}';
     reap_node := '{}';
     reap_peer := '{}';
@@ -1388,6 +1470,7 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_lifecycle_expire(
     p_bucket text, p_generation bigint, p_keys text[], p_ids bigint[], p_version_ids text[],
     p_kinds text[], p_successors bigint[], p_newer int[], p_marker_ids text[], p_tags text[],
+    p_notify text DEFAULT NULL,
     OUT status text, OUT applied boolean[],
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -1398,6 +1481,7 @@ DECLARE
     f record;
     v_locked uuid[];
 BEGIN
+    PERFORM pg_temp.cairn_notify_start(p_notify);
     reap_blob := '{}';
     reap_node := '{}';
     reap_peer := '{}';
@@ -1504,12 +1588,13 @@ $$;
 -- bucket's versioning state and the version's ID (for the last two, and
 -- 'tagged'), which the response reports.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_set_tags(
-    p_bucket text, p_key text, p_version_id text, p_tags text,
+    p_bucket text, p_key text, p_version_id text, p_tags text, p_notify text DEFAULT NULL,
     OUT status text, OUT versioning text, OUT version_id text
 ) LANGUAGE plpgsql AS $$
 DECLARE
     o record;
 BEGIN
+    PERFORM pg_temp.cairn_notify_start(p_notify);
     versioning := pg_temp.cairn_lock_bucket(p_bucket);
     IF versioning IS NULL THEN
         status := 'no_such_bucket';
@@ -1530,6 +1615,8 @@ BEGIN
         RETURN;
     END IF;
     UPDATE objects SET tags = p_tags WHERE id = o.id;
+    PERFORM pg_temp.cairn_notify(p_bucket, p_key, 'ObjectTagging', NULL,
+                                 (SELECT ob.etag FROM objects ob WHERE ob.id = o.id), o.version_id);
     status := 'tagged';
 END
 $$;

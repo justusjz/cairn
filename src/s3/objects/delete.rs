@@ -70,8 +70,8 @@ async fn try_delete(
     let row = client
         .query_one_cached(
             "SELECT status, version_ids, delete_markers, locked, reap_blob, reap_node, reap_peer
-             FROM pg_temp.cairn_delete_objects($1, $2, $3, $4, $5, $6)",
-            &[&bucket, &keys, &version_ids, &marker_ids, &bypass, &expected],
+             FROM pg_temp.cairn_delete_objects($1, $2, $3, $4, $5, $6, $7)",
+            &[&bucket, &keys, &version_ids, &marker_ids, &bypass, &expected, &crate::notifications::delete_context()],
         )
         .await?;
     match row.get::<_, &str>(0) {

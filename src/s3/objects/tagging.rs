@@ -75,13 +75,15 @@ async fn set(
     status: StatusCode,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let stored = tags.stored();
+    // A deletion of its tags is one event, a setting another.
+    let notify = crate::notifications::tagging_context(if status == StatusCode::NO_CONTENT { "Delete" } else { "Put" });
     let client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
         let row = match client
             .query_one_cached(
-                "SELECT status, versioning, version_id FROM pg_temp.cairn_set_tags($1, $2, $3, $4)",
-                &[&bucket, &key, &version_id, &stored],
+                "SELECT status, versioning, version_id FROM pg_temp.cairn_set_tags($1, $2, $3, $4, $5)",
+                &[&bucket, &key, &version_id, &stored, &notify],
             )
             .await
         {

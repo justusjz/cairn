@@ -56,6 +56,9 @@ pub enum On {
     /// A directory bucket of an account (by its ID), for S3 Express's
     /// actions on it (`s3express:`; see `s3::directory`).
     Directory(String, String),
+    /// An SNS topic of an account (by its ID), by its name (see `sns`): its
+    /// policy is the resource's.
+    Topic(String, String),
     /// Any other resource, by its ARN (STS's federated users, ...).
     Arn(String),
 }
@@ -78,6 +81,7 @@ impl On {
             On::Policy(account, name) => format!("arn:aws:iam::{account}:policy/{name}"),
             On::Cluster => CLUSTER_ARN.to_owned(),
             On::Directory(account, bucket) => crate::s3::directory::arn(account, bucket),
+            On::Topic(account, name) => crate::sns::topic_arn(account, name),
             On::Arn(arn) => arn.clone(),
         }
     }
@@ -203,7 +207,11 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
     ("accelerate", ("GetBucketAccelerateConfiguration", "s3:GetAccelerateConfiguration"), None),
     ("requestPayment", ("GetBucketRequestPayment", "s3:GetBucketRequestPayment"), None),
     ("logging", ("GetBucketLogging", "s3:GetBucketLogging"), None),
-    ("notification", ("GetBucketNotificationConfiguration", "s3:GetBucketNotification"), None),
+    (
+        "notification",
+        ("GetBucketNotificationConfiguration", "s3:GetBucketNotification"),
+        Some(("PutBucketNotificationConfiguration", "s3:PutBucketNotification", "", "")),
+    ),
 ];
 
 /// What managing a bucket takes (the `manage` level of the bucket-access

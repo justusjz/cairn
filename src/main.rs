@@ -50,6 +50,7 @@ mod lifecycle;
 mod listen;
 mod metrics;
 mod mover;
+mod notifications;
 mod nodes;
 mod oidc;
 mod packer;
@@ -60,6 +61,7 @@ mod s3;
 mod scrub;
 mod sessions;
 mod settings;
+mod sns;
 mod shards;
 mod store;
 mod templates;
@@ -389,6 +391,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(apply_lifecycles(app.clone()));
     tokio::spawn(scrub::run(app.clone()));
     tokio::spawn(mover::run(app.clone()));
+    tokio::spawn(notifications::delivery::run(app.clone()));
     // The users' identities in the KMS, now rather than in a minute.
     let identifying = app.clone();
     tokio::spawn(async move {
@@ -491,6 +494,9 @@ async fn maintain(app: Arc<App>) {
                     }
                     if let Err(e) = app.sessions.rotate(&client, false).await {
                         eprintln!("sessions: rotating the keys: {e:#}");
+                    }
+                    if let Err(e) = notifications::maintain(&client).await {
+                        eprintln!("notifications: upkeep: {e:#}");
                     }
                 }
                 Err(e) => eprintln!("console: reaping expired sessions: {e:#}"),
@@ -1776,6 +1782,7 @@ where
             };
             let stored = Stored {
                 etag: &stored_etag,
+                plain_etag: &etag,
                 part_etag: &stored_part_etag,
                 checksum: checksum.as_ref().zip(stored_checksum.as_deref()),
             };
@@ -1846,6 +1853,8 @@ struct Encrypted {
 /// SSE-S3 one's ETag, an encrypted one's checksum).
 struct Stored<'a> {
     etag: &'a str,
+    /// The ETag clients are told, which an object's events say.
+    plain_etag: &'a str,
     /// A single PUT's part's (see `encryption::Owner`).
     part_etag: &'a str,
     /// The checksum, and its value as it's stored.
@@ -1898,7 +1907,7 @@ async fn try_commit_part(
                      FROM pg_temp.cairn_commit_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                                                       $11, $12, $13, $14, $15, $16, $17, $18,
                                                       $19, $20, $21, $22, $23, $24, $25, $26,
-                                                      $27, $28, $29, $30, $31, $32, $33, $34)",
+                                                      $27, $28, $29, $30, $31, $32, $33, $34, $35)",
                     &[
                         &written.blob_id,
                         &nodes,
@@ -1934,6 +1943,7 @@ async fn try_commit_part(
                         &lock_mode,
                         &lock_until,
                         &legal_hold,
+                        &notifications::context(None, Some(stored.plain_etag)),
                     ],
                 )
                 .await?;

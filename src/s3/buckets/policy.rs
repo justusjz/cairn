@@ -36,7 +36,13 @@ pub struct Checked {
 /// `text` as `bucket`'s policy would be kept, if S3 would take it: a valid
 /// bucket policy, whose users and accounts exist.
 pub async fn check(client: &Object, bucket: &str, text: &str) -> anyhow::Result<Result<Checked, Refused>> {
-    let policy = match Policy::parse(text, Kind::Bucket(bucket)) {
+    check_as(client, Kind::Bucket(bucket), text).await
+}
+
+/// `text` as a resource policy of `kind` (a bucket's, a topic's) would be
+/// kept, if it's a valid one whose users and accounts exist.
+pub async fn check_as(client: &Object, kind: Kind<'_>, text: &str) -> anyhow::Result<Result<Checked, Refused>> {
+    let policy = match Policy::parse(text, kind) {
         Ok(policy) => policy,
         Err(invalid) => {
             let status = match invalid.code {

@@ -12,6 +12,7 @@
 mod condition;
 mod pattern;
 pub mod s3_actions;
+pub mod sns_actions;
 
 use std::collections::HashMap;
 
@@ -334,6 +335,9 @@ pub enum Kind<'a> {
     /// names its principals, no resources (it's about the role), and only
     /// the actions that assume a role (`TRUST_ACTIONS`).
     Trust,
+    /// An SNS topic's (by its ARN): every statement names its principals,
+    /// and only SNS's actions, on SNS's resources (see `sns`).
+    Topic(&'a str),
 }
 
 /// The actions a trust policy may name (probed: no wildcards, not
@@ -756,6 +760,7 @@ fn s3_actions(name: &str, kind: Kind) -> Vec<&'static (&'static str, Applies, &'
         .filter(|(action, applies, _)| match kind {
             Kind::Identity | Kind::Trust => true,
             Kind::Bucket(_) => matches!(applies, Applies::Bucket | Applies::Object) && *action != "CreateBucket",
+            Kind::Topic(_) => false,
         })
         .filter(|(action, _, _)| pattern.matches(action, true))
         .collect()
@@ -816,8 +821,10 @@ impl Statement {
         let principals = match (kind, either("Principal")) {
             (Kind::Identity, Some(_)) => return Err(Invalid::malformed("Policy document should not specify a principal.")),
             (Kind::Identity, None) => None,
-            (Kind::Bucket(_) | Kind::Trust, None) => return Err(Invalid::malformed("Missing required field Principal")),
-            (Kind::Bucket(_) | Kind::Trust, Some((not, value))) => {
+            (Kind::Bucket(_) | Kind::Trust | Kind::Topic(_), None) => {
+                return Err(Invalid::malformed("Missing required field Principal"));
+            }
+            (Kind::Bucket(_) | Kind::Trust | Kind::Topic(_), Some((not, value))) => {
                 if not && allow {
                     return Err(Invalid::malformed("Allow with NotPrincipal is not allowed."));
                 }
@@ -860,6 +867,13 @@ impl Statement {
                     || (service.eq_ignore_ascii_case("s3express")
                         && crate::s3::directory::ACTIONS.iter().any(|a| pattern.matches(a, true)));
                 if !express {
+                    return Err(invalid());
+                }
+            } else if let Kind::Topic(_) = kind {
+                // A topic's policy is about SNS's actions only.
+                let pattern = Pattern::new(name, Syntax { wildcards: true, variables: None }).expect("no variables");
+                let named = action == "*" || service.eq_ignore_ascii_case("sns") && sns_actions::ACTIONS.iter().any(|a| pattern.matches(a, true));
+                if !named {
                     return Err(invalid());
                 }
             } else if service.eq_ignore_ascii_case("s3") {
@@ -949,7 +963,7 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
     let invalid = || Invalid::malformed("Policy has invalid resource");
     if resource == "*" {
         return match kind {
-            Kind::Identity | Kind::Trust => Ok(None),
+            Kind::Identity | Kind::Trust | Kind::Topic(_) => Ok(None),
             Kind::Bucket(_) => Err(invalid()),
         };
     }
@@ -967,6 +981,13 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
             return Err(invalid());
         }
         return Ok(Some(Applies::Other));
+    }
+    if let Kind::Topic(_) = kind {
+        // SNS's resources (topics) only.
+        return match service == "sns" {
+            true => Ok(Some(Applies::Other)),
+            false => Err(invalid()),
+        };
     }
     if let Kind::Bucket(bucket) = kind {
         // Only the bucket, and its objects.
@@ -1159,6 +1180,12 @@ fn parse_conditions(
                 None if lower.starts_with("s3:") => return Err(invalid_key()),
                 // STS's, in a trust policy: those Cairn decides, the rest
                 // refused as undecidable.
+                // SNS's, in a topic's policy: those Cairn's requests carry.
+                None if matches!(kind, Kind::Topic(_)) && lower.starts_with("sns:") => {
+                    if !sns_actions::EVALUATED_KEYS.contains(&lower.as_str()) {
+                        unsupported.get_or_insert_with(|| key.clone());
+                    }
+                }
                 None if kind == Kind::Trust && lower.starts_with("sts:") => {
                     if !STS_KEYS.iter().any(|k| *k == lower) {
                         unsupported.get_or_insert_with(|| key.clone());

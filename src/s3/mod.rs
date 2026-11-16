@@ -102,12 +102,15 @@ pub async fn handle(
     // whatever the response is, if its bucket allows it (see `cors`).
     let cross = cors::Cross::of(req.method(), req.headers(), &bucket_of(&route.path));
     let mut response = REQUEST_ID
-        .scope(id.clone(), async {
-            handle_request(req, app.clone(), route, peer).await.unwrap_or_else(|e| {
-                eprintln!("{what} failed (request {id}): {e:#}");
-                error_response(&e)
-            })
-        })
+        .scope(
+            id.clone(),
+            crate::notifications::scope(async {
+                handle_request(req, app.clone(), route, peer).await.unwrap_or_else(|e| {
+                    eprintln!("{what} failed (request {id}): {e:#}");
+                    error_response(&e)
+                })
+            }),
+        )
         .await;
     response.headers_mut().insert(
         "x-amz-request-id",
@@ -169,6 +172,10 @@ async fn handle_request(
     if let Some(signed) = signed.as_ref().filter(|s| crate::iam::wants(s)) {
         return Ok(box_response(crate::iam::handle(&app, req, signed.clone(), peer).await));
     }
+    // SNS's (signed for `sns`), for S3's event notifications (see `sns`).
+    if let Some(signed) = signed.as_ref().filter(|s| crate::sns::wants(s)) {
+        return Ok(box_response(crate::sns::handle(&app, req, signed.clone(), peer).await));
+    }
     // Signed for S3 Express (`s3express`): a directory bucket's request, or
     // ListDirectoryBuckets (see `directory`).
     let express = signed.as_ref().is_some_and(|s| s.service == "s3express")
@@ -219,6 +226,12 @@ async fn handle_request(
         {
             return Ok(forbidden("AccessDenied", "request is not signed"));
         }
+        // SNS's confirmations and unsubscriptions, which messages' URLs
+        // make, and its signing certificates: unsigned.
+        // (Never a bucket's own host, whose GETs are its objects'.)
+        None if !route.virtual_host && crate::sns::wants_unsigned(&req) => {
+            return Ok(box_response(crate::sns::handle_unsigned(&app, req).await));
+        }
         // STS's AssumeRoleWithWebIdentity, which is unsigned.
         None if crate::iam::wants_unsigned(&req) => {
             return Ok(box_response(crate::iam::handle_unsigned(&app, req, peer).await));
@@ -231,6 +244,11 @@ async fn handle_request(
         return Ok(box_response(util::header_not_implemented("Transfer-Encoding", None)));
     }
     let account = crate::users::account(&app.pool.get().await?).await?;
+    // Who makes it, as its writes' events say (see `notifications`).
+    crate::notifications::set_requester(
+        principal.as_ref().map(|p| p.unique_id()),
+        access::client_address(req.headers(), Some(peer), &app.trusted_proxies),
+    );
     let origin = access::Origin {
         peer: Some(peer),
         trusted_proxies: &app.trusted_proxies,
@@ -626,6 +644,9 @@ async fn handle_request(
             if operation.name == "GetBucketOwnershipControls" {
                 return Ok(box_response(acl::ownership_controls()));
             }
+            if operation.name == "GetBucketNotificationConfiguration" {
+                return Ok(box_response(buckets::notification::get(&app, &bucket).await?));
+            }
             if let Some(resp) = bucket_subresource_stub(&query, &util::canonical_id(&account)) {
                 return Ok(box_response(resp));
             }
@@ -775,6 +796,15 @@ async fn handle_request(
                 }
                 match read_body(req, &secret, true).await? {
                     Ok(body) => put_bucket_cors(&app, &bucket, body).await?,
+                    Err(rejection) => util::rejection_response(&rejection),
+                }
+            }
+            // PutBucketNotificationConfiguration: PUT /{bucket}?notification
+            // with a <NotificationConfiguration> body (see
+            // `buckets::notification`).
+            hyper::Method::PUT if operation.name == "PutBucketNotificationConfiguration" => {
+                match read_body(req, &secret, true).await? {
+                    Ok(body) => buckets::notification::put(&app, &bucket, body).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
