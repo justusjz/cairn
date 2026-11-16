@@ -884,7 +884,7 @@ fn trust_policies_decide_who_assumes_a_role() {
 }
 
 #[test]
-fn a_service_is_let_in_only_by_name() {
+fn a_service_is_let_in_by_name_or_as_everyone() {
     // S3's inventory destination policy (its user guide's).
     let policy = bucket_policy(&format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"Service":"s3.amazonaws.com"}},
@@ -906,12 +906,12 @@ fn a_service_is_let_in_only_by_name() {
     assert_eq!(check(&policy, other, "s3:PutObject", &object("inv/a"), &context), Decision::NotApplicable);
     assert_eq!(check(&policy, Principal::Anonymous, "s3:PutObject", &object("inv/a"), &context), Decision::NotApplicable);
     assert_eq!(check(&policy, user("alice"), "s3:PutObject", &object("inv/a"), &context), Decision::NotApplicable);
-    // Everyone (`*`) doesn't let a service in, but does keep it out.
+    // Everyone (`*`) is services too: it lets them in, and keeps them out.
     let everyone = bucket_policy(
         r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:PutObject",
             "Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
     );
-    assert_eq!(check(&everyone, service, "s3:PutObject", &object("a"), &context), Decision::NotApplicable);
+    assert_eq!(check(&everyone, service, "s3:PutObject", &object("a"), &context), Decision::Allow);
     let denied = bucket_policy(
         r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:PutObject",
             "Resource":"arn:aws:s3:::examplebucket/*"}]}"#,

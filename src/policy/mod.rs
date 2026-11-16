@@ -441,13 +441,14 @@ impl Principals {
                     false => direct(named || (self.everyone && !allow)),
                 }
             }
-            // As a web identity: only a statement naming the service lets
-            // it in; everyone (`*`) only denies it.
+            // A statement naming the service, or everyone (`*`, which
+            // covers AWS's services: its IAM guide's `aws:PrincipalOrgID`
+            // and `aws:PrincipalIsAWSService` examples).
             Principal::Service { name } => {
                 let named = self.services.iter().any(|s| s == name);
                 match self.not {
                     true => direct(!(self.everyone || named)),
-                    false => direct(named || (self.everyone && !allow)),
+                    false => direct(named || self.everyone),
                 }
             }
             Principal::User { account, id, .. } => {

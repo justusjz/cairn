@@ -17,7 +17,12 @@ use crate::{
     lifecycle::pass,
     packer,
     s3::{
-        buckets::{inventory, lifecycle::put_bucket_lifecycle, policy::put_bucket_policy},
+        buckets::{
+            inventory,
+            lifecycle::put_bucket_lifecycle,
+            policy::put_bucket_policy,
+            public_access::{self, Block},
+        },
         conditional::Preconditions,
         objects::get::get_object,
     },
@@ -382,6 +387,27 @@ async fn reports_and_lifecycle_sweeps_take_turns() {
     assert_eq!(files_written(&app).await, 1);
     // While the report's debt is paid off, no sweep reads anything either.
     assert_eq!(debt(&app).await, 9000);
+}
+
+#[tokio::test]
+async fn a_bucket_anyone_may_write_to_takes_reports() {
+    let Some(app) = node().await else { return };
+    let public = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":"*","Action":"s3:PutObject",
+            "Resource":"arn:aws:s3:::{REPORTS}/*"}}]}}"#
+    );
+    // (Without its Block Public Access, which refuses public policies.)
+    assert!(public_access::set(&app, REPORTS, None).await.unwrap());
+    let response = put_bucket_policy(&app, REPORTS, Bytes::from(public)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    // Restricting public buckets leaves AWS's services their access, as in S3.
+    let restrict = Block { restrict_public_buckets: true, ..Block::default() };
+    assert!(public_access::set(&app, REPORTS, Some(restrict)).await.unwrap());
+    put(&app, "a", b"a".to_vec()).await;
+    assert_eq!(configure(&app, "daily", configuration("daily", "Current", "")).await, StatusCode::OK);
+    step_at(&app, Duration::ZERO).await;
+    let (_, _, lines) = delivered(&app).await;
+    assert_eq!(lines, [format!("\"{BUCKET}\",\"a\"")]);
 }
 
 #[tokio::test]

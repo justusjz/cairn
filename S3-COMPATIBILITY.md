@@ -205,9 +205,8 @@ trust policies.
   batch job keys. `aws:SourceAccount` and `aws:SourceArn` are present only
   in what Cairn does as `s3.amazonaws.com`.
 - **Principals:** `Service` principals match only what Cairn does as that
-  service: `s3.amazonaws.com` delivering inventory reports. Only a statement
-  naming the service allows it (not `"*"`). `CanonicalUser` principals are
-  refused.
+  service: `s3.amazonaws.com` delivering inventory reports. As in AWS, `"*"`
+  covers it too. `CanonicalUser` principals are refused.
 - **Managed policies:** of AWS's, only `AdministratorAccess`,
   `AmazonS3FullAccess` and `AmazonS3ReadOnlyAccess` exist, plus Cairn's
   `CairnOperatorAccess`.
