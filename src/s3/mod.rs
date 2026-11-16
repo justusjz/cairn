@@ -153,8 +153,7 @@ async fn handle_request(
     if req.method() == Method::POST && objects::post::is_form(req.headers()) {
         // Not to a directory bucket, which S3 takes no forms for.
         if directory::is_directory(&bucket_of(&route.path)) {
-            let message = "POST Object is not supported for directory buckets.";
-            return Ok(box_response(format_s3_error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", message)));
+            return Ok(box_response(directory::unsupported("POST Object")));
         }
         let path = route.path.trim_start_matches('/').to_owned();
         return Ok(box_response(objects::post::post_object(&app, req, &path, route.virtual_host, Some(peer)).await?));

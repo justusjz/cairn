@@ -919,6 +919,7 @@ fn a_service_is_let_in_by_name_or_as_everyone() {
     assert_eq!(check(&denied, service, "s3:PutObject", &object("a"), &context), Decision::Deny);
     // Naming a service doesn't make a policy public.
     assert!(!policy.is_public());
+}
 
 /// A directory bucket's policy is about S3 Express's actions on the bucket
 /// (by its `s3express` ARN), and may test a session's mode; S3's actions,

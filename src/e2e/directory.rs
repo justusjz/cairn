@@ -186,6 +186,7 @@ async fn directory_buckets_refuse_what_they_dont_have() {
     assert_eq!(refused(Method::PUT, "k", "", &[("x-amz-object-lock-legal-hold", "ON")]), not_implemented);
     assert_eq!(refused(Method::PUT, "k", "", &[("x-amz-server-side-encryption-customer-algorithm", "AES256")]), not_implemented);
     assert_eq!(refused(Method::PUT, "k", "", &[("x-amz-write-offset-bytes", "0")]), not_implemented);
+    assert_eq!(refused(Method::PUT, "k", "", &[("content-md5", "1B2M2Y8AsgTpgAmY7PhCfg==")]), not_implemented);
     assert_eq!(refused(Method::PUT, "k", "", &[("x-amz-storage-class", "STANDARD")]), Some(StatusCode::BAD_REQUEST));
     assert_eq!(refused(Method::GET, "", "list-type=2&prefix=a", &[]), Some(StatusCode::BAD_REQUEST));
     assert_eq!(refused(Method::PUT, "k", "", &[("x-amz-storage-class", "EXPRESS_ONEZONE")]), None);

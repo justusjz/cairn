@@ -175,11 +175,17 @@ impl Kind {
     }
 }
 
-/// What may not be asked of a directory bucket (S3's documented "not
-/// supported for directory buckets"; its error wasn't probed: Cairn's 501
-/// for a header it doesn't implement).
+/// S3's refusal of what a directory bucket doesn't have, `what` (an
+/// operation, a header): a 501, which S3 answers a directory bucket's
+/// unsupported header with (seen: "This bucket does not support Content Md5
+/// header."), as a limit of the bucket's, not something S3 lacks.
+pub fn unsupported(what: &str) -> Response<Full<Bytes>> {
+    format_s3_error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", &format!("This bucket does not support {what}."))
+}
+
+/// `unsupported`, of header `header`.
 fn unsupported_header(header: &str) -> Response<Full<Bytes>> {
-    header_not_implemented(header, Some("This functionality is not supported for directory buckets."))
+    unsupported(&format!("{header} header"))
 }
 
 /// The operation `operation` of a request to directory bucket `bucket` of
@@ -195,11 +201,11 @@ pub fn prepare(
 ) -> Result<Kind, Response<Full<Bytes>>> {
     let kind = Kind::of(operation.name);
     if kind == Kind::Unsupported {
-        return Err(format_s3_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "NotImplemented",
-            &format!("{} is not supported for directory buckets.", operation.name),
-        ));
+        return Err(unsupported(operation.name));
+    }
+    // Zonal operations take no MD5 (seen).
+    if kind.zonal() && headers.contains_key("content-md5") {
+        return Err(unsupported_header("Content Md5"));
     }
     // What objects can't have here, which writes would give them.
     for name in [
@@ -211,12 +217,15 @@ pub fn prepare(
         "x-amz-website-redirect-location",
         "x-amz-acl",
         "x-amz-bucket-object-lock-enabled",
-        // Appends (see `S3-COMPATIBILITY.md`).
-        "x-amz-write-offset-bytes",
     ] {
         if headers.contains_key(name) {
             return Err(unsupported_header(name));
         }
+    }
+    // Appends, which directory buckets have and Cairn doesn't yet (see
+    // `S3-COMPATIBILITY.md`): Cairn's 501 for a header it doesn't implement.
+    if headers.contains_key("x-amz-write-offset-bytes") {
+        return Err(header_not_implemented("x-amz-write-offset-bytes", None));
     }
     if let Some(name) = headers.keys().find(|name| name.as_str().starts_with("x-amz-grant-")) {
         return Err(unsupported_header(name.as_str()));
@@ -342,7 +351,7 @@ pub fn refuse_configuration(bucket: &str, body: &[u8]) -> Option<Response<Full<B
         return Some(format_s3_error(
             StatusCode::NOT_IMPLEMENTED,
             "NotImplemented",
-            "Tags are not supported for directory buckets.",
+            "Cairn doesn't implement directory buckets' tags yet.",
         ));
     }
     if root.children().any(|n| n.has_tag_name("LocationConstraint")) {

@@ -222,9 +222,12 @@ looking up policies.
   headers are ignored (its response tells the bucket's default).
 - **ETags** are MD5 digests, as in general purpose buckets; S3's aren't, and
   clients don't rely on either.
-- **Errors S3 doesn't document** for refusing what a directory bucket doesn't
-  take (a delimiter, a gap in part numbers, a feature's header) weren't
-  probed; Cairn answers S3's for the nearest case, or `501 NotImplemented`.
+- **Refusals.** What a directory bucket doesn't have (an operation, a
+  feature's header, `Content-MD5` on zonal operations) is
+  `501 NotImplemented`, "This bucket does not support …", as S3 refuses
+  `Content-MD5`; whether S3 answers its other unsupported operations the
+  same wasn't probed. Neither were its errors for a listing's delimiter or
+  prefix, `start-after`, or a gap in part numbers (Cairn: `400`).
 - **The console** doesn't manage directory buckets; use the S3 API.
 
 ### Policies
