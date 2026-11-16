@@ -354,12 +354,7 @@ impl Iam<'_> {
 
     pub(super) async fn list_role_policies(&mut self, params: &Params) -> Result<Option<String>> {
         let role = self.role(params, "iam:ListRolePolicies").await?;
-        let members: String = roles::policy_names(self.client, role.id)
-            .await?
-            .iter()
-            .map(|n| format!("<member>{}</member>", xml_escape(n)))
-            .collect();
-        Ok(Some(format!("<PolicyNames>{members}</PolicyNames><IsTruncated>false</IsTruncated>")))
+        Ok(Some(super::names_page(params, roles::policy_names(self.client, role.id).await?)?))
     }
 
     pub(super) async fn delete_role_policy(&mut self, params: &Params) -> Result<Option<String>> {
@@ -385,13 +380,6 @@ impl Iam<'_> {
 
     pub(super) async fn list_attached_role_policies(&mut self, params: &Params) -> Result<Option<String>> {
         let role = self.role(params, "iam:ListAttachedRolePolicies").await?;
-        let members: String = roles::attached(self.client, role.id)
-            .await?
-            .iter()
-            .map(|p| {
-                format!("<member><PolicyName>{}</PolicyName><PolicyArn>{}</PolicyArn></member>", xml_escape(&p.name), xml_escape(&p.arn))
-            })
-            .collect();
-        Ok(Some(format!("<AttachedPolicies>{members}</AttachedPolicies><IsTruncated>false</IsTruncated>")))
+        Ok(Some(super::attached_page(params, roles::attached(self.client, role.id).await?)?))
     }
 }

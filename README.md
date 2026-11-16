@@ -381,6 +381,17 @@ allows; else it's denied. They are:
   before doesn't know managed policies, and denies what they allow.)
 - its **inline policies**: identity policies of its own, for anything finer
   (per key prefix, by condition, ...), set with `cairn user policy`;
+- its **groups'** policies, as if they were its own: a **group** has inline
+  policies (at most 5,120 characters together) and managed ones (at most
+  10) as a user has, and members, the account's users, each in at most 10
+  groups, as in IAM. So `invoices-read` is attached to the group of those
+  who read invoices, not to each of them. A group has a path and a name
+  (`arn:aws:iam::<account>:group/<path…/name>`, unique regardless of case),
+  but no tags or boundary, and it's no principal: policies name it only as
+  the resource of IAM's actions on it. A member's permissions boundary caps
+  what its groups' policies allow too, as its own. Older Cairns know no
+  groups: to them, a user in any has an inline policy that denies it
+  everything; upgrade every node.
 - its **permissions boundary**, if it has one: a managed policy (the
   account's own, or Cairn's) that caps what its identity policies (managed
   and inline) allow: they allow only what the boundary allows too, and a
@@ -563,7 +574,15 @@ if there are five already, as Terraform does. [Roles](#roles-and-temporary-crede
 are there too (CreateRole, GetRole, ListRoles, UpdateRole,
 UpdateRoleDescription, UpdateAssumeRolePolicy, DeleteRole, and their
 policies, boundaries and tags, as users'), and OpenID Connect providers
-(CreateOpenIDConnectProvider and the rest). Groups are NotImplemented. STS
+(CreateOpenIDConnectProvider and the rest), and groups: CreateGroup (with a
+path), GetGroup (with its members), ListGroups (by path prefix), UpdateGroup
+(which renames or moves one, checked on where it goes too), DeleteGroup
+(which refuses while members or policies are left, as IAM does),
+AddUserToGroup and RemoveUserFromGroup (checked on the group),
+ListGroupsForUser (on the user), their inline policies (PutGroupPolicy,
+GetGroupPolicy, ListGroupPolicies, DeleteGroupPolicy) and managed ones
+(AttachGroupPolicy, DetachGroupPolicy, ListAttachedGroupPolicies); a user in
+a group isn't deleted, nor a managed policy attached to one. STS
 answers on the same endpoint (requests signed for `sts`): GetCallerIdentity,
 which Terraform's AWS provider calls as it starts, and the actions that issue
 temporary credentials. The AWS CLI refuses access key IDs shorter than
@@ -867,7 +886,11 @@ passkeys and sign-in providers, and signing out.
   both are IAM users, as in AWS, but a person signs in to the console (or
   has a link out to), with how, and when they last did; a service has only
   access keys. A new person gets a console link and no access key; a new
-  service, an access key.
+  service, an access key. Each user shows the groups it's in.
+- **Groups:** [groups](#users-and-permissions), as IAM's actions allow:
+  make one (with a path), add and remove members, attach and write
+  policies, rename or move it, and delete it once it has no members or
+  policies left. A group's members show to whom may `iam:GetGroup` it.
 - **Roles:** [roles](#roles-and-temporary-credentials), with who their
   trust policies let in, as IAM's actions allow: make one (the trust
   policy's templates write statements for the account, a user or role, or a
@@ -877,8 +900,8 @@ passkeys and sign-in providers, and signing out.
   [OpenID Connect providers](#web-identities): add one (checked against its
   issuer), change its client IDs, thumbprints and tags, see which roles
   trust it, and delete it.
-- **Policies:** the account's managed policies and Cairn's, which users and
-  roles have each attached, and making, changing (a new version) and
+- **Policies:** the account's managed policies and Cairn's, which users,
+  groups and roles have each attached, and making, changing (a new version) and
   deleting the account's own. *From a template* makes policies from one of
   the [templates](#teams-and-policy-templates), shown before they're made.
   The editor adds the bucket-access template's statement for a bucket (or a

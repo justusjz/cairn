@@ -234,6 +234,7 @@ const MIGRATIONS: &[&str] = &[
     BUCKET_WEBSITE,
     BUCKET_ABAC,
     UPLOAD_INITIATORS,
+    IAM_GROUPS,
     INVENTORY,
 ];
 
@@ -2445,7 +2446,118 @@ ALTER TABLE buckets ADD COLUMN abac boolean NOT NULL DEFAULT false;
 const UPLOAD_INITIATORS: &str = r#"
 ALTER TABLE multipart_uploads ADD COLUMN initiator text;
 "#;
-/// Migration 54: S3 Inventory (see `inventory`, `plans/inventory.md`).
+/// Migration 54: IAM groups (see `groups`): collections of users, with
+/// inline and managed policies, which apply to each of their members as if
+/// they were the member's own. A group has a path and name, as a role has,
+/// but no tags or boundary, as in IAM. Named `iam_group…`, as roles' tables
+/// are. Changed as the lock protocol says (Q(q) in `catalog.sql`).
+///
+/// An older Cairn knows no groups, and would neither allow a member what
+/// its groups allow nor deny it what they deny: so a user in any group also
+/// has an inline policy that denies everything, `cairn:groups` (kept by a
+/// trigger), which only older Cairns read, as `cairn:boundary` (see
+/// `BOUNDARIES`). Older Cairns can't make members, so no user has it before
+/// a Cairn that knows groups is running.
+const IAM_GROUPS: &str = r#"
+CREATE TABLE iam_groups (
+    id         uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id text NOT NULL REFERENCES accounts (id),
+    name       text NOT NULL CHECK (name ~ '^[A-Za-z0-9+=,.@_-]{1,128}$'),
+    path       text NOT NULL DEFAULT '/'
+               CHECK (length(path) <= 512 AND path ~ '^/([A-Za-z0-9+=,.@_/-]*/)?$' AND path <> '//'),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE UNIQUE INDEX iam_groups_account_lower_name ON iam_groups (account_id, lower(name));
+
+CREATE TABLE iam_group_members (
+    group_id   uuid NOT NULL REFERENCES iam_groups (id) ON DELETE CASCADE,
+    user_id    uuid NOT NULL REFERENCES users (id) ON DELETE CASCADE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (group_id, user_id)
+);
+CREATE INDEX iam_group_members_user ON iam_group_members (user_id);
+
+CREATE TABLE iam_group_policies (
+    group_id uuid NOT NULL REFERENCES iam_groups (id) ON DELETE CASCADE,
+    name     text NOT NULL,
+    document text NOT NULL,
+    PRIMARY KEY (group_id, name)
+);
+
+CREATE TABLE iam_group_attached_policies (
+    group_id   uuid NOT NULL REFERENCES iam_groups (id) ON DELETE CASCADE,
+    policy_id  uuid REFERENCES managed_policies (id),
+    aws_policy text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CHECK ((policy_id IS NULL) <> (aws_policy IS NULL))
+);
+CREATE UNIQUE INDEX iam_group_attached_policies_own ON iam_group_attached_policies (group_id, policy_id)
+    WHERE policy_id IS NOT NULL;
+CREATE UNIQUE INDEX iam_group_attached_policies_aws ON iam_group_attached_policies (group_id, aws_policy)
+    WHERE aws_policy IS NOT NULL;
+CREATE INDEX iam_group_attached_policies_policy ON iam_group_attached_policies (policy_id);
+
+-- A group's members and managed policies are its own account's.
+CREATE FUNCTION cairn_group_member_account() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF (SELECT account_id FROM users WHERE id = NEW.user_id)
+        IS DISTINCT FROM (SELECT account_id FROM iam_groups WHERE id = NEW.group_id) THEN
+        RAISE EXCEPTION 'a group''s members are its own account''s' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER iam_group_members_account BEFORE INSERT OR UPDATE ON iam_group_members
+    FOR EACH ROW EXECUTE FUNCTION cairn_group_member_account();
+CREATE FUNCTION cairn_group_attached_policy_account() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF NEW.policy_id IS NOT NULL AND (SELECT account_id FROM managed_policies WHERE id = NEW.policy_id)
+        IS DISTINCT FROM (SELECT account_id FROM iam_groups WHERE id = NEW.group_id) THEN
+        RAISE EXCEPTION 'a group''s managed policies are its own account''s' USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NEW;
+END
+$$;
+CREATE TRIGGER iam_group_attached_policies_account BEFORE INSERT OR UPDATE ON iam_group_attached_policies
+    FOR EACH ROW EXECUTE FUNCTION cairn_group_attached_policy_account();
+
+-- What older Cairns read in place of a user's groups: deny all.
+CREATE FUNCTION cairn_groups_for_older() RETURNS trigger LANGUAGE plpgsql AS $$
+DECLARE
+    v_user uuid := CASE WHEN TG_OP = 'DELETE' THEN OLD.user_id ELSE NEW.user_id END;
+BEGIN
+    IF EXISTS (SELECT 1 FROM iam_group_members WHERE user_id = v_user) THEN
+        INSERT INTO user_policies (user_id, name, document)
+        VALUES (v_user, 'cairn:groups', '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"*","Resource":"*"}]}')
+        ON CONFLICT DO NOTHING;
+    ELSE
+        DELETE FROM user_policies WHERE user_id = v_user AND name = 'cairn:groups';
+    END IF;
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER iam_group_members_for_older AFTER INSERT OR DELETE ON iam_group_members
+    FOR EACH ROW EXECUTE FUNCTION cairn_groups_for_older();
+
+CREATE TRIGGER iam_groups_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_groups
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_groups_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_groups
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER iam_group_members_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_group_members
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_group_members_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_group_members
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER iam_group_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_group_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_group_policies_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_group_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+CREATE TRIGGER iam_group_attached_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_group_attached_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER iam_group_attached_policies_users BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON iam_group_attached_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_users();
+"#;
+
+/// Migration 55: S3 Inventory (see `inventory`, `plans/inventory.md`).
 ///
 /// A bucket's inventory configurations, one row each, by their IDs: as
 /// JSON, whether it's enabled, the user that set it (as whom an SSE-KMS
@@ -2466,7 +2578,7 @@ ALTER TABLE multipart_uploads ADD COLUMN initiator text;
 /// inventory reports share (see `lifecycle`) read beyond their shares,
 /// which the next steps pay off first.
 ///
-/// Changed by plain writes, keyed by the configuration (T57, T58, T59): no
+/// Changed by plain writes, keyed by the configuration (T61, T62, T63): no
 /// new lock protocol.
 const INVENTORY: &str = r#"
 CREATE SEQUENCE inventory_generations;

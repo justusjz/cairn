@@ -16,6 +16,7 @@ import Jobs from "./pages/Jobs";
 import Lifecycle from "./pages/Lifecycle";
 import Overview from "./pages/Overview";
 import Policies from "./pages/Policies";
+import Groups from "./pages/Groups";
 import Roles from "./pages/Roles";
 import Storage from "./pages/Storage";
 import SignIn from "./pages/SignIn";
@@ -108,6 +109,7 @@ function Layout(props: RouteSectionProps) {
 const ACCOUNT_NAV: [string, string][] = [
   ["/buckets", "Buckets"],
   ["/users", "Users"],
+  ["/groups", "Groups"],
   ["/roles", "Roles"],
   ["/policies", "Policies"],
 ];
@@ -554,6 +556,7 @@ render(
       <Route path="/jobs" component={Guarded(Jobs)} />
       <Route path="/sign-in" component={Guarded(SignIn)} />
       <Route path="/users" component={Guarded(Users)} />
+      <Route path="/groups" component={Guarded(Groups)} />
       <Route path="/roles" component={Guarded(Roles)} />
       <Route path="/policies" component={Guarded(Policies)} />
       <Route path="/account" component={Home} />

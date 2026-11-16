@@ -80,6 +80,11 @@
 --   O(o)    An IAM role's row (`iam_roles`; see `roles`). Exclusive:
 --           setting an inline policy or tagging it (I10); deleting it
 --           (T49), which checks it has no policies left.
+--   Q(q)    An IAM group's row (`iam_groups`; see `groups`). Shared:
+--           adding a member to it (T59), under the member's R(r), which
+--           every change of a user's memberships holds (T59, T60, deleting
+--           the user). Exclusive: setting an inline policy (I10); deleting
+--           it (T58), which checks it has no members or policies left.
 --   D(d)    An IAM OIDC provider's row (`iam_oidc_providers`; see
 --           `iam_oidc`). Exclusive: adding a client ID, tagging it,
 --           setting its thumbprints (I10).
@@ -177,7 +182,11 @@
 --     tagging it holds M(m) exclusively, and counts in a later statement
 --     (T43). A role's inline policies hold at most 10240 characters
 --     together, and it has at most 50 tags: under O(o), counted in a later
---     statement (T47, T48). An IAM OIDC provider has at most 100 client
+--     statement (T47, T48). A group's inline policies hold at most 5120
+--     characters together: under Q(q), counted in a later statement (T57);
+--     and a user is in at most 10 groups: adding it to one holds R(r)
+--     exclusively (then the group's Q(q) shared), and counts in a later
+--     statement (T59). An IAM OIDC provider has at most 100 client
 --     IDs and 50 tags: under D(d), counted in a later statement (T50,
 --     T51); its thumbprints (at most five, checked before) are replaced
 --     under D(d) too (T52). Likewise a console login
@@ -213,7 +222,7 @@
 -- There are none, by three rules, which every transaction follows:
 --
 -- A. All of a transaction's locks are taken up front, in one global order:
---    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, O, D, M, X (by
+--    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, O, Q, D, M, X (by
 --    blob id), each stripe in one mode, each blob
 --    in its final mode (exclusive wins over shared). A transaction that waits
 --    for a lock therefore only ever waits for one that comes later in the
@@ -2145,14 +2154,14 @@ BEGIN
 END
 $$;
 
--- T57: PutBucketInventoryConfiguration: sets the bucket's inventory
+-- T61: PutBucketInventoryConfiguration: sets the bucket's inventory
 -- configuration `p_id`, with a new generation, and starts a new report of
 -- it, due now (the last whole report stays), unless the bucket has
 -- `p_max` others already. Takes the bucket's row as a plain UPDATE does
 -- (FOR NO KEY UPDATE, as T18's UPDATE does), which serializes the
 -- bucket's configuration changes, so that two can't both find room for
 -- one more; it doesn't conflict with B(b) shared. No invariant involves
--- the configuration, which a report checks itself (T58, T59). Returns
+-- the configuration, which a report checks itself (T62, T63). Returns
 -- 'set', 'too_many' or 'no_such_bucket'.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_inventory(
     p_bucket text, p_id text, p_config text, p_enabled boolean, p_setter uuid, p_max int)
@@ -2176,10 +2185,10 @@ BEGIN
 END
 $$;
 
--- T58: a report's data file, written: records it, and where the report has
+-- T62: a report's data file, written: records it, and where the report has
 -- got to (the last version in it), and how many versions it has read, as
 -- long as the configuration is still of `p_generation`. Plain writes,
--- keyed by the configuration (see T57). Returns whether it was.
+-- keyed by the configuration (see T61). Returns whether it was.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_inventory_file(
     p_bucket text, p_id text, p_generation bigint, p_started timestamptz, p_key text,
     p_size bigint, p_md5 text, p_cursor_key text, p_cursor_id bigint, p_seen bigint)
@@ -2200,10 +2209,10 @@ BEGIN
 END
 $$;
 
--- T59: a report, done (its manifest written): records it as the last whole
+-- T63: a report, done (its manifest written): records it as the last whole
 -- one, makes the next one due at `p_due`, and drops its data files, as
 -- long as the configuration is still of `p_generation`. Plain writes, as
--- T58's. Returns whether it was.
+-- T62's. Returns whether it was.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_inventory_done(
     p_bucket text, p_id text, p_generation bigint, p_last text, p_due timestamptz)
 RETURNS boolean LANGUAGE plpgsql AS $$
@@ -3172,6 +3181,102 @@ BEGIN
     END IF;
     DELETE FROM iam_roles WHERE id = p_role;
     RETURN 'deleted';
+END
+$$;
+
+-- T57: PutGroupPolicy: sets the group's inline policy `p_name`, unless its
+-- inline policies would hold more than `p_max` characters (but whitespace)
+-- together (I10). Takes Q(q) exclusively, then sizes them in a later
+-- statement. Returns 'set', 'no_such_group' or 'too_big'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_put_group_policy(p_group uuid, p_name text, p_document text, p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM iam_groups WHERE id = p_group FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_group';
+    END IF;
+    IF (SELECT coalesce(sum(length(regexp_replace(document, '\s', '', 'g'))), 0)
+        FROM iam_group_policies WHERE group_id = p_group AND name <> p_name)
+       + length(regexp_replace(p_document, '\s', '', 'g')) > p_max THEN
+        RETURN 'too_big';
+    END IF;
+    INSERT INTO iam_group_policies (group_id, name, document) VALUES (p_group, p_name, p_document)
+    ON CONFLICT (group_id, name) DO UPDATE SET document = EXCLUDED.document;
+    RETURN 'set';
+END
+$$;
+
+-- T58: DeleteGroup: deletes the group, unless it has members, or inline or
+-- attached policies left, as IAM refuses it. Takes Q(q) exclusively, then
+-- checks in a later statement, so that no member added or policy set
+-- meanwhile goes with it unseen (an attachment's or a member's FK check
+-- takes Q(q) shared). Returns 'deleted', 'no_such_group', 'members',
+-- 'policies' or 'attached'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_group(p_group uuid)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM iam_groups WHERE id = p_group FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_group';
+    END IF;
+    IF EXISTS (SELECT 1 FROM iam_group_members WHERE group_id = p_group) THEN
+        RETURN 'members';
+    END IF;
+    IF EXISTS (SELECT 1 FROM iam_group_policies WHERE group_id = p_group) THEN
+        RETURN 'policies';
+    END IF;
+    IF EXISTS (SELECT 1 FROM iam_group_attached_policies WHERE group_id = p_group) THEN
+        RETURN 'attached';
+    END IF;
+    DELETE FROM iam_groups WHERE id = p_group;
+    RETURN 'deleted';
+END
+$$;
+
+-- T59: AddUserToGroup: makes the user a member of the group, unless it's in
+-- `p_max` groups already (I10). Takes R(r) exclusively, then Q(q) shared (so
+-- the group isn't deleted meanwhile: T58), then counts in a later
+-- statement. Returns 'added' (or already a member), 'no_such_user',
+-- 'no_such_group' or 'too_many'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_add_user_to_group(p_user uuid, p_group uuid, p_max integer)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM users WHERE id = p_user FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_user';
+    END IF;
+    PERFORM 1 FROM iam_groups WHERE id = p_group FOR KEY SHARE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_group';
+    END IF;
+    IF EXISTS (SELECT 1 FROM iam_group_members WHERE user_id = p_user AND group_id = p_group) THEN
+        RETURN 'added';
+    END IF;
+    IF (SELECT count(*) FROM iam_group_members WHERE user_id = p_user) >= p_max THEN
+        RETURN 'too_many';
+    END IF;
+    INSERT INTO iam_group_members (group_id, user_id) VALUES (p_group, p_user);
+    RETURN 'added';
+END
+$$;
+
+-- T60: RemoveUserFromGroup: ends the user's membership of the group. Takes
+-- R(r) exclusively, as every change of a user's memberships does (T59, and
+-- deleting the user), so that the trigger that keeps its `cairn:groups`
+-- policy (see `db::IAM_GROUPS`) sees all of them. Returns 'removed',
+-- 'no_such_user' or 'not_member'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_remove_user_from_group(p_user uuid, p_group uuid)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM users WHERE id = p_user FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN 'no_such_user';
+    END IF;
+    DELETE FROM iam_group_members WHERE user_id = p_user AND group_id = p_group;
+    IF NOT FOUND THEN
+        RETURN 'not_member';
+    END IF;
+    RETURN 'removed';
 END
 $$;
 

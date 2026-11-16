@@ -40,6 +40,7 @@ mod e2e;
 mod encryption;
 mod gc;
 mod grants;
+mod groups;
 mod iam;
 mod iam_oidc;
 mod inventory;

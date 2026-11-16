@@ -3,10 +3,13 @@
 //! cluster, so that issuing one writes nothing, and any node checks one
 //! (see `plans/roles.md`).
 //!
-//! A token is `base64(version ‖ key ID ‖ nonce ‖ XChaCha20-Poly1305(key,
-//! nonce, payload, version ‖ key ID))`. The payload (`Session`) holds the
-//! credentials' secret, so only a node with the key can recover it and
-//! check a request's signature; and whose session it is (a role's, a
+//! A token is `base64(version ‖ key ID ‖ payload ‖ tag)`, where the payload
+//! is the `Session` (JSON, readable by whoever holds the token) and the tag
+//! `HMAC-SHA256(key, "tag" ‖ version ‖ key ID ‖ payload)`, cut to 16 bytes.
+//! The credentials' secret isn't in the token: it's
+//! `HMAC-SHA256(key, "secret" ‖ version ‖ key ID ‖ payload)`, its first 30
+//! bytes in base64, so only a node with the key can derive it and check a
+//! request's signature. The payload says whose session it is (a role's, a
 //! user's, a federated user's), by ID, so a role deleted and made again
 //! with its name doesn't revive its sessions.
 //!
@@ -20,15 +23,21 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce, aead::{Aead, Payload}};
+use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
 use crate::db::Cached;
 
-/// The token format's version.
-const VERSION: u8 = 1;
+/// The token format's version (1's held the secret, encrypted; no node
+/// takes those anymore).
+const VERSION: u8 = 2;
+/// The token's head: its version, and its key's ID.
+const HEAD: usize = 1 + 4;
+/// The tag's length (of HMAC-SHA256's 32 bytes).
+const TAG: usize = 16;
 /// How often a node makes a new key: the newest older than this is
 /// replaced.
 const KEY_LIFETIME: Duration = Duration::from_secs(24 * 3600);
@@ -60,7 +69,9 @@ pub struct Session {
     /// Its access key ID (`ASIA…`): a token is its key's only.
     #[serde(rename = "k")]
     pub key_id: String,
-    #[serde(rename = "s")]
+    /// Its secret: derived from the token (see above), not in it; empty
+    /// until the session is sealed or opened.
+    #[serde(skip)]
     pub secret: String,
     /// When it was issued and when it expires (Unix seconds).
     #[serde(rename = "i")]
@@ -174,8 +185,8 @@ impl Keys {
         self.rotate(client, true).await
     }
 
-    /// `session`'s token.
-    pub async fn seal(&self, client: &deadpool_postgres::Object, session: &Session) -> anyhow::Result<String> {
+    /// `session`'s token; sets its secret.
+    pub async fn seal(&self, client: &deadpool_postgres::Object, session: &mut Session) -> anyhow::Result<String> {
         self.current(client, false).await?;
         let usable = |c: &Option<Loaded>| {
             c.as_ref().and_then(|c| c.newest).is_some_and(|(_, made)| now() as i64 - made < KEY_LIFETIME.as_secs() as i64 * 2)
@@ -187,51 +198,64 @@ impl Keys {
         let cached = guard.as_ref().ok_or_else(|| anyhow::anyhow!("no session keys"))?;
         let (id, _) = cached.newest.ok_or_else(|| anyhow::anyhow!("no session keys"))?;
         let key = &cached.keys[&id];
-        let mut nonce = [0u8; 24];
-        getrandom::fill(&mut nonce).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
-        let mut head = vec![VERSION];
-        head.extend_from_slice(&id.to_be_bytes());
-        let payload = Zeroizing::new(serde_json::to_vec(session)?);
-        let key: &[u8; 32] = key;
-        let sealed = XChaCha20Poly1305::new(key.into())
-            .encrypt(&XNonce::from(nonce), Payload { msg: &payload, aad: &head })
-            .map_err(|_| anyhow::anyhow!("sealing a session token failed"))?;
-        let mut token = head;
-        token.extend_from_slice(&nonce);
-        token.extend_from_slice(&sealed);
+        let mut token = vec![VERSION];
+        token.extend_from_slice(&id.to_be_bytes());
+        token.extend_from_slice(&serde_json::to_vec(session)?);
+        let tag = mac(key, b"tag", &token);
+        session.secret = secret(key, &token);
+        token.extend_from_slice(&tag[..TAG]);
         Ok(STANDARD.encode(token))
     }
 
-    /// The session `token` is, if it's one of ours (any key's), and not
-    /// expired.
+    /// The session `token` is (its secret set), if it's one of ours (any
+    /// key's), and not expired.
     pub async fn open(&self, client: &deadpool_postgres::Object, token: &str) -> anyhow::Result<Result<Session, Bad>> {
         let Ok(bytes) = STANDARD.decode(token.trim()) else { return Ok(Err(Bad::Malformed)) };
-        if bytes.len() < 1 + 4 + 24 + 16 || bytes[0] != VERSION {
+        if bytes.len() < HEAD + TAG || bytes[0] != VERSION {
             return Ok(Err(Bad::Malformed));
         }
-        let id = i32::from_be_bytes(bytes[1..5].try_into().unwrap());
+        let (signed, tag) = bytes.split_at(bytes.len() - TAG);
+        let id = i32::from_be_bytes(bytes[1..HEAD].try_into().unwrap());
         self.current(client, false).await?;
         let known = self.cached.lock().unwrap().as_ref().is_some_and(|c| c.keys.contains_key(&id));
         if !known {
             // Made by another node since this one last read them.
             self.current(client, true).await?;
         }
-        let opened = {
+        let secret = {
             let guard = self.cached.lock().unwrap();
             let Some(key) = guard.as_ref().and_then(|c| c.keys.get(&id)) else { return Ok(Err(Bad::Malformed)) };
-            let key: &[u8; 32] = key;
-            let nonce = XNonce::try_from(&bytes[5..29]).expect("24 bytes");
-            XChaCha20Poly1305::new(key.into())
-                .decrypt(&nonce, Payload { msg: &bytes[29..], aad: &bytes[..5] })
-                .map(Zeroizing::new)
+            if keyed(key, b"tag", signed).verify_truncated_left(tag).is_err() {
+                return Ok(Err(Bad::Malformed));
+            }
+            secret(key, signed)
         };
-        let Ok(payload) = opened else { return Ok(Err(Bad::Malformed)) };
-        let Ok(session) = serde_json::from_slice::<Session>(&payload) else { return Ok(Err(Bad::Malformed)) };
+        let Ok(mut session) = serde_json::from_slice::<Session>(&signed[HEAD..]) else { return Ok(Err(Bad::Malformed)) };
         if session.expires <= now() {
             return Ok(Err(Bad::Expired));
         }
+        session.secret = secret;
         Ok(Ok(session))
     }
+}
+
+/// HMAC-SHA256 under `key` of `label ‖ signed`, before it's finished.
+fn keyed(key: &[u8; 32], label: &[u8], signed: &[u8]) -> Hmac<Sha256> {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC takes any key");
+    mac.update(label);
+    mac.update(signed);
+    mac
+}
+
+/// HMAC-SHA256 under `key` of `label ‖ signed`.
+fn mac(key: &[u8; 32], label: &[u8], signed: &[u8]) -> Zeroizing<[u8; 32]> {
+    Zeroizing::new(keyed(key, label, signed).finalize().into_bytes().into())
+}
+
+/// The secret of the session whose token (without its tag) `signed` is: 40
+/// characters of base64's alphabet, as AWS's.
+fn secret(key: &[u8; 32], signed: &[u8]) -> String {
+    STANDARD.encode(&mac(key, b"secret", signed)[..30])
 }
 
 /// `cairn sessions …`: temporary credentials (STS's), cluster-wide.
@@ -278,13 +302,6 @@ pub fn new_key_id() -> anyhow::Result<String> {
     Ok(format!("ASIA{}", bytes.iter().map(|b| ALPHABET[(b & 31) as usize] as char).collect::<String>()))
 }
 
-/// A new secret: 40 random characters of base64's alphabet, as AWS's.
-pub fn new_secret() -> anyhow::Result<String> {
-    let mut bytes = [0u8; 30];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow::anyhow!("no randomness: {e}"))?;
-    Ok(STANDARD.encode(bytes))
-}
-
 /// Whether `key_id` is a temporary one (STS's).
 pub fn is_temporary(key_id: &str) -> bool {
     key_id.starts_with("ASIA")
@@ -316,12 +333,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn key_ids_and_secrets_look_like_awss() {
+    fn key_ids_look_like_awss() {
         let id = new_key_id().unwrap();
         assert_eq!(id.len(), 20);
         assert!(is_temporary(&id));
         assert!(id[4..].bytes().all(|b| b.is_ascii_uppercase() || (b'2'..=b'7').contains(&b)));
-        assert_eq!(new_secret().unwrap().len(), 40);
+    }
+
+    #[tokio::test]
+    async fn tokens_hold_no_secret_and_take_no_tampering() {
+        let Some(pool) = crate::e2e::fresh_database_through(usize::MAX).await else { return };
+        let client = pool.get().await.unwrap();
+        let keys = Keys::default();
+        let mut session = Session {
+            key_id: new_key_id().unwrap(),
+            secret: String::new(),
+            issued: now(),
+            expires: now() + 900,
+            who: Who::User { id: Uuid::new_v4() },
+            policy: None,
+            policy_arns: Vec::new(),
+            tags: Vec::new(),
+            transitive: Vec::new(),
+            source_identity: None,
+            chained: false,
+            provider: None,
+        };
+        let token = keys.seal(&client, &mut session).await.unwrap();
+        // The secret is AWS's shape, derived, not in the token.
+        assert_eq!(session.secret.len(), 40);
+        assert!(!String::from_utf8_lossy(&STANDARD.decode(&token).unwrap()).contains(&session.secret));
+        assert_eq!(keys.open(&client, &token).await.unwrap(), Ok(session.clone()));
+        // Another session of the same key ID gets another secret.
+        let mut other = Session { expires: session.expires + 1, ..session.clone() };
+        keys.seal(&client, &mut other).await.unwrap();
+        assert_ne!(other.secret, session.secret);
+        // Any byte changed (version, key ID, payload, tag) is no token.
+        let bytes = STANDARD.decode(&token).unwrap();
+        for i in [0, 4, HEAD + 5, bytes.len() - 1] {
+            let mut forged = bytes.clone();
+            forged[i] ^= 1;
+            assert_eq!(keys.open(&client, &STANDARD.encode(forged)).await.unwrap(), Err(Bad::Malformed), "byte {i}");
+        }
+        // Expired, and its keys revoked.
+        let mut old = Session { expires: now() - 1, ..session.clone() };
+        let expired = keys.seal(&client, &mut old).await.unwrap();
+        assert_eq!(keys.open(&client, &expired).await.unwrap(), Err(Bad::Expired));
+        keys.revoke_all(&client).await.unwrap();
+        assert_eq!(keys.open(&client, &token).await.unwrap(), Err(Bad::Malformed));
     }
 
     #[test]

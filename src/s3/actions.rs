@@ -98,6 +98,18 @@ impl On {
         On::Roles(account.to_owned(), prefix.strip_prefix('/').unwrap_or(prefix).to_owned())
     }
 
+    /// Group `name` of `account`, at `path`: by its ARN, as groups are no
+    /// principals, and nothing but IAM's actions on them names them.
+    pub fn group(account: &str, path: &str, name: &str) -> On {
+        On::Arn(crate::groups::group_arn(account, path, name))
+    }
+
+    /// `account`'s groups at paths starting with `prefix` (`/…`), for
+    /// `iam:ListGroups` (`group/`, then the prefix).
+    pub fn groups(account: &str, prefix: &str) -> On {
+        On::Arn(format!("arn:aws:iam::{account}:group/{}", prefix.strip_prefix('/').unwrap_or(prefix)))
+    }
+
     /// Managed policy `name` of `account` (`aws`: Cairn's), at `path`.
     pub fn policy(account: &str, path: &str, name: &str) -> On {
         On::Policy(account.to_owned(), format!("{}{name}", path.strip_prefix('/').unwrap_or(path)))
