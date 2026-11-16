@@ -8,15 +8,13 @@
 //! asked (`row_group`), so a file's written as it's made and only a row
 //! group of it is ever held: each column of a row group is one data page
 //! (v1), PLAIN-encoded with its definition levels bit-packed, and
-//! gzip-compressed. The footer (`finish`) lists the row groups, written
+//! Snappy-compressed, as S3's are (see `snappy`). The footer (`finish`) lists the row groups, written
 //! with Thrift's compact protocol by hand (`Thrift`).
 //!
 //! The format: <https://parquet.apache.org/docs/file-format/>, and its
 //! Thrift definitions, `parquet.thrift`.
 
-use std::io::Write;
-
-use flate2::{Compression, write::GzEncoder};
+use super::snappy;
 
 /// A column's type.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -90,7 +88,7 @@ const UTF8: i32 = 0;
 const TIMESTAMP_MILLIS: i32 = 9;
 const PLAIN: i32 = 0;
 const RLE: i32 = 3;
-const GZIP: i32 = 2;
+const SNAPPY: i32 = 1;
 const DATA_PAGE: i32 = 0;
 
 /// A column's rows of the row group being made.
@@ -270,7 +268,7 @@ impl Writer {
                             t.list(3, Thrift::BINARY, 1); // path_in_schema
                             t.varint(column.name.len() as u64);
                             t.out.extend_from_slice(column.name.as_bytes());
-                            t.i32(4, GZIP);
+                            t.i32(4, SNAPPY);
                             t.i64(5, chunk.values);
                             t.i64(6, chunk.uncompressed);
                             t.i64(7, chunk.compressed);
@@ -308,9 +306,7 @@ fn page(column: &Column, buffer: Buffer, rows: i64, out: &mut Vec<u8>) -> (i64, 
     } else {
         body.extend_from_slice(&buffer.plain);
     }
-    let mut gzip = GzEncoder::new(Vec::new(), Compression::default());
-    gzip.write_all(&body).expect("writing to memory");
-    let compressed = gzip.finish().expect("writing to memory");
+    let compressed = snappy::compress(&body);
     let mut header = Thrift::default();
     header.i32(1, DATA_PAGE);
     header.i32(2, i32::try_from(body.len()).expect("a page under 2 GiB"));
@@ -553,6 +549,9 @@ pub(crate) mod tests {
 import datetime
 f = pq.ParquetFile(path)
 assert f.metadata.num_row_groups > 2, f.metadata.num_row_groups
+for g in range(f.metadata.num_row_groups):
+    for c in range(f.metadata.num_columns):
+        assert f.metadata.row_group(g).column(c).compression == "SNAPPY"
 t = f.read().to_pylist()
 assert len(t) == 2500
 for i, r in enumerate(t):

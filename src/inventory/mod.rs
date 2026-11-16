@@ -40,6 +40,7 @@
 
 pub mod config;
 pub mod parquet;
+mod snappy;
 
 use std::{
     io,
