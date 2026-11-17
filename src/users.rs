@@ -95,6 +95,11 @@ pub struct Principal {
     /// Whether it's its account's root user (see `Principal::root`): then
     /// it has no ID, name, keys or policies of its own.
     pub root: bool,
+    /// The service control policies its account is under (see
+    /// `organizations`): each level's (the root's, each organizational
+    /// unit's down to its account's, and its account's), as documents.
+    /// None for the management account's, or with SCPs not enabled.
+    pub scps: Vec<Vec<String>>,
     /// Grants, for tests of what they allowed before they were bucket
     /// policies (`s3::authorize`); grants are statements of buckets'
     /// policies now (see `grants`).
@@ -253,6 +258,7 @@ impl Principal {
             boundary,
             session: None,
             root: false,
+            scps: Vec::new(),
             #[cfg(test)]
             read: HashSet::new(),
             #[cfg(test)]
@@ -378,6 +384,7 @@ impl Principal {
             boundary: None,
             session: Some(SessionOf { session, policies: Vec::new(), restricted: false }),
             root: false,
+            scps: Vec::new(),
             #[cfg(test)]
             read: HashSet::new(),
             #[cfg(test)]
@@ -412,7 +419,7 @@ impl Principal {
                 &[param],
             )
             .await?;
-        Ok(row.map(|r| Principal {
+        let principal = row.map(|r| Principal {
             policies: {
                 let mut policies: Vec<String> = r.get(5);
                 policies.extend(r.get::<_, Vec<String>>(6));
@@ -444,13 +451,18 @@ impl Principal {
             account: r.get(4),
             session: None,
             root: false,
+            scps: Vec::new(),
             #[cfg(test)]
             read: HashSet::new(),
             #[cfg(test)]
             write: HashSet::new(),
             #[cfg(test)]
             delete_version: HashSet::new(),
-        }))
+        });
+        let Some(mut principal) = principal else { return Ok(None) };
+        // Its account's SCPs (see `organizations::structure`).
+        principal.scps = crate::organizations::structure::scps(client, &principal.account).await?;
+        Ok(Some(principal))
     }
 
     /// What a grant allowed before there were policies (see `s3::authorize`).
@@ -491,6 +503,7 @@ impl Principal {
             boundary: None,
             session: None,
             root: false,
+            scps: Vec::new(),
         }
     }
 

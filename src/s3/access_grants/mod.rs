@@ -516,7 +516,7 @@ pub fn trusts_access_grants(role: &Role, account: &str) -> anyhow::Result<bool> 
         resource: &role.arn(),
         context: &context,
     };
-    let caps = crate::policy::Caps { boundary: None, session: None };
+    let caps = crate::policy::Caps { boundary: None, session: None, scps: &[] };
     Ok(crate::policy::trust_allows(std::iter::empty(), caps, &trust, &request, false))
 }
 

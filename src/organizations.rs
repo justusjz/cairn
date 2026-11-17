@@ -26,6 +26,8 @@
 //! Organizational units, policies (SCPs), invitations and delegated
 //! administrators answer 501.
 
+pub mod structure;
+
 use std::net::IpAddr;
 use std::sync::Arc;
 
@@ -64,6 +66,17 @@ const OPERATIONS: &[(&str, &str, bool)] = &[
     ("CloseAccount", "organizations:CloseAccount", false),
 ];
 
+/// Operation `name`, with its action, and whether a member account may
+/// make it: the accounts' and the structure's (the management account's
+/// only).
+fn operation_of(name: &str) -> Option<(&'static str, &'static str, bool)> {
+    OPERATIONS
+        .iter()
+        .copied()
+        .find(|(op, _, _)| *op == name)
+        .or_else(|| structure::OPERATIONS.iter().find(|(op, _)| *op == name).map(|&(op, action)| (op, action, false)))
+}
+
 /// Whether a request signed as `signed` is Organizations'.
 pub fn wants(signed: &Signed) -> bool {
     signed.service == "organizations"
@@ -75,6 +88,8 @@ pub struct Error {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// Why, as a ConstraintViolationException says (`OU_DEPTH_LIMIT_EXCEEDED`, …).
+    reason: Option<String>,
 }
 
 type Result<T> = std::result::Result<T, Error>;
@@ -87,7 +102,7 @@ impl Error {
 }
 
 fn error(status: StatusCode, code: &'static str, message: impl Into<String>) -> Error {
-    Error { status, code, message: message.into() }
+    Error { status, code, message: message.into(), reason: None }
 }
 
 fn invalid(message: impl Into<String>) -> Error {
@@ -133,7 +148,13 @@ pub async fn handle(app: &Arc<App>, req: Request<crate::listen::ClientBody>, sig
     let request_id = Uuid::new_v4().to_string();
     let (status, body) = match respond(app, req, &signed, peer).await {
         Ok(value) => (StatusCode::OK, value.to_string()),
-        Err(e) => (e.status, json!({ "__type": e.code, "Message": e.message, "message": e.message }).to_string()),
+        Err(e) => {
+            let mut body = json!({ "__type": e.code, "Message": e.message, "message": e.message });
+            if let Some(reason) = &e.reason {
+                body["Reason"] = json!(reason);
+            }
+            (e.status, body.to_string())
+        }
     };
     Response::builder()
         .status(status)
@@ -154,7 +175,7 @@ async fn respond(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed
     let Some(operation) = target.strip_prefix("AWSOrganizationsV20161128.") else {
         return Err(error(StatusCode::BAD_REQUEST, "UnknownOperationException", format!("No such operation: {target}")));
     };
-    let Some(&(operation, action, members)) = OPERATIONS.iter().find(|(op, _, _)| *op == operation) else {
+    let Some((operation, action, members)) = operation_of(operation) else {
         return Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn doesn't implement {operation}.")));
     };
     let client = app.pool.get().await?;
@@ -307,7 +328,13 @@ impl Ctx<'_> {
                 close(self.client, &self.management, id).await?;
                 Ok(json!({}))
             }
-            other => Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn doesn't implement {other}."))),
+            // The structure's: checked on the organization (its root,
+            // units and policies are its).
+            other => {
+                self.check(&organization)?;
+                let input = structure::Input { client: self.client, management: &self.management, input: self.input };
+                structure::answer(other, &input).await
+            }
         }
     }
 }
@@ -343,11 +370,21 @@ pub struct Account {
     /// (seconds since the epoch).
     pub joined: f64,
     pub closed: Option<f64>,
+    /// The organizational unit it's in (`None`: the root).
+    pub parent: Option<String>,
 }
 
 impl Account {
     fn of(row: &tokio_postgres::Row) -> Account {
-        Account { id: row.get(0), name: row.get(1), email: row.get(2), management: row.get(3), joined: row.get(4), closed: row.get(5) }
+        Account {
+            id: row.get(0),
+            name: row.get(1),
+            email: row.get(2),
+            management: row.get(3),
+            joined: row.get(4),
+            closed: row.get(5),
+            parent: row.get(6),
+        }
     }
 
     /// Its status, as AWS says it: `ACTIVE`, or (closed) `SUSPENDED`.
@@ -358,7 +395,7 @@ impl Account {
         }
     }
 
-    fn json(&self, management: &str) -> Value {
+    pub(crate) fn json(&self, management: &str) -> Value {
         let mut value = json!({
             "Id": self.id,
             "Arn": account_arn(management, &self.id),
@@ -376,7 +413,7 @@ impl Account {
 }
 
 const ACCOUNT_COLUMNS: &str =
-    "id, name, email, management, extract(epoch FROM created_at)::float8, extract(epoch FROM closed_at)::float8";
+    "id, name, email, management, extract(epoch FROM created_at)::float8, extract(epoch FROM closed_at)::float8, parent_id";
 
 /// The organization's accounts (closed ones too), the management account
 /// first, then by name.
@@ -517,6 +554,8 @@ pub async fn create(
         true => ("FAILED", Some("EMAIL_ALREADY_EXISTS"), None),
         false => {
             let id = new_account(client, name, email).await?;
+            // In the root, with FullAWSAccess if SCPs are enabled.
+            structure::attach_default(client, &id).await?;
             let trust = crate::roles::check_trust(client, &id, &access_trust(management)).await?;
             let new = crate::roles::New {
                 name: role,
@@ -595,7 +634,7 @@ pub async fn close(client: &deadpool_postgres::Object, management: &str, id: &st
 #[cfg(test)]
 pub(crate) async fn call(app: &App, principal: &Principal, operation: &str, input: Value) -> std::result::Result<Value, String> {
     let client = app.pool.get().await.unwrap();
-    let (operation, action, members) = *OPERATIONS.iter().find(|(op, _, _)| *op == operation).expect("an operation of ours");
+    let (operation, action, members) = operation_of(operation).expect("an operation of ours");
     let management = users::account(&client).await.unwrap();
     if principal.account != management && !members {
         return Err(denied().code.to_owned());

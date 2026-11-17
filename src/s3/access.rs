@@ -116,6 +116,9 @@ pub struct Access {
     session: Option<Vec<Arc<Policy>>>,
     /// The user's permissions boundary, and its ARN.
     boundary: Option<(Arc<Policy>, String)>,
+    /// Its account's service control policies, by level (see
+    /// `organizations`).
+    scps: Vec<Vec<Arc<Policy>>>,
     /// The user's ARN (its path and all).
     arn: Option<String>,
     pub context: Context,
@@ -217,7 +220,15 @@ impl Access {
         let mut identity = Vec::new();
         let mut boundary = None;
         let mut session = None;
+        let mut scps = Vec::new();
         if let Some(principal) = principal {
+            for level in &principal.scps {
+                let mut policies = Vec::new();
+                for document in level {
+                    policies.push(parsed(document, Kind::Identity, None)?);
+                }
+                scps.push(policies);
+            }
             if let Some(of) = principal.session.as_ref().filter(|of| of.restricted) {
                 let mut policies = Vec::new();
                 for document in &of.policies {
@@ -241,6 +252,7 @@ impl Access {
             identity,
             session,
             boundary,
+            scps,
             context: context(principal, account, method, headers, query, origin),
             buckets: HashMap::new(),
             object_tags: HashMap::new(),
@@ -491,8 +503,14 @@ impl Access {
         };
         let boundary = self.boundary.as_ref().map(|(policy, _)| &**policy);
         let session: Option<Vec<&Policy>> = self.session.as_ref().map(|policies| policies.iter().map(|p| &**p).collect());
-        let caps = crate::policy::Caps { boundary, session: session.as_deref() };
+        let scps = self.scp_levels();
+        let caps = crate::policy::Caps { boundary, session: session.as_deref(), scps: &scps };
         crate::policy::verdict_across(self.identity.iter().map(|p| &**p), caps, bucket, &request, cross)
+    }
+
+    /// Its account's SCPs, by level, as `Caps` takes them.
+    fn scp_levels(&self) -> Vec<Vec<&Policy>> {
+        self.scps.iter().map(|level| level.iter().map(|p| &**p).collect()).collect()
     }
 
     /// Whether `trust` (a role's trust policy, its principals' IDs given)
@@ -515,7 +533,8 @@ impl Access {
         let request = crate::policy::Request { principal, action, resource: role, context: &context };
         let boundary = self.boundary.as_ref().map(|(policy, _)| &**policy);
         let session: Option<Vec<&Policy>> = self.session.as_ref().map(|policies| policies.iter().map(|p| &**p).collect());
-        let caps = crate::policy::Caps { boundary, session: session.as_deref() };
+        let scps = self.scp_levels();
+        let caps = crate::policy::Caps { boundary, session: session.as_deref(), scps: &scps };
         let cross = owner.is_some_and(|owner| self.account() != Some(owner));
         crate::policy::trust_allows(self.identity.iter().map(|p| &**p), caps, trust, &request, cross)
     }
@@ -531,7 +550,7 @@ impl Access {
             context.set("aws:ResourceAccount", account);
         }
         let request = crate::policy::Request { principal: Who::WebIdentity { provider }, action, resource: role, context: &context };
-        let caps = crate::policy::Caps { boundary: None, session: None };
+        let caps = crate::policy::Caps { boundary: None, session: None, scps: &[] };
         crate::policy::trust_allows(std::iter::empty(), caps, trust, &request, false)
     }
 

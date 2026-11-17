@@ -74,10 +74,12 @@ Done:
   `OrganizationAccountAccessRole`, cross-account AssumeRole, CloseAccount):
   implemented. Cross-account access to SNS topics (their policies) and
   Access Grants (instances' resource policies): implemented (KMS keys are
-  OpenBao's, whose policies decide their use). Next: organizational units
-  and SCPs. Also: directory users and groups as Access Grants grantees,
-  switching roles in the console, and the access portal's APIs for `aws
-  sso login`.
+  OpenBao's, whose policies decide their use). Organizational units and
+  service control policies: implemented. Next: organization condition
+  keys (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`), and the console's
+  OUs and SCPs. Also: directory users and groups as Access Grants
+  grantees, switching roles in the console, and the access portal's APIs
+  for `aws sso login`.
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes

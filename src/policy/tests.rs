@@ -599,16 +599,16 @@ fn a_boundary_caps_identity_policies() {
     let get = Request { resource: &resource, ..request("") };
     let get_secret = Request { resource: &secret, ..request("") };
     let decide = |boundary: Option<&Policy>, bucket: Option<&Policy>, request: &Request, cross: bool| {
-        verdict_across([&s3_all], Caps { boundary, session: None }, bucket, request, cross)
+        verdict_across([&s3_all], Caps { boundary, session: None, scps: &[] }, bucket, request, cross)
     };
     assert_eq!(decide(None, None, &get, false), Verdict::Allow);
     assert_eq!(decide(Some(&list_only), None, &get, false), Verdict::OutsideBoundary);
     assert_eq!(decide(Some(&deny_secret), None, &get, false), Verdict::Allow);
     assert_eq!(decide(Some(&deny_secret), None, &get_secret, false), Verdict::BoundaryDeny);
     // Neither allows: it's the boundary that doesn't (probed).
-    assert_eq!(verdict_across([], Caps { boundary: Some(&list_only), session: None }, None, &get, false), Verdict::OutsideBoundary);
+    assert_eq!(verdict_across([], Caps { boundary: Some(&list_only), session: None, scps: &[] }, None, &get, false), Verdict::OutsideBoundary);
     // A boundary alone allows nothing.
-    assert_eq!(verdict_across([], Caps { boundary: Some(&s3_all), session: None }, None, &get, false), Verdict::ImplicitDeny);
+    assert_eq!(verdict_across([], Caps { boundary: Some(&s3_all), session: None, scps: &[] }, None, &get, false), Verdict::ImplicitDeny);
 
     let by_user = bucket_policy(
         r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/alice"},
@@ -623,7 +623,7 @@ fn a_boundary_caps_identity_policies() {
             "Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
     );
     assert_eq!(decide(Some(&list_only), Some(&by_user), &get, false), Verdict::Allow);
-    assert_eq!(verdict_across([], Caps { boundary: Some(&list_only), session: None }, Some(&by_user), &get, false), Verdict::Allow);
+    assert_eq!(verdict_across([], Caps { boundary: Some(&list_only), session: None, scps: &[] }, Some(&by_user), &get, false), Verdict::Allow);
     assert_eq!(decide(Some(&list_only), Some(&by_everyone), &get, false), Verdict::Allow);
     assert_eq!(decide(Some(&list_only), Some(&by_account), &get, false), Verdict::OutsideBoundary);
     assert_eq!(decide(Some(&deny_secret), Some(&by_user), &get_secret, false), Verdict::BoundaryDeny);
@@ -826,10 +826,10 @@ fn sessions_are_capped_by_their_role_and_session_policies() {
     };
     let none = Caps::default();
     let session_list: [&Policy; 1] = [&list_only];
-    let capped_by_session = Caps { boundary: None, session: Some(&session_list) };
-    let bounded = Caps { boundary: Some(&list_only), session: None };
+    let capped_by_session = Caps { boundary: None, session: Some(&session_list), scps: &[] };
+    let bounded = Caps { boundary: Some(&list_only), session: None, scps: &[] };
     let no_session_policies: [&Policy; 0] = [];
-    let restricted = Caps { boundary: None, session: Some(&no_session_policies) };
+    let restricted = Caps { boundary: None, session: Some(&no_session_policies), scps: &[] };
 
     // Naming the role: any of its sessions, within their caps.
     assert_eq!(decide(session("any"), "role/k", &[], none), Verdict::Allow);
@@ -845,7 +845,7 @@ fn sessions_are_capped_by_their_role_and_session_policies() {
     assert_eq!(decide(session("any"), "elsewhere", &[], capped_by_session), Verdict::ImplicitDeny);
     assert_eq!(decide(session("any"), "elsewhere", &[&read_all], restricted), Verdict::OutsideSession);
     assert_eq!(
-        decide(session("any"), "elsewhere", &[&read_all], Caps { boundary: Some(&list_only), session: Some(&session_list) }),
+        decide(session("any"), "elsewhere", &[&read_all], Caps { boundary: Some(&list_only), session: Some(&session_list), scps: &[] }),
         Verdict::OutsideBoundary
     );
     // A user is never the role's session.
@@ -876,10 +876,10 @@ fn trust_policies_decide_who_assumes_a_role() {
     let other = trusting(&format!("arn:aws:iam::{ACCOUNT}:user/bob"));
     assert!(decide(&alice, &[], Caps::default()));
     // Past a boundary that doesn't allow it.
-    assert!(decide(&alice, &[], Caps { boundary: Some(&s3_only), session: None }));
+    assert!(decide(&alice, &[], Caps { boundary: Some(&s3_only), session: None, scps: &[] }));
     assert!(!decide(&account, &[], Caps::default()));
     assert!(decide(&account, &[&may_assume], Caps::default()));
-    assert!(!decide(&account, &[&may_assume], Caps { boundary: Some(&s3_only), session: None }));
+    assert!(!decide(&account, &[&may_assume], Caps { boundary: Some(&s3_only), session: None, scps: &[] }));
     assert!(!decide(&other, &[&may_assume], Caps::default()));
 }
 
@@ -1046,4 +1046,46 @@ fn the_root_user_is_denied_only_by_resource_policies() {
         r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"123456789012"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
     );
     assert_eq!(root_verdict(Some(&allow_account), &request("s3:GetObject", &get), false), Verdict::Allow);
+}
+
+/// Service control policies cap a principal by level (its organization's
+/// root, each unit, its account): every level must allow a request, a Deny
+/// in any denies it, and they grant nothing; nor does a bucket's policy
+/// get past them.
+#[test]
+fn service_control_policies_cap_every_level() {
+    let all = identity_policy(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#);
+    let s3_only = identity_policy(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#);
+    let list_only = identity_policy(r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:List*","Resource":"*"}]}"#);
+    let no_secret = identity_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/secret/*"}]}"#,
+    );
+    let by_user = bucket_policy(
+        r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::123456789012:user/alice"},
+            "Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
+    );
+    let context = context_of("alice");
+    let resource = object("k");
+    let secret = object("secret/k");
+    let get = Request { principal: user("alice"), action: "s3:GetObject", resource: &resource, context: &context };
+    let get_secret = Request { resource: &secret, ..get };
+    let decide = |identity: &[&Policy], scps: &[Vec<&Policy>], bucket: Option<&Policy>, request: &Request| {
+        verdict_across(identity.iter().copied(), Caps { boundary: None, session: None, scps }, bucket, request, false)
+    };
+    // Every level allows it: the identity policy decides.
+    assert_eq!(decide(&[&all], &[vec![&all], vec![&s3_only], vec![&all]], None, &get), Verdict::Allow);
+    // SCPs grant nothing.
+    assert_eq!(decide(&[], &[vec![&all], vec![&all]], None, &get), Verdict::ImplicitDeny);
+    // A level that doesn't allow it (a unit allowing listing only) is
+    // enough to deny it, whatever the rest allow.
+    assert_eq!(decide(&[&all], &[vec![&all], vec![&list_only], vec![&all]], None, &get), Verdict::OutsideScp);
+    // Two at a level: one allowing it is enough there.
+    assert_eq!(decide(&[&all], &[vec![&all], vec![&list_only, &s3_only], vec![&all]], None, &get), Verdict::Allow);
+    // A Deny at any level denies.
+    assert_eq!(decide(&[&all], &[vec![&all, &no_secret], vec![&all]], None, &get_secret), Verdict::ScpDeny);
+    assert_eq!(decide(&[&all], &[vec![&all, &no_secret], vec![&all]], None, &get), Verdict::Allow);
+    // A bucket's policy doesn't get past them.
+    assert_eq!(decide(&[], &[vec![&all], vec![&list_only]], Some(&by_user), &get), Verdict::OutsideScp);
+    assert_eq!(decide(&[], &[], Some(&by_user), &get), Verdict::Allow);
+    assert_eq!(Verdict::OutsideScp.why("s3:GetObject", None), "because no service control policy allows the s3:GetObject action");
 }
