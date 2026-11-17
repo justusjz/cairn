@@ -205,3 +205,111 @@ async fn other_accounts_use_buckets_as_their_policies_allow() {
     access.load(&app, "shared-data").await.unwrap();
     assert!(access.foreign(&Check { action: "s3:GetBucketPolicy", on: On::Bucket("shared-data".into()) }));
 }
+
+/// Organizational units and service control policies, as AWS
+/// Organizations has them: a member account in a unit, under SCPs at every
+/// level from the root; the management account under none.
+#[tokio::test]
+async fn service_control_policies_cap_member_accounts() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let management = users::account(&client).await.unwrap();
+    let admin = user(&app, &management, "admin", ADMIN).await;
+    let made = org::create(&client, &management, "Team F", "team-f@example.com", org::ACCESS_ROLE).await.unwrap();
+    let member = made.account_id.unwrap();
+    let gina = user(&app, &member, "gina", ADMIN).await;
+    crate::s3::buckets::create::create(&app, "team-f-data", &member, false).await.unwrap();
+    let reload = |p: &Principal| {
+        let (app, id) = (app.clone(), p.id);
+        async move { Principal::load_user(&app.pool.get().await.unwrap(), id).await.unwrap().unwrap() }
+    };
+    let get = || On::Object("team-f-data".into(), "k".into());
+    let delete = || On::Bucket("team-f-data".into());
+
+    // The root, and units under it.
+    let roots = call(&app, &admin, "ListRoots", json!({})).await.unwrap();
+    let root = roots["Roots"][0]["Id"].as_str().unwrap().to_owned();
+    assert_eq!(roots["Roots"][0]["PolicyTypes"], json!([]));
+    let unit = |name: &str, parent: &str| json!({ "Name": name, "ParentId": parent });
+    let teams = call(&app, &admin, "CreateOrganizationalUnit", unit("Teams", &root)).await.unwrap();
+    let teams = teams["OrganizationalUnit"]["Id"].as_str().unwrap().to_owned();
+    assert_eq!(call(&app, &admin, "CreateOrganizationalUnit", unit("Teams", &root)).await.unwrap_err(), "DuplicateOrganizationalUnitException");
+    let prod = call(&app, &admin, "CreateOrganizationalUnit", unit("Prod", &teams)).await.unwrap();
+    assert!(prod["OrganizationalUnit"]["Path"].as_str().unwrap().ends_with(&format!("{root}/{teams}/{}/", prod["OrganizationalUnit"]["Id"].as_str().unwrap())));
+    let prod = prod["OrganizationalUnit"]["Id"].as_str().unwrap().to_owned();
+    // Five deep at most.
+    let mut parent = prod.clone();
+    for depth in 3..=5 {
+        parent = call(&app, &admin, "CreateOrganizationalUnit", unit(&format!("L{depth}"), &parent)).await.unwrap()["OrganizationalUnit"]["Id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    }
+    assert_eq!(call(&app, &admin, "CreateOrganizationalUnit", unit("L6", &parent)).await.unwrap_err(), "ConstraintViolationException");
+
+    // The member account moves into Prod.
+    let moving = |from: &str, to: &str| json!({ "AccountId": member, "SourceParentId": from, "DestinationParentId": to });
+    assert_eq!(call(&app, &admin, "MoveAccount", moving(&teams, &prod)).await.unwrap_err(), "SourceParentNotFoundException");
+    call(&app, &admin, "MoveAccount", moving(&root, &prod)).await.unwrap();
+    let parents = call(&app, &admin, "ListParents", json!({ "ChildId": member })).await.unwrap();
+    assert_eq!(parents["Parents"], json!([{ "Id": prod, "Type": "ORGANIZATIONAL_UNIT" }]));
+    let children = call(&app, &admin, "ListChildren", json!({ "ParentId": prod, "ChildType": "ACCOUNT" })).await.unwrap();
+    assert_eq!(children["Children"], json!([{ "Id": member, "Type": "ACCOUNT" }]));
+    assert_eq!(call(&app, &admin, "DeleteOrganizationalUnit", json!({ "OrganizationalUnitId": prod })).await.unwrap_err(), "OrganizationalUnitNotEmptyException");
+
+    // SCPs: none until enabled; then FullAWSAccess everywhere.
+    let deny_delete = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:DeleteBucket","Resource":"*"}]}"#;
+    let new_policy = |name: &str, content: &str| json!({ "Name": name, "Description": "", "Type": "SERVICE_CONTROL_POLICY", "Content": content });
+    let made = call(&app, &admin, "CreatePolicy", new_policy("NoDeletes", deny_delete)).await.unwrap();
+    let no_deletes = made["Policy"]["PolicySummary"]["Id"].as_str().unwrap().to_owned();
+    let attach = |policy: &str, target: &str| json!({ "PolicyId": policy, "TargetId": target });
+    assert_eq!(call(&app, &admin, "AttachPolicy", attach(&no_deletes, &prod)).await.unwrap_err(), "PolicyTypeNotEnabledException");
+    let enable = json!({ "RootId": root, "PolicyType": "SERVICE_CONTROL_POLICY" });
+    let enabled = call(&app, &admin, "EnablePolicyType", enable.clone()).await.unwrap();
+    assert_eq!(enabled["Root"]["PolicyTypes"][0]["Status"], "ENABLED");
+    assert_eq!(call(&app, &admin, "EnablePolicyType", enable.clone()).await.unwrap_err(), "PolicyTypeAlreadyEnabledException");
+    let on = |target: &str| json!({ "TargetId": target, "Filter": "SERVICE_CONTROL_POLICY" });
+    for target in [&root, &teams, &prod, &member] {
+        let listed = call(&app, &admin, "ListPoliciesForTarget", on(target)).await.unwrap();
+        assert_eq!(listed["Policies"][0]["Id"], "p-FullAWSAccess", "{target}");
+    }
+    assert_eq!(verdict(&app, &reload(&gina).await, &management, "s3:DeleteBucket", delete()).await, Verdict::Allow);
+
+    // A Deny on a unit on the way denies, whatever IAM allows.
+    call(&app, &admin, "AttachPolicy", attach(&no_deletes, &teams)).await.unwrap();
+    assert_eq!(call(&app, &admin, "AttachPolicy", attach(&no_deletes, &teams)).await.unwrap_err(), "DuplicatePolicyAttachmentException");
+    let gina = reload(&gina).await;
+    assert_eq!(verdict(&app, &gina, &management, "s3:DeleteBucket", delete()).await, Verdict::ScpDeny);
+    assert_eq!(verdict(&app, &gina, &management, "s3:GetObject", get()).await, Verdict::Allow);
+    // The management account is under none.
+    assert_eq!(verdict(&app, &admin, &management, "s3:DeleteBucket", On::Bucket("anything".into())).await, Verdict::Allow);
+    // Nor may its sessions assume past them.
+    let assumed = assume(&app, &admin, &format!("arn:aws:iam::{member}:role/{}", org::ACCESS_ROLE)).await.unwrap();
+    assert_eq!(verdict(&app, &assumed, &management, "s3:DeleteBucket", delete()).await, Verdict::ScpDeny);
+
+    // An allow-list: Prod's FullAWSAccess replaced by S3 reads only.
+    let reads = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*"],"Resource":"*"}]}"#;
+    assert_eq!(call(&app, &admin, "CreatePolicy", new_policy("NoDeletes", reads)).await.unwrap_err(), "DuplicatePolicyException");
+    let bad = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"arn:aws:s3:::x"}]}"#;
+    assert_eq!(call(&app, &admin, "CreatePolicy", new_policy("Bad", bad)).await.unwrap_err(), "MalformedPolicyDocumentException");
+    let made = call(&app, &admin, "CreatePolicy", new_policy("ReadsOnly", reads)).await.unwrap();
+    let reads_only = made["Policy"]["PolicySummary"]["Id"].as_str().unwrap().to_owned();
+    assert_eq!(call(&app, &admin, "DetachPolicy", attach("p-FullAWSAccess", &prod)).await.unwrap_err(), "ConstraintViolationException");
+    call(&app, &admin, "AttachPolicy", attach(&reads_only, &prod)).await.unwrap();
+    call(&app, &admin, "DetachPolicy", attach("p-FullAWSAccess", &prod)).await.unwrap();
+    let gina = reload(&gina).await;
+    assert_eq!(verdict(&app, &gina, &management, "s3:GetObject", get()).await, Verdict::Allow);
+    assert_eq!(verdict(&app, &gina, &management, "s3:PutObject", get()).await, Verdict::OutsideScp);
+    let targets = call(&app, &admin, "ListTargetsForPolicy", json!({ "PolicyId": reads_only })).await.unwrap();
+    assert_eq!((&targets["Targets"][0]["TargetId"], &targets["Targets"][0]["Type"]), (&json!(prod), &json!("ORGANIZATIONAL_UNIT")));
+    assert_eq!(call(&app, &admin, "DeletePolicy", json!({ "PolicyId": reads_only })).await.unwrap_err(), "PolicyInUseException");
+
+    // Disabled, all of them come off.
+    call(&app, &admin, "DisablePolicyType", enable).await.unwrap();
+    let gina = reload(&gina).await;
+    assert!(gina.scps.is_empty());
+    assert_eq!(verdict(&app, &gina, &management, "s3:PutObject", get()).await, Verdict::Allow);
+    call(&app, &admin, "DeletePolicy", json!({ "PolicyId": reads_only })).await.unwrap();
+    // A member account's principals may not change the organization.
+    assert_eq!(call(&app, &gina, "ListRoots", json!({})).await.unwrap_err(), "AccessDeniedException");
+}

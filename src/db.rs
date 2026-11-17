@@ -250,6 +250,7 @@ const MIGRATIONS: &[&str] = &[
     OWN_DIRECTORY,
     ORGANIZATIONS,
     ACCESS_GRANTS_POLICIES,
+    ORGANIZATIONAL_UNITS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3308,6 +3309,55 @@ ALTER TABLE access_grants_instances
     ADD COLUMN resource_policy            text,
     ADD COLUMN resource_policy_org        text,
     ADD COLUMN resource_policy_created_at timestamptz;
+"#;
+
+/// Migration 70: the organization's structure and its service control
+/// policies (see `organizations`). Organizational units nest under the
+/// root (`parent_id` NULL) or one another; each account is in the root or
+/// one of them. SCPs are the organization's own policies (AWS's
+/// `FullAWSAccess` is no row: `p-FullAWSAccess`), attached to the root
+/// (`r-…`), units and accounts by their IDs; `organization_policy_types`
+/// says which types are enabled (SCPs, or none).
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const ORGANIZATIONAL_UNITS: &str = r#"
+CREATE TABLE organizational_units (
+    id         text PRIMARY KEY,
+    parent_id  text REFERENCES organizational_units (id),
+    name       text NOT NULL CHECK (length(name) BETWEEN 1 AND 128),
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX organizational_units_parent ON organizational_units (parent_id);
+CREATE UNIQUE INDEX organizational_units_name ON organizational_units (coalesce(parent_id, ''), name);
+CREATE TRIGGER organizational_units_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON organizational_units
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+ALTER TABLE accounts ADD COLUMN parent_id text REFERENCES organizational_units (id);
+
+CREATE TABLE organization_policies (
+    id          text PRIMARY KEY,
+    type        text NOT NULL CHECK (type = 'SERVICE_CONTROL_POLICY'),
+    name        text NOT NULL UNIQUE CHECK (length(name) BETWEEN 1 AND 128),
+    description text NOT NULL DEFAULT '' CHECK (length(description) <= 512),
+    content     text NOT NULL,
+    created_at  timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER organization_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON organization_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE organization_policy_attachments (
+    policy_id text NOT NULL,
+    target_id text NOT NULL,
+    PRIMARY KEY (policy_id, target_id)
+);
+CREATE INDEX organization_policy_attachments_target ON organization_policy_attachments (target_id);
+CREATE TRIGGER organization_policy_attachments_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON organization_policy_attachments
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE organization_policy_types (
+    type       text PRIMARY KEY CHECK (type = 'SERVICE_CONTROL_POLICY'),
+    enabled_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER organization_policy_types_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON organization_policy_types
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

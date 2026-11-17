@@ -595,7 +595,7 @@ pub async fn principal(client: &Object, id: Uuid) -> anyhow::Result<Option<crate
             &[&id],
         )
         .await?;
-    Ok(row.map(|r| {
+    let principal = row.map(|r| {
         let mut policies: Vec<String> = r.get(4);
         policies.extend(r.get::<_, Vec<String>>(5));
         let aws: Vec<String> = r.get(6);
@@ -618,5 +618,9 @@ pub async fn principal(client: &Object, id: Uuid) -> anyhow::Result<Option<crate
             crate::users::tags_of(r.get(7), r.get(8)),
             boundary,
         )
-    }))
+    });
+    let Some(mut principal) = principal else { return Ok(None) };
+    // Its account's SCPs (see `organizations::structure`).
+    principal.scps = crate::organizations::structure::scps(client, &principal.account).await?;
+    Ok(Some(principal))
 }

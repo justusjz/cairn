@@ -78,7 +78,7 @@ supported.
 | S3 Access Grants | 🟡 | IAM grantees (any account's) only: [Access Grants](#access-grants) |
 | MFA delete | 🟡 | [MFA delete](#mfa-delete) |
 | IAM Identity Center (directory users, permission sets, sso-admin, identitystore) | 🟡 | Own directory and OIDC sources: [Identity Center](#identity-center) |
-| AWS Organizations (member accounts) | 🟡 | Accounts only: [Organizations](#organizations) |
+| AWS Organizations (member accounts, OUs, SCPs) | 🟡 | [Organizations](#organizations) |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
 ### Not implemented
@@ -111,8 +111,9 @@ S3 reports a bucket that doesn't use it:
   `BucketRegion`.
 - **Accounts.** A cluster has an organization: its management account,
   and member accounts made from it ([Organizations](#organizations)). An
-  account's canonical user ID is derived from its ID. There are no SCPs,
-  RCPs or organization condition keys yet.
+  account's canonical user ID is derived from its ID. SCPs cap member
+  accounts' principals; there are no RCPs or organization condition keys
+  (`aws:PrincipalOrgID`, …) yet.
 - **The root user is made on a node, for a while.** It has no password or
   long-term access keys, and no MFA device but MFA delete's ([MFA
   delete](#mfa-delete)): `cairn account root-link` prints a
@@ -401,12 +402,28 @@ is the organization's management account, which makes member accounts
 (see the README's *Accounts*). Organizations' API covers
 DescribeOrganization (any account's principals), and, the management
 account's only, ListAccounts, DescribeAccount, CreateAccount (with
-DescribeCreateAccountStatus and ListCreateAccountStatus) and CloseAccount.
-This wasn't checked against AWS. It differs in that:
+DescribeCreateAccountStatus and ListCreateAccountStatus), CloseAccount,
+the root (ListRoots, Enable/DisablePolicyType), organizational units
+(Create/Describe/Update/DeleteOrganizationalUnit,
+ListOrganizationalUnitsForParent, ListAccountsForParent, ListChildren,
+ListParents, MoveAccount) and service control policies
+(Create/Describe/Update/DeletePolicy, ListPolicies, Attach/DetachPolicy,
+ListPoliciesForTarget, ListTargetsForPolicy). This wasn't checked against
+AWS. It differs in that:
 
-- **Accounts only:** organizational units, roots, policies (SCPs, RCPs,
-  tag and backup policies), invitations, delegated administrators and
-  trusted services answer `501`, and so does CreateAccount with `Tags`.
+- **SCPs only:** other policy types (RCPs, tag, backup and declarative
+  policies, …), invitations, delegated administrators and trusted services
+  answer `501`, and so do `Tags` on CreateAccount, CreateOrganizationalUnit
+  and CreatePolicy.
+- **SCPs** are evaluated as AWS's: every level from the root to the
+  account must allow a member account principal's request, a Deny in any
+  denies it, a bucket's policy doesn't get past them, and the management
+  account is under none. `FullAWSAccess` is attached to every root, unit and
+  account while they're enabled, and each keeps one at least
+  (`MIN_POLICY_TYPE_ATTACHMENT_LIMIT_EXCEEDED`); disabling them detaches
+  all. Changes apply to requests at once, sessions' already made too.
+- **The structure's operations are decided on the organization's ARN,**
+  not on the root's, a unit's or a policy's.
 - **Done at once.** CreateAccount's status is `SUCCEEDED` (or `FAILED`, with
   `EMAIL_ALREADY_EXISTS`) when it's answered, and kept for 90 days.
 - **No member root users,** as AWS's centralized root access has it: a

@@ -170,6 +170,12 @@ pub enum Verdict {
     /// No session policy allows it (and no bucket policy allows it by
     /// itself).
     OutsideSession,
+    /// A statement of a service control policy denies it.
+    ScpDeny,
+    /// A level of the principal's account's service control policies (its
+    /// organization's root, an organizational unit, the account) has none
+    /// that allows it, whatever else does.
+    OutsideScp,
 }
 
 impl Verdict {
@@ -185,6 +191,8 @@ impl Verdict {
             Verdict::OutsideBoundary => format!("because no permissions boundary allows the {action} action"),
             Verdict::SessionDeny => "with an explicit deny in a session policy".to_owned(),
             Verdict::OutsideSession => format!("because no session policy allows the {action} action"),
+            Verdict::ScpDeny => "with an explicit deny in a service control policy".to_owned(),
+            Verdict::OutsideScp => format!("because no service control policy allows the {action} action"),
             _ => format!("because no identity-based policy allows the {action} action"),
         }
     }
@@ -212,6 +220,33 @@ pub struct Caps<'p> {
     /// which with none may do nothing): they allow only what one of them
     /// allows too.
     pub session: Option<&'p [&'p Policy]>,
+    /// The service control policies of the principal's account, by level
+    /// (its organization's root, each organizational unit, the account; see
+    /// `organizations`): each level allows only what one of its own does,
+    /// whatever any other policy allows, a resource's too. Empty: none.
+    pub scps: &'p [Vec<&'p Policy>],
+}
+
+/// What a principal's account's service control policies say of
+/// `request`: `Err` with the verdict if they deny it (a Deny in one, or a
+/// level allowing none of it).
+fn scp_verdict(scps: &[Vec<&Policy>], request: &Request) -> Result<(), Verdict> {
+    let mut outside = false;
+    for level in scps {
+        let mut allows = false;
+        for policy in level {
+            match policy.evaluate(request) {
+                Decision::Deny => return Err(Verdict::ScpDeny),
+                Decision::Allow => allows = true,
+                Decision::NotApplicable => {}
+            }
+        }
+        outside |= !allows;
+    }
+    match outside {
+        true => Err(Verdict::OutsideScp),
+        false => Ok(()),
+    }
 }
 
 /// As `verdict`, for a principal whose identity policies `caps` caps (a
@@ -234,6 +269,11 @@ pub fn verdict_across<'p>(
     let boundary = caps.boundary;
     let mut identity_allows = false;
     let anonymous = request.principal == Principal::Anonymous;
+    // SCPs first: what they deny, nothing else can allow (not even a
+    // resource's policy); an anonymous request has none.
+    if !anonymous && let Err(verdict) = scp_verdict(caps.scps, request) {
+        return verdict;
+    }
     for policy in identity.into_iter().filter(|_| !anonymous) {
         match policy.evaluate(request) {
             Decision::Deny => return Verdict::ExplicitDeny { identity: true },
@@ -294,6 +334,10 @@ pub fn trust_allows<'p>(
     request: &Request,
     cross: bool,
 ) -> bool {
+    // What the account's SCPs deny, no trust policy allows.
+    if scp_verdict(caps.scps, request).is_err() {
+        return false;
+    }
     let mut identity_allows = false;
     for policy in identity {
         match policy.evaluate(request) {

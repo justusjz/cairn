@@ -449,6 +449,31 @@ aws sts assume-role --role-arn arn:aws:iam::<member>:role/OrganizationAccountAcc
     --role-session-name setup
 ```
 
+Accounts are grouped in **organizational units** (OUs), nested under the
+organization's root (five deep at most), and **service control policies**
+(SCPs) set the most that a member account's principals may do, as AWS's:
+once SCPs are enabled, every request by a user or role of a member account
+must be allowed by an SCP at every level from the root down to its account
+(the root, each OU on the way, the account), and denied by none, whatever
+its IAM policies or a bucket's policy allow. They grant nothing. Enabling
+them attaches AWS's `FullAWSAccess` (allowing everything) to the root,
+every OU and every account, and to each made later; every one keeps an SCP
+at least, so replace it before detaching it. The management account is
+under none. SCPs are an identity policy's language, with a `Version`, and
+only `"Resource": "*"` in an Allow.
+
+```sh
+root=$(aws organizations list-roots --query 'Roots[0].Id' --output text)
+aws organizations enable-policy-type --root-id $root --policy-type SERVICE_CONTROL_POLICY
+ou=$(aws organizations create-organizational-unit --parent-id $root --name Prod \
+    --query OrganizationalUnit.Id --output text)
+aws organizations move-account --account-id <member> --source-parent-id $root --destination-parent-id $ou
+policy=$(aws organizations create-policy --type SERVICE_CONTROL_POLICY --name NoBucketDeletes \
+    --description "" --query Policy.PolicySummary.Id --output text --content \
+    '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:DeleteBucket","Resource":"*"}]}')
+aws organizations attach-policy --policy-id $policy --target-id $ou
+```
+
 The management account has a **root user**, as AWS's, for getting back in when
 policies lock everyone out. Only the command line on a node can make
 someone the root: it has no passkeys, long-term keys or password. Either of
