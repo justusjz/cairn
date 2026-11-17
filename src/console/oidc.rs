@@ -176,6 +176,8 @@ pub struct Finished {
     pub subject: String,
     pub email: Option<String>,
     pub name: Option<String>,
+    /// Its `preferred_username`, if it said one.
+    pub user_name: Option<String>,
     /// Its groups, from the provider's group claim.
     pub groups: Vec<String>,
 }
@@ -222,7 +224,8 @@ pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str
     let email = text("email").filter(|_| claims.get("email_verified").and_then(Value::as_bool) != Some(false));
     let name = text("name").or_else(|| text("preferred_username"));
     let groups = groups_of(claims.get(&provider.group_claim));
-    Ok(Ok(Finished { provider, subject, email, name, groups }))
+    let user_name = text("preferred_username").filter(|u| !u.is_empty());
+    Ok(Ok(Finished { provider, subject, email, name, user_name, groups }))
 }
 
 /// The groups a group claim lists: an array of names (others than strings

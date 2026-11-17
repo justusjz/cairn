@@ -23,7 +23,7 @@ pub async fn permission_set(client: &Object, session: &store::DirectorySession) 
     let Some(chosen) = session.permission_set else {
         return Err(ApiError::Forbidden("pick a permission set first".into()));
     };
-    let eligible = identity_center::eligible(client, &session.account_id, &session.provider, &session.subject, &session.groups).await?;
+    let eligible = identity_center::eligible(client, &session.account_id, session.user_id).await?;
     eligible
         .into_iter()
         .find(|set| set.id == chosen)
@@ -35,7 +35,7 @@ pub async fn permission_set(client: &Object, session: &store::DirectorySession) 
 /// Center names them.
 pub fn role_session(set: &PermissionSet, session: &store::DirectorySession) -> anyhow::Result<Session> {
     let now = sessions::now();
-    let name = identity_center::session_name(&[Some(&session.name), session.email.as_deref(), Some(&session.subject)]);
+    let name = identity_center::session_name(&[Some(&session.user_name), session.email.as_deref(), Some(&session.subject)]);
     Ok(Session {
         key_id: sessions::new_key_id()?,
         secret: String::new(),

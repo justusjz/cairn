@@ -48,6 +48,7 @@ export type IdentityProvider = Schemas["IdentityProvider"];
 export type PermissionSet = Schemas["PermissionSetSummary"];
 export type Assignment = Schemas["AssignmentSummary"];
 export type DirectoryUser = Schemas["DirectoryUserSummary"];
+export type DirectoryGroup = Schemas["DirectoryGroupSummary"];
 export type Topic = Schemas["TopicSummary"];
 export type TopicDetail = Schemas["TopicDetail"];
 export type Subscription = Schemas["SubscriptionSummary"];
@@ -198,8 +199,13 @@ export const api = {
   detachFromPermissionSet: (name: string, arn: string) =>
     ok(client.DELETE("/permission-sets/{name}/attached", { params: { path: { name }, query: { arn } } })),
   assignments: () => ok(client.GET("/assignments")),
-  assign: (permission_set: string, principal_type: "USER" | "GROUP", provider: string, principal_id: string) =>
-    ok(client.POST("/assignments", { body: { permission_set, principal_type, provider, principal_id } })),
+  assign: (permission_set: string, principal_type: "USER" | "GROUP", principal_id: string) =>
+    ok(client.POST("/assignments", { body: { permission_set, principal_type, principal_id } })),
+  setPermissionSetBoundary: (name: string, arn: string) =>
+    ok(client.PUT("/permission-sets/{name}/boundary", { params: { path: { name } }, body: { arn } })),
+  deletePermissionSetBoundary: (name: string) =>
+    ok(client.DELETE("/permission-sets/{name}/boundary", { params: { path: { name } } })),
+  directoryGroups: () => ok(client.GET("/directory-groups")),
   unassign: (id: string) => ok(client.DELETE("/assignments/{id}", { params: { path: { id } } })),
   directoryUsers: () => ok(client.GET("/directory-users")),
   createEnrollment: (user: string) =>

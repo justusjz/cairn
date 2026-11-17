@@ -563,8 +563,9 @@ function DirectoryHome(props: { me: Me }) {
         </Panel>
       </Show>
       <Panel title="Who you are">
-        <Table count={1} columns={["Source", "Subject", "E-mail", "Groups"]}>
+        <Table count={1} columns={["User name", "Source", "Subject", "E-mail", "Groups"]}>
           <tr>
+            <td class="mono">{d().user_name}</td>
             <td>{d().provider_label}</td>
             <td class="mono small">{d().subject}</td>
             <td>{d().email ?? <span class="subtle">none given</span>}</td>

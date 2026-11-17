@@ -1079,24 +1079,32 @@ restarts; everything else is read from the database.
 People can also sign in as **directory users**, as in IAM Identity Center:
 whoever an identity source vouches for, with no IAM user behind them. An
 administrator decides what they may do with **permission sets** and
-**assignments**, on the console's Identity Center page:
+**assignments**, on the console's Identity Center page, or through
+Identity Center's APIs (below):
 
 - A **permission set** is a set of policies (an inline one,
-  `AwsSSOInlinePolicy`, and managed ones) and a session length (1 to 12
-  hours). Cairn makes a role for each one, as Identity Center does, at
+  `AwsSSOInlinePolicy`, AWS's managed policies, the account's own as
+  *customer managed policy references*, and a permissions boundary) and a
+  session length (1 to 12 hours). Cairn makes a role for each one, as
+  Identity Center does, at
   `/aws-reserved/sso.amazonaws.com/AWSReservedSSO_<set>_<suffix>`. The role
   trusts only `sso.amazonaws.com`, so no one assumes it through STS, and IAM
   refuses to change it (`UnmodifiableEntity`), or to make roles under
   `/aws-reserved/`.
-- An **assignment** gives a permission set to a user of an identity
-  source, by its subject (`sub`), or to a group, by its name in the source's
-  group claim (`groups` by default; set per source).
+- An **assignment** gives a permission set to a user or a group of the
+  **identity store**: the users that have signed in, and the groups their
+  sources' group claims (`groups` by default; set per source) named. Each
+  has an ID of its own, as Identity Center's users and groups do; a user's
+  user name is its `preferred_username`, e-mail or subject, the first no
+  one else has. There's no directory sync (SCIM): users and groups are
+  there once someone has signed in with them, and a user's groups are what
+  its last sign-in said.
 
 At sign-in, Cairn reads the person's subject and groups from the ID token,
 and finds their permission sets. With none, they don't get in; with one,
 it's used; with several, they pick one (and can switch on their own page).
 They then act as a session of the set's role,
-`arn:aws:sts::<account>:assumed-role/AWSReservedSSO_<set>_<suffix>/<name>`,
+`arn:aws:sts::<account>:assumed-role/AWSReservedSSO_<set>_<suffix>/<user name>`,
 in the console and in policies, without MFA. Their page hands out
 temporary credentials of that session, for the AWS CLI and SDKs, valid for
 the set's session length. Taking an assignment away ends its users' access
@@ -1108,11 +1116,28 @@ cairn oidc set company --issuer https://sso.example.com/realms/main \
     --client-id cairn --client-secret ... --group-claim groups
 ```
 
-Cairn has no directory sync (SCIM): it learns of a person, and their
-groups, when they sign in, and lists who has on the Identity Center page.
-Its management API uses Identity Center's actions (`sso:CreatePermissionSet`,
-`sso:CreateAccountAssignment`, …, on the permission sets' ARNs;
-`identitystore:ListUsers`), which `AdministratorAccess` allows.
+**Identity Center's APIs** are on the S3 endpoint, as IAM's are:
+**sso-admin** (instances, permission sets and their policies,
+assignments, provisioning, tags) and **identitystore**'s reads (users,
+groups, memberships; they come from sign-ins, so its writes answer `501`).
+Point the AWS CLI, SDKs or Terraform at it (`AWS_ENDPOINT_URL_SSO_ADMIN`,
+`AWS_ENDPOINT_URL_IDENTITYSTORE`, or Terraform's `endpoints { ssoadmin,
+identitystore }`). The account's instance is its only one, and the
+account the only target; what's asked is done when it's answered, so
+assignments' and provisioning's statuses are `SUCCEEDED` at once. Each
+operation is decided as its action (`sso:CreatePermissionSet` on the
+instance, `sso:CreateAccountAssignment` on the permission set,
+`identitystore:GetUserId` on the identity store, …), which
+`AdministratorAccess` allows.
+
+```sh
+store=$(aws sso-admin list-instances --query 'Instances[0].IdentityStoreId' --output text)
+group=$(aws identitystore get-group-id --identity-store-id $store \
+    --alternate-identifier '{"UniqueAttribute": {"AttributePath": "DisplayName", "AttributeValue": "data"}}' \
+    --query GroupId --output text)
+aws sso-admin create-account-assignment --instance-arn ... --permission-set-arn ... \
+    --target-type AWS_ACCOUNT --target-id 123456789012 --principal-type GROUP --principal-id $group
+```
 
 ### Signing in
 

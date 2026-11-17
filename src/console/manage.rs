@@ -1843,7 +1843,7 @@ async fn list_oidc_providers(State(app): AppState, Extension(actor): Extension<A
     actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     let client = app.pool.get().await?;
     let counts: HashMap<String, i64> = client
-        .query_cached("SELECT provider, count(*) FROM directory_users GROUP BY provider", &[])
+        .query_cached("SELECT provider, count(*) FROM identity_users GROUP BY provider", &[])
         .await?
         .iter()
         .map(|r| (r.get(0), r.get(1)))

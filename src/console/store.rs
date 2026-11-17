@@ -456,24 +456,16 @@ pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {
 
 // ─── Directory users ─────────────────────────────────────────────────────────
 
-/// A session of a directory user (see `identity_center`), who signed in at
-/// identity source `provider` as `subject`, in `account` (by ID), with
-/// `groups`, acting as permission set `permission_set` (`None`: until it
-/// picks one).
-pub async fn create_directory_session(
-    client: &Object,
-    account: &str,
-    provider: &str,
-    subject: &str,
-    groups: &[String],
-    permission_set: Option<Uuid>,
-) -> anyhow::Result<String> {
+/// A session of directory user `user` (see `identity_center`), in
+/// `account` (by ID), acting as permission set `permission_set` (`None`:
+/// until it picks one).
+pub async fn create_directory_session(client: &Object, account: &str, user: Uuid, permission_set: Option<Uuid>) -> anyhow::Result<String> {
     let (token, hash) = token()?;
     client
         .execute_cached(
-            "INSERT INTO console_directory_sessions (token_hash, account_id, provider, subject, groups, permission_set_id, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7))",
-            &[&hash, &account, &provider, &subject, &groups, &permission_set, &secs(SESSION_TTL)],
+            "INSERT INTO console_directory_sessions (token_hash, account_id, user_id, permission_set_id, expires_at)
+             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+            &[&hash, &account, &user, &permission_set, &secs(SESSION_TTL)],
         )
         .await?;
     Ok(token)
@@ -485,11 +477,14 @@ pub struct DirectorySession {
     /// Its account's ID, and name.
     pub account_id: String,
     pub account: String,
-    /// The identity source (its name and label) and the user's subject
-    /// there, and what the user was when it signed in.
+    /// The user (its ID in the identity store), its identity source (its
+    /// name and label) and its subject there, and what the user was when it
+    /// last signed in: its user name, name, e-mail and groups (their names).
+    pub user_id: Uuid,
     pub provider: String,
     pub provider_label: String,
     pub subject: String,
+    pub user_name: String,
     pub name: String,
     pub email: Option<String>,
     pub groups: Vec<String>,
@@ -504,18 +499,20 @@ pub struct DirectorySession {
 pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<Option<DirectorySession>> {
     let row = client
         .query_opt_cached(
-            "SELECT a.id, a.name, s.provider, p.label, s.subject, u.name, u.email, s.groups, s.permission_set_id,
-                    extract(epoch FROM s.expires_at)::float8, s.last_seen_at < now() - interval '1 minute'
+            "SELECT a.id, a.name, u.id, u.provider, p.label, u.subject, u.user_name, u.display_name, u.email,
+                    ARRAY(SELECT g.name FROM identity_group_members m JOIN identity_groups g ON g.id = m.group_id
+                          WHERE m.user_id = u.id ORDER BY g.name),
+                    s.permission_set_id, extract(epoch FROM s.expires_at)::float8, s.last_seen_at < now() - interval '1 minute'
              FROM console_directory_sessions s JOIN accounts a ON a.id = s.account_id
-             JOIN directory_users u ON u.provider = s.provider AND u.subject = s.subject
-             JOIN oidc_providers p ON p.name = s.provider
+             JOIN identity_users u ON u.id = s.user_id
+             JOIN oidc_providers p ON p.name = u.provider
              WHERE s.token_hash = $1 AND s.expires_at > now()
                AND s.last_seen_at > now() - make_interval(secs => $2)",
             &[&hash(token), &secs(SESSION_IDLE)],
         )
         .await?;
     let Some(row) = row else { return Ok(None) };
-    if row.get::<_, bool>(10) {
+    if row.get::<_, bool>(12) {
         client
             .execute_cached("UPDATE console_directory_sessions SET last_seen_at = now() WHERE token_hash = $1", &[&hash(token)])
             .await?;
@@ -523,14 +520,16 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
     Ok(Some(DirectorySession {
         account_id: row.get(0),
         account: row.get(1),
-        provider: row.get(2),
-        provider_label: row.get(3),
-        subject: row.get(4),
-        name: row.get(5),
-        email: row.get(6),
-        groups: row.get(7),
-        permission_set: row.get(8),
-        expires_at: row.get(9),
+        user_id: row.get(2),
+        provider: row.get(3),
+        provider_label: row.get(4),
+        subject: row.get(5),
+        user_name: row.get(6),
+        name: row.get(7),
+        email: row.get(8),
+        groups: row.get(9),
+        permission_set: row.get(10),
+        expires_at: row.get(11),
     }))
 }
 

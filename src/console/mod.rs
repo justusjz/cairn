@@ -441,6 +441,21 @@ mod e2e {
         );
     }
 
+    /// Every operation has an ID of its own: the UI's client is generated
+    /// by them, and two of a name merge into one's types.
+    #[test]
+    fn operations_have_ids_of_their_own() {
+        let spec = serde_json::to_value(openapi()).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for item in spec["paths"].as_object().unwrap().values() {
+            for operation in item.as_object().unwrap().values() {
+                if let Some(id) = operation.get("operationId").and_then(Value::as_str) {
+                    assert!(seen.insert(id.to_owned()), "two operations are named {id}");
+                }
+            }
+        }
+    }
+
     /// The spec is the sign-in API's and `manage`'s, merged: a schema of one
     /// may share a name with one of the other only if it's the same (as
     /// `ErrorBody` is), as it would replace it.
@@ -1156,7 +1171,7 @@ mod e2e {
         let (_, buttons) = browser().send("GET", "/api/oidc/providers", None).await;
         assert_eq!(buttons, json!([{ "name": "mock", "label": "Company SSO" }]));
         let (_, sources) = ops.send("GET", "/api/oidc-providers", None).await;
-        assert_eq!(sources["providers"][0]["group_claim"], "groups");
+        assert_eq!(sources["providers"][0]["group_claim"], "groups", "{sources}");
 
         // No permission set yet: no way in, but who it was is noted.
         let mut ada = browser();
@@ -1169,6 +1184,11 @@ mod e2e {
         assert!(ada.cookie.is_none());
         let (_, seen) = admin.send("GET", "/api/directory-users", None).await;
         assert_eq!((&seen[0]["subject"], &seen[0]["groups"]), (&json!("sub-ada"), &json!(["data"])));
+        assert_eq!(seen[0]["user_name"], "ada@example.com");
+        let ada_id = seen[0]["id"].as_str().unwrap().to_owned();
+        let (_, groups) = admin.send("GET", "/api/directory-groups", None).await;
+        assert_eq!((&groups[0]["name"], &groups[0]["members"]), (&json!("data"), &json!(1)));
+        let data_id = groups[0]["id"].as_str().unwrap().to_owned();
         assert_eq!(tenant.send("GET", "/api/directory-users", None).await.0, StatusCode::FORBIDDEN);
 
         // Permission sets, with their policies; the tenant may make none.
@@ -1199,15 +1219,14 @@ mod e2e {
         assert_eq!(admin.send("POST", "/api/roles", Some(fake)).await.0, StatusCode::BAD_REQUEST);
 
         // Assigned: Readers to the group, Admins to Ada herself.
-        let assign = |set: &str, kind: &str, id: &str| {
-            json!({ "permission_set": set, "principal_type": kind, "provider": "mock", "principal_id": id })
-        };
-        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Readers", "GROUP", "data"))).await.0, StatusCode::CREATED);
-        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", "sub-ada"))).await.0, StatusCode::CREATED);
-        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", "sub-ada"))).await.0, StatusCode::CONFLICT);
-        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "OTHER", "x"))).await.0, StatusCode::BAD_REQUEST);
-        let elsewhere = json!({ "permission_set": "Admins", "principal_type": "USER", "provider": "nowhere", "principal_id": "x" });
-        assert_eq!(admin.send("POST", "/api/assignments", Some(elsewhere)).await.0, StatusCode::NOT_FOUND);
+        let assign = |set: &str, kind: &str, id: &str| json!({ "permission_set": set, "principal_type": kind, "principal_id": id });
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Readers", "GROUP", &data_id))).await.0, StatusCode::CREATED);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &ada_id))).await.0, StatusCode::CREATED);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &ada_id))).await.0, StatusCode::CONFLICT);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "OTHER", &ada_id))).await.0, StatusCode::BAD_REQUEST);
+        // Only to who's in the identity store (a group as a user, say, isn't).
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &data_id))).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "GROUP", "x"))).await.0, StatusCode::NOT_FOUND);
 
         // Ada has both: she picks one, and acts as its role's session.
         let url = ada.start_oidc().await;
@@ -1228,7 +1247,7 @@ mod e2e {
         let (status, me) = ada.send("POST", "/api/directory/permission-set", Some(json!({ "name": "Admins" }))).await;
         assert_eq!(status, StatusCode::OK, "{me}");
         assert!(me["identity"]["arn"].as_str().unwrap().starts_with(&format!("arn:aws:sts::{account}:assumed-role/AWSReservedSSO_Admins_")));
-        assert!(me["identity"]["arn"].as_str().unwrap().ends_with("/TestPerson"), "{me}");
+        assert!(me["identity"]["arn"].as_str().unwrap().ends_with("/ada@example.com"), "{me}");
         assert_eq!(ada.send("GET", "/api/users", None).await.0, StatusCode::OK);
         // She has no login: no passkeys.
         assert_eq!(ada.send("POST", "/api/passkeys/options", None).await.0, StatusCode::FORBIDDEN);
@@ -1247,7 +1266,7 @@ mod e2e {
         .await
         .unwrap()
         .unwrap();
-        assert!(session.arn().ends_with("/TestPerson"));
+        assert!(session.arn().ends_with("/ada@example.com"));
         assert!(session.principal_arn().contains("/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admins_"));
         // A passkey's session has no permission sets.
         assert_eq!(tenant.send("POST", "/api/directory/credentials", None).await.0, StatusCode::FORBIDDEN);

@@ -212,6 +212,11 @@ async fn handle_request(
     if let Some(signed) = signed.as_ref().filter(|s| crate::iam::wants(s)) {
         return Ok(box_response(crate::iam::handle(&app, req, signed.clone(), peer).await));
     }
+    // Identity Center's sso-admin and identitystore (signed for `sso`,
+    // `identitystore`; see `sso`).
+    if let Some(signed) = signed.as_ref().filter(|s| crate::sso::wants(s)) {
+        return Ok(box_response(crate::sso::handle(&app, req, signed.clone(), peer).await));
+    }
     // SNS's (signed for `sns`), for S3's event notifications (see `sns`).
     if let Some(signed) = signed.as_ref().filter(|s| crate::sns::wants(s)) {
         return Ok(box_response(crate::sns::handle(&app, req, signed.clone(), peer).await));

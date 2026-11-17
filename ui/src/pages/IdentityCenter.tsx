@@ -5,10 +5,9 @@
 // set's own page.
 
 import { A, useNavigate, useParams } from "@solidjs/router";
-import { For, Show, createResource, createSignal, onMount } from "solid-js";
-import { type Assignment, type DirectoryUser, type PermissionSet, api } from "../api";
-import { api as session } from "../session";
-import { AttachDialog, DetailHead, Gone, InlinePolicyDialog, PermissionsPanel, PolicyChips, roleHref } from "../components/Iam";
+import { For, Show, createSignal, onMount } from "solid-js";
+import { type Assignment, type DirectoryGroup, type DirectoryUser, type ManagedPolicy, type PermissionSet, api } from "../api";
+import { AttachDialog, DetailHead, Gone, InlinePolicyDialog, PermissionsPanel, PolicyChips, PolicySelect, roleHref } from "../components/Iam";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { ago, date } from "../format";
 
@@ -19,11 +18,14 @@ const setHref = (name: string) => `/identity-center/${encodeURIComponent(name)}`
 const hours = (seconds: number) => `${Math.round(seconds / 360) / 10} h`;
 
 export default function IdentityCenter() {
-  const data = poll(() => Promise.all([api.permissionSets(), api.assignments(), api.directoryUsers().catch(() => [])]), 10000);
+  const data = poll(
+    () => Promise.all([api.permissionSets(), api.assignments(), api.directoryUsers().catch(() => []), api.directoryGroups().catch(() => [])]),
+    10000,
+  );
   const [creating, setCreating] = createSignal(false);
   const [assigning, setAssigning] = createSignal(false);
   const unassign = async (a: Assignment) => {
-    const who = a.principal_type === "GROUP" ? `group ${a.principal_id}` : (a.user_name ?? a.principal_id);
+    const who = a.principal_type === "GROUP" ? `group ${a.principal_name}` : a.principal_name;
     if (!confirm(`Take ${a.permission_set} from ${who}? Their sessions lose it at once.`)) return;
     if (await act(() => api.unassign(a.id), `Took ${a.permission_set} from ${who}`)) data.refresh();
   };
@@ -85,12 +87,12 @@ export default function IdentityCenter() {
                           when={a.principal_type === "USER"}
                           fallback={
                             <>
-                              <Badge>group</Badge> <span class="mono">{a.principal_id}</span>
+                              <Badge>group</Badge> <span class="mono">{a.principal_name}</span>
                             </>
                           }
                         >
-                          {a.user_name ?? <span class="subtle">not signed in yet</span>}
-                          <div class="subtle small mono">{a.user_email ?? a.principal_id}</div>
+                          {a.principal_name}
+                          <Show when={a.email}>{(e) => <div class="subtle small mono">{e()}</div>}</Show>
                         </Show>
                       </td>
                       <td class="mono small">{a.provider}</td>
@@ -111,8 +113,8 @@ export default function IdentityCenter() {
                   {(u) => (
                     <tr>
                       <td>
-                        {u.name}
-                        <div class="subtle small mono">{u.email ?? u.subject}</div>
+                        {u.display_name}
+                        <div class="subtle small mono">{u.user_name}</div>
                       </td>
                       <td class="mono small">{u.provider}</td>
                       <td>
@@ -126,15 +128,28 @@ export default function IdentityCenter() {
                 </For>
               </Table>
               <p class="subtle small">
-                Who has signed in, with their groups as their source last said. There's no directory sync: a user
-                shows here once they've signed in (they can be assigned by their subject before).
+                Who has signed in, with their groups as their source last said. There's no directory sync: users and
+                groups are here, to be assigned, once someone has signed in with them.
               </p>
+            </Panel>
+            <Panel title="Groups" note={`${d()[3].length}`}>
+              <Table count={d()[3].length} empty="No group yet: none was in a group claim of anyone who signed in." columns={["Name", "Source", { label: "Members", num: true }]}>
+                <For each={d()[3]}>
+                  {(g) => (
+                    <tr>
+                      <td class="mono">{g.name}</td>
+                      <td class="mono small">{g.provider}</td>
+                      <td class="num">{g.members}</td>
+                    </tr>
+                  )}
+                </For>
+              </Table>
             </Panel>
             <Show when={creating()}>
               <NewPermissionSetDialog onClose={() => setCreating(false)} changed={data.refresh} />
             </Show>
             <Show when={assigning()}>
-              <AssignDialog sets={d()[0]} users={d()[2]} onClose={() => setAssigning(false)} changed={data.refresh} />
+              <AssignDialog sets={d()[0]} users={d()[2]} groups={d()[3]} onClose={() => setAssigning(false)} changed={data.refresh} />
             </Show>
           </>
         )}
@@ -195,23 +210,31 @@ function NewPermissionSetDialog(props: { onClose: () => void; changed: () => voi
   );
 }
 
-/** Assigns a permission set to a directory user (one that signed in, or by
- * its subject) or a group of an identity source. */
-function AssignDialog(props: { sets: PermissionSet[]; users: DirectoryUser[]; set?: string; onClose: () => void; changed: () => void }) {
+/** Assigns a permission set to a directory user or group of the identity
+ * store (one someone has signed in with). */
+function AssignDialog(props: {
+  sets: PermissionSet[];
+  users: DirectoryUser[];
+  groups: DirectoryGroup[];
+  set?: string;
+  onClose: () => void;
+  changed: () => void;
+}) {
   let dialog!: HTMLDialogElement;
   onMount(() => dialog.showModal());
-  const [sources] = createResource(() => session.oidcProviders().catch(() => []));
   const [set, setSet] = createSignal(props.set ?? props.sets[0]?.name ?? "");
-  const [kind, setKind] = createSignal<"GROUP" | "USER">("GROUP");
-  const [source, setSource] = createSignal("");
-  const [id, setId] = createSignal("");
+  const [kind, setKind] = createSignal<"GROUP" | "USER">(props.groups.length ? "GROUP" : "USER");
+  const options = () =>
+    kind() === "GROUP"
+      ? props.groups.map((g) => ({ id: g.id, label: `${g.name} (${g.provider})` }))
+      : props.users.map((u) => ({ id: u.id, label: `${u.display_name} (${u.user_name})` }));
+  const [chosen, setChosen] = createSignal("");
+  const principal = () => (options().some((o) => o.id === chosen()) ? chosen() : (options()[0]?.id ?? ""));
   const [error, setError] = createSignal<string>();
-  const provider = () => source() || sources()?.[0]?.name || "";
-  const known = () => props.users.filter((u) => u.provider === provider());
   const assign = async (e: SubmitEvent) => {
     e.preventDefault();
     try {
-      await api.assign(set(), kind(), provider(), id().trim());
+      await api.assign(set(), kind(), principal());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       return;
@@ -232,12 +255,6 @@ function AssignDialog(props: { sets: PermissionSet[]; users: DirectoryUser[]; se
             </select>
           </label>
           <label class="field">
-            Identity source
-            <select value={provider()} onChange={(e) => setSource(e.currentTarget.value)}>
-              <For each={sources() ?? []}>{(p) => <option value={p.name}>{p.label}</option>}</For>
-            </select>
-          </label>
-          <label class="field">
             To
             <select value={kind()} onChange={(e) => setKind(e.currentTarget.value as "GROUP" | "USER")}>
               <option value="GROUP">a group</option>
@@ -245,24 +262,20 @@ function AssignDialog(props: { sets: PermissionSet[]; users: DirectoryUser[]; se
             </select>
           </label>
           <Show
-            when={kind() === "USER"}
+            when={options().length}
             fallback={
-              <label class="field">
-                Group (its name in the source's group claim)
-                <input type="text" required value={id()} onInput={(e) => setId(e.currentTarget.value)} placeholder="data-science" />
-              </label>
+              <p class="subtle small">
+                No {kind() === "GROUP" ? "group" : "user"} yet: users and groups are here once someone has signed in
+                with them.
+              </p>
             }
           >
             <label class="field">
-              User (its subject at the source)
-              <input type="text" required list="known-users" value={id()} onInput={(e) => setId(e.currentTarget.value)} />
-              <datalist id="known-users">
-                <For each={known()}>{(u) => <option value={u.subject}>{u.email ?? u.name}</option>}</For>
-              </datalist>
+              {kind() === "GROUP" ? "Group" : "User"}
+              <select value={principal()} onChange={(e) => setChosen(e.currentTarget.value)}>
+                <For each={options()}>{(o) => <option value={o.id}>{o.label}</option>}</For>
+              </select>
             </label>
-            <p class="subtle small">
-              Someone who has signed in is suggested; anyone else by their subject (<span class="mono">sub</span>).
-            </p>
           </Show>
         </Show>
         <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
@@ -270,7 +283,7 @@ function AssignDialog(props: { sets: PermissionSet[]; users: DirectoryUser[]; se
           <button type="button" onClick={() => dialog.close()}>
             Cancel
           </button>
-          <button class="primary" type="submit" disabled={!props.sets.length || !provider()}>
+          <button class="primary" type="submit" disabled={!props.sets.length || !principal()}>
             Assign
           </button>
         </div>
@@ -285,7 +298,15 @@ export function PermissionSetPage() {
   const navigate = useNavigate();
   const name = () => params.name!;
   const data = poll(
-    () => Promise.all([api.permissionSets(), api.assignments(), api.policies(), api.buckets(), api.directoryUsers().catch(() => [])]),
+    () =>
+      Promise.all([
+        api.permissionSets(),
+        api.assignments(),
+        api.policies(),
+        api.buckets(),
+        api.directoryUsers().catch(() => []),
+        api.directoryGroups().catch(() => []),
+      ]),
     10000,
   );
   const set = () => data.data()?.[0].find((s) => s.name === name());
@@ -294,6 +315,11 @@ export function PermissionSetPage() {
   const [editingInline, setEditingInline] = createSignal(false);
   const [editing, setEditing] = createSignal(false);
   const [assigning, setAssigning] = createSignal(false);
+  const [bounding, setBounding] = createSignal(false);
+  const unbound = async () => {
+    if (!confirm(`Take ${name()}'s permissions boundary off? Its users may then do all its policies allow.`)) return;
+    if (await act(() => api.deletePermissionSetBoundary(name()), "Boundary removed")) data.refresh();
+  };
   const detach = async (policy: string, arn: string) => {
     if (!confirm(`Detach ${policy} from ${name()}? Its users lose what it allowed them at once.`)) return;
     if (await act(() => api.detachFromPermissionSet(name(), arn), `Detached ${policy}`)) data.refresh();
@@ -322,6 +348,20 @@ export function PermissionSetPage() {
                 <dd>{s().description || <span class="subtle">none</span>}</dd>
                 <dt>Sessions</dt>
                 <dd>{hours(s().session_duration)}</dd>
+                <dt>Boundary</dt>
+                <dd>
+                  <Show when={s().boundary} fallback={<span class="subtle">none </span>}>
+                    {(b) => <span class="mono small">{b()} </span>}
+                  </Show>
+                  <button class="small" onClick={() => setBounding(true)}>
+                    {s().boundary ? "Change…" : "Set…"}
+                  </button>
+                  <Show when={s().boundary}>
+                    <button class="small" onClick={unbound}>
+                      Remove
+                    </button>
+                  </Show>
+                </dd>
                 <dt>Role</dt>
                 <dd>
                   <A class="mono" href={roleHref(s().role_name)} title={s().role_arn}>
@@ -345,8 +385,8 @@ export function PermissionSetPage() {
                   {(a) => (
                     <tr>
                       <td>
-                        <Show when={a.principal_type === "USER"} fallback={<><Badge>group</Badge> <span class="mono">{a.principal_id}</span></>}>
-                          {a.user_name ?? <span class="mono">{a.principal_id}</span>}
+                        <Show when={a.principal_type === "USER"} fallback={<><Badge>group</Badge> <span class="mono">{a.principal_name}</span></>}>
+                          {a.principal_name}
                         </Show>
                       </td>
                       <td class="mono small">{a.provider}</td>
@@ -383,6 +423,9 @@ export function PermissionSetPage() {
                 changed={data.refresh}
               />
             </Show>
+            <Show when={bounding()}>
+              <BoundaryDialog set={s()} policies={data.data()?.[2] ?? []} onClose={() => setBounding(false)} changed={data.refresh} />
+            </Show>
             <Show when={editing()}>
               <EditDialog set={s()} onClose={() => setEditing(false)} changed={data.refresh} />
             </Show>
@@ -390,6 +433,7 @@ export function PermissionSetPage() {
               <AssignDialog
                 sets={data.data()?.[0] ?? []}
                 users={data.data()?.[4] ?? []}
+                groups={data.data()?.[5] ?? []}
                 set={s().name}
                 onClose={() => setAssigning(false)}
                 changed={data.refresh}
@@ -442,6 +486,40 @@ function EditDialog(props: { set: PermissionSet; onClose: () => void; changed: (
           </button>
           <button class="primary" type="submit">
             Save
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+/** Sets a permission set's permissions boundary: a managed policy, AWS's or
+ * the account's, which caps what its policies allow. */
+function BoundaryDialog(props: { set: PermissionSet; policies: ManagedPolicy[]; onClose: () => void; changed: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const [arn, setArn] = createSignal(props.set.boundary ?? props.policies[0]?.arn ?? "");
+  const save = async (e: SubmitEvent) => {
+    e.preventDefault();
+    if (await act(() => api.setPermissionSetBoundary(props.set.name, arn()), "Boundary set")) {
+      props.changed();
+      dialog.close();
+    }
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={save}>
+        <h2>
+          Permissions boundary of <span class="mono">{props.set.name}</span>
+        </h2>
+        <PolicySelect policies={props.policies} value={arn()} setValue={setArn} label="Boundary" />
+        <p class="subtle small">Its users may do only what both its policies and the boundary allow.</p>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit" disabled={!arn()}>
+            Set
           </button>
         </div>
       </form>

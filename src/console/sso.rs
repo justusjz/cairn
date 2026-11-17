@@ -1,9 +1,11 @@
 //! The console's API for Identity Center (see `identity_center`): the
 //! account's permission sets, their policies and assignments, and the
-//! directory users that have signed in. Every handler checks what it does as
-//! Identity Center's action (`sso:CreatePermissionSet` on the set's ARN,
-//! `sso:CreateAccountAssignment`, …; `identitystore:ListUsers` to list
-//! directory users), as the session's identity.
+//! identity store's users and groups (who has signed in, and the groups
+//! their claims named). Every handler checks what it does as Identity
+//! Center's action, on the resource sso-admin's and identitystore's would
+//! (`sso:CreatePermissionSet` on the instance, `sso:CreateAccountAssignment`
+//! on the permission set, `identitystore:ListUsers` on the identity store,
+//! …), as the session's identity.
 
 use std::sync::Arc;
 
@@ -30,14 +32,22 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(update_permission_set, delete_permission_set))
         .routes(routes!(get_inline_policy, put_inline_policy, delete_inline_policy))
         .routes(routes!(attach_managed_policy, detach_managed_policy))
+        .routes(routes!(put_permission_set_boundary, delete_permission_set_boundary))
         .routes(routes!(list_assignments, create_assignment))
         .routes(routes!(delete_assignment))
         .routes(routes!(list_directory_users))
+        .routes(routes!(list_directory_groups))
 }
 
-/// The instance's ARN, which listing and assigning are checked on.
+/// The instance's ARN, which making permission sets is checked on.
 fn instance(actor: &Actor) -> On {
     On::Arn(ic::instance_arn(actor.account()))
+}
+
+/// The identity store's ARN, which listing its users and groups is checked
+/// on.
+fn store(actor: &Actor) -> On {
+    On::Arn(ic::identity_store_arn(actor.account()))
 }
 
 /// The session's permission set `name`, allowed `action` on it.
@@ -62,8 +72,11 @@ struct PermissionSetSummary {
     role_arn: String,
     /// Whether it has an inline policy.
     inline_policy: bool,
-    /// Its managed policies.
+    /// Its managed policies: AWS's (Cairn's), and the account's (customer
+    /// managed).
     attached: Vec<AttachedPolicy>,
+    /// Its permissions boundary's ARN, if it has one.
+    boundary: Option<String>,
     /// Its assignments.
     assignments: i64,
     created_at: f64,
@@ -77,9 +90,10 @@ struct PermissionSetSummary {
 async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<PermissionSetSummary>>> {
     actor.check(&app, "sso:ListPermissionSets", instance(&actor)).await?;
     let client = app.pool.get().await?;
-    let assignments = ic::assignments(&client, actor.account()).await?;
+    let assignments = ic::assignments(&client, actor.account(), None, None).await?;
     let mut out = Vec::new();
     for set in ic::list(&client, actor.account()).await? {
+        let role = set.role(&client).await?;
         out.push(PermissionSetSummary {
             arn: set.arn(),
             role_arn: set.role_arn(),
@@ -89,6 +103,7 @@ async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<
                 .into_iter()
                 .map(|a| AttachedPolicy { name: a.name, arn: a.arn })
                 .collect(),
+            boundary: role.boundary,
             assignments: assignments.iter().filter(|a| a.permission_set == set.name).count() as i64,
             name: set.name,
             description: set.description,
@@ -121,8 +136,14 @@ async fn create_permission_set(
     Json(body): Json<NewPermissionSet>,
 ) -> Result<StatusCode> {
     actor.check(&app, "sso:CreatePermissionSet", instance(&actor)).await?;
-    let duration = body.session_duration.unwrap_or(ic::DEFAULT_SESSION);
-    ic::create(&app.pool.get().await?, actor.account(), &body.name, &body.description, duration).await?;
+    let new = ic::New {
+        name: &body.name,
+        description: &body.description,
+        session_duration: body.session_duration.unwrap_or(ic::DEFAULT_SESSION),
+        relay_state: None,
+        tags: None,
+    };
+    ic::create(&app.pool.get().await?, actor.account(), &new).await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -146,7 +167,8 @@ async fn update_permission_set(
     Json(body): Json<PermissionSetChange>,
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:UpdatePermissionSet", &name).await?;
-    ic::update(&app.pool.get().await?, &set, &body.description, body.session_duration).await?;
+    let change = ic::Change { description: Some(&body.description), session_duration: Some(body.session_duration), relay_state: None };
+    ic::update(&app.pool.get().await?, &set, &change).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -205,6 +227,17 @@ async fn delete_inline_policy(State(app): AppState, Extension(actor): Extension<
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The action that attaches or detaches a managed policy: AWS's, or a
+/// customer managed policy reference (the account's).
+fn attach_action(arn: &str, attach: bool) -> &'static str {
+    match (ic::is_aws(arn), attach) {
+        (true, true) => "sso:AttachManagedPolicyToPermissionSet",
+        (true, false) => "sso:DetachManagedPolicyFromPermissionSet",
+        (false, true) => "sso:AttachCustomerManagedPolicyReferenceToPermissionSet",
+        (false, false) => "sso:DetachCustomerManagedPolicyReferenceFromPermissionSet",
+    }
+}
+
 /// Attaches a managed policy (AWS's, or the account's) to a permission set.
 #[utoipa::path(post, path = "/permission-sets/{name}/attached", params(("name" = String, Path)), request_body = PolicyArn, responses(
     (status = 204, description = "Attached"),
@@ -217,7 +250,7 @@ async fn attach_managed_policy(
     Path(name): Path<String>,
     Json(body): Json<PolicyArn>,
 ) -> Result<StatusCode> {
-    let set = check_set(&app, &actor, "sso:AttachManagedPolicyToPermissionSet", &name).await?;
+    let set = check_set(&app, &actor, attach_action(&body.arn, true), &name).await?;
     ic::attach(&app.pool.get().await?, &set, &body.arn, true).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -234,8 +267,38 @@ async fn detach_managed_policy(
     Path(name): Path<String>,
     Query(query): Query<PolicyArn>,
 ) -> Result<StatusCode> {
-    let set = check_set(&app, &actor, "sso:DetachManagedPolicyFromPermissionSet", &name).await?;
+    let set = check_set(&app, &actor, attach_action(&query.arn, false), &name).await?;
     ic::attach(&app.pool.get().await?, &set, &query.arn, false).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Sets a permission set's permissions boundary: a managed policy (AWS's,
+/// or the account's).
+#[utoipa::path(put, path = "/permission-sets/{name}/boundary", params(("name" = String, Path)), request_body = PolicyArn, responses(
+    (status = 204, description = "Set"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn put_permission_set_boundary(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(name): Path<String>,
+    Json(body): Json<PolicyArn>,
+) -> Result<StatusCode> {
+    let set = check_set(&app, &actor, "sso:PutPermissionsBoundaryToPermissionSet", &name).await?;
+    ic::set_boundary(&app.pool.get().await?, &set, Some(&body.arn)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Removes a permission set's permissions boundary.
+#[utoipa::path(delete, path = "/permission-sets/{name}/boundary", params(("name" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_permission_set_boundary(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+    let set = check_set(&app, &actor, "sso:DeletePermissionsBoundaryFromPermissionSet", &name).await?;
+    ic::set_boundary(&app.pool.get().await?, &set, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -246,13 +309,14 @@ struct AssignmentSummary {
     permission_set: String,
     /// `USER` or `GROUP`.
     principal_type: String,
-    /// The identity source.
-    provider: String,
-    /// A user's subject (`sub`), or a group's name in the group claim.
+    /// The user's or group's ID in the identity store.
     principal_id: String,
-    /// A user's name and e-mail, as it last signed in, if it has.
-    user_name: Option<String>,
-    user_email: Option<String>,
+    /// A user's user name, or a group's name.
+    principal_name: String,
+    /// Its identity source.
+    provider: String,
+    /// A user's e-mail.
+    email: Option<String>,
     created_at: f64,
 }
 
@@ -263,7 +327,7 @@ struct AssignmentSummary {
 ))]
 async fn list_assignments(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<AssignmentSummary>>> {
     actor.check(&app, "sso:ListAccountAssignments", instance(&actor)).await?;
-    let assignments = ic::assignments(&app.pool.get().await?, actor.account()).await?;
+    let assignments = ic::assignments(&app.pool.get().await?, actor.account(), None, None).await?;
     Ok(Json(
         assignments
             .into_iter()
@@ -271,10 +335,10 @@ async fn list_assignments(State(app): AppState, Extension(actor): Extension<Acto
                 id: a.id.to_string(),
                 permission_set: a.permission_set,
                 principal_type: a.principal_type.as_str().to_owned(),
+                principal_id: a.principal_id.to_string(),
+                principal_name: a.principal_name,
                 provider: a.provider,
-                principal_id: a.principal_id,
-                user_name: a.user.as_ref().map(|(name, _)| name.clone()),
-                user_email: a.user.and_then(|(_, email)| email),
+                email: a.email,
                 created_at: a.created,
             })
             .collect(),
@@ -286,9 +350,7 @@ struct NewAssignment {
     permission_set: String,
     /// `USER` or `GROUP`.
     principal_type: String,
-    /// The identity source.
-    provider: String,
-    /// A user's subject (`sub`), or a group's name in the group claim.
+    /// The user's or group's ID in the identity store.
     principal_id: String,
 }
 
@@ -302,8 +364,10 @@ async fn create_assignment(State(app): AppState, Extension(actor): Extension<Act
     let Some(kind) = PrincipalType::parse(&body.principal_type) else {
         return Err(ApiError::BadRequest("principal_type is USER or GROUP".into()));
     };
+    let principal = Uuid::parse_str(&body.principal_id)
+        .map_err(|_| ApiError::NotFound(format!("there's no {} {} in the identity store", kind.as_str().to_lowercase(), body.principal_id)))?;
     let set = check_set(&app, &actor, "sso:CreateAccountAssignment", &body.permission_set).await?;
-    ic::assign(&app.pool.get().await?, &set, kind, &body.provider, body.principal_id.trim()).await?;
+    ic::assign(&app.pool.get().await?, &set, kind, principal).await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -315,19 +379,17 @@ async fn create_assignment(State(app): AppState, Extension(actor): Extension<Act
     (status = "5XX", body = ErrorBody),
 ))]
 async fn delete_assignment(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
-    let id = Uuid::parse_str(&id).map_err(|_| ApiError::NotFound("no such assignment".into()))?;
+    let missing = || ApiError::NotFound("no such assignment".into());
+    let id = Uuid::parse_str(&id).map_err(|_| missing())?;
     let client = app.pool.get().await?;
-    let assignment = ic::assignments(&client, actor.account())
+    let assignment = ic::assignments(&client, actor.account(), None, None)
         .await?
         .into_iter()
         .find(|a| a.id == id)
-        .ok_or_else(|| ApiError::NotFound("no such assignment".into()))?;
-    let set = ic::load(&client, actor.account(), &assignment.permission_set)
-        .await?
-        .ok_or_else(|| ApiError::NotFound("no such assignment".into()))?;
-    actor.check(&app, "sso:DeleteAccountAssignment", On::Arn(set.arn())).await?;
-    if !ic::unassign(&client, actor.account(), id).await? {
-        return Err(ApiError::NotFound("no such assignment".into()));
+        .ok_or_else(missing)?;
+    let set = check_set(&app, &actor, "sso:DeleteAccountAssignment", &assignment.permission_set).await?;
+    if !ic::unassign(&client, &set, assignment.principal_type, assignment.principal_id).await? {
+        return Err(missing());
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -335,10 +397,15 @@ async fn delete_assignment(State(app): AppState, Extension(actor): Extension<Act
 /// A directory user, as it last signed in.
 #[derive(Serialize, ToSchema)]
 struct DirectoryUserSummary {
+    /// Its ID in the identity store.
+    id: String,
+    user_name: String,
+    display_name: String,
+    email: Option<String>,
+    /// Its identity source, and its subject there.
     provider: String,
     subject: String,
-    name: String,
-    email: Option<String>,
+    /// Its groups, by name, as its last sign-in said.
     groups: Vec<String>,
     first_signed_in: f64,
     last_signed_in: f64,
@@ -351,19 +418,68 @@ struct DirectoryUserSummary {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn list_directory_users(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<DirectoryUserSummary>>> {
-    actor.check(&app, "identitystore:ListUsers", instance(&actor)).await?;
-    let users = ic::directory_users(&app.pool.get().await?).await?;
+    actor.check(&app, "identitystore:ListUsers", store(&actor)).await?;
+    let client = app.pool.get().await?;
+    let groups = ic::groups(&client, None).await?;
+    let memberships = ic::memberships(&client, None, None).await?;
+    let mut users = ic::users(&client, None).await?;
+    users.sort_by(|a, b| b.updated.total_cmp(&a.updated));
     Ok(Json(
         users
             .into_iter()
-            .map(|u| DirectoryUserSummary {
-                provider: u.provider,
-                subject: u.subject,
-                name: u.name,
-                email: u.email,
-                groups: u.groups,
-                first_signed_in: u.created,
-                last_signed_in: u.last_signed_in,
+            .map(|u| {
+                let mut names: Vec<String> = memberships
+                    .iter()
+                    .filter(|m| m.user_id == u.id)
+                    .filter_map(|m| groups.iter().find(|g| g.id == m.group_id).map(|g| g.name.clone()))
+                    .collect();
+                names.sort();
+                DirectoryUserSummary {
+                    id: u.id.to_string(),
+                    user_name: u.user_name,
+                    display_name: u.display_name,
+                    email: u.email,
+                    provider: u.provider,
+                    subject: u.subject,
+                    groups: names,
+                    first_signed_in: u.created,
+                    last_signed_in: u.updated,
+                }
+            })
+            .collect(),
+    ))
+}
+
+/// A group, as its users' group claims named it.
+#[derive(Serialize, ToSchema)]
+struct DirectoryGroupSummary {
+    /// Its ID in the identity store.
+    id: String,
+    name: String,
+    provider: String,
+    /// How many users it had, as their last sign-ins said.
+    members: i64,
+}
+
+/// The identity store's groups.
+#[utoipa::path(get, path = "/directory-groups", responses(
+    (status = 200, body = Vec<DirectoryGroupSummary>),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn list_directory_groups(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<DirectoryGroupSummary>>> {
+    actor.check(&app, "identitystore:ListGroups", store(&actor)).await?;
+    let client = app.pool.get().await?;
+    let memberships = ic::memberships(&client, None, None).await?;
+    Ok(Json(
+        ic::groups(&client, None)
+            .await?
+            .into_iter()
+            .map(|g| DirectoryGroupSummary {
+                members: memberships.iter().filter(|m| m.group_id == g.id).count() as i64,
+                id: g.id.to_string(),
+                name: g.name,
+                provider: g.provider,
             })
             .collect(),
     ))

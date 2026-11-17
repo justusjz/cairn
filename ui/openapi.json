@@ -1917,6 +1917,44 @@
         }
       }
     },
+    "/directory-groups": {
+      "get": {
+        "summary": "The identity store's groups.",
+        "operationId": "list_directory_groups",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DirectoryGroupSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/directory-users": {
       "get": {
         "summary": "The directory users that have signed in, most recent first.",
@@ -3803,6 +3841,92 @@
         "responses": {
           "204": {
             "description": "Detached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/permission-sets/{name}/boundary": {
+      "put": {
+        "summary": "Sets a permission set's permissions boundary: a managed policy (AWS's,\nor the account's).",
+        "operationId": "put_permission_set_boundary",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyArn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a permission set's permissions boundary.",
+        "operationId": "delete_permission_set_boundary",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
           },
           "4XX": {
             "content": {
@@ -6496,14 +6620,22 @@
           "id",
           "permission_set",
           "principal_type",
-          "provider",
           "principal_id",
+          "principal_name",
+          "provider",
           "created_at"
         ],
         "properties": {
           "created_at": {
             "type": "number",
             "format": "double"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A user's e-mail."
           },
           "id": {
             "type": "string"
@@ -6513,7 +6645,11 @@
           },
           "principal_id": {
             "type": "string",
-            "description": "A user's subject (`sub`), or a group's name in the group claim."
+            "description": "The user's or group's ID in the identity store."
+          },
+          "principal_name": {
+            "type": "string",
+            "description": "A user's user name, or a group's name."
           },
           "principal_type": {
             "type": "string",
@@ -6521,20 +6657,7 @@
           },
           "provider": {
             "type": "string",
-            "description": "The identity source."
-          },
-          "user_email": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "user_name": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "A user's name and e-mail, as it last signed in, if it has."
+            "description": "Its identity source."
           }
         }
       },
@@ -7422,10 +7545,39 @@
           }
         }
       },
+      "DirectoryGroupSummary": {
+        "type": "object",
+        "description": "A group, as its users' group claims named it.",
+        "required": [
+          "id",
+          "name",
+          "provider",
+          "members"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Its ID in the identity store."
+          },
+          "members": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many users it had, as their last sign-ins said."
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        }
+      },
       "DirectoryMe": {
         "type": "object",
         "description": "A directory user, signed in at an identity source.",
         "required": [
+          "user_id",
+          "user_name",
           "provider",
           "provider_label",
           "subject",
@@ -7470,6 +7622,13 @@
           "subject": {
             "type": "string",
             "description": "Its subject there (`sub`), which assignments name it by."
+          },
+          "user_id": {
+            "type": "string",
+            "description": "Its ID in the identity store, and its user name there."
+          },
+          "user_name": {
+            "type": "string"
           }
         }
       },
@@ -7477,14 +7636,19 @@
         "type": "object",
         "description": "A directory user, as it last signed in.",
         "required": [
+          "id",
+          "user_name",
+          "display_name",
           "provider",
           "subject",
-          "name",
           "groups",
           "first_signed_in",
           "last_signed_in"
         ],
         "properties": {
+          "display_name": {
+            "type": "string"
+          },
           "email": {
             "type": [
               "string",
@@ -7499,19 +7663,25 @@
             "type": "array",
             "items": {
               "type": "string"
-            }
+            },
+            "description": "Its groups, by name, as its last sign-in said."
+          },
+          "id": {
+            "type": "string",
+            "description": "Its ID in the identity store."
           },
           "last_signed_in": {
             "type": "number",
             "format": "double"
           },
-          "name": {
-            "type": "string"
-          },
           "provider": {
-            "type": "string"
+            "type": "string",
+            "description": "Its identity source, and its subject there."
           },
           "subject": {
+            "type": "string"
+          },
+          "user_name": {
             "type": "string"
           }
         }
@@ -9044,7 +9214,6 @@
         "required": [
           "permission_set",
           "principal_type",
-          "provider",
           "principal_id"
         ],
         "properties": {
@@ -9053,15 +9222,11 @@
           },
           "principal_id": {
             "type": "string",
-            "description": "A user's subject (`sub`), or a group's name in the group claim."
+            "description": "The user's or group's ID in the identity store."
           },
           "principal_type": {
             "type": "string",
             "description": "`USER` or `GROUP`."
-          },
-          "provider": {
-            "type": "string",
-            "description": "The identity source."
           }
         }
       },
@@ -9967,7 +10132,14 @@
             "items": {
               "$ref": "#/components/schemas/AttachedPolicy"
             },
-            "description": "Its managed policies."
+            "description": "Its managed policies: AWS's (Cairn's), and the account's (customer\nmanaged)."
+          },
+          "boundary": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its permissions boundary's ARN, if it has one."
           },
           "created_at": {
             "type": "number",

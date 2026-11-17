@@ -475,6 +475,9 @@ struct Me {
 /// A directory user, signed in at an identity source.
 #[derive(Serialize, ToSchema)]
 struct DirectoryMe {
+    /// Its ID in the identity store, and its user name there.
+    user_id: String,
+    user_name: String,
     /// The identity source's name and label.
     provider: String,
     provider_label: String,
@@ -566,8 +569,7 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
 /// Who a directory user's session is: as its permission set's role's
 /// session, if it picked one that's still its.
 async fn directory_me(console: &Console, client: &deadpool_postgres::Object, session: &store::DirectorySession) -> Result<Me> {
-    let eligible =
-        crate::identity_center::eligible(client, &session.account_id, &session.provider, &session.subject, &session.groups).await?;
+    let eligible = crate::identity_center::eligible(client, &session.account_id, session.user_id).await?;
     let chosen = eligible.iter().find(|set| Some(set.id) == session.permission_set);
     let (arn, user, cluster) = match chosen {
         Some(set) => {
@@ -588,6 +590,8 @@ async fn directory_me(console: &Console, client: &deadpool_postgres::Object, ses
         cluster,
         passkeys: Vec::new(),
         directory: Some(DirectoryMe {
+            user_id: session.user_id.to_string(),
+            user_name: session.user_name.clone(),
             provider: session.provider.clone(),
             provider_label: session.provider_label.clone(),
             subject: session.subject.clone(),
@@ -625,8 +629,7 @@ async fn choose_permission_set(
 ) -> Result<Json<Me>> {
     let client = console.app.pool.get().await?;
     let session = &signed.session;
-    let eligible =
-        crate::identity_center::eligible(&client, &session.account_id, &session.provider, &session.subject, &session.groups).await?;
+    let eligible = crate::identity_center::eligible(&client, &session.account_id, session.user_id).await?;
     let Some(set) = eligible.into_iter().find(|set| set.name == body.name) else {
         return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you", body.name)));
     };
@@ -659,8 +662,8 @@ async fn directory_credentials(State(console): ConsoleState, signed: DirectorySi
     let mut session = super::directory::role_session(&set, &signed.session)?;
     let token = console.app.sessions.seal(&client, &mut session).await?;
     eprintln!(
-        "console: credentials {} of permission set {} for directory user {} of {}",
-        session.key_id, set.name, signed.session.subject, signed.session.provider
+        "console: credentials {} of permission set {} for directory user {} ({} of {})",
+        session.key_id, set.name, signed.session.user_name, signed.session.subject, signed.session.provider
     );
     Ok(Json(Credentials {
         access_key_id: session.key_id,
@@ -862,9 +865,18 @@ async fn oidc_callback(State(console): ConsoleState, headers: HeaderMap, Query(a
     };
     let provider = done.provider.name.as_str();
     let name = done.name.clone().or(done.email.clone()).unwrap_or_else(|| done.subject.clone());
-    crate::identity_center::signed_in(&client, provider, &done.subject, &name, done.email.as_deref(), &done.groups).await?;
+    let user = crate::identity_center::signed_in(
+        &client,
+        provider,
+        &done.subject,
+        &name,
+        done.user_name.as_deref(),
+        done.email.as_deref(),
+        &done.groups,
+    )
+    .await?;
     let account = crate::users::account(&client).await?;
-    let eligible = crate::identity_center::eligible(&client, &account, provider, &done.subject, &done.groups).await?;
+    let eligible = crate::identity_center::eligible(&client, &account, user).await?;
     if eligible.is_empty() {
         return Ok(failed(
             "/login",
@@ -879,6 +891,6 @@ async fn oidc_callback(State(console): ConsoleState, headers: HeaderMap, Query(a
     if let Some(old) = session_token(&headers) {
         store::end_session(&client, &old).await?;
     }
-    let token = store::create_directory_session(&client, &account, provider, &done.subject, &done.groups, chosen).await?;
+    let token = store::create_directory_session(&client, &account, user, chosen).await?;
     Ok(redirect("/", Some(session_cookie(&token))))
 }

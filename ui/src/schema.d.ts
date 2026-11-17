@@ -494,6 +494,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/directory-groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The identity store's groups. */
+        get: operations["list_directory_groups"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/directory-users": {
         parameters: {
             query?: never;
@@ -1121,6 +1138,27 @@ export interface paths {
         post: operations["attach_managed_policy"];
         /** Detaches a managed policy from a permission set. */
         delete: operations["detach_managed_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permission-sets/{name}/boundary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a permission set's permissions boundary: a managed policy (AWS's,
+         *     or the account's).
+         */
+        put: operations["put_permission_set_boundary"];
+        post?: never;
+        /** Removes a permission set's permissions boundary. */
+        delete: operations["delete_permission_set_boundary"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1841,17 +1879,18 @@ export interface components {
         AssignmentSummary: {
             /** Format: double */
             created_at: number;
+            /** @description A user's e-mail. */
+            email?: string | null;
             id: string;
             permission_set: string;
-            /** @description A user's subject (`sub`), or a group's name in the group claim. */
+            /** @description The user's or group's ID in the identity store. */
             principal_id: string;
+            /** @description A user's user name, or a group's name. */
+            principal_name: string;
             /** @description `USER` or `GROUP`. */
             principal_type: string;
-            /** @description The identity source. */
+            /** @description Its identity source. */
             provider: string;
-            user_email?: string | null;
-            /** @description A user's name and e-mail, as it last signed in, if it has. */
-            user_name?: string | null;
         };
         AttachedPolicy: {
             arn: string;
@@ -2211,6 +2250,18 @@ export interface components {
             /** Format: int32 */
             version: number;
         };
+        /** @description A group, as its users' group claims named it. */
+        DirectoryGroupSummary: {
+            /** @description Its ID in the identity store. */
+            id: string;
+            /**
+             * Format: int64
+             * @description How many users it had, as their last sign-ins said.
+             */
+            members: number;
+            name: string;
+            provider: string;
+        };
         /** @description A directory user, signed in at an identity source. */
         DirectoryMe: {
             email?: string | null;
@@ -2225,18 +2276,26 @@ export interface components {
             provider_label: string;
             /** @description Its subject there (`sub`), which assignments name it by. */
             subject: string;
+            /** @description Its ID in the identity store, and its user name there. */
+            user_id: string;
+            user_name: string;
         };
         /** @description A directory user, as it last signed in. */
         DirectoryUserSummary: {
+            display_name: string;
             email?: string | null;
             /** Format: double */
             first_signed_in: number;
+            /** @description Its groups, by name, as its last sign-in said. */
             groups: string[];
+            /** @description Its ID in the identity store. */
+            id: string;
             /** Format: double */
             last_signed_in: number;
-            name: string;
+            /** @description Its identity source, and its subject there. */
             provider: string;
             subject: string;
+            user_name: string;
         };
         Disk: {
             /**
@@ -2857,12 +2916,10 @@ export interface components {
         };
         NewAssignment: {
             permission_set: string;
-            /** @description A user's subject (`sub`), or a group's name in the group claim. */
+            /** @description The user's or group's ID in the identity store. */
             principal_id: string;
             /** @description `USER` or `GROUP`. */
             principal_type: string;
-            /** @description The identity source. */
-            provider: string;
         };
         NewBucket: {
             name: string;
@@ -3221,8 +3278,13 @@ export interface components {
              * @description Its assignments.
              */
             assignments: number;
-            /** @description Its managed policies. */
+            /**
+             * @description Its managed policies: AWS's (Cairn's), and the account's (customer
+             *     managed).
+             */
             attached: components["schemas"]["AttachedPolicy"][];
+            /** @description Its permissions boundary's ARN, if it has one. */
+            boundary?: string | null;
             /** Format: double */
             created_at: number;
             description: string;
@@ -5295,6 +5357,41 @@ export interface operations {
             };
         };
     };
+    list_directory_groups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryGroupSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_directory_users: {
         parameters: {
             query?: never;
@@ -6981,6 +7078,82 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Detached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_permission_set_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyArn"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_permission_set_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
             204: {
                 headers: {
                     [name: string]: unknown;

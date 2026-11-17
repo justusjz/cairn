@@ -62,7 +62,8 @@ Done:
   conditions, and STS with roles (`AssumeRoleWithWebIdentity`).
   S3 Access Grants (IAM grantees): implemented. Directory users, as
   Identity Center's (OIDC identity sources, permission sets as reserved
-  roles, assignments to users and groups): implemented. Next: directory
+  roles, assignments to users and groups, sso-admin's API and
+  identitystore's reads): implemented. Next: directory
   users and groups as Access Grants grantees, and the access portal's APIs
   for `aws sso login`.
 
