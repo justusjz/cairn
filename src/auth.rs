@@ -1020,18 +1020,23 @@ fn sigv2_query_header(query: &str, name: &str) -> Option<String> {
 /// SigV2's canonicalized resource: `resource` (the request's path-style
 /// path, `/bucket/key`, as sent), and the subresources in `query`, sorted by
 /// name, with their values decoded (as S3 and botocore sign them).
+///
+/// Names are decoded too, as `s3::util::query_param` matches them when it
+/// routes the request: else `?tagg%69ng`, added to a presigned PutObject's
+/// URL, would go unsigned and still make it a PutObjectTagging.
 fn sigv2_resource(resource: &str, query: &str) -> String {
-    let mut subresources: Vec<(&str, Option<String>)> = query
+    let decode = |s: &str| percent_encoding::percent_decode_str(s).decode_utf8_lossy().into_owned();
+    let mut subresources: Vec<(String, Option<String>)> = query
         .split('&')
         .filter(|pair| !pair.is_empty())
         .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => (k, Some(percent_encoding::percent_decode_str(v).decode_utf8_lossy().into_owned())),
-            None => (pair, None),
+            Some((k, v)) => (decode(k), Some(decode(v))),
+            None => (decode(pair), None),
         })
-        .filter(|(k, _)| SIGV2_SUBRESOURCES.contains(k))
+        .filter(|(k, _)| SIGV2_SUBRESOURCES.contains(&k.as_str()))
         .collect();
     // By name only: botocore keeps the order of a repeated one.
-    subresources.sort_by(|a, b| a.0.cmp(b.0));
+    subresources.sort_by(|a, b| a.0.cmp(&b.0));
     let mut canonical = resource.to_owned();
     for (i, (name, value)) in subresources.iter().enumerate() {
         canonical.push(if i == 0 { '?' } else { '&' });
@@ -1802,6 +1807,10 @@ pub(crate) mod tests {
             sigv2_resource("/b/k", "versionId=v1&response-content-disposition=attachment%3B%20filename%3Da.txt&uploads"),
             "/b/k?response-content-disposition=attachment; filename=a.txt&uploads&versionId=v1"
         );
+        // A subresource's name encoded is that subresource, as requests are
+        // routed by it: signed, not left out.
+        assert_eq!(sigv2_resource("/b/k", "tagg%69ng"), "/b/k?tagging");
+        assert_eq!(sigv2_resource("/b/k", "%61cl&x%2Did=GetObject"), "/b/k?acl");
     }
 
     /// botocore's presigned SigV2 URL, with temporary credentials: their

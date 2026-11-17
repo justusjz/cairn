@@ -3101,6 +3101,28 @@ missing_bucket_404_ok() {
     "${r[@]}" s3api create-bucket --bucket "no-such-bucket-$(date +%s)" 2>&1 | grep -q AccessDenied
 }
 
+# The same as testkey, an admin, whom policies allow everything: a missing
+# bucket is still a 404 NoSuchBucket, not the operation's own answer
+# (GetObject's NoSuchKey, the stubs' 200), and with a message, which
+# aws-cli's error hook needs (it crashes on an empty one).
+missing_bucket_admin_404_ok() {
+    local b="no-such-bucket-admin-$(date +%s)" sub
+    awss3 s3api list-objects-v2 --bucket "$b" 2>&1 | grep -q NoSuchBucket || return 1
+    awss3 s3api list-objects --bucket "$b" 2>&1 | grep -q NoSuchBucket || return 1
+    awss3 s3 ls "s3://$b" 2>&1 | grep -q NoSuchBucket || return 1
+    awss3 s3api get-object --bucket "$b" --key k "$WORK_DIR/x404" 2>&1 | grep -q NoSuchBucket || return 1
+    for sub in get-bucket-acl get-bucket-location get-bucket-accelerate-configuration \
+               get-bucket-request-payment get-bucket-notification-configuration \
+               get-bucket-ownership-controls get-bucket-versioning; do
+        awss3 s3api "$sub" --bucket "$b" 2>&1 | grep -q NoSuchBucket || return 1
+    done
+    awss3 s3api get-object-acl --bucket "$b" --key k 2>&1 | grep -q NoSuchBucket || return 1
+    # S3 Metadata's table updates are refused, not run as CreateBucket.
+    [ "$(scurl PUT "/$b?metadataInventoryTable" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    [ "$(scurl PUT "/$b?metadataJournalTable" "$EMPTY_SHA256" -)" = 501 ] || return 1
+    ! awss3 s3api head-bucket --bucket "$b" >/dev/null 2>&1
+}
+
 # A revoked grant takes effect on the very next request (no caching).
 revoke_takes_effect_ok() {
     revoke reader "$BUCKET" >/dev/null 2>&1 || return 1
@@ -3221,6 +3243,7 @@ run_test    "No cross-bucket copy / upload access"  cross_bucket_denied_ok
 run_test    "Resume an upload with write alone"     resume_upload_ok
 run_test    "Grants follow bucket lifecycle"        grants_follow_bucket_ok
 run_test    "Missing bucket 404, no grant 403"      missing_bucket_404_ok
+run_test    "Missing bucket 404 to an admin too"    missing_bucket_admin_404_ok
 run_test    "Revoked grant takes effect"            revoke_takes_effect_ok
 run_test    "Bucket policies, anonymous and signed" bucket_policy_ok
 run_test    "An account's public access block"      account_block_ok

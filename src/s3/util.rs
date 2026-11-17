@@ -82,8 +82,8 @@ const S3_XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 /// empty (or default) config; the rest return their "not configured" 404.
 /// Returns `None` for a normal listing GET (no recognised sub-resource).
 ///
-/// Existence-agnostic, like [`stub_acl`] — clients probe these on buckets they're
-/// already using.
+/// Existence-agnostic, like [`stub_acl`]: a bucket that isn't there is
+/// refused before these are reached (see `s3::refusal`).
 pub fn bucket_subresource_stub(query: &str, owner_id: &str) -> Option<Response<Full<Bytes>>> {
     let present = |name| query_param(query, name).is_some();
     if present("acl") {
@@ -321,6 +321,8 @@ const SUBRESOURCES: &[&str] = &[
     "location",
     "logging",
     "metadataConfiguration",
+    "metadataInventoryTable",
+    "metadataJournalTable",
     "metadataTable",
     "metrics",
     "notification",
@@ -570,17 +572,39 @@ pub fn delimiter(query: &str) -> Option<String> {
 }
 
 /// Extracts and percent-decodes a single parameter from a raw query string
-/// (e.g. "prefix=dir%2F&delimiter=%2F").
+/// (e.g. "prefix=dir%2F&delimiter=%2F"). Its name is matched decoded too,
+/// as [`unsupported_subresource`] reads names: else `?tagg%69ng` would pass
+/// that check as PutObjectTagging, and then run as a PutObject.
 pub fn query_param(query: &str, name: &str) -> Option<String> {
     query.split('&').find_map(|pair| {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
-        (k == name).then(|| decode_path_param(&v.replace('+', " ")))
+        (k == name || (k.contains('%') && decode_path_param(k) == name))
+            .then(|| decode_path_param(&v.replace('+', " ")))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parameter_names_match_decoded() {
+        assert_eq!(query_param("tagg%69ng", "tagging").as_deref(), Some(""));
+        assert_eq!(query_param("prefix=a%2Fb&tagging", "prefix").as_deref(), Some("a/b"));
+        assert_eq!(query_param("%70refix=x", "prefix").as_deref(), Some("x"));
+        assert_eq!(query_param("tagging2", "tagging"), None);
+        // Decoded alike by the subresource check, so an encoded name is
+        // either refused there or routed as the operation it names.
+        assert!(unsupported_subresource(&Method::PUT, false, "tagg%69ng").is_none());
+        assert!(unsupported_subresource(&Method::PUT, false, "%72estore").is_some());
+    }
+
+    #[test]
+    fn s3_metadatas_table_updates_are_refused() {
+        for name in ["metadataInventoryTable", "metadataJournalTable"] {
+            assert!(unsupported_subresource(&Method::PUT, true, name).is_some(), "{name}");
+        }
+    }
 
     #[test]
     fn only_utf8_without_nul_is_well_formed() {
