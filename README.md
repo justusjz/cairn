@@ -416,14 +416,37 @@ allows; else it's denied. They are:
   shows the first by its ID; one renamed or moved since still is, and the
   policy shows its ARN as it is now.
 
-**One account**, as AWS's: Cairn has one (a 12-digit ID), which every user,
-bucket and policy belongs to. Teams are kept
-apart by IAM, as within an AWS account: users' paths (`/team-a/`),
-permissions boundaries, and policies that give each team its own buckets,
-down to the names it may create (`s3:CreateBucket` on
+**Accounts**, as AWS's, in an organization as AWS Organizations has them.
+The account Cairn starts with (a 12-digit ID) is the **management
+account**: it owns the cluster (`cairn:` actions) and Identity Center, and
+makes **member accounts**. Each account has its own users, roles, policies,
+buckets (whose names are global, as in S3) and public access block, and
+nothing of another's unless a policy allows it, as between AWS accounts.
+Teams can also be kept apart within an account by IAM: users' paths
+(`/team-a/`), permissions boundaries, and policies that give each team its
+own buckets, down to the names it may create (`s3:CreateBucket` on
 `arn:aws:s3:::team-a-*`).
 
-The account has a **root user**, as AWS's, for getting back in when
+A member account is made in the console's Organization page, or with
+Organizations' API (`aws organizations create-account`, with
+`AWS_ENDPOINT_URL_ORGANIZATIONS` pointed at the S3 endpoint). It gets
+`OrganizationAccountAccessRole`, allowing everything and trusting the
+management account, as AWS's does: the management account's principals
+whose own policies allow `sts:AssumeRole` on it get into the member account
+by assuming it, and directory users with the permission sets assigned to
+them there ([Directory users](#directory-users)). Member accounts have no
+root user, as AWS recommends. Closing one (`close-account`, or the console)
+is at once, once it has no buckets: its users, roles and sessions stop
+working.
+
+```sh
+export AWS_ENDPOINT_URL_ORGANIZATIONS=https://s3.example.com
+aws organizations create-account --account-name "Team A" --email team-a@example.com
+aws sts assume-role --role-arn arn:aws:iam::<member>:role/OrganizationAccountAccessRole \
+    --role-session-name setup
+```
+
+The management account has a **root user**, as AWS's, for getting back in when
 policies lock everyone out. Only the command line on a node can make
 someone the root: it has no passkeys, long-term keys or password. Either of
 two commands on a node makes it, for a while:

@@ -284,12 +284,15 @@ pub fn verdict_across<'p>(
 /// `caps`): a Deny anywhere denies; else the trust policy must allow it, by
 /// naming the principal itself (or everyone), or by naming its account,
 /// which leaves it to the identity policies (probed: a trust policy naming
-/// someone else allows nothing, whatever the identity policies say).
+/// someone else allows nothing, whatever the identity policies say). A
+/// principal of another account than the role's (`cross`) needs both: the
+/// trust policy, and its own policies, as in AWS.
 pub fn trust_allows<'p>(
     identity: impl IntoIterator<Item = &'p Policy>,
     caps: Caps<'p>,
     trust: &Policy,
     request: &Request,
+    cross: bool,
 ) -> bool {
     let mut identity_allows = false;
     for policy in identity {
@@ -317,8 +320,10 @@ pub fn trust_allows<'p>(
     }
     match trust.evaluate_trust(request) {
         (Decision::Deny, _) => false,
-        (Decision::Allow, true) => true,
-        (Decision::Allow, false) => identity_allows && boundary_allows && session_allows,
+        // Naming the principal itself is enough within its account; from
+        // another account, its own policies must allow it too (`cross`).
+        (Decision::Allow, true) if !cross => true,
+        (Decision::Allow, _) => identity_allows && boundary_allows && session_allows,
         (Decision::NotApplicable, _) => false,
     }
 }

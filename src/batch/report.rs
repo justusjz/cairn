@@ -243,9 +243,8 @@ impl Writer {
 
 /// Whether `principal` may put `key` in `bucket`.
 async fn may_put(app: &App, principal: &Principal, bucket: &str, key: &str) -> anyhow::Result<Result<(), TaskFailure>> {
-    let account = crate::users::account(&app.pool.get().await?).await?;
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let mut access = Access::new(Some(principal), &account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
+    let mut access = Access::new(Some(principal), &principal.account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
     authorize(app, &mut access, &principal.arn(), &Method::PUT, bucket, key, "").await
 }
 

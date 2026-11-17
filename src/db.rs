@@ -248,6 +248,7 @@ const MIGRATIONS: &[&str] = &[
     PERMISSION_SET_ACCOUNTS,
     PERMISSION_SET_DEFINITIONS,
     OWN_DIRECTORY,
+    ORGANIZATIONS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3249,6 +3250,51 @@ ALTER TABLE console_directory_sessions
     ADD COLUMN credential_id bytea REFERENCES directory_passkeys (credential_id) ON DELETE CASCADE,
     ADD COLUMN verified_at   timestamptz,
     ADD CHECK ((credential_id IS NULL) = (verified_at IS NULL));
+"#;
+
+/// Migration 68: accounts as AWS Organizations has them (see
+/// `organizations`). The account there is becomes the organization's
+/// management account (`management`), which owns the cluster (`cairn:`
+/// actions) and Identity Center's instance; member accounts are made from
+/// it (`CreateAccount`), as many as asked, each with an e-mail (unique, as
+/// AWS's) and a name as AWS takes one (no longer unique), and closed
+/// (`closed_at`): a closed account's principals are no one. The operator
+/// account's row, empty since migration 45, goes (if nothing is its), and
+/// with it the index that kept to one account. `organization_requests`
+/// keep what CreateAccount did, for its status to be asked.
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const ORGANIZATIONS: &str = r#"
+DO $$
+BEGIN
+    DELETE FROM accounts WHERE operator;
+EXCEPTION WHEN foreign_key_violation THEN
+    NULL;
+END $$;
+DROP INDEX accounts_one;
+ALTER TABLE accounts
+    DROP CONSTRAINT accounts_name,
+    DROP CONSTRAINT accounts_name_check,
+    ADD CONSTRAINT accounts_name_check CHECK (name ~ '^[ -~]{1,50}$'),
+    ADD COLUMN management    boolean NOT NULL DEFAULT false,
+    ADD COLUMN email         text CHECK (length(email) BETWEEN 6 AND 64),
+    ADD COLUMN joined_method text NOT NULL DEFAULT 'CREATED' CHECK (joined_method IN ('CREATED', 'INVITED')),
+    ADD COLUMN closed_at     timestamptz;
+UPDATE accounts SET management = true WHERE NOT operator;
+CREATE UNIQUE INDEX accounts_management ON accounts (management) WHERE management;
+CREATE UNIQUE INDEX accounts_email ON accounts (lower(email));
+
+CREATE TABLE organization_requests (
+    id             text PRIMARY KEY,
+    account_name   text NOT NULL,
+    account_id     text REFERENCES accounts (id) ON DELETE SET NULL,
+    state          text NOT NULL CHECK (state IN ('IN_PROGRESS', 'SUCCEEDED', 'FAILED')),
+    failure_reason text,
+    requested_at   timestamptz NOT NULL DEFAULT now(),
+    completed_at   timestamptz
+);
+CREATE INDEX organization_requests_requested ON organization_requests (requested_at);
+CREATE TRIGGER organization_requests_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON organization_requests
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

@@ -1378,7 +1378,7 @@ pub async fn eligible(client: &Object, account: &str, user: Uuid) -> anyhow::Res
             &format!(
                 "SELECT {COLUMNS}, t.account_id, acc.name, t.role_id, tr.name {FROM}
                  JOIN permission_set_provisions t ON t.permission_set_id = p.id
-                 JOIN accounts acc ON acc.id = t.account_id
+                 JOIN accounts acc ON acc.id = t.account_id AND acc.closed_at IS NULL
                  JOIN iam_roles tr ON tr.id = t.role_id
                  WHERE p.account_id = $1 AND EXISTS (
                      SELECT 1 FROM permission_set_assignments a WHERE a.permission_set_id = p.id AND a.account_id = t.account_id

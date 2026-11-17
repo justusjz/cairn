@@ -95,6 +95,7 @@ impl Actor {
         let user = &self.0;
         let origin = Origin { peer: user.peer, trusted_proxies: &app.trusted_proxies, signed: None, form: false };
         let mut access = Access::new(Some(&user.principal), &user.account, &user.method, &user.headers, &user.query, &origin)?;
+        access.set_management(&crate::users::account(&app.pool.get().await?).await?);
         match user.mfa_age {
             Some(age) => {
                 access.context.set("aws:MultiFactorAuthPresent", "true");

@@ -187,10 +187,12 @@ const CURRENT_BOUNDARY_ACTIONS: &[&str] = &[
     "iam:DeleteRolePermissionsBoundary",
 ];
 
-/// `text` checked as a trust policy for a role of `account`, as IAM checks
-/// one (probed): valid, within `MAX_TRUST`, and naming principals that
-/// exist. It as IAM keeps it (normalized).
-pub async fn check_trust(client: &Object, account: &str, text: &str) -> anyhow::Result<String> {
+/// `text` checked as a trust policy for a role (of any account), as IAM
+/// checks one (probed): valid, within `MAX_TRUST`, and naming principals
+/// that exist: accounts of the cluster's (the role's own, or another one,
+/// that's not closed: see `organizations`), and their users and roles. It
+/// as IAM keeps it (normalized).
+pub async fn check_trust(client: &Object, _account: &str, text: &str) -> anyhow::Result<String> {
     let policy = Policy::parse(text, Kind::Trust).map_err(|e| match e.code {
         "NotImplemented" => Refused::Unsupported(e.message),
         _ => Refused::Malformed(e.message),
@@ -199,13 +201,16 @@ pub async fn check_trust(client: &Object, account: &str, text: &str) -> anyhow::
         return refused(Refused::Limit(format!("Cannot exceed quota for ACLSizePerRole: {MAX_TRUST}")));
     }
     let invalid = |arn: String| refused(Refused::Malformed(format!("Invalid principal in policy: \"AWS\":\"{arn}\"")));
+    let open: Vec<String> =
+        client.query_cached("SELECT id FROM accounts WHERE closed_at IS NULL", &[]).await?.iter().map(|r| r.get(0)).collect();
+    let known = |named: &str| open.iter().any(|a| a == named);
     for named in policy.accounts() {
-        if named != account {
+        if !known(named) {
             return invalid(format!("arn:aws:iam::{named}:root"));
         }
     }
     for (named, user) in policy.users() {
-        let exists = named == account
+        let exists = known(named)
             && client
                 .query_opt_cached(
                     "SELECT 1 FROM users WHERE substring(path FROM 2) || name = $1 AND account_id = $2",
@@ -218,7 +223,7 @@ pub async fn check_trust(client: &Object, account: &str, text: &str) -> anyhow::
         }
     }
     for (named, role) in policy.roles() {
-        let exists = named == account
+        let exists = known(named)
             && client
                 .query_opt_cached(
                     "SELECT 1 FROM iam_roles WHERE substring(path FROM 2) || name = $1 AND account_id = $2",
@@ -232,7 +237,7 @@ pub async fn check_trust(client: &Object, account: &str, text: &str) -> anyhow::
     }
     // A session by its role's name (its ARN has no path).
     for (named, role, session) in policy.sessions() {
-        let exists = named == account
+        let exists = known(named)
             && client
                 .query_opt_cached("SELECT 1 FROM iam_roles WHERE name = $1 AND account_id = $2", &[&role, &named])
                 .await?
@@ -583,7 +588,9 @@ pub async fn principal(client: &Object, id: Uuid) -> anyhow::Result<Option<crate
                         {BOUNDARY_ARN},
                         (SELECT m.document FROM managed_policies m WHERE m.id = r.boundary_policy_id),
                         r.boundary_aws
-                 FROM iam_roles r WHERE r.id = $1"
+                 FROM iam_roles r WHERE r.id = $1
+                   -- A closed account's roles are no one's (see `organizations`).
+                   AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = r.account_id AND a.closed_at IS NOT NULL)"
             ),
             &[&id],
         )

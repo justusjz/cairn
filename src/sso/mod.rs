@@ -223,6 +223,15 @@ async fn respond(app: &Arc<App>, req: Request<crate::listen::ClientBody>, signed
     if !input.is_object() {
         return Err(error(StatusCode::BAD_REQUEST, "SerializationException", "The request's body isn't a JSON object."));
     }
+    // Identity Center's instance is the management account's: a member
+    // account has none to manage (see `organizations`).
+    if principal.account != users::account(&client).await? {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "AccessDeniedException",
+            "Identity Center's instance is the organization's management account's.",
+        ));
+    }
     let origin = Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: Some(signed), form: false };
     let mut access = Access::new(Some(&principal), &principal.account, &parts.method, &parts.headers, "", &origin)?;
     dispatch(&client, &principal, &mut access, &signed.service, operation, action, &input).await
@@ -314,17 +323,17 @@ impl Ctx<'_> {
     }
 
     /// The account a request targets (`TargetId` and `TargetType`, or
-    /// `AccountId`), which must be the cluster's.
-    fn target(&self, id: &str, kind: Option<&str>) -> Result<String> {
+    /// `AccountId`), which must be one of the organization's, not closed.
+    async fn target(&self, id: &str, kind: Option<&str>) -> Result<String> {
         let target = self.required(id)?;
         if let Some(kind) = kind
             && self.text(kind) != Some("AWS_ACCOUNT")
         {
             return Err(validation(format!("{kind} must be AWS_ACCOUNT.")));
         }
-        match target == self.account {
+        match crate::organizations::open(self.client, target).await? {
             true => Ok(target.to_owned()),
-            false => Err(validation(format!("Account {target} isn't this cluster's ({}): it's the only one.", self.account))),
+            false => Err(validation(format!("Account {target} isn't one of the organization's (or it's closed)."))),
         }
     }
 
@@ -486,7 +495,7 @@ impl Ctx<'_> {
                 Ok(json!({}))
             }
             "CreateAccountAssignment" | "DeleteAccountAssignment" => {
-                let target = self.target("TargetId", Some("TargetType"))?;
+                let target = self.target("TargetId", Some("TargetType")).await?;
                 let set = self.permission_set().await?;
                 let principal = self.principal().await?;
                 let create = operation == "CreateAccountAssignment";
@@ -537,7 +546,7 @@ impl Ctx<'_> {
                 Ok(with_token(json!({ key: page }), next))
             }
             "ListAccountAssignments" => {
-                let target = self.target("AccountId", None)?;
+                let target = self.target("AccountId", None).await?;
                 let set = self.permission_set().await?;
                 let items: Vec<Value> = ic::assignments(self.client, &self.account, Some(&target), Some(set.id), None)
                     .await?
@@ -564,7 +573,7 @@ impl Ctx<'_> {
                 let set = self.permission_set().await?;
                 let target = match self.text("TargetType") {
                     Some("ALL_PROVISIONED_ACCOUNTS") => None,
-                    Some("AWS_ACCOUNT") => Some(self.target("TargetId", None)?),
+                    Some("AWS_ACCOUNT") => Some(self.target("TargetId", None).await?),
                     _ => return Err(validation("TargetType must be AWS_ACCOUNT or ALL_PROVISIONED_ACCOUNTS.")),
                 };
                 // Done at once: its roles hold the set as it is now.
@@ -597,7 +606,7 @@ impl Ctx<'_> {
             "ListPermissionSetsProvisionedToAccount" => {
                 let instance = self.instance()?;
                 self.check(&instance)?;
-                let target = self.target("AccountId", None)?;
+                let target = self.target("AccountId", None).await?;
                 let wanted = self.provisioning_filter()?;
                 let sets: Vec<String> = ic::provisioned_to(self.client, &self.account, &target)
                     .await?

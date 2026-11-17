@@ -32,6 +32,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/accounts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_accounts"];
+        put?: never;
+        /**
+         * Makes a member account, with `OrganizationAccountAccessRole` (as
+         *     CreateAccount).
+         */
+        post: operations["create_account"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/accounts/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Closes a member account, at once (it must have no buckets): its users,
+         *     roles and sessions are no one from then on.
+         */
+        delete: operations["close_account"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/assignments": {
         parameters: {
             query?: never;
@@ -1936,6 +1976,25 @@ export interface components {
             created_at: number;
             id: string;
         };
+        /** @description An account of the organization. */
+        AccountSummary: {
+            /**
+             * Format: int64
+             * @description How many buckets it has (which keep it from being closed).
+             */
+            buckets: number;
+            /** Format: double */
+            closed_at?: number | null;
+            email?: string | null;
+            id: string;
+            /** Format: double */
+            joined_at: number;
+            /** @description Whether it's the management account. */
+            management: boolean;
+            name: string;
+            /** @description `ACTIVE`, or (closed) `SUSPENDED`. */
+            status: string;
+        };
         /** @description What `navigator.credentials.get()` gave the page. */
         Assertion: {
             authenticator_data: string;
@@ -3026,6 +3085,18 @@ export interface components {
             /** Format: double */
             started_at: number;
         };
+        NewAccount: {
+            /** @description Unique among the organization's accounts. */
+            email: string;
+            /** @description 1 to 50 printable characters. */
+            name: string;
+        };
+        /** @description A new account's ID. */
+        NewAccountId: {
+            id: string;
+            /** @description The role the management account's principals may assume into it. */
+            role_arn: string;
+        };
         NewAssignment: {
             /**
              * @description The account to give it in, by ID: the instance's own, if not given
@@ -4025,6 +4096,116 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_accounts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccountSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewAccount"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewAccountId"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    close_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Closed */
             204: {
                 headers: {
                     [name: string]: unknown;

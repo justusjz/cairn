@@ -408,6 +408,9 @@ async fn create_assignment(State(app): AppState, Extension(actor): Extension<Act
         .map_err(|_| ApiError::NotFound(format!("there's no {} {} in the identity store", kind.as_str().to_lowercase(), body.principal_id)))?;
     let set = check_set(&app, &actor, "sso:CreateAccountAssignment", &body.permission_set).await?;
     let account = body.account_id.as_deref().unwrap_or(actor.account());
+    if !crate::organizations::open(&app.pool.get().await?, account).await? {
+        return Err(ApiError::BadRequest(format!("account {account} isn't one of the organization's (or it's closed)")));
+    }
     if let Err(why) = ic::assign(&app.pool.get().await?, &set, account, kind, principal).await? {
         return Err(ApiError::BadRequest(format!("{} can't be provisioned to {account}: {why}", set.name)));
     }

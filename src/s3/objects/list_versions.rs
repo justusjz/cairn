@@ -90,7 +90,7 @@ pub async fn list_object_versions(
 
     let owner = format!(
         "<Owner><ID>{}</ID></Owner>",
-        crate::s3::util::canonical_id(&crate::users::account(&app.pool.get().await?).await?)
+        crate::s3::util::canonical_id(&crate::s3::util::bucket_owner(&app.pool.get().await?, bucket).await?)
     );
     let mut entries = String::new();
     let mut prefixes = String::new();

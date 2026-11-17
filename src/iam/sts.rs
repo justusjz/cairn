@@ -264,8 +264,12 @@ impl Iam<'_> {
                 format!("User: {} is not authorized to perform: {action} on resource: {arn}", self.principal.arn()),
             )
         };
-        let role = match role_of_arn(&arn, self.account()) {
-            Some((path, role_name)) => Role::load(self.client, self.account(), role_name)
+        // In any open account of the organization's: another's, if its
+        // trust policy and the caller's own policies both allow it.
+        let account = arn.strip_prefix("arn:aws:iam::").and_then(|rest| rest.split(':').next()).unwrap_or("").to_owned();
+        let open = crate::organizations::open(self.client, &account).await?;
+        let role = match role_of_arn(&arn, &account).filter(|_| open) {
+            Some((path, role_name)) => Role::load(self.client, &account, role_name)
                 .await?
                 .filter(|r| r.path == path && r.name == role_name),
             None => None,

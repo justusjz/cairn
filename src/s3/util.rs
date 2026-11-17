@@ -41,6 +41,17 @@ pub fn canonical_id(account: &str) -> String {
     sha2::Sha256::digest(format!("cairn canonical user {account}")).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The account that owns `bucket` (the management account's, if it's gone
+/// meanwhile): what owns its objects and uploads, as its owner does with
+/// ACLs disabled (`BucketOwnerEnforced`).
+pub async fn bucket_owner(client: &deadpool_postgres::Object, bucket: &str) -> anyhow::Result<String> {
+    use crate::db::Cached;
+    match client.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await? {
+        Some(row) => Ok(row.get(0)),
+        None => crate::users::account(client).await,
+    }
+}
+
 /// A fixed AccessControlPolicy. Cairn doesn't model ACLs, so every bucket and
 /// object reports its owner, the account (by `owner_id`, its canonical ID),
 /// with FULL_CONTROL, as S3 does with ACLs disabled. This lets clients that

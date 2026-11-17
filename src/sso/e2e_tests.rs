@@ -268,7 +268,8 @@ async fn permission_sets_and_assignments() {
 async fn permission_sets_are_provisioned_to_their_account() {
     let Some(pool) = crate::e2e::fresh_database_through(64).await else { return };
     let client = pool.get().await.unwrap();
-    let account = users::account(&client).await.unwrap();
+    // (Not `users::account`, which wants migration 68's management account.)
+    let account: String = client.query_one("SELECT id FROM accounts WHERE NOT operator", &[]).await.unwrap().get(0);
     client
         .batch_execute(&format!(
             "INSERT INTO oidc_providers (name, label, issuer, client_id) VALUES ('mock', 'Mock', 'https://idp.example', 'c');

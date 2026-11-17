@@ -316,7 +316,10 @@ impl Principal {
             Who::User { id } | Who::Federated { id, .. } => Self::load_user(client, *id).await?,
             // An account that's gone has no root.
             Who::Root { account } => {
-                let exists = client.query_opt_cached("SELECT 1 FROM accounts WHERE id = $1", &[account]).await?.is_some();
+                let exists = client
+                    .query_opt_cached("SELECT 1 FROM accounts WHERE id = $1 AND closed_at IS NULL", &[account])
+                    .await?
+                    .is_some();
                 exists.then(|| Principal::root(account))
             }
         };
@@ -403,7 +406,9 @@ impl Principal {
                         (SELECT m.document FROM managed_policies m WHERE m.id = r.boundary_policy_id),
                         r.boundary_aws,
                         {GROUP_POLICIES}
-                 {from}"),
+                 {from}
+                   -- A closed account's users are no one (see `organizations`).
+                   AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = r.account_id AND a.closed_at IS NOT NULL)"),
                 &[param],
             )
             .await?;
@@ -988,15 +993,18 @@ async fn create_with_key(
     }
 }
 
-/// The account's ID (see `accounts`): Cairn has one, which every user,
-/// bucket and policy belongs to. It never changes, so it's read once.
+/// The organization's management account's ID (see `organizations`): the
+/// account the cluster's first users are made in, which owns the cluster
+/// (`cairn:` actions) and Identity Center's instance, and is the account of
+/// what no other account owns (anonymous requests). Member accounts are
+/// made from it. It never changes, so it's read once.
 pub async fn account(client: &Object) -> anyhow::Result<String> {
     static ACCOUNT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     if let Some(account) = ACCOUNT.get() {
         return Ok(account.clone());
     }
     // (The operator account's row, which older nodes read, is empty.)
-    let account: String = client.query_one_cached("SELECT id FROM accounts WHERE NOT operator", &[]).await?.get(0);
+    let account: String = client.query_one_cached("SELECT id FROM accounts WHERE management", &[]).await?.get(0);
     // Each test's database has an account of its own.
     if !cfg!(test) {
         let _ = ACCOUNT.set(account.clone());

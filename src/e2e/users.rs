@@ -379,18 +379,20 @@ async fn grants_trust_only_their_own_path() {
     assert!(arns[0].starts_with(&format!("arn:aws:iam::{account}:policy/cairn/grants/")), "{arns:?}");
 }
 
-/// Cairn has one account (see `plans/single-account.md`): it owns every user
-/// and bucket, and no second one can be made, even by an older node. The
-/// operator account's row, which older nodes read, is left empty.
+/// The account a cluster starts with is its organization's management
+/// account (see `organizations`): it owns the first buckets, and there's
+/// one of it; member accounts are more accounts, which an older node may
+/// not make.
 #[tokio::test]
-async fn there_is_one_account() {
+async fn the_first_account_is_the_management_account() {
     let Some(app) = node().await else { return };
     let client = app.pool.get().await.unwrap();
     let account = users::account(&client).await.unwrap();
     let owner: String = client.query_one("SELECT account_id FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
     assert_eq!(owner, account);
-    let err = client.execute("INSERT INTO accounts (id, name) VALUES ('000000000042', 'acme')", &[]).await.unwrap_err();
-    assert!(format!("{err:?}").contains("accounts_one"), "{err:?}");
+    client.execute("INSERT INTO accounts (id, name, email) VALUES ('000000000041', 'acme', 'acme@example.com')", &[]).await.unwrap();
+    let err = client.execute("INSERT INTO accounts (id, name, management) VALUES ('000000000043', 'two', true)", &[]).await.unwrap_err();
+    assert!(format!("{err:?}").contains("accounts_management"), "{err:?}");
     let mut session = app.pool.get().await.unwrap();
     let tx = session.transaction().await.unwrap();
     tx.batch_execute("SET LOCAL cairn.users = '4'").await.unwrap();
@@ -415,6 +417,7 @@ async fn operators_are_users_with_cairn_actions() {
         let principal = Principal::load(&client, user).await.unwrap().unwrap();
         let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
         let mut access = Access::new(Some(&principal), &account, &hyper::Method::GET, &hyper::HeaderMap::new(), "", &origin).unwrap();
+        access.set_management(&account);
         let check = Check { action, on };
         access.load_all(&app, std::slice::from_ref(&check)).await.unwrap();
         access.allows(&check)

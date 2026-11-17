@@ -48,6 +48,7 @@ mod iam;
 mod inventory;
 mod limit;
 mod manage;
+mod organizations;
 mod sns;
 mod sso;
 mod templates;
@@ -1110,7 +1111,8 @@ mod e2e {
         // Its access keys have neither: the guard denies them.
         let user = Principal::load_user(&client, crate::users::id_of(&client, &account, "guarded").await.unwrap()).await.unwrap().unwrap();
         let origin = crate::s3::access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-        let access = crate::s3::access::Access::new(Some(&user), &account, &Method::GET, &HeaderMap::new(), "", &origin).unwrap();
+        let mut access = crate::s3::access::Access::new(Some(&user), &account, &Method::GET, &HeaderMap::new(), "", &origin).unwrap();
+        access.set_management(&account);
         let check = crate::s3::actions::Check { action: "cairn:GetCluster", on: crate::s3::actions::On::Cluster };
         assert!(!access.allows(&check));
     }
@@ -1409,6 +1411,32 @@ mod e2e {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// The organization's accounts: listed, made and closed in the console,
+    /// by the management account's principals whose policies allow it.
+    #[tokio::test]
+    async fn the_organization_makes_and_closes_accounts() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = console_of(&app);
+        let mut admin = signed_in(&console, "admin", true).await;
+        let mut tenant = signed_in(&console, "tenant", false).await;
+        assert_eq!(tenant.send("GET", "/api/accounts", None).await.0, StatusCode::FORBIDDEN);
+        let team = json!({ "name": "Team B", "email": "team-b@example.com" });
+        assert_eq!(tenant.send("POST", "/api/accounts", Some(team.clone())).await.0, StatusCode::FORBIDDEN);
+        let (status, made) = admin.send("POST", "/api/accounts", Some(team.clone())).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        let id = made["id"].as_str().unwrap().to_owned();
+        assert_eq!(made["role_arn"], format!("arn:aws:iam::{id}:role/OrganizationAccountAccessRole"));
+        assert_eq!(admin.send("POST", "/api/accounts", Some(team)).await.0, StatusCode::CONFLICT);
+        let (_, accounts) = admin.send("GET", "/api/accounts", None).await;
+        let listed: Vec<(&str, bool)> = accounts.as_array().unwrap().iter().map(|a| (a["name"].as_str().unwrap(), a["management"].as_bool().unwrap())).collect();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[1], ("Team B", false));
+        assert_eq!(admin.send("DELETE", &format!("/api/accounts/{id}"), None).await.0, StatusCode::NO_CONTENT);
+        let (_, accounts) = admin.send("GET", "/api/accounts", None).await;
+        assert_eq!(accounts[1]["status"], "SUSPENDED");
+        assert_eq!(admin.send("DELETE", &format!("/api/accounts/{id}"), None).await.0, StatusCode::BAD_REQUEST);
     }
 
     /// Bucket and object tags, CORS and websites, set as S3 sets them (and
