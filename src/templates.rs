@@ -102,8 +102,8 @@ pub const TEMPLATES: &[Template] = &[
     Template {
         id: "mfa-guard",
         title: "MFA guard",
-        description: "Denies changing users, policies and the cluster (`iam:*`, `cairn:*`) without MFA: to console \
-                      sessions signed in at an OIDC provider, and to access keys, which never carry MFA (as in AWS).",
+        description: "Denies changing users, policies and the cluster (`iam:*`, `cairn:*`) without MFA: to directory \
+                      users, signed in at an identity source, and to access keys, which never carry MFA (as in AWS).",
         version: 1,
     },
 ];

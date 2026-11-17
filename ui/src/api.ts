@@ -45,6 +45,10 @@ export type Level = Schemas["Level"];
 export type Role = Schemas["RoleSummary"];
 export type Group = Schemas["GroupSummary"];
 export type IdentityProvider = Schemas["IdentityProvider"];
+export type PermissionSet = Schemas["PermissionSetSummary"];
+export type Assignment = Schemas["AssignmentSummary"];
+export type DirectoryUser = Schemas["DirectoryUserSummary"];
+export type DirectoryGroup = Schemas["DirectoryGroupSummary"];
 export type Topic = Schemas["TopicSummary"];
 export type TopicDetail = Schemas["TopicDetail"];
 export type Subscription = Schemas["SubscriptionSummary"];
@@ -176,9 +180,34 @@ export const api = {
   oidcConfig: () => ok(client.GET("/oidc-providers")),
   setOidcProvider: (
     name: string,
-    body: { label: string; issuer: string; client_id: string; client_secret: string | null; scopes: string | null },
+    body: { label: string; issuer: string; client_id: string; client_secret: string | null; scopes: string | null; group_claim: string | null },
   ) => ok(client.PUT("/oidc-providers/{name}", { params: { path: { name } }, body })),
   deleteOidcProvider: (name: string) => ok(client.DELETE("/oidc-providers/{name}", { params: { path: { name } } })),
+  permissionSets: () => ok(client.GET("/permission-sets")),
+  createPermissionSet: (name: string, description: string, session_duration: number) =>
+    ok(client.POST("/permission-sets", { body: { name, description, session_duration } })),
+  updatePermissionSet: (name: string, description: string, session_duration: number) =>
+    ok(client.PUT("/permission-sets/{name}", { params: { path: { name } }, body: { description, session_duration } })),
+  deletePermissionSet: (name: string) => ok(client.DELETE("/permission-sets/{name}", { params: { path: { name } } })),
+  permissionSetPolicy: (name: string) => ok(client.GET("/permission-sets/{name}/inline-policy", { params: { path: { name } } })),
+  putPermissionSetPolicy: (name: string, document: string) =>
+    ok(client.PUT("/permission-sets/{name}/inline-policy", { params: { path: { name } }, body: { document } })),
+  deletePermissionSetPolicy: (name: string) =>
+    ok(client.DELETE("/permission-sets/{name}/inline-policy", { params: { path: { name } } })),
+  attachToPermissionSet: (name: string, arn: string) =>
+    ok(client.POST("/permission-sets/{name}/attached", { params: { path: { name } }, body: { arn } })),
+  detachFromPermissionSet: (name: string, arn: string) =>
+    ok(client.DELETE("/permission-sets/{name}/attached", { params: { path: { name }, query: { arn } } })),
+  assignments: () => ok(client.GET("/assignments")),
+  assign: (permission_set: string, principal_type: "USER" | "GROUP", principal_id: string) =>
+    ok(client.POST("/assignments", { body: { permission_set, principal_type, principal_id } })),
+  setPermissionSetBoundary: (name: string, arn: string) =>
+    ok(client.PUT("/permission-sets/{name}/boundary", { params: { path: { name } }, body: { arn } })),
+  deletePermissionSetBoundary: (name: string) =>
+    ok(client.DELETE("/permission-sets/{name}/boundary", { params: { path: { name } } })),
+  directoryGroups: () => ok(client.GET("/directory-groups")),
+  unassign: (id: string) => ok(client.DELETE("/assignments/{id}", { params: { path: { id } } })),
+  directoryUsers: () => ok(client.GET("/directory-users")),
   createEnrollment: (user: string) =>
     ok(client.POST("/users/{user}/enrollment", { params: userPath(user) })),
   createKey: (user: string) => ok(client.POST("/users/{user}/keys", { params: userPath(user) })),

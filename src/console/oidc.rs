@@ -11,11 +11,12 @@
 //! PS256-512, ES256, ES384, EdDSA), its issuer, audience (and `azp`), expiry
 //! and nonce.
 //!
-//! An identity at a provider (its issuer's `sub`) signs in a login it's
-//! linked to, and nothing else: it's linked by an enrollment link ("continue
-//! with ..."), or from the account page, signed in. No account is ever
-//! entered for a matching e-mail address. Providers' URLs must be HTTPS but
-//! on loopback (for trying it, and tests).
+//! The providers are the account's identity sources: whoever a provider
+//! vouches for signs in as a directory user (see `identity_center`), its
+//! subject (`sub`) and its groups (in the provider's group claim) deciding
+//! which permission sets it may use. IAM users sign in with passkeys only.
+//! Providers' URLs must be HTTPS but on loopback (for trying it, and
+//! tests).
 
 use anyhow::Context;
 use base64::{Engine, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
@@ -26,11 +27,24 @@ use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use ring::digest;
 use serde_json::Value;
 use std::time::Duration;
-use uuid::Uuid;
 
 use super::store;
 use crate::oidc::{Discovery, Expect, Reach, Rejected};
 use crate::{db::Cached, users::Invalid};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn reads_group_claims() {
+        assert_eq!(groups_of(Some(&json!(["b", "a", "a", 3, ""]))), vec!["a", "b"]);
+        assert_eq!(groups_of(Some(&json!("admins"))), vec!["admins"]);
+        assert!(groups_of(Some(&json!({"x": 1}))).is_empty());
+        assert!(groups_of(None).is_empty());
+    }
+}
 
 /// How long a sign-in at a provider may take.
 pub const FLOW_TTL: Duration = Duration::from_secs(10 * 60);
@@ -44,6 +58,9 @@ pub struct Provider {
     pub client_id: String,
     pub client_secret: Option<String>,
     pub scopes: String,
+    /// The ID token's claim that lists a person's groups (`groups`, say):
+    /// an array of names, or one name.
+    pub group_claim: String,
 }
 
 /// Whether `url` may be a provider's: HTTPS, or HTTP on loopback.
@@ -88,45 +105,11 @@ fn encode(s: &str) -> String {
     utf8_percent_encode(s, &UNRESERVED).to_string()
 }
 
-/// What a sign-in at a provider is for.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Purpose {
-    /// Signing in.
-    Login,
-    /// A new login, for an enrollment link's identity.
-    Enroll,
-    /// Linking the identity to a signed-in login.
-    Link,
-}
-
-impl Purpose {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Purpose::Login => "login",
-            Purpose::Enroll => "enroll",
-            Purpose::Link => "link",
-        }
-    }
-
-    fn of(s: &str) -> Option<Purpose> {
-        [Purpose::Login, Purpose::Enroll, Purpose::Link].into_iter().find(|p| p.as_str() == s)
-    }
-}
-
-/// What a sign-in in progress carries to its end.
-#[derive(Default)]
-pub struct Carried<'a> {
-    /// The signed-in login (to link to).
-    pub login: Option<Uuid>,
-    /// The enrollment link's token.
-    pub enrollment: Option<&'a str>,
-}
-
 /// The provider named `name`.
 pub async fn provider(client: &Object, name: &str) -> anyhow::Result<Option<Provider>> {
     let row = client
         .query_opt_cached(
-            "SELECT name, label, issuer, client_id, client_secret, scopes FROM oidc_providers WHERE name = $1",
+            "SELECT name, label, issuer, client_id, client_secret, scopes, group_claim FROM oidc_providers WHERE name = $1",
             &[&name],
         )
         .await?;
@@ -137,13 +120,14 @@ pub async fn provider(client: &Object, name: &str) -> anyhow::Result<Option<Prov
         client_id: r.get(3),
         client_secret: r.get(4),
         scopes: r.get(5),
+        group_claim: r.get(6),
     }))
 }
 
 /// Every provider, by name.
 pub async fn providers(client: &Object) -> anyhow::Result<Vec<Provider>> {
     let rows = client
-        .query_cached("SELECT name, label, issuer, client_id, client_secret, scopes FROM oidc_providers ORDER BY name", &[])
+        .query_cached("SELECT name, label, issuer, client_id, client_secret, scopes, group_claim FROM oidc_providers ORDER BY name", &[])
         .await?;
     Ok(rows
         .iter()
@@ -154,37 +138,22 @@ pub async fn providers(client: &Object) -> anyhow::Result<Vec<Provider>> {
             client_id: r.get(3),
             client_secret: r.get(4),
             scopes: r.get(5),
+            group_claim: r.get(6),
         })
         .collect())
 }
 
-/// Starts a sign-in at `provider`, for `purpose`: the URL to send the
-/// browser to.
-pub async fn start(
-    client: &Object,
-    provider: &Provider,
-    redirect_uri: &str,
-    purpose: Purpose,
-    carried: Carried<'_>,
-) -> anyhow::Result<String> {
+/// Starts a sign-in at `provider`: the URL to send the browser to.
+pub async fn start(client: &Object, provider: &Provider, redirect_uri: &str) -> anyhow::Result<String> {
     let found = discovery(provider).await?;
     let authorize = found.authorization_endpoint.as_deref().context("no authorization endpoint")?;
     let (state, nonce, verifier) = (random(32), random(32), random(48));
     let challenge = b64(digest::digest(&digest::SHA256, verifier.as_bytes()).as_ref());
     client
         .execute_cached(
-            "INSERT INTO oidc_flows (state_hash, provider, nonce, verifier, purpose, login_id, enrollment, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8))",
-            &[
-                &store::hash(&state),
-                &provider.name,
-                &nonce,
-                &verifier,
-                &purpose.as_str(),
-                &carried.login,
-                &carried.enrollment.map(store::hash),
-                &FLOW_TTL.as_secs_f64(),
-            ],
+            "INSERT INTO oidc_flows (state_hash, provider, nonce, verifier, purpose, expires_at)
+             VALUES ($1, $2, $3, $4, 'login', now() + make_interval(secs => $5))",
+            &[&store::hash(&state), &provider.name, &nonce, &verifier, &FLOW_TTL.as_secs_f64()],
         )
         .await?;
     let url = format!(
@@ -199,18 +168,18 @@ pub async fn start(
     Ok(url)
 }
 
-/// A finished sign-in at a provider.
+/// A finished sign-in at a provider: who it vouches for.
 pub struct Finished {
     pub provider: Provider,
-    pub purpose: Purpose,
     /// The identity at the provider: its subject, and what it says of
     /// itself.
     pub subject: String,
     pub email: Option<String>,
     pub name: Option<String>,
-    /// What was carried (the enrollment link's token as its hash).
-    pub login: Option<Uuid>,
-    pub enrollment: Option<Vec<u8>>,
+    /// Its `preferred_username`, if it said one.
+    pub user_name: Option<String>,
+    /// Its groups, from the provider's group claim.
+    pub groups: Vec<String>,
 }
 
 /// Why a sign-in at a provider didn't work, for the person to read.
@@ -227,7 +196,7 @@ pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str
     let row = client
         .query_opt_cached(
             "DELETE FROM oidc_flows WHERE state_hash = $1 AND expires_at > now()
-             RETURNING provider, nonce, verifier, purpose, login_id, enrollment",
+             RETURNING provider, nonce, verifier",
             &[&store::hash(state)],
         )
         .await?;
@@ -239,11 +208,6 @@ pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str
         return Ok(failed("that sign-in provider is no longer configured"));
     };
     let (nonce, verifier): (String, String) = (row.get(1), row.get(2));
-    // (A sign-in again as the operator account, which there's none of
-    // now, started before an upgrade, is none of these.)
-    let Some(purpose) = Purpose::of(row.get(3)) else {
-        return Ok(failed("this sign-in is of a kind there's no more of; sign in again"));
-    };
     let found = discovery(&provider).await?;
     let token = match redeem(&provider, &found, redirect_uri, code, &verifier).await? {
         Ok(token) => token,
@@ -259,15 +223,23 @@ pub async fn finish(client: &Object, redirect_uri: &str, state: &str, code: &str
     };
     let email = text("email").filter(|_| claims.get("email_verified").and_then(Value::as_bool) != Some(false));
     let name = text("name").or_else(|| text("preferred_username"));
-    Ok(Ok(Finished {
-        provider,
-        purpose,
-        subject,
-        email,
-        name,
-        login: row.get(4),
-        enrollment: row.get(5),
-    }))
+    let groups = groups_of(claims.get(&provider.group_claim));
+    let user_name = text("preferred_username").filter(|u| !u.is_empty());
+    Ok(Ok(Finished { provider, subject, email, name, user_name, groups }))
+}
+
+/// The groups a group claim lists: an array of names (others than strings
+/// left out), or one name.
+fn groups_of(claim: Option<&Value>) -> Vec<String> {
+    let mut groups: Vec<String> = match claim {
+        Some(Value::Array(names)) => names.iter().filter_map(Value::as_str).map(str::to_owned).collect(),
+        Some(Value::String(name)) => vec![name.clone()],
+        _ => Vec::new(),
+    };
+    groups.retain(|g| !g.is_empty());
+    groups.sort();
+    groups.dedup();
+    groups
 }
 
 /// Exchanges `code` at the token endpoint: the ID token.
@@ -332,87 +304,6 @@ async fn verify(provider: &Provider, found: &Discovery, token: &str, nonce: &str
     })
 }
 
-// ─── Identities at providers ─────────────────────────────────────────────────
-
-/// The login an identity at a provider signs in, if it's linked to one; its
-/// use is noted.
-pub async fn login_of(client: &Object, provider: &str, subject: &str, email: Option<&str>) -> anyhow::Result<Option<Uuid>> {
-    let row = client
-        .query_opt_cached(
-            "UPDATE login_oidc SET last_used_at = now(), email = coalesce($3, email)
-             WHERE provider = $1 AND subject = $2 RETURNING login_id",
-            &[&provider, &subject, &email],
-        )
-        .await?;
-    Ok(row.map(|r| r.get(0)))
-}
-
-/// Links an identity at a provider to `login` (T35).
-pub async fn link(client: &Object, login: Uuid, provider: &str, subject: &str, email: Option<&str>) -> anyhow::Result<()> {
-    let status = client
-        .query_one_cached("SELECT pg_temp.cairn_link_oidc($1, $2, $3, $4)", &[&login, &provider, &subject, &email])
-        .await?;
-    match status.get::<_, &str>(0) {
-        "linked" => Ok(()),
-        "no_such_login" => Err(Invalid("sign in again".into()).into()),
-        "taken" => Err(Invalid("that identity signs in another login already".into()).into()),
-        status => unreachable!("cairn_link_oidc: unknown status {status}"),
-    }
-}
-
-/// A new login, named `name`, signing in with an identity at a provider, for
-/// enrollment link `enrollment` (its hash) (T36): its ID, and the identity's
-/// account.
-pub async fn new_login(
-    client: &Object,
-    name: &str,
-    enrollment: &[u8],
-    provider: &str,
-    subject: &str,
-    email: Option<&str>,
-) -> anyhow::Result<(Uuid, String)> {
-    let login = Uuid::new_v4();
-    let row = client
-        .query_one_cached(
-            "SELECT * FROM pg_temp.cairn_new_oidc_login($1, $2, $3, $4, $5, $6)",
-            &[&login, &name, &enrollment, &provider, &subject, &email],
-        )
-        .await?;
-    match row.get::<_, &str>(0) {
-        "created" => Ok((login, row.get(1))),
-        "no_enrollment" => Err(Invalid("this enrollment link has been used, or has expired".into()).into()),
-        "taken" => Err(Invalid(
-            "that identity signs in a login already: sign in with it, then open the link again".into(),
-        )
-        .into()),
-        "account_taken" => unreachable!("a new login has no identities"),
-        status => unreachable!("cairn_new_oidc_login: unknown status {status}"),
-    }
-}
-
-/// Unlinks a login's identity at `provider` (T37).
-pub async fn unlink(client: &Object, login: Uuid, provider: &str) -> anyhow::Result<()> {
-    let status = client.query_one_cached("SELECT pg_temp.cairn_unlink_oidc($1, $2)", &[&login, &provider]).await?;
-    match status.get::<_, &str>(0) {
-        "unlinked" => Ok(()),
-        "none" => Err(Invalid("that provider isn't linked".into()).into()),
-        "last" => Err(Invalid("it's your last way to sign in: add a passkey or another provider first".into()).into()),
-        status => unreachable!("cairn_unlink_oidc: unknown status {status}"),
-    }
-}
-
-/// A login's identities at providers: (provider, its label, e-mail).
-pub async fn linked(client: &Object, login: Uuid) -> anyhow::Result<Vec<(String, String, Option<String>)>> {
-    let rows = client
-        .query_cached(
-            "SELECT o.provider, p.label, o.email FROM login_oidc o JOIN oidc_providers p ON p.name = o.provider
-             WHERE o.login_id = $1 ORDER BY o.provider",
-            &[&login],
-        )
-        .await?;
-    Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
-}
-
 /// Sets provider `provider`, after checking it can be used (its discovery
 /// document and keys).
 pub async fn set_provider(client: &Object, provider: &Provider) -> anyhow::Result<()> {
@@ -428,14 +319,18 @@ pub async fn set_provider(client: &Object, provider: &Provider) -> anyhow::Resul
     if !provider.scopes.split_whitespace().any(|s| s == "openid") {
         return Err(Invalid("the scopes must include openid".into()).into());
     }
+    if provider.group_claim.trim().is_empty() || provider.group_claim.len() > 256 {
+        return Err(Invalid("the group claim is the name of a claim (1 to 256 characters)".into()).into());
+    }
     check_provider(provider)
         .await
         .map_err(|e| Invalid(format!("{} can't be used: {e:#}", provider.issuer)))?;
     client
         .execute_cached(
-            "INSERT INTO oidc_providers (name, label, issuer, client_id, client_secret, scopes)
-             VALUES ($1, $2, $3, $4, $5, $6)
-             ON CONFLICT (name) DO UPDATE SET label = $2, issuer = $3, client_id = $4, client_secret = $5, scopes = $6",
+            "INSERT INTO oidc_providers (name, label, issuer, client_id, client_secret, scopes, group_claim)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             ON CONFLICT (name) DO UPDATE SET label = $2, issuer = $3, client_id = $4, client_secret = $5, scopes = $6,
+                                              group_claim = $7",
             &[
                 &provider.name,
                 &provider.label.trim(),
@@ -443,6 +338,7 @@ pub async fn set_provider(client: &Object, provider: &Provider) -> anyhow::Resul
                 &provider.client_id,
                 &provider.client_secret,
                 &provider.scopes,
+                &provider.group_claim.trim(),
             ],
         )
         .await?;
@@ -450,7 +346,8 @@ pub async fn set_provider(client: &Object, provider: &Provider) -> anyhow::Resul
     Ok(())
 }
 
-/// Removes provider `name`, and every login's identity at it.
+/// Removes provider `name`: its directory users, their sessions, and the
+/// assignments to them and its groups go too.
 pub async fn remove_provider(client: &Object, name: &str) -> anyhow::Result<()> {
     let removed = client.execute_cached("DELETE FROM oidc_providers WHERE name = $1", &[&name]).await?;
     if removed == 0 {
@@ -477,7 +374,8 @@ pub struct OidcArgs {
 
 #[derive(clap::Subcommand, Debug, serde::Serialize, serde::Deserialize)]
 enum OidcCommand {
-    /// List the providers people may sign in to the console at.
+    /// List the identity sources: the providers people sign in to the
+    /// console at, as directory users.
     List,
     /// Add or change a provider, after checking its discovery document.
     /// Register `<console URL>/api/oidc/callback` as its redirect URI.
@@ -498,8 +396,12 @@ enum OidcCommand {
         label: Option<String>,
         #[arg(long, default_value = "openid email profile")]
         scopes: String,
+        /// The ID token's claim that lists a person's groups.
+        #[arg(long, default_value = "groups")]
+        group_claim: String,
     },
-    /// Remove a provider: the identities at it no longer sign anyone in.
+    /// Remove a provider: its directory users, and the assignments to them
+    /// and its groups, go too.
     Remove { name: String },
 }
 
@@ -511,12 +413,21 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: OidcArgs, out: &mut cra
         OidcCommand::List => {
             for p in providers(&client).await? {
                 let kind = if p.client_secret.is_some() { "confidential" } else { "public" };
-                outln!(out, "{} ({})\n  issuer {}\n  client {} ({kind}), scopes {}", p.name, p.label, p.issuer, p.client_id, p.scopes);
+                outln!(
+                    out,
+                    "{} ({})\n  issuer {}\n  client {} ({kind}), scopes {}, groups in {}",
+                    p.name,
+                    p.label,
+                    p.issuer,
+                    p.client_id,
+                    p.scopes,
+                    p.group_claim
+                );
             }
         }
-        OidcCommand::Set { name, issuer, client_id, client_secret, label, scopes } => {
+        OidcCommand::Set { name, issuer, client_id, client_secret, label, scopes, group_claim } => {
             let label = label.unwrap_or_else(|| name.clone());
-            let provider = Provider { name, label, issuer, client_id, client_secret, scopes };
+            let provider = Provider { name, label, issuer, client_id, client_secret, scopes, group_claim };
             set_provider(&client, &provider).await?;
         }
         OidcCommand::Remove { name } => remove_provider(&client, &name).await?,

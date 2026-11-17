@@ -45,6 +45,7 @@ mod grants;
 mod groups;
 mod iam;
 mod iam_oidc;
+mod identity_center;
 mod inventory;
 mod kms;
 mod managed;
@@ -65,6 +66,7 @@ mod scrub;
 mod sessions;
 mod settings;
 mod sns;
+mod sso;
 mod shards;
 mod store;
 mod templates;
@@ -489,6 +491,9 @@ async fn maintain(app: Arc<App>) {
                 Ok(client) => {
                     if let Err(e) = console::store::reap(&client).await {
                         eprintln!("console: reaping expired sessions: {e:#}");
+                    }
+                    if let Err(e) = identity_center::reap(&client).await {
+                        eprintln!("identity center: reaping old requests failed: {e:#}");
                     }
                     if let Err(e) = console::oidc::reap(&client).await {
                         eprintln!("console: reaping expired sign-ins: {e:#}");

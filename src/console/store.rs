@@ -151,9 +151,7 @@ pub struct ConsoleAccess {
     pub enrolled: bool,
     /// How many passkeys its login has.
     pub passkeys: i64,
-    /// The OIDC providers (their labels) its login signs in at.
-    pub providers: Vec<String>,
-    /// When its login last signed in (by a passkey or a provider).
+    /// When its login last signed in.
     pub last_sign_in: Option<f64>,
     /// Whether an enrollment link for it is out, and works still.
     pub link_pending: bool,
@@ -166,11 +164,7 @@ pub async fn console_access(client: &Object, account: &str) -> anyhow::Result<st
         .query_cached(
             "SELECT r.id, li.login_id IS NOT NULL,
                     (SELECT count(*) FROM passkeys p WHERE p.login_id = li.login_id),
-                    ARRAY(SELECT op.label FROM login_oidc o JOIN oidc_providers op ON op.name = o.provider
-                          WHERE o.login_id = li.login_id ORDER BY op.label),
-                    extract(epoch FROM greatest(
-                        (SELECT max(p.last_used_at) FROM passkeys p WHERE p.login_id = li.login_id),
-                        (SELECT max(o.last_used_at) FROM login_oidc o WHERE o.login_id = li.login_id)))::float8,
+                    extract(epoch FROM (SELECT max(p.last_used_at) FROM passkeys p WHERE p.login_id = li.login_id))::float8,
                     EXISTS (SELECT 1 FROM console_enrollments e WHERE e.user_id = r.id AND e.expires_at > now())
              FROM users r LEFT JOIN login_identities li ON li.user_id = r.id
              WHERE r.account_id = $1
@@ -185,9 +179,8 @@ pub async fn console_access(client: &Object, account: &str) -> anyhow::Result<st
             let access = ConsoleAccess {
                 enrolled: row.get(1),
                 passkeys: row.get(2),
-                providers: row.get(3),
-                last_sign_in: row.get(4),
-                link_pending: row.get(5),
+                last_sign_in: row.get(3),
+                link_pending: row.get(4),
             };
             (row.get(0), access)
         })
@@ -388,28 +381,15 @@ pub async fn identities(client: &Object, login: Uuid) -> anyhow::Result<Vec<Iden
     Ok(rows.iter().map(|r| identity_of(r, 0)).collect())
 }
 
-/// How a session was signed in.
-#[derive(Clone, Copy, Debug)]
-pub enum Way<'a> {
-    /// With this passkey (its credential ID).
-    Passkey(&'a [u8]),
-    /// At this OIDC provider (its name).
-    Oidc(&'a str),
-}
-
-/// A session's token, for `login`, signed in `way`, acting as its identity
-/// in `account` (by ID).
-pub async fn create_session(client: &Object, login: Uuid, account: &str, way: Way<'_>) -> anyhow::Result<String> {
+/// A session's token, for `login`, signed in with passkey `credential`
+/// (its ID), acting as its identity in `account` (by ID).
+pub async fn create_session(client: &Object, login: Uuid, account: &str, credential: &[u8]) -> anyhow::Result<String> {
     let (token, hash) = token()?;
-    let (credential, provider) = match way {
-        Way::Passkey(credential) => (Some(credential), None),
-        Way::Oidc(provider) => (None, Some(provider)),
-    };
     client
         .execute_cached(
-            "INSERT INTO console_sessions (token_hash, login_id, account_id, credential_id, oidc_provider, expires_at)
-             VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
-            &[&hash, &login, &account, &credential, &provider, &secs(SESSION_TTL)],
+            "INSERT INTO console_sessions (token_hash, login_id, account_id, credential_id, expires_at)
+             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+            &[&hash, &login, &account, &credential, &secs(SESSION_TTL)],
         )
         .await?;
     Ok(token)
@@ -423,13 +403,11 @@ pub struct Session {
     pub login_name: String,
     /// Who it acts as.
     pub identity: Identity,
-    /// The passkey it was signed in with, if it was.
-    pub credential_id: Option<Vec<u8>>,
-    /// The OIDC provider it was signed in at, if it was.
-    pub oidc_provider: Option<String>,
-    /// Seconds since it was signed in with its passkey (`None`: it was
-    /// signed in at a provider): `aws:MultiFactorAuthAge` (see `actor`).
-    pub mfa_age: Option<i64>,
+    /// The passkey it was signed in with.
+    pub credential_id: Vec<u8>,
+    /// Seconds since it was signed in with its passkey:
+    /// `aws:MultiFactorAuthAge` (see `actor`).
+    pub mfa_age: i64,
 }
 
 /// The session of `token`, while it lasts; it was used just now (noted at
@@ -440,7 +418,7 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
             &format!(
                 "SELECT {IDENTITY}, s.login_id, l.name, s.credential_id,
                         greatest(0, extract(epoch FROM now() - s.verified_at))::bigint,
-                        s.last_seen_at < now() - interval '1 minute', s.oidc_provider
+                        s.last_seen_at < now() - interval '1 minute'
                  FROM console_sessions s
                  JOIN logins l ON l.id = s.login_id
                  JOIN login_identities i ON i.login_id = s.login_id AND i.account_id = s.account_id
@@ -458,21 +436,111 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
             .execute_cached("UPDATE console_sessions SET last_seen_at = now() WHERE token_hash = $1", &[&hash(token)])
             .await?;
     }
-    let credential_id: Option<Vec<u8>> = row.get(at + 2);
     Ok(Some(Session {
         identity: identity_of(&row, 0),
         login: row.get(at),
         login_name: row.get(at + 1),
-        mfa_age: credential_id.is_some().then(|| row.get(at + 3)),
-        credential_id,
-        oidc_provider: row.get(at + 5),
+        credential_id: row.get(at + 2),
+        mfa_age: row.get(at + 3),
     }))
 }
 
-/// Ends the session of `token`, a login's or the root user's.
+/// Ends the session of `token`: a login's, the root user's, or a directory
+/// user's.
 pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {
-    client.execute_cached("DELETE FROM console_sessions WHERE token_hash = $1", &[&hash(token)]).await?;
-    client.execute_cached("DELETE FROM console_root_sessions WHERE token_hash = $1", &[&hash(token)]).await?;
+    for table in ["console_sessions", "console_root_sessions", "console_directory_sessions"] {
+        client.execute_cached(&format!("DELETE FROM {table} WHERE token_hash = $1"), &[&hash(token)]).await?;
+    }
+    Ok(())
+}
+
+// ─── Directory users ─────────────────────────────────────────────────────────
+
+/// A session of directory user `user` (see `identity_center`), in
+/// `account` (by ID), acting as permission set `permission_set` (`None`:
+/// until it picks one).
+pub async fn create_directory_session(client: &Object, account: &str, user: Uuid, permission_set: Option<Uuid>) -> anyhow::Result<String> {
+    let (token, hash) = token()?;
+    client
+        .execute_cached(
+            "INSERT INTO console_directory_sessions (token_hash, account_id, user_id, permission_set_id, expires_at)
+             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+            &[&hash, &account, &user, &permission_set, &secs(SESSION_TTL)],
+        )
+        .await?;
+    Ok(token)
+}
+
+/// A directory user's session.
+#[derive(Clone, Debug)]
+pub struct DirectorySession {
+    /// Its account's ID, and name.
+    pub account_id: String,
+    pub account: String,
+    /// The user (its ID in the identity store), its identity source (its
+    /// name and label) and its subject there, and what the user was when it
+    /// last signed in: its user name, name, e-mail and groups (their names).
+    pub user_id: Uuid,
+    pub provider: String,
+    pub provider_label: String,
+    pub subject: String,
+    pub user_name: String,
+    pub name: String,
+    pub email: Option<String>,
+    pub groups: Vec<String>,
+    /// The permission set it acts as, if it picked one.
+    pub permission_set: Option<Uuid>,
+    /// When it ends at the latest (seconds since the epoch).
+    pub expires_at: f64,
+}
+
+/// The directory user's session of `token`, while it lasts; it was used just
+/// now (noted at most once a minute).
+pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<Option<DirectorySession>> {
+    let row = client
+        .query_opt_cached(
+            "SELECT a.id, a.name, u.id, u.provider, p.label, u.subject, u.user_name, u.display_name, u.email,
+                    ARRAY(SELECT g.name FROM identity_group_members m JOIN identity_groups g ON g.id = m.group_id
+                          WHERE m.user_id = u.id ORDER BY g.name),
+                    s.permission_set_id, extract(epoch FROM s.expires_at)::float8, s.last_seen_at < now() - interval '1 minute'
+             FROM console_directory_sessions s JOIN accounts a ON a.id = s.account_id
+             JOIN identity_users u ON u.id = s.user_id
+             JOIN oidc_providers p ON p.name = u.provider
+             WHERE s.token_hash = $1 AND s.expires_at > now()
+               AND s.last_seen_at > now() - make_interval(secs => $2)",
+            &[&hash(token), &secs(SESSION_IDLE)],
+        )
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    if row.get::<_, bool>(12) {
+        client
+            .execute_cached("UPDATE console_directory_sessions SET last_seen_at = now() WHERE token_hash = $1", &[&hash(token)])
+            .await?;
+    }
+    Ok(Some(DirectorySession {
+        account_id: row.get(0),
+        account: row.get(1),
+        user_id: row.get(2),
+        provider: row.get(3),
+        provider_label: row.get(4),
+        subject: row.get(5),
+        user_name: row.get(6),
+        name: row.get(7),
+        email: row.get(8),
+        groups: row.get(9),
+        permission_set: row.get(10),
+        expires_at: row.get(11),
+    }))
+}
+
+/// Has the directory user's session of `token` act as `permission_set`.
+pub async fn choose_permission_set(client: &Object, token: &str, permission_set: Uuid) -> anyhow::Result<()> {
+    client
+        .execute_cached(
+            "UPDATE console_directory_sessions SET permission_set_id = $2 WHERE token_hash = $1",
+            &[&hash(token), &permission_set],
+        )
+        .await?;
     Ok(())
 }
 
@@ -625,6 +693,12 @@ pub async fn reap(client: &Object) -> anyhow::Result<u64> {
         .execute_cached(
             "DELETE FROM console_root_sessions WHERE expires_at <= now() OR last_seen_at <= now() - make_interval(secs => $1)",
             &[&secs(ROOT_SESSION_IDLE)],
+        )
+        .await?;
+    reaped += client
+        .execute_cached(
+            "DELETE FROM console_directory_sessions WHERE expires_at <= now() OR last_seen_at <= now() - make_interval(secs => $1)",
+            &[&secs(SESSION_IDLE)],
         )
         .await?;
     Ok(reaped)

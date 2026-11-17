@@ -32,6 +32,43 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/assignments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_assignments"];
+        put?: never;
+        /** Assigns a permission set to a directory user or group. */
+        post: operations["create_assignment"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/assignments/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Removes an assignment: the sessions it let in lose the permission set at
+         *     once.
+         */
+        delete: operations["delete_assignment"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/buckets": {
         parameters: {
             query?: never;
@@ -457,6 +494,78 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/directory-groups": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The identity store's groups. */
+        get: operations["list_directory_groups"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory-users": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** The directory users that have signed in, most recent first. */
+        get: operations["list_directory_users"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/credentials": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Hands a directory user credentials of its permission set's role, for its
+         *     session duration, as Identity Center's access portal does. They work
+         *     until they expire, whatever becomes of the console's session.
+         */
+        post: operations["directory_credentials"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory/permission-set": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Has a directory user's session act as one of its permission sets. */
+        post: operations["choose_permission_set"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/enroll": {
         parameters: {
             query?: never;
@@ -861,7 +970,10 @@ export interface paths {
         /** Sets an OIDC provider, after checking its discovery document and keys. */
         put: operations["set_oidc_provider"];
         post?: never;
-        /** Removes an OIDC provider: the identities at it no longer sign anyone in. */
+        /**
+         * Removes an OIDC provider: its directory users, their sessions, and the
+         *     assignments to them and its groups go too.
+         */
         delete: operations["delete_oidc_provider"];
         options?: never;
         head?: never;
@@ -877,7 +989,9 @@ export interface paths {
         };
         /**
          * Where providers send the browser back to (register it with them): ends
-         *     the sign-in, and goes on to the console.
+         *     the sign-in, as the directory user the provider vouches for, and goes on
+         *     to the console, replacing the browser's session if it had one. One with
+         *     no permission set assigned to it, or its groups, doesn't get in.
          */
         get: operations["oidc_callback"];
         put?: never;
@@ -905,26 +1019,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/oidc/{provider}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        /**
-         * Unlinks the signed-in login's identity at a provider (not its last way
-         *     in).
-         */
-        delete: operations["oidc_unlink"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/oidc/{provider}/start": {
         parameters: {
             query?: never;
@@ -934,7 +1028,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Starts a sign-in at a provider. */
+        /** Starts a sign-in at an identity source, as a directory user. */
         post: operations["oidc_start"];
         delete?: never;
         options?: never;
@@ -991,6 +1085,99 @@ export interface paths {
          *     the sessions signed in with it.
          */
         delete: operations["delete_passkey"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permission-sets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_permission_sets"];
+        put?: never;
+        /** Makes a permission set, and its role. */
+        post: operations["create_permission_set"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permission-sets/{name}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Changes a permission set's description and session duration. */
+        put: operations["update_permission_set"];
+        post?: never;
+        /** Deletes a permission set: its assignments and its role go too. */
+        delete: operations["delete_permission_set"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permission-sets/{name}/attached": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Attaches a managed policy (AWS's, or the account's) to a permission set. */
+        post: operations["attach_managed_policy"];
+        /** Detaches a managed policy from a permission set. */
+        delete: operations["detach_managed_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permission-sets/{name}/boundary": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Sets a permission set's permissions boundary: a managed policy (AWS's,
+         *     or the account's).
+         */
+        put: operations["put_permission_set_boundary"];
+        post?: never;
+        /** Removes a permission set's permissions boundary. */
+        delete: operations["delete_permission_set_boundary"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permission-sets/{name}/inline-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A permission set's inline policy. */
+        get: operations["get_inline_policy"];
+        /** Sets a permission set's inline policy. */
+        put: operations["put_inline_policy"];
+        post?: never;
+        /** Removes a permission set's inline policy. */
+        delete: operations["delete_inline_policy"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1688,6 +1875,23 @@ export interface components {
             /** @description The login the passkey is of, as the authenticator says. */
             user_handle?: string | null;
         };
+        /** @description A permission set's assignment to a directory user or group. */
+        AssignmentSummary: {
+            /** Format: double */
+            created_at: number;
+            /** @description A user's e-mail. */
+            email?: string | null;
+            id: string;
+            permission_set: string;
+            /** @description The user's or group's ID in the identity store. */
+            principal_id: string;
+            /** @description A user's user name, or a group's name. */
+            principal_name: string;
+            /** @description `USER` or `GROUP`. */
+            principal_type: string;
+            /** @description Its identity source. */
+            provider: string;
+        };
         AttachedPolicy: {
             arn: string;
             name: string;
@@ -1879,6 +2083,10 @@ export interface components {
             challenge_id: string;
             options: Record<string, never>;
         };
+        ChosenPermissionSet: {
+            /** @description One of the session's permission sets, by name. */
+            name: string;
+        };
         Cluster: {
             nodes: components["schemas"]["ClusterNode"][];
             /** Format: double */
@@ -1945,8 +2153,6 @@ export interface components {
             link_pending: boolean;
             /** Format: int64 */
             passkeys: number;
-            /** @description The OIDC providers (their labels) it signs in at. */
-            providers: string[];
         };
         /** @description Counts of requests, by how they ended, and of what they moved. */
         Counts: {
@@ -2029,9 +2235,67 @@ export interface components {
             /** @description Its tags. */
             tags?: components["schemas"]["Tag"][];
         };
+        /** @description Temporary credentials of a session's role, for the CLI and SDKs. */
+        Credentials: {
+            access_key_id: string;
+            /**
+             * Format: int64
+             * @description When they expire (seconds since the epoch).
+             */
+            expiration: number;
+            secret_access_key: string;
+            session_token: string;
+        };
         DefaultVersion: {
             /** Format: int32 */
             version: number;
+        };
+        /** @description A group, as its users' group claims named it. */
+        DirectoryGroupSummary: {
+            /** @description Its ID in the identity store. */
+            id: string;
+            /**
+             * Format: int64
+             * @description How many users it had, as their last sign-ins said.
+             */
+            members: number;
+            name: string;
+            provider: string;
+        };
+        /** @description A directory user, signed in at an identity source. */
+        DirectoryMe: {
+            email?: string | null;
+            /** @description Its groups, as the source's group claim said when it signed in. */
+            groups: string[];
+            /** @description The permission set it acts as, if it picked one. */
+            permission_set?: string | null;
+            /** @description The permission sets assigned to it or its groups, to pick from. */
+            permission_sets: components["schemas"]["PermissionSetChoice"][];
+            /** @description The identity source's name and label. */
+            provider: string;
+            provider_label: string;
+            /** @description Its subject there (`sub`), which assignments name it by. */
+            subject: string;
+            /** @description Its ID in the identity store, and its user name there. */
+            user_id: string;
+            user_name: string;
+        };
+        /** @description A directory user, as it last signed in. */
+        DirectoryUserSummary: {
+            display_name: string;
+            email?: string | null;
+            /** Format: double */
+            first_signed_in: number;
+            /** @description Its groups, by name, as its last sign-in said. */
+            groups: string[];
+            /** @description Its ID in the identity store. */
+            id: string;
+            /** Format: double */
+            last_signed_in: number;
+            /** @description Its identity source, and its subject there. */
+            provider: string;
+            subject: string;
+            user_name: string;
         };
         Disk: {
             /**
@@ -2536,11 +2800,6 @@ export interface components {
             id?: string;
             noncurrent_expiration?: components["schemas"]["LifecycleNoncurrentExpiration"] | null;
         };
-        LinkedProvider: {
-            email?: string | null;
-            label: string;
-            provider: string;
-        };
         /** @description A page of a bucket's keys, rolled up at `/` like a directory listing. */
         Listing: {
             entries: components["schemas"]["Entry"][];
@@ -2614,7 +2873,8 @@ export interface components {
         };
         /**
          * @description The signed-in login: who it acts as, its passkeys. Or the account's
-         *     root user (`root`), which has no login: no passkeys or providers.
+         *     root user (`root`), or a directory user (`directory`), which have no
+         *     login: no passkeys.
          */
         Me: {
             /**
@@ -2622,6 +2882,7 @@ export interface components {
              *     operator, and the console shows it the cluster's pages.
              */
             cluster: boolean;
+            directory?: components["schemas"]["DirectoryMe"] | null;
             /**
              * Format: double
              * @description When the root user's session ends at the latest (seconds since the
@@ -2630,23 +2891,16 @@ export interface components {
             expires_at?: number | null;
             /** @description Who the session acts as. */
             identity: components["schemas"]["IdentitySummary"];
-            /**
-             * @description Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`;
-             *     else at an OIDC provider).
-             */
+            /** @description Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`). */
             mfa: boolean;
-            /** @description The login's name (`root` for the root user). */
+            /** @description The login's name (`root` for the root user; a directory user's own). */
             name: string;
-            /** @description Its identities at OIDC providers, which sign it in too. */
-            oidc: components["schemas"]["LinkedProvider"][];
             passkeys: components["schemas"]["PasskeySummary"][];
             /**
              * @description Whether the session is the account's root user's, which no identity
              *     policy restricts (only resource policies' denies do).
              */
             root: boolean;
-            /** @description The OIDC provider this session was signed in at, if it was. */
-            signed_in_at?: string | null;
         };
         /** @description A node's metrics. Times are seconds since the Unix epoch. */
         MetricsReport: {
@@ -2659,6 +2913,13 @@ export interface components {
             requests: components["schemas"]["RequestsReport"];
             /** Format: double */
             started_at: number;
+        };
+        NewAssignment: {
+            permission_set: string;
+            /** @description The user's or group's ID in the identity store. */
+            principal_id: string;
+            /** @description `USER` or `GROUP`. */
+            principal_type: string;
         };
         NewBucket: {
             name: string;
@@ -2697,6 +2958,11 @@ export interface components {
              */
             client_secret?: string | null;
             /**
+             * @description The ID token's claim that lists a person's groups; `groups` if not
+             *     given.
+             */
+            group_claim?: string | null;
+            /**
              * @description The issuer's URL: its discovery document is at
              *     `<issuer>/.well-known/openid-configuration`.
              */
@@ -2711,6 +2977,15 @@ export interface components {
             credential: components["schemas"]["Registration"];
             /** @description What to call it, e.g. "Laptop". */
             name: string;
+        };
+        NewPermissionSet: {
+            description?: string;
+            name: string;
+            /**
+             * Format: int32
+             * @description In seconds, from 3600 to 43200; 3600 if not given.
+             */
+            session_duration?: number | null;
         };
         NewPolicy: {
             description?: string;
@@ -2874,22 +3149,25 @@ export interface components {
             noncurrent_bytes: number;
         };
         /**
-         * @description An OpenID Connect provider people may sign in to the console at (see
-         *     `console::oidc`); never its client secret.
+         * @description An OpenID Connect provider people sign in to the console at, as
+         *     directory users: an identity source (see `console::oidc`,
+         *     `identity_center`); never its client secret.
          */
         OidcProvider: {
             client_id: string;
+            /** @description The ID token's claim that lists a person's groups. */
+            group_claim: string;
             /** @description Whether it has a client secret (else it's a public client). */
             has_secret: boolean;
             issuer: string;
             label: string;
-            /**
-             * Format: int64
-             * @description Logins it signs in.
-             */
-            logins: number;
             name: string;
             scopes: string;
+            /**
+             * Format: int64
+             * @description The directory users that have signed in at it.
+             */
+            users: number;
         };
         /** @description The providers, and the redirect URI to register with them. */
         OidcProviders: {
@@ -2900,11 +3178,6 @@ export interface components {
         OidcRedirect: {
             /** @description Where to send the browser: the provider's sign-in. */
             url: string;
-        };
-        OidcStart: {
-            /** @description `login`, `enroll` (with `token`), or `link` (signed in). */
-            purpose: string;
-            token?: string | null;
         };
         OpCounts: components["schemas"]["Counts"] & {
             op: string;
@@ -2978,6 +3251,54 @@ export interface components {
             /** Format: double */
             last_used_at?: number | null;
             name: string;
+        };
+        PermissionSetChange: {
+            description: string;
+            /**
+             * Format: int32
+             * @description In seconds, from 3600 to 43200.
+             */
+            session_duration: number;
+        };
+        /** @description A permission set a directory user may use. */
+        PermissionSetChoice: {
+            description: string;
+            name: string;
+            /**
+             * Format: int32
+             * @description How long its sessions (and credentials) last, in seconds.
+             */
+            session_duration: number;
+        };
+        /** @description A permission set: the policies directory users act with, as its role. */
+        PermissionSetSummary: {
+            arn: string;
+            /**
+             * Format: int64
+             * @description Its assignments.
+             */
+            assignments: number;
+            /**
+             * @description Its managed policies: AWS's (Cairn's), and the account's (customer
+             *     managed).
+             */
+            attached: components["schemas"]["AttachedPolicy"][];
+            /** @description Its permissions boundary's ARN, if it has one. */
+            boundary?: string | null;
+            /** Format: double */
+            created_at: number;
+            description: string;
+            /** @description Whether it has an inline policy. */
+            inline_policy: boolean;
+            name: string;
+            role_arn: string;
+            /** @description The role it's provisioned as (which IAM can't change). */
+            role_name: string;
+            /**
+             * Format: int32
+             * @description How long its sessions (and credentials) last, in seconds.
+             */
+            session_duration: number;
         };
         PolicyArn: {
             arn: string;
@@ -3556,6 +3877,115 @@ export interface operations {
             query?: never;
             header?: never;
             path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_assignments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AssignmentSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_assignment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewAssignment"];
+            };
+        };
+        responses: {
+            /** @description Assigned */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_assignment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
             cookie?: never;
         };
         requestBody?: never;
@@ -4927,6 +5357,150 @@ export interface operations {
             };
         };
     };
+    list_directory_groups: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryGroupSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_directory_users: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DirectoryUserSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    directory_credentials: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Credentials"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    choose_permission_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ChosenPermissionSet"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     enroll: {
         parameters: {
             query?: never;
@@ -6115,42 +6689,6 @@ export interface operations {
             };
         };
     };
-    oidc_unlink: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                provider: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Unlinked */
-            204: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
     oidc_start: {
         parameters: {
             query?: never;
@@ -6160,11 +6698,7 @@ export interface operations {
             };
             cookie?: never;
         };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["OidcStart"];
-            };
-        };
+        requestBody?: never;
         responses: {
             200: {
                 headers: {
@@ -6311,6 +6845,422 @@ export interface operations {
             header?: never;
             path: {
                 id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    list_permission_sets: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PermissionSetSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_permission_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewPermissionSet"];
+            };
+        };
+        responses: {
+            /** @description Made */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_permission_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PermissionSetChange"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_permission_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    attach_managed_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyArn"];
+            };
+        };
+        responses: {
+            /** @description Attached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    detach_managed_policy: {
+        parameters: {
+            query: {
+                arn: string;
+            };
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Detached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_permission_set_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyArn"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_permission_set_boundary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_inline_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PolicyDocument"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    put_inline_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["PolicyDocument"];
+            };
+        };
+        responses: {
+            /** @description Set */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_inline_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
             };
             cookie?: never;
         };

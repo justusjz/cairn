@@ -1,8 +1,9 @@
-// The console (see `src/console/`): signing in, with a passkey or at an
-// OIDC provider, a first passkey through an enrollment link, one's own
-// passkeys, and the pages of what the signed-in identity manages: the
-// account's buckets, objects, users, roles and policies, and, for its operators
-// (whose policies allow `cairn:` actions), the cluster.
+// The console (see `src/console/`): signing in, with a passkey (an IAM
+// user), or at an identity source (a directory user, who picks a permission
+// set), a first passkey through an enrollment link, one's own passkeys, and
+// the pages of what the signed-in identity manages: the account's buckets,
+// objects, users, roles and policies, and, for its operators (whose policies
+// allow `cairn:` actions), the cluster.
 
 import { A, Navigate, Route, Router, type RouteSectionProps, useNavigate } from "@solidjs/router";
 import { For, Show, createEffect, createResource, createRoot, createSignal, onCleanup } from "solid-js";
@@ -19,6 +20,7 @@ import Notifications from "./pages/Notifications";
 import Overview from "./pages/Overview";
 import Policies, { PolicyPage } from "./pages/Policies";
 import Groups, { GroupPage } from "./pages/Groups";
+import IdentityCenter, { PermissionSetPage } from "./pages/IdentityCenter";
 import Roles, { RolePage } from "./pages/Roles";
 import Storage from "./pages/Storage";
 import Topics, { TopicPage } from "./pages/Topics";
@@ -26,7 +28,7 @@ import SignIn from "./pages/SignIn";
 import Users, { UserPage } from "./pages/Users";
 import { userHref } from "./components/Iam";
 import "./styles.css";
-import { ApiError, type Identity, type Me, type Passkey, api } from "./session";
+import { ApiError, type Credentials, type Me, type Passkey, api } from "./session";
 import { authenticate, deviceName, explain, register, supported } from "./webauthn";
 
 /** Who's signed in: `null` if no one, undefined while asking. */
@@ -135,6 +137,7 @@ const ACCOUNT_NAV: [string, string][] = [
   ["/groups", "Groups"],
   ["/roles", "Roles"],
   ["/policies", "Policies"],
+  ["/identity-center", "Identity Center"],
 ];
 
 /** What the cluster's operators see first: the cluster. */
@@ -148,9 +151,10 @@ const CLUSTER_NAV: [string, string][] = [
 /** ... and last: how people sign in. */
 const OPERATOR_NAV: [string, string][] = [["/sign-in", "Sign-in"]];
 
-/** The user's name. */
-function label(i: Identity): string {
-  return i.user;
+/** Who the session acts as: the user's name, or a directory user's
+ * permission set (or its own name, until it picks one). */
+function label(m: Me): string {
+  return m.directory ? (m.directory.permission_set ?? m.name) : m.identity.user;
 }
 
 /** The person signed in: who the session acts as, their own sign-in
@@ -181,7 +185,7 @@ function UserMenu(props: { me: Me; logout: () => void }) {
         <span class="avatar" aria-hidden="true">
           {props.me.name.slice(0, 1).toUpperCase()}
         </span>
-        <span class="mono">{label(props.me.identity)}</span>
+        <span class="mono">{label(props.me)}</span>
         <span aria-hidden="true">▾</span>
       </button>
       <Show when={open()}>
@@ -191,7 +195,7 @@ function UserMenu(props: { me: Me; logout: () => void }) {
           </div>
           <hr />
           <A role="menuitem" class="menu-item" href="/account" onClick={() => setOpen(false)}>
-            {props.me.root ? "Who you are" : "Passkeys and sign-in"}
+            {props.me.root ? "Who you are" : props.me.directory ? "Permission sets and credentials" : "Passkeys and sign-in"}
           </A>
           <button role="menuitem" class="menu-item" onClick={props.logout}>
             Sign out
@@ -215,12 +219,12 @@ function SignedIn(props: { children: (me: Me) => import("solid-js").JSX.Element 
   );
 }
 
-/** The OIDC providers to continue with, for `purpose`. */
-function ProviderButtons(props: { purpose: "login" | "enroll"; token?: string; onError: (e: string) => void }) {
+/** The identity sources to sign in at, as a directory user. */
+function ProviderButtons(props: { onError: (e: string) => void }) {
   const [providers] = createResource(() => api.oidcProviders().catch(() => []));
   const go = async (name: string) => {
     try {
-      const { url } = await api.oidcStart(name, props.purpose, { token: props.token });
+      const { url } = await api.oidcStart(name);
       location.assign(url);
     } catch (e) {
       props.onError(explain(e));
@@ -232,7 +236,7 @@ function ProviderButtons(props: { purpose: "login" | "enroll"; token?: string; o
         <For each={providers()}>
           {(p) => (
             <button type="button" onClick={() => go(p.name)}>
-              Continue with {p.label}
+              Sign in with {p.label}
             </button>
           )}
         </For>
@@ -274,17 +278,18 @@ function Login() {
     setBusy(false);
   };
   const [setup] = createResource(() => api.setup().catch(() => ({ enrolled: true })));
+  const [providers] = createResource(() => api.oidcProviders().catch(() => []));
   return (
     <div class="signin">
       <Panel title="Sign in to Cairn">
         <Show when={supported()} fallback={<NoPasskeys />}>
-          <Show when={setup()?.enrolled === false} fallback={
+          <Show when={setup()?.enrolled === false && !providers()?.length} fallback={
             <>
               <p class="subtle">Sign in with a passkey: your device asks for your fingerprint, face, PIN or security key.</p>
               <button class="primary" disabled={busy()} onClick={signIn}>
                 Sign in with a passkey
               </button>
-              <ProviderButtons purpose="login" onError={setError} />
+              <ProviderButtons onError={setError} />
               <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
               <p class="subtle small">
                 New here? Ask an administrator for an enrollment link.
@@ -384,7 +389,6 @@ function Enroll() {
                 <button class="primary" type="submit" disabled={busy()}>
                   Make a passkey
                 </button>
-                <ProviderButtons purpose="enroll" token={token} onError={setError} />
                 <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
                 <p class="subtle small">This link works once. If it doesn't anymore, ask for a new one.</p>
               </form>
@@ -402,11 +406,14 @@ function Guarded(page: () => import("solid-js").JSX.Element) {
 }
 
 /** The start: the cluster's overview to its operators, the buckets to
- * anyone else. */
+ * anyone else, and a directory user that hasn't picked a permission set
+ * yet its permission sets. */
 function Start() {
   return (
-    <Show when={me()?.cluster} fallback={<Navigate href="/buckets" />}>
-      <Overview />
+    <Show when={!(me()?.directory && !me()?.directory?.permission_set)} fallback={<Navigate href="/account" />}>
+      <Show when={me()?.cluster} fallback={<Navigate href="/buckets" />}>
+        <Overview />
+      </Show>
     </Show>
   );
 }
@@ -416,34 +423,167 @@ function Home() {
     <SignedIn>
       {(m) => (
         <Show when={!m.root} fallback={<RootHome me={m} />}>
-          <div class="page-head">
-            <h1>Your sign-in</h1>
-            <span class="subtle small">login {m.name}</span>
-          </div>
-          <Passkeys passkeys={m.passkeys} others={m.oidc.length} />
-          <Providers me={m} />
-          <Panel title="Who you are">
-            <Table count={1} columns={["As", "ARN"]}>
-              <tr>
-                <td>
-                  <A class="mono" href={userHref(m.identity.user)}>
-                    {m.identity.user}
-                  </A>
-                </td>
-                <td class="mono small">{m.identity.arn}</td>
-              </tr>
-            </Table>
-            <p class="subtle small">
-              Policies name you by the ARN: what you may do here is what your policies allow, and what buckets'
-              policies don't deny you (your user's page shows its policies). The cluster's pages show if your
-              policies allow you its actions (<span class="mono">cairn:*</span>). Signed in with a passkey, your session
-              counts as multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span>); at a provider, it
-              doesn't.
-            </p>
-          </Panel>
+          <Show when={!m.directory} fallback={<DirectoryHome me={m} />}>
+            <UserHome me={m} />
+          </Show>
         </Show>
       )}
     </SignedIn>
+  );
+}
+
+/** An IAM user's own page: its passkeys, and who it is. */
+function UserHome(props: { me: Me }) {
+  const m = props.me;
+  return (
+    <>
+      <div class="page-head">
+        <h1>Your sign-in</h1>
+        <span class="subtle small">login {m.name}</span>
+      </div>
+      <Passkeys passkeys={m.passkeys} />
+      <Panel title="Who you are">
+        <Table count={1} columns={["As", "ARN"]}>
+          <tr>
+            <td>
+              <A class="mono" href={userHref(m.identity.user)}>
+                {m.identity.user}
+              </A>
+            </td>
+            <td class="mono small">{m.identity.arn}</td>
+          </tr>
+        </Table>
+        <p class="subtle small">
+          Policies name you by the ARN: what you may do here is what your policies allow, and what buckets'
+          policies don't deny you (your user's page shows its policies). The cluster's pages show if your
+          policies allow you its actions (<span class="mono">cairn:*</span>). Signed in with a passkey, your session
+          counts as multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span>).
+        </p>
+      </Panel>
+    </>
+  );
+}
+
+/** A directory user's own page: who its identity source says it is, the
+ * permission sets it may use (to switch between), and credentials of the
+ * one it uses, for the CLI. */
+function DirectoryHome(props: { me: Me }) {
+  const navigate = useNavigate();
+  const d = () => props.me.directory!;
+  const [credentials, setCredentials] = createSignal<Credentials>();
+  const choose = async (name: string) => {
+    try {
+      setMe(await api.choosePermissionSet(name));
+      setCredentials(undefined);
+      toast(`Using ${name}`);
+      navigate("/");
+    } catch (e) {
+      toast(explain(e), true);
+    }
+  };
+  const getCredentials = async () => {
+    try {
+      setCredentials(await api.directoryCredentials());
+    } catch (e) {
+      toast(explain(e), true);
+    }
+  };
+  const exports = (c: Credentials) =>
+    `export AWS_ACCESS_KEY_ID=${c.access_key_id}\nexport AWS_SECRET_ACCESS_KEY=${c.secret_access_key}\nexport AWS_SESSION_TOKEN=${c.session_token}`;
+  const copy = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      toast("Copied");
+    } catch {
+      toast("Copying isn't allowed here: select the text instead", true);
+    }
+  };
+  return (
+    <>
+      <div class="page-head">
+        <h1>{props.me.name}</h1>
+        <span class="subtle small">signed in at {d().provider_label}</span>
+      </div>
+      <Panel title="Permission sets">
+        <Table count={d().permission_sets.length} empty="None is assigned to you anymore." columns={["Name", "Description", "Sessions", ""]}>
+          <For each={d().permission_sets}>
+            {(set) => (
+              <tr>
+                <td class="mono">
+                  {set.name}{" "}
+                  <Show when={set.name === d().permission_set}>
+                    <Badge tone="ok">in use</Badge>
+                  </Show>
+                </td>
+                <td>{set.description || <span class="subtle">none</span>}</td>
+                <td>{Math.round(set.session_duration / 360) / 10} h</td>
+                <td class="actions">
+                  <Show when={set.name !== d().permission_set}>
+                    <button class="small primary" onClick={() => choose(set.name)}>
+                      Use
+                    </button>
+                  </Show>
+                </td>
+              </tr>
+            )}
+          </For>
+        </Table>
+        <p class="subtle small">
+          What you may do here is what the permission set you use allows: you act as a session of its role,{" "}
+          <Show when={props.me.identity.arn} fallback={<>once you pick one</>}>
+            <span class="mono">{props.me.identity.arn}</span>
+          </Show>
+          . An administrator assigns them to you, or to your groups, on the Identity Center page.
+        </p>
+      </Panel>
+      <Show when={d().permission_set}>
+        <Panel title="Credentials for the CLI">
+          <p class="subtle small">
+            Temporary credentials of the permission set's role, for the AWS CLI and SDKs, valid as long as its sessions
+            last. Anyone who has them acts as you until they expire.
+          </p>
+          <Show
+            when={credentials()}
+            fallback={
+              <button class="small" onClick={getCredentials}>
+                Get credentials
+              </button>
+            }
+          >
+            {(c) => (
+              <>
+                <pre class="credentials">{exports(c())}</pre>
+                <p class="subtle small">They expire at {clock(c().expiration)}.</p>
+                <button class="small" onClick={() => copy(exports(c()))}>
+                  Copy
+                </button>
+              </>
+            )}
+          </Show>
+        </Panel>
+      </Show>
+      <Panel title="Who you are">
+        <Table count={1} columns={["User name", "Source", "Subject", "E-mail", "Groups"]}>
+          <tr>
+            <td class="mono">{d().user_name}</td>
+            <td>{d().provider_label}</td>
+            <td class="mono small">{d().subject}</td>
+            <td>{d().email ?? <span class="subtle">none given</span>}</td>
+            <td>
+              <For each={d().groups} fallback={<span class="subtle">none</span>}>
+                {(g) => <span class="chip mono">{g}</span>}
+              </For>
+            </td>
+          </tr>
+        </Table>
+        <p class="subtle small">
+          You're a directory user: {d().provider_label} vouches for you, with these groups, as of when you signed in.
+          You have no passkeys or access keys of your own here. A session signed in at an identity source isn't
+          multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span> is false). Your console session ends at{" "}
+          {clock(props.me.expires_at ?? 0)} at the latest.
+        </p>
+      </Panel>
+    </>
   );
 }
 
@@ -519,66 +659,7 @@ function RootSignIn() {
   );
 }
 
-/** The login's identities at OIDC providers, which sign it in too: linking
- * one (at the provider), and unlinking (not the last way in). */
-function Providers(props: { me: Me }) {
-  const [providers] = createResource(() => api.oidcProviders().catch(() => []));
-  const [error, setError] = createSignal<string | undefined>(takeError());
-  const unlinked = () => (providers() ?? []).filter((p) => !props.me.oidc.some((o) => o.provider === p.name));
-  const link = async (name: string) => {
-    try {
-      const { url } = await api.oidcStart(name, "link");
-      location.assign(url);
-    } catch (e) {
-      setError(explain(e));
-    }
-  };
-  const unlink = async (provider: string, label: string) => {
-    if (!confirm(`Stop signing in with ${label}?`)) return;
-    if (await act(() => api.oidcUnlink(provider), `Unlinked ${label}`)) refreshMe();
-  };
-  return (
-    <Show when={providers()?.length || props.me.oidc.length}>
-      <Panel title="Sign-in providers">
-        <Table count={props.me.oidc.length} empty="None linked." columns={["Provider", "As", ""]}>
-          <For each={props.me.oidc}>
-            {(o) => (
-              <tr>
-                <td>
-                  {o.label}{" "}
-                  <Show when={props.me.signed_in_at === o.provider}>
-                    <Badge tone="ok">this session</Badge>
-                  </Show>
-                </td>
-                <td>{o.email ?? <span class="subtle">no e-mail given</span>}</td>
-                <td class="actions">
-                  <button
-                    class="small danger"
-                    disabled={props.me.passkeys.length + props.me.oidc.length <= 1}
-                    title={props.me.passkeys.length + props.me.oidc.length <= 1 ? "Your last way to sign in" : ""}
-                    onClick={() => unlink(o.provider, o.label)}
-                  >
-                    Unlink
-                  </button>
-                </td>
-              </tr>
-            )}
-          </For>
-        </Table>
-        <For each={unlinked()}>
-          {(p) => (
-            <button class="small" onClick={() => link(p.name)}>
-              Link {p.label}
-            </button>
-          )}
-        </For>
-        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
-      </Panel>
-    </Show>
-  );
-}
-
-function Passkeys(props: { passkeys: Passkey[]; others: number }) {
+function Passkeys(props: { passkeys: Passkey[] }) {
   const add = async () => {
     try {
       const ceremony = await api.passkeyOptions();
@@ -624,8 +705,8 @@ function Passkeys(props: { passkeys: Passkey[]; others: number }) {
                 </button>
                 <button
                   class="small danger"
-                  disabled={props.passkeys.length + props.others <= 1}
-                  title={props.passkeys.length + props.others <= 1 ? "Your last way to sign in" : ""}
+                  disabled={props.passkeys.length <= 1}
+                  title={props.passkeys.length <= 1 ? "Your last way to sign in" : ""}
                   onClick={() => remove(p)}
                 >
                   Remove
@@ -673,6 +754,8 @@ render(
       <Route path="/roles/:name" component={Guarded(RolePage)} />
       <Route path="/policies" component={Guarded(Policies)} />
       <Route path="/policies/:name" component={Guarded(PolicyPage)} />
+      <Route path="/identity-center" component={Guarded(IdentityCenter)} />
+      <Route path="/identity-center/:name" component={Guarded(PermissionSetPage)} />
       <Route path="/account" component={Home} />
       <Route path="/buckets" component={Guarded(BucketList)} />
       <Route path="/buckets/:bucket" component={Guarded(BucketBrowser)} />

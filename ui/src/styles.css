@@ -357,7 +357,8 @@ button.chip.policy:hover { border-color: var(--accent); }
 /* The console. */
 .signin { max-width: 520px; margin: 48px auto; }
 .signin .primary { margin: 8px 0; }
-.signin pre.command { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; overflow-x: auto; user-select: all; }
+.signin pre.command, pre.credentials { font-family: var(--mono); font-size: 12.5px; background: var(--panel-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 10px 12px; overflow-x: auto; user-select: all; }
+pre.credentials { white-space: pre-wrap; word-break: break-all; }
 /* The person signed in: who they are, sign-in settings and signing out. */
 .user-menu { position: relative; margin-left: auto; flex-shrink: 0; }
 .user-button { border-color: transparent; background: none; padding: 4px 8px; max-width: 46vw; }

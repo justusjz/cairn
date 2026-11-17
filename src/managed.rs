@@ -88,13 +88,18 @@ pub enum Refused {
     /// NotImplemented (501): what IAM would take, but Cairn can't decide (a
     /// condition key it doesn't evaluate).
     Unsupported(String),
+    /// UnmodifiableEntity (400): a role only Cairn changes (a permission
+    /// set's: see `roles::protected`).
+    Unmodifiable(String),
 }
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refused::NoSuch(m) | Refused::Exists(m) | Refused::Conflict(m) | Refused::Limit(m) => f.write_str(m),
-            Refused::Malformed(m) | Refused::Invalid(m) | Refused::Validation(m) | Refused::Unsupported(m) => f.write_str(m),
+            Refused::Malformed(m) | Refused::Invalid(m) | Refused::Validation(m) | Refused::Unsupported(m) | Refused::Unmodifiable(m) => {
+                f.write_str(m)
+            }
         }
     }
 }

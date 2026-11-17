@@ -146,7 +146,7 @@ function UserRow(props: { user: User; person: boolean }) {
 /** How a person signs in, or why they don't yet. */
 function SignInCell(props: { access: ConsoleAccess }) {
   const a = () => props.access;
-  const ways = () => [...(a().passkeys ? [`${a().passkeys} passkey${a().passkeys === 1 ? "" : "s"}`] : []), ...a().providers];
+  const ways = () => (a().passkeys ? [`${a().passkeys} passkey${a().passkeys === 1 ? "" : "s"}`] : []);
   return (
     <Show
       when={a().enrolled}

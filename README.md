@@ -498,7 +498,8 @@ else (the cluster, without the data).
 
 A console session signed in with a passkey has
 `aws:MultiFactorAuthPresent` (`true`) and `aws:MultiFactorAuthAge` (seconds
-since it was signed in), one signed in at an OIDC provider has it `false`,
+since it was signed in), a [directory user's](#directory-users) has it
+`false`,
 and access keys never have it, as AWS's long-term keys don't. AWS's guard
 then keeps a leaked key from doing what matters, in any identity policy:
 
@@ -731,8 +732,8 @@ create-policy` too.
 - **Bucket access**: reading, writing, deleting versions for good, and
   managing (configuration, policy, deleting it) a bucket, or the buckets a
   pattern names (`logs-*`). A grant is one level of it on one bucket.
-- **MFA guard**: denies `iam:*` and `cairn:*` without MFA: to console
-  sessions signed in at an OIDC provider, and to access keys, which never
+- **MFA guard**: denies `iam:*` and `cairn:*` without MFA: to directory
+  users, signed in at an identity source, and to access keys, which never
   carry MFA, as in AWS.
 
 ## Roles and temporary credentials
@@ -832,8 +833,9 @@ First, the issuer is made an **OIDC provider** of the account (on the Roles
 page, or `aws iam create-open-id-connect-provider`, Terraform's
 `aws_iam_openid_connect_provider`), with the client IDs its tokens may be
 for (their audience; AWS's tools ask for `sts.amazonaws.com`). These are
-IAM's providers, apart from the [console's sign-in
-providers](#signing-in): an issuer may be both, configured in each place.
+IAM's providers, for workloads, apart from the console's [identity
+sources](#directory-users), for people: an issuer may be both, configured
+in each place.
 Then a role trusts it, naming the subjects that may assume it, by the
 token's claims `<url>:sub`, `<url>:aud` and `<url>:amr`:
 
@@ -951,8 +953,9 @@ The console is Cairn's web UI: people manage the account's buckets,
 objects, users and policies there, and its operators watch and run the
 cluster. It's off unless a node is started with `--listen-console` and
 `--console-url`; any number of nodes may serve it, behind one URL. People
-sign in with **passkeys**, or at an **OpenID Connect** provider: there are no
-passwords, and access keys are for S3, never for the console.
+sign in with **passkeys** (IAM users), or at an **identity source**, an
+OpenID Connect provider (as [directory users](#directory-users)): there are
+no passwords, and access keys are for S3, never for the console.
 
 ```sh
 cairn serve ... --listen-console 0.0.0.0:9480 --console-url https://console.example.com
@@ -967,9 +970,8 @@ console.
 cairn user create ada --admin    # on a node that serves the console
 ```
 
-A **login** (a person, with passkeys or identities at OIDC providers) acts
-as a user. An enrollment link is for a user: opened signed out, it makes a
-new login.
+A **login** (a person, with passkeys) acts as a user. An enrollment link is
+for a user: opened signed out, it makes a new login.
 
 The console acts as its identity: it allows exactly what that identity's S3,
 IAM and `cairn:` requests would be allowed, by the same policies (the user's
@@ -977,7 +979,8 @@ attached and inline policies, and the bucket's policy; an explicit Deny
 wins), and denies with S3's messages.
 
 The menu at the top right is the person's: who the session acts as, its
-passkeys and sign-in providers, and signing out.
+passkeys (a directory user's permission sets and credentials), and signing
+out.
 
 ### The account's pages
 
@@ -1037,6 +1040,9 @@ passkeys and sign-in providers, and signing out.
   A bucket's *Access and policy* shows which of the account's users its
   policies give access to the whole bucket, and what, besides its bucket
   policy and public access block.
+- **Identity Center:** permission sets, their policies and assignments to
+  [directory users](#directory-users) and groups, and who has signed in, as
+  Identity Center's actions allow.
 
 ### The operators' pages
 
@@ -1063,10 +1069,75 @@ users). Whichever node answers shows the whole cluster:
   doing on each node, what they still have to do, and what they did recently;
   and the [lifecycle](#lifecycle-rules) sweeps: each bucket's, how long a
   round of them takes, and the rate they go at, which can be changed there.
-- **Sign-in:** the OIDC providers people may sign in at.
+- **Sign-in:** the identity sources directory users sign in at.
 
 Request metrics are kept in memory by each node, so they start over when it
 restarts; everything else is read from the database.
+
+### Directory users
+
+People can also sign in as **directory users**, as in IAM Identity Center:
+whoever an identity source vouches for, with no IAM user behind them. An
+administrator decides what they may do with **permission sets** and
+**assignments**, on the console's Identity Center page, or through
+Identity Center's APIs (below):
+
+- A **permission set** is a set of policies (an inline one,
+  `AwsSSOInlinePolicy`, AWS's managed policies, the account's own as
+  *customer managed policy references*, and a permissions boundary) and a
+  session length (1 to 12 hours). Cairn makes a role for each one, as
+  Identity Center does, at
+  `/aws-reserved/sso.amazonaws.com/AWSReservedSSO_<set>_<suffix>`. The role
+  trusts only `sso.amazonaws.com`, so no one assumes it through STS, and IAM
+  refuses to change it (`UnmodifiableEntity`), or to make roles under
+  `/aws-reserved/`.
+- An **assignment** gives a permission set to a user or a group of the
+  **identity store**: the users that have signed in, and the groups their
+  sources' group claims (`groups` by default; set per source) named. Each
+  has an ID of its own, as Identity Center's users and groups do; a user's
+  user name is its `preferred_username`, e-mail or subject, the first no
+  one else has. There's no directory sync (SCIM): users and groups are
+  there once someone has signed in with them, and a user's groups are what
+  its last sign-in said.
+
+At sign-in, Cairn reads the person's subject and groups from the ID token,
+and finds their permission sets. With none, they don't get in; with one,
+it's used; with several, they pick one (and can switch on their own page).
+They then act as a session of the set's role,
+`arn:aws:sts::<account>:assumed-role/AWSReservedSSO_<set>_<suffix>/<user name>`,
+in the console and in policies, without MFA. Their page hands out
+temporary credentials of that session, for the AWS CLI and SDKs, valid for
+the set's session length. Taking an assignment away ends its users' access
+in the console at once; credentials already handed out last until they
+expire.
+
+```sh
+cairn oidc set company --issuer https://sso.example.com/realms/main \
+    --client-id cairn --client-secret ... --group-claim groups
+```
+
+**Identity Center's APIs** are on the S3 endpoint, as IAM's are:
+**sso-admin** (instances, permission sets and their policies,
+assignments, provisioning, tags) and **identitystore**'s reads (users,
+groups, memberships; they come from sign-ins, so its writes answer `501`).
+Point the AWS CLI, SDKs or Terraform at it (`AWS_ENDPOINT_URL_SSO_ADMIN`,
+`AWS_ENDPOINT_URL_IDENTITYSTORE`, or Terraform's `endpoints { ssoadmin,
+identitystore }`). The account's instance is its only one, and the
+account the only target; what's asked is done when it's answered, so
+assignments' and provisioning's statuses are `SUCCEEDED` at once. Each
+operation is decided as its action (`sso:CreatePermissionSet` on the
+instance, `sso:CreateAccountAssignment` on the permission set,
+`identitystore:GetUserId` on the identity store, …), which
+`AdministratorAccess` allows.
+
+```sh
+store=$(aws sso-admin list-instances --query 'Instances[0].IdentityStoreId' --output text)
+group=$(aws identitystore get-group-id --identity-store-id $store \
+    --alternate-identifier '{"UniqueAttribute": {"AttributePath": "DisplayName", "AttributeValue": "data"}}' \
+    --query GroupId --output text)
+aws sso-admin create-account-assignment --instance-arn ... --permission-set-arn ... \
+    --target-type AWS_ACCOUNT --target-id 123456789012 --principal-type GROUP --principal-id $group
+```
 
 ### Signing in
 
@@ -1093,19 +1164,17 @@ restarts; everything else is read from the database.
   as a hash, so every node serves them. Removing a passkey or the user ends
   the sessions signed in with it. Changes must come from the console's own
   page (its `Origin`).
-- **OpenID Connect**: besides passkeys, people may sign in at any OIDC
-  provider that follows the standard (Keycloak, Authentik, Dex, Entra ID,
-  Google, Okta, ...). An operator adds one on the console's Sign-in page
-  (or with `cairn oidc set <name> --issuer <URL> --client-id <ID>
-  [--client-secret <S>]`): Cairn reads the rest from the issuer's discovery
-  document. Register `<console URL>/api/oidc/callback` with the provider as
-  the client's redirect URI. Cairn uses the authorization code flow with
-  PKCE, and checks the ID token's signature by the provider's keys (RS*,
-  PS*, ES256, ES384, EdDSA), issuer, audience, expiry and nonce. An identity
-  at a provider signs in only a login it's linked to: through an enrollment
-  link ("Continue with ..."), or from the account page, signed in. No
-  account is ever entered for a matching e-mail address. A login keeps at least one way in: its last passkey or
-  provider can't be removed.
+- **Identity sources**: people sign in at any OpenID Connect provider that
+  follows the standard (Keycloak, Authentik, Dex, Entra ID, Google, Okta,
+  ...) as [directory users](#directory-users), not as IAM users. An operator
+  adds one on the console's Sign-in page (or with `cairn oidc set <name>
+  --issuer <URL> --client-id <ID> [--client-secret <S>] [--group-claim
+  <claim>]`): Cairn reads the rest from the issuer's discovery document.
+  Register `<console URL>/api/oidc/callback` with the provider as the
+  client's redirect URI. Cairn uses the authorization code flow with PKCE,
+  and checks the ID token's signature by the provider's keys (RS*, PS*,
+  ES256, ES384, EdDSA), issuer, audience, expiry and nonce. A login keeps at
+  least one passkey: its last can't be removed.
 - **Passkeys** are checked by Cairn itself (WebAuthn, with EdDSA, ES256 or
   RS256 keys), with user verification (a PIN or biometrics) every time, and
   without attestation: any authenticator works. A passkey whose signature

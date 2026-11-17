@@ -42,12 +42,14 @@ use crate::{App, users::Principal};
 pub(crate) mod actor;
 mod api;
 pub mod cbor;
+mod directory;
 mod groups;
 mod iam;
 mod inventory;
 mod limit;
 mod manage;
 mod sns;
+mod sso;
 mod templates;
 pub mod oidc;
 pub mod store;
@@ -249,6 +251,9 @@ async fn user_of(
     if let Some(session) = store::session(&client, &token).await? {
         return session_user(&client, &session, method, headers, query, peer).await?.ok_or_else(unauthorized);
     }
+    if let Some(session) = store::directory_session(&client, &token).await? {
+        return directory::user(&client, &session, method, headers, query, peer).await;
+    }
     let root = store::root_session(&client, &token).await?.ok_or_else(unauthorized)?;
     Ok(root_user(&root, method, headers, query, peer))
 }
@@ -279,7 +284,7 @@ async fn session_user(
 ) -> Result<Option<actor::User>, ApiError> {
     let Some(principal) = Principal::load_user(client, session.identity.user.id).await? else { return Ok(None) };
     let account = session.identity.account_id.clone();
-    Ok(Some(actor::User { principal, account, method, headers, query, peer, mfa_age: session.mfa_age }))
+    Ok(Some(actor::User { principal, account, method, headers, query, peer, mfa_age: Some(session.mfa_age) }))
 }
 
 /// A file of the console's UI, or else its page.
@@ -322,8 +327,8 @@ fn cleared_cookie() -> HeaderValue {
 }
 
 /// The signed-in session of a request: handlers that take it answer 401
-/// without one, and 403 to the account's root user, which has no login (no
-/// passkeys, providers or identities of its own).
+/// without one, and 403 to the account's root user and to directory users,
+/// which have no login (no passkeys or identities of their own).
 pub(crate) struct Signed {
     pub session: store::Session,
     /// The session's token (to switch it).
@@ -342,7 +347,29 @@ impl FromRequestParts<Arc<Console>> for Signed {
             None if store::root_session(&client, &token).await?.is_some() => {
                 Err(ApiError::Forbidden("the root user has no login: it has no passkeys or identities to manage".into()))
             }
+            None if store::directory_session(&client, &token).await?.is_some() => Err(ApiError::Forbidden(
+                "directory users have no login: they sign in at their identity source".into(),
+            )),
             None => Err(unauthorized()),
+        }
+    }
+}
+
+/// A directory user's signed-in session: handlers that take it answer 401
+/// without a session, and 403 to any other.
+pub(crate) struct DirectorySigned {
+    pub session: store::DirectorySession,
+    pub token: String,
+}
+
+impl FromRequestParts<Arc<Console>> for DirectorySigned {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, console: &Arc<Console>) -> Result<Self, ApiError> {
+        let token = session_token(&parts.headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+        match store::directory_session(&console.app.pool.get().await?, &token).await? {
+            Some(session) => Ok(DirectorySigned { session, token }),
+            None => Err(ApiError::Forbidden("only a directory user's session has permission sets".into())),
         }
     }
 }
@@ -412,6 +439,21 @@ mod e2e {
             "ui/openapi.json is out of date: run `CAIRN_UPDATE_OPENAPI=1 cargo test openapi`, \
              then `npm run gen` in ui/"
         );
+    }
+
+    /// Every operation has an ID of its own: the UI's client is generated
+    /// by them, and two of a name merge into one's types.
+    #[test]
+    fn operations_have_ids_of_their_own() {
+        let spec = serde_json::to_value(openapi()).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        for item in spec["paths"].as_object().unwrap().values() {
+            for operation in item.as_object().unwrap().values() {
+                if let Some(id) = operation.get("operationId").and_then(Value::as_str) {
+                    assert!(seen.insert(id.to_owned()), "two operations are named {id}");
+                }
+            }
+        }
     }
 
     /// The spec is the sign-in API's and `manage`'s, merged: a schema of one
@@ -1091,25 +1133,29 @@ mod e2e {
         }
 
         /// Starts a sign-in at the mock provider: its authorization URL.
-        async fn start_oidc(&mut self, body: Value) -> String {
-            let (status, answer) = self.send("POST", "/api/oidc/mock/start", Some(body)).await;
+        async fn start_oidc(&mut self) -> String {
+            let (status, answer) = self.send("POST", "/api/oidc/mock/start", None).await;
             assert_eq!(status, StatusCode::OK, "{answer}");
             answer["url"].as_str().unwrap().to_owned()
         }
     }
 
-    /// Signing in at an OIDC provider: configured by an operator, used to
-    /// enroll through a link (a new login), to sign in, linked to a login
-    /// that has a passkey, and unlinked but not as the last way in. Its
-    /// sessions have no MFA. Tokens that aren't right are refused, and an
-    /// identity linked to no login signs no one in.
+    /// Directory users: an operator configures an identity source; whoever
+    /// it vouches for signs in as itself, with the permission sets assigned
+    /// to it or its groups (picked for it when there's one), acting as their
+    /// roles' sessions, without MFA, and may take their credentials. One
+    /// with none doesn't get in; one whose assignment goes loses it at once.
+    /// Tokens that aren't right are refused. The permission sets' roles are
+    /// Identity Center's: IAM can't change them.
     #[tokio::test]
-    async fn signs_in_at_any_oidc_provider() {
+    async fn directory_users_sign_in_with_permission_sets() {
         use super::oidc::mock::{CLIENT_ID, CLIENT_SECRET, Mock};
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let client = app.pool.get().await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
         let mock = Mock::start().await;
+        let browser = || Browser { console: console.clone(), cookie: None, origin: party().origin };
 
         // An operator configures it (checked against its discovery).
         let mut ops = superadmin(&console, "op").await;
@@ -1118,75 +1164,148 @@ mod e2e {
         assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
         let bad = json!({ "label": "x", "issuer": "https://127.0.0.1:1", "client_id": "c" });
         assert_eq!(ops.send("PUT", "/api/oidc-providers/broken", Some(bad)).await.0, StatusCode::BAD_REQUEST);
-        let mut tenant = signed_in(&console, "tenant", false).await;
+        let mut admin = signed_in(&console, "admin", true).await;
         let config = json!({ "label": "x", "issuer": mock.issuer, "client_id": "c" });
+        let mut tenant = signed_in(&console, "tenant", false).await;
         assert_eq!(tenant.send("PUT", "/api/oidc-providers/sneaky", Some(config)).await.0, StatusCode::FORBIDDEN);
-        let (_, buttons) = Browser { console: console.clone(), cookie: None, origin: party().origin }
-            .send("GET", "/api/oidc/providers", None)
-            .await;
+        let (_, buttons) = browser().send("GET", "/api/oidc/providers", None).await;
         assert_eq!(buttons, json!([{ "name": "mock", "label": "Company SSO" }]));
+        let (_, sources) = ops.send("GET", "/api/oidc-providers", None).await;
+        assert_eq!(sources["providers"][0]["group_claim"], "groups", "{sources}");
 
-        // An identity no login has: signs in no one.
-        let mut stranger = Browser { console: console.clone(), cookie: None, origin: party().origin };
-        let url = stranger.start_oidc(json!({ "purpose": "login" })).await;
+        // No permission set yet: no way in, but who it was is noted.
+        let mut ada = browser();
+        let url = ada.start_oidc().await;
         assert!(url.starts_with(&format!("{}/authorize?", mock.issuer)), "{url}");
-        let (state, code) = mock.code_for(&url, "sub-unknown", "x@example.com");
-        let (status, location) = stranger.come_back(&state, &code).await;
+        let (state, code) = mock.code_with_groups(&url, "sub-ada", "ada@example.com", &["data"]);
+        let (status, location) = ada.come_back(&state, &code).await;
         assert_eq!(status, StatusCode::SEE_OTHER);
-        assert!(location.starts_with("/login?error="), "{location}");
-        assert!(stranger.cookie.is_none());
+        assert!(location.starts_with("/login?error=") && location.contains("permission%20set"), "{location}");
+        assert!(ada.cookie.is_none());
+        let (_, seen) = admin.send("GET", "/api/directory-users", None).await;
+        assert_eq!((&seen[0]["subject"], &seen[0]["groups"]), (&json!("sub-ada"), &json!(["data"])));
+        assert_eq!(seen[0]["user_name"], "ada@example.com");
+        let ada_id = seen[0]["id"].as_str().unwrap().to_owned();
+        let (_, groups) = admin.send("GET", "/api/directory-groups", None).await;
+        assert_eq!((&groups[0]["name"], &groups[0]["members"]), (&json!("data"), &json!(1)));
+        let data_id = groups[0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(tenant.send("GET", "/api/directory-users", None).await.0, StatusCode::FORBIDDEN);
 
-        // Enrolling through a link: a new login, signed in at the provider.
-        users::create(&client, "sam", None, false).await.unwrap();
-        let token = store::create_enrollment(&client, &crate::users::account(&client).await.unwrap(), "sam").await.unwrap();
-        let mut sam = Browser { console: console.clone(), cookie: None, origin: party().origin };
-        let url = sam.start_oidc(json!({ "purpose": "enroll", "token": token })).await;
-        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
-        let (status, location) = sam.come_back(&state, &code).await;
-        assert_eq!((status, location.as_str()), (StatusCode::SEE_OTHER, "/account"));
-        let (status, me) = sam.send("GET", "/api/me", None).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        assert_eq!(me["identity"]["user"], "sam");
-        assert_eq!(me["signed_in_at"], "mock");
-        assert_eq!(me["mfa"], false);
-        assert_eq!(me["oidc"], json!([{ "provider": "mock", "label": "Company SSO", "email": "sam@example.com" }]));
+        // Permission sets, with their policies; the tenant may make none.
+        let readers = json!({ "name": "Readers", "description": "Lists buckets" });
+        assert_eq!(tenant.send("POST", "/api/permission-sets", Some(readers.clone())).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("POST", "/api/permission-sets", Some(readers.clone())).await.0, StatusCode::CREATED);
+        assert_eq!(admin.send("POST", "/api/permission-sets", Some(readers)).await.0, StatusCode::CONFLICT);
+        let list = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*"}]}"#;
+        let (status, err) = admin.send("PUT", "/api/permission-sets/Readers/inline-policy", Some(json!({ "document": list }))).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        let admins = json!({ "name": "Admins", "session_duration": 7200 });
+        assert_eq!(admin.send("POST", "/api/permission-sets", Some(admins)).await.0, StatusCode::CREATED);
+        let full = json!({ "arn": "arn:aws:iam::aws:policy/AdministratorAccess" });
+        assert_eq!(admin.send("POST", "/api/permission-sets/Admins/attached", Some(full)).await.0, StatusCode::NO_CONTENT);
+        let (_, sets) = admin.send("GET", "/api/permission-sets", None).await;
+        assert_eq!(sets.as_array().unwrap().len(), 2);
+        let readers_role = sets[1]["role_name"].as_str().unwrap().to_owned();
+        assert!(readers_role.starts_with("AWSReservedSSO_Readers_"), "{sets}");
+        assert_eq!(sets[1]["role_arn"], format!("arn:aws:iam::{account}:role/aws-reserved/sso.amazonaws.com/{readers_role}"));
+
+        // IAM can't change their roles, nor make roles where they are.
+        let (status, err) = admin.send("PATCH", &format!("/api/roles/{readers_role}"), Some(json!({ "description": "mine" }))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(err["error"].as_str().unwrap().contains("protected role"), "{err}");
+        assert_eq!(admin.send("DELETE", &format!("/api/roles/{readers_role}"), None).await.0, StatusCode::FORBIDDEN);
+        let trust = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sso.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
+        let fake = json!({ "name": "fake", "path": "/aws-reserved/sso.amazonaws.com/", "trust": trust, "description": "" });
+        assert_eq!(admin.send("POST", "/api/roles", Some(fake)).await.0, StatusCode::BAD_REQUEST);
+
+        // Assigned: Readers to the group, Admins to Ada herself.
+        let assign = |set: &str, kind: &str, id: &str| json!({ "permission_set": set, "principal_type": kind, "principal_id": id });
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Readers", "GROUP", &data_id))).await.0, StatusCode::CREATED);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &ada_id))).await.0, StatusCode::CREATED);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &ada_id))).await.0, StatusCode::CONFLICT);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "OTHER", &ada_id))).await.0, StatusCode::BAD_REQUEST);
+        // Only to who's in the identity store (a group as a user, say, isn't).
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &data_id))).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "GROUP", "x"))).await.0, StatusCode::NOT_FOUND);
+
+        // Ada has both: she picks one, and acts as its role's session.
+        let url = ada.start_oidc().await;
+        let (state, code) = mock.code_with_groups(&url, "sub-ada", "ada@example.com", &["data"]);
+        assert_eq!(ada.come_back(&state, &code).await, (StatusCode::SEE_OTHER, "/".to_owned()));
         // A state is used once.
-        assert!(sam.come_back(&state, &code).await.1.starts_with("/login?error="));
+        assert!(browser().come_back(&state, &code).await.1.starts_with("/login?error="));
+        let (status, me) = ada.send("GET", "/api/me", None).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!((&me["name"], &me["mfa"], &me["directory"]["permission_set"]), (&json!("Test Person"), &json!(false), &Value::Null));
+        let names: Vec<&str> = me["directory"]["permission_sets"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Admins", "Readers"]);
+        let (status, err) = ada.send("GET", "/api/users", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(err["error"].as_str().unwrap().contains("pick a permission set"), "{err}");
+        let (status, _) = ada.send("POST", "/api/directory/permission-set", Some(json!({ "name": "Nope" }))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, me) = ada.send("POST", "/api/directory/permission-set", Some(json!({ "name": "Admins" }))).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert!(me["identity"]["arn"].as_str().unwrap().starts_with(&format!("arn:aws:sts::{account}:assumed-role/AWSReservedSSO_Admins_")));
+        assert!(me["identity"]["arn"].as_str().unwrap().ends_with("/ada@example.com"), "{me}");
+        assert_eq!(ada.send("GET", "/api/users", None).await.0, StatusCode::OK);
+        // She has no login: no passkeys.
+        assert_eq!(ada.send("POST", "/api/passkeys/options", None).await.0, StatusCode::FORBIDDEN);
 
-        // Signing in again, in another browser.
-        let mut again = Browser { console: console.clone(), cookie: None, origin: party().origin };
-        let url = again.start_oidc(json!({ "purpose": "login" })).await;
-        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
-        assert_eq!(again.come_back(&state, &code).await.1, "/");
-        assert_eq!(again.send("GET", "/api/me", None).await.1["identity"]["user"], "sam");
-        // Its last way in can't be unlinked.
-        let (status, err) = again.send("DELETE", "/api/oidc/mock", None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(err["error"].as_str().unwrap().contains("last way"), "{err}");
+        // Her credentials are a session of the role, for its duration.
+        let (status, creds) = ada.send("POST", "/api/directory/credentials", None).await;
+        assert_eq!(status, StatusCode::OK, "{creds}");
+        let expires = creds["expiration"].as_u64().unwrap();
+        assert!(expires > crate::sessions::now() + 7000 && expires <= crate::sessions::now() + 7200, "{creds}");
+        let session = Principal::authenticate(
+            &client,
+            &app.sessions,
+            creds["access_key_id"].as_str().unwrap(),
+            creds["session_token"].as_str().unwrap().into(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(session.arn().ends_with("/ada@example.com"));
+        assert!(session.principal_arn().contains("/aws-reserved/sso.amazonaws.com/AWSReservedSSO_Admins_"));
+        // A passkey's session has no permission sets.
+        assert_eq!(tenant.send("POST", "/api/directory/credentials", None).await.0, StatusCode::FORBIDDEN);
+
+        // Bob, in the group only: Readers, picked for him.
+        let mut bob = browser();
+        let url = bob.start_oidc().await;
+        let (state, code) = mock.code_with_groups(&url, "sub-bob", "bob@example.com", &["data", "other"]);
+        assert_eq!(bob.come_back(&state, &code).await.1, "/");
+        let (_, me) = bob.send("GET", "/api/me", None).await;
+        assert_eq!(me["directory"]["permission_set"], "Readers");
+        assert_eq!(me["directory"]["groups"], json!(["data", "other"]));
+        assert_eq!(bob.send("GET", "/api/buckets", None).await.0, StatusCode::OK);
+        assert_eq!(bob.send("GET", "/api/users", None).await.0, StatusCode::FORBIDDEN);
+        // The group's assignment goes: so does his access, at once.
+        let (_, assignments) = admin.send("GET", "/api/assignments", None).await;
+        let group = assignments.as_array().unwrap().iter().find(|a| a["principal_type"] == "GROUP").unwrap();
+        let path = format!("/api/assignments/{}", group["id"].as_str().unwrap());
+        assert_eq!(tenant.send("DELETE", &path, None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
+        let (status, err) = bob.send("GET", "/api/buckets", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(err["error"].as_str().unwrap().contains("isn't assigned to you"), "{err}");
 
         // A token for another client is refused.
         *mock.audience.lock().unwrap() = "someone-else".into();
-        let mut tricked = Browser { console: console.clone(), cookie: None, origin: party().origin };
-        let url = tricked.start_oidc(json!({ "purpose": "login" })).await;
-        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
+        let mut tricked = browser();
+        let url = tricked.start_oidc().await;
+        let (state, code) = mock.code_with_groups(&url, "sub-ada", "ada@example.com", &["data"]);
         let (_, location) = tricked.come_back(&state, &code).await;
         assert!(location.contains("another%20client"), "{location}");
         assert!(tricked.cookie.is_none());
         *mock.audience.lock().unwrap() = CLIENT_ID.into();
 
-        // A login with a passkey links the identity, and may then unlink it.
-        let url = tenant.start_oidc(json!({ "purpose": "link" })).await;
-        let (state, code) = mock.code_for(&url, "sub-tenant", "t@example.com");
-        let saved = tenant.cookie.clone();
-        assert_eq!(tenant.come_back(&state, &code).await.1, "/account");
-        tenant.cookie = saved;
-        let (_, me) = tenant.send("GET", "/api/me", None).await;
-        assert_eq!(me["oidc"][0]["provider"], "mock");
-        // Not to another login, though.
-        let url = tenant.start_oidc(json!({ "purpose": "link" })).await;
-        let (state, code) = mock.code_for(&url, "sub-sam", "sam@example.com");
-        assert!(tenant.come_back(&state, &code).await.1.starts_with("/account?error="));
-        assert_eq!(tenant.send("DELETE", "/api/oidc/mock", None).await.0, StatusCode::NO_CONTENT);
+        // Deleting a permission set: its role, and Ada's use of it, go.
+        let admins_role = sets[0]["role_name"].as_str().unwrap().to_owned();
+        assert_eq!(admin.send("DELETE", "/api/permission-sets/Admins", None).await.0, StatusCode::NO_CONTENT);
+        assert!(crate::roles::Role::load(&client, &account, &admins_role).await.unwrap().is_none());
+        assert_eq!(ada.send("GET", "/api/users", None).await.0, StatusCode::FORBIDDEN);
     }
 
     /// Bucket and object tags, CORS and websites, set as S3 sets them (and

@@ -77,6 +77,7 @@ supported.
 | Bucket ABAC (bucket tags in policies) | ✅ | |
 | S3 Access Grants | 🟡 | IAM grantees only: [Access Grants](#access-grants) |
 | MFA delete | 🟡 | [MFA delete](#mfa-delete) |
+| IAM Identity Center (directory users, permission sets, sso-admin, identitystore) | 🟡 | OIDC sources, one account: [Identity Center](#identity-center) |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
 ### Not implemented
@@ -89,8 +90,11 @@ S3 reports a bucket that doesn't use it:
 - S3 Select, torrents.
 - S3 Express's metadata tables, access points for directory buckets.
 - Requester pays, Transfer Acceleration.
-- IAM Identity Center grantees and cross-account S3 Access Grants
-  ([Access Grants](#access-grants)).
+- Directory users and groups as grantees, and cross-account S3 Access
+  Grants ([Access Grants](#access-grants)).
+- Identity Center's access portal APIs (`sso`, `sso-oidc`, so `aws sso
+  login`), applications and identitystore's writes ([Identity
+  Center](#identity-center)).
 
 ---
 
@@ -378,10 +382,58 @@ Differences:
   `MaxItems` and `Marker`, as IAM's do.)
 - `iam:PassRole` is checked only where a role is passed to a service:
   an Access Grants location's role ([Access Grants](#access-grants)).
+- Roles under `/aws-reserved/` are permission sets' ([Identity
+  Center](#identity-center)): IAM won't make them, and refuses to change
+  them with `UnmodifiableEntity`.
 - `RoleLastUsed` and `PasswordLastUsed` are never reported.
 - **OpenID Connect providers:** Cairn fetches the issuer's discovery document
   when a provider is created, and refuses one it can't reach. Thumbprints are
   enforced as certificate pins, which lets issuers on private CAs work.
+
+### Identity Center
+
+Directory users, as IAM Identity Center has them: people who sign in to the
+console at an identity source, and act as a session of the role of a
+permission set assigned to them or a group of theirs (see the README's
+*Directory users*). As in Identity Center, a permission set is a role at
+`/aws-reserved/sso.amazonaws.com/` named `AWSReservedSSO_<set>_<suffix>`,
+which IAM refuses to change (`UnmodifiableEntity`), with an inline policy
+named `AwsSSOInlinePolicy`. sso-admin's API covers the instance,
+permission sets (their inline, AWS managed and customer managed policies,
+boundaries, relay states and tags), assignments, and provisioning;
+identitystore's, its reads (users, groups, memberships, by IDs, user
+names, display names and external IDs). This, too, wasn't checked against
+AWS. It differs in that:
+
+- **Identity sources are OpenID Connect providers,** not SAML, and there's
+  no directory sync (SCIM) and no built-in directory: a user, and its
+  groups (from a claim of its ID token), are in the identity store once it
+  has signed in, and its memberships are what its last sign-in said. So
+  identitystore's writes (CreateUser, CreateGroup, CreateGroupMembership,
+  …) answer `501`, and a user or group can be assigned only once someone
+  has signed in with it. A cluster may have several sources: a user's
+  external ID is its source's issuer and its subject; a group's, its
+  source's issuer and its name (its display name, which several sources'
+  groups may share: GetGroupId then wants the external ID).
+- **One account, done at once.** The account's instance is its only one
+  (CreateInstance, DeleteInstance and UpdateInstance answer `501`), and the
+  account the only target of assignments and provisioning. Their requests
+  are done when they're answered: their statuses are `SUCCEEDED` (never
+  `IN_PROGRESS`), a permission set is provisioned once it's assigned, and
+  creating an assignment there is, or deleting one there isn't, succeeds.
+  Their statuses are kept for 90 days.
+- **Customer managed policy references** must name a policy of the account
+  that exists, when attached; AWS checks only when provisioning.
+- **No access portal API** (`sso`, `sso-oidc`): `aws sso login` and SSO
+  profiles don't work. A directory user's page hands out its session's
+  credentials instead, as the access portal's "access keys" do.
+- **Not supported:** applications, trusted token issuers, regions, and
+  attributes for access control (claims as session tags), which answer
+  `501`; the instance's tags; and MFA at the identity source, which Cairn
+  doesn't trust: directory users' sessions never have
+  `aws:MultiFactorAuthPresent`.
+- **Console sessions** last 12 hours at most (1 hour unused); taking an
+  assignment away ends a session's use of it at once.
 
 ### Access Grants
 
@@ -392,9 +444,9 @@ in AWS's SDKs and CLI. Unlike the rest of this document, its behavior was
 **not checked against S3**, only against AWS's documentation and API model,
 so the points below are Cairn's reading of them:
 
-- **IAM grantees only.** There's no IAM Identity Center:
-  `DIRECTORY_USER` and `DIRECTORY_GROUP` grantees, applications and
-  Identity Center instances are refused with `501`. So is the instance's
+- **IAM grantees only.** Cairn's [directory users](#identity-center) aren't
+  grantees yet: `DIRECTORY_USER` and `DIRECTORY_GROUP` grantees,
+  applications and Identity Center instances are refused with `501`. So is the instance's
   resource policy, which is for other accounts (there's one).
 - **Scopes.** A grant's scope is its location's joined with its
   sub-prefix; without one, `<location>/*`. A trailing `*` is optional; one
@@ -429,8 +481,8 @@ so the points below are Cairn's reading of them:
 
 Not implemented:
 
-- **IAM Identity Center** and what Access Grants does with it: directory
-  users and groups as grantees (a group of an IdP, rather than an IAM
+- **Identity Center** in Access Grants: directory users and groups as
+  grantees (a group of an IdP, rather than an IAM
   principal, granted a prefix), applications (`ApplicationArn`,
   `allowedByApplication`), and sessions carrying a person's identity
   (`sts:SetContext`, trusted identity propagation).
