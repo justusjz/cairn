@@ -398,7 +398,9 @@ Differences:
 Directory users, as IAM Identity Center has them: people who sign in to the
 console at an identity source, and act as a session of the role of a
 permission set assigned to them or a group of theirs (see the README's
-*Directory users*). As in Identity Center, a permission set is a role at
+*Directory users*). As in Identity Center, a permission set is provisioned
+to an account (when it's first assigned there, and again by
+ProvisionPermissionSet once it has changed) as a role at
 `/aws-reserved/sso.amazonaws.com/` named `AWSReservedSSO_<set>_<suffix>`,
 which IAM refuses to change (`UnmodifiableEntity`), with an inline policy
 named `AwsSSOInlinePolicy`. sso-admin's API covers the instance,
@@ -420,17 +422,18 @@ AWS. It differs in that:
   groups may share: GetGroupId then wants the external ID).
 - **One account, done at once.** The account's instance is its only one
   (CreateInstance, DeleteInstance and UpdateInstance answer `501`), and the
-  account the only target of assignments and provisioning. Assignments and
-  console sessions do name the account they're in, and a permission set
-  keeps a role per account it's provisioned to, as AWS's, so that member
-  accounts can be added later; a permission set is provisioned to its own
-  account when it's made, rather than when it's first assigned. Their requests
-  are done when they're answered: their statuses are `SUCCEEDED` (never
-  `IN_PROGRESS`), a permission set is provisioned once it's assigned, and
-  creating an assignment there is, or deleting one there isn't, succeeds.
-  Their statuses are kept for 90 days.
-- **Customer managed policy references** must name a policy of the account
-  that exists, when attached; AWS checks only when provisioning.
+  account the only target of assignments and provisioning (assignments and
+  provisionings do name their accounts, so that member accounts can be
+  added). Their requests are done when they're answered: their statuses are
+  `SUCCEEDED` or `FAILED` (never `IN_PROGRESS`), and creating an
+  assignment there is, or deleting one there isn't, succeeds. Their
+  statuses are kept for 90 days.
+- **A provisioned set's role stays** when its last assignment in the
+  account goes, until the set is deleted.
+- **The console provisions a set again when it's saved there**, if the
+  session may (`sso:ProvisionPermissionSet`), so that edits there take
+  effect at once; sso-admin's changes wait for ProvisionPermissionSet, as
+  AWS's do.
 - **No access portal API** (`sso`, `sso-oidc`): `aws sso login` and SSO
   profiles don't work. A directory user's page hands out its session's
   credentials instead, as the access portal's "access keys" do.

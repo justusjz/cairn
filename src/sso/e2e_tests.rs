@@ -132,9 +132,14 @@ async fn permission_sets_and_assignments() {
     assert_eq!(sso("CreatePermissionSet", json!({ "InstanceArn": "arn:aws:sso:::instance/ssoins-0000000000000000", "Name": "X" })).await.unwrap_err(), "ResourceNotFoundException");
     assert_eq!(sso("UpdatePermissionSet", on(json!({ "SessionDuration": "PT13H" }))).await.unwrap_err(), "ValidationException");
 
-    // Its policies are its role's: AWS's managed, the account's by
-    // reference, inline, and a boundary.
+    // Its policies are its own: AWS's managed, customer managed by
+    // reference, inline, and a boundary. Made, it's provisioned nowhere.
+    assert_eq!(sso("ListAccountsForProvisionedPermissionSet", on(json!({}))).await.unwrap()["AccountIds"], json!([]));
     sso("AttachManagedPolicyToPermissionSet", on(json!({ "ManagedPolicyArn": "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess" }))).await.unwrap();
+    let aws = json!({ "ManagedPolicyArn": "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess" });
+    assert_eq!(sso("AttachManagedPolicyToPermissionSet", on(aws)).await.unwrap_err(), "ConflictException");
+    let unknown = json!({ "ManagedPolicyArn": "arn:aws:iam::aws:policy/NoSuchPolicy" });
+    assert_eq!(sso("AttachManagedPolicyToPermissionSet", on(unknown)).await.unwrap_err(), "ResourceNotFoundException");
     let own = format!("arn:aws:iam::{account}:policy/teams/list");
     let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*"}]}"#;
     crate::managed::create(&client, &account, "list", "/teams/", document, "").await.unwrap();
@@ -142,9 +147,8 @@ async fn permission_sets_and_assignments() {
     let reference = json!({ "CustomerManagedPolicyReference": { "Name": "list", "Path": "/teams/" } });
     sso("AttachCustomerManagedPolicyReferenceToPermissionSet", on(reference.clone())).await.unwrap();
     assert_eq!(sso("AttachCustomerManagedPolicyReferenceToPermissionSet", on(reference)).await.unwrap_err(), "ConflictException");
-    let missing = json!({ "CustomerManagedPolicyReference": { "Name": "nope" } });
-    assert_eq!(sso("AttachCustomerManagedPolicyReferenceToPermissionSet", on(missing)).await.unwrap_err(), "ResourceNotFoundException");
     sso("PutInlinePolicyToPermissionSet", on(json!({ "InlinePolicy": document }))).await.unwrap();
+    assert_eq!(sso("PutInlinePolicyToPermissionSet", on(json!({ "InlinePolicy": "{" }))).await.unwrap_err(), "ValidationException");
     sso("PutPermissionsBoundaryToPermissionSet", on(json!({ "PermissionsBoundary": { "CustomerManagedPolicyReference": { "Name": "list", "Path": "/teams/" } } })))
         .await
         .unwrap();
@@ -155,13 +159,23 @@ async fn permission_sets_and_assignments() {
     let managed = sso("ListManagedPoliciesInPermissionSet", on(json!({}))).await.unwrap();
     assert_eq!(managed["AttachedManagedPolicies"][0]["Name"], "AmazonS3ReadOnlyAccess");
     let read = ic::load_arn(&client, &account, &set).await.unwrap().unwrap();
-    let role = read.role(&client).await.unwrap();
-    assert_eq!(role.max_session_duration, 7200);
-    assert_eq!(role.boundary.as_deref(), Some(own.as_str()));
-    assert_eq!(crate::roles::attached(&client, role.id).await.unwrap().len(), 2);
+    assert!(ic::provisions(&client, &read).await.unwrap().is_empty());
 
-    // Assigned to a group, by its ID: done when answered.
+    // A reference needn't name a policy until the set is provisioned: the
+    // account must have it then, or the assignment that provisions it fails.
+    let missing = json!({ "CustomerManagedPolicyReference": { "Name": "nope" } });
+    sso("AttachCustomerManagedPolicyReferenceToPermissionSet", on(missing.clone())).await.unwrap();
     let target = |kind: &str, id: String| on(json!({ "TargetId": account, "TargetType": "AWS_ACCOUNT", "PrincipalType": kind, "PrincipalId": id }));
+    let failed = sso("CreateAccountAssignment", target("GROUP", data.to_string())).await.unwrap();
+    assert_eq!(failed["AccountAssignmentCreationStatus"]["Status"], "FAILED");
+    assert!(failed["AccountAssignmentCreationStatus"]["FailureReason"].as_str().unwrap().contains("/nope"), "{failed}");
+    assert!(ic::assignments(&client, &account, None, None, None).await.unwrap().is_empty());
+    assert!(ic::provisions(&client, &read).await.unwrap().is_empty());
+    sso("DetachCustomerManagedPolicyReferenceFromPermissionSet", on(missing.clone())).await.unwrap();
+    assert_eq!(sso("DetachCustomerManagedPolicyReferenceFromPermissionSet", on(missing)).await.unwrap_err(), "ResourceNotFoundException");
+
+    // Assigned to a group, by its ID: done when answered, and provisioned
+    // to the account, its role there holding what the set does.
     let made = sso("CreateAccountAssignment", target("GROUP", data.to_string())).await.unwrap();
     let request = made["AccountAssignmentCreationStatus"]["RequestId"].as_str().unwrap().to_owned();
     assert_eq!(made["AccountAssignmentCreationStatus"]["Status"], "SUCCEEDED");
@@ -175,6 +189,14 @@ async fn permission_sets_and_assignments() {
     assert_eq!(sso("CreateAccountAssignment", elsewhere).await.unwrap_err(), "ValidationException");
     // In the account it targeted, as the set's role there.
     assert_eq!(status["AccountAssignmentCreationStatus"]["TargetId"], json!(account));
+    let provisions = ic::provisions(&client, &read).await.unwrap();
+    assert_eq!((provisions.len(), provisions[0].latest), (1, true));
+    let role = crate::roles::Role::load_id(&client, provisions[0].role_id).await.unwrap().unwrap();
+    assert_eq!(role.name, read.role_name());
+    assert_eq!(role.max_session_duration, 7200);
+    assert_eq!(role.boundary.as_deref(), Some(own.as_str()));
+    assert_eq!(crate::roles::attached(&client, role.id).await.unwrap().len(), 2);
+    assert_eq!(crate::roles::get_policy(&client, role.id, ic::INLINE_POLICY).await.unwrap().as_deref(), Some(document));
     let eligible = ic::eligible(&client, &account, ada).await.unwrap();
     let pairs: Vec<(&str, &str)> = eligible.iter().map(|e| (e.account.as_str(), e.set.name.as_str())).collect();
     assert_eq!(pairs, [(account.as_str(), "Readers")]);
@@ -192,9 +214,23 @@ async fn permission_sets_and_assignments() {
     assert_eq!(provisioned["PermissionSets"], json!([set]));
     let accounts = sso("ListAccountsForProvisionedPermissionSet", on(json!({}))).await.unwrap();
     assert_eq!(accounts["AccountIds"], json!([account]));
+
+    // Changed, its role keeps what it held until it's provisioned again.
+    sso("UpdatePermissionSet", on(json!({ "SessionDuration": "PT3H" }))).await.unwrap();
+    sso("DeleteInlinePolicyFromPermissionSet", on(json!({}))).await.unwrap();
+    sso("DeletePermissionsBoundaryFromPermissionSet", on(json!({}))).await.unwrap();
+    let stale = json!({ "InstanceArn": instance, "AccountId": account, "ProvisioningStatus": "LATEST_PERMISSION_SET_NOT_PROVISIONED" });
+    assert_eq!(sso("ListPermissionSetsProvisionedToAccount", stale.clone()).await.unwrap()["PermissionSets"], json!([set]));
+    let role = crate::roles::Role::load_id(&client, role.id).await.unwrap().unwrap();
+    assert_eq!((role.max_session_duration, role.boundary.is_some()), (7200, true));
+    assert!(crate::roles::get_policy(&client, role.id, ic::INLINE_POLICY).await.unwrap().is_some());
     let provision = sso("ProvisionPermissionSet", on(json!({ "TargetType": "AWS_ACCOUNT", "TargetId": account }))).await.unwrap();
     assert_eq!(provision["PermissionSetProvisioningStatus"]["Status"], "SUCCEEDED");
     assert_eq!(provision["PermissionSetProvisioningStatus"]["AccountId"], json!(account));
+    let role = crate::roles::Role::load_id(&client, role.id).await.unwrap().unwrap();
+    assert_eq!((role.max_session_duration, role.boundary), (10800, None));
+    assert!(crate::roles::get_policy(&client, role.id, ic::INLINE_POLICY).await.unwrap().is_none());
+    assert_eq!(sso("ListPermissionSetsProvisionedToAccount", stale).await.unwrap()["PermissionSets"], json!([]));
     let provision = sso("ProvisionPermissionSet", on(json!({ "TargetType": "ALL_PROVISIONED_ACCOUNTS" }))).await.unwrap();
     assert_eq!(provision["PermissionSetProvisioningStatus"]["Status"], "SUCCEEDED");
 
@@ -226,7 +262,8 @@ async fn permission_sets_and_assignments() {
 /// Migration 65 (`db::PERMISSION_SET_ACCOUNTS`) provisions each permission
 /// set to its own account, as the role it had, and has its assignments,
 /// the console's sessions acting as it and sso-admin's requests target that
-/// account.
+/// account; migration 66 (`db::PERMISSION_SET_DEFINITIONS`) has the set
+/// hold what its role did, as its latest version.
 #[tokio::test]
 async fn permission_sets_are_provisioned_to_their_account() {
     let Some(pool) = crate::e2e::fresh_database_through(64).await else { return };
@@ -244,6 +281,12 @@ async fn permission_sets_are_provisioned_to_their_account() {
              INSERT INTO permission_sets (id, account_id, short_id, name, session_duration, role_id)
                  VALUES ('00000000-0000-4000-8000-000000000003', '{account}', '0123456789abcdef', 'Readers', 3600,
                          '00000000-0000-4000-8000-000000000002');
+             INSERT INTO iam_role_policies (role_id, name, document)
+                 VALUES ('00000000-0000-4000-8000-000000000002', 'AwsSSOInlinePolicy',
+                         '{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\"Action\":\"s3:ListAllMyBuckets\",\"Resource\":\"*\"}}]}}');
+             INSERT INTO iam_role_attached_policies (role_id, aws_policy)
+                 VALUES ('00000000-0000-4000-8000-000000000002', 'AmazonS3ReadOnlyAccess');
+             UPDATE iam_roles SET boundary_aws = 'AmazonS3ReadOnlyAccess' WHERE id = '00000000-0000-4000-8000-000000000002';
              INSERT INTO permission_set_assignments (permission_set_id, user_id)
                  VALUES ('00000000-0000-4000-8000-000000000003', '00000000-0000-4000-8000-000000000001');
              INSERT INTO console_directory_sessions (token_hash, account_id, user_id, permission_set_id, expires_at)
@@ -258,13 +301,21 @@ async fn permission_sets_are_provisioned_to_their_account() {
     crate::db::init(&pool, usize::MAX).await.unwrap();
 
     let set = ic::load(&client, &account, "Readers").await.unwrap().unwrap();
-    assert_eq!(set.role_id, Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap());
-    let provisions: Vec<String> = ic::provisions(&client, &set).await.unwrap().into_iter().map(|p| p.account).collect();
-    assert_eq!(provisions, std::slice::from_ref(&account));
+    let role = Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap();
+    let provisions = ic::provisions(&client, &set).await.unwrap();
+    let provisioned: Vec<(&str, Uuid, bool)> = provisions.iter().map(|p| (p.account.as_str(), p.role_id, p.latest)).collect();
+    assert_eq!(provisioned, [(account.as_str(), role, true)]);
+    assert!(ic::inline_policy(&client, &set).await.unwrap().unwrap().contains("s3:ListAllMyBuckets"));
+    let attached: Vec<String> = ic::managed_policies(&client, &set).await.unwrap().into_iter().map(|a| a.name).collect();
+    assert_eq!(attached, ["AmazonS3ReadOnlyAccess"]);
+    assert_eq!(ic::boundary(&client, &set).await.unwrap().as_deref(), Some("arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess"));
+    // Provisioned again, its role holds the same.
+    assert_eq!(ic::provision(&client, &set, &account).await.unwrap(), Ok(()));
+    assert_eq!(crate::roles::attached(&client, role).await.unwrap().len(), 1);
     let assigned: Vec<String> = ic::assignments(&client, &account, None, None, None).await.unwrap().into_iter().map(|a| a.account).collect();
     assert_eq!(assigned, std::slice::from_ref(&account));
     let user = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
-    assert_eq!(ic::eligible(&client, &account, user).await.unwrap()[0].role_id, set.role_id);
+    assert_eq!(ic::eligible(&client, &account, user).await.unwrap()[0].role_id, role);
     let sessions: Vec<(Option<Uuid>, Option<String>)> = client
         .query("SELECT permission_set_id, target_account_id FROM console_directory_sessions ORDER BY token_hash", &[])
         .await

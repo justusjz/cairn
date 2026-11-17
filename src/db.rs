@@ -246,6 +246,7 @@ const MIGRATIONS: &[&str] = &[
     DIRECTORY_USERS,
     BATCH_INVENTORY_MANIFESTS,
     PERMISSION_SET_ACCOUNTS,
+    PERMISSION_SET_DEFINITIONS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3142,6 +3143,58 @@ ALTER TABLE sso_operations ADD COLUMN target_account_id text;
 UPDATE sso_operations SET target_account_id = account_id;
 "#;
 
+/// Migration 66: a permission set is what it holds, as Identity Center's:
+/// its inline policy, AWS managed policies (by name), customer managed
+/// policy references (by name and path, which each account it's
+/// provisioned to must have) and permissions boundary (AWS's, or a
+/// reference) are the set's, which provisioning copies into its role in an
+/// account (see `identity_center`). Its version rises with every change to
+/// them (or to its session duration); a provisioning notes the version its
+/// role holds, which is the latest until the set changes again. Each set so
+/// far is what its role in its own account holds, as provisioned there.
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const PERMISSION_SET_DEFINITIONS: &str = r#"
+ALTER TABLE permission_sets
+    ADD COLUMN inline_policy text,
+    ADD COLUMN boundary_aws  text,
+    ADD COLUMN boundary_name text,
+    ADD COLUMN boundary_path text,
+    ADD COLUMN version       bigint NOT NULL DEFAULT 1,
+    ADD CONSTRAINT permission_sets_one_boundary CHECK (boundary_aws IS NULL OR boundary_name IS NULL),
+    ADD CONSTRAINT permission_sets_boundary_reference CHECK ((boundary_name IS NULL) = (boundary_path IS NULL));
+ALTER TABLE permission_set_provisions ADD COLUMN version bigint NOT NULL DEFAULT 1;
+
+CREATE TABLE permission_set_managed_policies (
+    permission_set_id uuid NOT NULL REFERENCES permission_sets (id) ON DELETE CASCADE,
+    name              text NOT NULL,
+    PRIMARY KEY (permission_set_id, name)
+);
+CREATE TRIGGER permission_set_managed_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON permission_set_managed_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TABLE permission_set_customer_policies (
+    permission_set_id uuid NOT NULL REFERENCES permission_sets (id) ON DELETE CASCADE,
+    name              text NOT NULL,
+    path              text NOT NULL,
+    PRIMARY KEY (permission_set_id, path, name)
+);
+CREATE TRIGGER permission_set_customer_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON permission_set_customer_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+UPDATE permission_sets p SET inline_policy = rp.document
+FROM permission_set_provisions v JOIN iam_role_policies rp ON rp.role_id = v.role_id AND rp.name = 'AwsSSOInlinePolicy'
+WHERE v.permission_set_id = p.id AND v.account_id = p.account_id;
+INSERT INTO permission_set_managed_policies (permission_set_id, name)
+SELECT p.id, x.aws_policy FROM permission_sets p
+JOIN permission_set_provisions v ON v.permission_set_id = p.id AND v.account_id = p.account_id
+JOIN iam_role_attached_policies x ON x.role_id = v.role_id WHERE x.aws_policy IS NOT NULL;
+INSERT INTO permission_set_customer_policies (permission_set_id, name, path)
+SELECT p.id, m.name, m.path FROM permission_sets p
+JOIN permission_set_provisions v ON v.permission_set_id = p.id AND v.account_id = p.account_id
+JOIN iam_role_attached_policies x ON x.role_id = v.role_id JOIN managed_policies m ON m.id = x.policy_id;
+UPDATE permission_sets p SET boundary_aws = r.boundary_aws, boundary_name = m.name, boundary_path = m.path
+FROM permission_set_provisions v JOIN iam_roles r ON r.id = v.role_id LEFT JOIN managed_policies m ON m.id = r.boundary_policy_id
+WHERE v.permission_set_id = p.id AND v.account_id = p.account_id;
+"#;
 
 #[cfg(test)]
 mod tests {

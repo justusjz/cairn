@@ -1207,7 +1207,29 @@ mod e2e {
         assert_eq!(sets.as_array().unwrap().len(), 2);
         let readers_role = sets[1]["role_name"].as_str().unwrap().to_owned();
         assert!(readers_role.starts_with("AWSReservedSSO_Readers_"), "{sets}");
-        assert_eq!(sets[1]["role_arn"], format!("arn:aws:iam::{account}:role/aws-reserved/sso.amazonaws.com/{readers_role}"));
+        // Provisioned nowhere, until they're assigned.
+        assert_eq!(sets[1]["provisioned"], json!([]));
+        assert!(crate::roles::Role::load(&client, &account, &readers_role).await.unwrap().is_none());
+
+        // Assigned: Readers to the group, Admins to Ada herself.
+        let assign = |set: &str, kind: &str, id: &str| json!({ "permission_set": set, "principal_type": kind, "principal_id": id });
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Readers", "GROUP", &data_id))).await.0, StatusCode::CREATED);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &ada_id))).await.0, StatusCode::CREATED);
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &ada_id))).await.0, StatusCode::CONFLICT);
+        // Provisioned to the account, as roles there.
+        let (_, sets) = admin.send("GET", "/api/permission-sets", None).await;
+        let provisioned = &sets[1]["provisioned"];
+        assert_eq!(provisioned[0]["role_arn"], format!("arn:aws:iam::{account}:role/aws-reserved/sso.amazonaws.com/{readers_role}"));
+        assert_eq!((&provisioned[0]["account_id"], &provisioned[0]["latest"]), (&json!(account), &json!(true)));
+        // Changed in the console, it's provisioned again at once.
+        let both = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListAllMyBuckets","s3:ListBucket"],"Resource":"*"}]}"#;
+        let put = Some(json!({ "document": both }));
+        assert_eq!(admin.send("PUT", "/api/permission-sets/Readers/inline-policy", put).await.0, StatusCode::NO_CONTENT);
+        let role = crate::roles::Role::load(&client, &account, &readers_role).await.unwrap().unwrap();
+        let held = crate::roles::get_policy(&client, role.id, crate::identity_center::INLINE_POLICY).await.unwrap();
+        assert_eq!(held.as_deref(), Some(both));
+        let (_, sets) = admin.send("GET", "/api/permission-sets", None).await;
+        assert_eq!(sets[1]["provisioned"][0]["latest"], true);
 
         // IAM can't change their roles, nor make roles where they are.
         let (status, err) = admin.send("PATCH", &format!("/api/roles/{readers_role}"), Some(json!({ "description": "mine" }))).await;
@@ -1217,12 +1239,6 @@ mod e2e {
         let trust = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"sso.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
         let fake = json!({ "name": "fake", "path": "/aws-reserved/sso.amazonaws.com/", "trust": trust, "description": "" });
         assert_eq!(admin.send("POST", "/api/roles", Some(fake)).await.0, StatusCode::BAD_REQUEST);
-
-        // Assigned: Readers to the group, Admins to Ada herself.
-        let assign = |set: &str, kind: &str, id: &str| json!({ "permission_set": set, "principal_type": kind, "principal_id": id });
-        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Readers", "GROUP", &data_id))).await.0, StatusCode::CREATED);
-        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &ada_id))).await.0, StatusCode::CREATED);
-        assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &ada_id))).await.0, StatusCode::CONFLICT);
         assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "OTHER", &ada_id))).await.0, StatusCode::BAD_REQUEST);
         // Only to who's in the identity store (a group as a user, say, isn't).
         assert_eq!(admin.send("POST", "/api/assignments", Some(assign("Admins", "USER", &data_id))).await.0, StatusCode::NOT_FOUND);

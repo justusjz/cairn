@@ -1118,7 +1118,7 @@ export interface paths {
         /** Changes a permission set's description and session duration. */
         put: operations["update_permission_set"];
         post?: never;
-        /** Deletes a permission set: its assignments and its role go too. */
+        /** Deletes a permission set: its assignments and its roles go too. */
         delete: operations["delete_permission_set"];
         options?: never;
         head?: never;
@@ -3316,8 +3316,12 @@ export interface components {
             /** @description Whether it has an inline policy. */
             inline_policy: boolean;
             name: string;
-            role_arn: string;
-            /** @description The role it's provisioned as (which IAM can't change). */
+            /** @description The accounts it's provisioned to (none until it's first assigned). */
+            provisioned: components["schemas"]["ProvisionSummary"][];
+            /**
+             * @description The name of its role in each account it's provisioned to (which IAM
+             *     can't change).
+             */
             role_name: string;
             /**
              * Format: int32
@@ -3392,6 +3396,13 @@ export interface components {
         ProviderButton: {
             label: string;
             name: string;
+        };
+        /** @description A permission set's provisioning to an account. */
+        ProvisionSummary: {
+            account_id: string;
+            /** @description Whether its role there holds the set as it is now. */
+            latest: boolean;
+            role_arn: string;
         };
         Published: {
             message_id: string;

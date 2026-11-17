@@ -50,6 +50,21 @@ fn store(actor: &Actor) -> On {
     On::Arn(ic::identity_store_arn(actor.account()))
 }
 
+/// Provisions `set`, just changed, to the accounts it's provisioned to, so
+/// that saving it in the console takes effect there, if the session may
+/// (`sso:ProvisionPermissionSet` on it); else their roles keep what they
+/// hold, until it's provisioned. Saved, but not provisioned to one of them,
+/// it answers why.
+async fn reprovision(app: &Arc<App>, actor: &Actor, set: &PermissionSet) -> Result<StatusCode> {
+    if !actor.allows(app, "sso:ProvisionPermissionSet", On::Arn(set.arn())).await? {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    match ic::provision_all(&app.pool.get().await?, set).await? {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(why) => Err(ApiError::BadRequest(format!("saved, but not provisioned: {why}"))),
+    }
+}
+
 /// The session's permission set `name`, allowed `action` on it.
 async fn check_set(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str) -> Result<PermissionSet> {
     let set = ic::load(&app.pool.get().await?, actor.account(), name)
@@ -67,9 +82,11 @@ struct PermissionSetSummary {
     description: String,
     /// How long its sessions (and credentials) last, in seconds.
     session_duration: i32,
-    /// The role it's provisioned as (which IAM can't change).
+    /// The name of its role in each account it's provisioned to (which IAM
+    /// can't change).
     role_name: String,
-    role_arn: String,
+    /// The accounts it's provisioned to (none until it's first assigned).
+    provisioned: Vec<ProvisionSummary>,
     /// Whether it has an inline policy.
     inline_policy: bool,
     /// Its managed policies: AWS's (Cairn's), and the account's (customer
@@ -80,6 +97,15 @@ struct PermissionSetSummary {
     /// Its assignments.
     assignments: i64,
     created_at: f64,
+}
+
+/// A permission set's provisioning to an account.
+#[derive(Serialize, ToSchema)]
+struct ProvisionSummary {
+    account_id: String,
+    role_arn: String,
+    /// Whether its role there holds the set as it is now.
+    latest: bool,
 }
 
 #[utoipa::path(get, path = "/permission-sets", responses(
@@ -93,22 +119,26 @@ async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<
     let assignments = ic::assignments(&client, actor.account(), None, None, None).await?;
     let mut out = Vec::new();
     for set in ic::list(&client, actor.account()).await? {
-        let role = set.role(&client).await?;
+        let provisioned = ic::provisions(&client, &set)
+            .await?
+            .into_iter()
+            .map(|p| ProvisionSummary { role_arn: p.role_arn(), account_id: p.account, latest: p.latest })
+            .collect();
         out.push(PermissionSetSummary {
             arn: set.arn(),
-            role_arn: set.role_arn(),
+            role_name: set.role_name(),
+            provisioned,
             inline_policy: ic::inline_policy(&client, &set).await?.is_some(),
             attached: ic::managed_policies(&client, &set)
                 .await?
                 .into_iter()
                 .map(|a| AttachedPolicy { name: a.name, arn: a.arn })
                 .collect(),
-            boundary: role.boundary,
+            boundary: ic::boundary(&client, &set).await?,
             assignments: assignments.iter().filter(|a| a.permission_set == set.name).count() as i64,
             name: set.name,
             description: set.description,
             session_duration: set.session_duration,
-            role_name: set.role_name,
             created_at: set.created,
         });
     }
@@ -169,10 +199,10 @@ async fn update_permission_set(
     let set = check_set(&app, &actor, "sso:UpdatePermissionSet", &name).await?;
     let change = ic::Change { description: Some(&body.description), session_duration: Some(body.session_duration), relay_state: None };
     ic::update(&app.pool.get().await?, &set, &change).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
-/// Deletes a permission set: its assignments and its role go too.
+/// Deletes a permission set: its assignments and its roles go too.
 #[utoipa::path(delete, path = "/permission-sets/{name}", params(("name" = String, Path)), responses(
     (status = 204, description = "Deleted"),
     (status = "4XX", body = ErrorBody),
@@ -212,7 +242,7 @@ async fn put_inline_policy(
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:PutInlinePolicyToPermissionSet", &name).await?;
     ic::set_inline_policy(&app.pool.get().await?, &set, Some(&body.document)).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// Removes a permission set's inline policy.
@@ -224,7 +254,7 @@ async fn put_inline_policy(
 async fn delete_inline_policy(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:DeleteInlinePolicyFromPermissionSet", &name).await?;
     ic::set_inline_policy(&app.pool.get().await?, &set, None).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// The action that attaches or detaches a managed policy: AWS's, or a
@@ -252,7 +282,7 @@ async fn attach_managed_policy(
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, attach_action(&body.arn, true), &name).await?;
     ic::attach(&app.pool.get().await?, &set, &body.arn, true).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// Detaches a managed policy from a permission set.
@@ -269,7 +299,7 @@ async fn detach_managed_policy(
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, attach_action(&query.arn, false), &name).await?;
     ic::attach(&app.pool.get().await?, &set, &query.arn, false).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// Sets a permission set's permissions boundary: a managed policy (AWS's,
@@ -287,7 +317,7 @@ async fn put_permission_set_boundary(
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:PutPermissionsBoundaryToPermissionSet", &name).await?;
     ic::set_boundary(&app.pool.get().await?, &set, Some(&body.arn)).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// Removes a permission set's permissions boundary.
@@ -299,7 +329,7 @@ async fn put_permission_set_boundary(
 async fn delete_permission_set_boundary(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:DeletePermissionsBoundaryFromPermissionSet", &name).await?;
     ic::set_boundary(&app.pool.get().await?, &set, None).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// A permission set's assignment to a directory user or group, in an
@@ -375,7 +405,9 @@ async fn create_assignment(State(app): AppState, Extension(actor): Extension<Act
         .map_err(|_| ApiError::NotFound(format!("there's no {} {} in the identity store", kind.as_str().to_lowercase(), body.principal_id)))?;
     let set = check_set(&app, &actor, "sso:CreateAccountAssignment", &body.permission_set).await?;
     let account = body.account_id.as_deref().unwrap_or(actor.account());
-    ic::assign(&app.pool.get().await?, &set, account, kind, principal).await?;
+    if let Err(why) = ic::assign(&app.pool.get().await?, &set, account, kind, principal).await? {
+        return Err(ApiError::BadRequest(format!("{} can't be provisioned to {account}: {why}", set.name)));
+    }
     Ok(StatusCode::CREATED)
 }
 

@@ -64,8 +64,9 @@ Done:
   Identity Center's (OIDC identity sources, permission sets as reserved
   roles, assignments to users and groups, sso-admin's API and
   identitystore's reads): implemented. Permission sets provisioned per
-  account, and assignments and directory users' sessions in an account:
-  implemented, with the one account. Next, toward accounts as AWS
+  account (as roles made at their first assignment there, updated by
+  provisioning), and assignments and directory users' sessions in an
+  account: implemented, with the one account. Next, toward accounts as AWS
   Organizations has them (the existing account as the management
   account): directory users of Cairn's own, who sign in with passkeys
   (identitystore's writes, for them only); then member accounts, which

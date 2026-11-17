@@ -12,9 +12,11 @@
 //! `identitystore:DescribeUser`, …) on its resource: the instance, a
 //! permission set, the identity store, a user or group. A cluster has one
 //! account, so its instance is the only one, and the only target of
-//! assignments; its changes apply at once, so its asynchronous requests
-//! (assignments, provisioning) are done when they're answered, and their
-//! statuses say so. Applications, trusted token issuers, attributes for
+//! assignments. Its asynchronous requests (assignments, provisioning) are
+//! done when they're answered, and their statuses say so (`SUCCEEDED`, or
+//! `FAILED` with why: a customer managed policy the account hasn't, say);
+//! as in Identity Center, a permission set's changes reach its roles when
+//! it's provisioned again. Applications, trusted token issuers, attributes for
 //! access control, regions, the instance's own lifecycle, and the identity
 //! store's writes answer 501.
 
@@ -412,11 +414,7 @@ impl Ctx<'_> {
                         "{arn} isn't an AWS managed policy: attach the account's own as a customer managed policy reference."
                     )));
                 }
-                let attach = operation.starts_with("Attach");
-                if attach && ic::managed_policies(self.client, &set).await?.iter().any(|a| a.arn == arn) {
-                    return Err(conflict(format!("Permission set {} already has the managed policy {arn}.", set.name)));
-                }
-                ic::attach(self.client, &set, &arn, attach).await?;
+                ic::attach(self.client, &set, &arn, operation.starts_with("Attach")).await?;
                 Ok(json!({}))
             }
             "ListManagedPoliciesInPermissionSet" => {
@@ -433,11 +431,7 @@ impl Ctx<'_> {
             "AttachCustomerManagedPolicyReferenceToPermissionSet" | "DetachCustomerManagedPolicyReferenceFromPermissionSet" => {
                 let set = self.permission_set().await?;
                 let arn = self.reference(self.input.get("CustomerManagedPolicyReference"))?;
-                let attach = operation.starts_with("Attach");
-                if attach && ic::managed_policies(self.client, &set).await?.iter().any(|a| a.arn == arn) {
-                    return Err(conflict(format!("Permission set {} already has the customer managed policy {arn}.", set.name)));
-                }
-                ic::attach(self.client, &set, &arn, attach).await?;
+                ic::attach(self.client, &set, &arn, operation.starts_with("Attach")).await?;
                 Ok(json!({}))
             }
             "ListCustomerManagedPolicyReferencesInPermissionSet" => {
@@ -487,22 +481,24 @@ impl Ctx<'_> {
                 let set = self.permission_set().await?;
                 let principal = self.principal().await?;
                 let create = operation == "CreateAccountAssignment";
-                // Done at once; one there already (or gone already) is done too.
-                let kind = match create {
+                // Done at once; one there already (or gone already) is done
+                // too. Creating one provisions the set to the account, if
+                // it isn't yet: if that fails, so does the request.
+                let (kind, failure) = match create {
                     true => {
-                        match ic::assign(self.client, &set, &target, principal.0, principal.1).await {
-                            Ok(()) => {}
-                            Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => {}
+                        let failure = match ic::assign(self.client, &set, &target, principal.0, principal.1).await {
+                            Ok(done) => done.err(),
+                            Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => None,
                             Err(e) => return Err(e.into()),
-                        }
-                        OperationKind::Create
+                        };
+                        (OperationKind::Create, failure)
                     }
                     false => {
                         ic::unassign(self.client, &set, &target, principal.0, principal.1).await?;
-                        OperationKind::Delete
+                        (OperationKind::Delete, None)
                     }
                 };
-                let op = ic::record(self.client, &self.account, kind, &set.arn(), Some(&target), Some(principal), None).await?;
+                let op = ic::record(self.client, &self.account, kind, &set.arn(), Some(&target), Some(principal), failure.as_deref()).await?;
                 let key = if create { "AccountAssignmentCreationStatus" } else { "AccountAssignmentDeletionStatus" };
                 Ok(json!({ key: self.assignment_status(&op) }))
             }
@@ -562,7 +558,14 @@ impl Ctx<'_> {
                     Some("AWS_ACCOUNT") => Some(self.target("TargetId", None)?),
                     _ => return Err(validation("TargetType must be AWS_ACCOUNT or ALL_PROVISIONED_ACCOUNTS.")),
                 };
-                let op = ic::record(self.client, &self.account, OperationKind::Provision, &set.arn(), target.as_deref(), None, None).await?;
+                // Done at once: its roles hold the set as it is now.
+                let done = match &target {
+                    Some(account) => ic::provision(self.client, &set, account).await?,
+                    None => ic::provision_all(self.client, &set).await?,
+                };
+                let failure = done.err();
+                let op = ic::record(self.client, &self.account, OperationKind::Provision, &set.arn(), target.as_deref(), None, failure.as_deref())
+                    .await?;
                 Ok(json!({ "PermissionSetProvisioningStatus": self.provisioning_status(&op) }))
             }
             "DescribePermissionSetProvisioningStatus" => {
@@ -586,27 +589,25 @@ impl Ctx<'_> {
                 let instance = self.instance()?;
                 self.check(&instance)?;
                 let target = self.target("AccountId", None)?;
-                // Provisioned: assigned there (Cairn provisions at once).
-                let assigned = ic::assignments(self.client, &self.account, Some(&target), None, None).await?;
-                let stale = self.text("ProvisioningStatus") == Some("LATEST_PERMISSION_SET_NOT_PROVISIONED");
-                let sets: Vec<String> = ic::list(self.client, &self.account)
+                let wanted = self.provisioning_filter()?;
+                let sets: Vec<String> = ic::provisioned_to(self.client, &self.account, &target)
                     .await?
                     .iter()
-                    .filter(|s| !stale && assigned.iter().any(|a| a.permission_set == s.name))
-                    .map(PermissionSet::arn)
+                    .filter(|(_, latest)| wanted.is_none_or(|w| w == *latest))
+                    .map(|(set, _)| set.arn())
                     .collect();
                 let (page, next) = self.page(sets)?;
                 Ok(with_token(json!({ "PermissionSets": page }), next))
             }
             "ListAccountsForProvisionedPermissionSet" => {
                 let set = self.permission_set().await?;
-                // Provisioned: assigned there (Cairn provisions at once).
-                let mut accounts: Vec<String> =
-                    ic::assignments(self.client, &self.account, None, Some(set.id), None).await?.into_iter().map(|a| a.account).collect();
-                accounts.dedup();
-                if self.text("ProvisioningStatus") == Some("LATEST_PERMISSION_SET_NOT_PROVISIONED") {
-                    accounts.clear();
-                }
+                let wanted = self.provisioning_filter()?;
+                let accounts: Vec<String> = ic::provisions(self.client, &set)
+                    .await?
+                    .into_iter()
+                    .filter(|p| wanted.is_none_or(|w| w == p.latest))
+                    .map(|p| p.account)
+                    .collect();
                 let (page, next) = self.page(accounts)?;
                 Ok(with_token(json!({ "AccountIds": page }), next))
             }
@@ -633,8 +634,9 @@ impl Ctx<'_> {
         i32::try_from(seconds).map(Some).map_err(|_| validation("SessionDuration is from PT1H to PT12H."))
     }
 
-    /// A customer managed policy reference's policy's ARN (the account's,
-    /// which must exist).
+    /// A customer managed policy reference's policy's ARN, as the instance's
+    /// account has it (which needn't have it: each account the set is
+    /// provisioned to must).
     fn reference(&self, reference: Option<&Value>) -> Result<String> {
         let name = reference.and_then(|r| r.get("Name")).and_then(Value::as_str).filter(|n| !n.is_empty());
         let Some(name) = name else {
@@ -671,6 +673,20 @@ impl Ctx<'_> {
             .await?
             .pop()
             .ok_or_else(|| not_found(format!("There's no request {text}.")))
+    }
+
+    /// `ProvisioningStatus`, if given: whether the latest version is
+    /// wanted (`LATEST_PERMISSION_SET_PROVISIONED`), or one that isn't
+    /// (`LATEST_PERMISSION_SET_NOT_PROVISIONED`).
+    fn provisioning_filter(&self) -> Result<Option<bool>> {
+        match self.text("ProvisioningStatus") {
+            None => Ok(None),
+            Some("LATEST_PERMISSION_SET_PROVISIONED") => Ok(Some(true)),
+            Some("LATEST_PERMISSION_SET_NOT_PROVISIONED") => Ok(Some(false)),
+            Some(other) => Err(validation(format!(
+                "ProvisioningStatus {other} isn't LATEST_PERMISSION_SET_PROVISIONED or LATEST_PERMISSION_SET_NOT_PROVISIONED."
+            ))),
+        }
     }
 
     fn status_filter(&self) -> Result<Option<&str>> {

@@ -1085,9 +1085,14 @@ Identity Center's APIs (below):
 - A **permission set** is a set of policies (an inline one,
   `AwsSSOInlinePolicy`, AWS's managed policies, the account's own as
   *customer managed policy references*, and a permissions boundary) and a
-  session length (1 to 12 hours). Cairn makes a role for each one, as
-  Identity Center does, at
-  `/aws-reserved/sso.amazonaws.com/AWSReservedSSO_<set>_<suffix>`. The role
+  session length (1 to 12 hours). When it's first assigned in an account,
+  Cairn **provisions** it there, as Identity Center does: makes a role
+  holding those policies, at
+  `/aws-reserved/sso.amazonaws.com/AWSReservedSSO_<set>_<suffix>`, with
+  the account's own policies the references name (which it must have).
+  Changes to the set reach its roles when it's provisioned again: the
+  console does that when you save, sso-admin's `ProvisionPermissionSet`
+  otherwise. The role
   trusts only `sso.amazonaws.com`, so no one assumes it through STS, and IAM
   refuses to change it (`UnmodifiableEntity`), or to make roles under
   `/aws-reserved/`.

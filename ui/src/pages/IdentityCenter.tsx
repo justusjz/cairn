@@ -363,11 +363,24 @@ export function PermissionSetPage() {
                     </button>
                   </Show>
                 </dd>
-                <dt>Role</dt>
+                <dt>Provisioned to</dt>
                 <dd>
-                  <A class="mono" href={roleHref(s().role_name)} title={s().role_arn}>
-                    {s().role_name}
-                  </A>
+                  <For
+                    each={s().provisioned}
+                    fallback={<span class="subtle">no account yet: it's provisioned when it's first assigned</span>}
+                  >
+                    {(p) => (
+                      <div>
+                        <span class="mono small">{p.account_id}</span>{" "}
+                        <A class="mono" href={roleHref(s().role_name)} title={p.role_arn}>
+                          {s().role_name}
+                        </A>{" "}
+                        <Show when={!p.latest}>
+                          <Badge tone="warn">not the latest</Badge>
+                        </Show>
+                      </div>
+                    )}
+                  </For>
                 </dd>
               </dl>
             </Panel>

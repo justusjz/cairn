@@ -3732,7 +3732,7 @@
         }
       },
       "delete": {
-        "summary": "Deletes a permission set: its assignments and its role go too.",
+        "summary": "Deletes a permission set: its assignments and its roles go too.",
         "operationId": "delete_permission_set",
         "parameters": [
           {
@@ -10146,7 +10146,7 @@
           "description",
           "session_duration",
           "role_name",
-          "role_arn",
+          "provisioned",
           "inline_policy",
           "attached",
           "assignments",
@@ -10189,12 +10189,16 @@
           "name": {
             "type": "string"
           },
-          "role_arn": {
-            "type": "string"
+          "provisioned": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProvisionSummary"
+            },
+            "description": "The accounts it's provisioned to (none until it's first assigned)."
           },
           "role_name": {
             "type": "string",
-            "description": "The role it's provisioned as (which IAM can't change)."
+            "description": "The name of its role in each account it's provisioned to (which IAM\ncan't change)."
           },
           "session_duration": {
             "type": "integer",
@@ -10395,6 +10399,27 @@
             "type": "string"
           },
           "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ProvisionSummary": {
+        "type": "object",
+        "description": "A permission set's provisioning to an account.",
+        "required": [
+          "account_id",
+          "role_arn",
+          "latest"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "latest": {
+            "type": "boolean",
+            "description": "Whether its role there holds the set as it is now."
+          },
+          "role_arn": {
             "type": "string"
           }
         }
