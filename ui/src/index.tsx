@@ -8,7 +8,7 @@ import { A, Navigate, Route, Router, type RouteSectionProps, useNavigate } from 
 import { For, Show, createEffect, createResource, createRoot, createSignal, onCleanup } from "solid-js";
 import { render } from "solid-js/web";
 import { Badge, Loading, Panel, Table, Toasts, act, poll, toast } from "./components/ui";
-import { ago, date } from "./format";
+import { ago, clock, date } from "./format";
 import { api as manage, setOperatorMode } from "./api";
 import { BucketBrowser, BucketList, ObjectPage } from "./pages/Buckets";
 import Integrity from "./pages/Integrity";
@@ -102,9 +102,27 @@ function Layout(props: RouteSectionProps) {
         </nav>
         <Show when={me()}>{(m) => <UserMenu me={m()} logout={logout} />}</Show>
       </header>
+      <Show when={me()?.root && me()}>{(m) => <RootBanner me={m()} logout={logout} />}</Show>
       <main>{props.children}</main>
       <Toasts />
     </>
+  );
+}
+
+/** On every page while the account's root user is signed in: what that
+ * means, and when the session ends. */
+function RootBanner(props: { me: Me; logout: () => void }) {
+  return (
+    <div class="root-banner" role="status">
+      <span>
+        <strong>You're the account's root user.</strong> No identity policy restricts you; buckets' and topics' policies
+        that deny you still do, but you can always change a bucket's policy.
+        <Show when={props.me.expires_at}>{(t) => <> This session ends at {clock(t())} at the latest.</>}</Show>
+      </span>
+      <button class="small" onClick={props.logout}>
+        Sign out
+      </button>
+    </div>
   );
 }
 
@@ -173,7 +191,7 @@ function UserMenu(props: { me: Me; logout: () => void }) {
           </div>
           <hr />
           <A role="menuitem" class="menu-item" href="/account" onClick={() => setOpen(false)}>
-            Passkeys and sign-in
+            {props.me.root ? "Who you are" : "Passkeys and sign-in"}
           </A>
           <button role="menuitem" class="menu-item" onClick={props.logout}>
             Sign out
@@ -397,7 +415,7 @@ function Home() {
   return (
     <SignedIn>
       {(m) => (
-        <>
+        <Show when={!m.root} fallback={<RootHome me={m} />}>
           <div class="page-head">
             <h1>Your sign-in</h1>
             <span class="subtle small">login {m.name}</span>
@@ -423,9 +441,81 @@ function Home() {
               doesn't.
             </p>
           </Panel>
-        </>
+        </Show>
       )}
     </SignedIn>
+  );
+}
+
+/** Who the account's root user is: no login, so nothing of its own to set. */
+function RootHome(props: { me: Me }) {
+  return (
+    <>
+      <div class="page-head">
+        <h1>The root user</h1>
+      </div>
+      <Panel title="Who you are">
+        <Table count={1} columns={["As", "ARN"]}>
+          <tr>
+            <td class="mono">root</td>
+            <td class="mono small">{props.me.identity.arn}</td>
+          </tr>
+        </Table>
+        <p class="subtle small">
+          You're the account itself, as AWS's root user: no identity policy, permissions boundary or group restricts
+          you. A bucket's or topic's policy that denies you (everyone, or the account) still does, but you can always
+          read, change and delete a bucket's policy. You signed in with a link from the command line, so your session
+          isn't multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span> is false). It has no passkeys: the
+          only way in is another link (<span class="mono">cairn account root-link</span> on a node).
+        </p>
+      </Panel>
+    </>
+  );
+}
+
+/** Signing in as the account's root user, with a link from the command line
+ * (`cairn account root-link`): the button uses it up. */
+function RootSignIn() {
+  const navigate = useNavigate();
+  const token = location.hash.slice(1);
+  // The token stays out of the history and the address bar once read.
+  history.replaceState(null, "", location.pathname);
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string | undefined>(token ? undefined : "This link has no token.");
+  const signIn = async () => {
+    setBusy(true);
+    setError(undefined);
+    try {
+      setMe(await api.rootSignIn(token));
+      navigate("/");
+    } catch (e) {
+      setError(explain(e));
+      setBusy(false);
+    }
+  };
+  return (
+    <div class="signin">
+      <Panel title="Sign in as the root user">
+        <p>
+          This link signs you in as the account's root user, whom no identity policy restricts: for getting back in
+          when policies lock everyone else out. It works once, and the session lasts an hour at most.
+        </p>
+        <Show when={me()}>
+          {(m) => (
+            <p class="subtle small">
+              You're signed in as <span class="mono">{m().name}</span>; this replaces that session.
+            </p>
+          )}
+        </Show>
+        <button class="primary" disabled={busy() || !token} onClick={signIn}>
+          Sign in as root
+        </button>
+        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+        <p class="subtle small">
+          If it doesn't work anymore, make another on a node: <span class="mono">cairn account root-link</span>.
+        </p>
+      </Panel>
+    </div>
   );
 }
 
@@ -594,6 +684,7 @@ render(
       <Route path="/topics/:name" component={Guarded(TopicPage)} />
       <Route path="/login" component={Login} />
       <Route path="/enroll" component={Enroll} />
+      <Route path="/root" component={RootSignIn} />
       <Route path="*" component={NotFound} />
     </Router>
   ),

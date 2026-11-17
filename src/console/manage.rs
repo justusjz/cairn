@@ -1028,8 +1028,14 @@ struct BucketAccess {
     policy: Option<String>,
     /// Whether the policy makes the bucket public.
     public: bool,
-    /// Its public access block; `null` if it has none.
+    /// Its public access block; `null` if it has none, or the actor may not
+    /// see it (`public_access_block_hidden`).
     public_access_block: Option<crate::s3::buckets::public_access::Block>,
+    /// Whether the actor may not see the bucket's public access block
+    /// (`s3:GetBucketPublicAccessBlock`): its policy is shown all the same,
+    /// so that whoever may change a policy that denies everything else (the
+    /// account's root user, say) can.
+    public_access_block_hidden: bool,
     /// Its account's public access block, if it has one, which applies to
     /// the bucket as well.
     account_public_access_block: Option<crate::s3::buckets::public_access::Block>,
@@ -1104,11 +1110,8 @@ async fn get_bucket_access(
 ) -> Result<Json<BucketAccess>> {
     use crate::s3::buckets::{policy, public_access};
     let on = || On::Bucket(bucket.clone());
-    let checks = [
-        Check { action: "s3:GetBucketPolicy", on: on() },
-        Check { action: "s3:GetBucketPublicAccessBlock", on: on() },
-    ];
-    actor.check_all(&app, &checks).await?;
+    actor.check(&app, "s3:GetBucketPolicy", on()).await?;
+    let block_visible = actor.allows(&app, "s3:GetBucketPublicAccessBlock", on()).await?;
     let client = app.pool.get().await?;
     let no_bucket = || ApiError::NotFound(format!("no bucket named {bucket:?}"));
     let policy = policy::shown(&client, &bucket).await?.ok_or_else(no_bucket)?;
@@ -1123,7 +1126,10 @@ async fn get_bucket_access(
             .is_public(),
         None => false,
     };
-    let public_access_block = public_access::get(&app, &bucket).await?.ok_or_else(no_bucket)?;
+    let public_access_block = match block_visible {
+        true => public_access::get(&app, &bucket).await?.ok_or_else(no_bucket)?,
+        false => None,
+    };
     // Its account's users, if the actor may see them.
     let owner: String = client.query_one_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await?.get(0);
     let account_public_access_block = public_access::account(&client, &owner).await?;
@@ -1137,7 +1143,14 @@ async fn get_bucket_access(
             .collect(),
         false => Vec::new(),
     };
-    Ok(Json(BucketAccess { policy, public, public_access_block, account_public_access_block, users }))
+    Ok(Json(BucketAccess {
+        policy,
+        public,
+        public_access_block,
+        public_access_block_hidden: !block_visible,
+        account_public_access_block,
+        users,
+    }))
 }
 
 /// Sets a bucket's policy, as PutBucketPolicy does: checked as S3 checks

@@ -424,7 +424,7 @@ where
         Err(refused) => return Ok(refused),
     };
     let conditions = Preconditions::default();
-    let role = principal.map(|principal| principal.id);
+    let role = principal.and_then(|principal| principal.kms_role());
     let body = FileBody(file);
     let response = match put_object(app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &conditions, wanted, role, lock)
         .await

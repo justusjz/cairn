@@ -671,8 +671,7 @@ export function EnrollmentDialog(props: { user: string; url?: string | null; pat
       </p>
       <Show when={!props.url}>
         <p class="subtle small">
-          This node doesn't serve the console, so put the console's URL in front (as with{" "}
-          <span class="mono">cairn user enroll --console-url</span>).
+          This node doesn't know the console's URL (<span class="mono">--console-url</span>), so put it in front.
         </p>
       </Show>
       <div class="secret">

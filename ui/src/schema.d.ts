@@ -1242,6 +1242,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/root/sign-in": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Signs in as the account's root user, with a link the command line on a
+         *     node made (`cairn account root-link`), which it uses up. The session is
+         *     short (an hour at most), and not multi-factor.
+         */
+        post: operations["root_sign_in"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/settings/{name}": {
         parameters: {
             query?: never;
@@ -1771,6 +1792,13 @@ export interface components {
             /** @description Whether the policy makes the bucket public. */
             public: boolean;
             public_access_block?: components["schemas"]["Block"] | null;
+            /**
+             * @description Whether the actor may not see the bucket's public access block
+             *     (`s3:GetBucketPublicAccessBlock`): its policy is shown all the same,
+             *     so that whoever may change a policy that denies everything else (the
+             *     account's root user, say) can.
+             */
+            public_access_block_hidden: boolean;
             /**
              * @description The bucket's account's users whose own policies (inline and
              *     attached) give them access to the whole bucket, and what.
@@ -2584,13 +2612,22 @@ export interface components {
              */
             sweep_shard: number;
         };
-        /** @description The signed-in login: who it acts as, its passkeys. */
+        /**
+         * @description The signed-in login: who it acts as, its passkeys. Or the account's
+         *     root user (`root`), which has no login: no passkeys or providers.
+         */
         Me: {
             /**
              * @description Whether it may see the cluster (`cairn:GetCluster`): it's an
              *     operator, and the console shows it the cluster's pages.
              */
             cluster: boolean;
+            /**
+             * Format: double
+             * @description When the root user's session ends at the latest (seconds since the
+             *     epoch); a login's has none here.
+             */
+            expires_at?: number | null;
             /** @description Who the session acts as. */
             identity: components["schemas"]["IdentitySummary"];
             /**
@@ -2598,11 +2635,16 @@ export interface components {
              *     else at an OIDC provider).
              */
             mfa: boolean;
-            /** @description The login's name. */
+            /** @description The login's name (`root` for the root user). */
             name: string;
             /** @description Its identities at OIDC providers, which sign it in too. */
             oidc: components["schemas"]["LinkedProvider"][];
             passkeys: components["schemas"]["PasskeySummary"][];
+            /**
+             * @description Whether the session is the account's root user's, which no identity
+             *     policy restricts (only resource policies' denies do).
+             */
+            root: boolean;
             /** @description The OIDC provider this session was signed in at, if it was. */
             signed_in_at?: string | null;
         };
@@ -3115,6 +3157,10 @@ export interface components {
              *     rest are set (TagRole).
              */
             tags: components["schemas"]["Tag"][];
+        };
+        RootSignIn: {
+            /** @description The token of the root user's link (after its `#`). */
+            token: string;
         };
         RoutingRule: {
             condition?: components["schemas"]["Condition"] | null;
@@ -7114,6 +7160,46 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    root_sign_in: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RootSignIn"];
+            };
+        };
+        responses: {
+            /** @description Signed in as the root user; the session's cookie is set */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
             };
             "4XX": {
                 headers: {

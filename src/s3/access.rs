@@ -138,6 +138,8 @@ pub struct Access {
 /// Who makes a request, as policies see it (an owned `policy::Principal`).
 enum Who_ {
     User { account: String, name: String, id: String },
+    /// An account's root user (see `policy::root_verdict`).
+    Root { account: String },
     Session { account: String, role: String, id: String, session: String },
     Federated { account: String, name: String },
 }
@@ -146,6 +148,9 @@ impl Who_ {
     fn of(principal: &Principal) -> Who_ {
         use crate::sessions::Who as Session;
         let account = principal.account.clone();
+        if principal.root {
+            return Who_::Root { account };
+        }
         match principal.session.as_ref().map(|s| &s.session.who) {
             Some(Session::Role { session, .. }) => Who_::Session {
                 account,
@@ -162,6 +167,7 @@ impl Who_ {
     fn as_policy(&self) -> Who<'_> {
         match self {
             Who_::User { account, name, id } => Who::User { account, name, id },
+            Who_::Root { account } => Who::Root { account },
             // A session's role by its name only, as session ARNs name it.
             Who_::Session { account, role, id, session } => Who::Session { account, role: role_name(role), id, session },
             Who_::Federated { account, name } => Who::Federated { account, name },
@@ -170,7 +176,10 @@ impl Who_ {
 
     fn account(&self) -> &str {
         match self {
-            Who_::User { account, .. } | Who_::Session { account, .. } | Who_::Federated { account, .. } => account,
+            Who_::User { account, .. }
+            | Who_::Root { account }
+            | Who_::Session { account, .. }
+            | Who_::Federated { account, .. } => account,
         }
     }
 }
@@ -428,6 +437,11 @@ impl Access {
         // Only the `s3:` keys this action takes (see `Context::for_action`).
         let context = context.for_action(check.action);
         let request = crate::policy::Request { principal, action: check.action, resource: &resource, context: &context };
+        // An account's root user: no identity policy restricts it, only
+        // resource policies (a bucket's, a topic's) may.
+        if let Some(Who_::Root { account }) = &self.user {
+            return crate::policy::root_verdict(bucket, &request, owner.is_none_or(|owner| owner == account));
+        }
         let cross = match (&self.user, owner) {
             (Some(who), Some(owner)) => who.account() != owner,
             _ => false,
@@ -443,6 +457,10 @@ impl Access {
     /// `role` (its ARN), with the condition keys `extra` too (see
     /// `policy::trust_allows`).
     pub fn trusted(&self, action: &str, role: &str, trust: &Policy, extra: &Context) -> bool {
+        // An account's root user assumes no role, as in AWS.
+        if matches!(self.user, Some(Who_::Root { .. })) {
+            return false;
+        }
         let principal = self.user.as_ref().map_or(Who::Anonymous, Who_::as_policy);
         let mut context = self.context.clone();
         context.extend(extra);
@@ -588,7 +606,7 @@ fn context(
             let session = principal.session.as_ref().map(|of| &of.session);
             // A user's name, but a role session's or a federated user's
             // (probed).
-            if !matches!(session.map(|s| &s.who), Some(Session::Role { .. } | Session::Federated { .. })) {
+            if !principal.root && !matches!(session.map(|s| &s.who), Some(Session::Role { .. } | Session::Federated { .. })) {
                 context.set("aws:username", &principal.name);
             }
             context.set("aws:userid", principal.unique_id());
@@ -598,6 +616,7 @@ fn context(
             }
             context.set("aws:PrincipalAccount", &principal.account);
             let kind = match session.map(|s| &s.who) {
+                _ if principal.root => "Account",
                 Some(Session::Role { .. }) => "AssumedRole",
                 Some(Session::Federated { .. }) => "FederatedUser",
                 _ => "User",

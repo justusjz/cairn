@@ -107,6 +107,11 @@ pub enum Principal<'a> {
     Session { account: &'a str, role: &'a str, id: &'a str, session: &'a str },
     /// A federated user (GetFederationToken's), by its name.
     Federated { account: &'a str, name: &'a str },
+    /// The root user of `account`: the account itself
+    /// (`arn:aws:iam::<account>:root`), whom identity policies don't
+    /// restrict (see `root_verdict`). Only the console signs it in, with a
+    /// link the command line on a node makes.
+    Root { account: &'a str },
     /// A web identity (AssumeRoleWithWebIdentity's caller), by its OIDC
     /// provider's ARN (`arn:aws:iam::<account>:oidc-provider/<url>`).
     WebIdentity { provider: &'a str },
@@ -318,10 +323,28 @@ pub fn trust_allows<'p>(
     }
 }
 
-/// The actions on a bucket's policy, which no other account may take,
-/// whatever it allows (see `s3::access::Access::foreign`). (A policy that
-/// denies everyone them is undone with `cairn bucket-policy delete`.)
+/// The actions on a bucket's policy, which its account's root user may
+/// always take, whatever the policy says (AWS's way out of a policy that
+/// denies everyone), and no other account may take, whatever it allows (see
+/// `s3::access::Access::foreign`).
 pub const POLICY_ACTIONS: [&str; 3] = ["s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy"];
+
+/// The verdict on a request by an account's root user (`request.principal`),
+/// as AWS decides it: no identity policy, boundary or session policy
+/// restricts it, so it may do anything to what its account owns (`owns`);
+/// but a resource policy's `Deny` that's about it (everyone, or its account)
+/// denies it, other than getting, setting and deleting a bucket's policy;
+/// and something of another account only if that resource's policy allows
+/// it.
+pub fn root_verdict(resource: Option<&Policy>, request: &Request, owns: bool) -> Verdict {
+    let exempt = owns && POLICY_ACTIONS.contains(&request.action);
+    match resource.map(|policy| policy.evaluate(request)) {
+        Some(Decision::Deny) if !exempt => Verdict::ExplicitDeny { identity: false },
+        Some(Decision::Allow) => Verdict::Allow,
+        _ if owns => Verdict::Allow,
+        _ => Verdict::ImplicitDeny,
+    }
+}
 
 /// What a policy is attached to, which decides what it may say.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -418,6 +441,9 @@ impl Principals {
         let whole = |account: &str| self.accounts.iter().any(|a| a == account);
         match principal {
             Principal::Anonymous => direct(self.everyone != self.not),
+            // The account itself: named by the account (its ID or root ARN),
+            // or everyone; `NotPrincipal` naming the account leaves it out.
+            Principal::Root { account } => direct((self.everyone || whole(account)) != self.not),
             Principal::Session { account, role, id, session } => {
                 let named = self.sessions.iter().any(|(a, r, s)| a == account && r == role && s == session);
                 let by_role = self.roles.iter().any(|(a, n)| a == account && ids.get(&role_arn(a, n)).is_some_and(|named| named == id));

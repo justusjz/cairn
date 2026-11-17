@@ -479,6 +479,10 @@ pub async fn create_session(
             return Ok(access.denied(&check, verdict));
         }
     }
+    // The root user's key is for getting back in, not for S3 Express.
+    if principal.root {
+        return Ok(format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "The root user can't create a directory bucket's session"));
+    }
     let now = sessions::now();
     let mut session = match parent {
         // A role's (or another STS) session's: as it is, but its own key,

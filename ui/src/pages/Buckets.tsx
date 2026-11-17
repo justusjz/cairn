@@ -598,40 +598,45 @@ function AccessDialog(props: { bucket: string; onClose: () => void }) {
               </For>
             </Table>
             <h3>Public access block</h3>
-            <p class="subtle small">
-              <Show when={a().public_access_block} fallback="The bucket has no block of its own: only its account's applies.">
-                The bucket's own block. Its account's applies as well
-                {a().account_public_access_block?.block_public_policy || a().account_public_access_block?.restrict_public_buckets
-                  ? " (it has some on)"
-                  : " (it has none on)"}
-                .
-              </Show>
-            </p>
-            <For each={FLAGS}>
-              {(f) => (
-                <div>
-                  <label class="check" title={f.note}>
-                    <input
-                      type="checkbox"
-                      checked={block()[f.key]}
-                      onChange={(e) => setBlock({ ...block(), [f.key]: e.currentTarget.checked })}
-                    />
-                    {f.label}
-                  </label>{" "}
-                  <span class="subtle small">{f.note}</span>
-                </div>
-              )}
-            </For>
-            <div class="buttons">
-              <Show when={a().public_access_block}>
-                <button type="button" class="danger" onClick={removeBlock}>
-                  Remove block
+            <Show
+              when={!a().public_access_block_hidden}
+              fallback={<p class="subtle small">Your policies don't let you see the bucket's own block.</p>}
+            >
+              <p class="subtle small">
+                <Show when={a().public_access_block} fallback="The bucket has no block of its own: only its account's applies.">
+                  The bucket's own block. Its account's applies as well
+                  {a().account_public_access_block?.block_public_policy || a().account_public_access_block?.restrict_public_buckets
+                    ? " (it has some on)"
+                    : " (it has none on)"}
+                  .
+                </Show>
+              </p>
+              <For each={FLAGS}>
+                {(f) => (
+                  <div>
+                    <label class="check" title={f.note}>
+                      <input
+                        type="checkbox"
+                        checked={block()[f.key]}
+                        onChange={(e) => setBlock({ ...block(), [f.key]: e.currentTarget.checked })}
+                      />
+                      {f.label}
+                    </label>{" "}
+                    <span class="subtle small">{f.note}</span>
+                  </div>
+                )}
+              </For>
+              <div class="buttons">
+                <Show when={a().public_access_block}>
+                  <button type="button" class="danger" onClick={removeBlock}>
+                    Remove block
+                  </button>
+                </Show>
+                <button type="button" class="primary" onClick={saveBlock}>
+                  Save block
                 </button>
-              </Show>
-              <button type="button" class="primary" onClick={saveBlock}>
-                Save block
-              </button>
-            </div>
+              </div>
+            </Show>
             <h3>
               Bucket policy{" "}
               <Show when={a().public}>

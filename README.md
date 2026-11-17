@@ -134,7 +134,7 @@ cairn user create admin --admin --key  # prints its access key ID and secret
 ```
 
 The `cairn` commands that manage the cluster (`user`, `account`, `oidc`,
-`bucket-policy`, `config` and `node`) don't touch the database themselves:
+`config`, `node` and `sessions`) don't touch the database themselves:
 they run on a node, sent to its peer endpoint. That's the node on this
 host by default (`http://127.0.0.1:9431`, the default `--listen-peer`), or
 the one `--peer-url` (`CAIRN_PEER_URL`, as `cairn serve` has it) names, so
@@ -353,8 +353,8 @@ allows; else it's denied. They are:
   And the account's own (`arn:aws:iam::<account>:policy/<name>`), made with
   the console's Policies page or the IAM API: a document of up to 6,144
   characters (but whitespace); a user has at most 10 attached, as in IAM.
-  **Grants** (deprecated, as `cairn user grant` is) were the simple way to
-  make them: `cairn user grant` attaches
+  **Grants** were the simple way to make them (the console's bucket
+  access template still makes them): a grant attaches
   the account's policy `/cairn/grants/<bucket>-<permission>` (making it,
   the first time; with a suffix if another policy has the name). Only
   policies at that path are taken for grants: IAM decides who may change a
@@ -379,7 +379,7 @@ allows; else it's denied. They are:
   bucket's policy; the access is the same. Upgrade every node: one from
   before doesn't know managed policies, and denies what they allow.)
 - its **inline policies**: identity policies of its own, for anything finer
-  (per key prefix, by condition, ...), set with `cairn user policy`;
+  (per key prefix, by condition, ...), set with PutUserPolicy;
 - its **groups'** policies, as if they were its own: a **group** has inline
   policies (at most 5,120 characters together) and managed ones (at most
   10) as a user has, and members, the account's users, each in at most 10
@@ -409,25 +409,71 @@ allows; else it's denied. They are:
   in S3. A bucket policy can allow other users, or anyone: unsigned requests
   are **anonymous**, and only a bucket policy with `"Principal": "*"` can
   allow them (a public bucket, say). Users are named in policies as
-  `arn:aws:iam::<account>:user/<path…/name>`; their account's ID is in
-  `cairn user list`. As in S3, a bucket policy names the user that
+  `arn:aws:iam::<account>:user/<path…/name>` (`aws sts
+  get-caller-identity` says the account's ID). As in S3, a bucket policy names the user that
   had the name when the policy was set: a user deleted and created again
   under the same name isn't allowed what the first was, and the policy then
   shows the first by its ID; one renamed or moved since still is, and the
   policy shows its ARN as it is now.
 
 **One account**, as AWS's: Cairn has one (a 12-digit ID), which every user,
-bucket and policy belongs to; `cairn account show` shows it. Teams are kept
+bucket and policy belongs to. Teams are kept
 apart by IAM, as within an AWS account: users' paths (`/team-a/`),
 permissions boundaries, and policies that give each team its own buckets,
 down to the names it may create (`s3:CreateBucket` on
-`arn:aws:s3:::team-a-*`). There's no root user, which no policy restricts:
-the way out of policies that lock people out is the command line on a node
-(`cairn user update <name> --admin`, `cairn user detach`, `cairn user
-unbound`, `cairn bucket-policy delete`), which reaches the database anyway.
+`arn:aws:s3:::team-a-*`).
+
+The account has a **root user**, as AWS's, for getting back in when
+policies lock everyone out. Only the command line on a node can make
+someone the root: it has no passkeys, long-term keys or password. Either of
+two commands on a node makes it, for a while:
+
+- `cairn account root-link` prints a one-time link to sign in to the
+  [console](#console) (valid 15 minutes; its session lasts an hour at most,
+  and 15 minutes unused);
+- `cairn account root-key` prints temporary credentials for the S3, IAM and
+  STS APIs, valid 15 minutes (as AWS's `AssumeRoot`'s at most), as shell
+  `export`s: `eval "$(cairn account root-key)"`, then `aws s3api
+  delete-bucket-policy ...`. `cairn sessions revoke-all` ends them sooner
+  (no policy can).
+
+Whoever can run those could change the database anyway, so the root adds no
+way in; each link and key made, and each sign-in, is logged on its node.
+As in AWS:
+
+- no identity policy restricts it: no policy can be attached to it, and no
+  permissions boundary or group applies. It may do anything in the account,
+  IAM and the cluster's `cairn:` actions included;
+- a bucket's (or topic's) policy that denies everyone (`"*"`), or the
+  account (`arn:aws:iam::<account>:root`, or its ID), denies it too; but it
+  may always get, set and delete its own buckets' policies, whatever they
+  say: that's the way out of a policy that denies everyone;
+- its session isn't multi-factor (`aws:MultiFactorAuthPresent` is false),
+  so a policy that denies requests without MFA denies it too (but for the
+  policy itself). It has `aws:PrincipalType` `Account`, and its
+  `aws:userid` is the account's ID;
+- Object Lock's compliance mode holds against it, and it assumes no
+  roles; the KMS doesn't know it, so it can't read SSE-KMS objects;
+- it's no user: IAM's actions on the signer's own user (CreateAccessKey or
+  ListAccessKeys without `UserName`, say) must name one, and STS makes no
+  sessions of it (GetSessionToken, GetFederationToken, AssumeRole), nor S3
+  Express of its directory buckets.
+
+So the root is how to undo whatever policies lock: an admin's
+`AdministratorAccess` taken away, a boundary or a group's deny that keeps
+everyone out, a bucket policy that denies everyone. With the console, or
+without one, through the IAM and S3 APIs:
+
+```sh
+eval "$(cairn account root-key)"   # with AWS_ENDPOINT_URL set, as above
+aws iam delete-user-permissions-boundary --user-name ada
+aws iam attach-user-policy --user-name ada --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+aws s3api delete-bucket-policy --bucket my-bucket
+```
+
 In a bucket policy, `arn:aws:iam::<account>:root` (or the account's ID)
-still means what it does in AWS: the account, whose users' own policies
-then decide.
+means what it does in AWS: the account, whose users' own policies then
+decide, and its root user.
 
 **Operators** run the cluster: they're users whose policies allow Cairn's
 own actions, `cairn:` ones (`cairn:GetCluster`, `cairn:PutSetting`,
@@ -518,27 +564,17 @@ hyphens, starting and ending with a letter or digit, not formatted like an IP
 address, and without the prefixes and suffixes S3 reserves (such as `xn--` or
 `-s3alias`).
 
-Manage users with the IAM API or the console. `cairn user <command>` is for
-setting a cluster up and for getting back in (it acts on the database,
-whatever the policies say): `create`, `update --admin`, `enroll`, `detach`,
-`unbound`, `policy delete` and `list`. Its other commands are deprecated, will
-be removed, and print a warning when used:
+Manage users with the IAM API or the console. The command line only makes
+the first ones, to set a cluster up (it acts on the database, whatever the
+policies say); after that, the account's [root
+user](#users-and-permissions) is the way back in:
 
 | Command | Description |
 | --- | --- |
-| `create <name> [--admin] [--key [--id <ID>] [--secret <S>]]` | Create a person: a user without access keys, and print a link for it to sign in to the [console](#console) with, as `enroll` does. With `--key` (or `--id`, `--secret`), a service instead: a user with an access key of a random 20-char ID (or `--id`), whose ID is printed, with a generated 40-char secret unless `--secret` is given (min. 8 chars). |
-| `update <name> [--admin true\|false] [--rotate-secret \| --secret <S>]` | Toggle admin. Deprecated: replace the secret of the key named as the user (`--rotate-secret` prints the new one); rotate a key by making a second one and deleting the first instead, as in IAM. |
-| `delete <name>` (deprecated) | Delete a user, with its keys and policies. |
-| `grant <name> <bucket> <read\|write\|delete-version>...` (deprecated) | Grant permissions on an existing bucket of the account: attaches its managed policy `/cairn/grants/<bucket>-<permission>`, made the first time. |
-| `revoke <name> <bucket> [read\|write\|delete-version]...` (deprecated) | Revoke permissions on a bucket (detaches those policies); all of them if none are listed. |
-| `attach <name> <arn>` (deprecated) / `detach <name> <arn>` | Attach or detach a managed policy, Cairn's (`arn:aws:iam::aws:policy/CairnOperatorAccess`) or the account's. |
-| `unbound <name>` | Take a user's permissions boundary off, whatever its policies say. |
-| `key create <name> [--id <ID>] [--secret <S>]` (deprecated) | Make the user another access key (at most two). Prints its ID and secret. |
-| `key activate\|deactivate\|delete <ID>` (deprecated) | Let a key sign requests, stop it, or delete it. |
-| `policy put <name> <policy> <file>` (deprecated) | Set an inline policy (JSON; `-` reads stdin). A user's policies hold at most 2048 characters together, as in IAM. |
-| `policy get` (deprecated) / `policy delete <name> <policy>` | Show or delete an inline policy. |
-| `list` | List users, their ARNs, admin flags, keys, attached and inline policies (secrets are not shown). |
-| `enroll <name>` | Print a one-time link (24 hours) for the user to sign in to the [console](#console): a new login with a passkey, or (opened signed in) added to the login. A new link replaces the last. It's made from the console URL of the node the command runs on; one that serves no console prints the link's path. |
+| `cairn user create <name> [--admin] [--key [--id <ID>] [--secret <S>]]` | Create a person: a user without access keys, and print a link (valid 24 hours) for it to sign in to the [console](#console) with: made from the console URL of the node the command runs on; one that serves no console prints the link's path. With `--key` (or `--id`, `--secret`), a service instead: a user with an access key of a random 20-char ID (or `--id`), whose ID is printed, with a generated 40-char secret unless `--secret` is given (min. 8 chars). `cairn role create` does the same. |
+| `cairn account root-link` | Print a one-time link (15 minutes) to sign in to the console as the account's root user. |
+| `cairn account root-key` | Print temporary credentials (15 minutes) of the account's root user, as shell `export`s. |
+| `cairn sessions revoke-all` | End every temporary credential issued so far (AssumeRole's, GetSessionToken's, root keys, ...). |
 
 **The IAM API** is on the S3 endpoint too: requests signed for the `iam`
 service (SigV4's credential scope) are IAM's, whatever their path, so the AWS
@@ -590,9 +626,9 @@ temporary credentials. The AWS CLI refuses access key IDs shorter than
 as it.
 
 A bucket policy can deny everyone everything, its admins too, as in S3. The
-command line on a node can always remove it, as an AWS account's root user
-can: `cairn bucket-policy delete <bucket>` (or `get`, or `put <bucket>
-<file>`).
+account's [root user](#users-and-permissions) can always change or remove it,
+as in AWS: `eval "$(cairn account root-key)"`, then `aws s3api
+delete-bucket-policy --bucket <bucket>`.
 
 Secrets are stored in plaintext in the `access_keys` table: SigV4 is an HMAC scheme,
 so verifying a signature needs the secret itself. Restrict access to the
@@ -961,9 +997,16 @@ restarts; everything else is read from the database.
   secure). Passkeys are bound to the console URL's host, so changing it
   makes everyone enroll again.
 - **Enrollment.** An identity gets a first passkey through a one-time link,
-  valid 24 hours: `cairn user enroll <name>`, or the user's page in the console. Once signed in, people add more passkeys (at most 8; a second one,
+  valid 24 hours: `cairn user create <name>` prints the first, the user's
+  page in the console makes more. Once signed in, people add more passkeys (at most 8; a second one,
   on another device, keeps them from being locked out) and remove them, but
   never their last. A lost passkey takes a new link.
+- **The root user** signs in with a link from `cairn account root-link`
+  (see [Users and permissions](#users-and-permissions)), opened at
+  `/root`: it works once, within 15 minutes, and a new one replaces the
+  last. Its session lasts an hour at most (15 minutes unused), and every
+  page says it's the root's. Each link made and each sign-in is logged on
+  its node.
 - **Sessions** last 12 hours at most, and end after an hour unused. They're a
   cookie (`__Host-`, Secure, HttpOnly, SameSite=Strict), kept in the database
   as a hash, so every node serves them. Removing a passkey or the user ends
@@ -1680,8 +1723,8 @@ deleting a key makes its objects unreadable for good (crypto-shredding).
   OpenBao, which Cairn logs in as through a JWT auth mount of its own,
   naming the role by its ID, which is never reused. Cairn logs in once for
   each new role (when the console creates it, or within a minute), so that
-  OpenBao makes its entity right away. `cairn user list` and the console
-  show each role's ID and entity; the console's Storage page also shows
+  OpenBao makes its entity right away. The console shows each role's ID
+  and entity; the console's Storage page also shows
   Cairn's public key, whether each node reaches OpenBao, and how its logins
   went, with what's wrong in OpenBao's setup if they fail. A deleted role's
   entity stays in OpenBao,

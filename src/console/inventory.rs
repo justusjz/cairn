@@ -220,7 +220,7 @@ async fn put_inventory(
     context.set_all("s3:InventoryAccessibleOptionalFields", form.fields.clone());
     actor.check_with(&app, "s3:PutInventoryConfiguration", On::Bucket(bucket.clone()), &context).await?;
     let query = format!("inventory&id={}", percent_encoding::utf8_percent_encode(&id, percent_encoding::NON_ALPHANUMERIC));
-    let response = crate::s3::buckets::inventory::put(&app, &bucket, &query, xml_of(&form).into(), Some(actor.principal().id)).await?;
+    let response = crate::s3::buckets::inventory::put(&app, &bucket, &query, xml_of(&form).into(), actor.kms_role()).await?;
     if !response.status().is_success() {
         return Err(s3_error(response).await);
     }

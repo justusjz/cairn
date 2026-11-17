@@ -559,7 +559,7 @@ async fn handle_request(
         if let Some(refused) = util::unexpected_owner(&headers, &account) {
             return Ok(box_response(refused));
         }
-        let setter = principal.as_ref().map(|p| p.id);
+        let setter = principal.as_ref().and_then(|p| p.kms_role());
         return Ok(box_response(buckets::inventory::put(&app, &bucket, &query, body, setter).await?));
     }
     // CreateBucket: the tags its body gives the bucket are in it, and need
@@ -813,7 +813,7 @@ async fn handle_request(
             hyper::Method::PUT if operation.name == "PutBucketEncryption" => {
                 match read_body(req, &secret, true).await? {
                     Ok(body) => {
-                        let role = principal.as_ref().map_or(uuid::Uuid::nil(), |p| p.id);
+                        let role = principal.as_ref().and_then(|p| p.kms_role()).unwrap_or(uuid::Uuid::nil());
                         put_bucket_encryption(&app, &bucket, body, role).await?
                     }
                     Err(rejection) => util::rejection_response(&rejection),
@@ -1129,7 +1129,7 @@ async fn handle_request(
     // How an object write asks for its object to be encrypted.
     let wanted = sse::Wanted::new(customer_key.as_ref(), server.as_ref());
     // Who the KMS is asked as, for SSE-KMS (see `kms`).
-    let role = principal.as_ref().map(|p| p.id);
+    let role = principal.as_ref().and_then(|p| p.kms_role());
     // An object write may only ask for the ACL there is (see `acl`).
     if writes_object && let Err(refused) = acl::check_write(req.headers(), acl::On::Object) {
         return Ok(box_response(refused));

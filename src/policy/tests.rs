@@ -976,3 +976,74 @@ fn directory_bucket_policies_take_s3express_actions() {
     ));
     assert_eq!(check(&identity, user("a"), "s3express:CreateSession", &arn, &context), Decision::Allow);
 }
+
+/// The account's root user, as AWS decides it: no identity policy applies
+/// to it, so it may do anything to what its account owns; a bucket policy
+/// that denies everyone, or its account, denies it too (a `NotPrincipal`
+/// naming the account leaves it out), but never getting, setting or
+/// deleting that policy. Something of another account it may do only if
+/// that bucket's policy allows it.
+#[test]
+fn the_root_user_is_denied_only_by_resource_policies() {
+    let root = Principal::Root { account: ACCOUNT };
+    let none = Context::default();
+    let request = |action, resource| Request { principal: root, action, resource, context: &none };
+    let get = object("a");
+    let bucket_arn = format!("arn:aws:s3:::{BUCKET}");
+    // No policy: everything of its own, nothing of another account's.
+    assert_eq!(root_verdict(None, &request("s3:GetObject", &get), true), Verdict::Allow);
+    assert_eq!(root_verdict(None, &request("iam:DeleteUser", "arn:aws:iam::123456789012:user/a"), true), Verdict::Allow);
+    assert_eq!(root_verdict(None, &request("s3:GetObject", &get), false), Verdict::ImplicitDeny);
+
+    let deny_everyone = bucket_policy(
+        r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::examplebucket","arn:aws:s3:::examplebucket/*"]}]}"#,
+    );
+    assert_eq!(
+        root_verdict(Some(&deny_everyone), &request("s3:GetObject", &get), true),
+        Verdict::ExplicitDeny { identity: false }
+    );
+    for action in POLICY_ACTIONS {
+        assert_eq!(root_verdict(Some(&deny_everyone), &request(action, &bucket_arn), true), Verdict::Allow, "{action}");
+        // Not another account's bucket's.
+        assert_ne!(root_verdict(Some(&deny_everyone), &request(action, &bucket_arn), false), Verdict::Allow, "{action}");
+    }
+
+    // Naming the account (its ID or root ARN) is naming its root.
+    for principal in [r#""123456789012""#, r#""arn:aws:iam::123456789012:root""#] {
+        let deny = bucket_policy(&format!(
+            r#"{{"Statement":[{{"Effect":"Deny","Principal":{{"AWS":{principal}}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}}]}}"#
+        ));
+        assert_eq!(root_verdict(Some(&deny), &request("s3:GetObject", &get), true), Verdict::ExplicitDeny { identity: false });
+    }
+    // A user named isn't the root, nor is another account.
+    for principal in [r#""arn:aws:iam::123456789012:user/ada""#, r#""111122223333""#] {
+        let deny = bucket_policy(&format!(
+            r#"{{"Statement":[{{"Effect":"Deny","Principal":{{"AWS":{principal}}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}}]}}"#
+        ));
+        assert_eq!(root_verdict(Some(&deny), &request("s3:GetObject", &get), true), Verdict::Allow, "{principal}");
+    }
+    // `NotPrincipal` naming the account leaves its root out of a deny.
+    let all_but_root = bucket_policy(
+        r#"{"Statement":[{"Effect":"Deny","NotPrincipal":{"AWS":"arn:aws:iam::123456789012:root"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
+    );
+    assert_eq!(root_verdict(Some(&all_but_root), &request("s3:GetObject", &get), true), Verdict::Allow);
+    assert_eq!(check(&all_but_root, user("ada"), "s3:GetObject", &get, &none), Decision::Deny);
+
+    // AWS's guard against sessions without MFA denies the root too, which
+    // signs in with no second factor: it can still take the policy off.
+    let mfa_guard = bucket_policy(
+        r#"{"Statement":[{"Effect":"Deny","Principal":"*","Action":"s3:*","Resource":["arn:aws:s3:::examplebucket","arn:aws:s3:::examplebucket/*"],
+            "Condition":{"BoolIfExists":{"aws:MultiFactorAuthPresent":"false"}}}]}"#,
+    );
+    let mut no_mfa = Context::default();
+    no_mfa.set("aws:MultiFactorAuthPresent", "false");
+    let without = |action, resource| Request { principal: root, action, resource, context: &no_mfa };
+    assert_eq!(root_verdict(Some(&mfa_guard), &without("s3:GetObject", &get), true), Verdict::ExplicitDeny { identity: false });
+    assert_eq!(root_verdict(Some(&mfa_guard), &without("s3:DeleteBucketPolicy", &bucket_arn), true), Verdict::Allow);
+
+    // A bucket of another account's whose policy allows the account.
+    let allow_account = bucket_policy(
+        r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"123456789012"},"Action":"s3:GetObject","Resource":"arn:aws:s3:::examplebucket/*"}]}"#,
+    );
+    assert_eq!(root_verdict(Some(&allow_account), &request("s3:GetObject", &get), false), Verdict::Allow);
+}

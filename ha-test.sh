@@ -231,9 +231,9 @@ for i in $(seq 1 "$INSTANCES"); do
 done
 info "All $INSTANCES instances are up."
 
-# Roles live in Postgres, shared by every instance: one admin role, granted
-# read/write on the test bucket once it exists (mb_granted). `cairn role`
-# runs on a node: the first one that's running.
+# Roles live in Postgres, shared by every instance: one admin role
+# (AdministratorAccess: every bucket of the account, and their objects).
+# `cairn role create` runs on a node: the first one that's running.
 cairn_role() {
     local n
     for n in $(seq 1 "$INSTANCES"); do
@@ -263,10 +263,10 @@ EOF
 done
 s3i() { local n="$1"; shift; s3cmd --config "$WORK_DIR/s3cfg.$n" "$@"; }
 
-# mb_granted <n> <bucket> — creates a bucket via node n, then grants the test
-# role read/write on it (admin alone allows no object access).
+# mb_granted <n> <bucket> — creates a bucket via node n (the admin needs no
+# grant on it).
 mb_granted() {
-    s3i "$1" mb "s3://$2" && cairn_role grant "$ACCESS_KEY" "$2" read write
+    s3i "$1" mb "s3://$2"
 }
 
 # upload_rejected_503 <n> <file> <uri> — the upload must fail with a proper 503

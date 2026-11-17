@@ -6,6 +6,9 @@
 //! A login is a person: its passkeys sign it in, and it's linked to an
 //! identity, a user of the account (see `plans/single-account.md`); a user
 //! belongs to at most one login. A session acts as its login's user.
+//!
+//! The account's root user is no login: a one-time link that the command
+//! line on a node makes (migration 58) starts a short session as it.
 
 use std::time::Duration;
 
@@ -24,6 +27,12 @@ pub const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 /// How long a session lasts at most, and unused.
 pub const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 pub const SESSION_IDLE: Duration = Duration::from_secs(3600);
+/// How long a link for the account's root user works, and how long the
+/// session it starts lasts at most, and unused: the root is for getting
+/// back in, not for every day.
+pub const ROOT_LINK_TTL: Duration = Duration::from_secs(15 * 60);
+pub const ROOT_SESSION_TTL: Duration = Duration::from_secs(3600);
+pub const ROOT_SESSION_IDLE: Duration = Duration::from_secs(15 * 60);
 /// The most passkeys a login may have, as IAM's MFA devices (I10).
 pub const MAX_PASSKEYS: i32 = 8;
 
@@ -460,9 +469,78 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
     }))
 }
 
+/// Ends the session of `token`, a login's or the root user's.
 pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {
     client.execute_cached("DELETE FROM console_sessions WHERE token_hash = $1", &[&hash(token)]).await?;
+    client.execute_cached("DELETE FROM console_root_sessions WHERE token_hash = $1", &[&hash(token)]).await?;
     Ok(())
+}
+
+// ─── The root user ───────────────────────────────────────────────────────────
+
+/// Makes a link's token for the root user of account `account` (its ID) to
+/// sign in to the console with, once, within `ROOT_LINK_TTL`; it replaces
+/// any the account had. Only the command line on a node makes one (see
+/// `accounts`): the root has no passkeys or keys, so that's its only way in.
+pub async fn create_root_link(client: &Object, account: &str) -> anyhow::Result<String> {
+    let (token, hash) = token()?;
+    client
+        .execute_cached(
+            "WITH d AS (DELETE FROM console_root_links WHERE account_id = $1)
+             INSERT INTO console_root_links (token_hash, account_id, expires_at)
+             VALUES ($2, $1, now() + make_interval(secs => $3))",
+            &[&account, &hash, &secs(ROOT_LINK_TTL)],
+        )
+        .await?;
+    Ok(token)
+}
+
+/// Uses up the root user's link `link` (while it works), starting a
+/// session as the root of its account: the session's token; `None` if the
+/// link was used, or has expired. One statement: both, or neither.
+pub async fn root_sign_in(client: &Object, link: &str) -> anyhow::Result<Option<String>> {
+    let (token, session) = token()?;
+    let made = client
+        .execute_cached(
+            "WITH l AS (DELETE FROM console_root_links WHERE token_hash = $1 AND expires_at > now() RETURNING account_id)
+             INSERT INTO console_root_sessions (token_hash, account_id, expires_at)
+             SELECT $2, l.account_id, now() + make_interval(secs => $3) FROM l",
+            &[&hash(link), &session, &secs(ROOT_SESSION_TTL)],
+        )
+        .await?;
+    Ok((made == 1).then_some(token))
+}
+
+/// A session of an account's root user.
+#[derive(Clone, Debug)]
+pub struct RootSession {
+    /// Its account's ID, and name.
+    pub account_id: String,
+    pub account: String,
+    /// When it ends at the latest (seconds since the epoch).
+    pub expires_at: f64,
+}
+
+/// The root user's session of `token`, while it lasts; it was used just now
+/// (noted at most once a minute).
+pub async fn root_session(client: &Object, token: &str) -> anyhow::Result<Option<RootSession>> {
+    let row = client
+        .query_opt_cached(
+            "SELECT a.id, a.name, extract(epoch FROM s.expires_at)::float8,
+                    s.last_seen_at < now() - interval '1 minute'
+             FROM console_root_sessions s JOIN accounts a ON a.id = s.account_id
+             WHERE s.token_hash = $1 AND s.expires_at > now()
+               AND s.last_seen_at > now() - make_interval(secs => $2)",
+            &[&hash(token), &secs(ROOT_SESSION_IDLE)],
+        )
+        .await?;
+    let Some(row) = row else { return Ok(None) };
+    if row.get::<_, bool>(3) {
+        client
+            .execute_cached("UPDATE console_root_sessions SET last_seen_at = now() WHERE token_hash = $1", &[&hash(token)])
+            .await?;
+    }
+    Ok(Some(RootSession { account_id: row.get(0), account: row.get(1), expires_at: row.get(2) }))
 }
 
 /// A passkey, as its login sees it.
@@ -534,13 +612,19 @@ pub async fn delete_passkey(client: &Object, login: Uuid, credential_id: &[u8]) 
 /// Removes what has expired: challenges, enrollment links, sessions.
 pub async fn reap(client: &Object) -> anyhow::Result<u64> {
     let mut reaped = 0;
-    for table in ["console_challenges", "console_enrollments"] {
+    for table in ["console_challenges", "console_enrollments", "console_root_links"] {
         reaped += client.execute_cached(&format!("DELETE FROM {table} WHERE expires_at <= now()"), &[]).await?;
     }
     reaped += client
         .execute_cached(
             "DELETE FROM console_sessions WHERE expires_at <= now() OR last_seen_at <= now() - make_interval(secs => $1)",
             &[&secs(SESSION_IDLE)],
+        )
+        .await?;
+    reaped += client
+        .execute_cached(
+            "DELETE FROM console_root_sessions WHERE expires_at <= now() OR last_seen_at <= now() - make_interval(secs => $1)",
+            &[&secs(ROOT_SESSION_IDLE)],
         )
         .await?;
     Ok(reaped)

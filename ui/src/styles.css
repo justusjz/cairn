@@ -103,6 +103,12 @@ nav a.active { background: var(--accent-soft); color: var(--accent); font-weight
 }
 .nav-count.bad { background: var(--bad); color: var(--panel); }
 .warn-text { color: var(--warn); font-weight: 600; }
+.root-banner {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+  padding: 8px 16px; background: var(--warn-soft); color: var(--text); border-bottom: 2px solid var(--warn);
+  font-size: 14px;
+}
+.root-banner strong { color: var(--warn); }
 .badge-link:hover { text-decoration: none; }
 .nav-count.warn { background: var(--warn-soft); color: var(--warn); }
 
