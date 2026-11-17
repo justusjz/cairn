@@ -17,7 +17,7 @@ use crate::{
 
 /// Uploads `data` to `key`, returning the error a client would get.
 async fn try_put(app: &Arc<App>, key: &str, data: Vec<u8>) -> anyhow::Result<()> {
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),

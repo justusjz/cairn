@@ -67,14 +67,14 @@ async fn put_multipart(app: &Arc<App>, key: &str, parts: &[Vec<u8>]) {
 }
 
 async fn create_upload(app: &Arc<App>, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "", "", Wanted::Plain, None, None, Default::default(), None)
+    let response = create_multipart_upload(app, BUCKET, key, "application/octet-stream", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD)
         .await
         .unwrap();
     Uuid::parse_str(&xml_field(&body_text(response).await, "UploadId")).unwrap()
 }
 
 async fn put_part(app: &Arc<App>, upload_id: Uuid, part_number: i32, data: Vec<u8>) -> String {
-    let attach = AttachTarget::MultipartPart {
+    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
         upload_id,
         part_number,
         key: None,

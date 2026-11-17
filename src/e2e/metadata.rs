@@ -35,7 +35,7 @@ pub(super) fn stored(pairs: &[(&str, &str)]) -> String {
 
 /// Writes `key` with the stored `metadata`, as PutObject does.
 async fn put_with(app: &Arc<App>, key: &str, metadata: String) {
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "text/plain".to_owned(),

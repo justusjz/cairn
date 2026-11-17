@@ -23,8 +23,8 @@ pub struct NodeArgs {
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum NodeCommand {
-    /// List the nodes: their state, whether they're live, and how many shards
-    /// they hold.
+    /// List the nodes: their state, whether they're live, how many shards
+    /// they hold, and their pools (see `cairn class`).
     List,
     /// Remove a node: it gets no new shards, and its shards move to other
     /// nodes, copied from it while it's live, else rebuilt from the other
@@ -49,16 +49,19 @@ pub async fn run(app: &Arc<App>, args: NodeArgs, out: &mut Output) -> anyhow::Re
             let rows = client
                 .query_cached(
                     "SELECT n.id, n.peer_url, n.state, n.last_seen > NOW() - INTERVAL '10 seconds',
-                            (SELECT count(*) FROM blob_locations bl WHERE bl.node = n.id)
+                            (SELECT count(*) FROM blob_locations bl WHERE bl.node = n.id),
+                        (SELECT coalesce(string_agg(np.pool, ',' ORDER BY np.pool), '')
+                         FROM node_pools np WHERE np.node = n.id)
                      FROM nodes n ORDER BY n.id",
                     &[],
                 )
                 .await?;
-            outln!(out, "{:>4}  {:<9} {:<5} {:>10}  peer URL", "id", "state", "live", "shards");
+            outln!(out, "{:>4}  {:<9} {:<5} {:>10}  {:<20} peer URL", "id", "state", "live", "shards", "pools");
             for r in rows {
                 let live = if r.get::<_, bool>(3) { "yes" } else { "no" };
                 let (id, url, state, shards): (i32, String, String, i64) = (r.get(0), r.get(1), r.get(2), r.get(4));
-                outln!(out, "{id:>4}  {state:<9} {live:<5} {shards:>10}  {url}");
+                let pools: String = r.get(5);
+                outln!(out, "{id:>4}  {state:<9} {live:<5} {shards:>10}  {pools:<20} {url}");
             }
         }
         NodeCommand::Remove { id } => match remove(&client, id).await? {

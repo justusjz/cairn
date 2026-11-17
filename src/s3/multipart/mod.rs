@@ -44,6 +44,8 @@ pub(crate) struct Upload {
     pub encryption: Stored,
     /// The checksum its client asked for, if it did (see `s3::checksums`).
     pub checksum: Option<(Algorithm, Type)>,
+    /// Its storage class (see `classes`), its parts'.
+    pub storage_class: String,
 }
 
 impl Upload {
@@ -107,7 +109,7 @@ pub(crate) async fn upload(app: &App, upload_id: &Uuid, bucket: &str, key: &str)
         .await?
         .query_opt_cached(
             "SELECT sse_c_key, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
-                    checksum_algorithm, checksum_type
+                    checksum_algorithm, checksum_type, storage_class
              FROM multipart_uploads WHERE upload_id = $1 AND bucket = $2 AND key = $3",
             &[upload_id, &bucket, &key],
         )
@@ -115,6 +117,7 @@ pub(crate) async fn upload(app: &App, upload_id: &Uuid, bucket: &str, key: &str)
     Ok(row.map(|row| Upload {
         encryption: Stored::from_row(&row, 0),
         checksum: checksum_columns(&row, 6),
+        storage_class: row.get(8),
     }))
 }
 

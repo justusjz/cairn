@@ -53,7 +53,7 @@ async fn put_kms(
 ) -> Result<String, Response<Full<Bytes>>> {
     let sealing = sse::seal(app, Wanted::Kms(request), Some(role), BUCKET, key).await.unwrap()?;
     assert!(matches!(sealing, Some(sse::Sealing { stored: Stored::Kms(_), .. })));
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),
@@ -232,7 +232,7 @@ async fn put_part(app: &Arc<App>, role: Uuid, upload_id: Uuid, key: &str, part_n
     let encryption = upload_encryption(app, &upload_id, BUCKET, key).await.unwrap().unwrap();
     let upload_key = sse::open(app, &encryption, None, Some(role), BUCKET, key).await.unwrap().ok().unwrap();
     assert!(upload_key.is_some() == !encryption.is_plain());
-    let attach = AttachTarget::MultipartPart {
+    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
         upload_id,
         part_number,
         key: upload_key,
@@ -247,7 +247,7 @@ async fn put_part(app: &Arc<App>, role: Uuid, upload_id: Uuid, key: &str, part_n
 }
 
 async fn create(app: &Arc<App>, role: Uuid, key: &str, wanted: Wanted<'_>) -> (Uuid, Headers) {
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, Some(role), None, Default::default(), None).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, Some(role), None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     let headers = Headers::of(response.headers());
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -679,7 +679,7 @@ pub(super) async fn allow_cairn(app: &App, keys: &[&str]) {
 async fn put_s3(app: &Arc<App>, role: Uuid, key: &str, data: Vec<u8>) {
     let sealing = sse::seal(app, Wanted::S3, Some(role), BUCKET, key).await.unwrap().unwrap();
     assert!(matches!(sealing, Some(sse::Sealing { stored: Stored::S3(_), .. })));
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),
@@ -855,7 +855,7 @@ async fn sse_s3_etags_are_md5s_stored_sealed() {
         let app = app.clone();
         async move {
             let sealing = sse::seal(&app, Wanted::S3, Some(bob), BUCKET, "k").await.unwrap().unwrap();
-            let attach = AttachTarget::Object {
+            let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
                 bucket: BUCKET.to_owned(),
                 key: "k".to_owned(),
                 content_type: "x".to_owned(),

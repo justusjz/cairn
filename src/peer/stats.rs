@@ -18,9 +18,12 @@ pub struct NodeStats {
     pub scrub_rate: u64,
     /// The node's clock, in seconds since the Unix epoch.
     pub now: f64,
-    /// The filesystem of its data dir, if it could tell.
+    /// The filesystems of its data dirs, together (each counted once), if
+    /// it could tell.
     pub disk: Option<Disk>,
     pub disk_error: Option<String>,
+    /// Its pools (see `classes`), and their filesystems.
+    pub pools: Vec<PoolDisk>,
     /// Its KMS, if it has one (see `kms`).
     pub kms: Option<KmsStatus>,
     #[serde(flatten)]
@@ -98,6 +101,14 @@ async fn kms_status(app: &App) -> Option<KmsStatus> {
     })
 }
 
+/// A pool of a node, and the filesystem of its data dir.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct PoolDisk {
+    pub name: String,
+    pub disk: Option<Disk>,
+    pub disk_error: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct Disk {
     /// Bytes in all.
@@ -107,10 +118,30 @@ pub struct Disk {
 }
 
 pub async fn node_stats(app: &App) -> NodeStats {
-    let (disk, disk_error) = match app.store.disk_space() {
-        Ok((total, available)) => (Some(Disk { total, available }), None),
-        Err(e) => (None, Some(e.to_string())),
-    };
+    let mut pools = Vec::new();
+    let mut sum = Disk { total: 0, available: 0 };
+    let mut disk_error = None;
+    let mut counted = Vec::new();
+    for pool in app.store.pools() {
+        let (disk, error) = match pool.disk_space() {
+            Ok((total, available)) => {
+                // Pools on one filesystem share its space.
+                let device = std::fs::metadata(pool.data_dir()).map(|m| std::os::unix::fs::MetadataExt::dev(&m)).ok();
+                if device.is_none() || !counted.contains(&device) {
+                    counted.push(device);
+                    sum.total += total;
+                    sum.available += available;
+                }
+                (Some(Disk { total, available }), None)
+            }
+            Err(e) => {
+                disk_error.get_or_insert_with(|| e.to_string());
+                (None, Some(e.to_string()))
+            }
+        };
+        pools.push(PoolDisk { name: pool.name.clone(), disk, disk_error: error });
+    }
+    let disk = disk_error.is_none().then_some(sum);
     NodeStats {
         node: app.node,
         node_id: app.store.get_node_id().to_string(),
@@ -120,6 +151,7 @@ pub async fn node_stats(app: &App) -> NodeStats {
         now: now_secs(),
         disk,
         disk_error,
+        pools,
         kms: kms_status(app).await,
         metrics: app.metrics.report(),
     }

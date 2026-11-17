@@ -48,7 +48,7 @@ async fn error_code(
 }
 
 async fn new_upload(app: &Arc<App>, key: &str) -> String {
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default(), None)
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD)
         .await
         .unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
@@ -118,7 +118,7 @@ async fn objects_are_limited_to_5_tib() {
     let upload = new_upload(&app, "huge").await;
     let mut etags = Vec::new();
     for n in 1..=2 {
-        let attach = crate::AttachTarget::MultipartPart {
+        let attach = crate::AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
             upload_id: upload.parse().unwrap(),
             part_number: n,
             key: None,

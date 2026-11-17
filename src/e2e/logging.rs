@@ -165,7 +165,7 @@ async fn requests_are_logged_to_the_target() {
     assert_eq!(put_bucket_logging(&app, BUCKET, status(&enabled)).await.unwrap().status(), StatusCode::OK);
     app.access_logs.refresh(&app).await.unwrap();
 
-    let attach = crate::AttachTarget::Object {
+    let attach = crate::AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: "hello.txt".to_owned(),
         content_type: "text/plain".to_owned(),

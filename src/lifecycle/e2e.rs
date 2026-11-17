@@ -484,7 +484,7 @@ async fn deleting_the_configuration_stops_expirations() {
 async fn incomplete_uploads_are_aborted() {
     let Some(app) = node().await else { return };
     for key in ["tmp/a", "b"] {
-        let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default(), None).await.unwrap();
+        let response = create_multipart_upload(&app, BUCKET, key, "x", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
     }
     configure(

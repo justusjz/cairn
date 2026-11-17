@@ -103,13 +103,14 @@ pub(crate) async fn shards_of(cluster: &Cluster, blob_id: Uuid) -> (Layout, Vec<
 pub(crate) async fn assert_intact(cluster: &Cluster, blob_id: Uuid) {
     let (layout, holders) = shards_of(cluster, blob_id).await;
     let client = cluster.nodes[0].pool.get().await.unwrap();
-    let crcs: Vec<i64> = client
-        .query_one("SELECT shard_crcs FROM blobs WHERE blob_id = $1", &[&blob_id])
+    let row = client
+        .query_one("SELECT shard_crcs, pool FROM blobs WHERE blob_id = $1", &[&blob_id])
         .await
-        .unwrap()
-        .get(0);
+        .unwrap();
+    let (crcs, pool): (Vec<i64>, String) = (row.get(0), row.get(1));
     for (shard, &i) in holders.iter().enumerate() {
-        let path = cluster.nodes[i].store.blob_path(blob_id);
+        // In the blob's pool (see `classes`).
+        let path = cluster.nodes[i].store.pool(&pool).unwrap().blob_path(blob_id);
         let mut file = tokio::fs::File::open(path).await.unwrap();
         let expected = ShardFile {
             blob_id,
@@ -514,7 +515,7 @@ async fn a_shard_has_one_location() {
     let other = &cluster.nodes[1 - holders[0]];
     let write = crate::ShardWrite::Replica { blob_id, shard: 0 };
     let body = http_body_util::Full::new(hyper::body::Bytes::from(vec![1; 10]));
-    assert!(crate::write_blob_streaming(other, &write, crate::Placement::New, body).await.is_err());
+    assert!(crate::write_blob_streaming(other, &write, crate::classes::DEFAULT_POOL, crate::Placement::New, body).await.is_err());
     assert!(other.store.open_blob(blob_id).await.unwrap().is_none(), "its file is gone");
     let locations = format!("SELECT count(*) FROM blob_locations WHERE blob_id = '{blob_id}'");
     assert_eq!(query_i64(a, &locations).await, 1);

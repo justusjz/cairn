@@ -182,7 +182,7 @@ command line wins. The other commands read `CAIRN_PEER_URL` as well.
 | `--listen-peer <ADDR>` | `CAIRN_LISTEN_PEER` | `127.0.0.1:9431` | Bind address for the peer endpoint (replica traffic between nodes). Always runs. |
 | `--peer-url <URL>` | `CAIRN_PEER_URL` | `http://<listen-peer>` | URL other nodes use to reach this node. Set explicitly when `--listen-peer` is a wildcard/private address (e.g. `http://10.0.0.1:9431`). |
 | `--replication-factor <N>` | `CAIRN_REPLICATION_FACTOR` | `1` | How many distinct nodes each blob is stored on, until the cluster's `parity-shards` setting is set (see below), which overrides it on every node. |
-| `--data-dir <PATH>` | `CAIRN_DATA_DIR` | *required* | Local directory for blobs. |
+| `--data-dir [<POOL>=]<PATH>` | `CAIRN_DATA_DIR` (comma-separated) | *required* | Local directory for blobs, of the pool `POOL` (`default` if none is named), which [storage classes](#storage-classes) keep their data in. May be given several times, a pool each. |
 | `--allow-sse-c-over-http` | `CAIRN_ALLOW_SSE_C_OVER_HTTP` | off | Accept [SSE-C](#sse-c) keys in requests no proxy marked as HTTPS. Only for a network that's encrypted itself. |
 | `--trusted-proxy <CIDR>` | `CAIRN_TRUSTED_PROXIES` (comma-separated) | none | A proxy in front of Cairn, whose `X-Forwarded-For` and `X-Forwarded-Proto` [policies](#users-and-permissions) believe (`aws:SourceIp`, `aws:SecureTransport`). May be given several times. |
 | `--domain <NAME>` | `CAIRN_DOMAIN` | none | The domain the S3 API is reached at, e.g. `s3.example.com`, to take [virtual-hosted-style](#virtual-hosted-style-requests) requests. Any other host name (but IP addresses and `localhost`) is then a [website's](#websites) custom domain. |
@@ -285,7 +285,9 @@ packer rewrites erasure-coded blobs. While the setting isn't set, existing
 blobs keep their copies, since nodes may go by different flags.
 
 Large blobs can be stored with less overhead than full copies, with the same
-tolerance for lost nodes: see [Erasure coding](#erasure-coding).
+tolerance for lost nodes: see [Erasure coding](#erasure-coding). Both settings
+are the layout of STANDARD, and of every [storage class](#storage-classes)
+that doesn't set its own.
 
 ### Removing nodes, and repair
 
@@ -318,6 +320,83 @@ cairn config set repair-after 60   # minutes; 0, the default, is off
 
 The console's Overview shows each node's state, and its Jobs page how many
 shards are waiting to move.
+
+### Storage classes
+
+A **storage class** says where an object's data is kept and how much
+redundancy it has: the **pool** its blobs go to, and their data and parity
+shards (see [Erasure coding](#erasure-coding)). So objects can be on SSDs or
+on HDDs, or kept with more or fewer copies, side by side. Clients ask for a
+class as they ask S3 for one, with `x-amz-storage-class` on PutObject,
+CreateMultipartUpload, CopyObject or a POST form:
+
+```sh
+aws s3 cp backup.tar s3://my-bucket/ --storage-class STANDARD_IA
+```
+
+A node keeps each pool it has in a data dir of its own, named by
+`--data-dir <pool>=<path>` (given once per pool; a bare path is the pool
+`default`). A node's shards of a blob are in the blob's pool, and a blob's
+shards are each on a node of their own, as ever, so every pool spreads its
+data over the nodes that have it:
+
+```sh
+# Nodes with SSDs and HDDs
+cairn serve ... --data-dir default=/mnt/nvme/cairn --data-dir hdd=/mnt/disks/cairn
+# A node with HDDs only
+cairn serve ... --data-dir hdd=/mnt/disks/cairn
+```
+
+Then define the classes, for the whole cluster:
+
+```sh
+cairn class set STANDARD_IA --pool hdd --parity-shards 2 --data-shards 4
+cairn class set REDUCED_REDUNDANCY --pool default --parity-shards 0
+cairn class list
+```
+
+`--data-shards` and `--parity-shards` are the class's own layout: unset (or
+set to `default`), it goes by the cluster's `data-shards` and `parity-shards`
+settings, as STANDARD does until it sets its own. STANDARD always exists, in
+the pool `default`; `cairn class set STANDARD --pool ssd` moves it. A class
+can be named anything in capitals, digits and underscores, but S3's names are
+safest, since some SDKs only send those. An object that asks for no class is
+STANDARD, and so is one that asks for one of S3's classes that isn't defined
+(as before Cairn had classes, so clients configured for, say, `STANDARD_IA`
+keep working); any other class that isn't defined is refused with
+`InvalidStorageClass`. `cairn class delete` deletes a class that holds no
+objects or uploads.
+
+An object reports its class as S3 does (HEAD and GET tell
+`x-amz-storage-class` for any but STANDARD, listings, GetObjectAttributes and
+inventory reports tell it always). It changes class by being copied into
+another, onto itself, say:
+
+```sh
+aws s3 cp s3://my-bucket/backup.tar s3://my-bucket/backup.tar --storage-class STANDARD
+```
+
+A copy within a class shares its source's bytes; one into another class (a
+copy that names no class is STANDARD, as in S3) writes them again, in its
+pool. A multipart upload's parts are of the class it was created in.
+
+A change of a class applies to new objects within a heartbeat. Its existing
+data is rewritten by the [packer](#packing), as after a change of the
+redundancy settings: into its new pool (once the pool has nodes enough for
+the class's copies), and its new layout; the mover adds or drops copies of
+replicated blobs. A class needs as many active nodes with its pool as its
+blobs take shards, as a cluster does for STANDARD: `cairn class set` warns
+when it hasn't. A node that holds shards in a pool won't start without the
+pool's `--data-dir`, which would lose them; [remove](#removing-nodes-and-repair)
+the node first. `cairn node list` shows the nodes' pools, and the console's
+Storage page each class's pool, layout, nodes and data.
+
+Lifecycle rules can't move objects between classes yet (`Transition`); copy
+them instead.
+
+Upgrade every node: once one runs a Cairn with storage classes, older ones
+can no longer write (they'd place shards on nodes without their pool), as
+their log says.
 
 ## Users and permissions
 
@@ -1520,7 +1599,8 @@ node uses the database's clock, so a node whose clock is off doesn't expire
 anything early.
 
 Not supported, and refused with `501 NotImplemented`: transitions to other
-storage classes (`Transition`, `NoncurrentVersionTransition`; Cairn has one).
+[storage classes](#storage-classes) (`Transition`,
+`NoncurrentVersionTransition`); copy objects into another class instead.
 
 ## Inventory
 

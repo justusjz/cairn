@@ -79,6 +79,7 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App, BlobWriter, Written,
+    classes::Class,
     db,
     blobs::{
         BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, ReapTarget, layout_at, location_at,
@@ -215,42 +216,57 @@ enum Kind {
 /// Runs packing jobs until there's nothing left worth packing (or the pass hits
 /// its limit). Compaction goes first, since it frees space. A failed job is
 /// logged, and the pass moves on to other blobs.
+///
+/// A job packs blobs of one storage class, into new blobs of that class, in
+/// its pool and layout (see `classes`); the classes take turns.
 pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
     fold_garbage(app).await?;
-    let layouts = layouts(app).await?;
-    let coding = layouts.and_then(|l| l.coding());
+    crate::refresh_settings(app).await?;
+    let classes: Vec<Class> = app.classes.all().values().cloned().collect();
     let mut reports = Vec::new();
-    for _ in 0..MAX_JOBS_PER_PASS {
-        let claimed = match claim(app, Kind::Compact).await? {
-            Some(sources) => Some((Kind::Compact, sources)),
-            None => claim(app, Kind::Consolidate)
-                .await?
-                .map(|sources| (Kind::Consolidate, sources)),
-        };
-        let Some((kind, sources)) = claimed else {
-            break;
-        };
-        match run_job(app, kind, &sources, coding).await {
-            Ok(report) => reports.push(report),
-            Err(e) => {
-                let message = format!("packing {} blobs failed: {e:#}", sources.len());
-                eprintln!("packer: {message}");
-                app.metrics.pack_failed(message);
-            }
-        }
-    }
-    if let Some(layouts) = layouts {
-        for _ in 0..CONVERSIONS_PER_PASS {
-            let Some(sources) = claim_conversion(app, layouts).await? else {
+    let mut jobs = 0;
+    for class in &classes {
+        let layouts = layouts(app, class).await?;
+        let coding = layouts.and_then(|l| l.coding());
+        while jobs < MAX_JOBS_PER_PASS {
+            let claimed = match claim(app, Kind::Compact, class).await? {
+                Some(sources) => Some((Kind::Compact, sources)),
+                None => claim(app, Kind::Consolidate, class)
+                    .await?
+                    .map(|sources| (Kind::Consolidate, sources)),
+            };
+            let Some((kind, sources)) = claimed else {
                 break;
             };
-            match run_job(app, Kind::Convert, &sources, coding).await {
+            jobs += 1;
+            match run_job(app, kind, &sources, class, coding).await {
                 Ok(report) => reports.push(report),
                 Err(e) => {
-                    let message = format!("converting {} blobs failed: {e:#}", sources.len());
+                    let message = format!("packing {} blobs of {} failed: {e:#}", sources.len(), class.name);
                     eprintln!("packer: {message}");
                     app.metrics.pack_failed(message);
                 }
+            }
+        }
+        // Into the class's pool first, then into its layout. A blob outside
+        // its pool goes to it once the pool has nodes enough for its copies.
+        let mut conversions = 0;
+        if layouts.is_some() || live_in_pool(app, &class.pool).await? > app.parity_shards_of(class) as i64 {
+            while conversions < CONVERSIONS_PER_PASS {
+                let Some(sources) = claim_conversion(app, class, None).await? else {
+                    break;
+                };
+                conversions += 1;
+                convert(app, &sources, class, coding, &mut reports).await;
+            }
+        }
+        if let Some(layouts) = layouts {
+            while conversions < CONVERSIONS_PER_PASS {
+                let Some(sources) = claim_conversion(app, class, Some(layouts)).await? else {
+                    break;
+                };
+                conversions += 1;
+                convert(app, &sources, class, coding, &mut reports).await;
             }
         }
     }
@@ -263,15 +279,32 @@ pub async fn pass(app: &Arc<App>) -> anyhow::Result<Vec<JobReport>> {
     Ok(reports)
 }
 
+/// Runs a conversion job on `sources`, of class `class`, and reports it.
+async fn convert(app: &Arc<App>, sources: &[Uuid], class: &Class, coding: Option<u32>, reports: &mut Vec<JobReport>) {
+    match run_job(app, Kind::Convert, sources, class, coding).await {
+        Ok(report) => reports.push(report),
+        Err(e) => {
+            let message = format!("converting {} blobs of {} failed: {e:#}", sources.len(), class.name);
+            eprintln!("packer: {message}");
+            app.metrics.pack_failed(message);
+        }
+    }
+}
+
 /// Upgrades blobs from before checksums, oldest first, one per job, until
 /// their bytes add up to `budget` (but at least one). A failed job is logged,
 /// and its blob stays leased, so the next one is tried.
 pub(crate) async fn upgrade(app: &Arc<App>, budget: u64) -> anyhow::Result<Vec<JobReport>> {
     let mut reports = Vec::new();
     let mut spent = 0;
+    let classes: Vec<Class> = app.classes.all().values().cloned().collect();
+    let mut classes = classes.iter();
+    let mut class = classes.next();
     while spent < budget.max(1) {
-        let Some(sources) = claim(app, Kind::Upgrade).await? else {
-            break;
+        let Some(current) = class else { break };
+        let Some(sources) = claim(app, Kind::Upgrade, current).await? else {
+            class = classes.next();
+            continue;
         };
         let size: i64 = app
             .pool
@@ -281,7 +314,7 @@ pub(crate) async fn upgrade(app: &Arc<App>, budget: u64) -> anyhow::Result<Vec<J
             .await?
             .get(0);
         spent += size.max(1) as u64;
-        match run_upgrade(app, &sources, coding(app).await?).await {
+        match run_upgrade(app, &sources, current, coding(app, current).await?).await {
             Ok(report) => reports.push(report),
             Err(e) => {
                 let message = format!("upgrading blob {} failed: {e:#}", sources[0]);
@@ -298,7 +331,15 @@ pub(crate) async fn upgrade(app: &Arc<App>, budget: u64) -> anyhow::Result<Vec<J
 /// `mover`), since their bytes can't be verified as they're copied. Its new
 /// blob goes to active nodes, as every new blob does.
 pub(crate) async fn upgrade_blob(app: &Arc<App>, blob_id: Uuid) -> anyhow::Result<JobReport> {
-    run_upgrade(app, &[blob_id], coding(app).await?).await
+    let class: String = app
+        .pool
+        .get()
+        .await?
+        .query_one_cached("SELECT storage_class FROM blobs WHERE blob_id = $1", &[&blob_id])
+        .await?
+        .get(0);
+    let class = app.classes.get(&class);
+    run_upgrade(app, &[blob_id], &class, coding(app, &class).await?).await
 }
 
 /// Upgrades a blob from before checksums. Its bytes can't be verified as
@@ -307,7 +348,7 @@ pub(crate) async fn upgrade_blob(app: &Arc<App>, blob_id: Uuid) -> anyhow::Resul
 /// one gives a copy that verifies. If none does, though every one was read,
 /// its parts are intact nowhere: their bytes go to `lost_ranges` (see
 /// `scrub`), which keeps reads off them, and the blob is left as it is.
-async fn run_upgrade(app: &Arc<App>, sources: &[Uuid], coding: Option<u32>) -> anyhow::Result<JobReport> {
+async fn run_upgrade(app: &Arc<App>, sources: &[Uuid], class: &Class, coding: Option<u32>) -> anyhow::Result<JobReport> {
     let blob_id = sources[0];
     let replicas: Vec<(i32, bool)> = app
         .pool
@@ -331,7 +372,7 @@ async fn run_upgrade(app: &Arc<App>, sources: &[Uuid], coding: Option<u32>) -> a
             continue;
         }
         let mut outputs = Vec::new();
-        let result = pack(app, Kind::Upgrade, sources, &mut outputs, Some(node), coding).await;
+        let result = pack(app, Kind::Upgrade, sources, &mut outputs, Some(node), class, coding).await;
         if result.is_err() {
             for output in outputs {
                 crate::blobs::discard(app, output).await;
@@ -375,17 +416,19 @@ async fn run_upgrade(app: &Arc<App>, sources: &[Uuid], coding: Option<u32>) -> a
     Err(last_error)
 }
 
-/// The layout that every blob larger than [`SMALL_SIZE`] is to have, as the
-/// settings say: coded in `data_shards` data shards and `parity_shards`
-/// parity shards while coding is on (the `data-shards` setting is more than
-/// 1, and there are parity shards to add), else replicated, with
-/// `parity_shards` copies besides the first.
+/// The layout that every blob of a storage class larger than [`SMALL_SIZE`]
+/// is to have, as the class says, or the settings where it doesn't (see
+/// `classes`): coded in `data_shards` data shards and `parity_shards` parity
+/// shards while coding is on (its data shards are more than 1, and there are
+/// parity shards to add), else replicated, with `parity_shards` copies
+/// besides the first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Layouts {
     pub data_shards: u32,
     pub parity_shards: u32,
-    /// Whether the parity shards are the cluster's, the `parity-shards`
-    /// setting, rather than this node's `--replication-factor`. Only then is a
+    /// Whether the parity shards are the cluster's, the class's or the
+    /// `parity-shards` setting, rather than this node's
+    /// `--replication-factor`. Only then is a
     /// blob rewritten (or a replicated blob's copies added or dropped) for its
     /// parity shards alone: nodes that go by their own flags may disagree.
     pub parity_settled: bool,
@@ -398,45 +441,45 @@ impl Layouts {
     }
 }
 
-/// The layout that the settings say large blobs are to have (see
+/// The layout that class `class` says its large blobs are to have (see
 /// [`Layouts`]), whether or not there are nodes enough for it.
-pub(crate) async fn wanted_layouts(app: &App) -> anyhow::Result<Layouts> {
-    let client = app.pool.get().await?;
-    let setting = crate::settings::DATA_SHARDS.get(&client).await? as u32;
-    let parity_settled = crate::settings::PARITY_SHARDS.get_set(&client).await?.is_some();
-    let parity_shards = app.parity_shards();
-    let data_shards = if parity_shards == 0 { 1 } else { setting.max(1) };
-    Ok(Layouts {
-        data_shards,
-        parity_shards,
-        parity_settled,
-    })
+pub(crate) fn wanted_layouts(app: &App, class: &Class) -> Layouts {
+    Layouts {
+        data_shards: app.coding_of(class).unwrap_or(1),
+        parity_shards: app.parity_shards_of(class),
+        parity_settled: app.parity_settled(class),
+    }
 }
 
-/// The layout that large blobs are to have now (see [`Layouts`]): `None` if
-/// there are fewer live nodes than it takes, and then they keep theirs.
-pub(crate) async fn layouts(app: &App) -> anyhow::Result<Option<Layouts>> {
-    let layouts = wanted_layouts(app).await?;
-    // Live as `live_nodes` counts them.
-    let live: i64 = app
+/// How many active, live nodes have pool `pool`, as `live_nodes` counts them.
+pub(crate) async fn live_in_pool(app: &App, pool: &str) -> anyhow::Result<i64> {
+    Ok(app
         .pool
         .get()
         .await?
         .query_one_cached(
-            "SELECT count(*) FROM nodes
-             WHERE state = 'active' AND last_seen > NOW() - INTERVAL '10 seconds'",
-            &[],
+            "SELECT count(*) FROM nodes n JOIN node_pools np ON np.node = n.id AND np.pool = $1
+             WHERE n.state = 'active' AND n.last_seen > NOW() - INTERVAL '10 seconds'",
+            &[&pool],
         )
         .await?
-        .get(0);
+        .get(0))
+}
+
+/// The layout that class `class`'s large blobs are to have now (see
+/// [`Layouts`]): `None` if there are fewer live nodes with its pool than it
+/// takes, and then they keep theirs.
+pub(crate) async fn layouts(app: &App, class: &Class) -> anyhow::Result<Option<Layouts>> {
+    let layouts = wanted_layouts(app, class);
+    let live = live_in_pool(app, &class.pool).await?;
     Ok((live >= (layouts.data_shards + layouts.parity_shards) as i64).then_some(layouts))
 }
 
-/// How many data shards large blobs are coded into now (see `shards`):
-/// `None` if they aren't (see [`Layouts`]), or there are fewer live nodes
-/// than shards.
-pub(crate) async fn coding(app: &App) -> anyhow::Result<Option<u32>> {
-    Ok(layouts(app).await?.and_then(Layouts::coding))
+/// How many data shards class `class`'s large blobs are coded into now (see
+/// `shards`): `None` if they aren't (see [`Layouts`]), or there are fewer
+/// live nodes with its pool than shards.
+pub(crate) async fn coding(app: &App, class: &Class) -> anyhow::Result<Option<u32>> {
+    Ok(layouts(app, class).await?.and_then(Layouts::coding))
 }
 
 /// Takes the garbage log, in batches: the blobs that parts were deleted from
@@ -469,25 +512,26 @@ async fn fold_garbage(app: &Arc<App>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Claims the source blobs for a job of `kind`, if there's one worth running:
-/// as many candidates as fit into `OUTPUTS_PER_JOB` new blobs, by their live
-/// bytes.
-async fn claim(app: &App, kind: Kind) -> anyhow::Result<Option<Vec<Uuid>>> {
+/// Claims the source blobs for a job of `kind`, of class `class`, if there's
+/// one worth running: as many candidates as fit into `OUTPUTS_PER_JOB` new
+/// blobs, by their live bytes.
+async fn claim(app: &App, kind: Kind, class: &Class) -> anyhow::Result<Option<Vec<Uuid>>> {
     let kind = match kind {
         Kind::Compact => "compact",
         Kind::Consolidate => "consolidate",
         Kind::Upgrade => "upgrade",
         Kind::Convert => unreachable!("conversions are claimed by `claim_conversion`"),
     };
-    claim_with(app, kind, None).await
+    claim_with(app, kind, class, None).await
 }
 
-/// Claims blobs to convert into `layouts`, as `claim` does.
-async fn claim_conversion(app: &App, layouts: Layouts) -> anyhow::Result<Option<Vec<Uuid>>> {
-    claim_with(app, "convert", Some(layouts)).await
+/// Claims blobs of class `class` to convert into `layouts`, or without,
+/// those outside the class's pool, as `claim` does.
+async fn claim_conversion(app: &App, class: &Class, layouts: Option<Layouts>) -> anyhow::Result<Option<Vec<Uuid>>> {
+    claim_with(app, "convert", class, layouts).await
 }
 
-async fn claim_with(app: &App, kind: &str, layouts: Option<Layouts>) -> anyhow::Result<Option<Vec<Uuid>>> {
+async fn claim_with(app: &App, kind: &str, class: &Class, layouts: Option<Layouts>) -> anyhow::Result<Option<Vec<Uuid>>> {
     let config = &app.pack;
     let budget = OUTPUTS_PER_JOB * config.target_size;
     let data_shards = layouts.map(|l| l.data_shards as i16);
@@ -499,7 +543,7 @@ async fn claim_with(app: &App, kind: &str, layouts: Option<Layouts>) -> anyhow::
         .get()
         .await?
         .query_one_cached(
-            "SELECT pg_temp.cairn_claim($1, $2, $3, $4, $5, $6, $7, $8, $9)",
+            "SELECT pg_temp.cairn_claim($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
             &[
                 &kind,
                 &config.compact_threshold,
@@ -510,6 +554,8 @@ async fn claim_with(app: &App, kind: &str, layouts: Option<Layouts>) -> anyhow::
                 &LEASE.as_secs_f64(),
                 &data_shards,
                 &parity_shards,
+                &class.name,
+                &class.pool,
             ],
         )
         .await?
@@ -560,9 +606,15 @@ struct Run {
 
 /// Runs a job on the claimed `sources`. On failure, the new blobs are deleted
 /// (left to the GC if that fails too), and the sources stay leased.
-async fn run_job(app: &Arc<App>, kind: Kind, sources: &[Uuid], coding: Option<u32>) -> anyhow::Result<JobReport> {
+async fn run_job(
+    app: &Arc<App>,
+    kind: Kind,
+    sources: &[Uuid],
+    class: &Class,
+    coding: Option<u32>,
+) -> anyhow::Result<JobReport> {
     let mut outputs = Vec::new();
-    let result = pack(app, kind, sources, &mut outputs, None, coding).await;
+    let result = pack(app, kind, sources, &mut outputs, None, class, coding).await;
     if result.is_err() {
         for blob_id in outputs {
             if let Err(e) = crate::blobs::abandon(app, blob_id).await {
@@ -575,14 +627,16 @@ async fn run_job(app: &Arc<App>, kind: Kind, sources: &[Uuid], coding: Option<u3
 
 /// The body of [`run_job`]. Adds each new blob to `outputs` once it exists.
 /// Reads the sources from their shard on node `only`, if given, else from
-/// any. Writes a new blob coded in `coding` data shards if it's large enough,
-/// else replicated.
+/// any. Writes new blobs of class `class` (the sources'), coded in `coding`
+/// data shards if they're large enough, else replicated.
+#[allow(clippy::too_many_arguments)]
 async fn pack(
     app: &Arc<App>,
     kind: Kind,
     sources: &[Uuid],
     outputs: &mut Vec<Uuid>,
     only: Option<i32>,
+    class: &Class,
     coding: Option<u32>,
 ) -> anyhow::Result<JobReport> {
     let client = app.pool.get().await?;
@@ -619,9 +673,9 @@ async fn pack(
         let size: u64 = output.iter().map(|r| r.length).sum();
         let mut writer = match coding {
             Some(data_shards) if size > app.pack.small_size => {
-                BlobWriter::begin_coded(app, data_shards, size).await?
+                BlobWriter::begin_coded(app, class, data_shards, size).await?
             }
-            _ => BlobWriter::begin(app).await?,
+            _ => BlobWriter::begin(app, class).await?,
         };
         outputs.push(writer.blob_id);
         for run in output {

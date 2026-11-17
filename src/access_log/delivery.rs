@@ -229,6 +229,7 @@ async fn write(app: &Arc<App>, target: &Target, bucket: &str, key: &str, body: V
         Wanted::new(None, target.server.as_ref()),
         None,
         Lock::default(),
+        crate::classes::STANDARD,
     )
     .await?;
     let status = response.status();

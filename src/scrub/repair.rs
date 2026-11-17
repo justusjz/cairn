@@ -119,7 +119,19 @@ async fn repair_once(
     pacer: &Arc<Mutex<Pacer>>,
 ) -> anyhow::Result<Outcome> {
     let blob_id = expected.blob_id;
-    let file = app.store.create_repair(blob_id).await?;
+    // In the blob's pool, where its file is.
+    let pool: Option<String> = app
+        .pool
+        .get()
+        .await?
+        .query_opt_cached("SELECT pool FROM blobs WHERE blob_id = $1", &[&blob_id])
+        .await?
+        .map(|r| r.get(0));
+    let Some(pool) = pool else {
+        anyhow::bail!("blob {blob_id} is gone");
+    };
+    let pool = app.store.need(&pool)?;
+    let file = pool.create_repair(blob_id).await?;
     let mut copy = NewCopy {
         file,
         summer: BlobSummer::new(expected.layout.block_size as u32),
@@ -127,7 +139,7 @@ async fn repair_once(
     };
     let result = async {
         let (others, provisional) = other_shards(app, blob_id).await?;
-        let lost = assemble(app, expected, &others, bad, pacer, &mut copy).await?;
+        let lost = assemble(app, pool, expected, &others, bad, pacer, &mut copy).await?;
         if lost.incomplete {
             return Ok(Outcome::Lost {
                 ranges: lost.ranges,
@@ -150,7 +162,7 @@ async fn repair_once(
                  not the catalog's {crc:016x}"
             )));
         }
-        app.store.install_repair(blob_id).await?;
+        pool.install_repair(blob_id).await?;
         // Installed: it's the blob's file now, unless the blob is gone.
         if !location_exists(app, blob_id).await? {
             crate::blobs::remove_unplaced(app, blob_id).await?;
@@ -160,7 +172,7 @@ async fn repair_once(
     .await;
     // Whatever didn't replace the blob's file is of no use.
     if !matches!(result, Ok(Outcome::Repaired)) {
-        app.store.remove_repair(blob_id).await?;
+        pool.remove_repair(blob_id).await?;
     }
     result
 }
@@ -251,8 +263,10 @@ impl Lost {
 /// Writes the shard's data to `copy`, block by block: those that verified
 /// locally from the local file, all others from the other shards. Lost
 /// blocks are written as zeros, so that the rest can still be looked for.
+#[allow(clippy::too_many_arguments)]
 async fn assemble(
     app: &Arc<App>,
+    pool: &crate::store::Pool,
     expected: &ShardFile,
     others: &[Location],
     bad: Option<&[i64]>,
@@ -262,7 +276,7 @@ async fn assemble(
     let blob_id = expected.blob_id;
     let mut lost = Lost::default();
     let mut local = match bad {
-        Some(_) => app.store.open_blob(blob_id).await?,
+        Some(_) => pool.open_blob(blob_id).await?,
         None => None,
     };
     let layout = expected.blocks_of(expected.shard);
@@ -426,6 +440,7 @@ async fn other_shards(app: &App, blob_id: Uuid) -> anyhow::Result<(Vec<Location>
             &format!(
                 "SELECT {LOCATION_COLUMNS}, n.last_seen > NOW() - INTERVAL '10 seconds'
                  FROM blob_locations bl JOIN nodes n ON n.id = bl.node
+                 JOIN blobs b ON b.blob_id = bl.blob_id
                  WHERE bl.blob_id = $1 AND bl.node <> $2
                  ORDER BY n.last_seen DESC"
             ),
@@ -434,10 +449,10 @@ async fn other_shards(app: &App, blob_id: Uuid) -> anyhow::Result<(Vec<Location>
         .await?;
     let live = rows
         .iter()
-        .filter(|r| r.get::<_, bool>(3))
+        .filter(|r| r.get::<_, bool>(4))
         .map(|r| location_at(r, 0))
         .collect();
-    let down = rows.iter().any(|r| !r.get::<_, bool>(3));
+    let down = rows.iter().any(|r| !r.get::<_, bool>(4));
     Ok((live, down))
 }
 

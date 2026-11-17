@@ -600,7 +600,7 @@ impl Rule {
         )?;
         if !children(node, "Transition").is_empty() || !children(node, "NoncurrentVersionTransition").is_empty() {
             return Err(Invalid::Unsupported(
-                "lifecycle transitions aren't supported: Cairn has a single storage class".to_owned(),
+                "lifecycle transitions aren't supported yet: objects change storage class by being copied into it".to_owned(),
             ));
         }
         let id = match text(node, "ID")? {

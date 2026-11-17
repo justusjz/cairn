@@ -71,6 +71,7 @@ where
         app,
         body,
         &AttachTarget::MultipartPart {
+            storage_class: upload.storage_class.clone(),
             upload_id,
             part_number,
             key: upload_key,

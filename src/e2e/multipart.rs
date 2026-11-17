@@ -30,14 +30,14 @@ async fn staged(app: &Arc<App>, key: &str) -> (String, [String; 2]) {
 
 /// Like `staged`, the upload to give its object the stored `metadata`.
 async fn staged_with(app: &Arc<App>, key: &str, metadata: &str) -> (String, [String; 2]) {
-    let response = create_multipart_upload(app, BUCKET, key, "x", metadata, "", Wanted::Plain, None, None, Default::default(), None).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", metadata, "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
     let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
     let mut etags = [String::new(), String::new()];
     for (i, etag) in etags.iter_mut().enumerate() {
-        let attach = AttachTarget::MultipartPart {
+        let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
             upload_id: upload_id.parse::<Uuid>().unwrap(),
             part_number: i as i32 + 1,
             key: None,
@@ -170,7 +170,7 @@ async fn a_completed_upload_has_its_metadata() {
 async fn an_sse_c_upload_makes_an_sse_c_object() {
     let Some(app) = node().await else { return };
     let customer = super::customer_key(&[3; 32]);
-    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", "", Wanted::Customer(&customer), None, None, Default::default(), None).await.unwrap();
+    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", "", Wanted::Customer(&customer), None, None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
     assert_eq!(response.headers()["x-amz-server-side-encryption-customer-algorithm"], "AES256");
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
@@ -186,7 +186,7 @@ async fn an_sse_c_upload_makes_an_sse_c_object() {
     let upload = crate::s3::multipart::upload(&app, &upload_id.parse().unwrap(), BUCKET, "k").await.unwrap().unwrap();
     let upload_key = crate::s3::sse::open(&app, &upload.encryption, Some(&customer), None, BUCKET, "k").await.unwrap().ok().unwrap();
     for (i, part) in data.iter().enumerate() {
-        let attach = AttachTarget::MultipartPart {
+        let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
             upload_id: upload_id.parse().unwrap(),
             part_number: i as i32 + 1,
             key: upload_key.clone(),
@@ -242,7 +242,7 @@ async fn parts_but_the_last_must_be_5_mib() {
     let Some(app) = node().await else { return };
     let (upload_id, [_, e2]) = staged(&app, "k").await;
     // Part 1 again, now 4 bytes.
-    let attach = AttachTarget::MultipartPart {
+    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
         upload_id: upload_id.parse().unwrap(),
         part_number: 1,
         key: None,
@@ -313,7 +313,7 @@ async fn parts_page(
 async fn lists_an_uploads_parts() {
     let Some(app) = node().await else { return };
     let customer = super::customer_key(&[7; 32]);
-    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", "", Wanted::Customer(&customer), None, None, Default::default(), None).await.unwrap();
+    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", "", Wanted::Customer(&customer), None, None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     let body = std::str::from_utf8(&body).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -321,7 +321,7 @@ async fn lists_an_uploads_parts() {
     // Parts 3, 1 and 2, and 2 again: the second upload of it counts.
     let mut etags = std::collections::BTreeMap::new();
     for (number, len) in [(3, 30), (1, 10), (2, 20), (2, 25)] {
-        let attach = AttachTarget::MultipartPart {
+        let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
             upload_id: upload_id.parse().unwrap(),
             part_number: number,
             key: Some(zeroize::Zeroizing::new(*customer.key())),

@@ -101,6 +101,16 @@ pub struct CopyKeys<'a> {
     /// makes a copy onto itself one that changes something, as S3 has it
     /// (probed).
     pub restates: bool,
+    /// The storage class its destination is stored in (see `classes`), as
+    /// it asks for it: `None` is STANDARD, as in S3, whatever its source's.
+    pub storage_class: Option<&'a str>,
+}
+
+impl CopyKeys<'_> {
+    /// The storage class its destination is stored in.
+    fn storage_class(&self) -> &str {
+        self.storage_class.unwrap_or(crate::classes::STANDARD)
+    }
 }
 
 impl CopyKeys<'_> {
@@ -307,7 +317,9 @@ pub async fn copy_object(
             .checksum
             .or(version.checksum.as_ref().map(|checksum| checksum.algorithm))
             .unwrap_or(Algorithm::Crc64Nvme);
-        if !keys.shares(encryption) {
+        // Its bytes are shared only within a storage class: a copy into
+        // another one writes them again, in its pool and layout.
+        if !keys.shares(encryption) || version.storage_class != keys.storage_class() {
             let dest = Dest {
                 bucket: dest_bucket,
                 key: dest_key,
@@ -317,6 +329,7 @@ pub async fn copy_object(
                 checksum: checksum_algorithm,
                 lock: keys.lock,
                 conditions: dest_conditions,
+                storage_class: keys.storage_class(),
             };
             let sealing = match sse::seal(app, keys.dest, keys.role, dest_bucket, dest_key).await? {
                 Ok(sealing) => sealing,
@@ -406,6 +419,7 @@ pub async fn copy_object(
             checksum: checksum_algorithm,
             lock: keys.lock,
             conditions: dest_conditions,
+            storage_class: keys.storage_class(),
         };
         let (version_id, last_modified) =
             match commit_object_copy(app, &source, &dest, &stored_etag, &etag, &stored, &copied, expected).await? {
@@ -466,6 +480,8 @@ struct Dest<'a> {
     lock: crate::s3::object_lock::Lock,
     /// Its If-Match and If-None-Match.
     conditions: &'a Preconditions,
+    /// Its storage class.
+    storage_class: &'a str,
 }
 
 /// The checksum of a copy that shares its source's parts, as it's stored, and
@@ -549,6 +565,7 @@ async fn stream_object_copy(
     let slices = select_parts_in_range(source.locations.clone(), 0, size, source_key.as_deref());
     spawn_range_stream(app.clone(), slices, sender);
     let attach = AttachTarget::Object {
+        storage_class: dest.storage_class.to_owned(),
         bucket: dest.bucket.to_owned(),
         key: dest.key.to_owned(),
         content_type: dest.content_type.to_owned(),
@@ -689,7 +706,8 @@ async fn commit_object_copy(
 /// whole part, takes reading them (but not writing them). A part can't span
 /// blobs, so a range over several parts of the source is copied as data.
 ///
-/// So is any range of an encrypted source (an SSE-C one needs its key,
+/// So is a range of a source of another storage class than the upload's
+/// (see `classes`), and any range of an encrypted source (an SSE-C one needs its key,
 /// `source_key`), or into an encrypted upload (an SSE-C one needs its key,
 /// `dest_key`, as an UploadPart does): a range of ciphertext isn't a part of
 /// its own.
@@ -807,14 +825,16 @@ pub async fn copy_part(
             sse::echo_onto(resp, &upload_encryption, dest_key)
         };
         let encrypted = !version.encryption.is_plain() || !upload_encryption.is_plain();
-        let holding = part_holding(&source.parts, start, end).filter(|_| !encrypted);
+        // Bytes are shared only within a storage class (see `CopyKeys`).
+        let reclassed = version.storage_class != upload.storage_class;
+        let holding = part_holding(&source.parts, start, end).filter(|_| !encrypted && !reclassed);
         let Some((index, within)) = holding else {
             let keys = match stream_keys(app, &source, source_key, &src_bucket, &src_key, &upload_encryption, dest_key, role, bucket, key).await? {
                 Ok(keys) => keys,
                 Err(refused) => return Ok(refused),
             };
             return Ok(
-                match stream_part_copy(app, &source, start, end, upload_id, part_number, keys, upload.part_checksum()).await {
+                match stream_part_copy(app, &source, start, end, (upload_id, &upload.storage_class), part_number, keys, upload.part_checksum()).await {
                     Ok(Some((etag, checksum))) => respond(&etag, checksum.as_ref()),
                     Ok(None) => crate::s3::multipart::no_such_upload(&upload_id.to_string()),
                     // Its data went with it: copy what it is now.
@@ -996,7 +1016,7 @@ async fn stream_part_copy(
     source: &Source,
     start: u64,
     end: u64,
-    upload_id: Uuid,
+    (upload_id, storage_class): (Uuid, &str),
     part_number: i32,
     keys: StreamKeys,
     checksum: checksums::Wanted,
@@ -1005,6 +1025,7 @@ async fn stream_part_copy(
     let slices = select_parts_in_range(source.locations.clone(), start, end, keys.source.as_deref());
     spawn_range_stream(app.clone(), slices, sender);
     let attach = AttachTarget::MultipartPart {
+        storage_class: storage_class.to_owned(),
         upload_id,
         part_number,
         key: keys.dest,

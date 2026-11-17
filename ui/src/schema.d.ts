@@ -2301,16 +2301,17 @@ export interface components {
             consolidate_bytes: number;
             /**
              * Format: int64
-             * @description Blobs large enough to be coded that aren't in the cluster's layout,
-             *     which the packer converts (see `packer::Layouts`).
+             * @description Blobs large enough to be coded that aren't in their class's layout,
+             *     and blobs outside their class's pool, which the packer converts (see
+             *     `packer::Layouts`).
              */
             convert: number;
             /** Format: int64 */
             convert_bytes: number;
             /**
              * Format: int64
-             * @description Replicated blobs with more or fewer copies than the `parity-shards`
-             *     setting says (none while it isn't set), and how many copies the
+             * @description Replicated blobs with more or fewer copies than their class says
+             *     (none while that isn't settled), and how many copies the
              *     mover is to add and to drop (see `mover`).
              */
             copies: number;
@@ -2479,6 +2480,50 @@ export interface components {
             account_id?: string | null;
             /** @description One of the session's permission sets, by name. */
             name: string;
+        };
+        /** @description A storage class, as this node goes by it, and what it holds. */
+        ClassUsage: {
+            /** Format: int64 */
+            blobs: number;
+            /** Format: int64 */
+            bytes: number;
+            /**
+             * @description Whether they're brought to it now: it takes as many live nodes with
+             *     its pool as shards.
+             */
+            coding: boolean;
+            /**
+             * Format: int64
+             * @description Its own data and parity shards, if it sets them (else the
+             *     settings').
+             */
+            data_shards?: number | null;
+            /**
+             * Format: int64
+             * @description The layout its large blobs are to have: in so many data shards (1:
+             *     replicated) and parity shards.
+             */
+            layout_data_shards: number;
+            /** Format: int64 */
+            layout_parity_shards: number;
+            /** Format: int64 */
+            live_nodes: number;
+            /**
+             * Format: int64
+             * @description Committed blobs outside its pool, which the packer rewrites into it.
+             */
+            misplaced: number;
+            /** Format: int64 */
+            misplaced_bytes: number;
+            name: string;
+            /**
+             * Format: int64
+             * @description Active nodes with its pool, and of them, the live ones.
+             */
+            nodes: number;
+            /** Format: int64 */
+            parity_shards?: number | null;
+            pool: string;
         };
         Cluster: {
             nodes: components["schemas"]["ClusterNode"][];
@@ -3623,6 +3668,8 @@ export interface components {
              * @description The node's clock, in seconds since the Unix epoch.
              */
             now: number;
+            /** @description Its pools (see `classes`), and their filesystems. */
+            pools: components["schemas"]["PoolDisk"][];
             replication_factor: number;
             /**
              * Format: int64
@@ -3720,9 +3767,10 @@ export interface components {
             compact_threshold: number;
             /**
              * Format: int64
-             * @description What blobs larger than `small_size` are erasure-coded into (the
-             *     `data-shards` setting, and the parity shards). One data shard: they
-             *     aren't.
+             * @description What STANDARD's blobs larger than `small_size` are erasure-coded
+             *     into (its data shards, or the `data-shards` setting, and the parity
+             *     shards). One data shard: they aren't. Other classes' are in
+             *     `classes`.
              */
             data_shards: number;
             /**
@@ -3902,6 +3950,12 @@ export interface components {
              * @description Its number (`v1`, ...).
              */
             version: number;
+        };
+        /** @description A pool of a node, and the filesystem of its data dir. */
+        PoolDisk: {
+            disk?: components["schemas"]["Disk"] | null;
+            disk_error?: string | null;
+            name: string;
         };
         /** @description A provider to sign in at. */
         ProviderButton: {
@@ -4137,6 +4191,8 @@ export interface components {
         Storage: {
             backlog: components["schemas"]["Backlog"];
             blobs: components["schemas"]["BlobTotals"];
+            /** @description The storage classes (see `classes`), and what each holds. */
+            classes: components["schemas"]["ClassUsage"][];
             integrity: components["schemas"]["Coverage"];
             nodes: components["schemas"]["NodeHolding"][];
             objects: components["schemas"]["ObjectTotals"];

@@ -91,7 +91,7 @@ async fn lock_bucket(app: &App) {
 
 /// Writes `key` asking for `lock`; its version ID.
 async fn put_locked(app: &Arc<App>, key: &str, lock: Lock) -> String {
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),
@@ -188,14 +188,14 @@ async fn locks_need_object_lock() {
     let (status, _, body) = text(
         put_object(
             &app, BUCKET, "k", "x", "", "", Full::new(Bytes::from_static(b"x")), Payload::unchecked(),
-            &Preconditions::default(), Wanted::Plain, None, lock,
+            &Preconditions::default(), Wanted::Plain, None, lock, crate::classes::STANDARD,
         )
         .await
         .unwrap(),
     )
     .await;
     assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "InvalidRequest"));
-    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", "", Wanted::Plain, None, None, lock, None).await.unwrap();
+    let response = create_multipart_upload(&app, BUCKET, "k", "x", "", "", Wanted::Plain, None, None, lock, None, crate::classes::STANDARD).await.unwrap();
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     let (status, _, body) = text(get_object_retention(&app, BUCKET, "plain", None).await.unwrap()).await;
     assert_eq!((status, code(&body)), (StatusCode::BAD_REQUEST, "InvalidRequest"));
@@ -350,12 +350,12 @@ async fn uploads_and_copies_take_their_own_locks() {
     lock_bucket(&app).await;
     // An upload completes with what it asked for.
     let lock = Lock { retention: Some((Mode::Governance, in_days(3))), legal_hold: Some(true) };
-    let response = create_multipart_upload(&app, BUCKET, "m", "x", "", "", Wanted::Plain, None, None, lock, None).await.unwrap();
+    let response = create_multipart_upload(&app, BUCKET, "m", "x", "", "", Wanted::Plain, None, None, lock, None, crate::classes::STANDARD).await.unwrap();
     let (status, _, body) = text(response).await;
     assert_eq!(status, StatusCode::OK);
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
     let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
-    let attach = AttachTarget::MultipartPart {
+    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
         upload_id: upload_id.parse::<Uuid>().unwrap(),
         part_number: 1,
         key: None,

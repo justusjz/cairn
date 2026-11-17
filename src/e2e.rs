@@ -101,8 +101,8 @@ pub async fn fresh_database_through(last: usize) -> Option<Pool> {
     Some(crate::db::connect_through(&format!("{server}/{name}"), last).await.unwrap())
 }
 
-/// A node with a data dir of its own, registered in the database of `pool`
-/// as reachable at `peer_url`.
+/// A node with a data dir of its own, the pool `default`, registered in
+/// the database of `pool` as reachable at `peer_url`.
 async fn node_on(
     pool: &Pool,
     peer_url: &str,
@@ -110,11 +110,24 @@ async fn node_on(
     hook: Option<Hook>,
     replication_factor: usize,
 ) -> Arc<App> {
-    let store = Store::new(data_dir().to_string_lossy().into_owned()).unwrap();
+    node_with_pools(pool, peer_url, pack, hook, replication_factor, &[crate::classes::DEFAULT_POOL]).await
+}
+
+/// As `node_on`, with a data dir of its own for each of `pools`.
+pub(crate) async fn node_with_pools(
+    pool: &Pool,
+    peer_url: &str,
+    pack: Config,
+    hook: Option<Hook>,
+    replication_factor: usize,
+    pools: &[&str],
+) -> Arc<App> {
+    let dirs = pools.iter().map(|name| (name.to_string(), data_dir())).collect();
+    let store = Store::new(dirs).unwrap();
     let node = crate::register_node(pool, &store, peer_url)
         .await
         .unwrap();
-    Arc::new(App {
+    let app = Arc::new(App {
         pool: pool.clone(),
         store,
         node,
@@ -135,8 +148,11 @@ async fn node_on(
         kms: None,
         sessions: Default::default(),
         access_logs: Default::default(),
+        classes: Default::default(),
         pack_hook: hook,
-    })
+    });
+    crate::refresh_settings(&app).await.unwrap();
+    app
 }
 
 /// The data dirs of the nodes the tests made, all removed as the tests'
@@ -192,6 +208,18 @@ pub async fn cluster_with(
     n: usize,
     replication_factor: usize,
     pack: Config,
+    hook: Option<Hook>,
+) -> Option<Cluster> {
+    let pools = vec![&[crate::classes::DEFAULT_POOL][..]; n];
+    cluster_of_pools(&pools, replication_factor, pack, hook).await
+}
+
+/// Like `cluster_with`, of a node for each of `pools`, with those pools (see
+/// `classes`).
+pub async fn cluster_of_pools(
+    pools: &[&[&str]],
+    replication_factor: usize,
+    pack: Config,
     mut hook: Option<Hook>,
 ) -> Option<Cluster> {
     let pool = fresh_database().await?;
@@ -199,10 +227,10 @@ pub async fn cluster_with(
         nodes: Vec::new(),
         tasks: Vec::new(),
     };
-    for _ in 0..n {
+    for node_pools in pools {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peer_url = format!("http://{}", listener.local_addr().unwrap());
-        let app = node_on(&pool, &peer_url, pack.clone(), hook.take(), replication_factor).await;
+        let app = node_with_pools(&pool, &peer_url, pack.clone(), hook.take(), replication_factor, node_pools).await;
         let router = crate::peer::router(app.clone());
         let serving = tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
@@ -278,7 +306,7 @@ pub async fn put_sized(app: &Arc<App>, key: &str, data: Vec<u8>) {
 }
 
 async fn put_with(app: &Arc<App>, key: &str, data: Vec<u8>, payload: Payload) {
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),
@@ -342,7 +370,7 @@ async fn put_sealed_with(
     customer: &crate::s3::sse_c::CustomerKey,
     payload: Payload,
 ) -> String {
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),

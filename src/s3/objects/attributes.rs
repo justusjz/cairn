@@ -2,7 +2,7 @@
 //! an object version without its data, as the `x-amz-object-attributes`
 //! header asks for it (probed; see `plans/probes/parts_probe.py`):
 //!
-//! - `ETag`, unquoted; `ObjectSize`; `StorageClass` (always STANDARD);
+//! - `ETag`, unquoted; `ObjectSize`; `StorageClass`;
 //! - `Checksum`: the object's, a composite one without its `-N`;
 //! - `ObjectParts`, for a multipart object only: its part count, and, if its
 //!   checksum is composite, its parts (numbered from 1, whatever numbers
@@ -109,7 +109,7 @@ pub async fn get_object_attributes(
     role: Option<uuid::Uuid>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
-    let ObjectVersion { id, etag, encryption, size, last_modified, version_id, checksum, .. } =
+    let ObjectVersion { id, etag, encryption, size, last_modified, version_id, checksum, storage_class, .. } =
         match lookup_version(&client, bucket, key, version_id).await? {
             Ok(version) => version,
             Err(missing) => return Ok(missing.read_response()),
@@ -204,7 +204,7 @@ pub async fn get_object_attributes(
         body.push_str("</ObjectParts>");
     }
     if asked.wants("StorageClass") {
-        body.push_str("<StorageClass>STANDARD</StorageClass>");
+        body.push_str(&format!("<StorageClass>{storage_class}</StorageClass>"));
     }
     if asked.wants("ObjectSize") {
         body.push_str(&format!("<ObjectSize>{size}</ObjectSize>"));

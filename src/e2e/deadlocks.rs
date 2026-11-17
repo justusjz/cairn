@@ -54,7 +54,7 @@ async fn text(response: hyper::Response<Full<Bytes>>) -> (StatusCode, String) {
 
 /// Uploads `data` as part `number` of the upload; its ETag.
 async fn upload_part(app: &Arc<App>, upload_id: &str, number: i32, data: Vec<u8>) -> anyhow::Result<String> {
-    let attach = AttachTarget::MultipartPart {
+    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
         upload_id: upload_id.parse().unwrap(),
         part_number: number,
         key: None,
@@ -119,7 +119,7 @@ async fn step(app: &Arc<App>, rng: &mut Rng) -> anyhow::Result<()> {
         }
         // Part re-uploads racing each other, then a complete or an abort.
         12..=16 => {
-            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "", "", Wanted::Plain, None, None, Default::default(), None).await?).await;
+            let (_, body) = text(create_multipart_upload(app, BUCKET, &a, "x", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD).await?).await;
             let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
             let upload_id = body[start..body.find("</UploadId>").unwrap()].to_owned();
             let mut parts = JoinSet::new();

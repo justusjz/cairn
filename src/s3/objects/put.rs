@@ -17,7 +17,8 @@ use crate::{
 
 /// PutObject, and POST Object (see `post`), whose body is a part of a form.
 /// `tags` are the object's, stored form (see `s3::tags`), and `lock` the
-/// Object Lock it asks for (see `s3::object_lock`).
+/// Object Lock it asks for (see `s3::object_lock`), and `storage_class` the
+/// class it's stored in, which exists (see `classes`).
 #[allow(clippy::too_many_arguments)]
 pub async fn put_object<B>(
     app: &Arc<App>,
@@ -32,6 +33,7 @@ pub async fn put_object<B>(
     wanted: Wanted<'_>,
     role: Option<uuid::Uuid>,
     lock: Lock,
+    storage_class: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>>
 where
     B: Body<Data = Bytes> + Unpin + Send,
@@ -77,6 +79,7 @@ where
     // Stream the body into one replicated, committed part and atomically point
     // (bucket, key) at it. `upload_part` computes the ETag (hex MD5) as it streams.
     let attach = AttachTarget::Object {
+        storage_class: storage_class.to_owned(),
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         content_type: content_type.to_owned(),

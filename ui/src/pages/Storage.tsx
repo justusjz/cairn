@@ -84,6 +84,7 @@ function View(props: { storage: StorageInfo; cluster: Cluster; refresh: () => vo
       </div>
 
       <Redundancy storage={s()} cluster={props.cluster} refresh={props.refresh} />
+      <Classes storage={s()} />
 
       <div class="grid cols-2">
         <Panel
@@ -140,7 +141,14 @@ function View(props: { storage: StorageInfo; cluster: Cluster; refresh: () => vo
                     <td>
                       <LiveDot live={n.live} />#{n.id}
                     </td>
-                    <td class="mono">{n.peer_url}</td>
+                    <td class="mono">
+                      {n.peer_url}
+                      <Show when={n.stats?.pools.length}>
+                        <div class="subtle small">
+                          pools: {n.stats!.pools.map((p) => p.name).join(", ")}
+                        </div>
+                      </Show>
+                    </td>
                     <td class="num">{num(held(n.id).blobs)}</td>
                     <td class="num">{bytes(held(n.id).bytes)}</td>
                     <td class="num">{pct(held(n.id).bytes, b().bytes * rf())}</td>
@@ -182,7 +190,7 @@ function Redundancy(props: { storage: StorageInfo; cluster: Cluster; refresh: ()
   return (
     <Panel
       title="Redundancy"
-      note={`for the whole cluster · new blobs follow a change within a heartbeat, existing ones are rewritten in the background (Jobs) · ${num(active())} active nodes`}
+      note={`for STANDARD, and every storage class that sets none of its own · new blobs follow a change within a heartbeat, existing ones are rewritten in the background (Jobs) · ${num(active())} active nodes`}
     >
       <Table count={3} columns={["Setting", "Now", "", "Change"]}>
         <SettingRow
@@ -236,6 +244,61 @@ function Redundancy(props: { storage: StorageInfo; cluster: Cluster; refresh: ()
             set("repair-after", v, v > 0 ? `Nodes down for ${num(v)} min have their shards rebuilt` : "Repair of nodes that are down is off")
           }
         />
+      </Table>
+    </Panel>
+  );
+}
+
+/** The storage classes (`cairn class`): the pool each keeps its data in,
+ * its layout, the nodes with its pool, and what it holds. */
+function Classes(props: { storage: StorageInfo }) {
+  const layout = (c: StorageInfo["classes"][number]) =>
+    c.layout_data_shards > 1
+      ? `coded ${c.layout_data_shards}+${c.layout_parity_shards}`
+      : plural(c.layout_parity_shards + 1, "copy", "copies");
+  return (
+    <Panel title="Storage classes" note="defined with cairn class set · objects ask for one with x-amz-storage-class">
+      <Table
+        count={props.storage.classes.length}
+        columns={["Class", "Pool", "Layout", { label: "Nodes", num: true }, { label: "Blobs", num: true }, { label: "Bytes", num: true }, ""]}
+      >
+        <For each={props.storage.classes}>
+          {(c) => {
+            const shards = () => c.layout_data_shards + c.layout_parity_shards;
+            return (
+              <tr>
+                <td class="mono">{c.name}</td>
+                <td class="mono">{c.pool}</td>
+                <td>
+                  {layout(c)}
+                  <Show when={c.data_shards == null || c.parity_shards == null}>
+                    <div class="subtle small">from the settings above</div>
+                  </Show>
+                </td>
+                <td class="num">
+                  {num(c.live_nodes)} / {num(c.nodes)}
+                </td>
+                <td class="num">{num(c.blobs)}</td>
+                <td class="num">{bytes(c.bytes)}</td>
+                <td>
+                  <Show
+                    when={c.live_nodes >= c.layout_parity_shards + 1}
+                    fallback={<Badge tone="bad">too few nodes with {c.pool}</Badge>}
+                  >
+                    <Show when={!c.coding && shards() > c.layout_parity_shards + 1}>
+                      <Badge tone="warn">replicated until {num(shards())} nodes are live</Badge>
+                    </Show>
+                  </Show>
+                  <Show when={c.misplaced > 0}>
+                    <div class="subtle small">
+                      {num(c.misplaced)} blobs ({bytes(c.misplaced_bytes)}) moving into {c.pool}
+                    </div>
+                  </Show>
+                </td>
+              </tr>
+            );
+          }}
+        </For>
       </Table>
     </Panel>
   );
