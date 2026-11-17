@@ -51,6 +51,7 @@ pub(crate) fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Resul
             // No bucket's name has a NUL.
             Kind::Trust => Some("\0trust".to_owned()),
             Kind::Topic(arn) => Some(format!("\0topic {arn}")),
+            Kind::AccessGrants(arn) => Some(format!("\0access-grants {arn}")),
         },
         text.to_owned(),
         ids.map(str::to_owned),
@@ -137,6 +138,10 @@ pub struct Access {
     /// `set_management`): unset, the cluster is no one's, and every check
     /// on it denied.
     management: Option<String>,
+    /// An S3 Access Grants instance the checks may be on (see
+    /// `set_grants_instance`): its ARN, its account, and its resource
+    /// policy, if it has one.
+    grants: Option<(String, String, Option<Arc<Policy>>)>,
 }
 
 /// Who makes a request, as policies see it (an owned `policy::Principal`).
@@ -243,7 +248,22 @@ impl Access {
             writes: None,
             topics: HashMap::new(),
             management: None,
+            grants: None,
         })
+    }
+
+    /// Says that checks on the S3 Access Grants instance `arn` (and on its
+    /// locations and grants) are on `account`'s, whose resource policy
+    /// `policy` decides them as a bucket's policy decides its checks:
+    /// across accounts, with the principal's own policies.
+    pub fn set_grants_instance(&mut self, arn: &str, account: &str, policy: Option<Arc<Policy>>) {
+        self.grants = Some((arn.to_owned(), account.to_owned(), policy));
+    }
+
+    /// The Access Grants instance (as `set_grants_instance` said) that
+    /// `resource` (an ARN) is, or is a location or grant of.
+    fn grants_of(&self, resource: &str) -> Option<&(String, String, Option<Arc<Policy>>)> {
+        self.grants.as_ref().filter(|(arn, _, _)| resource == arn || resource.strip_prefix(arn.as_str()).is_some_and(|r| r.starts_with('/')))
     }
 
     /// Says which account is the organization's management account, which
@@ -403,9 +423,11 @@ impl Access {
             .filter(|loaded| !(loaded.restricted && loaded.account.as_deref() != self.account()))
             .filter(|_| !regional)
             .and_then(|loaded| loaded.policy.as_deref());
-        // A topic's policy is its resource policy, as a bucket's is.
+        // A topic's policy is its resource policy, as a bucket's is; and an
+        // Access Grants instance's.
         let bucket = match &check.on {
             On::Topic(..) => self.topics.get(&resource).map(|p| &**p),
+            On::Arn(arn) if self.grants_of(arn).is_some() => self.grants_of(arn).and_then(|(_, _, p)| p.as_deref()),
             _ => bucket,
         };
         // Whose the resource is: a bucket's owner; else (no bucket, or none
@@ -420,6 +442,7 @@ impl Access {
             // them `cairn:` actions; never anonymously, nor to a member
             // account's (see `organizations`).
             On::Cluster => Some(self.management.as_deref().unwrap_or("")),
+            On::Arn(arn) if self.grants_of(arn).is_some() => self.grants_of(arn).map(|(_, account, _)| account.as_str()),
             _ => loaded
                 .and_then(|loaded| loaded.account.as_deref())
                 .filter(|_| !matches!(check.action, "s3:CreateBucket" | "s3express:CreateBucket")),

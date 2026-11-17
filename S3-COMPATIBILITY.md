@@ -75,7 +75,7 @@ supported.
 | ACLs | 🟡 | Disabled, as on new S3 buckets: [ACLs](#acls) |
 | Object Ownership | 🟡 | Always `BucketOwnerEnforced`: [ACLs](#acls) |
 | Bucket ABAC (bucket tags in policies) | ✅ | |
-| S3 Access Grants | 🟡 | IAM grantees only: [Access Grants](#access-grants) |
+| S3 Access Grants | 🟡 | IAM grantees (any account's) only: [Access Grants](#access-grants) |
 | MFA delete | 🟡 | [MFA delete](#mfa-delete) |
 | IAM Identity Center (directory users, permission sets, sso-admin, identitystore) | 🟡 | Own directory and OIDC sources: [Identity Center](#identity-center) |
 | AWS Organizations (member accounts) | 🟡 | Accounts only: [Organizations](#organizations) |
@@ -91,8 +91,8 @@ S3 reports a bucket that doesn't use it:
 - S3 Select, torrents.
 - S3 Express's metadata tables, access points for directory buckets.
 - Requester pays, Transfer Acceleration.
-- Directory users and groups as grantees, and cross-account S3 Access
-  Grants ([Access Grants](#access-grants)).
+- Directory users and groups as S3 Access Grants grantees ([Access
+  Grants](#access-grants)).
 - Identity Center's access portal APIs (`sso`, `sso-oidc`, so `aws sso
   login`) and applications ([Identity Center](#identity-center)).
 
@@ -417,9 +417,14 @@ This wasn't checked against AWS. It differs in that:
   no one. AWS keeps a closed account for 90 days, and its data with it.
 - **No e-mail is sent,** and the management account has none (so
   DescribeOrganization has no `MasterAccountEmail`).
-- **Cross-account access** works as AWS's, by bucket policies and role
-  trust: an `AssumeRole` into another account needs both the role's trust
-  policy and the caller's own policies to allow it.
+- **Cross-account access** works as AWS's, by resource policies: buckets'
+  policies, roles' trust policies, SNS topics' policies (AddPermission) and
+  Access Grants instances' resource policies. Across accounts, both the
+  resource's policy and the caller's own policies must allow a request.
+  Other accounts are the organization's (open) only: a policy naming one
+  that isn't is refused. KMS keys are OpenBao's or Vault's, not accounts'
+  ([Encryption](#encryption)): their own policies decide who uses them,
+  whatever account a role is in.
 
 ### Identity Center
 
@@ -502,8 +507,14 @@ so the points below are Cairn's reading of them:
 
 - **IAM grantees only.** Cairn's [directory users](#identity-center) aren't
   grantees yet: `DIRECTORY_USER` and `DIRECTORY_GROUP` grantees,
-  applications and Identity Center instances are refused with `501`. So is the instance's
-  resource policy, which is for other accounts (there's one).
+  applications and Identity Center instances are refused with `501`.
+- **Other accounts.** A grant may name another account's user or role,
+  which calls GetDataAccess with the instance's account
+  (`x-amz-account-id`), if the instance's resource policy allows it and its
+  own policies do too, as in AWS. `instanceScope=ALL` is taken as `SELF`:
+  there's no sharing through AWS RAM. GetAccessGrantsInstanceResourcePolicy
+  answers an empty result when there's none, and the policy's
+  `Organization` is kept, but decides nothing.
 - **Scopes.** A grant's scope is its location's joined with its
   sub-prefix; without one, `<location>/*`. A trailing `*` is optional; one
   elsewhere is refused. A grantee's narrowest matching grant is the one
@@ -542,9 +553,6 @@ Not implemented:
   principal, granted a prefix), applications (`ApplicationArn`,
   `allowedByApplication`), and sessions carrying a person's identity
   (`sts:SetContext`, trusted identity propagation).
-- **Other accounts' grantees:** the instance's resource policy
-  (Put/Get/DeleteAccessGrantsInstanceResourcePolicy), and so cross-account
-  GetDataAccess.
 - **Auditing:** there's no CloudTrail, and S3 Control's requests aren't in
   [server access logs](#server-access-logging), so who got data access
   when isn't recorded (the session's name, the grantee's unique ID, is in

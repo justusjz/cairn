@@ -249,6 +249,7 @@ const MIGRATIONS: &[&str] = &[
     PERMISSION_SET_DEFINITIONS,
     OWN_DIRECTORY,
     ORGANIZATIONS,
+    ACCESS_GRANTS_POLICIES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3295,6 +3296,18 @@ CREATE TABLE organization_requests (
 CREATE INDEX organization_requests_requested ON organization_requests (requested_at);
 CREATE TRIGGER organization_requests_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON organization_requests
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 69: an S3 Access Grants instance's resource policy (see
+/// `s3::access_grants`), which lets other accounts' principals use it (as
+/// their own policies do too), with the organization it names, and when it
+/// was set.
+/// No new lock protocol: plain columns of plain rows.
+const ACCESS_GRANTS_POLICIES: &str = r#"
+ALTER TABLE access_grants_instances
+    ADD COLUMN resource_policy            text,
+    ADD COLUMN resource_policy_org        text,
+    ADD COLUMN resource_policy_created_at timestamptz;
 "#;
 
 #[cfg(test)]

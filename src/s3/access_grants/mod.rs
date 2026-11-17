@@ -17,15 +17,21 @@
 //! S3's do. Its sessions' requests carry the instance's ARN as
 //! `s3:AccessGrantsInstanceArn`.
 //!
-//! Every operation is the signer's own account's, as S3 Control's others
-//! here (see `buckets::public_access`), and needs its `s3:` action, on the
-//! instance's ARN, a location's or a grant's; creating or changing a
-//! location needs `iam:PassRole` on its role too. Grants' and locations'
-//! scopes are `s3:AccessGrantScope` and `s3:AccessGrantsLocationScope`.
+//! Every operation is on the instance of the account the request names
+//! (`x-amz-account-id`), and needs its `s3:` action, on the instance's ARN,
+//! a location's or a grant's; creating or changing a location needs
+//! `iam:PassRole` on its role too. Grants' and locations' scopes are
+//! `s3:AccessGrantScope` and `s3:AccessGrantsLocationScope`. The signer's
+//! own account's, its own policies decide that; another account's (of the
+//! organization's, open: see `organizations`), the instance's **resource
+//! policy** must allow it too, as AWS's: so a grant may name another
+//! account's user or role, which calls GetDataAccess on the instance's
+//! account. Making or deleting an instance, and its resource policy, are
+//! its own account's only.
 //!
 //! Not here: IAM Identity Center (directory users and groups as grantees,
-//! applications), and the instance's resource policy, which is for other
-//! accounts (Cairn has one): NotImplemented.
+//! applications): NotImplemented. `instanceScope=ALL` is taken as `SELF`:
+//! the instance is the named account's, as there's no sharing (AWS RAM).
 
 pub mod scope;
 #[cfg(test)]
@@ -144,9 +150,19 @@ enum Op {
     ListGrants,
     GetDataAccess,
     ListCallerGrants,
-    /// What Cairn doesn't do: the instance's resource policy, IAM Identity
-    /// Center.
+    PutPolicy,
+    GetPolicy,
+    DeletePolicy,
+    /// What Cairn doesn't do: IAM Identity Center.
     Unsupported(&'static str),
+}
+
+impl Op {
+    /// Whether another account's principals may make it, if the instance's
+    /// resource policy allows it: all but what's about the instance itself.
+    fn shared(&self) -> bool {
+        !matches!(self, Op::CreateInstance | Op::DeleteInstance | Op::ListInstances | Op::PutPolicy | Op::GetPolicy | Op::DeletePolicy)
+    }
 }
 
 /// The operation a request with `method` to `path` is: `Err(true)` if the
@@ -171,7 +187,9 @@ fn route(method: &Method, path: &str) -> Result<Op, bool> {
         (Method::GET, "/grants") => Op::ListGrants,
         (Method::GET, "/dataaccess") => Op::GetDataAccess,
         (Method::GET, "/caller/grants") => Op::ListCallerGrants,
-        (Method::GET | Method::PUT | Method::DELETE, "/resourcepolicy") => Op::Unsupported("Access Grants instances' resource policies"),
+        (Method::PUT, "/resourcepolicy") => Op::PutPolicy,
+        (Method::GET, "/resourcepolicy") => Op::GetPolicy,
+        (Method::DELETE, "/resourcepolicy") => Op::DeletePolicy,
         (Method::POST | Method::DELETE, "/identitycenter") => Op::Unsupported("IAM Identity Center"),
         (method, _) if id("/location/").is_some() => {
             let id = id("/location/").expect("just checked");
@@ -218,6 +236,9 @@ impl Op {
             Op::ListGrants => "s3:ListAccessGrants",
             Op::GetDataAccess => "s3:GetDataAccess",
             Op::ListCallerGrants => "s3:ListCallerAccessGrants",
+            Op::PutPolicy => "s3:PutAccessGrantsInstanceResourcePolicy",
+            Op::GetPolicy => "s3:GetAccessGrantsInstanceResourcePolicy",
+            Op::DeletePolicy => "s3:DeleteAccessGrantsInstanceResourcePolicy",
             Op::Unsupported(_) => "",
         }
     }
@@ -454,6 +475,12 @@ async fn role_named(client: &Object, account: &str, arn: &str) -> anyhow::Result
 /// Whether `arn` is an IAM user's or role's of `account` that exists, as a
 /// grantee must be.
 async fn principal_exists(client: &Object, account: &str, arn: &str) -> anyhow::Result<bool> {
+    // Of `account`, or another (open) account of the organization's.
+    let named = arn.strip_prefix("arn:aws:iam::").and_then(|r| r.split(':').next()).unwrap_or("").to_owned();
+    if named != account && !crate::organizations::open(client, &named).await? {
+        return Ok(false);
+    }
+    let account = named.as_str();
     let Some(rest) = arn.strip_prefix("arn:aws:iam::").and_then(|r| r.strip_prefix(account)) else { return Ok(false) };
     let row = match (rest.strip_prefix(":user/"), rest.strip_prefix(":role/")) {
         (Some(user), _) => {
@@ -542,12 +569,16 @@ pub async fn handle(
     access: &mut Access,
     secret: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
-    let named = req.headers().get("x-amz-account-id").and_then(|v| v.to_str().ok());
-    let Some(principal) = principal.filter(|p| named == Some(p.account.as_str())) else {
-        return Ok(format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"));
-    };
+    let denied = || Ok(format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"));
+    let named = req.headers().get("x-amz-account-id").and_then(|v| v.to_str().ok()).map(str::to_owned);
+    let (Some(principal), Some(named)) = (principal, named) else { return denied() };
+    // Another account's instance: of the organization's, open.
+    if named != principal.account && !crate::organizations::open(&app.pool.get().await?, &named).await? {
+        return denied();
+    }
     let op = match route(req.method(), req.uri().path()) {
         Ok(Op::Unsupported(what)) => return Ok(not_implemented(what)),
+        Ok(op) if named != principal.account && !op.shared() => return denied(),
         Ok(op) => op,
         Err(true) => {
             return Ok(format_s3_error(StatusCode::METHOD_NOT_ALLOWED, "MethodNotAllowed", "The specified method is not allowed against this resource."));
@@ -562,15 +593,17 @@ pub async fn handle(
         },
         _ => None,
     };
-    answer(app, op, principal, access, &query, body).await
+    answer(app, op, principal, &named, access, &query, body).await
 }
 
-/// Answers `op`, by `principal` (of the account the request names), with
-/// its `query` and its `body` (a POST's or PUT's), as `access` decides it.
+/// Answers `op` on `account`'s instance, by `principal` (of that account,
+/// or another), with its `query` and its `body` (a POST's or PUT's), as
+/// `access` decides it, with the instance's resource policy.
 async fn answer(
     app: &App,
     op: Op,
     principal: &Principal,
+    account: &str,
     access: &mut Access,
     query: &str,
     body: Option<Bytes>,
@@ -590,7 +623,14 @@ async fn answer(
         None => None,
     };
     let body = document.as_ref().map(|d| Body { root: d.root_element() });
-    let mut ctx = Ctx { app, client: app.pool.get().await?, account: principal.account.clone(), principal, access };
+    let client = app.pool.get().await?;
+    let policy = resource_policy(&client, account).await?.map(|p| p.policy);
+    let policy = match policy {
+        Some(text) => Some(crate::s3::access::parsed(&text, Kind::AccessGrants(&instance_arn(account)), None)?),
+        None => None,
+    };
+    access.set_grants_instance(&instance_arn(account), account, policy);
+    let mut ctx = Ctx { app, client, account: account.to_owned(), principal, access };
     let action = op.action();
     match op {
         Op::CreateInstance => create_instance(&mut ctx, body.as_ref()).await,
@@ -669,9 +709,40 @@ async fn answer(
         Op::ListGrants => list_grants(&mut ctx, &query).await,
         Op::GetDataAccess => get_data_access(&mut ctx, &query).await,
         Op::ListCallerGrants => list_caller_grants(&mut ctx, &query).await,
+        Op::PutPolicy => put_policy(&mut ctx, body.as_ref()).await,
+        Op::GetPolicy => {
+            if let Some(refused) = ctx.denied(action, ctx.instance_on(), &Context::default()) {
+                return Ok(refused);
+            }
+            if instance(&ctx.client, &ctx.account).await?.is_none() {
+                return Ok(no_instance());
+            }
+            // None set: an empty result (AWS doesn't say).
+            let inner = resource_policy(&ctx.client, &ctx.account).await?.map(|p| p.xml()).unwrap_or_default();
+            Ok(result("GetAccessGrantsInstanceResourcePolicyResult", &inner))
+        }
+        Op::DeletePolicy => {
+            if let Some(refused) = ctx.denied(action, ctx.instance_on(), &Context::default()) {
+                return Ok(refused);
+            }
+            let changed = ctx
+                .client
+                .execute_cached(
+                    "UPDATE access_grants_instances SET resource_policy = NULL, resource_policy_org = NULL, resource_policy_created_at = NULL
+                     WHERE account_id = $1",
+                    &[&ctx.account],
+                )
+                .await?;
+            Ok(match changed {
+                0 => no_instance(),
+                // 200, with no body, as AWS's.
+                _ => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+            })
+        }
         Op::Unsupported(what) => Ok(not_implemented(what)),
     }
 }
+
 
 /// The body a request must have.
 fn required<'b, 'a>(body: Option<&'b Body<'a>>) -> Result<&'b Body<'a>, Response<Full<Bytes>>> {
@@ -693,6 +764,76 @@ macro_rules! or_answer {
             Err(response) => return Ok(response),
         }
     };
+}
+
+/// An instance's resource policy, as it was set.
+struct ResourcePolicy {
+    policy: String,
+    organization: Option<String>,
+    created: u64,
+}
+
+impl ResourcePolicy {
+    fn xml(&self) -> String {
+        let organization = self.organization.as_deref().map(|o| format!("<Organization>{}</Organization>", xml_escape(o))).unwrap_or_default();
+        format!("<Policy>{}</Policy>{organization}<CreatedAt>{}</CreatedAt>", xml_escape(&self.policy), sessions::iso(self.created))
+    }
+}
+
+/// `account`'s instance's resource policy, if it has one.
+async fn resource_policy(client: &Object, account: &str) -> anyhow::Result<Option<ResourcePolicy>> {
+    let row = client
+        .query_opt_cached(
+            "SELECT resource_policy, resource_policy_org, extract(epoch FROM resource_policy_created_at)::bigint
+             FROM access_grants_instances WHERE account_id = $1 AND resource_policy IS NOT NULL",
+            &[&account],
+        )
+        .await?;
+    Ok(row.map(|r| ResourcePolicy { policy: r.get(0), organization: r.get(1), created: r.get::<_, i64>(2) as u64 }))
+}
+
+/// PutAccessGrantsInstanceResourcePolicy: `Policy`, valid as an instance's
+/// (naming the instance, its locations or grants, and Access Grants'
+/// actions), and `Organization`, an organization's ID if given.
+async fn put_policy(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Result<Response<Full<Bytes>>> {
+    let body = or_answer!(required(body));
+    let policy = or_answer!(field(body, "Policy"));
+    let organization = body.text("Organization").filter(|o| !o.is_empty());
+    if let Some(organization) = &organization {
+        let valid = organization.strip_prefix("o-").is_some_and(|rest| {
+            (10..=32).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+        if !valid {
+            return Ok(invalid("Organization isn't an organization's ID."));
+        }
+    }
+    if let Some(refused) = ctx.denied("s3:PutAccessGrantsInstanceResourcePolicy", ctx.instance_on(), &Context::default()) {
+        return Ok(refused);
+    }
+    if policy.len() > 350_000 {
+        return Ok(invalid("Policy is longer than 350000 characters."));
+    }
+    let arn = instance_arn(&ctx.account);
+    if let Err(e) = Policy::parse(&policy, Kind::AccessGrants(&arn)) {
+        return Ok(format_s3_error(StatusCode::BAD_REQUEST, "MalformedPolicy", &e.message));
+    }
+    // The other accounts it names must be the organization's.
+    for named in Policy::parse(&policy, Kind::AccessGrants(&arn)).expect("just parsed").accounts() {
+        if !crate::organizations::open(&ctx.client, named).await? {
+            return Ok(format_s3_error(StatusCode::BAD_REQUEST, "MalformedPolicy", &format!("Invalid principal in policy: {named}")));
+        }
+    }
+    let row = ctx
+        .client
+        .query_opt_cached(
+            "UPDATE access_grants_instances SET resource_policy = $2, resource_policy_org = $3, resource_policy_created_at = now()
+             WHERE account_id = $1 RETURNING extract(epoch FROM resource_policy_created_at)::bigint",
+            &[&ctx.account, &policy, &organization],
+        )
+        .await?;
+    let Some(row) = row else { return Ok(no_instance()) };
+    let set = ResourcePolicy { policy, organization, created: row.get::<_, i64>(0) as u64 };
+    Ok(result("PutAccessGrantsInstanceResourcePolicyResult", &set.xml()))
 }
 
 async fn create_instance(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Result<Response<Full<Bytes>>> {
@@ -991,7 +1132,7 @@ async fn create_grant(ctx: &mut Ctx<'_>, body: Option<&Body<'_>>) -> anyhow::Res
         }
     }
     if !principal_exists(&ctx.client, &ctx.account, &grantee).await? {
-        return Ok(invalid(format!("The grantee {grantee} isn't an IAM user or role of this account.")));
+        return Ok(invalid(format!("The grantee {grantee} isn't an IAM user or role of this account, or another of the organization's.")));
     }
     let count: i64 = ctx
         .client
@@ -1340,7 +1481,7 @@ mod tests {
         assert_eq!(route(&Method::PUT, "/v20180820/accessgrantsinstance/grant/x"), Err(true));
         assert_eq!(route(&Method::PUT, "/v20180820/accessgrantsinstance/grants"), Err(true));
         assert_eq!(route(&Method::GET, "/v20180820/accessgrantsinstance/nothing"), Err(false));
-        assert!(matches!(route(&Method::PUT, "/v20180820/accessgrantsinstance/resourcepolicy"), Ok(Op::Unsupported(_))));
+        assert_eq!(route(&Method::PUT, "/v20180820/accessgrantsinstance/resourcepolicy"), Ok(Op::PutPolicy));
     }
 
     #[test]
