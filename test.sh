@@ -2573,6 +2573,15 @@ batch_jobs_ok() {
         --query Priority --output text 2>/dev/null)" = 20 ] || return 1
     [ "$(awsvhost s3control get-job-tagging --account-id "$account" --job-id "$job" \
         --query 'Tags[0].Value' --output text 2>/dev/null)" = test ] || return 1
+    # A job that sets retention, as its operation tells.
+    out=$(awsvhost s3control create-job --account-id "$account" --confirmation-required --priority 10 \
+        --role-arn "arn:aws:iam::$account:role/$r" --manifest "$manifest" --report '{"Enabled":false}' \
+        --operation '{"S3PutObjectRetention":{"Retention":{"Mode":"GOVERNANCE","RetainUntilDate":"2100-01-01T00:00:00Z"}}}' \
+        --query JobId --output text 2>/dev/null) || return 1
+    [ "$(awsvhost s3control describe-job --account-id "$account" --job-id "$out" \
+        --query 'Job.Operation.S3PutObjectRetention.Retention.Mode' --output text 2>/dev/null)" = GOVERNANCE ] || return 1
+    awsvhost s3control update-job-status --account-id "$account" --job-id "$out" \
+        --requested-job-status Cancelled >/dev/null 2>&1 || return 1
     # A job with a completion report, which tells it back; one without the
     # report's format is refused.
     out=$(awsvhost s3control create-job --account-id "$account" --confirmation-required --priority 10 \
@@ -2593,7 +2602,8 @@ batch_jobs_ok() {
     # Operations and manifests Cairn doesn't do yet are 501s.
     out=$(awsvhost s3control create-job --account-id "$account" --no-confirmation-required --priority 10 \
         --role-arn "arn:aws:iam::$account:role/$r" --report '{"Enabled":false}' \
-        --operation '{"S3PutObjectLegalHold":{"LegalHold":{"Status":"ON"}}}' --manifest "$manifest" 2>&1) && return 1
+        --operation '{"S3InitiateRestoreObject":{"ExpirationInDays":1,"GlacierJobTier":"STANDARD"}}' \
+        --manifest "$manifest" 2>&1) && return 1
     echo "$out" | grep -q NotImplemented || return 1
     [ "$(awsvhost s3control update-job-status --account-id "$account" --job-id "$job" \
         --requested-job-status Cancelled --query Status --output text 2>/dev/null)" = Cancelled ] || return 1

@@ -1405,7 +1405,9 @@ written or deleted while it's made may or may not be in it.
 S3 Batch Operations: a job (S3 Control's `CreateJob`,
 `aws s3control create-job`) does one operation to every object a manifest
 lists, as a role. Cairn does `S3PutObjectTagging` (replacing each object's
-tags) and `S3DeleteObjectTagging`, from a CSV manifest: an object of lines
+tags), `S3DeleteObjectTagging`, `S3PutObjectRetention` and
+`S3PutObjectLegalHold` ([Object Lock](#object-lock)), from a CSV manifest:
+an object of lines
 `bucket,key` (or `bucket,key,versionId`, as its `Fields` say), keys
 URL-encoded. Other operations and inventory reports as manifests aren't
 done yet (see [S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#batch-operations)).
@@ -1446,6 +1448,20 @@ succeeded and failed. A job fails, saying why in its `FailureReasons`, if
 its role or manifest can't be used, if its manifest changes (it's pinned to
 the ETag it was created with), or if more than half its tasks fail once a
 thousand have run. Jobs are kept for 90 days after they end.
+
+Retention and legal holds are set as PutObjectRetention and
+PutObjectLegalHold set them, so the role needs `s3:PutObjectRetention` or
+`s3:PutObjectLegalHold`, and the objects' bucket Object Lock. A retention
+can only be lengthened, unless the job asks to bypass governance mode
+(`BypassGovernanceRetention`) and the role is allowed
+`s3:BypassGovernanceRetention`; a compliance-mode one can't be shortened at
+all. Each task that can't is a failed task:
+
+```sh
+  --operation '{"S3PutObjectRetention":{"Retention":{"Mode":"GOVERNANCE",
+    "RetainUntilDate":"2030-01-01T00:00:00Z"}}}'
+  --operation '{"S3PutObjectLegalHold":{"LegalHold":{"Status":"ON"}}}'
+```
 
 A completion report (`--report`) goes to a bucket, under its prefix, as S3
 writes it: `<prefix>/job-<id>/results/*.csv`, a line per task (bucket, key,

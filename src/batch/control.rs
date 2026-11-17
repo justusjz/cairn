@@ -65,8 +65,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "S3PutObjectCopy",
     "S3PutObjectAcl",
     "S3InitiateRestoreObject",
-    "S3PutObjectLegalHold",
-    "S3PutObjectRetention",
     "S3ReplicateObject",
     "S3ComputeObjectChecksum",
     "S3UpdateObjectEncryption",
@@ -333,6 +331,25 @@ fn operation_xml(operation: &Operation) -> String {
             format!("<Operation><S3PutObjectTagging>{}</S3PutObjectTagging></Operation>", tags_xml("TagSet", tags))
         }
         Operation::DeleteTagging => "<Operation><S3DeleteObjectTagging/></Operation>".to_owned(),
+        Operation::PutRetention { mode, until, bypass } => {
+            let mut out = String::from("<Operation><S3PutObjectRetention>");
+            if *bypass {
+                out.push_str("<BypassGovernanceRetention>true</BypassGovernanceRetention>");
+            }
+            out.push_str("<Retention>");
+            if let Some(until) = until {
+                out.push_str(&element("RetainUntilDate", until));
+            }
+            if let Some(mode) = mode {
+                out.push_str(&element("Mode", mode));
+            }
+            out.push_str("</Retention></S3PutObjectRetention></Operation>");
+            out
+        }
+        Operation::PutLegalHold { on } => format!(
+            "<Operation><S3PutObjectLegalHold><LegalHold><Status>{}</Status></LegalHold></S3PutObjectLegalHold></Operation>",
+            if *on { "ON" } else { "OFF" }
+        ),
     }
 }
 
@@ -501,6 +518,15 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
             Operation::PutTagging { tags: tags.iter().map(|(k, v)| (k.to_owned(), v.to_owned())).collect() }
         }
         "S3DeleteObjectTagging" => Operation::DeleteTagging,
+        "S3PutObjectRetention" => parse_retention(operation)?,
+        "S3PutObjectLegalHold" => {
+            let status = child(operation, "LegalHold").and_then(|hold| text(hold, "Status"));
+            match status {
+                Some("ON") => Operation::PutLegalHold { on: true },
+                Some("OFF") => Operation::PutLegalHold { on: false },
+                _ => return Err(bad_request("A legal hold's Status, ON or OFF, is required.")),
+            }
+        }
         name if UNIMPLEMENTED.contains(&name) => return Err(not_implemented(&format!("The {name} operation"))),
         name => return Err(bad_request(&format!("{name} isn't an operation."))),
     };
@@ -587,6 +613,37 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
         None => Vec::new(),
     };
     Ok(NewJob { confirmation, operation, report, token: token.to_owned(), manifest, description, priority, role_arn, tags })
+}
+
+/// S3PutObjectRetention's operation: its `Retention` (a mode and a
+/// retain-until date in the future, or neither, to remove one), and
+/// whether it may bypass GOVERNANCE mode.
+fn parse_retention(operation: roxmltree::Node) -> Result<Operation, Response<Full<Bytes>>> {
+    use crate::s3::object_lock::{Mode, parse_date};
+    let bypass = boolean(operation, "BypassGovernanceRetention")?.unwrap_or(false);
+    let Some(retention) = child(operation, "Retention") else {
+        return Err(bad_request("A retention is required."));
+    };
+    if child(retention, "EventHold").is_some() || child(retention, "EventHoldDuration").is_some() {
+        return Err(not_implemented("An event hold"));
+    }
+    let (mode, until) = match (text(retention, "Mode"), text(retention, "RetainUntilDate")) {
+        (None, None) => (None, None),
+        (Some(mode), Some(until)) => {
+            if Mode::parse(mode).is_none() {
+                return Err(bad_request("A retention's Mode is GOVERNANCE or COMPLIANCE."));
+            }
+            let Some(date) = parse_date(until) else {
+                return Err(bad_request("A retention's RetainUntilDate isn't a date."));
+            };
+            if date <= SystemTime::now() {
+                return Err(bad_request(crate::s3::object_lock::IN_THE_PAST));
+            }
+            (Some(mode.to_owned()), Some(until.to_owned()))
+        }
+        _ => return Err(bad_request("A retention has both a Mode and a RetainUntilDate, or neither.")),
+    };
+    Ok(Operation::PutRetention { mode, until, bypass })
 }
 
 /// Why an enabled report isn't one Cairn writes: it needs a bucket (by its
@@ -986,6 +1043,42 @@ mod tests {
         assert_eq!(refusal(&request(copy, "")), (501, "NotImplemented".to_owned()));
         let inventory = request(PUT, "").replace("S3BatchOperations_CSV_20180820", "S3InventoryReport_CSV_20161130");
         assert_eq!(refusal(&inventory), (501, "NotImplemented".to_owned()));
+    }
+
+    #[test]
+    fn object_lock_operations_are_parsed() {
+        let retention = |inner: &str| format!("<S3PutObjectRetention>{inner}</S3PutObjectRetention>");
+        let job = parse_create(
+            request(
+                &retention(
+                    "<BypassGovernanceRetention>true</BypassGovernanceRetention>\
+                     <Retention><RetainUntilDate>2100-01-01T00:00:00Z</RetainUntilDate><Mode>COMPLIANCE</Mode></Retention>",
+                ),
+                "",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let until = Some("2100-01-01T00:00:00Z".to_owned());
+        assert_eq!(job.operation, Operation::PutRetention { mode: Some("COMPLIANCE".to_owned()), until, bypass: true });
+        assert!(operation_xml(&job.operation).contains("<Mode>COMPLIANCE</Mode>"));
+        // Neither removes a retention.
+        let job = parse_create(request(&retention("<Retention/>"), "").as_bytes()).unwrap();
+        assert_eq!(job.operation, Operation::PutRetention { mode: None, until: None, bypass: false });
+        let bad = (400, "BadRequestException".to_owned());
+        assert_eq!(refusal(&request(&retention(""), "")), bad);
+        assert_eq!(refusal(&request(&retention("<Retention><Mode>COMPLIANCE</Mode></Retention>"), "")), bad);
+        let past = "<Retention><RetainUntilDate>2000-01-01T00:00:00Z</RetainUntilDate><Mode>GOVERNANCE</Mode></Retention>";
+        assert_eq!(refusal(&request(&retention(past), "")), bad);
+        let lower = "<Retention><RetainUntilDate>2100-01-01T00:00:00Z</RetainUntilDate><Mode>governance</Mode></Retention>";
+        assert_eq!(refusal(&request(&retention(lower), "")), bad);
+        let event = "<Retention><EventHold>ON</EventHold></Retention>";
+        assert_eq!(refusal(&request(&retention(event), "")), (501, "NotImplemented".to_owned()));
+
+        let hold = |status: &str| format!("<S3PutObjectLegalHold><LegalHold><Status>{status}</Status></LegalHold></S3PutObjectLegalHold>");
+        let job = parse_create(request(&hold("ON"), "").as_bytes()).unwrap();
+        assert_eq!(job.operation, Operation::PutLegalHold { on: true });
+        assert_eq!(refusal(&request(&hold("on"), "")), bad);
     }
 
     #[test]

@@ -288,8 +288,11 @@ fn invalid_argument(message: &str) -> Response<Full<Bytes>> {
     format_s3_error(StatusCode::BAD_REQUEST, "InvalidArgument", message)
 }
 
+/// S3's message for a retention that ends in the past.
+pub const IN_THE_PAST: &str = "The retain until date must be in the future!";
+
 fn in_the_past() -> Response<Full<Bytes>> {
-    invalid_argument("The retain until date must be in the future!")
+    invalid_argument(IN_THE_PAST)
 }
 
 fn malformed() -> Response<Full<Bytes>> {
@@ -584,25 +587,8 @@ pub async fn put_object_retention(
         }
         Some(_) => return Ok(malformed()),
     };
-    let mode = retention.map(|(mode, _)| mode.name());
-    let until = retention.map(|(_, until)| until);
-    let client = app.pool.get().await?;
-    for attempt in 0..db::MAX_TX_ATTEMPTS {
-        db::backoff(attempt).await;
-        let row = match client
-            .query_one_cached(
-                "SELECT status, versioning, version_id FROM pg_temp.cairn_set_retention($1, $2, $3, $4, $5, $6)",
-                &[&bucket, &key, &version_id, &mode, &until, &bypass],
-            )
-            .await
-        {
-            Ok(row) => row,
-            Err(e) if db::is_conflict(&e) => continue,
-            Err(e) => return Err(e.into()),
-        };
-        return answer(&row, "cairn_set_retention");
-    }
-    Ok(slow_down())
+    let outcome = change_lock(app, bucket, key, version_id, Change::Retention { retention, bypass }).await?;
+    Ok(respond(outcome))
 }
 
 /// PutObjectLegalHold: `PUT /{bucket}/{key}?legal-hold` with a
@@ -620,42 +606,108 @@ pub async fn put_object_legal_hold(
         Some("OFF") => false,
         _ => return Ok(malformed()),
     };
+    Ok(respond(change_lock(app, bucket, key, version_id, Change::LegalHold(hold)).await?))
+}
+
+/// A change to a version's Object Lock.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Change {
+    /// Its retention set (or, `None`, removed), bypassing GOVERNANCE mode
+    /// if `bypass`.
+    Retention { retention: Option<(Mode, SystemTime)>, bypass: bool },
+    /// Its legal hold put on or lifted.
+    LegalHold(bool),
+}
+
+/// What a change to a version's lock came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    Set,
+    /// Its retention may not be changed so.
+    Locked,
+    /// The version is a delete marker; its ID, as a response reports it.
+    DeleteMarker(Option<String>),
+    NoSuchVersion,
+    NoSuchKey,
+    /// The bucket hasn't Object Lock enabled.
+    NoObjectLock,
+    NoSuchBucket,
+    /// Other writes to the key kept getting in its way.
+    Contended,
+}
+
+/// Changes the lock of the version `version_id` of `key` (the current one
+/// if `None`) as `change` says (`cairn_set_retention`,
+/// `cairn_set_legal_hold`), retrying on a conflict: what PutObjectRetention
+/// and PutObjectLegalHold do, and batch jobs' tasks (see `batch`).
+pub async fn change_lock(
+    app: &App,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    change: Change,
+) -> anyhow::Result<Outcome> {
     let client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
-        let row = match client
-            .query_one_cached(
-                "SELECT status, versioning, version_id FROM pg_temp.cairn_set_legal_hold($1, $2, $3, $4)",
-                &[&bucket, &key, &version_id, &hold],
-            )
-            .await
-        {
+        let (function, result) = match change {
+            Change::Retention { retention, bypass } => {
+                let mode = retention.map(|(mode, _)| mode.name());
+                let until = retention.map(|(_, until)| until);
+                let result = client
+                    .query_one_cached(
+                        "SELECT status, versioning, version_id FROM pg_temp.cairn_set_retention($1, $2, $3, $4, $5, $6)",
+                        &[&bucket, &key, &version_id, &mode, &until, &bypass],
+                    )
+                    .await;
+                ("cairn_set_retention", result)
+            }
+            Change::LegalHold(hold) => {
+                let result = client
+                    .query_one_cached(
+                        "SELECT status, versioning, version_id FROM pg_temp.cairn_set_legal_hold($1, $2, $3, $4)",
+                        &[&bucket, &key, &version_id, &hold],
+                    )
+                    .await;
+                ("cairn_set_legal_hold", result)
+            }
+        };
+        let row = match result {
             Ok(row) => row,
             Err(e) if db::is_conflict(&e) => continue,
             Err(e) => return Err(e.into()),
         };
-        return answer(&row, "cairn_set_legal_hold");
+        let reported = row
+            .get::<_, Option<&str>>(1)
+            .zip(row.get::<_, Option<&str>>(2))
+            .and_then(|(versioning, id)| Versioning::from_db(versioning).reported(id));
+        return Ok(match row.get::<_, &str>(0) {
+            "set" => Outcome::Set,
+            "locked" => Outcome::Locked,
+            "delete_marker" => Outcome::DeleteMarker(reported),
+            "no_such_version" => Outcome::NoSuchVersion,
+            "no_such_key" => Outcome::NoSuchKey,
+            "no_object_lock" => Outcome::NoObjectLock,
+            "no_such_bucket" => Outcome::NoSuchBucket,
+            other => anyhow::bail!("{function}: unexpected status {other}"),
+        });
     }
-    Ok(slow_down())
+    Ok(Outcome::Contended)
 }
 
-/// The response to PutObjectRetention's or PutObjectLegalHold's
-/// transaction (status, versioning, version ID).
-fn answer(row: &tokio_postgres::Row, function: &str) -> anyhow::Result<Response<Full<Bytes>>> {
-    let reported = row
-        .get::<_, Option<&str>>(1)
-        .zip(row.get::<_, Option<&str>>(2))
-        .and_then(|(versioning, id)| Versioning::from_db(versioning).reported(id));
-    Ok(match row.get::<_, &str>(0) {
-        "set" => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
-        "locked" => locked(),
-        "delete_marker" => delete_marker(reported.as_deref()),
-        "no_such_version" => no_such_version(),
-        "no_such_key" => no_such_key(),
-        "no_object_lock" => missing_configuration(),
-        "no_such_bucket" => no_such_bucket(),
-        other => anyhow::bail!("{function}: unexpected status {other}"),
-    })
+/// The response to PutObjectRetention or PutObjectLegalHold that came to
+/// `outcome`.
+fn respond(outcome: Outcome) -> Response<Full<Bytes>> {
+    match outcome {
+        Outcome::Set => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+        Outcome::Locked => locked(),
+        Outcome::DeleteMarker(reported) => delete_marker(reported.as_deref()),
+        Outcome::NoSuchVersion => no_such_version(),
+        Outcome::NoSuchKey => no_such_key(),
+        Outcome::NoObjectLock => missing_configuration(),
+        Outcome::NoSuchBucket => no_such_bucket(),
+        Outcome::Contended => slow_down(),
+    }
 }
 
 /// A DeleteObjects `<Error>` for a version Object Lock keeps.
