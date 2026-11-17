@@ -511,9 +511,6 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
     let Some(enabled) = boolean(report, "Enabled")? else {
         return Err(bad_request("A report's Enabled is required."));
     };
-    if enabled {
-        return Err(not_implemented("A completion report"));
-    }
     let owned = |name| text(report, name).map(str::to_owned);
     let report = Report {
         enabled,
@@ -523,6 +520,9 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
         scope: owned("ReportScope"),
         expected_owner: owned("ExpectedBucketOwner"),
     };
+    if enabled {
+        check_report(&report)?;
+    }
 
     let token = text(root, "ClientRequestToken").unwrap_or("");
     if token.is_empty() || token.chars().count() > MAX_TOKEN {
@@ -587,6 +587,29 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
         None => Vec::new(),
     };
     Ok(NewJob { confirmation, operation, report, token: token.to_owned(), manifest, description, priority, role_arn, tags })
+}
+
+/// Why an enabled report isn't one Cairn writes: it needs a bucket (by its
+/// ARN) and the format, and may have a scope, a prefix of up to 512
+/// characters and an expected owner.
+fn check_report(report: &Report) -> Result<(), Response<Full<Bytes>>> {
+    let bucket = report.bucket.as_deref().unwrap_or("");
+    if super::report::bucket_of_arn(bucket).is_none() {
+        return Err(bad_request("A report's Bucket must be a bucket's ARN."));
+    }
+    if report.format.as_deref() != Some(super::report::FORMAT) {
+        return Err(bad_request("A report's Format must be Report_CSV_20180820."));
+    }
+    if report.scope.as_deref().is_some_and(|s| s != super::report::ALL_TASKS && s != super::report::FAILED_TASKS_ONLY) {
+        return Err(bad_request("A report's ReportScope must be AllTasks or FailedTasksOnly."));
+    }
+    if report.prefix.as_deref().is_some_and(|p| p.is_empty() || p.chars().count() > 512) {
+        return Err(bad_request("A report's Prefix is 1 to 512 characters."));
+    }
+    if report.expected_owner.as_deref().is_some_and(|o| o.len() != 12 || !o.bytes().all(|b| b.is_ascii_digit())) {
+        return Err(bad_request("A report's ExpectedBucketOwner must be an account ID."));
+    }
+    Ok(())
 }
 
 /// Whether `arn` is a role's (`arn:aws:iam::<account>:role/…`).
@@ -961,10 +984,40 @@ mod tests {
     fn what_cairn_doesnt_do_is_not_implemented() {
         let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::b</TargetResource></S3PutObjectCopy>";
         assert_eq!(refusal(&request(copy, "")), (501, "NotImplemented".to_owned()));
-        let report = request(PUT, "").replace("<Enabled>false</Enabled>", "<Enabled>true</Enabled>");
-        assert_eq!(refusal(&report), (501, "NotImplemented".to_owned()));
         let inventory = request(PUT, "").replace("S3BatchOperations_CSV_20180820", "S3InventoryReport_CSV_20161130");
         assert_eq!(refusal(&inventory), (501, "NotImplemented".to_owned()));
+    }
+
+    #[test]
+    fn reports_are_checked() {
+        let with = |report: &str| request(PUT, "").replace("<Report><Enabled>false</Enabled></Report>", report);
+        let job = parse_create(
+            with("<Report><Bucket>arn:aws:s3:::reports</Bucket><Format>Report_CSV_20180820</Format>\
+                  <Enabled>true</Enabled><Prefix>batch</Prefix><ReportScope>FailedTasksOnly</ReportScope></Report>")
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(job.report.enabled);
+        assert_eq!(job.report.scope.as_deref(), Some("FailedTasksOnly"));
+        let bad = (400, "BadRequestException".to_owned());
+        assert_eq!(refusal(&with("<Report><Enabled>true</Enabled></Report>")), bad);
+        assert_eq!(
+            refusal(&with("<Report><Bucket>arn:aws:s3:::reports</Bucket><Enabled>true</Enabled></Report>")),
+            bad
+        );
+        assert_eq!(
+            refusal(&with(
+                "<Report><Bucket>reports</Bucket><Format>Report_CSV_20180820</Format><Enabled>true</Enabled></Report>"
+            )),
+            bad
+        );
+        assert_eq!(
+            refusal(&with(
+                "<Report><Bucket>arn:aws:s3:::reports</Bucket><Format>Report_CSV_20180820</Format>\
+                 <Enabled>true</Enabled><ReportScope>Some</ReportScope></Report>"
+            )),
+            bad
+        );
     }
 
     #[test]

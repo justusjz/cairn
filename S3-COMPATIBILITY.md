@@ -59,7 +59,7 @@ supported.
 | Event notifications, to SNS topics | 🟡 | Over HTTP(S) subscriptions: [Event notifications](#event-notifications) |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
 | Server access logging | 🟡 | [Server access logging](#server-access-logging) |
-| Batch Operations | 🟡 | Tagging, from CSV manifests: [Batch Operations](#batch-operations) |
+| Batch Operations | 🟡 | Tagging, from CSV manifests, with completion reports: [Batch Operations](#batch-operations) |
 
 ### Security
 
@@ -215,10 +215,13 @@ once it's been configured.
   inventory reports' (`S3InventoryReport_CSV_20161130`) and manifest
   generators are refused with `501 NotImplemented`. A manifest's lines must
   have exactly the columns its `Fields` name.
-- **No completion reports.** A job's `Report` must have `Enabled` false
-  (else `501 NotImplemented`): its counts of tasks that succeeded and failed
-  are all it tells, and the node that ran it logs the first task of each
-  turn that failed, and why.
+- **Completion reports** have a result file per page of up to a thousand
+  tasks (one for those that succeeded, one for those that failed), named
+  by a hash of the job and the page; their lines' messages are Cairn's.
+  The report bucket is checked (it exists, the role may put the manifest)
+  while the job is prepared: a job whose report can't be written fails
+  then, with `ReportUnwritable`. A job that fails or is cancelled before it
+  runs has no report.
 - **Statuses.** A job is never `Completing`, `Failing`, `Pausing` or
   `Paused`: it goes straight to `Complete`, `Failed` or `Cancelled`.
 - **Errors.** CreateJob checks the request, and then `s3:CreateJob` and
