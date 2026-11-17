@@ -9,8 +9,8 @@
 //!   relies on (below). Others are refused with 501 NotImplemented.
 //! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`) only; not
 //!   inventory reports' `manifest.json`, nor manifests S3 generates.
-//! - Completion reports: none (`Report` must have `Enabled` false); a job's
-//!   counts of tasks that succeeded and failed are all it tells.
+//! - Completion reports: as S3 writes them, of all tasks or only those that
+//!   failed (see `report`).
 //!
 //! A job goes through S3's statuses: `New` when it's created, `Preparing`
 //! while its manifest is read through (each line checked, and counted:
@@ -32,7 +32,8 @@
 //! by byte ranges, pinned to its ETag (If-Match), so that a manifest
 //! changed under a job fails it rather than changing what it does; and
 //! saves where it has got to after each page (`batch_jobs.cursor`), with
-//! the counts of what succeeded and failed. A node that dies mid-page
+//! the counts of what succeeded and failed, and the page's result files,
+//! if it has a report. A node that dies mid-page
 //! leaves its page to be done again by another: its tasks were done, but
 //! not counted, and are done and counted again, which is why only
 //! operations that can be repeated are run.
@@ -49,6 +50,7 @@
 
 pub mod control;
 pub mod manifest;
+pub mod report;
 
 use std::{
     sync::Arc,
@@ -75,6 +77,7 @@ use crate::{
 };
 
 use manifest::{Field, Task};
+use report::{Line, TaskFailure, Writer};
 
 /// The service a job's role is assumed as.
 pub const SERVICE: &str = "batchoperations.s3.amazonaws.com";
@@ -159,7 +162,7 @@ impl Manifest {
     }
 }
 
-/// A job's completion report, as CreateJob gave it (JSON): only told back.
+/// A job's completion report, as CreateJob gave it (JSON); see `report`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Report {
     pub enabled: bool,
@@ -198,6 +201,7 @@ pub(crate) struct Job {
     pub status: String,
     operation: Operation,
     manifest: Manifest,
+    report: Report,
     role_arn: String,
     prepared: i64,
     total: i64,
@@ -262,7 +266,7 @@ pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Op
     let row = client
         .query_opt_cached(
             "SELECT id, account_id, status, operation, manifest, role_arn, prepared, total, cursor,
-                    succeeded, failed, waiting_since
+                    succeeded, failed, waiting_since, report
              FROM batch_jobs
              WHERE status IN ('New', 'Preparing', 'Ready', 'Active', 'Cancelling') AND NOT (id = ANY($1))
              ORDER BY priority DESC, waiting_since LIMIT 1",
@@ -272,12 +276,14 @@ pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Op
     let Some(row) = row else { return Ok(None) };
     let operation: String = row.get(3);
     let manifest: String = row.get(4);
+    let report: String = row.get(12);
     let job = Job {
         id: row.get(0),
         account: row.get(1),
         status: row.get(2),
         operation: serde_json::from_str(&operation)?,
         manifest: serde_json::from_str(&manifest)?,
+        report: serde_json::from_str(&report)?,
         role_arn: row.get(5),
         prepared: row.get(6),
         total: row.get(7),
@@ -300,8 +306,8 @@ pub(crate) async fn turn(
     let mut turn = Turn { id: job.id, status: job.status.clone(), ..Turn::default() };
     match job.status.as_str() {
         "Cancelling" => {
-            end(client, &job, "Cancelled", None, now).await?;
-            turn.status = "Cancelled".to_owned();
+            let principal = session(client, &job).await?.ok();
+            conclude(app, client, &job, principal.as_ref(), "Cancelled", None, now, &mut turn).await?;
         }
         "New" | "Preparing" => prepare(app, client, &job, now, &mut turn).await?,
         _ => run(app, client, &job, now, budget, &mut turn).await?,
@@ -310,9 +316,9 @@ pub(crate) async fn turn(
 }
 
 /// Ends the job as `status` (`Complete`, `Cancelled`, or `Failed` with
-/// `failure`), unless it ended meanwhile.
-async fn end(client: &Object, job: &Job, status: &str, failure: Option<&Failure>, now: SystemTime) -> anyhow::Result<()> {
-    let failures = serde_json::to_string(&failure.into_iter().collect::<Vec<_>>())?;
+/// `failures`), unless it ended meanwhile.
+async fn end(client: &Object, job: &Job, status: &str, failures: &[&Failure], now: SystemTime) -> anyhow::Result<()> {
+    let failures = serde_json::to_string(failures)?;
     client
         .execute_cached(
             "UPDATE batch_jobs SET status = $2, terminated_at = $3, waiting_since = $3, failures = (failures::jsonb || $4::text::jsonb)::text
@@ -325,10 +331,48 @@ async fn end(client: &Object, job: &Job, status: &str, failure: Option<&Failure>
 
 /// Fails the job, as `turn` tells.
 async fn fail(client: &Object, job: &Job, failure: Failure, now: SystemTime, turn: &mut Turn) -> anyhow::Result<()> {
-    end(client, job, "Failed", Some(&failure), now).await?;
+    end(client, job, "Failed", &[&failure], now).await?;
     turn.status = "Failed".to_owned();
     turn.failure = Some(failure);
     Ok(())
+}
+
+/// Ends a job that has run as `status` (`Complete`, `Cancelled`, or
+/// `Failed` with `failure`): writes its report's manifest first, if it has
+/// a report, as its role session `principal`; if that can't be written (or
+/// the role can't be assumed any more), the job fails, saying so.
+#[allow(clippy::too_many_arguments)]
+async fn conclude(
+    app: &Arc<App>,
+    client: &Object,
+    job: &Job,
+    principal: Option<&Principal>,
+    status: &str,
+    failure: Option<Failure>,
+    now: SystemTime,
+    turn: &mut Turn,
+) -> anyhow::Result<()> {
+    if let Some(writer) = Writer::of(&job.report, job.id) {
+        let written = match principal {
+            Some(principal) => writer.manifest(app, client, principal, job.id, now).await?,
+            None => Err(Failure::new("ReportUnwritable", format!("The role {} can't be assumed to write the completion report.", job.role_arn))),
+        };
+        if let Err(unwritable) = written {
+            let failures: Vec<&Failure> = failure.iter().chain([&unwritable]).collect();
+            end(client, job, "Failed", &failures, now).await?;
+            turn.status = "Failed".to_owned();
+            turn.failure = Some(unwritable);
+            return Ok(());
+        }
+    }
+    match failure {
+        Some(failure) => fail(client, job, failure, now, turn).await,
+        None => {
+            end(client, job, status, &[], now).await?;
+            turn.status = status.to_owned();
+            Ok(())
+        }
+    }
 }
 
 /// Reads the job's manifest through from where preparing it got to, as
@@ -340,6 +384,11 @@ async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, tu
         Err(failure) => return fail(client, job, failure, now, turn).await,
     };
     if let Err(failure) = may_read_manifest(app, &principal, &job.manifest).await? {
+        return fail(client, job, failure, now, turn).await;
+    }
+    if let Some(writer) = Writer::of(&job.report, job.id)
+        && let Err(failure) = writer.check(app, &principal).await?
+    {
         return fail(client, job, failure, now, turn).await;
     }
     let fields = job.manifest.fields();
@@ -427,6 +476,8 @@ async fn run(
         crate::s3::abac::request_tags(&mut access, &tags);
     }
     let fields = job.manifest.fields();
+    let writer = Writer::of(&job.report, job.id);
+    let who = principal.arn();
     let (mut cursor, mut succeeded, mut failed) = (job.cursor as u64, job.succeeded, job.failed);
     // Its tasks' writes are its role session's, as their events say.
     crate::notifications::scope(async {
@@ -444,15 +495,24 @@ async fn run(
                 let failure = Failure::new("ManifestInvalid", "A line of the manifest is too long.");
                 return fail(client, job, failure, now, turn).await;
             }
+            let mut done_lines = Vec::with_capacity(lines.len());
             for line in &lines {
-                let task = std::str::from_utf8(line)
+                let parsed = std::str::from_utf8(line)
                     .map_err(|_| "it isn't UTF-8".to_owned())
                     .and_then(|line| manifest::parse_line(line, &fields));
-                let result = match &task {
-                    Ok(task) => run_task(app, &mut access, &job.operation, &tags, task).await?,
-                    Err(why) => Err(format!("400 InvalidManifestLine ({why})")),
+                // Preparing checked every line, and the manifest is pinned
+                // to its ETag: one that isn't a task fails all the same.
+                let (task, result) = match parsed {
+                    Ok(task) => {
+                        let result = run_task(app, &mut access, &who, &job.operation, &tags, &task).await?;
+                        (task, result)
+                    }
+                    Err(why) => {
+                        let task = Task { bucket: String::new(), key: String::from_utf8_lossy(line).into_owned(), version_id: None };
+                        (task, Err(TaskFailure::new(400, "InvalidManifestLine", why)))
+                    }
                 };
-                match result {
+                match &result {
                     Ok(()) => {
                         succeeded += 1;
                         turn.succeeded += 1;
@@ -460,22 +520,54 @@ async fn run(
                     Err(why) => {
                         failed += 1;
                         if turn.failed_task.is_none() {
-                            let on = task.map_or_else(|_| "a line".to_owned(), |t| format!("{}/{}", t.bucket, t.key));
-                            turn.failed_task = Some(format!("{on}: {why}"));
+                            turn.failed_task = Some(format!("{}/{}: {why}", task.bucket, task.key));
                         }
                     }
                 }
                 turn.tasks += 1;
+                done_lines.push(Line { task, result });
             }
             *budget -= lines.len().max(1) as i64;
+            let start = cursor;
             cursor += consumed as u64;
+            let files = match &writer {
+                Some(writer) => match writer.page(app, &principal, job.id, start, &done_lines).await? {
+                    Ok(files) => files,
+                    Err(failure) => return fail(client, job, failure, now, turn).await,
+                },
+                None => Vec::new(),
+            };
+            let keys: Vec<&str> = files.iter().map(|f| f.key.as_str()).collect();
+            let statuses: Vec<&str> = files.iter().map(|f| f.status).collect();
+            let md5s: Vec<&str> = files.iter().map(|f| f.md5.as_str()).collect();
+            // Where it got to, its counts and the page's result files, at
+            // once.
             let row = client
                 .query_opt_cached(
-                    "UPDATE batch_jobs SET cursor = $2, succeeded = $3, failed = $4,
-                         active_seconds = active_seconds + $5, waiting_since = $6
-                     WHERE id = $1 AND status IN ('Active', 'Cancelling')
-                     RETURNING status",
-                    &[&job.id, &(cursor as i64), &succeeded, &failed, &began.elapsed().as_secs_f64(), &now],
+                    "WITH job AS (
+                         UPDATE batch_jobs SET cursor = $2, succeeded = $3, failed = $4,
+                             active_seconds = active_seconds + $5, waiting_since = $6
+                         WHERE id = $1 AND status IN ('Active', 'Cancelling')
+                         RETURNING status),
+                     files AS (
+                         INSERT INTO batch_job_results (job_id, start_at, status, key, md5)
+                         SELECT $1, $7, f.status, f.key, f.md5
+                         FROM unnest($8::text[], $9::text[], $10::text[]) AS f(status, key, md5)
+                         WHERE EXISTS (SELECT 1 FROM job)
+                         ON CONFLICT DO NOTHING)
+                     SELECT status FROM job",
+                    &[
+                        &job.id,
+                        &(cursor as i64),
+                        &succeeded,
+                        &failed,
+                        &began.elapsed().as_secs_f64(),
+                        &now,
+                        &(start as i64),
+                        &statuses,
+                        &keys,
+                        &md5s,
+                    ],
                 )
                 .await?;
             let Some(row) = row else {
@@ -490,17 +582,13 @@ async fn run(
                     "TaskFailureThresholdExceeded",
                     format!("{failed} of the job's {done} tasks so far failed, more than half of them."),
                 );
-                return fail(client, job, failure, now, turn).await;
+                return conclude(app, client, job, Some(&principal), "Failed", Some(failure), now, turn).await;
             }
             if finished {
-                end(client, job, "Complete", None, now).await?;
-                turn.status = "Complete".to_owned();
-                return Ok(());
+                return conclude(app, client, job, Some(&principal), "Complete", None, now, turn).await;
             }
             if row.get::<_, &str>(0) == "Cancelling" {
-                end(client, job, "Cancelled", None, now).await?;
-                turn.status = "Cancelled".to_owned();
-                return Ok(());
+                return conclude(app, client, job, Some(&principal), "Cancelled", None, now, turn).await;
             }
         }
         Ok(())
@@ -509,20 +597,21 @@ async fn run(
 }
 
 /// Does `operation` to the object of `task`, as `access` (its role's
-/// session's) allows it; why not, if it didn't (S3's status and code).
+/// session's, `who`) allows it; why not, if it didn't.
 async fn run_task(
     app: &Arc<App>,
     access: &mut Access,
+    who: &str,
     operation: &Operation,
     tags: &Tags,
     task: &Task,
-) -> anyhow::Result<Result<(), String>> {
+) -> anyhow::Result<Result<(), TaskFailure>> {
     let Task { bucket, key, version_id } = task;
-    if let Some(v) = version_id.as_deref().filter(|v| !crate::s3::versions::is_version_id(v)) {
-        return Ok(Err(format!("400 InvalidArgument (invalid version ID {v})")));
+    if version_id.as_deref().is_some_and(|v| !crate::s3::versions::is_version_id(v)) {
+        return Ok(Err(TaskFailure::new(400, "InvalidArgument", "Invalid version id specified")));
     }
     if crate::s3::directory::is_directory(bucket) {
-        return Ok(Err("501 NotImplemented (a directory bucket's objects have no tags)".to_owned()));
+        return Ok(Err(TaskFailure::new(501, "NotImplemented", "A directory bucket's objects have no tags.")));
     }
     let (method, tagging) = match operation {
         Operation::PutTagging { .. } => (Method::PUT, Tagging::Put),
@@ -532,30 +621,33 @@ async fn run_task(
     if let Some(v) = version_id {
         query.push_str(&format!("&versionId={}", percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)));
     }
-    if let Err(why) = authorize(app, access, &method, bucket, key, &query).await? {
-        return Ok(Err(why));
+    if let Err(failure) = authorize(app, access, who, &method, bucket, key, &query).await? {
+        return Ok(Err(failure));
     }
     Ok(match tagging::set_tags(app, bucket, key, version_id.as_deref(), tags, tagging).await? {
         Outcome::Tagged(_) => Ok(()),
-        Outcome::DeleteMarker(_) => Err("405 MethodNotAllowed (a delete marker has no tags)".to_owned()),
-        Outcome::NoSuchVersion => Err("404 NoSuchVersion".to_owned()),
-        Outcome::NoSuchKey => Err("404 NoSuchKey".to_owned()),
-        Outcome::NoSuchBucket => Err("404 NoSuchBucket".to_owned()),
-        Outcome::Contended => Err("503 SlowDown".to_owned()),
+        Outcome::DeleteMarker(_) => {
+            Err(TaskFailure::new(405, "MethodNotAllowed", "The specified method is not allowed against this resource."))
+        }
+        Outcome::NoSuchVersion => Err(TaskFailure::new(404, "NoSuchVersion", "The specified version does not exist.")),
+        Outcome::NoSuchKey => Err(TaskFailure::new(404, "NoSuchKey", "The specified key does not exist.")),
+        Outcome::NoSuchBucket => Err(TaskFailure::new(404, "NoSuchBucket", "The specified bucket does not exist")),
+        Outcome::Contended => Err(TaskFailure::new(503, "SlowDown", "Please reduce your request rate.")),
     })
 }
 
-/// Whether `access` allows the request (`method` on `bucket`'s `key`, with
-/// `query`), as `s3::handle_request` authorizes it; why not (S3's status
-/// and code), if it doesn't.
+/// Whether `access` (of `who`, by its ARN) allows the request (`method` on
+/// `bucket`'s `key`, with `query`), as `s3::handle_request` authorizes it;
+/// why not, as S3 would answer, if it doesn't.
 async fn authorize(
     app: &App,
     access: &mut Access,
+    who: &str,
     method: &Method,
     bucket: &str,
     key: &str,
     query: &str,
-) -> anyhow::Result<Result<(), String>> {
+) -> anyhow::Result<Result<(), TaskFailure>> {
     let headers = HeaderMap::new();
     let Some(operation) = actions::operation(method, bucket, key, query, &headers) else {
         anyhow::bail!("{method} {bucket}/{key}?{query} is no operation");
@@ -566,8 +658,12 @@ async fn authorize(
     crate::s3::abac::prepare(app, access, &operation, bucket, key, query, &headers).await?;
     Ok(match access.first_denied(&operation.checks) {
         None => Ok(()),
-        Some(_) if !exists => Err("404 NoSuchBucket".to_owned()),
-        Some((check, _)) => Err(format!("403 AccessDenied (the role may not {} on it)", check.action)),
+        Some(_) if !exists => Err(TaskFailure::new(404, "NoSuchBucket", "The specified bucket does not exist")),
+        Some((check, _)) => Err(TaskFailure::new(
+            403,
+            "AccessDenied",
+            format!("User: {who} is not authorized to perform: {} on resource: \"{}\"", check.action, check.on.arn()),
+        )),
     })
 }
 
@@ -580,7 +676,7 @@ async fn may_read_manifest(app: &App, principal: &Principal, manifest: &Manifest
         Some(v) => format!("versionId={}", percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)),
         None => String::new(),
     };
-    Ok(authorize(app, &mut access, &Method::GET, &manifest.bucket, &manifest.key, &query)
+    Ok(authorize(app, &mut access, &principal.arn(), &Method::GET, &manifest.bucket, &manifest.key, &query)
         .await?
         .map_err(|why| Failure::new("ManifestUnreadable", format!("Reading the manifest {} failed: {why}.", manifest.arn))))
 }

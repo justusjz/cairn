@@ -1407,9 +1407,10 @@ S3 Batch Operations: a job (S3 Control's `CreateJob`,
 lists, as a role. Cairn does `S3PutObjectTagging` (replacing each object's
 tags) and `S3DeleteObjectTagging`, from a CSV manifest: an object of lines
 `bucket,key` (or `bucket,key,versionId`, as its `Fields` say), keys
-URL-encoded. Other operations, inventory reports as manifests, and
-completion reports aren't done yet (see
-[S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#batch-operations)).
+URL-encoded. Other operations and inventory reports as manifests aren't
+done yet (see [S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#batch-operations)).
+A job can write a completion report, of all its tasks or only those that
+failed, as S3 writes it.
 
 A job acts as its role, as S3 does: the role's trust policy must let the
 `batchoperations.s3.amazonaws.com` service assume it, and its policies must
@@ -1446,13 +1447,28 @@ its role or manifest can't be used, if its manifest changes (it's pinned to
 the ETag it was created with), or if more than half its tasks fail once a
 thousand have run. Jobs are kept for 90 days after they end.
 
+A completion report (`--report`) goes to a bucket, under its prefix, as S3
+writes it: `<prefix>/job-<id>/results/*.csv`, a line per task (bucket, key,
+version ID, `succeeded` or `failed`, the HTTP status, the error code and a
+message), and `<prefix>/job-<id>/manifest.json`, which lists those files
+once the job ends (complete, failed after its tasks did, or cancelled while
+it ran). The role writes it, so it needs `s3:PutObject` there too; a job
+whose report can't be written fails while it's prepared, before it does
+anything:
+
+```sh
+  --report '{"Bucket":"arn:aws:s3:::reports","Format":"Report_CSV_20180820","Enabled":true,
+    "Prefix":"batch","ReportScope":"AllTasks"}'
+```
+
 Jobs take turns with [lifecycle sweeps](#lifecycle-rules) and
 [inventory reports](#inventory), and share their rate (`lifecycle-rate`):
 each task counts as a version read. Among jobs, the highest priority goes
 first. Where a job has got to in its manifest is saved after each page of
-a thousand tasks, so if its node dies, another carries on from there; the
-tasks of the page it was on are done again, which is harmless for the
-operations Cairn does.
+a thousand tasks, with the page's report files, so if its node dies,
+another carries on from there; the tasks of the page it was on are done
+again, which is harmless for the operations Cairn does, and their report
+files written again, over the old ones.
 
 ## Event notifications
 

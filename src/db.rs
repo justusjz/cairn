@@ -242,6 +242,7 @@ const MIGRATIONS: &[&str] = &[
     ACCESS_GRANTS,
     MFA_DELETE,
     BATCH_JOBS,
+    BATCH_JOB_RESULTS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2930,6 +2931,25 @@ CREATE INDEX batch_jobs_runnable ON batch_jobs (priority DESC, waiting_since)
 CREATE INDEX batch_jobs_listed ON batch_jobs (account_id, created_at DESC, id);
 CREATE INDEX batch_jobs_terminated ON batch_jobs (terminated_at) WHERE terminated_at IS NOT NULL;
 CREATE TRIGGER batch_jobs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON batch_jobs
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 62: the result files of Batch Operations jobs' completion
+/// reports (see `batch::report`), as they're written: a page's, recorded in
+/// the same statement that saves where its job has got to, by where the
+/// page starts in the manifest (a byte offset) and whether its tasks
+/// succeeded or failed. The manifest lists them once the job ends. Plain
+/// writes keyed by the job, as `batch_jobs`' (migration 61).
+const BATCH_JOB_RESULTS: &str = r#"
+CREATE TABLE batch_job_results (
+    job_id   uuid NOT NULL REFERENCES batch_jobs (id) ON DELETE CASCADE,
+    start_at bigint NOT NULL,
+    status   text NOT NULL CHECK (status IN ('succeeded', 'failed')),
+    key      text NOT NULL,
+    md5      text NOT NULL,
+    PRIMARY KEY (job_id, start_at, status)
+);
+CREATE TRIGGER batch_job_results_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON batch_job_results
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

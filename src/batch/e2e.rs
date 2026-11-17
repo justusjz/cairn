@@ -386,3 +386,118 @@ async fn jobs_are_listed() {
     let (_, body) = body_of(control::get_tagging(&app, &access(&admin), &account, &ids[0]).await.unwrap()).await;
     assert!(body.contains("<Tags><member><Key>k</Key><Value>v</Value></member></Tags>"), "{body}");
 }
+
+/// `request` with the report `report` (a `<Report>` element) instead of
+/// none.
+fn with_report(request: &str, report: &str) -> String {
+    request.replace("<Report><Enabled>false</Enabled></Report>", report)
+}
+
+fn report(scope: &str) -> String {
+    format!(
+        "<Report><Bucket>arn:aws:s3:::{BUCKET}</Bucket><Format>Report_CSV_20180820</Format>\
+         <Enabled>true</Enabled><Prefix>reports</Prefix><ReportScope>{scope}</ReportScope></Report>"
+    )
+}
+
+/// The report's manifest of job `id`, and its result files' contents, by
+/// their statuses, checked against the manifest's MD5s.
+async fn report_of(app: &Arc<App>, id: &str) -> (serde_json::Value, Vec<(String, String)>) {
+    let manifest = crate::e2e::get(app, &format!("reports/job-{id}/manifest.json")).await.expect("a manifest");
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+    assert_eq!(manifest["Format"], "Report_CSV_20180820");
+    assert_eq!(manifest["ReportSchema"], "Bucket, Key, VersionId, TaskStatus, ErrorCode, HTTPStatusCode, ResultMessage");
+    let mut files = Vec::new();
+    for result in manifest["Results"].as_array().unwrap() {
+        assert_eq!(result["Bucket"], BUCKET);
+        let key = result["Key"].as_str().unwrap();
+        assert!(key.starts_with(&format!("reports/job-{id}/results/")), "{key}");
+        let data = crate::e2e::get(app, key).await.expect("a result file");
+        use md5::Digest;
+        let md5: String = md5::Md5::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(result["MD5Checksum"], md5.as_str());
+        files.push((result["TaskExecutionStatus"].as_str().unwrap().to_owned(), String::from_utf8(data).unwrap()));
+    }
+    (manifest, files)
+}
+
+/// A job's report lists every task, those that succeeded and those that
+/// failed in files of their own; or only those that failed.
+#[tokio::test]
+async fn reports_list_the_tasks() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(&app, super::SERVICE, r#"["s3:GetObject","s3:PutObject","s3:PutObjectTagging"]"#).await;
+    put(&app, "a b", b"a".to_vec()).await;
+    let etag = manifest(&app, "manifest.csv", &format!("{BUCKET},a+b\n{BUCKET},missing\n")).await;
+    let all = with_report(&create_request("t1", PUT_TAGS, "manifest.csv", &etag, false, &account), &report("AllTasks"));
+    let all = create(&app, &admin, &all).await;
+    let failed = with_report(&create_request("t2", PUT_TAGS, "manifest.csv", &etag, false, &account), &report("FailedTasksOnly"));
+    let failed = create(&app, &admin, &failed).await;
+    step(&app, 1).await;
+    step(&app, 2).await;
+    assert_eq!(status_of(&app, &admin, &all).await, "Complete");
+    assert_eq!(status_of(&app, &admin, &failed).await, "Complete");
+
+    let (manifest, files) = report_of(&app, &all).await;
+    assert!(manifest["ReportCreationDate"].as_str().unwrap().ends_with('Z'));
+    assert_eq!(
+        files,
+        [
+            ("succeeded".to_owned(), format!("{BUCKET},a+b,,succeeded,200,,Successful\n")),
+            ("failed".to_owned(), format!("{BUCKET},missing,,failed,404,NoSuchKey,The specified key does not exist.\n")),
+        ]
+    );
+    let (_, files) = report_of(&app, &failed).await;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].0, "failed");
+}
+
+/// A job whose report can't be written fails before it does anything.
+#[tokio::test]
+async fn a_report_that_cant_be_written_fails_the_job() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    tagging_role(&app).await;
+    put(&app, "a", b"a".to_vec()).await;
+    let etag = manifest(&app, "manifest.csv", &format!("{BUCKET},a\n")).await;
+    let id = with_report(&create_request("t1", PUT_TAGS, "manifest.csv", &etag, false, &account), &report("AllTasks"));
+    let id = create(&app, &admin, &id).await;
+    step(&app, 1).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Failed"), "{job}");
+    assert_eq!(element(&job, "FailureCode"), Some("ReportUnwritable"));
+    assert!(element(&job, "FailureReason").unwrap().contains("s3:PutObject"), "{job}");
+    step(&app, 2).await;
+    assert_eq!(tags_of(&app, "a").await, "");
+}
+
+/// A job cancelled while it runs reports the tasks it did.
+#[tokio::test]
+async fn a_cancelled_job_reports_what_it_did() {
+    let Some(app) = node().await else { return };
+    // Ten tasks a minute.
+    crate::settings::LIFECYCLE_RATE.set(&app.pool.get().await.unwrap(), 600).await.unwrap();
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(&app, super::SERVICE, r#"["s3:GetObject","s3:PutObject","s3:PutObjectTagging"]"#).await;
+    let lines: String = (0..30).map(|i| format!("{BUCKET},missing{i}\n")).collect();
+    let etag = manifest(&app, "manifest.csv", &lines).await;
+    let id = with_report(&create_request("t1", PUT_TAGS, "manifest.csv", &etag, false, &account), &report("AllTasks"));
+    let id = create(&app, &admin, &id).await;
+    step(&app, 1).await;
+    step(&app, 2).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Active"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksFailed"), Some("10"));
+    let (status, body) =
+        body_of(control::update_status(&app, &access(&admin), &account, &id, "requestedJobStatus=Cancelled").await.unwrap()).await;
+    assert_eq!((status, element(&body, "Status")), (StatusCode::OK, Some("Cancelling")), "{body}");
+    step(&app, 3).await;
+    assert_eq!(status_of(&app, &admin, &id).await, "Cancelled");
+    let (_, files) = report_of(&app, &id).await;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1.lines().count(), 10);
+}

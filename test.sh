@@ -2573,7 +2573,24 @@ batch_jobs_ok() {
         --query Priority --output text 2>/dev/null)" = 20 ] || return 1
     [ "$(awsvhost s3control get-job-tagging --account-id "$account" --job-id "$job" \
         --query 'Tags[0].Value' --output text 2>/dev/null)" = test ] || return 1
-    # Operations, manifests and reports Cairn doesn't do yet are 501s.
+    # A job with a completion report, which tells it back; one without the
+    # report's format is refused.
+    out=$(awsvhost s3control create-job --account-id "$account" --confirmation-required --priority 10 \
+        --role-arn "arn:aws:iam::$account:role/$r" --manifest "$manifest" \
+        --operation '{"S3DeleteObjectTagging":{}}' \
+        --report '{"Bucket":"arn:aws:s3:::'"$b"'","Format":"Report_CSV_20180820","Enabled":true,"Prefix":"reports","ReportScope":"FailedTasksOnly"}' \
+        --query JobId --output text 2>/dev/null) || return 1
+    [ "$(awsvhost s3control describe-job --account-id "$account" --job-id "$out" \
+        --query 'Job.Report.[Enabled,Prefix,ReportScope]' --output text 2>/dev/null)" \
+        = "$(printf 'True\treports\tFailedTasksOnly')" ] || return 1
+    awsvhost s3control update-job-status --account-id "$account" --job-id "$out" \
+        --requested-job-status Cancelled >/dev/null 2>&1 || return 1
+    out=$(awsvhost s3control create-job --account-id "$account" --no-confirmation-required --priority 10 \
+        --role-arn "arn:aws:iam::$account:role/$r" --manifest "$manifest" \
+        --operation '{"S3DeleteObjectTagging":{}}' \
+        --report '{"Bucket":"arn:aws:s3:::'"$b"'","Enabled":true}' 2>&1) && return 1
+    echo "$out" | grep -q BadRequestException || return 1
+    # Operations and manifests Cairn doesn't do yet are 501s.
     out=$(awsvhost s3control create-job --account-id "$account" --no-confirmation-required --priority 10 \
         --role-arn "arn:aws:iam::$account:role/$r" --report '{"Enabled":false}' \
         --operation '{"S3PutObjectLegalHold":{"LegalHold":{"Status":"ON"}}}' --manifest "$manifest" 2>&1) && return 1
