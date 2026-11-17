@@ -864,6 +864,71 @@ certificate becomes the anchor the chain is verified to, name and expiry
 included. AWS no longer uses thumbprints; in Cairn they're what lets a
 self-hosted issuer with its own CA work.
 
+### S3 Access Grants
+
+**S3 Access Grants** map who may read or write which part of S3, as a list
+of grants rather than policies: each gives an IAM user or role `READ`,
+`WRITE` or `READWRITE` on a scope (`s3://bucket/prefix/*`, or one object).
+Grants decide no request themselves. A grantee calls **GetDataAccess** for
+what it wants, and gets temporary credentials of a role that S3 Access
+Grants assumes for it, narrowed by a session policy to what its grant
+allows (or, with `--privilege Minimal`, to what it asked for). It then uses
+those, as AWS's SDK plugins, EMR and Spark do. So a grant needs no change to
+any policy, and tens of thousands of them fit where a bucket policy's 20 KB
+wouldn't.
+
+It's S3 Control's API (`aws s3control`, which puts the account's ID in
+front of the endpoint's host, `123456789012.s3.example.com`: that name must
+reach Cairn too, as a bucket's does with [virtual-hosted-style
+requests](#virtual-hosted-style-requests)):
+
+1. An account has one **instance**: `create-access-grants-instance`.
+2. A **location** is a scope (`s3://`, a bucket, a prefix) and the **role**
+   whose sessions its grants vend. The role's policies must allow what the
+   grants do, and its trust policy must let the service in:
+
+   ```json
+   {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "sts:AssumeRole",
+     "Principal": {"Service": "access-grants.s3.amazonaws.com"},
+     "Condition": {"StringEquals": {"aws:SourceAccount": "123456789012"},
+                   "ArnEquals": {"aws:SourceArn": "arn:aws:s3:us-east-1:123456789012:access-grants/default"}}}]}
+   ```
+
+   Making or changing a location needs `iam:PassRole` on its role.
+3. A **grant** is on a location, with a sub-prefix (`data/logs/*`), or an
+   object's key with `--s3-prefix-type Object`.
+
+```sh
+aws s3control create-access-grants-instance --account-id 123456789012
+aws s3control create-access-grants-location --account-id 123456789012 \
+    --location-scope s3:// --iam-role-arn arn:aws:iam::123456789012:role/access-grants
+aws s3control create-access-grant --account-id 123456789012 --access-grants-location-id default \
+    --access-grants-location-configuration S3SubPrefix='data/logs/*' --permission READ \
+    --grantee GranteeType=IAM,GranteeIdentifier=arn:aws:iam::123456789012:user/ada
+# As ada, who needs s3:GetDataAccess:
+aws s3control get-data-access --account-id 123456789012 --target 's3://data/logs/*' --permission READ
+```
+
+GetDataAccess takes the grantee's narrowest grant that covers the target
+with the permission asked for (`READWRITE` covers either), and answers
+which it matched. Its session lasts an hour by default (15 minutes to the
+role's longest), and its requests are decided as the role's other
+sessions' are: by the role's policies, capped by the session policy, and
+the buckets' policies; they carry the instance's ARN as
+`s3:AccessGrantsInstanceArn`, so a role's or bucket's policy can tell them
+apart. `READ` allows reading objects (and their versions) and listing
+under the scope; `WRITE` writing and deleting them (versions too), and
+multipart uploads. Each operation needs its `s3:` action (`s3:CreateAccessGrant`,
+`s3:GetDataAccess`, …) on the instance's, location's or grant's ARN, with
+`s3:AccessGrantScope` and `s3:AccessGrantsLocationScope` to condition on;
+`list-caller-access-grants` shows a grantee its own grants. The root user
+may manage all of it, but is no grantee.
+
+These are AWS's *Access Grants*, not Cairn's old [grants](#users-and-permissions),
+which were managed policies. Grantees are IAM users and roles only: Cairn
+has no IAM Identity Center (see
+[S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#access-grants)).
+
 ## Console
 
 The console is Cairn's web UI: people manage the account's buckets,

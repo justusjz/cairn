@@ -507,6 +507,7 @@ pub async fn create_session(
             chained: false,
             provider: None,
             directory: None,
+            access_grants: None,
         },
     };
     session.directory = Some(Directory {

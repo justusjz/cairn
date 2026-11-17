@@ -74,6 +74,7 @@ supported.
 | ACLs | 🟡 | Disabled, as on new S3 buckets: [ACLs](#acls) |
 | Object Ownership | 🟡 | Always `BucketOwnerEnforced`: [ACLs](#acls) |
 | Bucket ABAC (bucket tags in policies) | ✅ | |
+| S3 Access Grants | 🟡 | IAM grantees only: [Access Grants](#access-grants) |
 | MFA delete | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
@@ -87,6 +88,8 @@ S3 reports a bucket that doesn't use it:
 - S3 Select, torrents, S3 Batch Operations.
 - S3 Express's metadata tables, access points for directory buckets.
 - Requester pays, Transfer Acceleration.
+- IAM Identity Center grantees and cross-account S3 Access Grants
+  ([Access Grants](#access-grants)).
 
 ---
 
@@ -276,12 +279,14 @@ trust policies.
   `s3:x-amz-object-ownership`, `s3:x-amz-object-if-match`,
   `s3:x-amz-bucket-namespace` and `s3:resourceArnBeingAuthorized`.
 - **Keys that are never present,** because what they describe doesn't exist:
-  VPC, organization, service, access point, access grant, replication and
-  batch job keys. `aws:SourceAccount` and `aws:SourceArn` are present only
-  in what Cairn does as `s3.amazonaws.com`.
+  VPC, organization, service, access point, replication and batch job
+  keys. `aws:SourceAccount` and `aws:SourceArn` are present only in what
+  Cairn does as `s3.amazonaws.com`, and in Access Grants' assuming a
+  location's role.
 - **Principals:** `Service` principals match only what Cairn does as that
-  service: `s3.amazonaws.com` delivering inventory reports. As in AWS, `"*"`
-  covers it too. `CanonicalUser` principals are refused.
+  service: `s3.amazonaws.com` delivering inventory reports, and
+  `access-grants.s3.amazonaws.com` assuming a location's role. As in AWS,
+  `"*"` covers it too. `CanonicalUser` principals are refused.
 - **Managed policies:** of AWS's, only `AdministratorAccess`,
   `AmazonS3FullAccess` and `AmazonS3ReadOnlyAccess` exist, plus Cairn's
   `CairnOperatorAccess`.
@@ -313,11 +318,72 @@ Differences:
   ListAttachedGroupPolicies and ListEntitiesForPolicy ignore `PathPrefix`,
   and ListPolicies ignores `PolicyUsageFilter`. (Every list pages, with
   `MaxItems` and `Marker`, as IAM's do.)
-- `iam:PassRole` is never checked, since there are no services to pass roles to.
+- `iam:PassRole` is checked only where a role is passed to a service:
+  an Access Grants location's role ([Access Grants](#access-grants)).
 - `RoleLastUsed` and `PasswordLastUsed` are never reported.
 - **OpenID Connect providers:** Cairn fetches the issuer's discovery document
   when a provider is created, and refuses one it can't reach. Thumbprints are
   enforced as certificate pins, which lets issuers on private CAs work.
+
+### Access Grants
+
+S3 Control's Access Grants API: instances, locations, grants,
+GetDataAccess, ListCallerAccessGrants, GetAccessGrantsInstanceForPrefix,
+and tags on all three (TagResource, at creation too). Its responses parse
+in AWS's SDKs and CLI. Unlike the rest of this document, its behavior was
+**not checked against S3**, only against AWS's documentation and API model,
+so the points below are Cairn's reading of them:
+
+- **IAM grantees only.** There's no IAM Identity Center:
+  `DIRECTORY_USER` and `DIRECTORY_GROUP` grantees, applications and
+  Identity Center instances are refused with `501`. So is the instance's
+  resource policy, which is for other accounts (there's one).
+- **Scopes.** A grant's scope is its location's joined with its
+  sub-prefix; without one, `<location>/*`. A trailing `*` is optional; one
+  elsewhere is refused. A grantee's narrowest matching grant is the one
+  GetDataAccess uses.
+- **Vended sessions** are sessions of the location's role, whose trust
+  policy must let `access-grants.s3.amazonaws.com` take `sts:AssumeRole`
+  (with `aws:SourceAccount` and `aws:SourceArn` to condition on). Their
+  session policy allows: `READ`, GetObject(Version)(Acl),
+  ListMultipartUploadParts, ListBucket and ListBucketVersions; `WRITE`,
+  PutObject(Version)Acl, PutObject, DeleteObject(Version),
+  AbortMultipartUpload, ListMultipartUploadParts and
+  ListBucketMultipartUploads (the actions that take
+  `s3:AccessGrantsInstanceArn`). Listing is allowed under the scope's
+  prefix (`s3:prefix`) only. The session's name is the grantee's unique ID.
+- **Authorization.** Each operation needs its `s3:` action on the
+  instance's ARN, but those on one location or grant, which need it on
+  theirs; CreateAccessGrant needs it on both the instance and the
+  location. Creating or updating a location needs `iam:PassRole` on its
+  role (with `iam:PassedToService`). The root user may do everything, but
+  is no grantee, nor is a federated user.
+- **Grantees** must be existing IAM users or roles of the account when the
+  grant is made. They're kept by ARN, as in S3: a user deleted and made
+  again with its name has its grants again.
+- **Errors** for missing, duplicate and non-empty resources use the codes
+  AWS documents, with `404` and `409`; their messages are Cairn's.
+- `s3:AccessGrantScope`, `s3:AccessGrantsLocationScope` and
+  `s3:AccessGrantsInstanceArn` are evaluated. The resources' tags are kept
+  and listed, but aren't `aws:ResourceTag/…` to policies.
+- GetDataAccess's `auditContext` and `instanceScope` are taken and
+  ignored. Vended sessions have no source identity.
+
+Not implemented:
+
+- **IAM Identity Center** and what Access Grants does with it: directory
+  users and groups as grantees (a group of an IdP, rather than an IAM
+  principal, granted a prefix), applications (`ApplicationArn`,
+  `allowedByApplication`), and sessions carrying a person's identity
+  (`sts:SetContext`, trusted identity propagation).
+- **Other accounts' grantees:** the instance's resource policy
+  (Put/Get/DeleteAccessGrantsInstanceResourcePolicy), and so cross-account
+  GetDataAccess. A cluster has one account.
+- **Auditing:** there's no CloudTrail, and S3 Control's requests aren't in
+  [server access logs](#server-access-logging), so who got data access
+  when isn't recorded (the session's name, the grantee's unique ID, is in
+  its requests' access log records).
+- **Access points,** which grants can't name either.
 
 ### Event notifications
 
