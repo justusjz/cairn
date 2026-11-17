@@ -1,6 +1,7 @@
 //! Directory users in the console (see `identity_center`): who signed in at
 //! an identity source, acting as a session of the role of the permission set
-//! it picked, among those assigned to it or its groups. The assignment is
+//! it picked in an account, among those assigned to it or its groups in
+//! that account. The assignment is
 //! checked again on every request, so that taking it away ends the
 //! session's access at once; credentials handed out for the CLI last as
 //! their own session does.
@@ -12,36 +13,36 @@ use deadpool_postgres::Object;
 
 use super::{actor, store, web::ApiError};
 use crate::{
-    identity_center::{self, PermissionSet},
+    identity_center::{self, Eligible},
     sessions::{self, Session, Who},
     users::Principal,
 };
 
-/// The permission set `session` acts as, while it's still assigned to its
-/// user (or a group of it); else why not.
-pub async fn permission_set(client: &Object, session: &store::DirectorySession) -> Result<PermissionSet, ApiError> {
-    let Some(chosen) = session.permission_set else {
+/// The permission set `session` acts as, and the account it acts in, while
+/// it's still assigned to its user (or a group of it) there; else why not.
+pub async fn permission_set(client: &Object, session: &store::DirectorySession) -> Result<Eligible, ApiError> {
+    let Some((chosen, account)) = &session.permission_set else {
         return Err(ApiError::Forbidden("pick a permission set first".into()));
     };
     let eligible = identity_center::eligible(client, &session.account_id, session.user_id).await?;
     eligible
         .into_iter()
-        .find(|set| set.id == chosen)
+        .find(|e| e.set.id == *chosen && e.account == *account)
         .ok_or_else(|| ApiError::Forbidden("that permission set isn't assigned to you anymore: pick another".into()))
 }
 
-/// A session of `set`'s role for the directory user of `session`, for the
-/// permission set's session duration: named after the user, as Identity
-/// Center names them.
-pub fn role_session(set: &PermissionSet, session: &store::DirectorySession) -> anyhow::Result<Session> {
+/// A session of the permission set's role in its account for the directory
+/// user of `session`, for the set's session duration: named after the
+/// user, as Identity Center names them.
+pub fn role_session(chosen: &Eligible, session: &store::DirectorySession) -> anyhow::Result<Session> {
     let now = sessions::now();
     let name = identity_center::session_name(&[Some(&session.user_name), session.email.as_deref(), Some(&session.subject)]);
     Ok(Session {
         key_id: sessions::new_key_id()?,
         secret: String::new(),
         issued: now,
-        expires: now + set.session_duration as u64,
-        who: Who::Role { id: set.role_id, session: name },
+        expires: now + chosen.set.session_duration as u64,
+        who: Who::Role { id: chosen.role_id, session: name },
         policy: None,
         policy_arns: Vec::new(),
         tags: Vec::new(),
@@ -55,7 +56,8 @@ pub fn role_session(set: &PermissionSet, session: &store::DirectorySession) -> a
 }
 
 /// Who a directory user's `session` acts as, for a request (`method`,
-/// `headers`, `query`, from `peer`): its permission set's role's session.
+/// `headers`, `query`, from `peer`): its permission set's role's session,
+/// in the account it picked.
 /// It signed in at an identity source, which Cairn takes as no second
 /// factor: `aws:MultiFactorAuthPresent` is false.
 pub async fn user(
@@ -66,11 +68,11 @@ pub async fn user(
     query: String,
     peer: Option<IpAddr>,
 ) -> Result<actor::User, ApiError> {
-    let set = permission_set(client, session).await?;
-    let principal = match Principal::of_session(client, role_session(&set, session)?).await? {
+    let chosen = permission_set(client, session).await?;
+    let principal = match Principal::of_session(client, role_session(&chosen, session)?).await? {
         Ok(principal) => principal,
         Err(_) => return Err(ApiError::Forbidden("the permission set's role is gone: pick another".into())),
     };
-    let account = session.account_id.clone();
+    let account = chosen.account;
     Ok(actor::User { principal, account, method, headers, query, peer, mfa_age: None })
 }

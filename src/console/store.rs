@@ -456,16 +456,22 @@ pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {
 
 // ─── Directory users ─────────────────────────────────────────────────────────
 
-/// A session of directory user `user` (see `identity_center`), in
-/// `account` (by ID), acting as permission set `permission_set` (`None`:
-/// until it picks one).
-pub async fn create_directory_session(client: &Object, account: &str, user: Uuid, permission_set: Option<Uuid>) -> anyhow::Result<String> {
+/// A session of directory user `user` (see `identity_center`), of the
+/// instance of `account` (by ID), acting as permission set `chosen` in an
+/// account (its ID and the account's; `None`: until it picks one).
+pub async fn create_directory_session(
+    client: &Object,
+    account: &str,
+    user: Uuid,
+    chosen: Option<(Uuid, &str)>,
+) -> anyhow::Result<String> {
     let (token, hash) = token()?;
+    let (set, target) = chosen.unzip();
     client
         .execute_cached(
-            "INSERT INTO console_directory_sessions (token_hash, account_id, user_id, permission_set_id, expires_at)
-             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
-            &[&hash, &account, &user, &permission_set, &secs(SESSION_TTL)],
+            "INSERT INTO console_directory_sessions (token_hash, account_id, user_id, permission_set_id, target_account_id, expires_at)
+             VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
+            &[&hash, &account, &user, &set, &target, &secs(SESSION_TTL)],
         )
         .await?;
     Ok(token)
@@ -474,7 +480,7 @@ pub async fn create_directory_session(client: &Object, account: &str, user: Uuid
 /// A directory user's session.
 #[derive(Clone, Debug)]
 pub struct DirectorySession {
-    /// Its account's ID, and name.
+    /// Its instance's account's ID, and name.
     pub account_id: String,
     pub account: String,
     /// The user (its ID in the identity store), its identity source (its
@@ -488,8 +494,9 @@ pub struct DirectorySession {
     pub name: String,
     pub email: Option<String>,
     pub groups: Vec<String>,
-    /// The permission set it acts as, if it picked one.
-    pub permission_set: Option<Uuid>,
+    /// The permission set it acts as, and the account (by ID) it acts in, if
+    /// it picked one.
+    pub permission_set: Option<(Uuid, String)>,
     /// When it ends at the latest (seconds since the epoch).
     pub expires_at: f64,
 }
@@ -502,7 +509,8 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
             "SELECT a.id, a.name, u.id, u.provider, p.label, u.subject, u.user_name, u.display_name, u.email,
                     ARRAY(SELECT g.name FROM identity_group_members m JOIN identity_groups g ON g.id = m.group_id
                           WHERE m.user_id = u.id ORDER BY g.name),
-                    s.permission_set_id, extract(epoch FROM s.expires_at)::float8, s.last_seen_at < now() - interval '1 minute'
+                    s.permission_set_id, extract(epoch FROM s.expires_at)::float8, s.last_seen_at < now() - interval '1 minute',
+                    s.target_account_id
              FROM console_directory_sessions s JOIN accounts a ON a.id = s.account_id
              JOIN identity_users u ON u.id = s.user_id
              JOIN oidc_providers p ON p.name = u.provider
@@ -528,17 +536,18 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
         name: row.get(7),
         email: row.get(8),
         groups: row.get(9),
-        permission_set: row.get(10),
+        permission_set: row.get::<_, Option<Uuid>>(10).zip(row.get::<_, Option<String>>(13)),
         expires_at: row.get(11),
     }))
 }
 
-/// Has the directory user's session of `token` act as `permission_set`.
-pub async fn choose_permission_set(client: &Object, token: &str, permission_set: Uuid) -> anyhow::Result<()> {
+/// Has the directory user's session of `token` act as `permission_set` in
+/// account `account` (by ID).
+pub async fn choose_permission_set(client: &Object, token: &str, permission_set: Uuid, account: &str) -> anyhow::Result<()> {
     client
         .execute_cached(
-            "UPDATE console_directory_sessions SET permission_set_id = $2 WHERE token_hash = $1",
-            &[&hash(token), &permission_set],
+            "UPDATE console_directory_sessions SET permission_set_id = $2, target_account_id = $3 WHERE token_hash = $1",
+            &[&hash(token), &permission_set, &account],
         )
         .await?;
     Ok(())

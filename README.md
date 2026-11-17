@@ -1092,7 +1092,8 @@ Identity Center's APIs (below):
   refuses to change it (`UnmodifiableEntity`), or to make roles under
   `/aws-reserved/`.
 - An **assignment** gives a permission set to a user or a group of the
-  **identity store**: the users that have signed in, and the groups their
+  **identity store**, in an account (so far always the cluster's one
+  account): the users that have signed in, and the groups their
   sources' group claims (`groups` by default; set per source) named. Each
   has an ID of its own, as Identity Center's users and groups do; a user's
   user name is its `preferred_username`, e-mail or subject, the first no
@@ -1102,7 +1103,8 @@ Identity Center's APIs (below):
 
 At sign-in, Cairn reads the person's subject and groups from the ID token,
 and finds their permission sets. With none, they don't get in; with one,
-it's used; with several, they pick one (and can switch on their own page).
+it's used; with several, they pick one, by account and permission set
+(and can switch on their own page).
 They then act as a session of the set's role,
 `arn:aws:sts::<account>:assumed-role/AWSReservedSSO_<set>_<suffix>/<user name>`,
 in the console and in policies, without MFA. Their page hands out

@@ -14,17 +14,24 @@
 //! name is its name in the claim.
 //!
 //! What a directory user may do is what the **permission sets** assigned to
-//! it, or to one of its groups, allow. As in Identity Center, a permission
-//! set is provisioned as a role of the account: at
+//! it, or to one of its groups, allow, in the accounts they're assigned in.
+//! As in Identity Center, a permission set is the instance's (its
+//! account's), an assignment gives it to a user or group in an account
+//! (its target), and the set is provisioned to each account it's assigned
+//! in as a role there (`permission_set_provisions`). Cairn provisions a set
+//! to its own account when it's made, and keeps it there, its role there
+//! holding what the set is; a cluster has one account so far, so that's
+//! the only one sets are provisioned to. The role is at
 //! `/aws-reserved/sso.amazonaws.com/`, named `AWSReservedSSO_<set>_<suffix>`,
 //! trusting `sso.amazonaws.com` only (so that no one assumes it with STS),
 //! holding the set's inline policy (`AwsSSOInlinePolicy`), its AWS managed
-//! policies and customer managed policies (the account's, by name and
+//! policies and customer managed policies (each account's own, by name and
 //! path), and its permissions boundary. Only the permission set changes it:
-//! IAM refuses to (`roles::protected`). Changes apply at once, so
-//! provisioning (sso-admin's `ProvisionPermissionSet`) has nothing left to
-//! do. A directory user signed in to the console picks one of its
-//! permission sets, and acts as a session of its role
+//! IAM refuses to (`roles::protected`). Changes apply at once, to every
+//! account the set is provisioned to, so provisioning (sso-admin's
+//! `ProvisionPermissionSet`) has nothing left to do. A directory user signed
+//! in to the console picks an account and one of its permission sets there,
+//! and acts as a session of the set's role in that account
 //! (`assumed-role/AWSReservedSSO_…/<name>`), which may hand it the session's
 //! credentials for the CLI too (see `console::directory`).
 
@@ -128,7 +135,9 @@ pub struct PermissionSet {
     pub relay_state: Option<String>,
     /// Its tags, as stored (see `s3::tags`); `None` for none.
     pub tags: Option<String>,
-    /// The role it's provisioned as.
+    /// Its role in its own account (the instance's), which holds what it
+    /// is: Cairn provisions it there when it's made, and keeps it there
+    /// (see `provisions` for the accounts it's provisioned to).
     pub role_id: Uuid,
     pub role_name: String,
     /// When it was made (seconds since the epoch).
@@ -136,8 +145,10 @@ pub struct PermissionSet {
 }
 
 const COLUMNS: &str = "p.id, p.account_id, p.short_id, p.name, p.description, p.session_duration, p.relay_state, p.tags,
-     p.role_id, r.name, extract(epoch FROM p.created_at)::float8";
-const FROM: &str = "FROM permission_sets p JOIN iam_roles r ON r.id = p.role_id";
+     v.role_id, r.name, extract(epoch FROM p.created_at)::float8";
+const FROM: &str = "FROM permission_sets p
+     JOIN permission_set_provisions v ON v.permission_set_id = p.id AND v.account_id = p.account_id
+     JOIN iam_roles r ON r.id = v.role_id";
 
 impl PermissionSet {
     fn of(row: &tokio_postgres::Row) -> PermissionSet {
@@ -164,9 +175,48 @@ impl PermissionSet {
         roles::role_arn(&self.account, ROLE_PATH, &self.role_name)
     }
 
-    /// Its role.
+    /// Its role in its own account.
     pub async fn role(&self, client: &Object) -> anyhow::Result<Role> {
         Role::load_id(client, self.role_id).await?.context("a permission set's role is gone")
+    }
+}
+
+/// A permission set provisioned to an account: its role there.
+#[derive(Clone, Debug)]
+pub struct Provision {
+    pub account: String,
+    pub role_id: Uuid,
+}
+
+impl Provision {
+    async fn role(&self, client: &Object) -> anyhow::Result<Role> {
+        Role::load_id(client, self.role_id).await?.context("a permission set's role is gone")
+    }
+}
+
+/// The accounts `set` is provisioned to (its own among them), by ID.
+pub async fn provisions(client: &Object, set: &PermissionSet) -> anyhow::Result<Vec<Provision>> {
+    let rows = client
+        .query_cached(
+            "SELECT account_id, role_id FROM permission_set_provisions WHERE permission_set_id = $1 ORDER BY account_id",
+            &[&set.id],
+        )
+        .await?;
+    Ok(rows.iter().map(|r| Provision { account: r.get(0), role_id: r.get(1) }).collect())
+}
+
+/// `set`'s provisioning to `account`, if it's provisioned there.
+pub async fn provisioned(client: &Object, set: &PermissionSet, account: &str) -> anyhow::Result<Option<Provision>> {
+    Ok(provisions(client, set).await?.into_iter().find(|p| p.account == account))
+}
+
+/// A managed policy's ARN (AWS's, or a customer managed policy's of any
+/// account) as `account` has it: AWS's as it is, a customer managed one by
+/// its name and path, which permission sets reference them by.
+fn in_account(arn: &str, account: &str) -> String {
+    match customer_policy_reference(arn) {
+        Some((name, path)) if !is_aws(arn) => customer_policy_arn(account, &name, &path),
+        _ => arn.to_owned(),
     }
 }
 
@@ -263,9 +313,9 @@ pub async fn create(client: &Object, account: &str, new: &New<'_>) -> anyhow::Re
     let role_id = roles::create(client, account, &role).await?;
     let made = client
         .execute_cached(
-            "INSERT INTO permission_sets (id, account_id, short_id, name, description, session_duration, relay_state, tags, role_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT DO NOTHING",
-            &[&id, &account, &short_id, &new.name, &new.description, &new.session_duration, &new.relay_state, &new.tags, &role_id],
+            "INSERT INTO permission_sets (id, account_id, short_id, name, description, session_duration, relay_state, tags)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
+            &[&id, &account, &short_id, &new.name, &new.description, &new.session_duration, &new.relay_state, &new.tags],
         )
         .await?;
     if made == 0 {
@@ -275,6 +325,12 @@ pub async fn create(client: &Object, account: &str, new: &New<'_>) -> anyhow::Re
         }
         return refused(Refused::Exists(format!("A permission set named {} already exists.", new.name)));
     }
+    client
+        .execute_cached(
+            "INSERT INTO permission_set_provisions (permission_set_id, account_id, role_id) VALUES ($1, $2, $3)",
+            &[&id, &account, &role_id],
+        )
+        .await?;
     load_id(client, id).await?.context("a new permission set is gone")
 }
 
@@ -286,7 +342,7 @@ pub struct Change<'a> {
     pub relay_state: Option<&'a str>,
 }
 
-/// Changes a permission set (its role's longest session too).
+/// Changes a permission set (its roles' longest session too).
 pub async fn update(client: &Object, set: &PermissionSet, change: &Change<'_>) -> anyhow::Result<()> {
     if let Some(description) = change.description {
         check_description(description)?;
@@ -306,7 +362,9 @@ pub async fn update(client: &Object, set: &PermissionSet, change: &Change<'_>) -
         )
         .await?;
     if change.session_duration.is_some() {
-        roles::update(client, set.role_id, None, change.session_duration).await?;
+        for provision in provisions(client, set).await? {
+            roles::update(client, provision.role_id, None, change.session_duration).await?;
+        }
     }
     Ok(())
 }
@@ -322,12 +380,18 @@ pub async fn inline_policy(client: &Object, set: &PermissionSet) -> anyhow::Resu
     roles::get_policy(client, set.role_id, INLINE_POLICY).await
 }
 
-/// Sets (`Some`) or removes a permission set's inline policy.
+/// Sets (`Some`) or removes a permission set's inline policy, in every
+/// account it's provisioned to.
 pub async fn set_inline_policy(client: &Object, set: &PermissionSet, document: Option<&str>) -> anyhow::Result<()> {
-    match document {
-        Some(document) => roles::put_policy(client, &set.role(client).await?, INLINE_POLICY, document).await,
-        None => roles::delete_policy(client, set.role_id, INLINE_POLICY).await.map(|_| ()),
+    for provision in provisions(client, set).await? {
+        match document {
+            Some(document) => roles::put_policy(client, &provision.role(client).await?, INLINE_POLICY, document).await?,
+            None => {
+                roles::delete_policy(client, provision.role_id, INLINE_POLICY).await?;
+            }
+        }
     }
+    Ok(())
 }
 
 /// The managed policies attached to a permission set: AWS's (Cairn's) and
@@ -357,9 +421,15 @@ pub fn customer_policy_reference(arn: &str) -> Option<(String, String)> {
 }
 
 /// Attaches (`attach`) or detaches a managed policy (by its ARN: AWS's or
-/// the account's) to or from a permission set.
+/// the account's) to or from a permission set, in every account it's
+/// provisioned to: a customer managed policy as each account has it, by
+/// its name and path, which it must have.
 pub async fn attach(client: &Object, set: &PermissionSet, arn: &str, attach: bool) -> anyhow::Result<()> {
-    roles::attach(client, &set.account, &set.role(client).await?, arn, attach).await
+    for provision in provisions(client, set).await? {
+        let role = provision.role(client).await?;
+        roles::attach(client, &provision.account, &role, &in_account(arn, &provision.account), attach).await?;
+    }
+    Ok(())
 }
 
 /// A permission set's permissions boundary's ARN, if it has one.
@@ -368,31 +438,43 @@ pub async fn boundary(client: &Object, set: &PermissionSet) -> anyhow::Result<Op
 }
 
 /// Sets (`Some`: a managed policy's ARN, AWS's or the account's) or removes
-/// a permission set's permissions boundary.
+/// a permission set's permissions boundary, in every account it's
+/// provisioned to (a customer managed policy as `attach` finds it).
 pub async fn set_boundary(client: &Object, set: &PermissionSet, arn: Option<&str>) -> anyhow::Result<()> {
-    let boundary: Option<BoundaryRef> = match arn {
-        Some(arn) => Some(crate::managed::boundary(client, &set.account, arn).await?),
-        None => None,
-    };
-    roles::set_boundary(client, set.role_id, boundary.as_ref()).await
+    for provision in provisions(client, set).await? {
+        let boundary: Option<BoundaryRef> = match arn {
+            Some(arn) => Some(crate::managed::boundary(client, &provision.account, &in_account(arn, &provision.account)).await?),
+            None => None,
+        };
+        roles::set_boundary(client, provision.role_id, boundary.as_ref()).await?;
+    }
+    Ok(())
 }
 
-/// Deletes a permission set: its assignments, its role, and its role's
-/// policies. Its sessions in the console end; credentials handed out from
-/// them stop working, as their role is gone.
+/// Deletes a permission set: its assignments, and its roles in every
+/// account it's provisioned to, with their policies. Its sessions in the
+/// console end; credentials handed out from them stop working, as their
+/// roles are gone.
 pub async fn delete(client: &Object, set: &PermissionSet) -> anyhow::Result<()> {
-    let role = set.role(client).await?;
-    for name in roles::policy_names(client, role.id).await? {
-        roles::delete_policy(client, role.id, &name).await?;
-    }
-    for attached in roles::attached(client, role.id).await? {
-        roles::attach(client, &set.account, &role, &attached.arn, false).await?;
-    }
-    if role.boundary.is_some() {
-        roles::set_boundary(client, role.id, None).await?;
+    let mut gone = Vec::new();
+    for provision in provisions(client, set).await? {
+        let role = provision.role(client).await?;
+        for name in roles::policy_names(client, role.id).await? {
+            roles::delete_policy(client, role.id, &name).await?;
+        }
+        for attached in roles::attached(client, role.id).await? {
+            roles::attach(client, &provision.account, &role, &attached.arn, false).await?;
+        }
+        if role.boundary.is_some() {
+            roles::set_boundary(client, role.id, None).await?;
+        }
+        gone.push(role);
     }
     client.execute_cached("DELETE FROM permission_sets WHERE id = $1", &[&set.id]).await?;
-    roles::delete(client, &role).await
+    for role in &gone {
+        roles::delete(client, role).await?;
+    }
+    Ok(())
 }
 
 // ─── The identity store ──────────────────────────────────────────────────────
@@ -631,10 +713,12 @@ impl PrincipalType {
     }
 }
 
-/// A permission set's assignment to a user or group.
+/// A permission set's assignment to a user or group, in an account.
 #[derive(Clone, Debug)]
 pub struct Assignment {
     pub id: Uuid,
+    /// The account it gives the permission set in (its target), by ID.
+    pub account: String,
     pub permission_set: String,
     pub permission_set_short_id: String,
     pub principal_type: PrincipalType,
@@ -646,11 +730,13 @@ pub struct Assignment {
     pub created: f64,
 }
 
-/// `account`'s assignments (of permission set `set`, or to principal
-/// `principal`, if given), by permission set.
+/// The assignments of `account`'s permission sets (in account `target`, of
+/// permission set `set`, or to principal `principal`, if given), by
+/// permission set and account.
 pub async fn assignments(
     client: &Object,
     account: &str,
+    target: Option<&str>,
     set: Option<Uuid>,
     principal: Option<(PrincipalType, Uuid)>,
 ) -> anyhow::Result<Vec<Assignment>> {
@@ -662,19 +748,21 @@ pub async fn assignments(
         .query_cached(
             "SELECT a.id, p.name, p.short_id, CASE WHEN a.user_id IS NULL THEN 'GROUP' ELSE 'USER' END,
                     coalesce(a.user_id, a.group_id), coalesce(u.user_name, g.name), coalesce(u.provider, g.provider), u.email,
-                    extract(epoch FROM a.created_at)::float8
+                    extract(epoch FROM a.created_at)::float8, a.account_id
              FROM permission_set_assignments a JOIN permission_sets p ON p.id = a.permission_set_id
              LEFT JOIN identity_users u ON u.id = a.user_id LEFT JOIN identity_groups g ON g.id = a.group_id
              WHERE p.account_id = $1 AND ($2::uuid IS NULL OR p.id = $2)
                AND ($3::text IS NULL OR ($3 = 'USER' AND a.user_id = $4) OR ($3 = 'GROUP' AND a.group_id = $4))
-             ORDER BY p.name, 4, 6",
-            &[&account, &set, &kind, &id],
+               AND ($5::text IS NULL OR a.account_id = $5)
+             ORDER BY p.name, a.account_id, 4, 6",
+            &[&account, &set, &kind, &id, &target],
         )
         .await?;
     Ok(rows
         .iter()
         .map(|r| Assignment {
             id: r.get(0),
+            account: r.get(9),
             permission_set: r.get(1),
             permission_set_short_id: r.get(2),
             principal_type: PrincipalType::parse(r.get(3)).expect("one of them"),
@@ -687,16 +775,23 @@ pub async fn assignments(
         .collect())
 }
 
-/// Assigns `set` to the user or group `principal` (by its ID).
-pub async fn assign(client: &Object, set: &PermissionSet, kind: PrincipalType, principal: Uuid) -> anyhow::Result<()> {
+/// Assigns `set` to the user or group `principal` (by its ID) in
+/// `account`, which it must be provisioned to.
+pub async fn assign(client: &Object, set: &PermissionSet, account: &str, kind: PrincipalType, principal: Uuid) -> anyhow::Result<()> {
+    if provisioned(client, set, account).await?.is_none() {
+        return refused(Refused::Unsupported(format!(
+            "Cairn provisions permission sets to their own account only, not to {account}."
+        )));
+    }
     let (user, group) = match kind {
         PrincipalType::User => (Some(principal), None),
         PrincipalType::Group => (None, Some(principal)),
     };
     let made = client
         .execute_cached(
-            "INSERT INTO permission_set_assignments (permission_set_id, user_id, group_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-            &[&set.id, &user, &group],
+            "INSERT INTO permission_set_assignments (permission_set_id, account_id, user_id, group_id) VALUES ($1, $2, $3, $4)
+             ON CONFLICT DO NOTHING",
+            &[&set.id, &account, &user, &group],
         )
         .await;
     match made {
@@ -711,34 +806,63 @@ pub async fn assign(client: &Object, set: &PermissionSet, kind: PrincipalType, p
     }
 }
 
-/// Removes `set`'s assignment to a user or group: whether there was one.
-pub async fn unassign(client: &Object, set: &PermissionSet, kind: PrincipalType, principal: Uuid) -> anyhow::Result<bool> {
+/// Removes `set`'s assignment to a user or group in `account`: whether
+/// there was one.
+pub async fn unassign(client: &Object, set: &PermissionSet, account: &str, kind: PrincipalType, principal: Uuid) -> anyhow::Result<bool> {
     let column = match kind {
         PrincipalType::User => "user_id",
         PrincipalType::Group => "group_id",
     };
     let removed = client
-        .execute(&format!("DELETE FROM permission_set_assignments WHERE permission_set_id = $1 AND {column} = $2"), &[&set.id, &principal])
+        .execute(
+            &format!("DELETE FROM permission_set_assignments WHERE permission_set_id = $1 AND account_id = $2 AND {column} = $3"),
+            &[&set.id, &account, &principal],
+        )
         .await?;
     Ok(removed > 0)
 }
 
-/// The permission sets of `account` assigned to directory user `user`, or
-/// to one of its groups.
-pub async fn eligible(client: &Object, account: &str, user: Uuid) -> anyhow::Result<Vec<PermissionSet>> {
+/// A permission set a directory user may act as in an account: the
+/// access portal's choice of an account, and a role there.
+#[derive(Clone, Debug)]
+pub struct Eligible {
+    pub set: PermissionSet,
+    /// The account (its ID and name), and the set's role there.
+    pub account: String,
+    pub account_name: String,
+    pub role_id: Uuid,
+    pub role_name: String,
+}
+
+/// The permission sets of `account`'s instance assigned to directory user
+/// `user`, or to one of its groups, with the accounts they're assigned in:
+/// by account name, then permission set.
+pub async fn eligible(client: &Object, account: &str, user: Uuid) -> anyhow::Result<Vec<Eligible>> {
     let rows = client
         .query_cached(
             &format!(
-                "SELECT {COLUMNS} {FROM}
+                "SELECT {COLUMNS}, t.account_id, acc.name, t.role_id, tr.name {FROM}
+                 JOIN permission_set_provisions t ON t.permission_set_id = p.id
+                 JOIN accounts acc ON acc.id = t.account_id
+                 JOIN iam_roles tr ON tr.id = t.role_id
                  WHERE p.account_id = $1 AND EXISTS (
-                     SELECT 1 FROM permission_set_assignments a WHERE a.permission_set_id = p.id
+                     SELECT 1 FROM permission_set_assignments a WHERE a.permission_set_id = p.id AND a.account_id = t.account_id
                        AND (a.user_id = $2 OR a.group_id IN (SELECT group_id FROM identity_group_members WHERE user_id = $2)))
-                 ORDER BY p.name"
+                 ORDER BY acc.name, t.account_id, p.name"
             ),
             &[&account, &user],
         )
         .await?;
-    Ok(rows.iter().map(PermissionSet::of).collect())
+    Ok(rows
+        .iter()
+        .map(|r| Eligible {
+            set: PermissionSet::of(r),
+            account: r.get(11),
+            account_name: r.get(12),
+            role_id: r.get(13),
+            role_name: r.get(14),
+        })
+        .collect())
 }
 
 // ─── sso-admin's requests ────────────────────────────────────────────────────
@@ -769,6 +893,8 @@ impl OperationKind {
 pub struct Operation {
     pub request_id: Uuid,
     pub permission_set_arn: String,
+    /// The account it targeted, by ID.
+    pub target: Option<String>,
     pub principal: Option<(PrincipalType, Uuid)>,
     /// `SUCCEEDED` or `FAILED` (with why).
     pub status: String,
@@ -776,12 +902,14 @@ pub struct Operation {
     pub created: f64,
 }
 
-/// Notes a request of `kind` done (`failure`: why it failed): its ID.
+/// Notes a request of `kind` done, in account `target` (`failure`: why it
+/// failed): its ID.
 pub async fn record(
     client: &Object,
     account: &str,
     kind: OperationKind,
     permission_set_arn: &str,
+    target: Option<&str>,
     principal: Option<(PrincipalType, Uuid)>,
     failure: Option<&str>,
 ) -> anyhow::Result<Operation> {
@@ -793,14 +921,16 @@ pub async fn record(
     };
     let row = client
         .query_one_cached(
-            "INSERT INTO sso_operations (request_id, account_id, kind, permission_set_arn, principal_type, principal_id, status, failure_reason)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING extract(epoch FROM created_at)::float8",
-            &[&request_id, &account, &kind.as_str(), &permission_set_arn, &principal_type, &principal_id, &status, &failure],
+            "INSERT INTO sso_operations (request_id, account_id, kind, permission_set_arn, target_account_id, principal_type, principal_id,
+                                         status, failure_reason)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING extract(epoch FROM created_at)::float8",
+            &[&request_id, &account, &kind.as_str(), &permission_set_arn, &target, &principal_type, &principal_id, &status, &failure],
         )
         .await?;
     Ok(Operation {
         request_id,
         permission_set_arn: permission_set_arn.to_owned(),
+        target: target.map(str::to_owned),
         principal,
         status: status.to_owned(),
         failure_reason: failure.map(str::to_owned),
@@ -820,7 +950,7 @@ pub async fn operations(
     let rows = client
         .query_cached(
             "SELECT request_id, permission_set_arn, principal_type, principal_id, status, failure_reason,
-                    extract(epoch FROM created_at)::float8
+                    extract(epoch FROM created_at)::float8, target_account_id
              FROM sso_operations WHERE account_id = $1 AND kind = $2 AND ($3::uuid IS NULL OR request_id = $3)
                AND ($4::text IS NULL OR status = $4)
              ORDER BY created_at DESC, request_id",
@@ -832,6 +962,7 @@ pub async fn operations(
         .map(|r| Operation {
             request_id: r.get(0),
             permission_set_arn: r.get(1),
+            target: r.get(7),
             principal: r
                 .get::<_, Option<&str>>(2)
                 .and_then(PrincipalType::parse)

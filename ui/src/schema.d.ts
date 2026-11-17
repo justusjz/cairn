@@ -41,7 +41,7 @@ export interface paths {
         };
         get: operations["list_assignments"];
         put?: never;
-        /** Assigns a permission set to a directory user or group. */
+        /** Assigns a permission set to a directory user or group, in an account. */
         post: operations["create_assignment"];
         delete?: never;
         options?: never;
@@ -1875,8 +1875,13 @@ export interface components {
             /** @description The login the passkey is of, as the authenticator says. */
             user_handle?: string | null;
         };
-        /** @description A permission set's assignment to a directory user or group. */
+        /**
+         * @description A permission set's assignment to a directory user or group, in an
+         *     account.
+         */
         AssignmentSummary: {
+            /** @description The account it gives the permission set in, by ID. */
+            account_id: string;
             /** Format: double */
             created_at: number;
             /** @description A user's e-mail. */
@@ -2084,6 +2089,11 @@ export interface components {
             options: Record<string, never>;
         };
         ChosenPermissionSet: {
+            /**
+             * @description The account to act in, by ID: one the set is assigned to the user
+             *     in. Needed only when it's assigned in more than one.
+             */
+            account_id?: string | null;
             /** @description One of the session's permission sets, by name. */
             name: string;
         };
@@ -2267,9 +2277,16 @@ export interface components {
             email?: string | null;
             /** @description Its groups, as the source's group claim said when it signed in. */
             groups: string[];
-            /** @description The permission set it acts as, if it picked one. */
+            /**
+             * @description The permission set it acts as, and the account (by ID) it acts in
+             *     there, if it picked one.
+             */
             permission_set?: string | null;
-            /** @description The permission sets assigned to it or its groups, to pick from. */
+            permission_set_account_id?: string | null;
+            /**
+             * @description The permission sets assigned to it or its groups, in the accounts
+             *     they're assigned in, to pick from.
+             */
             permission_sets: components["schemas"]["PermissionSetChoice"][];
             /** @description The identity source's name and label. */
             provider: string;
@@ -2915,6 +2932,11 @@ export interface components {
             started_at: number;
         };
         NewAssignment: {
+            /**
+             * @description The account to give it in, by ID: the instance's own, if not given
+             *     (the only one so far).
+             */
+            account_id?: string | null;
             permission_set: string;
             /** @description The user's or group's ID in the identity store. */
             principal_id: string;
@@ -3260,8 +3282,11 @@ export interface components {
              */
             session_duration: number;
         };
-        /** @description A permission set a directory user may use. */
+        /** @description A permission set a directory user may use, in an account. */
         PermissionSetChoice: {
+            account: string;
+            /** @description The account's ID and name. */
+            account_id: string;
             description: string;
             name: string;
             /**

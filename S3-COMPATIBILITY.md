@@ -420,7 +420,11 @@ AWS. It differs in that:
   groups may share: GetGroupId then wants the external ID).
 - **One account, done at once.** The account's instance is its only one
   (CreateInstance, DeleteInstance and UpdateInstance answer `501`), and the
-  account the only target of assignments and provisioning. Their requests
+  account the only target of assignments and provisioning. Assignments and
+  console sessions do name the account they're in, and a permission set
+  keeps a role per account it's provisioned to, as AWS's, so that member
+  accounts can be added later; a permission set is provisioned to its own
+  account when it's made, rather than when it's first assigned. Their requests
   are done when they're answered: their statuses are `SUCCEEDED` (never
   `IN_PROGRESS`), a permission set is provisioned once it's assigned, and
   creating an assignment there is, or deleting one there isn't, succeeds.

@@ -1239,13 +1239,18 @@ mod e2e {
         assert_eq!((&me["name"], &me["mfa"], &me["directory"]["permission_set"]), (&json!("Test Person"), &json!(false), &Value::Null));
         let names: Vec<&str> = me["directory"]["permission_sets"].as_array().unwrap().iter().map(|s| s["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["Admins", "Readers"]);
+        // Each in the account it's assigned in: the only one.
+        assert!(me["directory"]["permission_sets"].as_array().unwrap().iter().all(|s| s["account_id"] == json!(account)), "{me}");
         let (status, err) = ada.send("GET", "/api/users", None).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert!(err["error"].as_str().unwrap().contains("pick a permission set"), "{err}");
         let (status, _) = ada.send("POST", "/api/directory/permission-set", Some(json!({ "name": "Nope" }))).await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+        let elsewhere = json!({ "name": "Admins", "account_id": "111111111111" });
+        assert_eq!(ada.send("POST", "/api/directory/permission-set", Some(elsewhere)).await.0, StatusCode::FORBIDDEN);
         let (status, me) = ada.send("POST", "/api/directory/permission-set", Some(json!({ "name": "Admins" }))).await;
         assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!((&me["directory"]["permission_set_account_id"], &me["identity"]["account_id"]), (&json!(account), &json!(account)));
         assert!(me["identity"]["arn"].as_str().unwrap().starts_with(&format!("arn:aws:sts::{account}:assumed-role/AWSReservedSSO_Admins_")));
         assert!(me["identity"]["arn"].as_str().unwrap().ends_with("/ada@example.com"), "{me}");
         assert_eq!(ada.send("GET", "/api/users", None).await.0, StatusCode::OK);

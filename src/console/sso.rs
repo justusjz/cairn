@@ -90,7 +90,7 @@ struct PermissionSetSummary {
 async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<PermissionSetSummary>>> {
     actor.check(&app, "sso:ListPermissionSets", instance(&actor)).await?;
     let client = app.pool.get().await?;
-    let assignments = ic::assignments(&client, actor.account(), None, None).await?;
+    let assignments = ic::assignments(&client, actor.account(), None, None, None).await?;
     let mut out = Vec::new();
     for set in ic::list(&client, actor.account()).await? {
         let role = set.role(&client).await?;
@@ -302,10 +302,13 @@ async fn delete_permission_set_boundary(State(app): AppState, Extension(actor): 
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A permission set's assignment to a directory user or group.
+/// A permission set's assignment to a directory user or group, in an
+/// account.
 #[derive(Serialize, ToSchema)]
 struct AssignmentSummary {
     id: String,
+    /// The account it gives the permission set in, by ID.
+    account_id: String,
     permission_set: String,
     /// `USER` or `GROUP`.
     principal_type: String,
@@ -327,12 +330,13 @@ struct AssignmentSummary {
 ))]
 async fn list_assignments(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<AssignmentSummary>>> {
     actor.check(&app, "sso:ListAccountAssignments", instance(&actor)).await?;
-    let assignments = ic::assignments(&app.pool.get().await?, actor.account(), None, None).await?;
+    let assignments = ic::assignments(&app.pool.get().await?, actor.account(), None, None, None).await?;
     Ok(Json(
         assignments
             .into_iter()
             .map(|a| AssignmentSummary {
                 id: a.id.to_string(),
+                account_id: a.account,
                 permission_set: a.permission_set,
                 principal_type: a.principal_type.as_str().to_owned(),
                 principal_id: a.principal_id.to_string(),
@@ -352,9 +356,12 @@ struct NewAssignment {
     principal_type: String,
     /// The user's or group's ID in the identity store.
     principal_id: String,
+    /// The account to give it in, by ID: the instance's own, if not given
+    /// (the only one so far).
+    account_id: Option<String>,
 }
 
-/// Assigns a permission set to a directory user or group.
+/// Assigns a permission set to a directory user or group, in an account.
 #[utoipa::path(post, path = "/assignments", request_body = NewAssignment, responses(
     (status = 201, description = "Assigned"),
     (status = "4XX", body = ErrorBody),
@@ -367,7 +374,8 @@ async fn create_assignment(State(app): AppState, Extension(actor): Extension<Act
     let principal = Uuid::parse_str(&body.principal_id)
         .map_err(|_| ApiError::NotFound(format!("there's no {} {} in the identity store", kind.as_str().to_lowercase(), body.principal_id)))?;
     let set = check_set(&app, &actor, "sso:CreateAccountAssignment", &body.permission_set).await?;
-    ic::assign(&app.pool.get().await?, &set, kind, principal).await?;
+    let account = body.account_id.as_deref().unwrap_or(actor.account());
+    ic::assign(&app.pool.get().await?, &set, account, kind, principal).await?;
     Ok(StatusCode::CREATED)
 }
 
@@ -382,13 +390,13 @@ async fn delete_assignment(State(app): AppState, Extension(actor): Extension<Act
     let missing = || ApiError::NotFound("no such assignment".into());
     let id = Uuid::parse_str(&id).map_err(|_| missing())?;
     let client = app.pool.get().await?;
-    let assignment = ic::assignments(&client, actor.account(), None, None)
+    let assignment = ic::assignments(&client, actor.account(), None, None, None)
         .await?
         .into_iter()
         .find(|a| a.id == id)
         .ok_or_else(missing)?;
     let set = check_set(&app, &actor, "sso:DeleteAccountAssignment", &assignment.permission_set).await?;
-    if !ic::unassign(&client, &set, assignment.principal_type, assignment.principal_id).await? {
+    if !ic::unassign(&client, &set, &assignment.account, assignment.principal_type, assignment.principal_id).await? {
         return Err(missing());
     }
     Ok(StatusCode::NO_CONTENT)

@@ -465,15 +465,15 @@ function UserHome(props: { me: Me }) {
 }
 
 /** A directory user's own page: who its identity source says it is, the
- * permission sets it may use (to switch between), and credentials of the
- * one it uses, for the CLI. */
+ * permission sets it may use and the accounts it may use them in (to switch
+ * between), and credentials of the one it uses, for the CLI. */
 function DirectoryHome(props: { me: Me }) {
   const navigate = useNavigate();
   const d = () => props.me.directory!;
   const [credentials, setCredentials] = createSignal<Credentials>();
-  const choose = async (name: string) => {
+  const choose = async (name: string, account_id: string) => {
     try {
-      setMe(await api.choosePermissionSet(name));
+      setMe(await api.choosePermissionSet(name, account_id));
       setCredentials(undefined);
       toast(`Using ${name}`);
       navigate("/");
@@ -481,6 +481,8 @@ function DirectoryHome(props: { me: Me }) {
       toast(explain(e), true);
     }
   };
+  const inUse = (set: { name: string; account_id: string }) =>
+    set.name === d().permission_set && set.account_id === d().permission_set_account_id;
   const getCredentials = async () => {
     try {
       setCredentials(await api.directoryCredentials());
@@ -505,21 +507,29 @@ function DirectoryHome(props: { me: Me }) {
         <span class="subtle small">signed in at {d().provider_label}</span>
       </div>
       <Panel title="Permission sets">
-        <Table count={d().permission_sets.length} empty="None is assigned to you anymore." columns={["Name", "Description", "Sessions", ""]}>
+        <Table
+          count={d().permission_sets.length}
+          empty="None is assigned to you anymore."
+          columns={["Account", "Name", "Description", "Sessions", ""]}
+        >
           <For each={d().permission_sets}>
             {(set) => (
               <tr>
+                <td>
+                  {set.account}
+                  <div class="subtle small mono">{set.account_id}</div>
+                </td>
                 <td class="mono">
                   {set.name}{" "}
-                  <Show when={set.name === d().permission_set}>
+                  <Show when={inUse(set)}>
                     <Badge tone="ok">in use</Badge>
                   </Show>
                 </td>
                 <td>{set.description || <span class="subtle">none</span>}</td>
                 <td>{Math.round(set.session_duration / 360) / 10} h</td>
                 <td class="actions">
-                  <Show when={set.name !== d().permission_set}>
-                    <button class="small primary" onClick={() => choose(set.name)}>
+                  <Show when={!inUse(set)}>
+                    <button class="small primary" onClick={() => choose(set.name, set.account_id)}>
                       Use
                     </button>
                   </Show>

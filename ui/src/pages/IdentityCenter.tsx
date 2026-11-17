@@ -73,7 +73,7 @@ export default function IdentityCenter() {
               </Table>
             </Panel>
             <Panel title="Assignments">
-              <Table count={d()[1].length} empty="None: no directory user can sign in yet." columns={["Permission set", "To", "Source", "Since", ""]}>
+              <Table count={d()[1].length} empty="None: no directory user can sign in yet." columns={["Permission set", "Account", "To", "Source", "Since", ""]}>
                 <For each={d()[1]}>
                   {(a) => (
                     <tr>
@@ -82,6 +82,7 @@ export default function IdentityCenter() {
                           {a.permission_set}
                         </A>
                       </td>
+                      <td class="mono small">{a.account_id}</td>
                       <td>
                         <Show
                           when={a.principal_type === "USER"}

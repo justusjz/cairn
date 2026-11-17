@@ -486,15 +486,21 @@ struct DirectoryMe {
     email: Option<String>,
     /// Its groups, as the source's group claim said when it signed in.
     groups: Vec<String>,
-    /// The permission set it acts as, if it picked one.
+    /// The permission set it acts as, and the account (by ID) it acts in
+    /// there, if it picked one.
     permission_set: Option<String>,
-    /// The permission sets assigned to it or its groups, to pick from.
+    permission_set_account_id: Option<String>,
+    /// The permission sets assigned to it or its groups, in the accounts
+    /// they're assigned in, to pick from.
     permission_sets: Vec<PermissionSetChoice>,
 }
 
-/// A permission set a directory user may use.
+/// A permission set a directory user may use, in an account.
 #[derive(Serialize, ToSchema)]
 struct PermissionSetChoice {
+    /// The account's ID and name.
+    account_id: String,
+    account: String,
     name: String,
     description: String,
     /// How long its sessions (and credentials) last, in seconds.
@@ -570,22 +576,36 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
 /// session, if it picked one that's still its.
 async fn directory_me(console: &Console, client: &deadpool_postgres::Object, session: &store::DirectorySession) -> Result<Me> {
     let eligible = crate::identity_center::eligible(client, &session.account_id, session.user_id).await?;
-    let chosen = eligible.iter().find(|set| Some(set.id) == session.permission_set);
-    let (arn, user, cluster) = match chosen {
-        Some(set) => {
+    let chosen = eligible.iter().find(|e| session.permission_set.as_ref() == Some(&(e.set.id, e.account.clone())));
+    let (identity, cluster) = match chosen {
+        Some(chosen) => {
             let user = super::directory::user(client, session, axum::http::Method::GET, HeaderMap::new(), String::new(), None).await?;
             let arn = user.principal.arn();
             let actor = super::Actor(Arc::new(user));
             let cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
-            (arn, set.role_name.clone(), cluster)
+            let identity = IdentitySummary {
+                account_id: chosen.account.clone(),
+                account: chosen.account_name.clone(),
+                user: chosen.role_name.clone(),
+                arn,
+            };
+            (identity, cluster)
         }
-        None => (String::new(), String::new(), false),
+        None => {
+            let identity = IdentitySummary {
+                account_id: session.account_id.clone(),
+                account: session.account.clone(),
+                user: String::new(),
+                arn: String::new(),
+            };
+            (identity, false)
+        }
     };
     Ok(Me {
         name: session.name.clone(),
         root: false,
         expires_at: Some(session.expires_at),
-        identity: IdentitySummary { account_id: session.account_id.clone(), account: session.account.clone(), user, arn },
+        identity,
         mfa: false,
         cluster,
         passkeys: Vec::new(),
@@ -597,13 +617,16 @@ async fn directory_me(console: &Console, client: &deadpool_postgres::Object, ses
             subject: session.subject.clone(),
             email: session.email.clone(),
             groups: session.groups.clone(),
-            permission_set: chosen.map(|set| set.name.clone()),
+            permission_set: chosen.map(|e| e.set.name.clone()),
+            permission_set_account_id: chosen.map(|e| e.account.clone()),
             permission_sets: eligible
                 .iter()
-                .map(|set| PermissionSetChoice {
-                    name: set.name.clone(),
-                    description: set.description.clone(),
-                    session_duration: set.session_duration,
+                .map(|e| PermissionSetChoice {
+                    account_id: e.account.clone(),
+                    account: e.account_name.clone(),
+                    name: e.set.name.clone(),
+                    description: e.set.description.clone(),
+                    session_duration: e.set.session_duration,
                 })
                 .collect(),
         }),
@@ -614,6 +637,9 @@ async fn directory_me(console: &Console, client: &deadpool_postgres::Object, ses
 struct ChosenPermissionSet {
     /// One of the session's permission sets, by name.
     name: String,
+    /// The account to act in, by ID: one the set is assigned to the user
+    /// in. Needed only when it's assigned in more than one.
+    account_id: Option<String>,
 }
 
 /// Has a directory user's session act as one of its permission sets.
@@ -630,10 +656,19 @@ async fn choose_permission_set(
     let client = console.app.pool.get().await?;
     let session = &signed.session;
     let eligible = crate::identity_center::eligible(&client, &session.account_id, session.user_id).await?;
-    let Some(set) = eligible.into_iter().find(|set| set.name == body.name) else {
-        return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you", body.name)));
+    let matching: Vec<_> = eligible
+        .into_iter()
+        .filter(|e| e.set.name == body.name && body.account_id.as_ref().is_none_or(|id| *id == e.account))
+        .collect();
+    let chosen = match matching.as_slice() {
+        [] => match &body.account_id {
+            Some(id) => return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you in account {id}", body.name))),
+            None => return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you", body.name))),
+        },
+        [one] => one,
+        _ => return Err(ApiError::BadRequest(format!("the permission set {:?} is yours in several accounts: say which", body.name))),
     };
-    store::choose_permission_set(&client, &signed.token, set.id).await?;
+    store::choose_permission_set(&client, &signed.token, chosen.set.id, &chosen.account).await?;
     let session = store::directory_session(&client, &signed.token).await?.ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
     Ok(Json(directory_me(&console, &client, &session).await?))
 }
@@ -658,12 +693,12 @@ struct Credentials {
 ))]
 async fn directory_credentials(State(console): ConsoleState, signed: DirectorySigned) -> Result<Json<Credentials>> {
     let client = console.app.pool.get().await?;
-    let set = super::directory::permission_set(&client, &signed.session).await?;
-    let mut session = super::directory::role_session(&set, &signed.session)?;
+    let chosen = super::directory::permission_set(&client, &signed.session).await?;
+    let mut session = super::directory::role_session(&chosen, &signed.session)?;
     let token = console.app.sessions.seal(&client, &mut session).await?;
     eprintln!(
-        "console: credentials {} of permission set {} for directory user {} ({} of {})",
-        session.key_id, set.name, signed.session.user_name, signed.session.subject, signed.session.provider
+        "console: credentials {} of permission set {} in account {} for directory user {} ({} of {})",
+        session.key_id, chosen.set.name, chosen.account, signed.session.user_name, signed.session.subject, signed.session.provider
     );
     Ok(Json(Credentials {
         access_key_id: session.key_id,
@@ -883,9 +918,10 @@ async fn oidc_callback(State(console): ConsoleState, headers: HeaderMap, Query(a
             &format!("no permission set is assigned to you at {}: ask an administrator for one", done.provider.label),
         ));
     }
-    // Picked for it when it has one only; else it picks.
+    // Picked for it when it has one only (one set, in one account); else it
+    // picks.
     let chosen = match eligible.as_slice() {
-        [only] => Some(only.id),
+        [only] => Some((only.set.id, only.account.as_str())),
         _ => None,
     };
     if let Some(old) = session_token(&headers) {

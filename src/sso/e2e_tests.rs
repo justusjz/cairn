@@ -173,11 +173,28 @@ async fn permission_sets_and_assignments() {
     let mut elsewhere = target("GROUP", data.to_string());
     elsewhere["TargetId"] = json!("111111111111");
     assert_eq!(sso("CreateAccountAssignment", elsewhere).await.unwrap_err(), "ValidationException");
-    assert_eq!(ic::eligible(&client, &account, ada).await.unwrap().iter().map(|s| s.name.as_str()).collect::<Vec<_>>(), ["Readers"]);
+    // In the account it targeted, as the set's role there.
+    assert_eq!(status["AccountAssignmentCreationStatus"]["TargetId"], json!(account));
+    let eligible = ic::eligible(&client, &account, ada).await.unwrap();
+    let pairs: Vec<(&str, &str)> = eligible.iter().map(|e| (e.account.as_str(), e.set.name.as_str())).collect();
+    assert_eq!(pairs, [(account.as_str(), "Readers")]);
+    assert_eq!(eligible[0].role_id, role.id);
     let listed = sso("ListAccountAssignments", on(json!({ "AccountId": account }))).await.unwrap();
     assert_eq!(listed["AccountAssignments"][0]["PrincipalType"], "GROUP");
+    assert_eq!(listed["AccountAssignments"][0]["AccountId"], json!(account));
+    let principal = json!({ "InstanceArn": instance, "PrincipalType": "GROUP", "PrincipalId": data.to_string() });
+    let mine = sso("ListAccountAssignmentsForPrincipal", principal.clone()).await.unwrap();
+    assert_eq!(mine["AccountAssignments"].as_array().unwrap().len(), 1);
+    let mut filtered = principal;
+    filtered["Filter"] = json!({ "AccountId": "111111111111" });
+    assert_eq!(sso("ListAccountAssignmentsForPrincipal", filtered).await.unwrap()["AccountAssignments"], json!([]));
     let provisioned = sso("ListPermissionSetsProvisionedToAccount", json!({ "InstanceArn": instance, "AccountId": account })).await.unwrap();
     assert_eq!(provisioned["PermissionSets"], json!([set]));
+    let accounts = sso("ListAccountsForProvisionedPermissionSet", on(json!({}))).await.unwrap();
+    assert_eq!(accounts["AccountIds"], json!([account]));
+    let provision = sso("ProvisionPermissionSet", on(json!({ "TargetType": "AWS_ACCOUNT", "TargetId": account }))).await.unwrap();
+    assert_eq!(provision["PermissionSetProvisioningStatus"]["Status"], "SUCCEEDED");
+    assert_eq!(provision["PermissionSetProvisioningStatus"]["AccountId"], json!(account));
     let provision = sso("ProvisionPermissionSet", on(json!({ "TargetType": "ALL_PROVISIONED_ACCOUNTS" }))).await.unwrap();
     assert_eq!(provision["PermissionSetProvisioningStatus"]["Status"], "SUCCEEDED");
 
@@ -204,4 +221,67 @@ async fn permission_sets_and_assignments() {
     assert!(call(&app, &viewer, "sso", "ListPermissionSets", json!({ "InstanceArn": instance })).await.is_ok());
     let create = json!({ "InstanceArn": instance, "Name": "Mine" });
     assert_eq!(call(&app, &viewer, "sso", "CreatePermissionSet", create).await.unwrap_err(), "AccessDeniedException");
+}
+
+/// Migration 65 (`db::PERMISSION_SET_ACCOUNTS`) provisions each permission
+/// set to its own account, as the role it had, and has its assignments,
+/// the console's sessions acting as it and sso-admin's requests target that
+/// account.
+#[tokio::test]
+async fn permission_sets_are_provisioned_to_their_account() {
+    let Some(pool) = crate::e2e::fresh_database_through(64).await else { return };
+    let client = pool.get().await.unwrap();
+    let account = users::account(&client).await.unwrap();
+    client
+        .batch_execute(&format!(
+            "INSERT INTO oidc_providers (name, label, issuer, client_id) VALUES ('mock', 'Mock', 'https://idp.example', 'c');
+             INSERT INTO identity_users (id, provider, subject, user_name, display_name)
+                 VALUES ('00000000-0000-4000-8000-000000000001', 'mock', 'sub-ada', 'ada', 'Ada');
+             INSERT INTO iam_roles (id, account_id, name, path, trust_policy)
+                 VALUES ('00000000-0000-4000-8000-000000000002', '{account}', 'AWSReservedSSO_Readers_0123456789abcdef',
+                         '/aws-reserved/sso.amazonaws.com/',
+                         '{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\"Principal\":{{\"Service\":\"sso.amazonaws.com\"}},\"Action\":\"sts:AssumeRole\"}}]}}');
+             INSERT INTO permission_sets (id, account_id, short_id, name, session_duration, role_id)
+                 VALUES ('00000000-0000-4000-8000-000000000003', '{account}', '0123456789abcdef', 'Readers', 3600,
+                         '00000000-0000-4000-8000-000000000002');
+             INSERT INTO permission_set_assignments (permission_set_id, user_id)
+                 VALUES ('00000000-0000-4000-8000-000000000003', '00000000-0000-4000-8000-000000000001');
+             INSERT INTO console_directory_sessions (token_hash, account_id, user_id, permission_set_id, expires_at)
+                 VALUES ('\\x01', '{account}', '00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000003',
+                         now() + interval '1 hour'),
+                        ('\\x02', '{account}', '00000000-0000-4000-8000-000000000001', NULL, now() + interval '1 hour');
+             INSERT INTO sso_operations (request_id, account_id, kind, permission_set_arn, status)
+                 VALUES ('00000000-0000-4000-8000-000000000004', '{account}', 'PROVISION', 'arn', 'SUCCEEDED');"
+        ))
+        .await
+        .unwrap();
+    crate::db::init(&pool, usize::MAX).await.unwrap();
+
+    let set = ic::load(&client, &account, "Readers").await.unwrap().unwrap();
+    assert_eq!(set.role_id, Uuid::parse_str("00000000-0000-4000-8000-000000000002").unwrap());
+    let provisions: Vec<String> = ic::provisions(&client, &set).await.unwrap().into_iter().map(|p| p.account).collect();
+    assert_eq!(provisions, std::slice::from_ref(&account));
+    let assigned: Vec<String> = ic::assignments(&client, &account, None, None, None).await.unwrap().into_iter().map(|a| a.account).collect();
+    assert_eq!(assigned, std::slice::from_ref(&account));
+    let user = Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+    assert_eq!(ic::eligible(&client, &account, user).await.unwrap()[0].role_id, set.role_id);
+    let sessions: Vec<(Option<Uuid>, Option<String>)> = client
+        .query("SELECT permission_set_id, target_account_id FROM console_directory_sessions ORDER BY token_hash", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(sessions, [(Some(set.id), Some(account.clone())), (None, None)]);
+    let ops = ic::operations(&client, &account, OperationKind::Provision, None, None).await.unwrap();
+    assert_eq!(ops[0].target.as_deref(), Some(account.as_str()));
+
+    // Deleted, the set's sessions act as nothing, in no account.
+    ic::delete(&client, &set).await.unwrap();
+    let left: (Option<Uuid>, Option<String>) = client
+        .query_one("SELECT permission_set_id, target_account_id FROM console_directory_sessions WHERE token_hash = '\\x01'", &[])
+        .await
+        .map(|r| (r.get(0), r.get(1)))
+        .unwrap();
+    assert_eq!(left, (None, None));
 }

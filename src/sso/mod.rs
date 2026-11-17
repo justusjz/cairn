@@ -304,7 +304,7 @@ impl Ctx<'_> {
 
     /// The account a request targets (`TargetId` and `TargetType`, or
     /// `AccountId`), which must be the cluster's.
-    fn target(&self, id: &str, kind: Option<&str>) -> Result<()> {
+    fn target(&self, id: &str, kind: Option<&str>) -> Result<String> {
         let target = self.required(id)?;
         if let Some(kind) = kind
             && self.text(kind) != Some("AWS_ACCOUNT")
@@ -312,7 +312,7 @@ impl Ctx<'_> {
             return Err(validation(format!("{kind} must be AWS_ACCOUNT.")));
         }
         match target == self.account {
-            true => Ok(()),
+            true => Ok(target.to_owned()),
             false => Err(validation(format!("Account {target} isn't this cluster's ({}): it's the only one.", self.account))),
         }
     }
@@ -483,14 +483,14 @@ impl Ctx<'_> {
                 Ok(json!({}))
             }
             "CreateAccountAssignment" | "DeleteAccountAssignment" => {
-                self.target("TargetId", Some("TargetType"))?;
+                let target = self.target("TargetId", Some("TargetType"))?;
                 let set = self.permission_set().await?;
                 let principal = self.principal().await?;
                 let create = operation == "CreateAccountAssignment";
                 // Done at once; one there already (or gone already) is done too.
                 let kind = match create {
                     true => {
-                        match ic::assign(self.client, &set, principal.0, principal.1).await {
+                        match ic::assign(self.client, &set, &target, principal.0, principal.1).await {
                             Ok(()) => {}
                             Err(e) if matches!(e.downcast_ref::<Refused>(), Some(Refused::Exists(_))) => {}
                             Err(e) => return Err(e.into()),
@@ -498,11 +498,11 @@ impl Ctx<'_> {
                         OperationKind::Create
                     }
                     false => {
-                        ic::unassign(self.client, &set, principal.0, principal.1).await?;
+                        ic::unassign(self.client, &set, &target, principal.0, principal.1).await?;
                         OperationKind::Delete
                     }
                 };
-                let op = ic::record(self.client, &self.account, kind, &set.arn(), Some(principal), None).await?;
+                let op = ic::record(self.client, &self.account, kind, &set.arn(), Some(&target), Some(principal), None).await?;
                 let key = if create { "AccountAssignmentCreationStatus" } else { "AccountAssignmentDeletionStatus" };
                 Ok(json!({ key: self.assignment_status(&op) }))
             }
@@ -532,9 +532,9 @@ impl Ctx<'_> {
                 Ok(with_token(json!({ key: page }), next))
             }
             "ListAccountAssignments" => {
-                self.target("AccountId", None)?;
+                let target = self.target("AccountId", None)?;
                 let set = self.permission_set().await?;
-                let items: Vec<Value> = ic::assignments(self.client, &self.account, Some(set.id), None)
+                let items: Vec<Value> = ic::assignments(self.client, &self.account, Some(&target), Some(set.id), None)
                     .await?
                     .iter()
                     .map(|a| self.assignment_json(a))
@@ -545,13 +545,9 @@ impl Ctx<'_> {
             "ListAccountAssignmentsForPrincipal" => {
                 let instance = self.instance()?;
                 self.check(&instance)?;
-                if let Some(account) = self.input.get("Filter").and_then(|f| f.get("AccountId")).and_then(Value::as_str)
-                    && account != self.account
-                {
-                    return Ok(json!({ "AccountAssignments": [] }));
-                }
+                let account = self.input.get("Filter").and_then(|f| f.get("AccountId")).and_then(Value::as_str);
                 let principal = self.principal().await?;
-                let items: Vec<Value> = ic::assignments(self.client, &self.account, None, Some(principal))
+                let items: Vec<Value> = ic::assignments(self.client, &self.account, account, None, Some(principal))
                     .await?
                     .iter()
                     .map(|a| self.assignment_json(a))
@@ -561,12 +557,12 @@ impl Ctx<'_> {
             }
             "ProvisionPermissionSet" => {
                 let set = self.permission_set().await?;
-                match self.text("TargetType") {
-                    Some("ALL_PROVISIONED_ACCOUNTS") => {}
-                    Some("AWS_ACCOUNT") => self.target("TargetId", None)?,
+                let target = match self.text("TargetType") {
+                    Some("ALL_PROVISIONED_ACCOUNTS") => None,
+                    Some("AWS_ACCOUNT") => Some(self.target("TargetId", None)?),
                     _ => return Err(validation("TargetType must be AWS_ACCOUNT or ALL_PROVISIONED_ACCOUNTS.")),
-                }
-                let op = ic::record(self.client, &self.account, OperationKind::Provision, &set.arn(), None, None).await?;
+                };
+                let op = ic::record(self.client, &self.account, OperationKind::Provision, &set.arn(), target.as_deref(), None, None).await?;
                 Ok(json!({ "PermissionSetProvisioningStatus": self.provisioning_status(&op) }))
             }
             "DescribePermissionSetProvisioningStatus" => {
@@ -589,9 +585,9 @@ impl Ctx<'_> {
             "ListPermissionSetsProvisionedToAccount" => {
                 let instance = self.instance()?;
                 self.check(&instance)?;
-                self.target("AccountId", None)?;
-                // Provisioned: assigned (Cairn provisions at once).
-                let assigned = ic::assignments(self.client, &self.account, None, None).await?;
+                let target = self.target("AccountId", None)?;
+                // Provisioned: assigned there (Cairn provisions at once).
+                let assigned = ic::assignments(self.client, &self.account, Some(&target), None, None).await?;
                 let stale = self.text("ProvisioningStatus") == Some("LATEST_PERMISSION_SET_NOT_PROVISIONED");
                 let sets: Vec<String> = ic::list(self.client, &self.account)
                     .await?
@@ -604,10 +600,15 @@ impl Ctx<'_> {
             }
             "ListAccountsForProvisionedPermissionSet" => {
                 let set = self.permission_set().await?;
-                let assigned = !ic::assignments(self.client, &self.account, Some(set.id), None).await?.is_empty();
-                let provisioned = assigned && self.text("ProvisioningStatus") != Some("LATEST_PERMISSION_SET_NOT_PROVISIONED");
-                let accounts: Vec<&str> = if provisioned { vec![self.account.as_str()] } else { Vec::new() };
-                Ok(json!({ "AccountIds": accounts }))
+                // Provisioned: assigned there (Cairn provisions at once).
+                let mut accounts: Vec<String> =
+                    ic::assignments(self.client, &self.account, None, Some(set.id), None).await?.into_iter().map(|a| a.account).collect();
+                accounts.dedup();
+                if self.text("ProvisioningStatus") == Some("LATEST_PERMISSION_SET_NOT_PROVISIONED") {
+                    accounts.clear();
+                }
+                let (page, next) = self.page(accounts)?;
+                Ok(with_token(json!({ "AccountIds": page }), next))
             }
             "TagResource" | "UntagResource" | "ListTagsForResource" => self.tagging(operation).await,
             other => Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn doesn't implement {other}."))),
@@ -684,7 +685,7 @@ impl Ctx<'_> {
         let mut status = json!({
             "Status": op.status,
             "RequestId": op.request_id.to_string(),
-            "TargetId": self.account,
+            "TargetId": op.target.as_deref().unwrap_or(&self.account),
             "TargetType": "AWS_ACCOUNT",
             "PermissionSetArn": op.permission_set_arn,
             "CreatedDate": op.created,
@@ -703,7 +704,7 @@ impl Ctx<'_> {
         json!({
             "Status": op.status,
             "RequestId": op.request_id.to_string(),
-            "AccountId": self.account,
+            "AccountId": op.target.as_deref().unwrap_or(&self.account),
             "PermissionSetArn": op.permission_set_arn,
             "CreatedDate": op.created,
         })
@@ -711,7 +712,7 @@ impl Ctx<'_> {
 
     fn assignment_json(&self, a: &ic::Assignment) -> Value {
         json!({
-            "AccountId": self.account,
+            "AccountId": a.account,
             "PermissionSetArn": ic::permission_set_arn(&self.account, &a.permission_set_short_id),
             "PrincipalType": a.principal_type.as_str(),
             "PrincipalId": a.principal_id.to_string(),

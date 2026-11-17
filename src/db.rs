@@ -245,6 +245,7 @@ const MIGRATIONS: &[&str] = &[
     BATCH_JOB_RESULTS,
     DIRECTORY_USERS,
     BATCH_INVENTORY_MANIFESTS,
+    PERMISSION_SET_ACCOUNTS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3093,6 +3094,54 @@ ALTER TABLE batch_job_results ADD COLUMN file int NOT NULL DEFAULT 0;
 ALTER TABLE batch_job_results DROP CONSTRAINT batch_job_results_pkey;
 ALTER TABLE batch_job_results ADD PRIMARY KEY (job_id, file, start_at, status);
 "#;
+
+/// Migration 65: permission sets across accounts, as Identity Center's (see
+/// `identity_center`). A permission set is the instance's (its account's,
+/// `permission_sets.account_id`), and is provisioned to accounts as a role
+/// in each: `permission_set_provisions`, which take over the set's role.
+/// An assignment gives a set to a user or group in an account (its target),
+/// which the set must be provisioned to; a directory user's console session
+/// acts as a set in an account, and sso-admin's requests note the account
+/// they targeted. Every row so far is the one account's.
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const PERMISSION_SET_ACCOUNTS: &str = r#"
+CREATE TABLE permission_set_provisions (
+    permission_set_id uuid NOT NULL REFERENCES permission_sets (id) ON DELETE CASCADE,
+    account_id        text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    role_id           uuid NOT NULL UNIQUE REFERENCES iam_roles (id),
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (permission_set_id, account_id)
+);
+CREATE INDEX permission_set_provisions_account ON permission_set_provisions (account_id);
+CREATE TRIGGER permission_set_provisions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON permission_set_provisions
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+INSERT INTO permission_set_provisions (permission_set_id, account_id, role_id, created_at)
+SELECT id, account_id, role_id, created_at FROM permission_sets;
+ALTER TABLE permission_sets DROP COLUMN role_id;
+
+ALTER TABLE permission_set_assignments ADD COLUMN account_id text;
+UPDATE permission_set_assignments a SET account_id = p.account_id FROM permission_sets p WHERE p.id = a.permission_set_id;
+ALTER TABLE permission_set_assignments ALTER COLUMN account_id SET NOT NULL;
+ALTER TABLE permission_set_assignments
+    ADD FOREIGN KEY (permission_set_id, account_id) REFERENCES permission_set_provisions (permission_set_id, account_id) ON DELETE CASCADE,
+    DROP CONSTRAINT permission_set_assignments_permission_set_id_user_id_key,
+    DROP CONSTRAINT permission_set_assignments_permission_set_id_group_id_key,
+    ADD UNIQUE (permission_set_id, account_id, user_id),
+    ADD UNIQUE (permission_set_id, account_id, group_id);
+CREATE INDEX permission_set_assignments_account ON permission_set_assignments (account_id);
+
+ALTER TABLE console_directory_sessions ADD COLUMN target_account_id text;
+UPDATE console_directory_sessions SET target_account_id = account_id WHERE permission_set_id IS NOT NULL;
+ALTER TABLE console_directory_sessions
+    DROP CONSTRAINT console_directory_sessions_permission_set_id_fkey,
+    ADD FOREIGN KEY (permission_set_id, target_account_id)
+        REFERENCES permission_set_provisions (permission_set_id, account_id) ON DELETE SET NULL,
+    ADD CHECK ((permission_set_id IS NULL) = (target_account_id IS NULL));
+
+ALTER TABLE sso_operations ADD COLUMN target_account_id text;
+UPDATE sso_operations SET target_account_id = account_id;
+"#;
+
 
 #[cfg(test)]
 mod tests {

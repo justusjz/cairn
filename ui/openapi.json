@@ -161,7 +161,7 @@
         }
       },
       "post": {
-        "summary": "Assigns a permission set to a directory user or group.",
+        "summary": "Assigns a permission set to a directory user or group, in an account.",
         "operationId": "create_assignment",
         "requestBody": {
           "content": {
@@ -6615,9 +6615,10 @@
       },
       "AssignmentSummary": {
         "type": "object",
-        "description": "A permission set's assignment to a directory user or group.",
+        "description": "A permission set's assignment to a directory user or group, in an\naccount.",
         "required": [
           "id",
+          "account_id",
           "permission_set",
           "principal_type",
           "principal_id",
@@ -6626,6 +6627,10 @@
           "created_at"
         ],
         "properties": {
+          "account_id": {
+            "type": "string",
+            "description": "The account it gives the permission set in, by ID."
+          },
           "created_at": {
             "type": "number",
             "format": "double"
@@ -7123,6 +7128,13 @@
           "name"
         ],
         "properties": {
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account to act in, by ID: one the set is assigned to the user\nin. Needed only when it's assigned in more than one."
+          },
           "name": {
             "type": "string",
             "description": "One of the session's permission sets, by name."
@@ -7603,14 +7615,20 @@
               "string",
               "null"
             ],
-            "description": "The permission set it acts as, if it picked one."
+            "description": "The permission set it acts as, and the account (by ID) it acts in\nthere, if it picked one."
+          },
+          "permission_set_account_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "permission_sets": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PermissionSetChoice"
             },
-            "description": "The permission sets assigned to it or its groups, to pick from."
+            "description": "The permission sets assigned to it or its groups, in the accounts\nthey're assigned in, to pick from."
           },
           "provider": {
             "type": "string",
@@ -9217,6 +9235,13 @@
           "principal_id"
         ],
         "properties": {
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account to give it in, by ID: the instance's own, if not given\n(the only one so far)."
+          },
           "permission_set": {
             "type": "string"
           },
@@ -10083,13 +10108,22 @@
       },
       "PermissionSetChoice": {
         "type": "object",
-        "description": "A permission set a directory user may use.",
+        "description": "A permission set a directory user may use, in an account.",
         "required": [
+          "account_id",
+          "account",
           "name",
           "description",
           "session_duration"
         ],
         "properties": {
+          "account": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string",
+            "description": "The account's ID and name."
+          },
           "description": {
             "type": "string"
           },
