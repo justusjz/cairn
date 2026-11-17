@@ -13,6 +13,7 @@ use crate::{
         format_s3_error, header_not_implemented, rejection_response, slow_down, with_delete_marker, with_version_id,
         xml_escape, xml_ok,
     },
+    mfa::Presented,
     s3::versions::{Deleted, is_version_id, new_version_id},
 };
 
@@ -45,6 +46,9 @@ enum DeleteStatus {
     NoSuchBucket,
     /// A conditional target's version isn't current any more.
     Stale,
+    /// MFA delete wants the root's code, which the request didn't give
+    /// (see `mfa`).
+    MfaRequired,
     /// It kept conflicting with concurrent requests.
     Contended,
 }
@@ -55,11 +59,13 @@ enum DeleteStatus {
 /// immediate reaping. It follows the same lock protocol as the writes that also
 /// touch `objects`/`parts` (see `catalog.sql`), so the delete can't undermine
 /// their guarantees. The raw postgres error is returned so the caller can retry
-/// on a conflict.
+/// on a conflict. `mfa` is the root's code, as the request gave it, which
+/// MFA delete may want (see `mfa`).
 async fn try_delete(
     client: &mut Object,
     bucket: &str,
     targets: &[Target],
+    mfa: Presented,
 ) -> Result<(DeleteStatus, Vec<ReapTarget>), tokio_postgres::Error> {
     let keys: Vec<&str> = targets.iter().map(|t| t.key.as_str()).collect();
     let version_ids: Vec<Option<&str>> = targets.iter().map(|t| t.version_id.as_deref()).collect();
@@ -70,8 +76,17 @@ async fn try_delete(
     let row = client
         .query_one_cached(
             "SELECT status, version_ids, delete_markers, locked, reap_blob, reap_node, reap_peer
-             FROM pg_temp.cairn_delete_objects($1, $2, $3, $4, $5, $6, $7)",
-            &[&bucket, &keys, &version_ids, &marker_ids, &bypass, &expected, &crate::notifications::delete_context()],
+             FROM pg_temp.cairn_delete_objects($1, $2, $3, $4, $5, $6, $7, $8)",
+            &[
+                &bucket,
+                &keys,
+                &version_ids,
+                &marker_ids,
+                &bypass,
+                &expected,
+                &crate::notifications::delete_context(),
+                &mfa.as_db(),
+            ],
         )
         .await?;
     match row.get::<_, &str>(0) {
@@ -79,6 +94,7 @@ async fn try_delete(
         // The function changed nothing.
         "no_such_bucket" => return Ok((DeleteStatus::NoSuchBucket, Vec::new())),
         "stale" => return Ok((DeleteStatus::Stale, Vec::new())),
+        "mfa" => return Ok((DeleteStatus::MfaRequired, Vec::new())),
         status => unreachable!("cairn_delete_objects: unknown status {status}"),
     }
     let version_ids: Vec<Option<String>> = row.get(1);
@@ -101,11 +117,12 @@ async fn delete_targets(
     app: &Arc<App>,
     bucket: &str,
     targets: &[Target],
+    mfa: Presented,
 ) -> anyhow::Result<DeleteStatus> {
     let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
-        match try_delete(&mut client, bucket, targets).await {
+        match try_delete(&mut client, bucket, targets, mfa).await {
             Ok((status, reap)) => {
                 reap_blobs(app, reap);
                 return Ok(status);
@@ -124,7 +141,9 @@ async fn delete_targets(
 /// mode and the request may bypass that (`bypass`). With `if_match`
 /// (If-Match, of a request without a version ID; see `refuse_conditions`),
 /// only if the key's current version has that ETag (or is there at all, `*`),
-/// as S3 deletes (probed).
+/// as S3 deletes (probed). In a bucket with MFA delete, a version is
+/// deleted only with the root's code (`mfa`; see `mfa`), and a code that
+/// isn't valid refuses even a delete marker's making.
 pub async fn delete_object(
     app: &Arc<App>,
     bucket: &str,
@@ -132,6 +151,7 @@ pub async fn delete_object(
     version_id: Option<&str>,
     bypass: bool,
     if_match: Option<&str>,
+    mfa: Presented,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let mut target = Target {
         key: key.to_owned(),
@@ -150,7 +170,7 @@ pub async fn delete_object(
         }
         // Idempotent: deleting a key or version that isn't there still returns 204,
         // per S3.
-        return Ok(match delete_targets(app, bucket, std::slice::from_ref(&target)).await? {
+        return Ok(match delete_targets(app, bucket, std::slice::from_ref(&target), mfa).await? {
             DeleteStatus::Deleted(outcomes) => {
                 let Some(deleted) = &outcomes[0] else { return Ok(crate::s3::object_lock::locked()) };
                 let resp = Response::builder()
@@ -171,6 +191,7 @@ pub async fn delete_object(
             ),
             // Its version changed since it was checked: again.
             DeleteStatus::Stale => continue,
+            DeleteStatus::MfaRequired => crate::mfa::required(),
             DeleteStatus::Contended => slow_down(),
         });
     }
@@ -294,15 +315,6 @@ fn parse_delete_request(body: &str) -> Option<(Vec<Target>, bool)> {
     Some((targets, quiet))
 }
 
-/// DeleteObjects (batch): `POST /{bucket}?delete` with a `<Delete>` body listing
-/// keys, each optionally with a version ID. The body has been checked against
-/// its integrity headers (see `Payload`), of which S3 requires one here
-/// ([`missing_checksum`]). Authorization is per entry, as in S3: whether
-/// `allowed` the entry's key, and whether it names a version
-/// (`s3:DeleteObjectVersion`, else `s3:DeleteObject`); a denied entry is
-/// reported as an AccessDenied `<Error>` and the rest still proceed. So is a
-/// version that Object Lock keeps, unless it's in GOVERNANCE mode and
-/// `bypass` its key (the request asks to, and may).
 /// The error for a DeleteObjects without an integrity header. The body *is*
 /// the list of things to destroy, so S3 requires one: Content-MD5 (minio-go)
 /// or an x-amz-checksum-* (aws-cli).
@@ -314,12 +326,25 @@ pub fn missing_checksum() -> Response<Full<Bytes>> {
     )
 }
 
+/// DeleteObjects (batch): `POST /{bucket}?delete` with a `<Delete>` body listing
+/// keys, each optionally with a version ID. The body has been checked against
+/// its integrity headers (see `Payload`), of which S3 requires one here
+/// ([`missing_checksum`]). Authorization is per entry, as in S3: whether
+/// `allowed` the entry's key, and whether it names a version
+/// (`s3:DeleteObjectVersion`, else `s3:DeleteObject`); a denied entry is
+/// reported as an AccessDenied `<Error>` and the rest still proceed. So is a
+/// version that Object Lock keeps, unless it's in GOVERNANCE mode and
+/// `bypass` its key (the request asks to, and may). In a bucket with MFA
+/// delete, the whole request fails unless it gave the root's code (`mfa`)
+/// if it names any version, and it fails with a code that isn't valid
+/// whatever it names, as S3's docs say.
 pub async fn delete_objects(
     app: &Arc<App>,
     bucket: &str,
     body: Bytes,
     allowed: &(dyn Fn(&str, bool) -> bool + Sync),
     bypass: &(dyn Fn(&str) -> bool + Sync),
+    mfa: Presented,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let Ok(body_str) = std::str::from_utf8(&body) else {
         return Ok(format_s3_error(
@@ -383,7 +408,7 @@ pub async fn delete_objects(
                 Err(Failed::Response(refused)) => return Ok(refused),
             }
         }
-        match delete_targets(app, bucket, &checked).await? {
+        match delete_targets(app, bucket, &checked, mfa).await? {
             DeleteStatus::Deleted(outcomes) => break (checked, failed, outcomes),
             DeleteStatus::NoSuchBucket => {
                 return Ok(format_s3_error(
@@ -393,6 +418,7 @@ pub async fn delete_objects(
                 ));
             }
             DeleteStatus::Stale => continue,
+            DeleteStatus::MfaRequired => return Ok(crate::mfa::required()),
             DeleteStatus::Contended => return Ok(slow_down()),
         }
     };

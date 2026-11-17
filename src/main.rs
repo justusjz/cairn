@@ -50,6 +50,7 @@ mod managed;
 mod lifecycle;
 mod listen;
 mod metrics;
+mod mfa;
 mod mover;
 mod notifications;
 mod nodes;

@@ -1255,10 +1255,14 @@ $$;
 -- checked by the caller against the version it read) names that version's
 -- row in `p_expected`: unless it's still its key's current version, under
 -- K(b,k), nothing is deleted and the status is 'stale', for the caller to
--- check again.
+-- check again. In a bucket with MFA delete, which B(b) keeps as it is,
+-- nothing is deleted and the status is 'mfa' unless the request gave the
+-- root's code (`p_mfa`, as `mfa::Presented::as_db`) if any target names a
+-- version, and gave no code that isn't valid at all (as S3's DeleteObjects
+-- fails whole).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_objects(
     p_bucket text, p_keys text[], p_version_ids text[], p_marker_ids text[], p_bypass boolean[],
-    p_expected bigint[] DEFAULT '{}', p_notify text DEFAULT NULL,
+    p_expected bigint[] DEFAULT '{}', p_notify text DEFAULT NULL, p_mfa boolean DEFAULT NULL,
     OUT status text, OUT version_ids text[], OUT delete_markers boolean[], OUT locked boolean[],
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -1280,6 +1284,11 @@ BEGIN
     v_versioning := pg_temp.cairn_lock_bucket(p_bucket);
     IF v_versioning IS NULL THEN
         status := 'no_such_bucket';
+        RETURN;
+    END IF;
+    IF (SELECT mfa_delete FROM buckets WHERE name = p_bucket) AND p_mfa IS NOT TRUE
+       AND (p_mfa IS NOT NULL OR EXISTS (SELECT 1 FROM unnest(p_version_ids) v WHERE v IS NOT NULL)) THEN
+        status := 'mfa';
         RETURN;
     END IF;
     PERFORM pg_temp.cairn_lock_keys(p_bucket, p_keys);
@@ -1379,19 +1388,35 @@ $$;
 
 -- T10: PutBucketVersioning. Takes B(b) exclusive, so that the change is
 -- ordered against every write and delete in the bucket (I2), and against
--- enabling Object Lock (T38). Returns 'set', 'no_such_bucket', or 'locked'
+-- enabling Object Lock (T38). Sets the versioning state (`p_versioning`,
+-- NULL to keep it) and MFA delete (`p_mfa_delete`, NULL to keep it). With
+-- MFA delete enabled, or to enable it, the request must have given the
+-- root's code (`p_mfa`, as `mfa::Presented::as_db`), else 'mfa'. Returns
+-- 'set', 'no_such_bucket', 'mfa', 'lifecycle' to enable MFA delete on a
+-- bucket with a lifecycle configuration (which it can't have), or 'locked'
 -- for a bucket with Object Lock, which stays versioned.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_set_versioning(p_bucket text, p_versioning text)
-RETURNS text LANGUAGE plpgsql AS $$
+CREATE OR REPLACE FUNCTION pg_temp.cairn_set_versioning(
+    p_bucket text, p_versioning text, p_mfa_delete boolean DEFAULT NULL, p_mfa boolean DEFAULT NULL
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    b record;
 BEGIN
-    PERFORM 1 FROM buckets WHERE name = p_bucket FOR UPDATE;
+    SELECT object_lock, lifecycle IS NOT NULL AS lifecycle, coalesce(mfa_delete, false) AS mfa_delete
+    INTO b FROM buckets WHERE name = p_bucket FOR UPDATE;
     IF NOT FOUND THEN
         RETURN 'no_such_bucket';
     END IF;
-    IF p_versioning <> 'enabled' AND (SELECT object_lock FROM buckets WHERE name = p_bucket) THEN
+    IF (b.mfa_delete OR p_mfa_delete) AND p_mfa IS NOT TRUE THEN
+        RETURN 'mfa';
+    END IF;
+    IF p_mfa_delete AND b.lifecycle THEN
+        RETURN 'lifecycle';
+    END IF;
+    IF p_versioning <> 'enabled' AND b.object_lock THEN
         RETURN 'locked';
     END IF;
-    UPDATE buckets SET versioning = p_versioning WHERE name = p_bucket;
+    UPDATE buckets SET versioning = coalesce(p_versioning, versioning), mfa_delete = coalesce(p_mfa_delete, mfa_delete)
+    WHERE name = p_bucket;
     RETURN 'set';
 END
 $$;

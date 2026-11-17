@@ -74,7 +74,7 @@ fn iso(time: SystemTime) -> String {
 
 async fn set_versioning(app: &App, state: &str) -> StatusCode {
     let body = format!("<VersioningConfiguration><Status>{state}</Status></VersioningConfiguration>");
-    put_bucket_versioning(app, BUCKET, Bytes::from(body)).await.unwrap().status()
+    put_bucket_versioning(app, BUCKET, Bytes::from(body), crate::mfa::Presented::Absent).await.unwrap().status()
 }
 
 async fn configure(app: &App, rule: &str) -> (StatusCode, String) {
@@ -112,7 +112,7 @@ fn retained(mode: Mode, until: SystemTime) -> Lock {
 }
 
 async fn delete_version(app: &Arc<App>, key: &str, version: &str, bypass: bool) -> (StatusCode, String) {
-    let (status, _, body) = text(delete_object(app, BUCKET, key, Some(version), bypass, None).await.unwrap()).await;
+    let (status, _, body) = text(delete_object(app, BUCKET, key, Some(version), bypass, None, crate::mfa::Presented::Absent).await.unwrap()).await;
     (status, code(&body).to_owned())
 }
 
@@ -219,7 +219,7 @@ async fn governance_mode_can_be_bypassed() {
     assert!(body.contains("<Mode>GOVERNANCE</Mode><RetainUntilDate>"), "{body}");
     // Not deleted, but a delete marker goes on top, as ever.
     assert_eq!(delete_version(&app, "g", &version, false).await, (StatusCode::FORBIDDEN, "AccessDenied".to_owned()));
-    assert_eq!(delete_object(&app, BUCKET, "g", None, false, None).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(delete_object(&app, BUCKET, "g", None, false, None, crate::mfa::Presented::Absent).await.unwrap().status(), StatusCode::NO_CONTENT);
     assert_eq!(versions(&app, "g").await, 2);
     // Not shortened or removed, but lengthened, or made COMPLIANCE.
     assert_eq!(set_retention(&app, "g", &version, "GOVERNANCE", in_days(5), false).await.0, StatusCode::FORBIDDEN);
@@ -326,7 +326,7 @@ async fn delete_objects_reports_locked_versions() {
         "<Delete><Object><Key>kept</Key><VersionId>{kept}</VersionId></Object>\
          <Object><Key>free</Key><VersionId>{free}</VersionId></Object></Delete>"
     );
-    let response = delete_objects(&app, BUCKET, Bytes::from(body.clone()), &|_, _| true, &|_| false).await.unwrap();
+    let response = delete_objects(&app, BUCKET, Bytes::from(body.clone()), &|_, _| true, &|_| false, crate::mfa::Presented::Absent).await.unwrap();
     let (status, _, text) = text(response).await;
     assert_eq!(status, StatusCode::OK);
     assert!(text.contains(&format!("<Deleted><Key>free</Key><VersionId>{free}</VersionId></Deleted>")), "{text}");
@@ -339,7 +339,7 @@ async fn delete_objects_reports_locked_versions() {
     );
     assert_eq!(versions(&app, "kept").await, 1);
     // With a bypass, it goes.
-    let response = delete_objects(&app, BUCKET, Bytes::from(body), &|_, _| true, &|_| true).await.unwrap();
+    let response = delete_objects(&app, BUCKET, Bytes::from(body), &|_, _| true, &|_| true, crate::mfa::Presented::Absent).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(versions(&app, "kept").await, 0);
 }
@@ -399,7 +399,7 @@ async fn deleted_markers_and_missing_versions_have_no_lock() {
     assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "NoSuchObjectLockConfiguration"));
     let (status, _, body) = text(get_object_retention(&app, BUCKET, "nope", None).await.unwrap()).await;
     assert_eq!((status, code(&body)), (StatusCode::NOT_FOUND, "NoSuchKey"));
-    assert_eq!(delete_object(&app, BUCKET, "k", None, false, None).await.unwrap().status(), StatusCode::NO_CONTENT);
+    assert_eq!(delete_object(&app, BUCKET, "k", None, false, None, crate::mfa::Presented::Absent).await.unwrap().status(), StatusCode::NO_CONTENT);
     assert_eq!(set_hold(&app, "k", None, "ON").await, StatusCode::METHOD_NOT_ALLOWED);
     // A retention must lie ahead.
     let past = put_object_retention(

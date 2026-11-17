@@ -46,7 +46,7 @@ supported.
 | Object and bucket tags | ✅ | Bucket tags through S3 Control's TagResource too. |
 | Checksums: CRC32, CRC32C, CRC64NVME, SHA-1, SHA-256, full-object and composite | ✅ | |
 | Checksums: MD5, SHA-512, XXHash | ❌ | |
-| Versioning | ✅ | Without MFA delete. |
+| Versioning | ✅ | |
 | Object Lock: retention, legal holds, default retention | ✅ | No event-based holds. |
 | Lifecycle: expiration, noncurrent expiration, delete markers, incomplete uploads | 🟡 | [Lifecycle](#lifecycle) |
 | Lifecycle transitions | ❌ | There are no other storage classes. |
@@ -75,7 +75,7 @@ supported.
 | Object Ownership | 🟡 | Always `BucketOwnerEnforced`: [ACLs](#acls) |
 | Bucket ABAC (bucket tags in policies) | ✅ | |
 | S3 Access Grants | 🟡 | IAM grantees only: [Access Grants](#access-grants) |
-| MFA delete | ❌ | |
+| MFA delete | 🟡 | [MFA delete](#mfa-delete) |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
 ### Not implemented
@@ -107,8 +107,9 @@ S3 reports a bucket that doesn't use it:
 - **One account.** A cluster has one account, which owns every bucket, user,
   role and policy. Its canonical user ID is derived from the account ID.
   There are no Organizations, so no SCPs, RCPs or organization condition keys.
-- **The root user is made on a node, for a while.** It has no password,
-  long-term access keys or MFA devices: `cairn account root-link` prints a
+- **The root user is made on a node, for a while.** It has no password or
+  long-term access keys, and no MFA device but MFA delete's ([MFA
+  delete](#mfa-delete)): `cairn account root-link` prints a
   one-time link to the console, and `cairn account root-key` temporary
   credentials (15 minutes, as `AssumeRoot`'s at most, but not scoped to a
   task policy). As in AWS, identity policies don't restrict it; resource
@@ -162,6 +163,32 @@ and refuses too. The difference is that ACLs can't be enabled:
 
 - Rules are applied by a daily background sweep of each bucket, so an expired
   object can stay readable for up to a day after it expires.
+
+### MFA delete
+
+As in S3, a bucket with MFA delete takes no request that deletes a version
+(DeleteObject with `versionId`, DeleteObjects naming one) or changes its
+versioning without `x-amz-mfa`, and only the root user's own request, with a
+code of its MFA device, over HTTPS, gives a valid one. Only the root enables
+it. DeleteObjects fails whole without a code if it names a version, and with
+an invalid one whatever it names. GetBucketVersioning reports `MfaDelete`
+once it's been configured.
+
+- **The device** is a virtual one (TOTP, as authenticator apps make codes),
+  the account's only: `cairn account root-mfa` makes it on a node, and
+  prints its secret. Its serial number is
+  `arn:aws:iam::<account>:mfa/root-account-mfa-device`. There are no IAM MFA
+  device APIs, and the console can't use it, as AWS's can't.
+- **Codes** are taken from the 30-second step before now to the one after,
+  and may be used more than once while they last.
+- **Not checked against S3**, only against AWS's documentation: the error
+  for a missing or invalid code (`403 AccessDenied`, "Mfa Authentication
+  must be used for this request"), for `x-amz-mfa` over plain HTTP (`400
+  InvalidRequest`), and for a lifecycle configuration on a bucket with MFA
+  delete, or MFA delete on a bucket with one (`409 InvalidBucketState`: S3
+  supports no lifecycle configuration with MFA delete). Nor whether S3 wants
+  the code for a delete without `versionId` that removes a suspended
+  bucket's `null` version for good: Cairn doesn't.
 
 ### Inventory
 
