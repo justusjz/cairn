@@ -22,6 +22,9 @@ use crate::users::Invalid;
 
 /// How long an enrollment link works.
 pub const ENROLLMENT_TTL: Duration = Duration::from_secs(24 * 3600);
+/// How long a directory user's setup link works: as long as Identity
+/// Center's invitations.
+pub const SETUP_LINK_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 /// How long a ceremony may take, from its options to its response.
 pub const CHALLENGE_TTL: Duration = Duration::from_secs(5 * 60);
 /// How long a session lasts at most, and unused.
@@ -458,20 +461,23 @@ pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {
 
 /// A session of directory user `user` (see `identity_center`), of the
 /// instance of `account` (by ID), acting as permission set `chosen` in an
-/// account (its ID and the account's; `None`: until it picks one).
+/// account (its ID and the account's; `None`: until it picks one), signed
+/// in with passkey `credential` (just now), or at its identity source.
 pub async fn create_directory_session(
     client: &Object,
     account: &str,
     user: Uuid,
     chosen: Option<(Uuid, &str)>,
+    credential: Option<&[u8]>,
 ) -> anyhow::Result<String> {
     let (token, hash) = token()?;
     let (set, target) = chosen.unzip();
     client
         .execute_cached(
-            "INSERT INTO console_directory_sessions (token_hash, account_id, user_id, permission_set_id, target_account_id, expires_at)
-             VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6))",
-            &[&hash, &account, &user, &set, &target, &secs(SESSION_TTL)],
+            "INSERT INTO console_directory_sessions (token_hash, account_id, user_id, permission_set_id, target_account_id, expires_at,
+                                                     credential_id, verified_at)
+             VALUES ($1, $2, $3, $4, $5, now() + make_interval(secs => $6), $7, CASE WHEN $7::bytea IS NULL THEN NULL ELSE now() END)",
+            &[&hash, &account, &user, &set, &target, &secs(SESSION_TTL), &credential],
         )
         .await?;
     Ok(token)
@@ -484,12 +490,13 @@ pub struct DirectorySession {
     pub account_id: String,
     pub account: String,
     /// The user (its ID in the identity store), its identity source (its
-    /// name and label) and its subject there, and what the user was when it
-    /// last signed in: its user name, name, e-mail and groups (their names).
+    /// name and label) and its subject there (none, for a user of Cairn's
+    /// own directory), and what the user is: its user name, name, e-mail
+    /// and groups (their names).
     pub user_id: Uuid,
-    pub provider: String,
-    pub provider_label: String,
-    pub subject: String,
+    pub provider: Option<String>,
+    pub provider_label: Option<String>,
+    pub subject: Option<String>,
     pub user_name: String,
     pub name: String,
     pub email: Option<String>,
@@ -499,6 +506,9 @@ pub struct DirectorySession {
     pub permission_set: Option<(Uuid, String)>,
     /// When it ends at the latest (seconds since the epoch).
     pub expires_at: f64,
+    /// Seconds since it was signed in with a passkey, if it was (a user of
+    /// Cairn's own directory): `aws:MultiFactorAuthAge`.
+    pub mfa_age: Option<i64>,
 }
 
 /// The directory user's session of `token`, while it lasts; it was used just
@@ -510,10 +520,12 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
                     ARRAY(SELECT g.name FROM identity_group_members m JOIN identity_groups g ON g.id = m.group_id
                           WHERE m.user_id = u.id ORDER BY g.name),
                     s.permission_set_id, extract(epoch FROM s.expires_at)::float8, s.last_seen_at < now() - interval '1 minute',
-                    s.target_account_id
+                    s.target_account_id,
+                    -- Not greatest(0, …), which is 0 for NULL: signed in at a source, none.
+                    CASE WHEN s.verified_at IS NULL THEN NULL ELSE greatest(0, extract(epoch FROM now() - s.verified_at))::bigint END
              FROM console_directory_sessions s JOIN accounts a ON a.id = s.account_id
              JOIN identity_users u ON u.id = s.user_id
-             JOIN oidc_providers p ON p.name = u.provider
+             LEFT JOIN oidc_providers p ON p.name = u.provider
              WHERE s.token_hash = $1 AND s.expires_at > now()
                AND s.last_seen_at > now() - make_interval(secs => $2)",
             &[&hash(token), &secs(SESSION_IDLE)],
@@ -538,6 +550,7 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
         groups: row.get(9),
         permission_set: row.get::<_, Option<Uuid>>(10).zip(row.get::<_, Option<String>>(13)),
         expires_at: row.get(11),
+        mfa_age: row.get(14),
     }))
 }
 
@@ -551,6 +564,135 @@ pub async fn choose_permission_set(client: &Object, token: &str, permission_set:
         )
         .await?;
     Ok(())
+}
+
+/// Makes a setup link's token for user `user` of Cairn's own directory, to
+/// make a passkey with, within `SETUP_LINK_TTL`; it replaces any the user
+/// had. Refused for a user of an identity source, which signs in there.
+pub async fn create_setup_link(client: &Object, user: Uuid) -> anyhow::Result<String> {
+    let (token, hash) = token()?;
+    let made = client
+        .execute_cached(
+            "INSERT INTO directory_setup_links (token_hash, user_id, expires_at)
+             SELECT $2, id, now() + make_interval(secs => $3) FROM identity_users WHERE id = $1 AND provider IS NULL
+             ON CONFLICT (user_id) DO UPDATE SET token_hash = EXCLUDED.token_hash, expires_at = EXCLUDED.expires_at",
+            &[&user, &hash, &secs(SETUP_LINK_TTL)],
+        )
+        .await?;
+    if made == 0 {
+        return Err(Invalid("only a user of Cairn's own directory has passkeys: one of an identity source signs in there".into()).into());
+    }
+    Ok(token)
+}
+
+/// The directory user setup link `token` is for, while it works: its ID
+/// and user name.
+pub async fn setup_link(client: &Object, token: &str) -> anyhow::Result<Option<(Uuid, String)>> {
+    let row = client
+        .query_opt_cached(
+            "SELECT u.id, u.user_name FROM directory_setup_links l JOIN identity_users u ON u.id = l.user_id
+             WHERE l.token_hash = $1 AND l.expires_at > now()",
+            &[&hash(token)],
+        )
+        .await?;
+    Ok(row.map(|r| (r.get(0), r.get(1))))
+}
+
+/// Gives the directory user of setup link `token` passkey `key`, using the
+/// link up: the user's ID.
+pub async fn new_directory_passkey(client: &Object, token: &str, key: &NewPasskey<'_>) -> anyhow::Result<Uuid> {
+    let Some((user, _)) = setup_link(client, token).await? else { return Err(no_enrollment()) };
+    let taken = || Invalid("this passkey is registered already".into());
+    let count: i64 =
+        client.query_one_cached("SELECT count(*) FROM directory_passkeys WHERE user_id = $1", &[&user]).await?.get(0);
+    if count >= i64::from(MAX_PASSKEYS) {
+        return Err(Invalid(format!("a user has at most {MAX_PASSKEYS} passkeys: ask for the ones you don't use to be removed")).into());
+    }
+    if client.query_opt_cached("SELECT 1 FROM passkeys WHERE credential_id = $1", &[&key.credential_id]).await?.is_some() {
+        return Err(taken().into());
+    }
+    let row = client
+        .query_opt_cached(
+            "WITH l AS (DELETE FROM directory_setup_links WHERE token_hash = $1 AND expires_at > now() RETURNING user_id)
+             INSERT INTO directory_passkeys (credential_id, user_id, public_key, sign_count, name, backup_eligible, backed_up)
+             SELECT $2, l.user_id, $3, $4, $5, $6, $7 FROM l RETURNING user_id",
+            &[
+                &hash(token),
+                &key.credential_id,
+                &key.public_key,
+                &i64::from(key.sign_count),
+                &key.name,
+                &key.backup_eligible,
+                &key.backed_up,
+            ],
+        )
+        .await
+        .map_err(|e| match e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+            true => taken().into(),
+            false => anyhow::Error::from(e),
+        })?;
+    row.map(|r| r.get(0)).ok_or_else(no_enrollment)
+}
+
+/// A directory user's passkey, to check an assertion by.
+pub struct DirectoryPasskey {
+    pub user: Uuid,
+    pub public_key: Vec<u8>,
+    pub sign_count: u32,
+}
+
+pub async fn directory_passkey(client: &Object, credential_id: &[u8]) -> anyhow::Result<Option<DirectoryPasskey>> {
+    let row = client
+        .query_opt_cached(
+            "SELECT user_id, public_key, sign_count FROM directory_passkeys WHERE credential_id = $1",
+            &[&credential_id],
+        )
+        .await?;
+    Ok(row.map(|r| DirectoryPasskey { user: r.get(0), public_key: r.get(1), sign_count: r.get::<_, i64>(2) as u32 }))
+}
+
+/// Records a directory user's passkey's use, as `record_use` a login's.
+pub async fn record_directory_use(client: &Object, credential_id: &[u8], sign_count: u32, backed_up: bool) -> anyhow::Result<bool> {
+    let updated = client
+        .execute_cached(
+            "UPDATE directory_passkeys SET sign_count = $2, backed_up = $3, last_used_at = now()
+             WHERE credential_id = $1 AND (($2::bigint = 0 AND sign_count = 0) OR $2::bigint > sign_count)",
+            &[&credential_id, &i64::from(sign_count), &backed_up],
+        )
+        .await?;
+    Ok(updated == 1)
+}
+
+/// How a user of Cairn's own directory signs in: how many passkeys it
+/// has, when it last used one, and whether a setup link for it is out.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DirectoryAccess {
+    pub passkeys: i64,
+    pub last_sign_in: Option<f64>,
+    pub link_pending: bool,
+}
+
+/// How each user of Cairn's own directory signs in, by its ID.
+pub async fn directory_access(client: &Object) -> anyhow::Result<std::collections::HashMap<Uuid, DirectoryAccess>> {
+    let rows = client
+        .query_cached(
+            "SELECT u.id, (SELECT count(*) FROM directory_passkeys d WHERE d.user_id = u.id),
+                    extract(epoch FROM (SELECT max(d.last_used_at) FROM directory_passkeys d WHERE d.user_id = u.id))::float8,
+                    EXISTS (SELECT 1 FROM directory_setup_links l WHERE l.user_id = u.id AND l.expires_at > now())
+             FROM identity_users u WHERE u.provider IS NULL",
+            &[],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get(0), DirectoryAccess { passkeys: r.get(1), last_sign_in: r.get(2), link_pending: r.get(3) }))
+        .collect())
+}
+
+/// Removes all of a directory user's passkeys (signing it out): how many
+/// it had.
+pub async fn delete_directory_passkeys(client: &Object, user: Uuid) -> anyhow::Result<u64> {
+    Ok(client.execute_cached("DELETE FROM directory_passkeys WHERE user_id = $1", &[&user]).await?)
 }
 
 // ─── The root user ───────────────────────────────────────────────────────────
@@ -689,7 +831,7 @@ pub async fn delete_passkey(client: &Object, login: Uuid, credential_id: &[u8]) 
 /// Removes what has expired: challenges, enrollment links, sessions.
 pub async fn reap(client: &Object) -> anyhow::Result<u64> {
     let mut reaped = 0;
-    for table in ["console_challenges", "console_enrollments", "console_root_links"] {
+    for table in ["console_challenges", "console_enrollments", "console_root_links", "directory_setup_links"] {
         reaped += client.execute_cached(&format!("DELETE FROM {table} WHERE expires_at <= now()"), &[]).await?;
     }
     reaped += client

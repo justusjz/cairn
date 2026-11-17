@@ -47,6 +47,7 @@ pub struct Remote {
 pub enum Command {
     User(crate::users::UserArgs),
     Account(crate::accounts::AccountArgs),
+    DirectoryUser(crate::identity_center::DirectoryUserArgs),
     Oidc(crate::console::oidc::OidcArgs),
     Config(crate::settings::ConfigArgs),
     Node(crate::nodes::NodeArgs),
@@ -89,6 +90,7 @@ pub async fn run(app: &Arc<App>, command: Command) -> Output {
     let result = match command {
         Command::User(args) => crate::users::run(app, args, &mut out).await,
         Command::Account(args) => crate::accounts::run(app, args, &mut out).await,
+        Command::DirectoryUser(args) => crate::identity_center::run(app, args, &mut out).await,
         Command::Oidc(args) => crate::console::oidc::run(app, args, &mut out).await,
         Command::Config(args) => crate::settings::run(app, args, &mut out).await,
         Command::Node(args) => crate::nodes::run(app, args, &mut out).await,

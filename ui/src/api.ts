@@ -208,6 +208,10 @@ export const api = {
   directoryGroups: () => ok(client.GET("/directory-groups")),
   unassign: (id: string) => ok(client.DELETE("/assignments/{id}", { params: { path: { id } } })),
   directoryUsers: () => ok(client.GET("/directory-users")),
+  createDirectoryUser: (body: Schemas["NewDirectoryUser"]) => ok(client.POST("/directory-users", { body })),
+  deleteDirectoryUser: (id: string) => ok(client.DELETE("/directory-users/{id}", { params: { path: { id } } })),
+  directorySetupLink: (id: string) => ok(client.POST("/directory-users/{id}/setup-link", { params: { path: { id } } })),
+  deleteDirectoryPasskeys: (id: string) => ok(client.DELETE("/directory-users/{id}/passkeys", { params: { path: { id } } })),
   createEnrollment: (user: string) =>
     ok(client.POST("/users/{user}/enrollment", { params: userPath(user) })),
   createKey: (user: string) => ok(client.POST("/users/{user}/keys", { params: userPath(user) })),

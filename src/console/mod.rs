@@ -1329,6 +1329,88 @@ mod e2e {
         assert_eq!(ada.send("GET", "/api/users", None).await.0, StatusCode::FORBIDDEN);
     }
 
+    /// Users of Cairn's own directory: made in the console, they make a
+    /// passkey with a setup link, sign in with it (as multi-factor) and use
+    /// the permission sets assigned to them; their passkeys can be taken
+    /// away, which signs them out.
+    #[tokio::test]
+    async fn own_directory_users_sign_in_with_passkeys() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = console_of(&app);
+        let client = app.pool.get().await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
+        let mut admin = signed_in(&console, "admin", true).await;
+        let mut tenant = signed_in(&console, "tenant", false).await;
+
+        let grace = json!({ "user_name": "grace", "display_name": "Grace Hopper", "given_name": "Grace", "email": "grace@example.com" });
+        assert_eq!(tenant.send("POST", "/api/directory-users", Some(grace.clone())).await.0, StatusCode::FORBIDDEN);
+        let (status, made) = admin.send("POST", "/api/directory-users", Some(grace.clone())).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        assert_eq!(admin.send("POST", "/api/directory-users", Some(grace)).await.0, StatusCode::CONFLICT);
+        let id = made["id"].as_str().unwrap().to_owned();
+
+        // Its setup link: a passkey of its own, never a login's.
+        let link_path = format!("/api/directory-users/{id}/setup-link");
+        assert_eq!(tenant.send("POST", &link_path, None).await.0, StatusCode::FORBIDDEN);
+        let (status, link) = admin.send("POST", &link_path, None).await;
+        assert_eq!(status, StatusCode::CREATED, "{link}");
+        let token = link["path"].as_str().unwrap().strip_prefix("/enroll#").unwrap().to_owned();
+        assert_eq!(admin.send("POST", "/api/enroll/link", Some(json!({ "token": token }))).await.0, StatusCode::BAD_REQUEST);
+        let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let (status, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
+        assert_eq!(status, StatusCode::OK, "{ceremony}");
+        assert_eq!((&ceremony["identity"], &ceremony["directory"]), (&json!("grace"), &json!(true)));
+        let handle = URL_SAFE_NO_PAD.encode(uuid::Uuid::parse_str(&id).unwrap().as_bytes());
+        assert_eq!(ceremony["options"]["user"]["id"], handle);
+        let mut key = Authenticator::ed25519();
+        let mut body = registration(&mut key, &ceremony, "Laptop");
+        body["token"] = json!(token);
+        // Set up, but nothing is assigned to her yet: not signed in.
+        let (status, err) = browser.send("POST", "/api/enroll", Some(body.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("no permission set"), "{err}");
+        assert_eq!(browser.send("POST", "/api/enroll", Some(body)).await.0, StatusCode::BAD_REQUEST);
+        let (_, users) = admin.send("GET", "/api/directory-users", None).await;
+        let listed = users.as_array().unwrap().iter().find(|u| u["id"] == json!(id)).unwrap().clone();
+        assert_eq!((&listed["provider"], &listed["passkeys"], &listed["setup_link_pending"]), (&Value::Null, &json!(1), &json!(false)));
+
+        // Assigned a permission set, she signs in with her passkey.
+        let readers = json!({ "name": "Readers" });
+        assert_eq!(admin.send("POST", "/api/permission-sets", Some(readers)).await.0, StatusCode::CREATED);
+        let assign = json!({ "permission_set": "Readers", "principal_type": "USER", "principal_id": id });
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign)).await.0, StatusCode::CREATED);
+        let (status, me) = sign_in(&mut browser, &mut key).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!((&me["name"], &me["mfa"]), (&json!("Grace Hopper"), &json!(true)));
+        assert_eq!((&me["directory"]["permission_set"], &me["directory"]["provider_label"]), (&json!("Readers"), &Value::Null));
+        assert!(me["identity"]["arn"].as_str().unwrap().starts_with(&format!("arn:aws:sts::{account}:assumed-role/AWSReservedSSO_Readers_")));
+        assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::OK);
+
+        // The command line makes links too.
+        let args: crate::identity_center::DirectoryUserArgs =
+            serde_json::from_value(json!({ "command": { "Link": { "user_name": "grace" } } })).unwrap();
+        let mut out = crate::admin::Output::default();
+        crate::identity_center::run(&app, args, &mut out).await.unwrap();
+        assert!(out.stdout.contains("/enroll#"), "{}", out.stdout);
+        let args: crate::identity_center::DirectoryUserArgs =
+            serde_json::from_value(json!({ "command": { "Link": { "user_name": "nobody" } } })).unwrap();
+        assert!(crate::identity_center::run(&app, args, &mut crate::admin::Output::default()).await.is_err());
+
+        // Her passkeys taken away: signed out, and they no longer sign in.
+        let passkeys = format!("/api/directory-users/{id}/passkeys");
+        assert_eq!(tenant.send("DELETE", &passkeys, None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("DELETE", &passkeys, None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(sign_in(&mut browser, &mut key).await.0, StatusCode::BAD_REQUEST);
+
+        // Deleted, she's gone; a source's users have no setup links.
+        assert_eq!(admin.send("DELETE", &format!("/api/directory-users/{id}"), None).await.0, StatusCode::NO_CONTENT);
+        assert!(crate::identity_center::users(&client, Some(crate::identity_center::Lookup::Id(uuid::Uuid::parse_str(&id).unwrap())))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     /// Bucket and object tags, CORS and websites, set as S3 sets them (and
     /// checked as it checks them), by whom S3's actions allow.
     #[tokio::test]

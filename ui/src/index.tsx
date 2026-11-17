@@ -364,7 +364,7 @@ function Enroll() {
           <Show when={ceremony()} fallback={<Loading error={ceremony.error && (ceremony.error as Error).message} />}>
             {(c) => (
               <form onSubmit={enroll}>
-                <Show when={me()}>
+                <Show when={!c().directory && me()}>
                   {(m) => (
                     <>
                       <p>
@@ -504,7 +504,9 @@ function DirectoryHome(props: { me: Me }) {
     <>
       <div class="page-head">
         <h1>{props.me.name}</h1>
-        <span class="subtle small">signed in at {d().provider_label}</span>
+        <span class="subtle small">
+          {d().provider_label ? `signed in at ${d().provider_label}` : "signed in with a passkey"}
+        </span>
       </div>
       <Panel title="Permission sets">
         <Table

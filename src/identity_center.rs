@@ -685,25 +685,39 @@ pub async fn delete(client: &Object, set: &PermissionSet) -> anyhow::Result<()> 
 
 // ─── The identity store ──────────────────────────────────────────────────────
 
-/// A directory user, as it last signed in.
+/// A directory user: one of an identity source, as it last signed in, or
+/// one of Cairn's own directory, as identitystore's writes made it.
 #[derive(Clone, Debug)]
 pub struct User {
     pub id: Uuid,
-    /// Its identity source (by name), and its issuer, and its subject there.
-    pub provider: String,
-    pub issuer: String,
-    pub subject: String,
+    /// Its identity source (by name), and its issuer, and its subject there;
+    /// `None` for one of Cairn's own.
+    pub provider: Option<String>,
+    pub issuer: Option<String>,
+    pub subject: Option<String>,
     pub user_name: String,
     pub display_name: String,
     pub email: Option<String>,
+    /// One of Cairn's own's attributes, as identitystore has them (`Name`,
+    /// `Emails`, `NickName`, …); `{}` for a source's.
+    pub profile: serde_json::Value,
+    /// Its revision, which every change raises.
+    pub revision: i64,
     pub created: f64,
-    /// When it last signed in.
+    /// When it last changed (signed in, for a source's).
     pub updated: f64,
 }
 
+impl User {
+    /// Whether it's one of Cairn's own directory's.
+    pub fn own(&self) -> bool {
+        self.provider.is_none()
+    }
+}
+
 const USER_COLUMNS: &str = "u.id, u.provider, p.issuer, u.subject, u.user_name, u.display_name, u.email,
-     extract(epoch FROM u.created_at)::float8, extract(epoch FROM u.updated_at)::float8";
-const USERS: &str = "FROM identity_users u JOIN oidc_providers p ON p.name = u.provider";
+     extract(epoch FROM u.created_at)::float8, extract(epoch FROM u.updated_at)::float8, u.profile::text, u.revision";
+const USERS: &str = "FROM identity_users u LEFT JOIN oidc_providers p ON p.name = u.provider";
 
 impl User {
     fn of(row: &tokio_postgres::Row) -> User {
@@ -717,29 +731,52 @@ impl User {
             email: row.get(6),
             created: row.get(7),
             updated: row.get(8),
+            profile: serde_json::from_str(row.get(9)).unwrap_or_default(),
+            revision: row.get(10),
         }
     }
 }
 
-/// A group of an identity source, as its users' group claims name it.
+/// A group: one of an identity source, as its users' group claims name it,
+/// or one of Cairn's own directory, as identitystore's writes made it.
 #[derive(Clone, Debug)]
 pub struct Group {
     pub id: Uuid,
-    pub provider: String,
-    pub issuer: String,
-    /// Its name in the claim (its display name).
+    /// Its identity source (by name), and its issuer; `None` for one of
+    /// Cairn's own.
+    pub provider: Option<String>,
+    pub issuer: Option<String>,
+    /// Its display name (a source's: its name in the claim).
     pub name: String,
+    pub description: Option<String>,
+    pub revision: i64,
     pub created: f64,
     pub updated: f64,
 }
 
+impl Group {
+    /// Whether it's one of Cairn's own directory's.
+    pub fn own(&self) -> bool {
+        self.provider.is_none()
+    }
+}
+
 const GROUP_COLUMNS: &str = "g.id, g.provider, p.issuer, g.name, extract(epoch FROM g.created_at)::float8,
-     extract(epoch FROM g.updated_at)::float8";
-const GROUPS: &str = "FROM identity_groups g JOIN oidc_providers p ON p.name = g.provider";
+     extract(epoch FROM g.updated_at)::float8, g.description, g.revision";
+const GROUPS: &str = "FROM identity_groups g LEFT JOIN oidc_providers p ON p.name = g.provider";
 
 impl Group {
     fn of(row: &tokio_postgres::Row) -> Group {
-        Group { id: row.get(0), provider: row.get(1), issuer: row.get(2), name: row.get(3), created: row.get(4), updated: row.get(5) }
+        Group {
+            id: row.get(0),
+            provider: row.get(1),
+            issuer: row.get(2),
+            name: row.get(3),
+            created: row.get(4),
+            updated: row.get(5),
+            description: row.get(6),
+            revision: row.get(7),
+        }
     }
 }
 
@@ -829,7 +866,7 @@ pub async fn signed_in(
 ) -> anyhow::Result<Uuid> {
     let known = client
         .query_opt_cached(
-            "UPDATE identity_users SET display_name = $3, email = $4, updated_at = now()
+            "UPDATE identity_users SET display_name = $3, email = $4, updated_at = now(), revision = revision + 1
              WHERE provider = $1 AND subject = $2 RETURNING id",
             &[&provider, &subject, &name, &email],
         )
@@ -870,7 +907,7 @@ pub async fn signed_in(
         let row = client
             .query_one_cached(
                 "INSERT INTO identity_groups (id, provider, name) VALUES ($1, $2, $3)
-                 ON CONFLICT (provider, name) DO UPDATE SET updated_at = now() RETURNING id",
+                 ON CONFLICT (provider, name) DO UPDATE SET updated_at = now(), revision = identity_groups.revision + 1 RETURNING id",
                 &[&Uuid::new_v4(), &provider, &group],
             )
             .await?;
@@ -878,8 +915,10 @@ pub async fn signed_in(
     }
     client
         .execute_cached(
-            "DELETE FROM identity_group_members WHERE user_id = $1 AND NOT group_id = ANY($2)",
-            &[&user, &group_ids],
+            // Its source's groups only: one of Cairn's own may have it too.
+            "DELETE FROM identity_group_members WHERE user_id = $1 AND NOT group_id = ANY($2)
+               AND group_id IN (SELECT id FROM identity_groups WHERE provider = $3)",
+            &[&user, &group_ids, &provider],
         )
         .await?;
     for group in &group_ids {
@@ -891,6 +930,279 @@ pub async fn signed_in(
             .await?;
     }
     Ok(user)
+}
+
+// ─── Cairn's own directory ───────────────────────────────────────────────────
+
+/// Whether `name` is reserved, as Identity Center reserves it for users and
+/// groups.
+fn reserved(name: &str) -> bool {
+    name.eq_ignore_ascii_case("Administrator") || name.eq_ignore_ascii_case("AWSAdministrators")
+}
+
+/// Checks a text attribute, as identitystore takes one: 1 to 1024
+/// characters.
+fn check_text(what: &str, text: &str) -> anyhow::Result<()> {
+    if text.is_empty() || text.chars().count() > 1024 {
+        return refused(Refused::Validation(format!("{what} is 1 to 1024 characters.")));
+    }
+    Ok(())
+}
+
+/// Checks a user name, as identitystore takes one: 1 to 128 characters,
+/// none of them space, and not a reserved name.
+fn check_user_name(name: &str) -> anyhow::Result<()> {
+    if name.is_empty() || name.chars().count() > 128 || name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return refused(Refused::Validation("A UserName is 1 to 128 characters, with no spaces.".into()));
+    }
+    if reserved(name) {
+        return refused(Refused::Validation(format!("{name} is a reserved name.")));
+    }
+    Ok(())
+}
+
+/// Refused, as one of an identity source's: what it is is what the source
+/// says when its users sign in.
+fn sources(what: &str) -> anyhow::Error {
+    Refused::Validation(format!(
+        "That {what} is an identity source's: it's what the source says when its users sign in, and only Cairn's own directory's \
+         are changed here."
+    ))
+    .into()
+}
+
+/// A user of Cairn's own directory, as it's made or changed.
+pub struct OwnUser<'a> {
+    pub user_name: &'a str,
+    pub display_name: &'a str,
+    /// Its primary e-mail, if it has one.
+    pub email: Option<&'a str>,
+    /// All its attributes, as identitystore has them.
+    pub profile: &'a serde_json::Value,
+}
+
+impl OwnUser<'_> {
+    fn check(&self) -> anyhow::Result<()> {
+        check_user_name(self.user_name)?;
+        check_text("A DisplayName", self.display_name)?;
+        if let Some(email) = self.email {
+            check_text("An e-mail", email)?;
+        }
+        Ok(())
+    }
+}
+
+/// What a write refused for a unique name, else its error.
+fn unique(e: tokio_postgres::Error, taken: impl FnOnce() -> String) -> anyhow::Error {
+    match e.code() == Some(&tokio_postgres::error::SqlState::UNIQUE_VIOLATION) {
+        true => Refused::Exists(taken()).into(),
+        false => e.into(),
+    }
+}
+
+/// What a change of `what` that matched no row means: another changed it
+/// meanwhile, or it isn't at `revision`.
+fn stale(what: &str) -> anyhow::Error {
+    Refused::Conflict(format!("The {what} isn't at that Revision: it was changed meanwhile.")).into()
+}
+
+/// Makes a user of Cairn's own directory.
+pub async fn create_user(client: &Object, new: &OwnUser<'_>) -> anyhow::Result<User> {
+    new.check()?;
+    let id = Uuid::new_v4();
+    client
+        .execute_cached(
+            "INSERT INTO identity_users (id, provider, subject, user_name, display_name, email, profile)
+             VALUES ($1, NULL, NULL, $2, $3, $4, $5::text::jsonb)",
+            &[&id, &new.user_name, &new.display_name, &new.email, &new.profile.to_string()],
+        )
+        .await
+        .map_err(|e| unique(e, || format!("A user named {} exists already.", new.user_name)))?;
+    users(client, Some(Lookup::Id(id))).await?.pop().context("a new user is gone")
+}
+
+/// Changes a user of Cairn's own directory to `to`, if it's at `revision`
+/// (if given): it as it is now.
+pub async fn update_user(client: &Object, user: &User, to: &OwnUser<'_>, revision: Option<i64>) -> anyhow::Result<User> {
+    if !user.own() {
+        return Err(sources("user"));
+    }
+    to.check()?;
+    let changed = client
+        .execute_cached(
+            "UPDATE identity_users SET user_name = $2, display_name = $3, email = $4, profile = $5::text::jsonb, revision = revision + 1,
+                    updated_at = now()
+             WHERE id = $1 AND provider IS NULL AND ($6::bigint IS NULL OR revision = $6)",
+            &[&user.id, &to.user_name, &to.display_name, &to.email, &to.profile.to_string(), &revision],
+        )
+        .await
+        .map_err(|e| unique(e, || format!("A user named {} exists already.", to.user_name)))?;
+    if changed == 0 {
+        return Err(stale("user"));
+    }
+    users(client, Some(Lookup::Id(user.id))).await?.pop().context("a changed user is gone")
+}
+
+/// Deletes a user of Cairn's own directory, if it's at `revision` (if
+/// given): its memberships, assignments, passkeys and sessions go too.
+pub async fn delete_user(client: &Object, user: &User, revision: Option<i64>) -> anyhow::Result<()> {
+    if !user.own() {
+        return Err(sources("user"));
+    }
+    let deleted = client
+        .execute_cached(
+            "DELETE FROM identity_users WHERE id = $1 AND provider IS NULL AND ($2::bigint IS NULL OR revision = $2)",
+            &[&user.id, &revision],
+        )
+        .await?;
+    if deleted == 0 {
+        return Err(stale("user"));
+    }
+    Ok(())
+}
+
+fn check_group(name: &str, description: Option<&str>) -> anyhow::Result<()> {
+    check_text("A DisplayName", name)?;
+    if reserved(name) {
+        return refused(Refused::Validation(format!("{name} is a reserved name.")));
+    }
+    if let Some(description) = description {
+        check_text("A Description", description)?;
+    }
+    Ok(())
+}
+
+/// Makes a group of Cairn's own directory, named `name` (unique among its
+/// own, whatever the case).
+pub async fn create_group(client: &Object, name: &str, description: Option<&str>) -> anyhow::Result<Group> {
+    check_group(name, description)?;
+    let id = Uuid::new_v4();
+    client
+        .execute_cached(
+            "INSERT INTO identity_groups (id, provider, name, description) VALUES ($1, NULL, $2, $3)",
+            &[&id, &name, &description],
+        )
+        .await
+        .map_err(|e| unique(e, || format!("A group named {name} exists already.")))?;
+    groups(client, Some(Lookup::Id(id))).await?.pop().context("a new group is gone")
+}
+
+/// Changes a group of Cairn's own directory, if it's at `revision` (if
+/// given): it as it is now.
+pub async fn update_group(
+    client: &Object,
+    group: &Group,
+    name: &str,
+    description: Option<&str>,
+    revision: Option<i64>,
+) -> anyhow::Result<Group> {
+    if !group.own() {
+        return Err(sources("group"));
+    }
+    check_group(name, description)?;
+    let changed = client
+        .execute_cached(
+            "UPDATE identity_groups SET name = $2, description = $3, revision = revision + 1, updated_at = now()
+             WHERE id = $1 AND provider IS NULL AND ($4::bigint IS NULL OR revision = $4)",
+            &[&group.id, &name, &description, &revision],
+        )
+        .await
+        .map_err(|e| unique(e, || format!("A group named {name} exists already.")))?;
+    if changed == 0 {
+        return Err(stale("group"));
+    }
+    groups(client, Some(Lookup::Id(group.id))).await?.pop().context("a changed group is gone")
+}
+
+/// Deletes a group of Cairn's own directory, if it's at `revision` (if
+/// given): its memberships and assignments go too.
+pub async fn delete_group(client: &Object, group: &Group, revision: Option<i64>) -> anyhow::Result<()> {
+    if !group.own() {
+        return Err(sources("group"));
+    }
+    let deleted = client
+        .execute_cached(
+            "DELETE FROM identity_groups WHERE id = $1 AND provider IS NULL AND ($2::bigint IS NULL OR revision = $2)",
+            &[&group.id, &revision],
+        )
+        .await?;
+    if deleted == 0 {
+        return Err(stale("group"));
+    }
+    Ok(())
+}
+
+/// Puts `user` (any directory user, a source's too) in `group`, one of
+/// Cairn's own directory's: the membership.
+pub async fn add_member(client: &Object, group: &Group, user: &User) -> anyhow::Result<Membership> {
+    if !group.own() {
+        return Err(sources("group"));
+    }
+    let id = Uuid::new_v4();
+    let made = client
+        .execute_cached(
+            "INSERT INTO identity_group_members (id, group_id, user_id) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+            &[&id, &group.id, &user.id],
+        )
+        .await?;
+    if made == 0 {
+        return refused(Refused::Exists(format!("{} is in {} already.", user.user_name, group.name)));
+    }
+    memberships(client, Some(group.id), Some(user.id)).await?.pop().context("a new membership is gone")
+}
+
+/// Takes a user out of a group of Cairn's own directory, by the
+/// membership's ID.
+pub async fn remove_membership(client: &Object, id: Uuid) -> anyhow::Result<()> {
+    let membership = memberships(client, None, None).await?.into_iter().find(|m| m.id == id);
+    let Some(membership) = membership else {
+        return refused(Refused::NoSuch(format!("There's no membership {id}.")));
+    };
+    let group = groups(client, Some(Lookup::Id(membership.group_id))).await?.pop().context("a membership's group is gone")?;
+    if !group.own() {
+        return Err(sources("group"));
+    }
+    client.execute_cached("DELETE FROM identity_group_members WHERE id = $1", &[&id]).await?;
+    Ok(())
+}
+
+/// `cairn directory-user …`: what the command line does to Cairn's own
+/// directory, on a node (see `admin`). The rest is identitystore's, or the
+/// console's.
+#[derive(clap::Args, Debug, serde::Serialize, serde::Deserialize)]
+pub struct DirectoryUserArgs {
+    #[command(flatten)]
+    #[serde(skip)]
+    pub remote: crate::admin::Remote,
+    #[command(subcommand)]
+    command: DirectoryUserCommand,
+}
+
+#[derive(clap::Subcommand, Debug, serde::Serialize, serde::Deserialize)]
+enum DirectoryUserCommand {
+    /// Print a link (valid 7 days, working once) for a user of Cairn's own
+    /// directory to make a passkey with: its first, or another, after
+    /// losing one. A new link replaces the last. Made from the node's
+    /// console URL.
+    Link {
+        /// The user's UserName.
+        user_name: String,
+    },
+}
+
+/// `cairn directory-user …`, on a node.
+pub async fn run(app: &std::sync::Arc<crate::App>, args: DirectoryUserArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
+    let client = app.pool.get().await?;
+    match args.command {
+        DirectoryUserCommand::Link { user_name } => {
+            let Some(user) = users(&client, Some(Lookup::Name(&user_name))).await?.pop() else {
+                return Err(crate::users::Invalid(format!("there's no directory user named {user_name:?}")).into());
+            };
+            let token = crate::console::store::create_setup_link(&client, user.id).await?;
+            crate::users::enrollment_link(app, &token, out);
+        }
+    }
+    Ok(())
 }
 
 // ─── Assignments ─────────────────────────────────────────────────────────────
@@ -931,7 +1243,8 @@ pub struct Assignment {
     pub principal_id: Uuid,
     /// The user's or group's name, its source, and a user's e-mail.
     pub principal_name: String,
-    pub provider: String,
+    /// The user's or group's identity source; `None` for Cairn's own.
+    pub provider: Option<String>,
     pub email: Option<String>,
     pub created: f64,
 }

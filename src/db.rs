@@ -247,6 +247,7 @@ const MIGRATIONS: &[&str] = &[
     BATCH_INVENTORY_MANIFESTS,
     PERMISSION_SET_ACCOUNTS,
     PERMISSION_SET_DEFINITIONS,
+    OWN_DIRECTORY,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3194,6 +3195,60 @@ JOIN iam_role_attached_policies x ON x.role_id = v.role_id JOIN managed_policies
 UPDATE permission_sets p SET boundary_aws = r.boundary_aws, boundary_name = m.name, boundary_path = m.path
 FROM permission_set_provisions v JOIN iam_roles r ON r.id = v.role_id LEFT JOIN managed_policies m ON m.id = r.boundary_policy_id
 WHERE v.permission_set_id = p.id AND v.account_id = p.account_id;
+"#;
+
+/// Migration 67: Cairn's own directory, as Identity Center's: users and
+/// groups of no identity source (`provider` NULL), which identitystore's
+/// writes make and change, as opposed to those sign-ins at a source fill.
+/// A user of its own keeps the attributes it was given as Identity Center
+/// has them (`profile`); it signs in with passkeys (`directory_passkeys`),
+/// the first of which it makes with a setup link (`directory_setup_links`,
+/// one per user), and its console sessions note the passkey they were
+/// signed in with, and when. Its own groups' names are unique, as
+/// display names, whatever their case; its own users' user names were
+/// unique already. Users and groups have revisions, which every change
+/// raises (identitystore's `Revision`).
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const OWN_DIRECTORY: &str = r#"
+ALTER TABLE identity_users
+    ALTER COLUMN provider DROP NOT NULL,
+    ALTER COLUMN subject DROP NOT NULL,
+    ADD COLUMN profile jsonb NOT NULL DEFAULT '{}',
+    ADD COLUMN revision bigint NOT NULL DEFAULT 1,
+    ADD CONSTRAINT identity_users_source CHECK ((provider IS NULL) = (subject IS NULL));
+ALTER TABLE identity_groups
+    ALTER COLUMN provider DROP NOT NULL,
+    ADD COLUMN description text,
+    ADD COLUMN revision bigint NOT NULL DEFAULT 1;
+CREATE UNIQUE INDEX identity_groups_own_name ON identity_groups (lower(name)) WHERE provider IS NULL;
+
+CREATE TABLE directory_passkeys (
+    credential_id   bytea PRIMARY KEY,
+    user_id         uuid NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+    public_key      bytea NOT NULL,
+    sign_count      bigint NOT NULL,
+    name            text NOT NULL,
+    backup_eligible boolean NOT NULL,
+    backed_up       boolean NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    last_used_at    timestamptz
+);
+CREATE INDEX directory_passkeys_user ON directory_passkeys (user_id);
+CREATE TRIGGER directory_passkeys_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON directory_passkeys
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE directory_setup_links (
+    token_hash bytea PRIMARY KEY,
+    user_id    uuid NOT NULL UNIQUE REFERENCES identity_users (id) ON DELETE CASCADE,
+    expires_at timestamptz NOT NULL
+);
+CREATE TRIGGER directory_setup_links_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON directory_setup_links
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+ALTER TABLE console_directory_sessions
+    ADD COLUMN credential_id bytea REFERENCES directory_passkeys (credential_id) ON DELETE CASCADE,
+    ADD COLUMN verified_at   timestamptz,
+    ADD CHECK ((credential_id IS NULL) = (verified_at IS NULL));
 "#;
 
 #[cfg(test)]

@@ -66,10 +66,11 @@ Done:
   identitystore's reads): implemented. Permission sets provisioned per
   account (as roles made at their first assignment there, updated by
   provisioning), and assignments and directory users' sessions in an
-  account: implemented, with the one account. Next, toward accounts as AWS
+  account: implemented, with the one account. Cairn's own directory
+  (users and groups made with identitystore's writes, or the console;
+  passkeys set up with links): implemented. Next, toward accounts as AWS
   Organizations has them (the existing account as the management
-  account): directory users of Cairn's own, who sign in with passkeys
-  (identitystore's writes, for them only); then member accounts, which
+  account): member accounts, which
   permission sets are provisioned to as they're assigned there, and
   cross-account access. Also: directory users and groups as Access Grants
   grantees, and the access portal's APIs for `aws sso login`.

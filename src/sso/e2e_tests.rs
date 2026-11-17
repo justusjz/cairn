@@ -336,3 +336,106 @@ async fn permission_sets_are_provisioned_to_their_account() {
         .unwrap();
     assert_eq!(left, (None, None));
 }
+
+/// identitystore's writes make and change Cairn's own directory's users,
+/// groups and memberships, as Identity Center's; an identity source's are
+/// what its sign-ins say.
+#[tokio::test]
+async fn own_directory_users_and_groups() {
+    let Some(app) = node().await else { return };
+    source(&app).await;
+    let client = app.pool.get().await.unwrap();
+    let admin = Arc::new(user(&app, "admin", ADMIN).await);
+    let store = ic::identity_store_id(&admin.account);
+    let ids = |operation: &'static str, input: Value| {
+        let (app, admin, store) = (app.clone(), admin.clone(), store.clone());
+        async move {
+            let mut input = input;
+            input["IdentityStoreId"] = json!(store);
+            call(&app, &admin, "identitystore", operation, input).await
+        }
+    };
+
+    // Users: UserName, DisplayName and Name are required, some names reserved.
+    let ada = json!({ "UserName": "ada", "DisplayName": "Ada Lovelace", "Name": { "GivenName": "Ada", "FamilyName": "Lovelace" },
+                      "Emails": [{ "Value": "ada@example.com", "Type": "work", "Primary": true }] });
+    assert_eq!(ids("CreateUser", json!({ "UserName": "x", "DisplayName": "X" })).await.unwrap_err(), "ValidationException");
+    let mut reserved = ada.clone();
+    reserved["UserName"] = json!("Administrator");
+    assert_eq!(ids("CreateUser", reserved).await.unwrap_err(), "ValidationException");
+    let mut spaced = ada.clone();
+    spaced["UserName"] = json!("ada l");
+    assert_eq!(ids("CreateUser", spaced).await.unwrap_err(), "ValidationException");
+    let made = ids("CreateUser", ada.clone()).await.unwrap();
+    assert_eq!(made["Revision"], "1");
+    let ada_id = made["UserId"].as_str().unwrap().to_owned();
+    assert_eq!(ids("CreateUser", ada).await.unwrap_err(), "ConflictException");
+    let described = ids("DescribeUser", json!({ "UserId": ada_id })).await.unwrap();
+    assert_eq!(described["Name"]["GivenName"], "Ada");
+    assert_eq!(described["Emails"][0]["Type"], "work");
+    assert!(described.get("ExternalIds").is_none(), "{described}");
+    let found = ids("GetUserId", json!({ "AlternateIdentifier": { "UniqueAttribute": { "AttributePath": "emails.value", "AttributeValue": "ada@example.com" } } }))
+        .await
+        .unwrap();
+    assert_eq!(found["UserId"], json!(ada_id));
+
+    // Updated by attribute paths; a missing value removes one; Revision guards.
+    let ops = |ops: Value| json!({ "UserId": ada_id, "Operations": ops });
+    let updated = ids("UpdateUser", ops(json!([
+        { "AttributePath": "nickName", "AttributeValue": "Countess" },
+        { "AttributePath": "name.familyName", "AttributeValue": "King" },
+        { "AttributePath": "aws:identitystore:enterprise.department", "AttributeValue": "Analytics" },
+    ])))
+    .await
+    .unwrap();
+    assert_eq!(updated["Revision"], "2");
+    let mut stale = ops(json!([{ "AttributePath": "title", "AttributeValue": "Dr" }]));
+    stale["Revision"] = json!("1");
+    assert_eq!(ids("UpdateUser", stale).await.unwrap_err(), "ConflictException");
+    ids("UpdateUser", ops(json!([{ "AttributePath": "nickName" }]))).await.unwrap();
+    assert_eq!(ids("UpdateUser", ops(json!([{ "AttributePath": "displayName" }]))).await.unwrap_err(), "ValidationException");
+    assert_eq!(ids("UpdateUser", ops(json!([{ "AttributePath": "shoeSize", "AttributeValue": "9" }]))).await.unwrap_err(), "ValidationException");
+    let described = ids("DescribeUser", json!({ "UserId": ada_id })).await.unwrap();
+    assert_eq!((&described["Name"]["FamilyName"], &described["Name"]["GivenName"]), (&json!("King"), &json!("Ada")));
+    assert_eq!(described["Extensions"][ENTERPRISE]["department"], "Analytics");
+    assert!(described.get("NickName").is_none(), "{described}");
+    assert_eq!(described["Revision"], "3");
+
+    // A source's users and groups are what its sign-ins say.
+    let bob = ic::signed_in(&client, "mock", "sub-bob", "Bob", Some("bob"), None, &["data".into()]).await.unwrap();
+    let data = ic::groups(&client, Some(Lookup::Name("data"))).await.unwrap().pop().unwrap().id;
+    let rename = json!({ "UserId": bob.to_string(), "Operations": [{ "AttributePath": "nickName", "AttributeValue": "B" }] });
+    assert_eq!(ids("UpdateUser", rename).await.unwrap_err(), "ValidationException");
+    assert_eq!(ids("DeleteUser", json!({ "UserId": bob.to_string() })).await.unwrap_err(), "ValidationException");
+
+    // Groups of its own, unique by name whatever the case, with members of
+    // its own or a source's.
+    let made = ids("CreateGroup", json!({ "DisplayName": "Analysts", "Description": "Look at things" })).await.unwrap();
+    let analysts = made["GroupId"].as_str().unwrap().to_owned();
+    assert_eq!(ids("CreateGroup", json!({ "DisplayName": "analysts" })).await.unwrap_err(), "ConflictException");
+    let group_ops = |ops: Value| json!({ "GroupId": analysts, "Operations": ops });
+    ids("UpdateGroup", group_ops(json!([{ "AttributePath": "description" }]))).await.unwrap();
+    let described = ids("DescribeGroup", json!({ "GroupId": analysts })).await.unwrap();
+    assert!(described.get("Description").is_none() && described.get("ExternalIds").is_none(), "{described}");
+    let member = |group: &str, user: &str| json!({ "GroupId": group, "MemberId": { "UserId": user } });
+    let joined = ids("CreateGroupMembership", member(&analysts, &ada_id)).await.unwrap();
+    ids("CreateGroupMembership", member(&analysts, &bob.to_string())).await.unwrap();
+    assert_eq!(ids("CreateGroupMembership", member(&analysts, &ada_id)).await.unwrap_err(), "ConflictException");
+    assert_eq!(ids("CreateGroupMembership", member(&data.to_string(), &ada_id)).await.unwrap_err(), "ValidationException");
+    // Bob signing in again keeps him in a group of Cairn's own.
+    ic::signed_in(&client, "mock", "sub-bob", "Bob", Some("bob"), None, &[]).await.unwrap();
+    let analysts_id = Uuid::parse_str(&analysts).unwrap();
+    assert_eq!(ic::memberships(&client, Some(analysts_id), None).await.unwrap().len(), 2);
+    assert!(ic::memberships(&client, Some(data), None).await.unwrap().is_empty());
+
+    ids("DeleteGroupMembership", json!({ "MembershipId": joined["MembershipId"] })).await.unwrap();
+    assert_eq!(ic::memberships(&client, Some(analysts_id), None).await.unwrap().len(), 1);
+    ids("DeleteGroup", json!({ "GroupId": analysts })).await.unwrap();
+    ids("DeleteUser", json!({ "UserId": ada_id })).await.unwrap();
+    assert_eq!(ids("DescribeUser", json!({ "UserId": ada_id })).await.unwrap_err(), "ResourceNotFoundException");
+
+    // Only to whom identitystore's writes are allowed.
+    let reader = user(&app, "reader", r#"{"Effect":"Allow","Action":"identitystore:List*","Resource":"*"}"#).await;
+    let input = json!({ "IdentityStoreId": store, "UserName": "eve", "DisplayName": "Eve", "Name": { "GivenName": "Eve" } });
+    assert_eq!(call(&app, &reader, "identitystore", "CreateUser", input).await.unwrap_err(), "AccessDeniedException");
+}

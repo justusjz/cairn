@@ -498,7 +498,8 @@ else (the cluster, without the data).
 
 A console session signed in with a passkey has
 `aws:MultiFactorAuthPresent` (`true`) and `aws:MultiFactorAuthAge` (seconds
-since it was signed in), a [directory user's](#directory-users) has it
+since it was signed in), as does a [directory user's](#directory-users)
+signed in with a passkey; one signed in at an identity source has it
 `false`,
 and access keys never have it, as AWS's long-term keys don't. AWS's guard
 then keeps a leaked key from doing what matters, in any identity policy:
@@ -1076,8 +1077,9 @@ restarts; everything else is read from the database.
 
 ### Directory users
 
-People can also sign in as **directory users**, as in IAM Identity Center:
-whoever an identity source vouches for, with no IAM user behind them. An
+People can also sign in as **directory users**, as in IAM Identity Center,
+with no IAM user behind them: users of **Cairn's own directory**, who sign
+in with passkeys, and whoever an identity source vouches for. An
 administrator decides what they may do with **permission sets** and
 **assignments**, on the console's Identity Center page, or through
 Identity Center's APIs (below):
@@ -1098,21 +1100,38 @@ Identity Center's APIs (below):
   `/aws-reserved/`.
 - An **assignment** gives a permission set to a user or a group of the
   **identity store**, in an account (so far always the cluster's one
-  account): the users that have signed in, and the groups their
-  sources' group claims (`groups` by default; set per source) named. Each
-  has an ID of its own, as Identity Center's users and groups do; a user's
-  user name is its `preferred_username`, e-mail or subject, the first no
-  one else has. There's no directory sync (SCIM): users and groups are
-  there once someone has signed in with them, and a user's groups are what
-  its last sign-in said.
+  account). Each has an ID of its own, as Identity Center's users and
+  groups do. The identity store holds:
+  - **Cairn's own directory's** users and groups, which an administrator
+    makes in the console (users) or with identitystore's API (users,
+    groups and their members, who may be any directory users).
+  - **Identity sources'**: the users that have signed in, and the groups
+    their sources' group claims (`groups` by default; set per source)
+    named. A user's user name is its `preferred_username`, e-mail or
+    subject, the first no one else has. There's no directory sync (SCIM):
+    they're there once someone has signed in with them, and a user's
+    groups of its source are what its last sign-in said.
 
-At sign-in, Cairn reads the person's subject and groups from the ID token,
-and finds their permission sets. With none, they don't get in; with one,
+A user of Cairn's own directory makes a passkey with a **setup link**,
+valid 7 days and working once: the console makes one when it makes the
+user, and the user's row makes more (for another passkey, or after
+removing a lost one), as does the command line on a node. Their passkeys
+sign them in as a login's do, as multi-factor.
+
+```sh
+cairn directory-user link grace
+```
+
+
+At sign-in at an identity source, Cairn reads the person's subject and
+groups from the ID token; with a passkey, it knows them by it. It then finds
+their permission sets. With none, they don't get in; with one,
 it's used; with several, they pick one, by account and permission set
 (and can switch on their own page).
 They then act as a session of the set's role,
 `arn:aws:sts::<account>:assumed-role/AWSReservedSSO_<set>_<suffix>/<user name>`,
-in the console and in policies, without MFA. Their page hands out
+in the console and in policies (with MFA if they signed in with a passkey,
+without at an identity source). Their page hands out
 temporary credentials of that session, for the AWS CLI and SDKs, valid for
 the set's session length. Taking an assignment away ends its users' access
 in the console at once; credentials already handed out last until they
@@ -1125,8 +1144,9 @@ cairn oidc set company --issuer https://sso.example.com/realms/main \
 
 **Identity Center's APIs** are on the S3 endpoint, as IAM's are:
 **sso-admin** (instances, permission sets and their policies,
-assignments, provisioning, tags) and **identitystore**'s reads (users,
-groups, memberships; they come from sign-ins, so its writes answer `501`).
+assignments, provisioning, tags) and **identitystore** (users, groups and
+memberships; its writes change Cairn's own directory's, while identity
+sources' are what their sign-ins say).
 Point the AWS CLI, SDKs or Terraform at it (`AWS_ENDPOINT_URL_SSO_ADMIN`,
 `AWS_ENDPOINT_URL_IDENTITYSTORE`, or Terraform's `endpoints { ssoadmin,
 identitystore }`). The account's instance is its only one, and the

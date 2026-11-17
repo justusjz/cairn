@@ -8,6 +8,7 @@ import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
 import { type Assignment, type DirectoryGroup, type DirectoryUser, type ManagedPolicy, type PermissionSet, api } from "../api";
 import { AttachDialog, DetailHead, Gone, InlinePolicyDialog, PermissionsPanel, PolicyChips, PolicySelect, roleHref } from "../components/Iam";
+import { EnrollmentDialog } from "./Users";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { ago, date } from "../format";
 
@@ -24,6 +25,23 @@ export default function IdentityCenter() {
   );
   const [creating, setCreating] = createSignal(false);
   const [assigning, setAssigning] = createSignal(false);
+  const [newUser, setNewUser] = createSignal(false);
+  const [link, setLink] = createSignal<{ user: string; url?: string | null; path: string }>();
+  const setupLink = async (u: DirectoryUser) => {
+    const made = await act(() => api.directorySetupLink(u.id));
+    if (made) {
+      setLink({ user: u.user_name, ...made.value });
+      data.refresh();
+    }
+  };
+  const removePasskeys = async (u: DirectoryUser) => {
+    if (!confirm(`Remove all of ${u.user_name}'s passkeys? Their sessions end, and they need a setup link to sign in again.`)) return;
+    if (await act(() => api.deleteDirectoryPasskeys(u.id), `Removed ${u.user_name}'s passkeys`)) data.refresh();
+  };
+  const deleteUser = async (u: DirectoryUser) => {
+    if (!confirm(`Delete ${u.user_name}? Their assignments, group memberships and passkeys go too.`)) return;
+    if (await act(() => api.deleteDirectoryUser(u.id), `Deleted ${u.user_name}`)) data.refresh();
+  };
   const unassign = async (a: Assignment) => {
     const who = a.principal_type === "GROUP" ? `group ${a.principal_name}` : a.principal_name;
     if (!confirm(`Take ${a.permission_set} from ${who}? Their sessions lose it at once.`)) return;
@@ -109,7 +127,10 @@ export default function IdentityCenter() {
               </Table>
             </Panel>
             <Panel title="Directory users" note={`${d()[2].length}`}>
-              <Table count={d()[2].length} empty="No one has signed in at an identity source yet." columns={["Name", "Source", "Groups", "Last signed in"]}>
+              <div class="buttons">
+                <button onClick={() => setNewUser(true)}>New user…</button>
+              </div>
+              <Table count={d()[2].length} empty="No directory user yet." columns={["Name", "Source", "Groups", "Last signed in", ""]}>
                 <For each={d()[2]}>
                   {(u) => (
                     <tr>
@@ -117,22 +138,62 @@ export default function IdentityCenter() {
                         {u.display_name}
                         <div class="subtle small mono">{u.user_name}</div>
                       </td>
-                      <td class="mono small">{u.provider}</td>
+                      <td class="small">
+                        <Show when={u.provider} fallback={
+                          <>
+                            Cairn{" "}
+                            <span class="subtle">
+                              · {u.passkeys} passkey{u.passkeys === 1 ? "" : "s"}
+                              {u.setup_link_pending ? " · link out" : ""}
+                            </span>
+                          </>
+                        }>
+                          {(p) => <span class="mono">{p()}</span>}
+                        </Show>
+                      </td>
                       <td>
                         <For each={u.groups} fallback={<span class="subtle">none</span>}>
                           {(g) => <span class="chip mono">{g}</span>}
                         </For>
                       </td>
-                      <td>{ago(u.last_signed_in)}</td>
+                      <td>
+                        {u.provider ? ago(u.last_signed_in) : u.last_passkey_use ? ago(u.last_passkey_use) : <span class="subtle">never</span>}
+                      </td>
+                      <td class="actions">
+                        <Show when={!u.provider}>
+                          <button class="small" onClick={() => setupLink(u)}>
+                            Setup link
+                          </button>
+                          <Show when={u.passkeys > 0}>
+                            <button class="small" onClick={() => removePasskeys(u)}>
+                              Remove passkeys
+                            </button>
+                          </Show>
+                          <button class="small danger" onClick={() => deleteUser(u)}>
+                            Delete
+                          </button>
+                        </Show>
+                      </td>
                     </tr>
                   )}
                 </For>
               </Table>
               <p class="subtle small">
-                Who has signed in, with their groups as their source last said. There's no directory sync: users and
-                groups are here, to be assigned, once someone has signed in with them.
+                Users of Cairn's own directory sign in with passkeys, which they make with a setup link (valid 7 days).
+                Those of an identity source are here once they've signed in there, with their groups as it last said:
+                there's no directory sync. Groups of Cairn's own, and their members, are identitystore's API's.
               </p>
             </Panel>
+            <Show when={newUser()}>
+              <NewDirectoryUserDialog
+                onClose={() => setNewUser(false)}
+                created={(user, made) => {
+                  setLink({ user, ...made });
+                  data.refresh();
+                }}
+              />
+            </Show>
+            <Show when={link()}>{(l) => <EnrollmentDialog {...l()} valid="7 days" onClose={() => setLink(undefined)} />}</Show>
             <Panel title="Groups" note={`${d()[3].length}`}>
               <Table count={d()[3].length} empty="No group yet: none was in a group claim of anyone who signed in." columns={["Name", "Source", { label: "Members", num: true }]}>
                 <For each={d()[3]}>
@@ -534,6 +595,77 @@ function BoundaryDialog(props: { set: PermissionSet; policies: ManagedPolicy[]; 
           </button>
           <button class="primary" type="submit" disabled={!arn()}>
             Set
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+/** Makes a user of Cairn's own directory, and its first setup link. */
+function NewDirectoryUserDialog(props: { onClose: () => void; created: (user: string, link: { url?: string | null; path: string }) => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const [userName, setUserName] = createSignal("");
+  const [displayName, setDisplayName] = createSignal("");
+  const [givenName, setGivenName] = createSignal("");
+  const [familyName, setFamilyName] = createSignal("");
+  const [email, setEmail] = createSignal("");
+  const [error, setError] = createSignal<string>();
+  const save = async (e: SubmitEvent) => {
+    e.preventDefault();
+    setError(undefined);
+    try {
+      const made = await api.createDirectoryUser({
+        user_name: userName(),
+        display_name: displayName() || userName(),
+        given_name: givenName() || null,
+        family_name: familyName() || null,
+        email: email() || null,
+      });
+      const link = await api.directorySetupLink(made.id);
+      toast(`Created ${userName()}`);
+      dialog.close();
+      props.created(userName(), link);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={save}>
+        <h2>New directory user</h2>
+        <p class="subtle small">
+          A user of Cairn's own directory, as IAM Identity Center's: they sign in with passkeys, and use the permission
+          sets assigned to them. You get a setup link for their first passkey.
+        </p>
+        <label class="field">
+          User name
+          <input type="text" required maxLength={128} pattern="\S+" value={userName()} onInput={(e) => setUserName(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          Display name
+          <input type="text" maxLength={1024} placeholder={userName()} value={displayName()} onInput={(e) => setDisplayName(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          Given name
+          <input type="text" maxLength={1024} value={givenName()} onInput={(e) => setGivenName(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          Family name
+          <input type="text" maxLength={1024} value={familyName()} onInput={(e) => setFamilyName(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          E-mail
+          <input type="email" maxLength={1024} value={email()} onInput={(e) => setEmail(e.currentTarget.value)} />
+        </label>
+        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit">
+            Create
           </button>
         </div>
       </form>

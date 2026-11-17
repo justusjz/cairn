@@ -192,6 +192,9 @@ enum Command {
     /// Become the account's root user for a while: a console link, or a
     /// temporary access key.
     Account(accounts::AccountArgs),
+    /// Make a user of Cairn's own directory (Identity Center's) a link to
+    /// set up a passkey with.
+    DirectoryUser(identity_center::DirectoryUserArgs),
     /// Configure the OpenID Connect providers people may sign in to the
     /// console at.
     Oidc(console::oidc::OidcArgs),
@@ -309,6 +312,7 @@ fn remote_command(command: Command) -> anyhow::Result<(admin::Remote, admin::Com
         Command::Serve(_) => anyhow::bail!("`cairn serve` runs here"),
         Command::User(args) => (args.remote.clone(), admin::Command::User(args)),
         Command::Account(args) => (args.remote.clone(), admin::Command::Account(args)),
+        Command::DirectoryUser(args) => (args.remote.clone(), admin::Command::DirectoryUser(args)),
         Command::Oidc(args) => (args.remote.clone(), admin::Command::Oidc(args)),
         Command::Config(args) => (args.remote.clone(), admin::Command::Config(args)),
         Command::Node(args) => (args.remote.clone(), admin::Command::Node(args)),

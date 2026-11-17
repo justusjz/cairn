@@ -20,7 +20,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::actor::Actor;
-use super::manage::{AppState, AttachedPolicy, PolicyArn, PolicyDocument, Result};
+use super::manage::{AppState, AttachedPolicy, EnrollmentLink, PolicyArn, PolicyDocument, Result};
 use super::web::{ApiError, ErrorBody};
 use crate::App;
 use crate::identity_center::{self as ic, PermissionSet, PrincipalType};
@@ -35,7 +35,10 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(put_permission_set_boundary, delete_permission_set_boundary))
         .routes(routes!(list_assignments, create_assignment))
         .routes(routes!(delete_assignment))
-        .routes(routes!(list_directory_users))
+        .routes(routes!(list_directory_users, create_directory_user))
+        .routes(routes!(delete_directory_user))
+        .routes(routes!(create_setup_link))
+        .routes(routes!(delete_directory_passkeys))
         .routes(routes!(list_directory_groups))
 }
 
@@ -346,8 +349,8 @@ struct AssignmentSummary {
     principal_id: String,
     /// A user's user name, or a group's name.
     principal_name: String,
-    /// Its identity source.
-    provider: String,
+    /// Its identity source; none for Cairn's own directory.
+    provider: Option<String>,
     /// A user's e-mail.
     email: Option<String>,
     created_at: f64,
@@ -442,16 +445,25 @@ struct DirectoryUserSummary {
     user_name: String,
     display_name: String,
     email: Option<String>,
-    /// Its identity source, and its subject there.
-    provider: String,
-    subject: String,
-    /// Its groups, by name, as its last sign-in said.
+    /// Its identity source, and its subject there; none for a user of
+    /// Cairn's own directory.
+    provider: Option<String>,
+    subject: Option<String>,
+    /// Its groups, by name (a source's: as its last sign-in said).
     groups: Vec<String>,
+    /// When it was first in the identity store, and when it last changed
+    /// (a source's: signed in).
     first_signed_in: f64,
     last_signed_in: f64,
+    /// A user of Cairn's own directory's passkeys, when it last signed in
+    /// with one, and whether a setup link for it is out.
+    passkeys: i64,
+    last_passkey_use: Option<f64>,
+    setup_link_pending: bool,
 }
 
-/// The directory users that have signed in, most recent first.
+/// The identity store's users: Cairn's own directory's, and those of
+/// identity sources that have signed in, most recent first.
 #[utoipa::path(get, path = "/directory-users", responses(
     (status = 200, body = Vec<DirectoryUserSummary>),
     (status = "4XX", body = ErrorBody),
@@ -462,6 +474,7 @@ async fn list_directory_users(State(app): AppState, Extension(actor): Extension<
     let client = app.pool.get().await?;
     let groups = ic::groups(&client, None).await?;
     let memberships = ic::memberships(&client, None, None).await?;
+    let access = crate::console::store::directory_access(&client).await?;
     let mut users = ic::users(&client, None).await?;
     users.sort_by(|a, b| b.updated.total_cmp(&a.updated));
     Ok(Json(
@@ -474,7 +487,11 @@ async fn list_directory_users(State(app): AppState, Extension(actor): Extension<
                     .filter_map(|m| groups.iter().find(|g| g.id == m.group_id).map(|g| g.name.clone()))
                     .collect();
                 names.sort();
+                let own = access.get(&u.id).cloned().unwrap_or_default();
                 DirectoryUserSummary {
+                    passkeys: own.passkeys,
+                    last_passkey_use: own.last_sign_in,
+                    setup_link_pending: own.link_pending,
                     id: u.id.to_string(),
                     user_name: u.user_name,
                     display_name: u.display_name,
@@ -490,13 +507,117 @@ async fn list_directory_users(State(app): AppState, Extension(actor): Extension<
     ))
 }
 
+#[derive(Deserialize, ToSchema)]
+struct NewDirectoryUser {
+    /// Its user name: 1 to 128 characters, no spaces.
+    user_name: String,
+    display_name: String,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    email: Option<String>,
+}
+
+/// The ID of a new directory user.
+#[derive(Serialize, ToSchema)]
+struct NewDirectoryUserId {
+    id: String,
+}
+
+/// Makes a user of Cairn's own directory, as identitystore's CreateUser:
+/// it signs in with passkeys, the first of which it makes with a setup
+/// link.
+#[utoipa::path(post, path = "/directory-users", request_body = NewDirectoryUser, responses(
+    (status = 201, body = NewDirectoryUserId),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_directory_user(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<NewDirectoryUser>,
+) -> Result<(StatusCode, Json<NewDirectoryUserId>)> {
+    actor.check(&app, "identitystore:CreateUser", store(&actor)).await?;
+    let present = |text: &Option<String>| text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
+    let mut name = serde_json::json!({ "Formatted": body.display_name });
+    if let Some(given) = present(&body.given_name) {
+        name["GivenName"] = given.into();
+    }
+    if let Some(family) = present(&body.family_name) {
+        name["FamilyName"] = family.into();
+    }
+    let email = present(&body.email);
+    let mut profile = serde_json::json!({ "Name": name });
+    if let Some(email) = &email {
+        profile["Emails"] = serde_json::json!([{ "Value": email, "Primary": true }]);
+    }
+    let new = ic::OwnUser { user_name: &body.user_name, display_name: &body.display_name, email: email.as_deref(), profile: &profile };
+    let user = ic::create_user(&app.pool.get().await?, &new).await?;
+    Ok((StatusCode::CREATED, Json(NewDirectoryUserId { id: user.id.to_string() })))
+}
+
+/// The directory user `id`, allowed `action` on it.
+async fn check_user(app: &Arc<App>, actor: &Actor, action: &'static str, id: &str) -> Result<ic::User> {
+    let missing = || ApiError::NotFound(format!("there's no directory user {id}"));
+    let id = Uuid::parse_str(id).map_err(|_| missing())?;
+    actor.check(app, action, On::Arn(ic::user_arn(id))).await?;
+    ic::users(&app.pool.get().await?, Some(ic::Lookup::Id(id))).await?.pop().ok_or_else(missing)
+}
+
+/// Deletes a user of Cairn's own directory: its memberships, assignments,
+/// passkeys and sessions go too.
+#[utoipa::path(delete, path = "/directory-users/{id}", params(("id" = String, Path)), responses(
+    (status = 204, description = "Deleted"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_directory_user(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+    let user = check_user(&app, &actor, "identitystore:DeleteUser", &id).await?;
+    ic::delete_user(&app.pool.get().await?, &user, None).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Makes a user of Cairn's own directory a setup link, valid 7 days, to
+/// make a passkey with (its first, or another): Cairn's way of Identity
+/// Center's one-time password. It replaces the user's last link. Checked as
+/// `identitystore:UpdateUser`, as a change of how the user signs in.
+#[utoipa::path(post, path = "/directory-users/{id}/setup-link", params(("id" = String, Path)), responses(
+    (status = 201, body = EnrollmentLink),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_setup_link(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<EnrollmentLink>)> {
+    let user = check_user(&app, &actor, "identitystore:UpdateUser", &id).await?;
+    let token = crate::console::store::create_setup_link(&app.pool.get().await?, user.id).await?;
+    let path = format!("/enroll#{token}");
+    let url = app.console.origin.as_ref().map(|origin| format!("{origin}{path}"));
+    Ok((StatusCode::CREATED, Json(EnrollmentLink { url, path })))
+}
+
+/// Removes all of a directory user's passkeys, as when one is lost: its
+/// sessions end, and it needs a setup link to sign in again.
+#[utoipa::path(delete, path = "/directory-users/{id}/passkeys", params(("id" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_directory_passkeys(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+    let user = check_user(&app, &actor, "identitystore:UpdateUser", &id).await?;
+    crate::console::store::delete_directory_passkeys(&app.pool.get().await?, user.id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// A group, as its users' group claims named it.
 #[derive(Serialize, ToSchema)]
 struct DirectoryGroupSummary {
     /// Its ID in the identity store.
     id: String,
     name: String,
-    provider: String,
+    /// Its identity source; none for a group of Cairn's own directory.
+    provider: Option<String>,
     /// How many users it had, as their last sign-ins said.
     members: i64,
 }

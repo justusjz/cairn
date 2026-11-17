@@ -36,7 +36,7 @@ pub async fn permission_set(client: &Object, session: &store::DirectorySession) 
 /// user, as Identity Center names them.
 pub fn role_session(chosen: &Eligible, session: &store::DirectorySession) -> anyhow::Result<Session> {
     let now = sessions::now();
-    let name = identity_center::session_name(&[Some(&session.user_name), session.email.as_deref(), Some(&session.subject)]);
+    let name = identity_center::session_name(&[Some(&session.user_name), session.email.as_deref(), session.subject.as_deref()]);
     Ok(Session {
         key_id: sessions::new_key_id()?,
         secret: String::new(),
@@ -58,8 +58,9 @@ pub fn role_session(chosen: &Eligible, session: &store::DirectorySession) -> any
 /// Who a directory user's `session` acts as, for a request (`method`,
 /// `headers`, `query`, from `peer`): its permission set's role's session,
 /// in the account it picked.
-/// It signed in at an identity source, which Cairn takes as no second
-/// factor: `aws:MultiFactorAuthPresent` is false.
+/// Signed in at an identity source, which Cairn takes as no second factor,
+/// `aws:MultiFactorAuthPresent` is false; signed in with a passkey (a user
+/// of Cairn's own directory), it's true, as a login's is.
 pub async fn user(
     client: &Object,
     session: &store::DirectorySession,
@@ -74,5 +75,5 @@ pub async fn user(
         Err(_) => return Err(ApiError::Forbidden("the permission set's role is gone: pick another".into())),
     };
     let account = chosen.account;
-    Ok(actor::User { principal, account, method, headers, query, peer, mfa_age: None })
+    Ok(actor::User { principal, account, method, headers, query, peer, mfa_age: session.mfa_age })
 }

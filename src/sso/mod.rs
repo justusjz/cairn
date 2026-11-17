@@ -3,8 +3,9 @@
 //! SWBExternalService.<Operation>`), for the instance, permission sets,
 //! their policies and assignments, and **identitystore** (signed for
 //! `identitystore`; `AWSIdentityStore.<Operation>`), for the identity
-//! store's users, groups and memberships, which only reads it: users and
-//! groups come from sign-ins (see `identity_center`). Both speak AWS's JSON
+//! store's users, groups and memberships: those of identity sources, which
+//! sign-ins fill and it only reads, and those of Cairn's own directory,
+//! which its writes make and change (see `identity_center`). Both speak AWS's JSON
 //! 1.1 protocol: a JSON body, answered with JSON, an error as its
 //! `__type` and `message`.
 //!
@@ -17,8 +18,7 @@
 //! `FAILED` with why: a customer managed policy the account hasn't, say);
 //! as in Identity Center, a permission set's changes reach its roles when
 //! it's provisioned again. Applications, trusted token issuers, attributes for
-//! access control, regions, the instance's own lifecycle, and the identity
-//! store's writes answer 501.
+//! access control, regions and the instance's own lifecycle answer 501.
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -83,8 +83,17 @@ const SSO: &[(&str, &str)] = &[
     ("ListTagsForResource", "sso:ListTagsForResource"),
 ];
 
-/// identitystore's operations Cairn answers (its reads), with their actions.
+/// identitystore's operations Cairn answers, with their actions: its reads,
+/// and its writes, of Cairn's own directory.
 const IDENTITY_STORE: &[(&str, &str)] = &[
+    ("CreateUser", "identitystore:CreateUser"),
+    ("UpdateUser", "identitystore:UpdateUser"),
+    ("DeleteUser", "identitystore:DeleteUser"),
+    ("CreateGroup", "identitystore:CreateGroup"),
+    ("UpdateGroup", "identitystore:UpdateGroup"),
+    ("DeleteGroup", "identitystore:DeleteGroup"),
+    ("CreateGroupMembership", "identitystore:CreateGroupMembership"),
+    ("DeleteGroupMembership", "identitystore:DeleteGroupMembership"),
     ("GetUserId", "identitystore:GetUserId"),
     ("DescribeUser", "identitystore:DescribeUser"),
     ("ListUsers", "identitystore:ListUsers"),
@@ -806,6 +815,104 @@ impl Ctx<'_> {
         }
         let store_arn = ic::identity_store_arn(&self.account);
         match operation {
+            "CreateUser" => {
+                self.check(&store_arn)?;
+                let mut attributes = serde_json::Map::new();
+                for (key, value) in self.input.as_object().into_iter().flatten() {
+                    if key != "IdentityStoreId" {
+                        attributes.insert(key.clone(), value.clone());
+                    }
+                }
+                let profile = Profile::of(Value::Object(attributes))?;
+                let user = ic::create_user(self.client, &profile.own()).await?;
+                Ok(json!({
+                    "IdentityStoreId": ours,
+                    "UserId": user.id.to_string(),
+                    "UserArn": ic::user_arn(user.id),
+                    "Revision": user.revision.to_string(),
+                }))
+            }
+            "UpdateUser" => {
+                let user = self.user("UserId").await?;
+                if !user.own() {
+                    return Err(validation("That user is an identity source's: it's what the source says when it signs in."));
+                }
+                let mut attributes = Profile::attributes(&user);
+                for (path, value) in self.operations()? {
+                    set_attribute(&mut attributes, &path, value)?;
+                }
+                let profile = Profile::of(attributes)?;
+                let user = ic::update_user(self.client, &user, &profile.own(), self.revision()?).await?;
+                Ok(json!({
+                    "IdentityStoreId": ours,
+                    "UserId": user.id.to_string(),
+                    "UserArn": ic::user_arn(user.id),
+                    "Revision": user.revision.to_string(),
+                }))
+            }
+            "DeleteUser" => {
+                let user = self.user("UserId").await?;
+                ic::delete_user(self.client, &user, self.revision()?).await?;
+                Ok(json!({}))
+            }
+            "CreateGroup" => {
+                self.check(&store_arn)?;
+                let name = self.required("DisplayName")?;
+                let group = ic::create_group(self.client, name, self.text("Description")).await?;
+                Ok(json!({
+                    "IdentityStoreId": ours,
+                    "GroupId": group.id.to_string(),
+                    "GroupArn": ic::group_arn(group.id),
+                    "Revision": group.revision.to_string(),
+                }))
+            }
+            "UpdateGroup" => {
+                let group = self.group("GroupId").await?;
+                let (mut name, mut description) = (group.name.clone(), group.description.clone());
+                for (path, value) in self.operations()? {
+                    let text = |value: Option<Value>| -> Result<Option<String>> {
+                        match value {
+                            None => Ok(None),
+                            Some(Value::String(text)) => Ok(Some(text)),
+                            Some(_) => Err(validation(format!("{path} is a string."))),
+                        }
+                    };
+                    match path.as_str() {
+                        "displayName" => name = text(value)?.ok_or_else(|| validation("A group's displayName can't be removed."))?,
+                        "description" => description = text(value)?,
+                        other => return Err(validation(format!("A group has no attribute {other}: displayName and description."))),
+                    }
+                }
+                let group = ic::update_group(self.client, &group, &name, description.as_deref(), self.revision()?).await?;
+                Ok(json!({
+                    "IdentityStoreId": ours,
+                    "GroupId": group.id.to_string(),
+                    "GroupArn": ic::group_arn(group.id),
+                    "Revision": group.revision.to_string(),
+                }))
+            }
+            "DeleteGroup" => {
+                let group = self.group("GroupId").await?;
+                ic::delete_group(self.client, &group, self.revision()?).await?;
+                Ok(json!({}))
+            }
+            "CreateGroupMembership" => {
+                let group = self.group("GroupId").await?;
+                let user = self.member().await?;
+                let membership = ic::add_member(self.client, &group, &user).await?;
+                Ok(json!({
+                    "IdentityStoreId": ours,
+                    "MembershipId": membership.id.to_string(),
+                    "MembershipArn": ic::membership_arn(membership.id),
+                }))
+            }
+            "DeleteGroupMembership" => {
+                let text = self.required("MembershipId")?;
+                let id = principal_id(text).ok_or_else(|| validation(format!("MembershipId {text} isn't one.")))?;
+                self.check(&ic::membership_arn(id))?;
+                ic::remove_membership(self.client, id).await?;
+                Ok(json!({}))
+            }
             "GetUserId" => {
                 self.check(&store_arn)?;
                 let users = match self.alternate()? {
@@ -915,6 +1022,30 @@ impl Ctx<'_> {
             }
             other => Err(error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", format!("Cairn doesn't implement {other}."))),
         }
+    }
+
+    /// `Revision`, if given: what a write requires of the user's or group's.
+    fn revision(&self) -> Result<Option<i64>> {
+        match self.text("Revision") {
+            None => Ok(None),
+            Some(text) => text.parse().map(Some).map_err(|_| validation(format!("Revision {text} isn't one."))),
+        }
+    }
+
+    /// `Operations`: 1 to 100 attributes' paths, and their new values
+    /// (none: removed).
+    fn operations(&self) -> Result<Vec<(String, Option<Value>)>> {
+        let list = self.input.get("Operations").and_then(Value::as_array).ok_or_else(|| validation("Operations is required."))?;
+        if list.is_empty() || list.len() > 100 {
+            return Err(validation("Operations has 1 to 100 operations."));
+        }
+        list.iter()
+            .map(|op| {
+                let path = op.get("AttributePath").and_then(Value::as_str).filter(|p| !p.is_empty() && p.len() <= 255);
+                let path = path.ok_or_else(|| validation("An operation needs its AttributePath."))?;
+                Ok((path.to_owned(), op.get("AttributeValue").filter(|v| !v.is_null()).cloned()))
+            })
+            .collect()
     }
 
     /// `AlternateIdentifier`: an external ID, or a unique attribute.
@@ -1029,36 +1160,214 @@ fn set_json(set: &PermissionSet) -> Value {
 }
 
 fn user_json(store: &str, user: &User) -> Value {
-    let mut value = json!({
-        "IdentityStoreId": store,
-        "UserId": user.id.to_string(),
-        "UserArn": ic::user_arn(user.id),
-        "Revision": (user.updated as i64).to_string(),
-        "UserName": user.user_name,
-        "ExternalIds": [{ "Issuer": user.issuer, "Id": user.subject }],
-        "DisplayName": user.display_name,
-        "Name": { "Formatted": user.display_name },
-        "UserStatus": "ENABLED",
-        "CreatedAt": user.created,
-        "UpdatedAt": user.updated,
-    });
-    if let Some(email) = &user.email {
-        value["Emails"] = json!([{ "Value": email, "Primary": true }]);
-    }
+    // One of Cairn's own: its attributes, as it was given them.
+    let mut value = match user.own() {
+        true => Profile::attributes(user),
+        false => {
+            let mut value = json!({
+                "UserName": user.user_name,
+                "ExternalIds": [{ "Issuer": user.issuer, "Id": user.subject }],
+                "DisplayName": user.display_name,
+                "Name": { "Formatted": user.display_name },
+            });
+            if let Some(email) = &user.email {
+                value["Emails"] = json!([{ "Value": email, "Primary": true }]);
+            }
+            value
+        }
+    };
+    value["IdentityStoreId"] = json!(store);
+    value["UserId"] = json!(user.id.to_string());
+    value["UserArn"] = json!(ic::user_arn(user.id));
+    value["Revision"] = json!(user.revision.to_string());
+    value["UserStatus"] = json!("ENABLED");
+    value["CreatedAt"] = json!(user.created);
+    value["UpdatedAt"] = json!(user.updated);
     value
 }
 
 fn group_json(store: &str, group: &Group) -> Value {
-    json!({
+    let mut value = json!({
         "IdentityStoreId": store,
         "GroupId": group.id.to_string(),
         "GroupArn": ic::group_arn(group.id),
-        "Revision": (group.updated as i64).to_string(),
+        "Revision": group.revision.to_string(),
         "DisplayName": group.name,
-        "ExternalIds": [{ "Issuer": group.issuer, "Id": group.name }],
         "CreatedAt": group.created,
         "UpdatedAt": group.updated,
-    })
+    });
+    if !group.own() {
+        value["ExternalIds"] = json!([{ "Issuer": group.issuer, "Id": group.name }]);
+    }
+    if let Some(description) = &group.description {
+        value["Description"] = json!(description);
+    }
+    value
+}
+
+/// A user of Cairn's own directory's attributes, as identitystore takes
+/// them (`UserName`, `DisplayName`, `Name`, `Emails`, …), checked as it
+/// checks them: what CreateUser was given, or UpdateUser made.
+struct Profile {
+    user_name: String,
+    display_name: String,
+    /// Its e-mail: the primary one, or else its one.
+    email: Option<String>,
+    /// The rest of them.
+    rest: Value,
+}
+
+/// A user's attributes that are strings.
+const STRINGS: &[&str] = &["NickName", "ProfileUrl", "UserType", "Title", "PreferredLanguage", "Locale", "Timezone", "Website", "Birthdate"];
+/// A user's attributes that are lists of objects, with how many each may
+/// have.
+const LISTS: &[(&str, usize)] = &[("Emails", 1), ("Addresses", 1), ("PhoneNumbers", 1), ("Roles", 1), ("Photos", 3)];
+/// The parts of a user's `Name`.
+const NAME_PARTS: &[&str] = &["FamilyName", "Formatted", "GivenName", "HonorificPrefix", "HonorificSuffix", "MiddleName"];
+/// The extension identitystore has.
+const ENTERPRISE: &str = "aws:identitystore:enterprise";
+
+/// Checks a string attribute: 1 to 1024 characters.
+fn check_string(what: &str, value: &Value) -> Result<()> {
+    match value.as_str() {
+        Some(text) if !text.is_empty() && text.chars().count() <= 1024 => Ok(()),
+        _ => Err(validation(format!("{what} is a string of 1 to 1024 characters."))),
+    }
+}
+
+impl Profile {
+    fn of(attributes: Value) -> Result<Profile> {
+        let Value::Object(mut map) = attributes else { return Err(validation("A user's attributes are an object.")) };
+        let mut take = |key: &str| match map.remove(key) {
+            Some(Value::String(text)) => Ok(text),
+            Some(_) => Err(validation(format!("{key} is a string."))),
+            // Identity Center requires them.
+            None => Err(validation(format!("{key} is required."))),
+        };
+        let user_name = take("UserName")?;
+        let display_name = take("DisplayName")?;
+        match map.get("Name") {
+            Some(Value::Object(name)) => {
+                for (part, value) in name {
+                    if !NAME_PARTS.contains(&part.as_str()) {
+                        return Err(validation(format!("A Name has no {part}: {}.", NAME_PARTS.join(", "))));
+                    }
+                    check_string(&format!("Name.{part}"), value)?;
+                }
+            }
+            Some(_) => return Err(validation("Name is an object.")),
+            None => return Err(validation("Name is required.")),
+        }
+        for (key, value) in &map {
+            match key.as_str() {
+                "Name" => {}
+                key if STRINGS.contains(&key) => check_string(key, value)?,
+                "Extensions" => {
+                    let extensions = value.as_object().ok_or_else(|| validation("Extensions is an object."))?;
+                    if let Some(other) = extensions.keys().find(|k| *k != ENTERPRISE) {
+                        return Err(validation(format!("{other} isn't an extension: {ENTERPRISE} is the only one.")));
+                    }
+                    if extensions.values().any(|v| !v.is_object()) {
+                        return Err(validation("An extension is an object."));
+                    }
+                }
+                key => {
+                    let Some((_, most)) = LISTS.iter().find(|(list, _)| *list == key) else {
+                        return Err(validation(format!("A user has no attribute {key}.")));
+                    };
+                    let items = value.as_array().ok_or_else(|| validation(format!("{key} is a list.")))?;
+                    if items.len() > *most {
+                        return Err(validation(format!("{key} has at most {most}.")));
+                    }
+                    for item in items {
+                        let fields = item.as_object().ok_or_else(|| validation(format!("{key} is a list of objects.")))?;
+                        for (field, value) in fields {
+                            if !value.is_boolean() {
+                                check_string(&format!("{key}.{field}"), value)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let emails = map.get("Emails").and_then(Value::as_array).cloned().unwrap_or_default();
+        let primary = emails.iter().find(|e| e.get("Primary") == Some(&Value::Bool(true))).or(emails.first());
+        let email = primary.and_then(|e| e.get("Value")).and_then(Value::as_str).map(str::to_owned);
+        Ok(Profile { user_name, display_name, email, rest: Value::Object(map) })
+    }
+
+    fn own(&self) -> ic::OwnUser<'_> {
+        ic::OwnUser { user_name: &self.user_name, display_name: &self.display_name, email: self.email.as_deref(), profile: &self.rest }
+    }
+
+    /// The attributes of `user`, one of Cairn's own.
+    fn attributes(user: &User) -> Value {
+        let mut value = match &user.profile {
+            Value::Object(map) => Value::Object(map.clone()),
+            _ => json!({}),
+        };
+        value["UserName"] = json!(user.user_name);
+        value["DisplayName"] = json!(user.display_name);
+        value
+    }
+}
+
+/// An attribute's name in an AttributePath (`familyName`) as it's kept
+/// (`FamilyName`).
+fn pascal(name: &str) -> String {
+    let mut chars = name.chars();
+    chars.next().map(|first| first.to_uppercase().chain(chars).collect()).unwrap_or_default()
+}
+
+/// Sets (`Some`) or removes the attribute at `path` (`nickName`,
+/// `name.familyName`, `aws:identitystore:enterprise.department`) of a
+/// user's `attributes`.
+fn set_attribute(attributes: &mut Value, path: &str, value: Option<Value>) -> Result<()> {
+    // Where it is: an attribute, maybe of an object.
+    let (outer, inner): (Vec<String>, Option<String>) = match path.strip_prefix(ENTERPRISE) {
+        Some("") => (vec!["Extensions".into(), ENTERPRISE.into()], None),
+        Some(rest) => match rest.strip_prefix('.') {
+            Some(field) if !field.is_empty() && !field.contains('.') => (vec!["Extensions".into(), ENTERPRISE.into()], Some(field.to_owned())),
+            _ => return Err(validation(format!("{path} isn't an attribute's path."))),
+        },
+        None => match path.split('.').collect::<Vec<_>>().as_slice() {
+            [name] if !name.is_empty() => (vec![pascal(name)], None),
+            [outer, inner] if !outer.is_empty() && !inner.is_empty() => (vec![pascal(outer)], Some(pascal(inner))),
+            _ => return Err(validation(format!("{path} isn't an attribute's path."))),
+        },
+    };
+    if path.contains(':') && !path.starts_with(ENTERPRISE) {
+        return Err(validation(format!("{path} isn't an attribute's path: {ENTERPRISE} is the only extension.")));
+    }
+    // The object that holds it, made as needed.
+    let (last, parents) = match &inner {
+        Some(field) => (field.clone(), outer.as_slice()),
+        None => (outer.last().expect("one").clone(), &outer[..outer.len() - 1]),
+    };
+    {
+        let mut holder = &mut *attributes;
+        for parent in parents {
+            let map = holder.as_object_mut().ok_or_else(|| validation(format!("{path} isn't in an object.")))?;
+            holder = map.entry(parent.clone()).or_insert_with(|| json!({}));
+        }
+        let map = holder.as_object_mut().ok_or_else(|| validation(format!("{path} isn't in an object.")))?;
+        match value {
+            Some(value) => {
+                map.insert(last, value);
+            }
+            None => {
+                map.remove(&last);
+            }
+        }
+    }
+    // Objects left empty go.
+    if let Some(root) = attributes.as_object_mut() {
+        if let Some(Value::Object(extensions)) = root.get_mut("Extensions") {
+            extensions.retain(|_, v| v.as_object().is_none_or(|o| !o.is_empty()));
+        }
+        root.retain(|k, v| k == "Name" || v.as_object().is_none_or(|o| !o.is_empty()));
+    }
+    Ok(())
 }
 
 fn membership_json(store: &str, membership: &ic::Membership) -> Value {
