@@ -234,6 +234,7 @@ async fn sessions_are_their_bucket_s() {
         date: None,
         token: None,
         directory_token: Some(token.clone()),
+        sigv2: false,
     };
     let principal = directory::authenticate(&app.sessions, &client, &signed(&key), &token, &bucket).await.unwrap().unwrap();
     assert_eq!((principal.arn(), principal.id, principal.secret.as_str()), (ro.arn(), ro.id, secret.as_str()));

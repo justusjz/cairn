@@ -712,7 +712,7 @@ fn context(
     }
     if let Some(signed) = origin.signed {
         context.set("aws:RequestedRegion", &signed.region);
-        context.set("s3:signatureversion", "AWS4-HMAC-SHA256");
+        context.set("s3:signatureversion", signed.signature_version());
         let auth_type = match (origin.form, signed.presigned) {
             (true, _) => "POST",
             (false, true) => "REST-QUERY-STRING",
