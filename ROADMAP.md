@@ -75,9 +75,9 @@ Done:
   of a bucket's objects, as S3 writes them (CSV or Parquet; not ORC),
   paced by the rate lifecycle sweeps go at, which they share. Implemented. Batch
   Operations: jobs that tag objects (or remove their tags) and set their
-  Object Lock retention and legal holds, from CSV manifests, as a role, at
-  that rate too, with completion reports. Implemented. Next: inventory
-  reports as manifests, then copies (once a copy done twice, when a node dies mid-page,
+  Object Lock retention and legal holds, from CSV manifests or inventory
+  reports, as a role, at that rate too, with completion reports.
+  Implemented. Next: copies (once a copy done twice, when a node dies mid-page,
   makes no second version).
 - **Lifecycle transitions.** Moving objects between storage classes by
   lifecycle rules, once Cairn has more than one (erasure-coded storage, say).

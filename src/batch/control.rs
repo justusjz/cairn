@@ -355,7 +355,11 @@ fn operation_xml(operation: &Operation) -> String {
 
 fn manifest_xml(manifest: &Manifest) -> String {
     let fields: String = manifest.fields.iter().map(|f| element("member", f)).collect();
-    let mut out = format!("<Manifest><Spec>{}<Fields>{fields}</Fields></Spec><Location>", element("Format", &manifest.format));
+    let fields = match fields.is_empty() {
+        true => fields,
+        false => format!("<Fields>{fields}</Fields>"),
+    };
+    let mut out = format!("<Manifest><Spec>{}{fields}</Spec><Location>", element("Format", &manifest.format));
     out.push_str(&element("ObjectArn", &manifest.arn));
     if let Some(version_id) = &manifest.version_id {
         out.push_str(&element("ObjectVersionId", version_id));
@@ -566,24 +570,27 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
     };
     let format = text(spec, "Format").unwrap_or("");
     match format {
-        manifest::CSV => {}
-        manifest::INVENTORY => return Err(not_implemented("A manifest of an inventory report")),
+        manifest::CSV | manifest::INVENTORY => {}
         _ => return Err(bad_request(&format!("{format} isn't a manifest format."))),
     }
-    let Some(fields) = child(spec, "Fields") else {
-        return Err(bad_request("A CSV manifest's Fields are required."));
-    };
-    let mut parsed = Vec::new();
+    // A CSV manifest's columns, as its Fields name them; an inventory
+    // report's are its schema's.
     let mut names = Vec::new();
-    for field in children(fields) {
-        let name = field.text().unwrap_or("");
-        let Some(f) = manifest::Field::parse(name) else {
-            return Err(bad_request(&format!("{name} isn't a manifest field.")));
+    if format == manifest::CSV {
+        let Some(fields) = child(spec, "Fields") else {
+            return Err(bad_request("A CSV manifest's Fields are required."));
         };
-        parsed.push(f);
-        names.push(f.name().to_owned());
+        let mut parsed = Vec::new();
+        for field in children(fields) {
+            let name = field.text().unwrap_or("");
+            let Some(f) = manifest::Field::parse(name) else {
+                return Err(bad_request(&format!("{name} isn't a manifest field.")));
+            };
+            parsed.push(f);
+            names.push(f.name().to_owned());
+        }
+        manifest::check_fields(&parsed).map_err(|why| bad_request(&why))?;
     }
-    manifest::check_fields(&parsed).map_err(|why| bad_request(&why))?;
     let arn = text(location, "ObjectArn").unwrap_or("").to_owned();
     let Some((bucket, key)) = object_of_arn(&arn) else {
         return Err(bad_request(&format!("{arn} isn't an object's ARN.")));
@@ -1041,8 +1048,6 @@ mod tests {
     fn what_cairn_doesnt_do_is_not_implemented() {
         let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::b</TargetResource></S3PutObjectCopy>";
         assert_eq!(refusal(&request(copy, "")), (501, "NotImplemented".to_owned()));
-        let inventory = request(PUT, "").replace("S3BatchOperations_CSV_20180820", "S3InventoryReport_CSV_20161130");
-        assert_eq!(refusal(&inventory), (501, "NotImplemented".to_owned()));
     }
 
     #[test]
@@ -1079,6 +1084,18 @@ mod tests {
         let job = parse_create(request(&hold("ON"), "").as_bytes()).unwrap();
         assert_eq!(job.operation, Operation::PutLegalHold { on: true });
         assert_eq!(refusal(&request(&hold("on"), "")), bad);
+    }
+
+    #[test]
+    fn inventory_reports_are_manifests() {
+        let inventory = request(PUT, "")
+            .replace("S3BatchOperations_CSV_20180820", "S3InventoryReport_CSV_20161130")
+            .replace("<Fields><member>Bucket</member><member>Key</member></Fields>", "");
+        let job = parse_create(inventory.as_bytes()).unwrap();
+        assert_eq!(job.manifest.format, "S3InventoryReport_CSV_20161130");
+        assert!(job.manifest.fields.is_empty());
+        let csv = request(PUT, "").replace("<Fields><member>Bucket</member><member>Key</member></Fields>", "");
+        assert_eq!(refusal(&csv), (400, "BadRequestException".to_owned()));
     }
 
     #[test]

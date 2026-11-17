@@ -617,3 +617,191 @@ async fn jobs_set_retention_and_legal_holds() {
     assert_eq!(run("t6", hold("OFF"), false).await.1, "0");
     assert_eq!(lock_of(&app, "a").await.2, Some(false));
 }
+
+/// `request`, its manifest an inventory report's (`manifest.json`).
+fn of_inventory(request: &str) -> String {
+    request
+        .replace("S3BatchOperations_CSV_20180820", "S3InventoryReport_CSV_20161130")
+        .replace("<Fields><member>Bucket</member><member>Key</member></Fields>", "")
+}
+
+fn gzip(text: &str) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(text.as_bytes()).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn md5_hex(data: &[u8]) -> String {
+    use md5::Digest;
+    md5::Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Puts an inventory report of data files `files` (their keys and lines),
+/// in `format`, its manifest at `inv/<name>/manifest.json`, listing
+/// `md5s` for its files (theirs, if `None`): the manifest's ETag.
+async fn put_inventory(app: &Arc<App>, name: &str, files: &[(&str, String)], format: &str, md5s: Option<&[&str]>) -> String {
+    let mut listed = Vec::new();
+    for (i, (key, lines)) in files.iter().enumerate() {
+        let data = gzip(lines);
+        let md5 = md5s.map_or_else(|| md5_hex(&data), |md5s| md5s[i].to_owned());
+        listed.push(serde_json::json!({ "key": key, "size": data.len(), "MD5checksum": md5 }));
+        put(app, key, data).await;
+    }
+    let manifest = serde_json::json!({
+        "sourceBucket": BUCKET,
+        "destinationBucket": format!("arn:aws:s3:::{BUCKET}"),
+        "version": "2016-11-30",
+        "creationTimestamp": "1700000000000",
+        "fileFormat": format,
+        "fileSchema": "Bucket, Key, VersionId, IsLatest",
+        "files": listed,
+    });
+    let manifest = serde_json::to_vec(&manifest).unwrap();
+    let etag = md5_hex(&manifest);
+    put(app, &format!("inv/{name}/manifest.json"), manifest).await;
+    etag
+}
+
+/// A data file's lines, as an inventory report writes them (quoted,
+/// with versions' columns), of `keys`.
+fn inventory_lines(keys: impl Iterator<Item = String>) -> String {
+    keys.map(|key| format!("\"{BUCKET}\",\"{key}\",\"\",\"true\"\n")).collect()
+}
+
+/// A job whose manifest is an inventory report Cairn wrote (see
+/// `inventory`) does its tasks to the objects the report lists.
+#[tokio::test]
+async fn a_job_runs_over_an_inventory_report() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    tagging_role(&app).await;
+    // Reports of the bucket's `photos/`, into the bucket itself.
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"Service":"s3.amazonaws.com"}},
+            "Action":"s3:PutObject","Resource":"arn:aws:s3:::{BUCKET}/inv/*"}}]}}"#
+    );
+    let response = crate::s3::buckets::policy::put_bucket_policy(&app, BUCKET, Bytes::from(policy)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    put(&app, "photos/a b.jpg", b"a".to_vec()).await;
+    put(&app, "photos/c.jpg", b"c".to_vec()).await;
+    let configuration = format!(
+        "<InventoryConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Destination><S3BucketDestination><Bucket>arn:aws:s3:::{BUCKET}</Bucket><Format>CSV</Format>\
+         <Prefix>inv</Prefix></S3BucketDestination></Destination><IsEnabled>true</IsEnabled><Id>daily</Id>\
+         <Filter><Prefix>photos/</Prefix></Filter><IncludedObjectVersions>Current</IncludedObjectVersions>\
+         <Schedule><Frequency>Daily</Frequency></Schedule></InventoryConfiguration>"
+    );
+    let response =
+        crate::s3::buckets::inventory::put(&app, BUCKET, "inventory&id=daily", Bytes::from(configuration), None).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    step(&app, 1).await;
+    let client = app.pool.get().await.unwrap();
+    let key: String = client
+        .query_one("SELECT key FROM objects WHERE bucket = $1 AND key LIKE 'inv/%/manifest.json' AND is_latest", &[&BUCKET])
+        .await
+        .unwrap()
+        .get(0);
+    let etag = md5_hex(&crate::e2e::get(&app, &key).await.unwrap());
+
+    let id = create(&app, &admin, &of_inventory(&create_request("t1", PUT_TAGS, &key, &etag, false, &account))).await;
+    step(&app, 2).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Ready"), "{job}");
+    assert_eq!(element(&job, "TotalNumberOfTasks"), Some("2"));
+    step(&app, 3).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("2"));
+    assert_eq!(tags_of(&app, "photos/a b.jpg").await, "team=red");
+    assert_eq!(tags_of(&app, "photos/c.jpg").await, "team=red");
+}
+
+/// An inventory report's data files are read a page at a time, across
+/// turns: a turn that starts in the middle of one goes on from there, and
+/// each task is done once.
+#[tokio::test]
+async fn inventory_reports_are_read_a_page_at_a_time() {
+    let Some(app) = node().await else { return };
+    // Ten tasks a minute.
+    crate::settings::LIFECYCLE_RATE.set(&app.pool.get().await.unwrap(), 600).await.unwrap();
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(&app, super::SERVICE, r#"["s3:GetObject","s3:PutObject","s3:PutObjectTagging"]"#).await;
+    for i in 0..28 {
+        put(&app, &format!("k{i:02}"), b"x".to_vec()).await;
+    }
+    let files = [
+        ("inv/r/data/1.csv.gz", inventory_lines((0..25).map(|i| format!("k{i:02}")))),
+        ("inv/r/data/2.csv.gz", inventory_lines((25..28).map(|i| format!("k{i:02}")))),
+    ];
+    let etag = put_inventory(&app, "r", &files, "CSV", None).await;
+    let request = of_inventory(&create_request("t1", PUT_TAGS, "inv/r/manifest.json", &etag, false, &account));
+    let id = create(&app, &admin, &with_report(&request, &report("AllTasks"))).await;
+    step(&app, 1).await;
+    assert_eq!(element(&describe(&app, &admin, &id).await, "TotalNumberOfTasks"), Some("28"));
+    // Ten tasks a step: the second starts in the middle of the first file.
+    step(&app, 2).await;
+    step(&app, 3).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Active"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("20"), "{job}");
+    // The rest of the first file, and the second.
+    step(&app, 4).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("28"));
+    assert_eq!(element(&job, "NumberOfTasksFailed"), Some("0"));
+    for i in 0..28 {
+        assert_eq!(tags_of(&app, &format!("k{i:02}")).await, "team=red", "k{i:02}");
+    }
+    // The report lists each task once, in order.
+    let (_, files) = report_of(&app, &id).await;
+    let keys: Vec<String> = files.iter().flat_map(|(_, lines)| lines.lines().map(|l| l.split(',').nth(1).unwrap().to_owned())).collect();
+    assert_eq!(keys, (0..28).map(|i| format!("k{i:02}")).collect::<Vec<_>>());
+}
+
+/// A job fails, saying why, if its inventory report isn't CSV, if a data
+/// file isn't the one its manifest lists, or if one changes after the job
+/// was prepared.
+#[tokio::test]
+async fn inventory_reports_that_cant_be_read_fail_jobs() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    tagging_role(&app).await;
+    let lines = inventory_lines(["a".to_owned()].into_iter());
+    let job = |token: &'static str, name: &'static str, etag: String, confirmation: bool| {
+        let app = app.clone();
+        let admin = &admin;
+        let account = account.clone();
+        async move {
+            let key = format!("inv/{name}/manifest.json");
+            create(&app, admin, &of_inventory(&create_request(token, PUT_TAGS, &key, &etag, confirmation, &account))).await
+        }
+    };
+    let etag = put_inventory(&app, "parquet", &[("inv/parquet/data/1.parquet", lines.clone())], "Parquet", None).await;
+    let parquet = job("t1", "parquet", etag, false).await;
+    let etag = put_inventory(&app, "md5", &[("inv/md5/data/1.csv.gz", lines.clone())], "CSV", Some(&["00"])).await;
+    let md5 = job("t2", "md5", etag, false).await;
+    let etag = put_inventory(&app, "changed", &[("inv/changed/data/1.csv.gz", lines.clone())], "CSV", None).await;
+    let changed = job("t3", "changed", etag, true).await;
+    step(&app, 1).await;
+
+    let job = describe(&app, &admin, &parquet).await;
+    assert_eq!(element(&job, "FailureCode"), Some("ManifestInvalid"), "{job}");
+    assert!(element(&job, "FailureReason").unwrap().contains("not CSV"), "{job}");
+    let job = describe(&app, &admin, &md5).await;
+    assert_eq!(element(&job, "FailureCode"), Some("ManifestInvalid"), "{job}");
+    assert!(element(&job, "FailureReason").unwrap().contains("MD5"), "{job}");
+    // Prepared, then its data file changes before it's confirmed.
+    assert_eq!(status_of(&app, &admin, &changed).await, "Suspended");
+    put(&app, "inv/changed/data/1.csv.gz", gzip(&inventory_lines(["b".to_owned()].into_iter()))).await;
+    let (status, _) =
+        body_of(control::update_status(&app, &access(&admin), &account, &changed, "requestedJobStatus=Ready").await.unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    step(&app, 2).await;
+    let job = describe(&app, &admin, &changed).await;
+    assert_eq!(element(&job, "FailureCode"), Some("ManifestETagMismatch"), "{job}");
+}

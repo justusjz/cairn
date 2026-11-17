@@ -244,6 +244,7 @@ const MIGRATIONS: &[&str] = &[
     BATCH_JOBS,
     BATCH_JOB_RESULTS,
     DIRECTORY_USERS,
+    BATCH_INVENTORY_MANIFESTS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3075,6 +3076,22 @@ CREATE TABLE console_directory_sessions (
 CREATE INDEX console_directory_sessions_user ON console_directory_sessions (user_id);
 CREATE TRIGGER console_directory_sessions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_directory_sessions
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+/// Migration 64: inventory reports as Batch Operations jobs' manifests (see
+/// `batch::source`). Where a job has got to is now a data file of its
+/// manifest (by its index; 0 for a CSV manifest) and an offset in it, while
+/// it's prepared (`prepared_file`, `prepared`) and while it runs
+/// (`cursor_file`, `cursor`); `inventory` is its inventory report's data
+/// files, as preparing it read them (with their ETags), as JSON. A page's
+/// result files are keyed by its data file too. Plain writes keyed by the
+/// job, as before.
+const BATCH_INVENTORY_MANIFESTS: &str = r#"
+ALTER TABLE batch_jobs ADD COLUMN prepared_file int NOT NULL DEFAULT 0,
+    ADD COLUMN cursor_file int NOT NULL DEFAULT 0,
+    ADD COLUMN inventory text;
+ALTER TABLE batch_job_results ADD COLUMN file int NOT NULL DEFAULT 0;
+ALTER TABLE batch_job_results DROP CONSTRAINT batch_job_results_pkey;
+ALTER TABLE batch_job_results ADD PRIMARY KEY (job_id, file, start_at, status);
 "#;
 
 #[cfg(test)]

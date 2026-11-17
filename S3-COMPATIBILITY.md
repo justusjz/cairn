@@ -59,7 +59,7 @@ supported.
 | Event notifications, to SNS topics | 🟡 | Over HTTP(S) subscriptions: [Event notifications](#event-notifications) |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
 | Server access logging | 🟡 | [Server access logging](#server-access-logging) |
-| Batch Operations | 🟡 | Tagging and Object Lock, from CSV manifests: [Batch Operations](#batch-operations) |
+| Batch Operations | 🟡 | Tagging and Object Lock: [Batch Operations](#batch-operations) |
 
 ### Security
 
@@ -218,10 +218,13 @@ once it's been configured.
   operation is refused with `501 NotImplemented`, as is a retention with an
   event hold (Cairn has none). A retention's date must be in the future
   when the job is created, and is checked again by each task.
-- **Manifests.** CSV manifests (`S3BatchOperations_CSV_20180820`) only;
-  inventory reports' (`S3InventoryReport_CSV_20161130`) and manifest
-  generators are refused with `501 NotImplemented`. A manifest's lines must
-  have exactly the columns its `Fields` name.
+- **Manifests.** CSV manifests (`S3BatchOperations_CSV_20180820`) and CSV
+  inventory reports (`S3InventoryReport_CSV_20161130`); manifest generators
+  are refused with `501 NotImplemented`. A CSV manifest's lines must have
+  exactly the columns its `Fields` name. An inventory report in Parquet or
+  ORC fails the job while it's prepared, as does a data file whose MD5
+  isn't the one its manifest lists; preparing records each data file's
+  ETag, and a data file changed after that fails the job too.
 - **Completion reports** have a result file per page of up to a thousand
   tasks (one for those that succeeded, one for those that failed), named
   by a hash of the job and the page; their lines' messages are Cairn's.
