@@ -8,7 +8,8 @@
 # Configure it through the environment: every flag of `cairn serve` has a
 # CAIRN_* variable (see README.md). Set at least CAIRN_DATABASE; for more than
 # one node, also CAIRN_PEER_URL, since peers can't reach this node at 0.0.0.0.
-# `cairn role …` reads CAIRN_DATABASE too, so it works as is in the container.
+# `cairn user create`, `cairn account root-key` and the like run on this node
+# (its peer endpoint), so they work as is in the container.
 
 FROM gcr.io/distroless/static-debian13
 

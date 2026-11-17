@@ -48,7 +48,6 @@ pub enum Command {
     User(crate::users::UserArgs),
     Account(crate::accounts::AccountArgs),
     Oidc(crate::console::oidc::OidcArgs),
-    BucketPolicy(crate::s3::buckets::policy::BucketPolicyArgs),
     Config(crate::settings::ConfigArgs),
     Node(crate::nodes::NodeArgs),
     Sessions(crate::sessions::SessionsArgs),
@@ -91,7 +90,6 @@ pub async fn run(app: &Arc<App>, command: Command) -> Output {
         Command::User(args) => crate::users::run(app, args, &mut out).await,
         Command::Account(args) => crate::accounts::run(app, args, &mut out).await,
         Command::Oidc(args) => crate::console::oidc::run(app, args, &mut out).await,
-        Command::BucketPolicy(args) => crate::s3::buckets::policy::run(app, args, &mut out).await,
         Command::Config(args) => crate::settings::run(app, args, &mut out).await,
         Command::Node(args) => crate::nodes::run(app, args, &mut out).await,
         Command::Sessions(args) => crate::sessions::run(app, args, &mut out).await,
@@ -153,22 +151,13 @@ pub async fn send(remote: &Remote, command: Command) -> anyhow::Result<()> {
     }
 }
 
-/// A document a command takes: the contents of `file` (`-`: stdin), read
-/// where the CLI runs.
-pub fn read_document(file: &str) -> anyhow::Result<String> {
-    Ok(match file {
-        "-" => std::io::read_to_string(std::io::stdin())?,
-        path => std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("reading {path}: {e}"))?,
-    })
-}
-
 #[cfg(test)]
 pub(crate) mod e2e {
     use clap::Parser;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::e2e::{BUCKET, node_with};
+    use crate::e2e::node_with;
 
     async fn node() -> Option<Arc<App>> {
         node_with(crate::packer::Config::default(), None).await
@@ -211,53 +200,27 @@ pub(crate) mod e2e {
         assert!(out.stdout.contains("\nsecret key: "), "{}", out.stdout);
         let out = cairn(&app, &["user", "create", "cli-bea", "--id", "cli-bea-key"]).await;
         assert!(out.stdout.starts_with("access key: cli-bea-key\nsecret key: "), "{}", out.stdout);
-        let out = cairn(&app, &["user", "list"]).await;
-        assert!(out.stdout.contains("cli-ada (admin)"), "{}", out.stdout);
         // Its failures, as the CLI prints them.
-        let out = cairn(&app, &["user", "delete", "nobody"]).await;
-        assert_eq!(out.error.as_deref(), Some("no user named \"nobody\""));
+        let out = cairn(&app, &["user", "create", "cli-ada", "--key"]).await;
+        assert_eq!(out.error.as_deref(), Some("a user named \"cli-ada\" already exists"));
 
-        // Enrollment links: this node serves no console, so only the path.
-        let out = cairn(&app, &["user", "enroll", "cli-ada"]).await;
+        // A person's enrollment link: this node serves no console, so only
+        // the path.
+        let out = cairn(&app, &["user", "create", "cli-cy"]).await;
         assert!(out.stdout.starts_with("/enroll#"), "{}", out.stdout);
         assert!(out.stderr.contains("serves no console"), "{}", out.stderr);
-        let out = cairn(&app, &["account", "show"]).await;
-        assert!(out.stdout.starts_with("account ") && out.stdout.contains(" users, "), "{}", out.stdout);
-        // The root user's link: again only the path.
-        let out = cairn(&app, &["account", "root-link"]).await;
-        assert!(out.stdout.starts_with("/root#"), "{}", out.stdout);
-        assert!(out.stderr.contains("15 minutes"), "{}", out.stderr);
-        // What undoes policies that lock people out: attach and detach,
-        // and taking a boundary off.
-        let ops = "arn:aws:iam::aws:policy/CairnOperatorAccess";
-        assert_eq!(cairn(&app, &["user", "attach", "cli-ada", ops]).await.error, None);
+        // The root user's link: again only the path, after the account.
         let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
-        let client = app.pool.get().await.unwrap();
-        let names = |a: Vec<crate::managed::Attached>| a.into_iter().map(|a| a.name).collect::<Vec<_>>();
-        assert!(names(crate::managed::attached(&client, &account, "cli-ada").await.unwrap()).contains(&"CairnOperatorAccess".to_owned()));
-        assert_eq!(cairn(&app, &["user", "detach", "cli-ada", ops]).await.error, None);
-        assert!(!names(crate::managed::attached(&client, &account, "cli-ada").await.unwrap()).contains(&"CairnOperatorAccess".to_owned()));
-        let id = crate::users::id_of(&client, &account, "cli-ada").await.unwrap();
-        let bound = crate::users::BoundaryRef::Aws("AmazonS3ReadOnlyAccess");
-        crate::users::set_boundary(&client, &account, id, Some(&bound)).await.unwrap();
-        assert_eq!(cairn(&app, &["user", "unbound", "cli-ada"]).await.error, None);
-        assert!(crate::users::Principal::load_user(&client, id).await.unwrap().unwrap().boundary.is_none());
-
-        // Documents are read where the CLI runs, and sent along.
-        let file = std::env::temp_dir().join(format!("cairn-policy-{}.json", uuid::Uuid::new_v4()));
-        let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:ListBucket","Resource":"*"}]}"#;
-        std::fs::write(&file, document).unwrap();
-        let path = file.to_str().unwrap();
-        let out = cairn(&app, &["user", "policy", "put", "cli-ada", "nolist", path]).await;
-        assert_eq!(out.error, None);
-        assert_eq!(cairn(&app, &["user", "policy", "get", "cli-ada", "nolist"]).await.stdout.trim(), document);
-        let bucket_policy = format!(
-            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":"*","Action":"s3:DeleteBucket","Resource":"arn:aws:s3:::{BUCKET}"}}]}}"#
-        );
-        std::fs::write(&file, &bucket_policy).unwrap();
-        assert_eq!(cairn(&app, &["bucket-policy", "put", BUCKET, path]).await.error, None);
-        assert!(cairn(&app, &["bucket-policy", "get", BUCKET]).await.stdout.contains("s3:DeleteBucket"));
-        std::fs::remove_file(&file).unwrap();
+        let out = cairn(&app, &["account", "root-link"]).await;
+        let mut lines = out.stdout.lines();
+        assert_eq!(lines.next(), Some(format!("# the root user of account {account} (arn:aws:iam::{account}:root)").as_str()));
+        assert!(lines.next().unwrap().starts_with("/root#"), "{}", out.stdout);
+        assert!(out.stderr.contains("15 minutes"), "{}", out.stderr);
+        // Its temporary credentials, as a shell takes them.
+        let out = cairn(&app, &["account", "root-key"]).await;
+        for var in ["AWS_ACCESS_KEY_ID=ASIA", "AWS_SECRET_ACCESS_KEY=", "AWS_SESSION_TOKEN="] {
+            assert!(out.stdout.contains(&format!("\nexport {var}")), "{}", out.stdout);
+        }
 
         // Settings: the node answering goes by them at once.
         let out = cairn(&app, &["config", "set", "parity-shards", "2"]).await;

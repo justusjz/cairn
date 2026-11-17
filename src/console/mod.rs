@@ -512,7 +512,7 @@ mod e2e {
         let account = crate::users::account(&client).await.unwrap();
         let token = store::create_person(&client, &account, "ada", true).await.unwrap();
         let ada = users::list(&client).await.unwrap().into_iter().find(|u| u.name == "ada").unwrap();
-        assert!(ada.admin);
+        assert!(Principal::load_user(&client, ada.id).await.unwrap().unwrap().admin);
         assert!(ada.keys.is_empty());
         let err = store::create_person(&client, &account, "ADA", false).await.unwrap_err();
         assert!(err.to_string().contains("already exists"), "{err}");

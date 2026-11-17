@@ -505,7 +505,7 @@ pub struct UserArgs {
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum UserCommand {
     /// Create a user: a person, who signs in to the console with the
-    /// one-time link printed (as `enroll` prints it), or with `--key` a
+    /// one-time link printed (valid 24 hours), or with `--key` a
     /// service, with an access key, whose ID and secret are printed.
     Create {
         /// The user's name.
@@ -526,152 +526,13 @@ enum UserCommand {
         #[arg(long)]
         admin: bool,
     },
-    /// Change a user's admin flag (the way back in for an admin locked out),
-    /// and/or (deprecated) the secret of its access key named as it.
-    Update {
-        name: String,
-        /// Give (true) or take (false) `AdministratorAccess`.
-        #[arg(long)]
-        admin: Option<bool>,
-        /// Deprecated: replace the secret with a newly generated one, and
-        /// print it. Rotate a key by making another instead, as in IAM.
-        #[arg(long, conflicts_with = "secret")]
-        rotate_secret: bool,
-        /// Deprecated: replace the secret with this one (at least 8
-        /// characters).
-        #[arg(long)]
-        secret: Option<String>,
-    },
-    /// Deprecated (use the IAM API or the console): delete a user, and all
-    /// its access keys, grants and policies.
-    Delete { name: String },
-    /// List users, their admin flag, access keys, grants and policies
-    /// (secrets are not shown).
-    List,
-    /// Print a one-time link (valid 24 hours) for a user to register its
-    /// first passkey for the console, and sign in. A new link replaces the
-    /// user's last; one for a user with passkeys adds another (when it lost
-    /// them, say). Made from the node's console URL; if the node serves no
-    /// console, only the link's path is printed.
-    Enroll { name: String },
-    /// Deprecated (use the IAM API or the console): manage a user's access
-    /// keys (at most two).
-    #[command(subcommand)]
-    Key(KeyCommand),
-    /// Manage a user's inline identity policies (IAM's policy language).
-    /// Only `delete` stays (the way out of one that locks an admin out); use
-    /// the IAM API or the console for the rest.
-    #[command(subcommand)]
-    Policy(PolicyCommand),
-    /// Deprecated (use the IAM API or the console): grant permissions on an
-    /// existing bucket of the account: attaches the
-    /// account's managed policy `/cairn/grants/<bucket>-<permission>`, made
-    /// if needed.
-    Grant {
-        name: String,
-        bucket: String,
-        #[arg(required = true, value_enum)]
-        permissions: Vec<Permission>,
-    },
-    /// Deprecated (use the IAM API or the console): revoke permissions on a
-    /// bucket (detaches their managed policies);
-    /// all of them if none are listed.
-    Revoke {
-        name: String,
-        bucket: String,
-        #[arg(value_enum)]
-        permissions: Vec<Permission>,
-    },
-    /// Deprecated (use the IAM API or the console; `update --admin` is the
-    /// way back in): attach a managed policy to a user, by its ARN: Cairn's
-    /// (`arn:aws:iam::aws:policy/CairnOperatorAccess`, say) or the account's.
-    Attach { name: String, arn: String },
-    /// Detach a managed policy from a user (one that denies it, say).
-    Detach { name: String, arn: String },
-    /// Take a user's permissions boundary off, whatever its policies say:
-    /// the way out of a boundary that locks an admin out.
-    Unbound { name: String },
 }
 
-#[derive(Subcommand, Debug, Serialize, Deserialize)]
-enum KeyCommand {
-    /// Make a new access key for a user. Prints its ID and secret.
-    Create {
-        user: String,
-        /// Use this ID (else a random one of 20 characters).
-        #[arg(long)]
-        id: Option<String>,
-        /// Use this secret (else a random one).
-        #[arg(long)]
-        secret: Option<String>,
-    },
-    /// Delete an access key.
-    Delete { id: String },
-    /// Let an access key sign requests again.
-    Activate { id: String },
-    /// Stop an access key from signing requests, without deleting it.
-    Deactivate { id: String },
-}
-
-#[derive(Subcommand, Debug, Serialize, Deserialize)]
-enum PolicyCommand {
-    /// Deprecated: set a user's inline policy `name` to the JSON in `file`
-    /// (`-`: stdin).
-    Put {
-        user: String,
-        name: String,
-        #[serde(skip)]
-        file: String,
-        /// The file's contents, as the CLI read them (see `prepare`).
-        #[arg(skip)]
-        document: String,
-    },
-    /// Deprecated: print a user's inline policy.
-    Get { user: String, name: String },
-    /// Delete a user's inline policy.
-    Delete { user: String, name: String },
-}
-
-impl UserArgs {
-    /// Reads what the command takes from files, where the CLI runs.
-    pub fn prepare(&mut self) -> anyhow::Result<()> {
-        if let UserCommand::Policy(PolicyCommand::Put { file, document, .. }) = &mut self.command {
-            *document = crate::admin::read_document(file)?;
-        }
-        Ok(())
-    }
-}
-
-/// `cairn user …` (or `cairn role …`): user management, on a node (see
-/// `admin`).
-/// What replaces `command`, if it's one of those going: the command line is
-/// for setting a cluster up and getting back in (`create`, `enroll`,
-/// `update --admin`, `detach`, `unbound`, deleting an inline policy, `list`),
-/// not a second IAM API.
-fn deprecated(command: &UserCommand) -> Option<&'static str> {
-    match command {
-        UserCommand::Update { rotate_secret, secret, .. } if *rotate_secret || secret.is_some() => Some(
-            "an access key's secret never changes, as in IAM: rotate a key by making a second one \
-             (`aws iam create-access-key`, or the console), moving its clients over, and deleting the first",
-        ),
-        UserCommand::Grant { .. } | UserCommand::Revoke { .. } | UserCommand::Attach { .. } => {
-            Some("use the IAM API (`aws iam attach-user-policy`, `detach-user-policy`) or the console")
-        }
-        UserCommand::Delete { .. } => Some("use the IAM API (`aws iam delete-user`) or the console"),
-        UserCommand::Key(_) => Some(
-            "use the IAM API (`aws iam create-access-key`, `update-access-key`, `delete-access-key`) or the console",
-        ),
-        UserCommand::Policy(PolicyCommand::Put { .. } | PolicyCommand::Get { .. }) => {
-            Some("use the IAM API (`aws iam put-user-policy`, `get-user-policy`) or the console")
-        }
-        _ => None,
-    }
-}
-
+/// `cairn user create` (or `cairn role create`), on a node (see `admin`):
+/// the first users of a cluster. Everything else about users is IAM's
+/// (the API, or the console), as the account's root user if need be (see
+/// `accounts`).
 pub async fn run(app: &std::sync::Arc<crate::App>, args: UserArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
-    if let Some(instead) = deprecated(&args.command) {
-        out.warn(format_args!("this command is deprecated and will be removed: {instead}"));
-    }
     let client = app.pool.get().await?;
     let account_id = account(&client).await?;
     let account_id = account_id.as_str();
@@ -711,86 +572,6 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: UserArgs, out: &mut cra
                     eprintln!("kms: identifying users: {e:#}");
                 }
             });
-        }
-        UserCommand::Update {
-            name,
-            admin,
-            rotate_secret,
-            secret,
-        } => {
-            let secret = match (rotate_secret, secret) {
-                (true, _) => Some(generate_secret()?),
-                (false, s) => s,
-            };
-            update(&client, account_id, &name, admin, secret.clone()).await?;
-            if rotate_secret && let Some(s) = secret {
-                outln!(out, "secret key: {s}");
-            }
-        }
-        UserCommand::Delete { name } => delete(&client, account_id, &name).await?,
-        UserCommand::List => {
-            for user in list(&client).await?.into_iter().filter(|r| r.account_id == account_id) {
-                let admin = if user.admin { " (admin)" } else { "" };
-                outln!(out, "{}{admin}", user.name);
-                outln!(out, "  {}", user_arn(account_id, &user.path, &user.name));
-                if let Some(boundary) = &user.boundary {
-                    outln!(out, "  boundary {boundary}");
-                }
-                for (key, value) in &user.tags {
-                    outln!(out, "  tag {key}={value}");
-                }
-                outln!(out, "  id {}", user.id);
-                if let Some(entity) = user.kms_entity_id {
-                    outln!(out, "  KMS entity {entity}");
-                }
-                for key in user.keys {
-                    let state = if key.active { "" } else { " (inactive)" };
-                    outln!(out, "  key {}{state}", key.id);
-                }
-                for policy in crate::managed::attached(&client, account_id, &user.name).await? {
-                    outln!(out, "  attached {}", policy.arn);
-                }
-                for policy in user.policies {
-                    outln!(out, "  policy {policy}");
-                }
-            }
-        }
-        UserCommand::Enroll { name } => {
-            let token = crate::console::store::create_enrollment(&client, account_id, &name).await?;
-            enrollment_link(app, &token, out);
-        }
-        UserCommand::Key(command) => match command {
-            KeyCommand::Create { user, id, secret } => {
-                let (id, secret) = create_key(&client, account_id, &user, id, secret).await?;
-                outln!(out, "access key: {id}");
-                outln!(out, "secret key: {secret}");
-            }
-            KeyCommand::Delete { id } => delete_key(&client, None, &id).await?,
-            KeyCommand::Activate { id } => set_key_active(&client, None, &id, true).await?,
-            KeyCommand::Deactivate { id } => set_key_active(&client, None, &id, false).await?,
-        },
-        UserCommand::Policy(command) => match command {
-            PolicyCommand::Put { user, name, document, .. } => {
-                put_policy(&client, account_id, &user, &name, &document).await?;
-            }
-            PolicyCommand::Get { user, name } => outln!(out, "{}", get_policy(&client, account_id, &user, &name).await?),
-            PolicyCommand::Delete { user, name } => delete_policy(&client, account_id, &user, &name).await?,
-        },
-        UserCommand::Grant {
-            name,
-            bucket,
-            permissions,
-        } => grant(&client, account_id, &name, &bucket, &permissions).await?,
-        UserCommand::Revoke {
-            name,
-            bucket,
-            permissions,
-        } => revoke(&client, account_id, &name, &bucket, &permissions).await?,
-        UserCommand::Attach { name, arn } => crate::managed::attach(&client, account_id, &name, &arn, true).await?,
-        UserCommand::Detach { name, arn } => crate::managed::attach(&client, account_id, &name, &arn, false).await?,
-        UserCommand::Unbound { name } => {
-            let id = id_of(&client, account_id, &name).await?;
-            set_boundary(&client, account_id, id, None).await?;
         }
     }
     Ok(())
@@ -1389,7 +1170,9 @@ pub async fn delete_policy(client: &Object, account: &str, user: &str, name: &st
     Ok(())
 }
 
-/// Changes a user's admin flag and/or secret.
+/// Changes a user's admin flag and/or the secret of its key named as it
+/// (a migrated role's), for tests.
+#[cfg(test)]
 pub async fn update(
     client: &Object,
     account: &str,
@@ -1509,7 +1292,6 @@ pub struct UserInfo {
     pub name: String,
     /// Its account's ID.
     pub account_id: String,
-    pub admin: bool,
     /// When it was created, in seconds since the Unix epoch.
     pub created_at: f64,
     /// Its ID, which the KMS knows it by (see `kms`).
@@ -1551,7 +1333,6 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<UserInfo>> {
         .map(|r| {
             Ok(UserInfo {
                 name: r.get(0),
-                admin: r.get(1),
                 created_at: r.get(2),
                 id: r.get(5),
                 kms_entity_id: r.get(6),
@@ -1573,7 +1354,9 @@ pub async fn list(client: &Object) -> anyhow::Result<Vec<UserInfo>> {
 }
 
 /// Grants `name` (of `account`) permissions on an existing bucket of its
-/// account: as statements of the bucket's policy (see `grants`).
+/// account: as statements of the bucket's policy (see `grants`). For tests:
+/// the console's bucket access template makes grants now (see `templates`).
+#[cfg(test)]
 pub async fn grant(
     client: &Object,
     account: &str,
@@ -1586,7 +1369,8 @@ pub async fn grant(
 }
 
 /// Revokes `name`'s (of `account`) permissions on a bucket; all of them if
-/// none are given.
+/// none are given. For tests, as `grant`.
+#[cfg(test)]
 pub async fn revoke(
     client: &Object,
     account: &str,
@@ -1612,38 +1396,24 @@ mod cli {
         user: UserArgs,
     }
 
-    fn command(args: &[&str]) -> UserCommand {
-        Cli::parse_from(std::iter::once("cairn").chain(args.iter().copied())).user.command
-    }
-
-    /// The command line keeps what the IAM API can't do (set a cluster up,
-    /// and get back in); the rest is going.
+    /// The command line only makes the first users: everything else is
+    /// IAM's, as the account's root user if need be.
     #[test]
-    fn keeps_only_what_iam_cannot_do() {
-        let kept: &[&[&str]] = &[
-            &["create", "a", "--admin"],
-            &["update", "a", "--admin", "true"],
+    fn only_creates_users() {
+        let parse = |args: &[&str]| Cli::try_parse_from(std::iter::once("cairn").chain(args.iter().copied())).map(|c| c.user.command);
+        assert!(parse(&["create", "a", "--admin"]).is_ok());
+        assert!(parse(&["create", "a", "--key", "--id", "a-key", "--secret", "12345678"]).is_ok());
+        for gone in [
+            &["update", "a", "--admin", "true"][..],
             &["enroll", "a"],
             &["detach", "a", "arn:aws:iam::aws:policy/AdministratorAccess"],
             &["unbound", "a"],
             &["policy", "delete", "a", "p"],
             &["list"],
-        ];
-        for args in kept {
-            assert!(deprecated(&command(args)).is_none(), "{args:?}");
-        }
-        let going: &[&[&str]] = &[
             &["grant", "a", "b", "read"],
-            &["revoke", "a", "b"],
-            &["attach", "a", "arn:aws:iam::aws:policy/AdministratorAccess"],
-            &["delete", "a"],
             &["key", "delete", "k"],
-            &["policy", "get", "a", "p"],
-            &["update", "a", "--rotate-secret"],
-            &["update", "a", "--secret", "12345678"],
-        ];
-        for args in going {
-            assert!(deprecated(&command(args)).is_some(), "{args:?}");
+        ] {
+            assert!(parse(gone).is_err(), "{gone:?}");
         }
     }
 }

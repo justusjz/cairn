@@ -7,7 +7,6 @@
 
 use std::collections::HashMap;
 
-use clap::{Args, Subcommand};
 use deadpool_postgres::Object;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, body::Bytes};
@@ -252,78 +251,3 @@ pub async fn get_bucket_policy_status(app: &App, bucket: &str) -> anyhow::Result
     })
 }
 
-// ─── CLI ─────────────────────────────────────────────────────────────────────
-
-#[derive(Args, Debug, serde::Serialize, serde::Deserialize)]
-pub struct BucketPolicyArgs {
-    #[command(flatten)]
-    #[serde(skip)]
-    pub remote: crate::admin::Remote,
-    #[command(subcommand)]
-    command: BucketPolicyCommand,
-}
-
-#[derive(Subcommand, Debug, serde::Serialize, serde::Deserialize)]
-enum BucketPolicyCommand {
-    /// Print a bucket's policy.
-    Get { bucket: String },
-    /// Set a bucket's policy to the JSON in `file` (`-`: stdin).
-    Put {
-        bucket: String,
-        #[serde(skip)]
-        file: String,
-        /// The file's contents, as the CLI read them (see `prepare`).
-        #[arg(skip)]
-        document: String,
-    },
-    /// Delete a bucket's policy, whatever it says.
-    Delete { bucket: String },
-}
-
-impl BucketPolicyArgs {
-    /// Reads what the command takes from files, where the CLI runs.
-    pub fn prepare(&mut self) -> anyhow::Result<()> {
-        if let BucketPolicyCommand::Put { file, document, .. } = &mut self.command {
-            *document = crate::admin::read_document(file)?;
-        }
-        Ok(())
-    }
-}
-
-/// `cairn bucket-policy …`: a bucket's policy, on a node (see `admin`),
-/// whatever the policy says about who may change it.
-pub async fn run(
-    app: &std::sync::Arc<crate::App>,
-    args: BucketPolicyArgs,
-    out: &mut crate::admin::Output,
-) -> anyhow::Result<()> {
-    use crate::admin::outln;
-    let client = app.pool.get().await?;
-    match args.command {
-        BucketPolicyCommand::Get { bucket } => match shown(&client, &bucket).await? {
-            None => anyhow::bail!("no bucket named {bucket:?}"),
-            Some(None) => anyhow::bail!("{bucket:?} has no policy"),
-            Some(Some(policy)) => outln!(out, "{policy}"),
-        },
-        BucketPolicyCommand::Put { bucket, document, .. } => {
-            let policy = match check(&client, &bucket, &document).await? {
-                Ok(policy) => policy,
-                Err(refused) => anyhow::bail!("{}: {}", refused.code, refused.message),
-            };
-            match set(&client, &bucket, Some(&policy)).await? {
-                Set::Set => {}
-                Set::Blocked => anyhow::bail!(
-                    "{BLOCKED}: turn it off first (DeletePublicAccessBlock, of the bucket or its account, \
-                     or in the console)"
-                ),
-                Set::NoSuchBucket => anyhow::bail!("no bucket named {bucket:?}"),
-            }
-        }
-        BucketPolicyCommand::Delete { bucket } => {
-            if set(&client, &bucket, None).await? == Set::NoSuchBucket {
-                anyhow::bail!("no bucket named {bucket:?}");
-            }
-        }
-    }
-    Ok(())
-}

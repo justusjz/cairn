@@ -1,9 +1,9 @@
 //! The account, as AWS's: Cairn has one (see `plans/single-account.md`),
 //! which owns every user, bucket and policy; teams are told apart by IAM
-//! (paths, permissions boundaries). `cairn account show` shows it, and
-//! `cairn account root-link` makes a link to sign in to the console as its
-//! root user: the only way to be the root, and the way out of policies that
-//! lock everyone else out.
+//! (paths, permissions boundaries). `cairn account root-link` and
+//! `root-key` make its root user, for a while: a link to sign in to the
+//! console, or temporary credentials. They're the only ways to be the root,
+//! and the way out of policies that lock everyone else out.
 
 use std::sync::Arc;
 
@@ -13,7 +13,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     App,
     admin::{Output, outln},
-    db::Cached,
 };
 
 #[derive(Args, Debug, Serialize, Deserialize)]
@@ -27,8 +26,6 @@ pub struct AccountArgs {
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum AccountCommand {
-    /// Show the account: its ID, users and buckets.
-    Show,
     /// Print a one-time link (valid 15 minutes) to sign in to the console
     /// as the account's root user, whom no identity policy restricts (only
     /// buckets' policies' denies, but not of the policies themselves). The
@@ -50,19 +47,6 @@ const ROOT_KEY_SECONDS: u64 = 15 * 60;
 pub async fn run(app: &Arc<App>, args: AccountArgs, out: &mut Output) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     match args.command {
-        AccountCommand::Show => {
-            let row = client
-                .query_one_cached(
-                    "SELECT a.id,
-                            (SELECT count(*) FROM users r WHERE r.account_id = a.id),
-                            (SELECT count(*) FROM buckets b WHERE b.account_id = a.id)
-                     FROM accounts a WHERE NOT a.operator",
-                    &[],
-                )
-                .await?;
-            let (id, users, buckets): (String, i64, i64) = (row.get(0), row.get(1), row.get(2));
-            outln!(out, "account {id}\n  {users} users, {buckets} buckets");
-        }
         AccountCommand::RootKey => {
             let account = crate::users::account(&client).await?;
             let now = crate::sessions::now();

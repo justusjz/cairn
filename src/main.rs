@@ -181,16 +181,16 @@ struct Cli {
 enum Command {
     /// Run a storage node.
     Serve(ServeArgs),
-    /// Manage users: their S3 access keys, bucket permissions and policies.
+    /// Create the first users: people (with a console link) or services
+    /// (with an access key). The rest is IAM's: the API, or the console.
     #[command(alias = "role")]
     User(users::UserArgs),
-    /// Show the account (Cairn has one).
+    /// Become the account's root user for a while: a console link, or a
+    /// temporary access key.
     Account(accounts::AccountArgs),
     /// Configure the OpenID Connect providers people may sign in to the
     /// console at.
     Oidc(console::oidc::OidcArgs),
-    /// Show, set or delete a bucket's policy, whatever it allows.
-    BucketPolicy(s3::buckets::policy::BucketPolicyArgs),
     /// Show or change the cluster's settings.
     Config(settings::ConfigArgs),
     /// List the cluster's nodes, or remove one.
@@ -303,16 +303,9 @@ async fn main() -> anyhow::Result<()> {
 fn remote_command(command: Command) -> anyhow::Result<(admin::Remote, admin::Command)> {
     Ok(match command {
         Command::Serve(_) => anyhow::bail!("`cairn serve` runs here"),
-        Command::User(mut args) => {
-            args.prepare()?;
-            (args.remote.clone(), admin::Command::User(args))
-        }
+        Command::User(args) => (args.remote.clone(), admin::Command::User(args)),
         Command::Account(args) => (args.remote.clone(), admin::Command::Account(args)),
         Command::Oidc(args) => (args.remote.clone(), admin::Command::Oidc(args)),
-        Command::BucketPolicy(mut args) => {
-            args.prepare()?;
-            (args.remote.clone(), admin::Command::BucketPolicy(args))
-        }
         Command::Config(args) => (args.remote.clone(), admin::Command::Config(args)),
         Command::Node(args) => (args.remote.clone(), admin::Command::Node(args)),
         Command::Sessions(args) => (args.remote.clone(), admin::Command::Sessions(args)),

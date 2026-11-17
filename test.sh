@@ -251,11 +251,12 @@ exec 3>&- 3<&- 2>/dev/null
 
 
 # ─── 2b. Roles ───────────────────────────────────────────────────────────────
-# Managed with `cairn role`, which runs on the node (its peer endpoint, at the
-# default 127.0.0.1:9431). testkey is an admin (AdministratorAccess), which
-# allows it everything without grants. The others exercise permission
-# checks: reader can only read $BUCKET, writer can only use $OBUCKET (both
-# granted once those exist), and bucketadmin is an admin that holds no grants.
+# Made with `cairn role create`, which runs on the node (its peer endpoint, at
+# the default 127.0.0.1:9431); the rest of what they may do is IAM's (see
+# `grant`). testkey is an admin (AdministratorAccess), which allows it
+# everything without grants. The others exercise permission checks: reader
+# can only read $BUCKET, writer can only use $OBUCKET (both granted once
+# those exist), and bucketadmin is an admin that holds no grants.
 cairn_role() { (cd "$SCRIPT_DIR" && cargo run -q -- role "$@"); }
 info "Creating roles..."
 {
@@ -315,6 +316,53 @@ awss3() { as_role "$ACCESS_KEY" "$SECRET_KEY" "$@"; }
 as_session() {
     local key="$1" secret="$2" token="$3"; shift 3
     AWS_SESSION_TOKEN="$token" as_role "$key" "$secret" "$@"
+}
+# as_root <aws args...> — aws-cli as the account's root user, with the
+# temporary credentials `cairn account root-key` prints.
+as_root() {
+    (
+        eval "$(cd "$SCRIPT_DIR" && cargo run -q -- account root-key 2>/dev/null)" &&
+        AWS_SESSION_TOKEN="$AWS_SESSION_TOKEN" as_role "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$@"
+    )
+}
+
+# grant <user> <bucket> <read|write|delete-version>... — what a grant was:
+# a managed policy of the account per bucket and permission (made the first
+# time), attached to the user, through IAM as testkey.
+GRANT_READ='"s3:GetObject","s3:GetObjectVersion","s3:GetObjectAttributes","s3:GetObjectVersionAttributes","s3:GetObjectTagging","s3:GetObjectVersionTagging","s3:GetObjectAcl","s3:GetObjectVersionAcl","s3:GetObjectRetention","s3:GetObjectLegalHold","s3:ListBucket","s3:ListBucketVersions","s3:ListBucketMultipartUploads","s3:ListMultipartUploadParts"'
+GRANT_WRITE='"s3:PutObject","s3:PutObjectTagging","s3:PutObjectVersionTagging","s3:DeleteObject","s3:DeleteObjectTagging","s3:DeleteObjectVersionTagging","s3:PutObjectAcl","s3:PutObjectVersionAcl","s3:AbortMultipartUpload","s3:ListBucketMultipartUploads","s3:ListMultipartUploadParts"'
+GRANT_DELETE_VERSION='"s3:DeleteObjectVersion"'
+GRANT_CONFIG_READS='"s3:GetBucketVersioning","s3:GetEncryptionConfiguration","s3:GetLifecycleConfiguration","s3:GetBucketCORS","s3:GetBucketTagging","s3:GetBucketPublicAccessBlock","s3:GetBucketAcl","s3:GetBucketOwnershipControls","s3:GetBucketLocation","s3:GetBucketObjectLockConfiguration","s3:GetBucketWebsite","s3:GetReplicationConfiguration","s3:GetAccelerateConfiguration","s3:GetBucketRequestPayment","s3:GetBucketLogging","s3:GetBucketNotification"'
+grant_arn() {
+    local account
+    account=$(awss3 sts get-caller-identity --query Account --output text 2>/dev/null) || return 1
+    echo "arn:aws:iam::${account}:policy/test-grants/$1-$2"
+}
+grant() {
+    local user="$1" bucket="$2" perm actions arn; shift 2
+    for perm in "$@"; do
+        case "$perm" in
+            read) actions="$GRANT_READ" ;;
+            write) actions="$GRANT_WRITE" ;;
+            delete-version) actions="$GRANT_DELETE_VERSION" ;;
+            *) return 1 ;;
+        esac
+        arn=$(grant_arn "$bucket" "$perm") || return 1
+        awss3 iam create-policy --path /test-grants/ --policy-name "$bucket-$perm" --policy-document \
+            '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":['"$actions,$GRANT_CONFIG_READS"'],"Resource":["arn:aws:s3:::'"$bucket"'","arn:aws:s3:::'"$bucket"'/*"]}]}' \
+            >/dev/null 2>&1
+        awss3 iam attach-user-policy --user-name "$user" --policy-arn "$arn" >/dev/null 2>&1 || return 1
+    done
+}
+# revoke <user> <bucket> [<permission>...] — detaches them (all, if none).
+revoke() {
+    local user="$1" bucket="$2" perm arn; shift 2
+    [ $# -gt 0 ] || set -- read write delete-version
+    for perm in "$@"; do
+        arn=$(grant_arn "$bucket" "$perm") || return 1
+        awss3 iam detach-user-policy --user-name "$user" --policy-arn "$arn" >/dev/null 2>&1
+    done
+    return 0
 }
 # aws-cli with virtual-hosted-style addressing: bucket.localhost:port/key.
 AWSCFG_VHOST="$WORK_DIR/awscfg-vhost"
@@ -794,12 +842,12 @@ sse_kms_ok() {
         || return 1
     # A role that may read the bucket, but not use the key, can't read it
     # (but a plain object).
-    cairn_role grant reader "$BUCKET" read >/dev/null 2>&1 || return 1
+    grant reader "$BUCKET" read >/dev/null 2>&1 || return 1
     ! as_role reader readersecret s3api get-object --bucket "$BUCKET" --key kms/copy.bin "$out" \
         >/dev/null 2>&1 || return 1
     as_role reader readersecret s3api get-object --bucket "$BUCKET" --key kms/clear.bin "$out" \
         >/dev/null 2>&1 || return 1
-    cairn_role revoke reader "$BUCKET" read >/dev/null 2>&1 || return 1
+    revoke reader "$BUCKET" read >/dev/null 2>&1 || return 1
     for key in default other multi copy clear; do
         awss3 s3api delete-object --bucket "$BUCKET" --key "kms/$key.bin" >/dev/null 2>&1 || return 1
     done
@@ -815,14 +863,14 @@ sse_s3_ok() {
     [ "$(awss3 s3api head-object --bucket "$BUCKET" --key s3/big.bin --query ServerSideEncryption \
         --output text 2>/dev/null)" = AES256 ] || return 1
     awss3 s3 cp "$MULTIPART" "s3://${BUCKET}/s3/multi.bin" --sse AES256 >/dev/null 2>&1 || return 1
-    cairn_role grant reader "$BUCKET" read >/dev/null 2>&1 || return 1
+    grant reader "$BUCKET" read >/dev/null 2>&1 || return 1
     for key in big multi; do
         local src="$BIG"; [ "$key" = multi ] && src="$MULTIPART"
         as_role reader readersecret s3api get-object --bucket "$BUCKET" --key "s3/$key.bin" "$out" \
             >/dev/null 2>&1 || return 1
         cmp -s "$src" "$out" || return 1
     done
-    cairn_role revoke reader "$BUCKET" read >/dev/null 2>&1 || return 1
+    revoke reader "$BUCKET" read >/dev/null 2>&1 || return 1
     # The ETag is the MD5, as in S3, which s3cmd checks after an upload.
     local log="$WORK_DIR/s3cmd-sse-s3.log"
     s3 put "$BIG" "s3://${BUCKET}/s3/s3cmd.bin" --server-side-encryption >"$log" 2>&1 || return 1
@@ -1870,7 +1918,7 @@ vdel() {
 # it reads back. testkey also gets delete-version here, for the tests below.
 versioning_enable_ok() {
     make_bucket "$VBUCKET" || return 1
-    cairn_role grant writer "$VBUCKET" read write >/dev/null 2>&1 || return 1
+    grant writer "$VBUCKET" read write >/dev/null 2>&1 || return 1
     [ "$(awss3 s3api get-bucket-versioning --bucket "$VBUCKET" \
         --query Status --output text 2>/dev/null)" = "None" ] || return 1
     ! as_role writer writersecret s3api put-bucket-versioning --bucket "$VBUCKET" \
@@ -2081,10 +2129,10 @@ list_versions_unversioned_ok() {
 # Listing versions is a read: a role holding only `write` on the bucket can't.
 # (The grant is revoked again, as later tests expect writer to have none here.)
 list_versions_needs_read_ok() {
-    cairn_role grant writer "$BUCKET" write >/dev/null 2>&1 || return 1
+    grant writer "$BUCKET" write >/dev/null 2>&1 || return 1
     ! as_role writer writersecret s3api list-object-versions --bucket "$BUCKET" >/dev/null 2>&1
     local rc=$?
-    cairn_role revoke writer "$BUCKET" >/dev/null 2>&1 || return 1
+    revoke writer "$BUCKET" >/dev/null 2>&1 || return 1
     return "$rc"
 }
 
@@ -2352,23 +2400,20 @@ list_buckets_denied_ok() {
         | tr '\t' '\n' | grep -qx "$OBUCKET"
 }
 
-cairn_user() { (cd "$SCRIPT_DIR" && cargo run -q -- user "$@"); }
-cairn_bucket_policy() { (cd "$SCRIPT_DIR" && cargo run -q -- bucket-policy "$@"); }
-
 # Bucket policies: only an admin sets one; it reads back as S3 keeps it, and
 # decides requests as S3's does: anonymous ones (a public prefix, and nothing
 # else: a missing key there is a 403, as the policy doesn't allow listing),
 # and a user's (allowed what it has no grant for, denied what its grant would
 # allow, with S3's messages). One that denies everyone, its admins too, the
-# command line (`cairn bucket-policy delete`) can still remove.
+# account's root user (`cairn account root-key`) can still remove.
 bucket_policy_ok() {
     local b="pol-$(date +%s)" doc="$WORK_DIR/policy.json" deny="$WORK_DIR/deny-all.json" out arn account url
     url="http://${SERVER_HOST}:${SERVER_PORT}/$b"
-    arn=$(cairn_user list | sed -n 's|^  \(arn:aws:iam::[0-9]*:user/writer\)$|\1|p')
+    arn=$(awss3 iam get-user --user-name writer --query User.Arn --output text 2>/dev/null)
     account=$(echo "$arn" | cut -d: -f5)
     [ -n "$account" ] || return 1
     awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
-    cairn_role grant writer "$b" write >/dev/null 2>&1 || return 1
+    grant writer "$b" write >/dev/null 2>&1 || return 1
     printf 'public' > "$WORK_DIR/pub.txt"
     for key in pub/a.txt private.txt; do
         awss3 s3api put-object --bucket "$b" --key "$key" --body "$WORK_DIR/pub.txt" >/dev/null 2>&1 || return 1
@@ -2447,7 +2492,9 @@ bucket_policy_ok() {
     awss3 s3api put-bucket-policy --bucket "$b" --policy "file://$deny" >/dev/null 2>&1 || return 1
     ! awss3 s3api delete-bucket-policy --bucket "$b" >/dev/null 2>&1 || return 1
     ! awss3 s3api get-object --bucket "$b" --key pub/a.txt "$WORK_DIR/pol.out" >/dev/null 2>&1 || return 1
-    cairn_bucket_policy delete "$b" >/dev/null 2>&1 || return 1
+    # The root, as everyone, may not read it, but may delete its policy.
+    ! as_root s3api get-object --bucket "$b" --key pub/a.txt "$WORK_DIR/pol.out" >/dev/null 2>&1 || return 1
+    as_root s3api delete-bucket-policy --bucket "$b" >/dev/null 2>&1 || return 1
     awss3 s3api get-object --bucket "$b" --key pub/a.txt "$WORK_DIR/pol.out" >/dev/null 2>&1 || return 1
     [ "$(curl -s -o /dev/null -w '%{http_code}' "$url/pub/a.txt")" = 403 ] || return 1
     for key in pub/a.txt private.txt open/x.txt drop/form.txt; do
@@ -2501,20 +2548,22 @@ account_block_ok() {
 user_keys_and_policies_ok() {
     local b="keys-$(date +%s)" out id secret
     awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
-    cairn_user grant reader "$b" read >/dev/null 2>&1 || return 1
-    out=$(cairn_user key create reader) || return 1
-    id=$(echo "$out" | sed -n 's/^access key: //p')
-    secret=$(echo "$out" | sed -n 's/^secret key: //p')
+    grant reader "$b" read >/dev/null 2>&1 || return 1
+    out=$(awss3 iam create-access-key --user-name reader \
+        --query 'AccessKey.[AccessKeyId,SecretAccessKey]' --output text 2>/dev/null) || return 1
+    id=$(echo "$out" | cut -f1)
+    secret=$(echo "$out" | cut -f2)
     as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
-    cairn_user key deactivate "$id" >/dev/null 2>&1 || return 1
+    awss3 iam update-access-key --user-name reader --access-key-id "$id" --status Inactive >/dev/null 2>&1 || return 1
     ! as_role "$id" "$secret" s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
-    cairn_user key delete "$id" >/dev/null 2>&1 || return 1
+    awss3 iam delete-access-key --user-name reader --access-key-id "$id" >/dev/null 2>&1 || return 1
     printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:ListBucket","Resource":"arn:aws:s3:::'"$b"'"}]}' \
         > "$WORK_DIR/nolist.json"
-    cairn_user policy put reader nolist "$WORK_DIR/nolist.json" >/dev/null 2>&1 || return 1
+    awss3 iam put-user-policy --user-name reader --policy-name nolist \
+        --policy-document "file://$WORK_DIR/nolist.json" >/dev/null 2>&1 || return 1
     out=$(as_role reader readersecret s3api list-objects-v2 --bucket "$b" 2>&1) && return 1
     echo "$out" | grep -q 'with an explicit deny in an identity-based policy' || return 1
-    cairn_user policy delete reader nolist >/dev/null 2>&1 || return 1
+    awss3 iam delete-user-policy --user-name reader --policy-name nolist >/dev/null 2>&1 || return 1
     as_role reader readersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
@@ -2901,8 +2950,8 @@ cross_bucket_denied_ok() {
 # Second bucket for the cross-bucket tests, and the grants for reader/writer.
 setup_role_buckets() {
     make_bucket "$OBUCKET" || return 1
-    cairn_role grant writer "$OBUCKET" read write || return 1
-    cairn_role grant reader "$BUCKET" read
+    grant writer "$OBUCKET" read write || return 1
+    grant reader "$BUCKET" read
 }
 
 # Resuming an upload with write alone: the role finds its upload
@@ -2910,7 +2959,7 @@ setup_role_buckets() {
 # (ListParts), and completes it with them.
 resume_upload_ok() {
     local w=(as_role writer writersecret) key="resume.bin" uid listed
-    cairn_role revoke writer "$OBUCKET" read >/dev/null 2>&1 || return 1
+    revoke writer "$OBUCKET" read >/dev/null 2>&1 || return 1
     uid=$("${w[@]}" s3api create-multipart-upload --bucket "$OBUCKET" --key "$key" \
         --query UploadId --output text 2>/dev/null) || return 1
     "${w[@]}" s3api upload-part --bucket "$OBUCKET" --key "$key" --upload-id "$uid" \
@@ -2921,25 +2970,24 @@ resume_upload_ok() {
         --query '{Parts: Parts[].{PartNumber: PartNumber, ETag: ETag}}' --output json 2>/dev/null) || return 1
     "${w[@]}" s3api complete-multipart-upload --bucket "$OBUCKET" --key "$key" --upload-id "$uid" \
         --multipart-upload "$listed" >/dev/null 2>&1 || return 1
-    cairn_role grant writer "$OBUCKET" read >/dev/null 2>&1 || return 1
+    grant writer "$OBUCKET" read >/dev/null 2>&1 || return 1
     check_roundtrip "$SMALL" "s3://${OBUCKET}/$key" || return 1
     "${w[@]}" s3api delete-object --bucket "$OBUCKET" --key "$key" >/dev/null 2>&1
 }
 
-# Grants and the bucket's lifecycle: granting on a missing bucket fails. A
-# grant is a managed policy of the user's (see `grants`), which outlives the
-# bucket, as an IAM policy does in AWS: a bucket made again under the same
-# name is the user's again, until the grant is revoked.
+# Grants and the bucket's lifecycle: a grant is a managed policy of the
+# user's (see `grant`), which outlives the bucket, as an IAM policy does in
+# AWS: a bucket made again under the same name is the user's again, until the
+# grant is revoked.
 grants_follow_bucket_ok() {
     local a=(as_role bucketadmin adminsecret) b="life-$(date +%s)"
-    ! cairn_role grant writer "$b" read >/dev/null 2>&1 || return 1
     "${a[@]}" s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
-    cairn_role grant writer "$b" read >/dev/null 2>&1 || return 1
+    grant writer "$b" read >/dev/null 2>&1 || return 1
     as_role writer writersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
     "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1 || return 1
     "${a[@]}" s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
     as_role writer writersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
-    cairn_role revoke writer "$b" read >/dev/null 2>&1 || return 1
+    revoke writer "$b" read >/dev/null 2>&1 || return 1
     ! as_role writer writersecret s3api list-objects-v2 --bucket "$b" >/dev/null 2>&1 || return 1
     "${a[@]}" s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
@@ -2957,7 +3005,7 @@ missing_bucket_404_ok() {
 
 # A revoked grant takes effect on the very next request (no caching).
 revoke_takes_effect_ok() {
-    cairn_role revoke reader "$BUCKET" >/dev/null 2>&1 || return 1
+    revoke reader "$BUCKET" >/dev/null 2>&1 || return 1
     ! as_role reader readersecret s3api head-object --bucket "$BUCKET" --key big.bin >/dev/null 2>&1
 }
 
