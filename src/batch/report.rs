@@ -24,7 +24,7 @@ use md5::{Digest, Md5};
 use sha2::Sha256;
 use uuid::Uuid;
 
-use super::{Failure, Report, authorize, manifest::Task};
+use super::{Failure, Report, authorize, manifest::Task, source::Position};
 use crate::db::Cached;
 use crate::{
     App,
@@ -132,13 +132,13 @@ impl Writer {
     }
 
     /// Writes the result files of the page of `lines` starting at `start`
-    /// (a byte offset in the manifest), as `principal`.
+    /// in the manifest, as `principal`.
     pub async fn page(
         &self,
         app: &Arc<App>,
         principal: &Principal,
         id: Uuid,
-        start: u64,
+        start: Position,
         lines: &[Line],
     ) -> anyhow::Result<Result<Vec<ResultFile>, Failure>> {
         let mut files = Vec::new();
@@ -171,7 +171,7 @@ impl Writer {
     ) -> anyhow::Result<Result<(), Failure>> {
         let rows = client
             .query_cached(
-                "SELECT key, status, md5 FROM batch_job_results WHERE job_id = $1 ORDER BY start_at, status DESC",
+                "SELECT key, status, md5 FROM batch_job_results WHERE job_id = $1 ORDER BY file, start_at, status DESC",
                 &[&id],
             )
             .await?;
@@ -269,8 +269,12 @@ pub fn bucket_of_arn(arn: &str) -> Option<&str> {
 
 /// The name of the result file of job `id`'s page at `start` of tasks that
 /// `status`: always the same, 40 hex digits, as S3's are.
-fn file_name(id: Uuid, start: u64, status: &str) -> String {
-    let digest = Sha256::digest(format!("{id}/{start}/{status}"));
+fn file_name(id: Uuid, start: Position, status: &str) -> String {
+    let Position { file, offset } = start;
+    let digest = match file {
+        0 => Sha256::digest(format!("{id}/{offset}/{status}")),
+        _ => Sha256::digest(format!("{id}/{file}/{offset}/{status}")),
+    };
     digest.iter().take(20).map(|b| format!("{b:02x}")).collect()
 }
 
@@ -353,10 +357,12 @@ mod tests {
     #[test]
     fn result_files_are_named_by_their_page() {
         let id = Uuid::nil();
-        assert_eq!(file_name(id, 0, "failed"), file_name(id, 0, "failed"));
-        assert_ne!(file_name(id, 0, "failed"), file_name(id, 0, "succeeded"));
-        assert_ne!(file_name(id, 0, "failed"), file_name(id, 1, "failed"));
-        assert_eq!(file_name(id, 0, "failed").len(), 40);
+        let at = |file, offset| Position { file, offset };
+        assert_eq!(file_name(id, at(0, 0), "failed"), file_name(id, at(0, 0), "failed"));
+        assert_ne!(file_name(id, at(0, 0), "failed"), file_name(id, at(0, 0), "succeeded"));
+        assert_ne!(file_name(id, at(0, 0), "failed"), file_name(id, at(0, 1), "failed"));
+        assert_ne!(file_name(id, at(1, 0), "failed"), file_name(id, at(0, 0), "failed"));
+        assert_eq!(file_name(id, at(0, 0), "failed").len(), 40);
     }
 
     #[test]

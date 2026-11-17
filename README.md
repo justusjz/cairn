@@ -1475,11 +1475,13 @@ S3 Batch Operations: a job (S3 Control's `CreateJob`,
 `aws s3control create-job`) does one operation to every object a manifest
 lists, as a role. Cairn does `S3PutObjectTagging` (replacing each object's
 tags), `S3DeleteObjectTagging`, `S3PutObjectRetention` and
-`S3PutObjectLegalHold` ([Object Lock](#object-lock)), from a CSV manifest:
-an object of lines
-`bucket,key` (or `bucket,key,versionId`, as its `Fields` say), keys
-URL-encoded. Other operations and inventory reports as manifests aren't
-done yet (see [S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#batch-operations)).
+`S3PutObjectLegalHold` ([Object Lock](#object-lock)). Its manifest is a
+CSV object of lines `bucket,key` (or `bucket,key,versionId`, as its
+`Fields` say), keys URL-encoded, or a CSV [inventory report](#inventory)'s
+`manifest.json` (`S3InventoryReport_CSV_20161130`, without `Fields`): its
+tasks are then the report's rows, so a job can do something to every
+object (or every version) a report lists. Other operations aren't done yet
+(see [S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#batch-operations)).
 A job can write a completion report, of all its tasks or only those that
 failed, as S3 writes it.
 

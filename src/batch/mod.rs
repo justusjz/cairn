@@ -10,8 +10,9 @@
 //!   does no harm, which a job relies on (below): a retention set again is
 //!   set to the same date, which isn't shortening it. Others are refused
 //!   with 501 NotImplemented.
-//! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`) only; not
-//!   inventory reports' `manifest.json`, nor manifests S3 generates.
+//! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`), and CSV
+//!   inventory reports (`S3InventoryReport_CSV_20161130`; see `source`);
+//!   not manifests S3 generates.
 //! - Completion reports: as S3 writes them, of all tasks or only those that
 //!   failed (see `report`).
 //!
@@ -31,8 +32,8 @@
 //! one of the versions read an hour the rate allows (preparing reads the
 //! manifest only, and takes none of it, but at most `PREPARE_BYTES` of it a
 //! turn). Among jobs, the highest priority goes first, then the one that
-//! has waited longest. A turn reads its manifest a page of lines at a time,
-//! by byte ranges, pinned to its ETag (If-Match), so that a manifest
+//! has waited longest. A turn reads its manifest a page of lines at a time
+//! (see `source`), pinned to its ETag (If-Match), so that a manifest
 //! changed under a job fails it rather than changing what it does; and
 //! saves where it has got to after each page (`batch_jobs.cursor`), with
 //! the counts of what succeeded and failed, and the page's result files,
@@ -54,6 +55,7 @@
 pub mod control;
 pub mod manifest;
 pub mod report;
+pub mod source;
 
 use std::{
     sync::Arc,
@@ -61,8 +63,7 @@ use std::{
 };
 
 use deadpool_postgres::Object;
-use http_body_util::BodyExt;
-use hyper::{HeaderMap, Method, StatusCode, body::Bytes, header};
+use hyper::{HeaderMap, Method};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -72,9 +73,9 @@ use crate::{
     policy::{Context, Decision, Kind, Policy, Principal as Who, Request},
     s3::{
         access::{Access, Origin},
-        actions, conditional::Preconditions,
+        actions,
         object_lock::{Change, Mode, Outcome as LockOutcome, parse_date},
-        objects::{get::get_object, tagging::{self, Outcome, Tagging}},
+        objects::tagging::{self, Outcome, Tagging},
         tags::Tags,
     },
     users::Principal,
@@ -82,6 +83,7 @@ use crate::{
 
 use manifest::{Field, Task};
 use report::{Line, TaskFailure, Writer};
+use source::{DataLines, Inventory, Position, Source};
 
 /// The service a job's role is assumed as.
 pub const SERVICE: &str = "batchoperations.s3.amazonaws.com";
@@ -218,9 +220,12 @@ pub(crate) struct Job {
     manifest: Manifest,
     report: Report,
     role_arn: String,
-    prepared: i64,
+    /// Its inventory report's data files, once preparing has read its
+    /// manifest (if its manifest is one).
+    inventory: Option<Inventory>,
+    prepared: Position,
     total: i64,
-    cursor: i64,
+    cursor: Position,
     succeeded: i64,
     failed: i64,
 }
@@ -281,7 +286,7 @@ pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Op
     let row = client
         .query_opt_cached(
             "SELECT id, account_id, status, operation, manifest, role_arn, prepared, total, cursor,
-                    succeeded, failed, waiting_since, report
+                    succeeded, failed, waiting_since, report, prepared_file, cursor_file, inventory
              FROM batch_jobs
              WHERE status IN ('New', 'Preparing', 'Ready', 'Active', 'Cancelling') AND NOT (id = ANY($1))
              ORDER BY priority DESC, waiting_since LIMIT 1",
@@ -292,6 +297,7 @@ pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Op
     let operation: String = row.get(3);
     let manifest: String = row.get(4);
     let report: String = row.get(12);
+    let inventory: Option<String> = row.get(15);
     let job = Job {
         id: row.get(0),
         account: row.get(1),
@@ -300,9 +306,10 @@ pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Op
         manifest: serde_json::from_str(&manifest)?,
         report: serde_json::from_str(&report)?,
         role_arn: row.get(5),
-        prepared: row.get(6),
+        inventory: inventory.as_deref().map(serde_json::from_str).transpose()?,
+        prepared: Position { file: row.get(13), offset: row.get::<_, i64>(6) as u64 },
         total: row.get(7),
-        cursor: row.get(8),
+        cursor: Position { file: row.get(14), offset: row.get::<_, i64>(8) as u64 },
         succeeded: row.get(9),
         failed: row.get(10),
     };
@@ -406,38 +413,82 @@ async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, tu
     {
         return fail(client, job, failure, now, turn).await;
     }
-    let fields = job.manifest.fields();
-    let mut prepared = job.prepared as u64;
     let mut total = job.total;
-    let mut done = false;
-    let start = prepared;
-    while prepared - start < PREPARE_BYTES {
-        let chunk = match read(app, &job.manifest, principal.id, prepared).await? {
-            Ok(chunk) => chunk,
-            Err(failure) => return fail(client, job, failure, now, turn).await,
-        };
-        let (lines, consumed) = manifest::lines(&chunk.data, chunk.last, usize::MAX);
-        for line in lines {
-            let parsed = std::str::from_utf8(line)
-                .map_err(|_| "it isn't UTF-8".to_owned())
-                .and_then(|line| manifest::parse_line(line, &fields));
-            if let Err(why) = parsed {
-                let failure = Failure::new("ManifestInvalid", format!("Line {} of the manifest isn't a task: {why}.", total + 1));
-                return fail(client, job, failure, now, turn).await;
+    let (prepared, inventory, done) = match job.manifest.format.as_str() {
+        manifest::INVENTORY => {
+            let mut inventory = match &job.inventory {
+                Some(inventory) => inventory.clone(),
+                None => match source::read_inventory(app, &job.manifest, principal.id).await? {
+                    Ok(inventory) => inventory,
+                    Err(failure) => return fail(client, job, failure, now, turn).await,
+                },
+            };
+            // Whole data files, as far as `PREPARE_BYTES` goes.
+            let fields = inventory.fields();
+            let mut file = job.prepared.file as usize;
+            let mut read = 0;
+            while file < inventory.files.len() && read < PREPARE_BYTES {
+                let data = &inventory.files[file];
+                let mut lines = match DataLines::open(app, data, &principal).await? {
+                    Ok(lines) => lines,
+                    Err(failure) => return fail(client, job, failure, now, turn).await,
+                };
+                loop {
+                    let line = match lines.line().await? {
+                        Ok(Some(line)) => line,
+                        Ok(None) => break,
+                        Err(failure) => return fail(client, job, failure, now, turn).await,
+                    };
+                    if let Err(why) = check_line(&line, &fields) {
+                        let why = format!("Line {} of the data file {} isn't a task: {why}.", total + 1, data.key);
+                        return fail(client, job, Failure::new("ManifestInvalid", why), now, turn).await;
+                    }
+                    total += 1;
+                    turn.prepared += 1;
+                }
+                if lines.md5() != data.md5 {
+                    let why = format!("The data file {} isn't the one the inventory report lists (its MD5 differs).", data.key);
+                    return fail(client, job, Failure::new("ManifestInvalid", why), now, turn).await;
+                }
+                read += lines.size;
+                inventory.files[file].etag = Some(lines.etag.clone());
+                file += 1;
             }
-            total += 1;
-            turn.prepared += 1;
+            let done = file == inventory.files.len();
+            (Position { file: file as i32, offset: 0 }, Some(serde_json::to_string(&inventory)?), done)
         }
-        prepared += consumed as u64;
-        if chunk.last && consumed == chunk.data.len() {
-            done = true;
-            break;
+        _ => {
+            let fields = job.manifest.fields();
+            let mut prepared = job.prepared.offset;
+            let mut done = false;
+            let start = prepared;
+            while prepared - start < PREPARE_BYTES {
+                let chunk = match source::read(app, &job.manifest, principal.id, prepared).await? {
+                    Ok(chunk) => chunk,
+                    Err(failure) => return fail(client, job, failure, now, turn).await,
+                };
+                let (lines, consumed) = manifest::lines(&chunk.data, chunk.last, usize::MAX);
+                for line in lines {
+                    if let Err(why) = check_line(line, &fields) {
+                        let why = format!("Line {} of the manifest isn't a task: {why}.", total + 1);
+                        return fail(client, job, Failure::new("ManifestInvalid", why), now, turn).await;
+                    }
+                    total += 1;
+                    turn.prepared += 1;
+                }
+                prepared += consumed as u64;
+                if chunk.last && consumed == chunk.data.len() {
+                    done = true;
+                    break;
+                }
+                if consumed == 0 {
+                    let failure = Failure::new("ManifestInvalid", format!("Line {} of the manifest is too long.", total + 1));
+                    return fail(client, job, failure, now, turn).await;
+                }
+            }
+            (Position { file: 0, offset: prepared }, None, done)
         }
-        if consumed == 0 {
-            let failure = Failure::new("ManifestInvalid", format!("Line {} of the manifest is too long.", total + 1));
-            return fail(client, job, failure, now, turn).await;
-        }
-    }
+    };
     let row = client
         .query_opt_cached(
             "UPDATE batch_jobs SET prepared = $2, total = $3::bigint, waiting_since = $4,
@@ -447,14 +498,21 @@ async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, tu
                                ELSE 'Ready' END,
                  suspended_at = CASE WHEN $5::boolean AND $3::bigint > 0 AND confirmation THEN $4::timestamptz END,
                  suspended_cause = CASE WHEN $5::boolean AND $3::bigint > 0 AND confirmation THEN $6::text END,
-                 terminated_at = CASE WHEN $5::boolean AND $3::bigint = 0 THEN $4::timestamptz END
+                 terminated_at = CASE WHEN $5::boolean AND $3::bigint = 0 THEN $4::timestamptz END,
+                 prepared_file = $7, inventory = $8
              WHERE id = $1 AND status IN ('New', 'Preparing')
              RETURNING status",
-            &[&job.id, &(prepared as i64), &total, &now, &done, &AWAITING_CONFIRMATION],
+            &[&job.id, &(prepared.offset as i64), &total, &now, &done, &AWAITING_CONFIRMATION, &prepared.file, &inventory],
         )
         .await?;
     turn.status = row.map_or_else(|| "Cancelled".to_owned(), |row| row.get(0));
     Ok(())
+}
+
+/// Why a manifest's line isn't a task, if it isn't.
+fn check_line(line: &[u8], fields: &[Field]) -> Result<(), String> {
+    let line = std::str::from_utf8(line).map_err(|_| "it isn't UTF-8".to_owned())?;
+    manifest::parse_line(line, fields).map(|_| ())
 }
 
 /// Does the job's tasks, a page at a time, as far as `budget` allows.
@@ -498,26 +556,25 @@ async fn run(
         }
         Operation::DeleteTagging => {}
     }
-    let fields = job.manifest.fields();
+    let (mut source, fields) = match (&job.inventory, job.manifest.format.as_str()) {
+        (Some(inventory), _) => (Source::Inventory(inventory, None), inventory.fields()),
+        (None, manifest::INVENTORY) => anyhow::bail!("job {} was prepared without its inventory report's files", job.id),
+        (None, _) => (Source::Csv(&job.manifest), job.manifest.fields()),
+    };
     let writer = Writer::of(&job.report, job.id);
     let who = principal.arn();
-    let (mut cursor, mut succeeded, mut failed) = (job.cursor as u64, job.succeeded, job.failed);
+    let (mut cursor, mut succeeded, mut failed) = (job.cursor, job.succeeded, job.failed);
     // Its tasks' writes are its role session's, as their events say.
     crate::notifications::scope(async {
         crate::notifications::set_requester(Some(principal.unique_id()), None);
         while *budget > 0 {
             let began = std::time::Instant::now();
-            let chunk = match read(app, &job.manifest, principal.id, cursor).await? {
-                Ok(chunk) => chunk,
+            let limit = (*budget).clamp(1, PAGE as i64) as usize;
+            let page = match source.page(app, &principal, cursor, limit).await? {
+                Ok(page) => page,
                 Err(failure) => return fail(client, job, failure, now, turn).await,
             };
-            let limit = (*budget).clamp(1, PAGE as i64) as usize;
-            let (lines, consumed) = manifest::lines(&chunk.data, chunk.last, limit);
-            let finished = chunk.last && consumed == chunk.data.len();
-            if lines.is_empty() && !finished {
-                let failure = Failure::new("ManifestInvalid", "A line of the manifest is too long.");
-                return fail(client, job, failure, now, turn).await;
-            }
+            let (lines, finished) = (page.lines, page.finished);
             let mut done_lines = Vec::with_capacity(lines.len());
             for line in &lines {
                 let parsed = std::str::from_utf8(line)
@@ -552,7 +609,7 @@ async fn run(
             }
             *budget -= lines.len().max(1) as i64;
             let start = cursor;
-            cursor += consumed as u64;
+            cursor = page.end;
             let files = match &writer {
                 Some(writer) => match writer.page(app, &principal, job.id, start, &done_lines).await? {
                     Ok(files) => files,
@@ -569,27 +626,29 @@ async fn run(
                 .query_opt_cached(
                     "WITH job AS (
                          UPDATE batch_jobs SET cursor = $2, succeeded = $3, failed = $4,
-                             active_seconds = active_seconds + $5, waiting_since = $6
+                             active_seconds = active_seconds + $5, waiting_since = $6, cursor_file = $11
                          WHERE id = $1 AND status IN ('Active', 'Cancelling')
                          RETURNING status),
                      files AS (
-                         INSERT INTO batch_job_results (job_id, start_at, status, key, md5)
-                         SELECT $1, $7, f.status, f.key, f.md5
+                         INSERT INTO batch_job_results (job_id, file, start_at, status, key, md5)
+                         SELECT $1, $12, $7, f.status, f.key, f.md5
                          FROM unnest($8::text[], $9::text[], $10::text[]) AS f(status, key, md5)
                          WHERE EXISTS (SELECT 1 FROM job)
                          ON CONFLICT DO NOTHING)
                      SELECT status FROM job",
                     &[
                         &job.id,
-                        &(cursor as i64),
+                        &(cursor.offset as i64),
                         &succeeded,
                         &failed,
                         &began.elapsed().as_secs_f64(),
                         &now,
-                        &(start as i64),
+                        &(start.offset as i64),
                         &statuses,
                         &keys,
                         &md5s,
+                        &cursor.file,
+                        &start.file,
                     ],
                 )
                 .await?;
@@ -754,16 +813,29 @@ async fn authorize(
 
 /// Whether the job's role session (`principal`) may read its manifest.
 async fn may_read_manifest(app: &App, principal: &Principal, manifest: &Manifest) -> anyhow::Result<Result<(), Failure>> {
+    may_read(app, principal, &manifest.bucket, &manifest.key, manifest.version_id.as_deref(), &manifest.arn).await
+}
+
+/// Whether the role session `principal` may read the object (`bucket`'s
+/// `key`, of `version_id`; `arn`, as failures name it).
+async fn may_read(
+    app: &App,
+    principal: &Principal,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    arn: &str,
+) -> anyhow::Result<Result<(), Failure>> {
     let account = crate::users::account(&app.pool.get().await?).await?;
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
     let mut access = Access::new(Some(principal), &account, &Method::GET, &HeaderMap::new(), "", &origin)?;
-    let query = match &manifest.version_id {
+    let query = match version_id {
         Some(v) => format!("versionId={}", percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)),
         None => String::new(),
     };
-    Ok(authorize(app, &mut access, &principal.arn(), &Method::GET, &manifest.bucket, &manifest.key, &query)
+    Ok(authorize(app, &mut access, &principal.arn(), &Method::GET, bucket, key, &query)
         .await?
-        .map_err(|why| Failure::new("ManifestUnreadable", format!("Reading the manifest {} failed: {why}.", manifest.arn))))
+        .map_err(|why| Failure::new("ManifestUnreadable", format!("Reading {arn} failed: {why}."))))
 }
 
 /// The session of the job's role, assumed as `SERVICE`; why not, if it
@@ -819,69 +891,6 @@ pub(crate) fn role_of_arn<'a>(arn: &'a str, account: &str) -> Option<(String, &'
         None => ("/".to_owned(), rest),
     };
     (!name.is_empty()).then_some((path, name))
-}
-
-/// Some of a manifest, read from `from`.
-struct Chunk {
-    data: Bytes,
-    /// Whether it's the rest of the manifest.
-    last: bool,
-}
-
-/// Reads up to `CHUNK` bytes of the manifest from `from`, as long as it's
-/// still the one of its ETag (as the role `role` asks the KMS for its key,
-/// if it's SSE-KMS); why it can't be, if it can't.
-async fn read(app: &Arc<App>, manifest: &Manifest, role: Uuid, from: u64) -> anyhow::Result<Result<Chunk, Failure>> {
-    let mut headers = HeaderMap::new();
-    headers.insert(header::IF_MATCH, manifest.if_match().parse()?);
-    let preconditions = Preconditions::from_headers(&headers);
-    let range = format!("bytes={from}-{}", from + CHUNK - 1);
-    let response = get_object(
-        app,
-        &manifest.bucket,
-        &manifest.key,
-        manifest.version_id.as_deref(),
-        Some(&range),
-        None,
-        &preconditions,
-        None,
-        Some(role),
-        false,
-    )
-    .await?;
-    let status = response.status();
-    let unreadable = |why: String| Ok(Err(Failure::new("ManifestUnreadable", format!("Reading the manifest {} failed: {why}.", manifest.arn))));
-    match status {
-        StatusCode::OK | StatusCode::PARTIAL_CONTENT => {}
-        // Past its end: there's no more.
-        StatusCode::RANGE_NOT_SATISFIABLE => return Ok(Ok(Chunk { data: Bytes::new(), last: true })),
-        StatusCode::PRECONDITION_FAILED => {
-            return Ok(Err(Failure::new(
-                "ManifestETagMismatch",
-                format!("The manifest {} isn't the one of ETag {} any more.", manifest.arn, manifest.etag),
-            )));
-        }
-        _ => {
-            let body = response.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
-            let body = String::from_utf8_lossy(&body);
-            let code = body.split("<Code>").nth(1).and_then(|s| s.split("</Code>").next()).unwrap_or("");
-            return unreadable(format!("{} {code}", status.as_u16()));
-        }
-    }
-    // Its size, from `Content-Range` (`bytes a-b/size`).
-    let size = response
-        .headers()
-        .get(header::CONTENT_RANGE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.rsplit_once('/'))
-        .and_then(|(_, size)| size.parse::<u64>().ok());
-    let data = response.into_body().collect().await.map_err(|e| anyhow::anyhow!("reading the manifest: {e}"))?.to_bytes();
-    let last = match size {
-        Some(size) => from + data.len() as u64 >= size,
-        // The whole of it.
-        None => status == StatusCode::OK,
-    };
-    Ok(Ok(Chunk { data, last }))
 }
 
 #[cfg(test)]

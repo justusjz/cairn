@@ -2573,6 +2573,22 @@ batch_jobs_ok() {
         --query Priority --output text 2>/dev/null)" = 20 ] || return 1
     [ "$(awsvhost s3control get-job-tagging --account-id "$account" --job-id "$job" \
         --query 'Tags[0].Value' --output text 2>/dev/null)" = test ] || return 1
+    # A job over an inventory report (its manifest.json), which needs no
+    # Fields; a CSV manifest does.
+    out=$(awsvhost s3control create-job --account-id "$account" --confirmation-required --priority 10 \
+        --role-arn "arn:aws:iam::$account:role/$r" --report '{"Enabled":false}' \
+        --operation '{"S3DeleteObjectTagging":{}}' \
+        --manifest '{"Spec":{"Format":"S3InventoryReport_CSV_20161130"},"Location":{"ObjectArn":"arn:aws:s3:::'"$b"'/manifest.csv","ETag":'"$etag"'}}' \
+        --query JobId --output text 2>/dev/null) || return 1
+    [ "$(awsvhost s3control describe-job --account-id "$account" --job-id "$out" \
+        --query 'Job.Manifest.Spec.Format' --output text 2>/dev/null)" = S3InventoryReport_CSV_20161130 ] || return 1
+    awsvhost s3control update-job-status --account-id "$account" --job-id "$out" \
+        --requested-job-status Cancelled >/dev/null 2>&1 || return 1
+    out=$(awsvhost s3control create-job --account-id "$account" --confirmation-required --priority 10 \
+        --role-arn "arn:aws:iam::$account:role/$r" --report '{"Enabled":false}' \
+        --operation '{"S3DeleteObjectTagging":{}}' \
+        --manifest '{"Spec":{"Format":"S3BatchOperations_CSV_20180820"},"Location":{"ObjectArn":"arn:aws:s3:::'"$b"'/manifest.csv","ETag":'"$etag"'}}' 2>&1) && return 1
+    echo "$out" | grep -q BadRequestException || return 1
     # A job that sets retention, as its operation tells.
     out=$(awsvhost s3control create-job --account-id "$account" --confirmation-required --priority 10 \
         --role-arn "arn:aws:iam::$account:role/$r" --manifest "$manifest" --report '{"Enabled":false}' \
