@@ -1142,8 +1142,9 @@ upload_checksums_ok() {
 }
 
 # Mode 3: STREAMING-UNSIGNED-PAYLOAD-TRAILER with a CRC32 trailer. Correct CRC
-# accepted + round-trips; wrong CRC → 400. No real client emits mode 3, so the
-# body is crafted and signed with scurl.
+# accepted + round-trips; wrong CRC → 400. botocore and aws-cli emit mode 3
+# only over HTTPS, which this test doesn't use, so the body is crafted and
+# signed with scurl.
 streaming_trailer_ok() {
     local body="$WORK_DIR/st.body" size hexsize crc
     size=$(wc -c <"$NESTED"); hexsize=$(printf '%x' "$size")
@@ -1156,7 +1157,13 @@ streaming_trailer_ok() {
     check_roundtrip "$NESTED" "s3://${BUCKET}/st-good.txt" || return 1
     { printf '%s\r\n' "$hexsize"; cat "$NESTED"; printf '\r\n0\r\nx-amz-checksum-crc32:AAAAAA==\r\n\r\n'; } >"$body"
     [ "$(scurl PUT "/${BUCKET}/st-bad.txt" "${h[@]}")" = 400 ] || return 1
+    # As botocore and aws-cli send it over HTTPS: in HTTP chunks too, without a
+    # Content-Length (unlike a plain body in chunks, which S3 doesn't take).
+    { printf '%s\r\n' "$hexsize"; cat "$NESTED"; printf '\r\n0\r\nx-amz-checksum-crc32:%s\r\n\r\n' "$crc"; } >"$body"
+    [ "$(scurl PUT "/${BUCKET}/st-chunked.txt" "${h[@]}" "Transfer-Encoding: chunked")" = 200 ] || return 1
+    check_roundtrip "$NESTED" "s3://${BUCKET}/st-chunked.txt" || return 1
     awss3 s3api delete-object --bucket "$BUCKET" --key st-good.txt >/dev/null 2>&1
+    awss3 s3api delete-object --bucket "$BUCKET" --key st-chunked.txt >/dev/null 2>&1
 }
 
 # Mode 4 via mcli — minio-go, the exact client Mimir uses. The good-secret cp

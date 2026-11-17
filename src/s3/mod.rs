@@ -287,8 +287,16 @@ async fn handle_request(
         None => None,
     };
     // A body without a length, in HTTP's chunked transfer encoding: S3 has none
-    // (probed). Its streaming uploads are aws-chunked, which has a length.
-    if req.headers().contains_key(hyper::header::TRANSFER_ENCODING) {
+    // (probed). Unless it's a streaming upload (aws-chunked), whose data's
+    // length is in x-amz-decoded-content-length (which `Payload` requires):
+    // botocore and aws-cli send theirs over HTTPS in chunks, without a
+    // Content-Length.
+    let streaming = req
+        .headers()
+        .get("x-amz-content-sha256")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.starts_with("STREAMING-"));
+    if req.headers().contains_key(hyper::header::TRANSFER_ENCODING) && !streaming {
         return Ok(box_response(util::header_not_implemented("Transfer-Encoding", None)));
     }
     // The signer's own account; anonymously, the management account's.
