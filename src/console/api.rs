@@ -525,15 +525,19 @@ struct IdentitySummary {
     user: String,
     /// The user's ARN, which policies name it by.
     arn: String,
+    /// Whether its account is the organization's management account, whose
+    /// alone Identity Center and the organization are.
+    management: bool,
 }
 
 impl IdentitySummary {
-    fn of(identity: &store::Identity) -> IdentitySummary {
+    fn of(identity: &store::Identity, management: &str) -> IdentitySummary {
         IdentitySummary {
             account_id: identity.account_id.clone(),
             account: identity.account.clone(),
             user: identity.user.name.clone(),
             arn: identity.arn(),
+            management: identity.account_id == management,
         }
     }
 }
@@ -629,7 +633,7 @@ async fn me_of(console: &Console, client: &deadpool_postgres::Object, session: &
         name: session.login_name.clone(),
         root: false,
         expires_at: None,
-        identity: IdentitySummary::of(&session.identity),
+        identity: IdentitySummary::of(&session.identity, &crate::users::account(client).await?),
         mfa: true,
         cluster,
         passkeys: passkeys
@@ -669,6 +673,7 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
 /// session, if it picked one that's still its.
 async fn directory_me(console: &Console, client: &deadpool_postgres::Object, session: &store::DirectorySession) -> Result<Me> {
     let eligible = crate::identity_center::eligible(client, &session.account_id, session.user_id).await?;
+    let management = crate::users::account(client).await?;
     let chosen = eligible.iter().find(|e| session.permission_set.as_ref() == Some(&(e.set.id, e.account.clone())));
     let (identity, cluster) = match chosen {
         Some(chosen) => {
@@ -681,6 +686,7 @@ async fn directory_me(console: &Console, client: &deadpool_postgres::Object, ses
                 account: chosen.account_name.clone(),
                 user: chosen.role_name.clone(),
                 arn,
+                management: chosen.account == management,
             };
             (identity, cluster)
         }
@@ -690,6 +696,7 @@ async fn directory_me(console: &Console, client: &deadpool_postgres::Object, ses
                 account: session.account.clone(),
                 user: String::new(),
                 arn: String::new(),
+                management: session.account_id == management,
             };
             (identity, false)
         }
@@ -811,6 +818,7 @@ async fn root_me(console: &Console, root: &store::RootSession) -> Result<Me> {
     let user = super::root_user(root, axum::http::Method::GET, HeaderMap::new(), String::new(), None);
     let actor = super::Actor(Arc::new(user));
     let cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
+    let management = crate::users::account(&console.app.pool.get().await?).await?;
     Ok(Me {
         name: "root".into(),
         root: true,
@@ -820,6 +828,7 @@ async fn root_me(console: &Console, root: &store::RootSession) -> Result<Me> {
             account: root.account.clone(),
             user: "root".into(),
             arn: actor.principal().arn(),
+            management: root.account_id == management,
         },
         mfa: false,
         cluster,

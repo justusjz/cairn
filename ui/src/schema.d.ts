@@ -72,6 +72,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/accounts/{id}/parent": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Moves an account to the root or a unit. */
+        put: operations["move_account"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/assignments": {
         parameters: {
             query?: never;
@@ -544,8 +561,70 @@ export interface paths {
         /** The identity store's groups. */
         get: operations["list_directory_groups"];
         put?: never;
-        post?: never;
+        /** Makes a group of Cairn's own directory, as identitystore's CreateGroup. */
+        post: operations["create_directory_group"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory-groups/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Changes a group of Cairn's own directory, as identitystore's UpdateGroup. */
+        put: operations["update_directory_group"];
+        post?: never;
+        /**
+         * Deletes a group of Cairn's own directory: its memberships and
+         *     assignments go too.
+         */
+        delete: operations["delete_directory_group"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory-groups/{id}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Puts a directory user (any, a source's too) in a group of Cairn's own
+         *     directory, as identitystore's CreateGroupMembership.
+         */
+        post: operations["add_group_member"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory-groups/{id}/members/{membership}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Takes a user out of a group of Cairn's own directory, by the
+         *     membership's ID, as identitystore's DeleteGroupMembership.
+         */
+        delete: operations["remove_group_member"];
         options?: never;
         head?: never;
         patch?: never;
@@ -584,7 +663,8 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        put?: never;
+        /** Changes a user of Cairn's own directory, as identitystore's UpdateUser. */
+        put: operations["update_directory_user"];
         post?: never;
         /**
          * Deletes a user of Cairn's own directory: its memberships, assignments,
@@ -1146,6 +1226,151 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/organization": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_organization"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/organization/policies": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Makes a service control policy (attached nowhere yet). */
+        post: operations["create_scp"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/organization/policies/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** A service control policy's document. */
+        get: operations["get_scp"];
+        /** Changes a service control policy: at once, wherever it's attached. */
+        put: operations["update_scp"];
+        post?: never;
+        /** Deletes a service control policy, which must be attached nowhere. */
+        delete: operations["delete_scp"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/organization/policies/{id}/targets": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Attaches a service control policy to the root, a unit or an account. */
+        post: operations["attach_scp"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/organization/policies/{id}/targets/{target}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /** Detaches a service control policy from a target, which must keep one. */
+        delete: operations["detach_scp"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/organization/scps": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Enables service control policies: FullAWSAccess is attached to the
+         *     root, every unit and every account.
+         */
+        put: operations["enable_scps"];
+        post?: never;
+        /** Disables service control policies: every SCP is detached. */
+        delete: operations["disable_scps"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/organization/units": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Makes an organizational unit, in the root or another unit (five deep at
+         *     most).
+         */
+        post: operations["create_unit"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/organization/units/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Renames an organizational unit. */
+        put: operations["rename_unit"];
+        post?: never;
+        /** Deletes an organizational unit, which must be empty. */
+        delete: operations["delete_unit"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/passkeys": {
         parameters: {
             query?: never;
@@ -1288,6 +1513,29 @@ export interface paths {
         post?: never;
         /** Removes a permission set's inline policy. */
         delete: operations["delete_inline_policy"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/permission-sets/{name}/provision": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Provisions a permission set again to every account it's provisioned to,
+         *     as sso-admin's `ProvisionPermissionSet` for `ALL_PROVISIONED_ACCOUNTS`:
+         *     their roles hold it as it is now. For a set whose roles don't, as when
+         *     it was changed by a session that may not provision it, or through
+         *     sso-admin.
+         */
+        post: operations["provision_permission_set"];
+        delete?: never;
         options?: never;
         head?: never;
         patch?: never;
@@ -1976,6 +2224,10 @@ export interface components {
             created_at: number;
             id: string;
         };
+        AccountParent: {
+            /** @description The root's or a unit's ID. */
+            parent_id: string;
+        };
         /** @description An account of the organization. */
         AccountSummary: {
             /**
@@ -1992,6 +2244,8 @@ export interface components {
             /** @description Whether it's the management account. */
             management: boolean;
             name: string;
+            /** @description The organizational unit it's in; none for the root. */
+            parent_id?: string | null;
             /** @description `ACTIVE`, or (closed) `SUSPENDED`. */
             status: string;
         };
@@ -2389,15 +2643,27 @@ export interface components {
             /** Format: int32 */
             version: number;
         };
-        /** @description A group, as its users' group claims named it. */
+        /** @description A group of Cairn's own directory, as it's made or changed. */
+        DirectoryGroupChange: {
+            description?: string | null;
+            /** @description Its display name, unique among Cairn's own groups. */
+            name: string;
+        };
+        /**
+         * @description A group: an identity source's, as its users' group claims named it, or
+         *     one of Cairn's own directory.
+         */
         DirectoryGroupSummary: {
+            description?: string | null;
             /** @description Its ID in the identity store. */
             id: string;
             /**
              * Format: int64
-             * @description How many users it had, as their last sign-ins said.
+             * @description How many users it has (a source's: as their last sign-ins said).
              */
             members: number;
+            /** @description Its members. */
+            memberships: components["schemas"]["GroupMember"][];
             name: string;
             /** @description Its identity source; none for a group of Cairn's own directory. */
             provider?: string | null;
@@ -2430,16 +2696,31 @@ export interface components {
             user_id: string;
             user_name: string;
         };
+        /**
+         * @description What a user of Cairn's own directory becomes: its attributes as the
+         *     console has them (others it has, set with identitystore's API, stay).
+         */
+        DirectoryUserChange: {
+            display_name: string;
+            email?: string | null;
+            family_name?: string | null;
+            given_name?: string | null;
+            /** @description Its user name: 1 to 128 characters, no spaces. */
+            user_name: string;
+        };
         /** @description A directory user, as it last signed in. */
         DirectoryUserSummary: {
             display_name: string;
             email?: string | null;
+            family_name?: string | null;
             /**
              * Format: double
              * @description When it was first in the identity store, and when it last changed
              *     (a source's: signed in).
              */
             first_signed_in: number;
+            /** @description A user of Cairn's own directory's names (its `Name`'s parts). */
+            given_name?: string | null;
             /** @description Its groups, by name (a source's: as its last sign-in said). */
             groups: string[];
             /** @description Its ID in the identity store. */
@@ -2606,6 +2887,13 @@ export interface components {
             /** @description Its new path (`/`, or `/…/`). */
             path?: string | null;
         };
+        /** @description A user's membership of a group. */
+        GroupMember: {
+            /** @description The membership's ID. */
+            id: string;
+            user_id: string;
+            user_name: string;
+        };
         /** @description A group: users whose policies include the group's. */
         GroupSummary: {
             arn: string;
@@ -2675,6 +2963,11 @@ export interface components {
             account_id: string;
             /** @description The user's ARN, which policies name it by. */
             arn: string;
+            /**
+             * @description Whether its account is the organization's management account, whose
+             *     alone Identity Center and the organization are.
+             */
+            management: boolean;
             /** @description The user's name. */
             user: string;
         };
@@ -3117,6 +3410,10 @@ export interface components {
              */
             object_lock?: boolean;
         };
+        /** @description The ID of a new group. */
+        NewDirectoryGroupId: {
+            id: string;
+        };
         NewDirectoryUser: {
             display_name: string;
             email?: string | null;
@@ -3128,6 +3425,11 @@ export interface components {
         /** @description The ID of a new directory user. */
         NewDirectoryUserId: {
             id: string;
+        };
+        /** @description A user to put in a group. */
+        NewGroupMember: {
+            /** @description The user's ID in the identity store. */
+            user_id: string;
         };
         NewIdentityProvider: {
             /** @description The audiences its tokens may be for (`sts.amazonaws.com`, say). */
@@ -3203,6 +3505,10 @@ export interface components {
              */
             rate: number;
         };
+        /** @description The ID of a new SCP. */
+        NewScpId: {
+            id: string;
+        };
         /**
          * @description Sets the rate lifecycle sweeps go at, for the whole cluster.
          *     A cluster setting's new value; `null` unsets it (it's back to its
@@ -3224,6 +3530,16 @@ export interface components {
         NewTopic: {
             display_name?: string;
             name: string;
+        };
+        NewUnit: {
+            /** @description 1 to 128 characters. */
+            name: string;
+            /** @description The root's or a unit's ID. */
+            parent_id: string;
+        };
+        /** @description The ID of a new unit. */
+        NewUnitId: {
+            id: string;
         };
         NewUpload: {
             content_type?: string | null;
@@ -3382,6 +3698,18 @@ export interface components {
         OpCounts: components["schemas"]["Counts"] & {
             op: string;
         };
+        /** @description The organization's structure and its SCPs. */
+        OrganizationOverview: {
+            /** @description Which SCPs each target (the root, a unit, an account) has. */
+            attachments: components["schemas"]["ScpAttachment"][];
+            /** @description FullAWSAccess first. */
+            policies: components["schemas"]["ScpSummary"][];
+            /** @description The root's ID (`r-…`), which units and accounts are under. */
+            root_id: string;
+            /** @description Whether service control policies are enabled. */
+            scps_enabled: boolean;
+            units: components["schemas"]["UnitSummary"][];
+        };
         PackerSettings: {
             /**
              * @description Whether blobs are brought to that layout now: it takes as many live
@@ -3475,6 +3803,11 @@ export interface components {
         };
         /** @description A permission set: the policies directory users act with, as its role. */
         PermissionSetSummary: {
+            /**
+             * @description The instance's account (the management account), whose roles the
+             *     console's IAM pages show.
+             */
+            account_id: string;
             arn: string;
             /**
              * Format: int64
@@ -3717,6 +4050,39 @@ export interface components {
             /** @description `AllowedOrigin`s. */
             origins: string[];
         };
+        /** @description An SCP attached to a target. */
+        ScpAttachment: {
+            policy_id: string;
+            target_id: string;
+        };
+        /** @description An SCP, as it's made or changed. */
+        ScpChange: {
+            /**
+             * @description The policy's JSON, at most 10,240 characters; an Allow statement's
+             *     resource is `*` only.
+             */
+            content: string;
+            /** @description At most 512 characters. */
+            description?: string;
+            /** @description 1 to 128 characters. */
+            name: string;
+        };
+        /** @description An SCP's document. */
+        ScpContent: {
+            content: string;
+        };
+        /** @description A service control policy. */
+        ScpSummary: {
+            /** @description AWS's FullAWSAccess, which can't be changed or deleted. */
+            aws_managed: boolean;
+            description: string;
+            id: string;
+            name: string;
+        };
+        ScpTarget: {
+            /** @description The root's, a unit's or an account's ID. */
+            target_id: string;
+        };
         /**
          * @description What the scrubber did since the node started: the copies it checked (and
          *     their bytes), how many of them it found damaged or missing, how many of
@@ -3859,6 +4225,16 @@ export interface components {
             subscriptions_confirmed: number;
             /** Format: int32 */
             subscriptions_pending: number;
+        };
+        UnitName: {
+            name: string;
+        };
+        /** @description An organizational unit. */
+        UnitSummary: {
+            id: string;
+            name: string;
+            /** @description Its parent unit; none for the root. */
+            parent_id?: string | null;
         };
         UploadStarted: {
             upload_id: string;
@@ -4206,6 +4582,46 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Closed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    move_account: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AccountParent"];
+            };
+        };
+        responses: {
+            /** @description Moved */
             204: {
                 headers: {
                     [name: string]: unknown;
@@ -5716,6 +6132,198 @@ export interface operations {
             };
         };
     };
+    create_directory_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryGroupChange"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewDirectoryGroupId"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_directory_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryGroupChange"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_directory_group: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    add_group_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewGroupMember"];
+            };
+        };
+        responses: {
+            /** @description Added */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    remove_group_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                membership: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     list_directory_users: {
         parameters: {
             query?: never;
@@ -5771,6 +6379,46 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["NewDirectoryUserId"];
                 };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_directory_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DirectoryUserChange"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             "4XX": {
                 headers: {
@@ -7198,6 +7846,453 @@ export interface operations {
             };
         };
     };
+    get_organization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OrganizationOverview"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_scp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScpChange"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewScpId"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    get_scp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ScpContent"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    update_scp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScpChange"];
+            };
+        };
+        responses: {
+            /** @description Changed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_scp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    attach_scp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ScpTarget"];
+            };
+        };
+        responses: {
+            /** @description Attached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    detach_scp: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                target: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Detached */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    enable_scps: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Enabled */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    disable_scps: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Disabled */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_unit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewUnit"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewUnitId"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    rename_unit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UnitName"];
+            };
+        };
+        responses: {
+            /** @description Renamed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_unit: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
     add_passkey: {
         parameters: {
             query?: never;
@@ -7739,6 +8834,42 @@ export interface operations {
         requestBody?: never;
         responses: {
             /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    provision_permission_set: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Provisioned */
             204: {
                 headers: {
                     [name: string]: unknown;

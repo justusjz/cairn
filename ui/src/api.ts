@@ -50,6 +50,9 @@ export type Assignment = Schemas["AssignmentSummary"];
 export type DirectoryUser = Schemas["DirectoryUserSummary"];
 export type OrgAccount = Schemas["AccountSummary"];
 export type DirectoryGroup = Schemas["DirectoryGroupSummary"];
+export type OrganizationOverview = Schemas["OrganizationOverview"];
+export type OrgUnit = Schemas["UnitSummary"];
+export type Scp = Schemas["ScpSummary"];
 export type Topic = Schemas["TopicSummary"];
 export type TopicDetail = Schemas["TopicDetail"];
 export type Subscription = Schemas["SubscriptionSummary"];
@@ -216,6 +219,33 @@ export const api = {
   deleteDirectoryUser: (id: string) => ok(client.DELETE("/directory-users/{id}", { params: { path: { id } } })),
   directorySetupLink: (id: string) => ok(client.POST("/directory-users/{id}/setup-link", { params: { path: { id } } })),
   deleteDirectoryPasskeys: (id: string) => ok(client.DELETE("/directory-users/{id}/passkeys", { params: { path: { id } } })),
+  updateDirectoryUser: (id: string, body: Schemas["DirectoryUserChange"]) =>
+    ok(client.PUT("/directory-users/{id}", { params: { path: { id } }, body })),
+  provisionPermissionSet: (name: string) => ok(client.POST("/permission-sets/{name}/provision", { params: { path: { name } } })),
+  createDirectoryGroup: (name: string, description: string) =>
+    ok(client.POST("/directory-groups", { body: { name, description: description || null } })),
+  updateDirectoryGroup: (id: string, name: string, description: string) =>
+    ok(client.PUT("/directory-groups/{id}", { params: { path: { id } }, body: { name, description: description || null } })),
+  deleteDirectoryGroup: (id: string) => ok(client.DELETE("/directory-groups/{id}", { params: { path: { id } } })),
+  addGroupMember: (id: string, user_id: string) =>
+    ok(client.POST("/directory-groups/{id}/members", { params: { path: { id } }, body: { user_id } })),
+  removeGroupMember: (id: string, membership: string) =>
+    ok(client.DELETE("/directory-groups/{id}/members/{membership}", { params: { path: { id, membership } } })),
+  organization: () => ok(client.GET("/organization")),
+  enableScps: () => ok(client.PUT("/organization/scps")),
+  disableScps: () => ok(client.DELETE("/organization/scps")),
+  createUnit: (name: string, parent_id: string) => ok(client.POST("/organization/units", { body: { name, parent_id } })),
+  renameUnit: (id: string, name: string) => ok(client.PUT("/organization/units/{id}", { params: { path: { id } }, body: { name } })),
+  deleteUnit: (id: string) => ok(client.DELETE("/organization/units/{id}", { params: { path: { id } } })),
+  moveAccount: (id: string, parent_id: string) => ok(client.PUT("/accounts/{id}/parent", { params: { path: { id } }, body: { parent_id } })),
+  scp: (id: string) => ok(client.GET("/organization/policies/{id}", { params: { path: { id } } })),
+  createScp: (body: Schemas["ScpChange"]) => ok(client.POST("/organization/policies", { body })),
+  updateScp: (id: string, body: Schemas["ScpChange"]) => ok(client.PUT("/organization/policies/{id}", { params: { path: { id } }, body })),
+  deleteScp: (id: string) => ok(client.DELETE("/organization/policies/{id}", { params: { path: { id } } })),
+  attachScp: (id: string, target_id: string) =>
+    ok(client.POST("/organization/policies/{id}/targets", { params: { path: { id } }, body: { target_id } })),
+  detachScp: (id: string, target: string) =>
+    ok(client.DELETE("/organization/policies/{id}/targets/{target}", { params: { path: { id, target } } })),
   createEnrollment: (user: string) =>
     ok(client.POST("/users/{user}/enrollment", { params: userPath(user) })),
   createKey: (user: string) => ok(client.POST("/users/{user}/keys", { params: userPath(user) })),

@@ -1,7 +1,9 @@
 //! The console's API for Identity Center (see `identity_center`): the
-//! account's permission sets, their policies and assignments, and the
-//! identity store's users and groups (who has signed in, and the groups
-//! their claims named). Every handler checks what it does as Identity
+//! management account's permission sets, their policies, provisioning and
+//! assignments, and the identity store's users and groups (Cairn's own
+//! directory's, made and changed here, and identity sources' that have
+//! signed in). A session in a member account gets none of it, as sso-admin
+//! and identitystore refuse it. Every handler checks what it does as Identity
 //! Center's action, on the resource sso-admin's and identitystore's would
 //! (`sso:CreatePermissionSet` on the instance, `sso:CreateAccountAssignment`
 //! on the permission set, `identitystore:ListUsers` on the identity store,
@@ -33,24 +35,43 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(get_inline_policy, put_inline_policy, delete_inline_policy))
         .routes(routes!(attach_managed_policy, detach_managed_policy))
         .routes(routes!(put_permission_set_boundary, delete_permission_set_boundary))
+        .routes(routes!(provision_permission_set))
         .routes(routes!(list_assignments, create_assignment))
         .routes(routes!(delete_assignment))
         .routes(routes!(list_directory_users, create_directory_user))
-        .routes(routes!(delete_directory_user))
+        .routes(routes!(delete_directory_user, update_directory_user))
         .routes(routes!(create_setup_link))
         .routes(routes!(delete_directory_passkeys))
-        .routes(routes!(list_directory_groups))
+        .routes(routes!(list_directory_groups, create_directory_group))
+        .routes(routes!(update_directory_group, delete_directory_group))
+        .routes(routes!(add_group_member))
+        .routes(routes!(remove_group_member))
 }
 
-/// The instance's ARN, which making permission sets is checked on.
-fn instance(actor: &Actor) -> On {
-    On::Arn(ic::instance_arn(actor.account()))
+/// Refuses a session in a member account: Identity Center's instance, and
+/// its identity store, are the management account's, as sso-admin and
+/// identitystore have them (see `sso`). Its users and groups are no
+/// account's, so a member account's principals, whatever their policies
+/// allow, mustn't see or change them.
+async fn management(app: &Arc<App>, actor: &Actor) -> Result<()> {
+    if actor.account() != crate::users::account(&app.pool.get().await?).await? {
+        return Err(ApiError::Forbidden("Identity Center is the organization's management account's".into()));
+    }
+    Ok(())
+}
+
+/// The instance's ARN, which making permission sets is checked on, if the
+/// session is in the management account.
+async fn instance(app: &Arc<App>, actor: &Actor) -> Result<On> {
+    management(app, actor).await?;
+    Ok(On::Arn(ic::instance_arn(actor.account())))
 }
 
 /// The identity store's ARN, which listing its users and groups is checked
-/// on.
-fn store(actor: &Actor) -> On {
-    On::Arn(ic::identity_store_arn(actor.account()))
+/// on, if the session is in the management account.
+async fn store(app: &Arc<App>, actor: &Actor) -> Result<On> {
+    management(app, actor).await?;
+    Ok(On::Arn(ic::identity_store_arn(actor.account())))
 }
 
 /// Provisions `set`, just changed, to the accounts it's provisioned to, so
@@ -70,6 +91,7 @@ async fn reprovision(app: &Arc<App>, actor: &Actor, set: &PermissionSet) -> Resu
 
 /// The session's permission set `name`, allowed `action` on it.
 async fn check_set(app: &Arc<App>, actor: &Actor, action: &'static str, name: &str) -> Result<PermissionSet> {
+    management(app, actor).await?;
     let set = ic::load(&app.pool.get().await?, actor.account(), name)
         .await?
         .ok_or_else(|| ApiError::NotFound(format!("no permission set named {name:?}")))?;
@@ -82,6 +104,9 @@ async fn check_set(app: &Arc<App>, actor: &Actor, action: &'static str, name: &s
 struct PermissionSetSummary {
     name: String,
     arn: String,
+    /// The instance's account (the management account), whose roles the
+    /// console's IAM pages show.
+    account_id: String,
     description: String,
     /// How long its sessions (and credentials) last, in seconds.
     session_duration: i32,
@@ -117,7 +142,7 @@ struct ProvisionSummary {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<PermissionSetSummary>>> {
-    actor.check(&app, "sso:ListPermissionSets", instance(&actor)).await?;
+    actor.check(&app, "sso:ListPermissionSets", instance(&app, &actor).await?).await?;
     let client = app.pool.get().await?;
     let assignments = ic::assignments(&client, actor.account(), None, None, None).await?;
     let mut out = Vec::new();
@@ -129,6 +154,7 @@ async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<
             .collect();
         out.push(PermissionSetSummary {
             arn: set.arn(),
+            account_id: set.account.clone(),
             role_name: set.role_name(),
             provisioned,
             inline_policy: ic::inline_policy(&client, &set).await?.is_some(),
@@ -168,7 +194,7 @@ async fn create_permission_set(
     Extension(actor): Extension<Actor>,
     Json(body): Json<NewPermissionSet>,
 ) -> Result<StatusCode> {
-    actor.check(&app, "sso:CreatePermissionSet", instance(&actor)).await?;
+    actor.check(&app, "sso:CreatePermissionSet", instance(&app, &actor).await?).await?;
     let new = ic::New {
         name: &body.name,
         description: &body.description,
@@ -335,6 +361,24 @@ async fn delete_permission_set_boundary(State(app): AppState, Extension(actor): 
     reprovision(&app, &actor, &set).await
 }
 
+/// Provisions a permission set again to every account it's provisioned to,
+/// as sso-admin's `ProvisionPermissionSet` for `ALL_PROVISIONED_ACCOUNTS`:
+/// their roles hold it as it is now. For a set whose roles don't, as when
+/// it was changed by a session that may not provision it, or through
+/// sso-admin.
+#[utoipa::path(post, path = "/permission-sets/{name}/provision", params(("name" = String, Path)), responses(
+    (status = 204, description = "Provisioned"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn provision_permission_set(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
+    let set = check_set(&app, &actor, "sso:ProvisionPermissionSet", &name).await?;
+    match ic::provision_all(&app.pool.get().await?, &set).await? {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(why) => Err(ApiError::BadRequest(format!("not provisioned: {why}"))),
+    }
+}
+
 /// A permission set's assignment to a directory user or group, in an
 /// account.
 #[derive(Serialize, ToSchema)]
@@ -362,7 +406,7 @@ struct AssignmentSummary {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn list_assignments(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<AssignmentSummary>>> {
-    actor.check(&app, "sso:ListAccountAssignments", instance(&actor)).await?;
+    actor.check(&app, "sso:ListAccountAssignments", instance(&app, &actor).await?).await?;
     let assignments = ic::assignments(&app.pool.get().await?, actor.account(), None, None, None).await?;
     Ok(Json(
         assignments
@@ -448,6 +492,9 @@ struct DirectoryUserSummary {
     user_name: String,
     display_name: String,
     email: Option<String>,
+    /// A user of Cairn's own directory's names (its `Name`'s parts).
+    given_name: Option<String>,
+    family_name: Option<String>,
     /// Its identity source, and its subject there; none for a user of
     /// Cairn's own directory.
     provider: Option<String>,
@@ -473,7 +520,7 @@ struct DirectoryUserSummary {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn list_directory_users(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<DirectoryUserSummary>>> {
-    actor.check(&app, "identitystore:ListUsers", store(&actor)).await?;
+    actor.check(&app, "identitystore:ListUsers", store(&app, &actor).await?).await?;
     let client = app.pool.get().await?;
     let groups = ic::groups(&client, None).await?;
     let memberships = ic::memberships(&client, None, None).await?;
@@ -491,7 +538,10 @@ async fn list_directory_users(State(app): AppState, Extension(actor): Extension<
                     .collect();
                 names.sort();
                 let own = access.get(&u.id).cloned().unwrap_or_default();
+                let part = |p: &str| u.profile.get("Name").and_then(|n| n.get(p)).and_then(serde_json::Value::as_str).map(str::to_owned);
                 DirectoryUserSummary {
+                    given_name: part("GivenName"),
+                    family_name: part("FamilyName"),
                     passkeys: own.passkeys,
                     last_passkey_use: own.last_sign_in,
                     setup_link_pending: own.link_pending,
@@ -539,7 +589,7 @@ async fn create_directory_user(
     Extension(actor): Extension<Actor>,
     Json(body): Json<NewDirectoryUser>,
 ) -> Result<(StatusCode, Json<NewDirectoryUserId>)> {
-    actor.check(&app, "identitystore:CreateUser", store(&actor)).await?;
+    actor.check(&app, "identitystore:CreateUser", store(&app, &actor).await?).await?;
     let present = |text: &Option<String>| text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
     let mut name = serde_json::json!({ "Formatted": body.display_name });
     if let Some(given) = present(&body.given_name) {
@@ -558,8 +608,66 @@ async fn create_directory_user(
     Ok((StatusCode::CREATED, Json(NewDirectoryUserId { id: user.id.to_string() })))
 }
 
+/// What a user of Cairn's own directory becomes: its attributes as the
+/// console has them (others it has, set with identitystore's API, stay).
+#[derive(Deserialize, ToSchema)]
+struct DirectoryUserChange {
+    /// Its user name: 1 to 128 characters, no spaces.
+    user_name: String,
+    display_name: String,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    email: Option<String>,
+}
+
+/// Changes a user of Cairn's own directory, as identitystore's UpdateUser.
+#[utoipa::path(put, path = "/directory-users/{id}", params(("id" = String, Path)), request_body = DirectoryUserChange, responses(
+    (status = 204, description = "Changed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn update_directory_user(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(body): Json<DirectoryUserChange>,
+) -> Result<StatusCode> {
+    let user = check_user(&app, &actor, "identitystore:UpdateUser", &id).await?;
+    if !user.own() {
+        return Err(ApiError::BadRequest(format!("{} is an identity source's: it's what the source says when it signs in", user.user_name)));
+    }
+    let present = |text: &Option<String>| text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
+    let mut profile = match &user.profile {
+        serde_json::Value::Object(_) => user.profile.clone(),
+        _ => serde_json::json!({}),
+    };
+    let mut name = match profile.get("Name") {
+        Some(serde_json::Value::Object(name)) => name.clone(),
+        _ => serde_json::Map::new(),
+    };
+    name.insert("Formatted".into(), body.display_name.clone().into());
+    for (part, value) in [("GivenName", present(&body.given_name)), ("FamilyName", present(&body.family_name))] {
+        match value {
+            Some(value) => name.insert(part.into(), value.into()),
+            None => name.remove(part),
+        };
+    }
+    profile["Name"] = serde_json::Value::Object(name);
+    let email = present(&body.email);
+    match &email {
+        Some(email) => profile["Emails"] = serde_json::json!([{ "Value": email, "Primary": true }]),
+        None => {
+            profile.as_object_mut().map(|p| p.remove("Emails"));
+        }
+    }
+    let to = ic::OwnUser { user_name: &body.user_name, display_name: &body.display_name, email: email.as_deref(), profile: &profile };
+    ic::update_user(&app.pool.get().await?, &user, &to, Some(user.revision)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// The directory user `id`, allowed `action` on it.
 async fn check_user(app: &Arc<App>, actor: &Actor, action: &'static str, id: &str) -> Result<ic::User> {
+    management(app, actor).await?;
     let missing = || ApiError::NotFound(format!("there's no directory user {id}"));
     let id = Uuid::parse_str(id).map_err(|_| missing())?;
     actor.check(app, action, On::Arn(ic::user_arn(id))).await?;
@@ -613,16 +721,29 @@ async fn delete_directory_passkeys(State(app): AppState, Extension(actor): Exten
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// A group, as its users' group claims named it.
+/// A group: an identity source's, as its users' group claims named it, or
+/// one of Cairn's own directory.
 #[derive(Serialize, ToSchema)]
 struct DirectoryGroupSummary {
     /// Its ID in the identity store.
     id: String,
     name: String,
+    description: Option<String>,
     /// Its identity source; none for a group of Cairn's own directory.
     provider: Option<String>,
-    /// How many users it had, as their last sign-ins said.
+    /// How many users it has (a source's: as their last sign-ins said).
     members: i64,
+    /// Its members.
+    memberships: Vec<GroupMember>,
+}
+
+/// A user's membership of a group.
+#[derive(Serialize, ToSchema)]
+struct GroupMember {
+    /// The membership's ID.
+    id: String,
+    user_id: String,
+    user_name: String,
 }
 
 /// The identity store's groups.
@@ -632,19 +753,158 @@ struct DirectoryGroupSummary {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn list_directory_groups(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<DirectoryGroupSummary>>> {
-    actor.check(&app, "identitystore:ListGroups", store(&actor)).await?;
+    actor.check(&app, "identitystore:ListGroups", store(&app, &actor).await?).await?;
     let client = app.pool.get().await?;
     let memberships = ic::memberships(&client, None, None).await?;
+    let users = ic::users(&client, None).await?;
     Ok(Json(
         ic::groups(&client, None)
             .await?
             .into_iter()
-            .map(|g| DirectoryGroupSummary {
-                members: memberships.iter().filter(|m| m.group_id == g.id).count() as i64,
-                id: g.id.to_string(),
-                name: g.name,
-                provider: g.provider,
+            .map(|g| {
+                let mut members: Vec<GroupMember> = memberships
+                    .iter()
+                    .filter(|m| m.group_id == g.id)
+                    .map(|m| GroupMember {
+                        id: m.id.to_string(),
+                        user_id: m.user_id.to_string(),
+                        user_name: users.iter().find(|u| u.id == m.user_id).map(|u| u.user_name.clone()).unwrap_or_default(),
+                    })
+                    .collect();
+                members.sort_by(|a, b| a.user_name.cmp(&b.user_name));
+                DirectoryGroupSummary {
+                    members: members.len() as i64,
+                    memberships: members,
+                    id: g.id.to_string(),
+                    name: g.name,
+                    description: g.description,
+                    provider: g.provider,
+                }
             })
             .collect(),
     ))
+}
+
+/// A group of Cairn's own directory, as it's made or changed.
+#[derive(Deserialize, ToSchema)]
+struct DirectoryGroupChange {
+    /// Its display name, unique among Cairn's own groups.
+    name: String,
+    description: Option<String>,
+}
+
+/// The ID of a new group.
+#[derive(Serialize, ToSchema)]
+struct NewDirectoryGroupId {
+    id: String,
+}
+
+/// The group `id`, allowed `action` on it.
+async fn check_group(app: &Arc<App>, actor: &Actor, action: &'static str, id: &str) -> Result<ic::Group> {
+    management(app, actor).await?;
+    let missing = || ApiError::NotFound(format!("there's no group {id}"));
+    let id = Uuid::parse_str(id).map_err(|_| missing())?;
+    actor.check(app, action, On::Arn(ic::group_arn(id))).await?;
+    ic::groups(&app.pool.get().await?, Some(ic::Lookup::Id(id))).await?.pop().ok_or_else(missing)
+}
+
+fn description(text: &Option<String>) -> Option<&str> {
+    text.as_deref().map(str::trim).filter(|t| !t.is_empty())
+}
+
+/// Makes a group of Cairn's own directory, as identitystore's CreateGroup.
+#[utoipa::path(post, path = "/directory-groups", request_body = DirectoryGroupChange, responses(
+    (status = 201, body = NewDirectoryGroupId),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_directory_group(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<DirectoryGroupChange>,
+) -> Result<(StatusCode, Json<NewDirectoryGroupId>)> {
+    actor.check(&app, "identitystore:CreateGroup", store(&app, &actor).await?).await?;
+    let group = ic::create_group(&app.pool.get().await?, body.name.trim(), description(&body.description)).await?;
+    Ok((StatusCode::CREATED, Json(NewDirectoryGroupId { id: group.id.to_string() })))
+}
+
+/// Changes a group of Cairn's own directory, as identitystore's UpdateGroup.
+#[utoipa::path(put, path = "/directory-groups/{id}", params(("id" = String, Path)), request_body = DirectoryGroupChange, responses(
+    (status = 204, description = "Changed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn update_directory_group(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(body): Json<DirectoryGroupChange>,
+) -> Result<StatusCode> {
+    let group = check_group(&app, &actor, "identitystore:UpdateGroup", &id).await?;
+    ic::update_group(&app.pool.get().await?, &group, body.name.trim(), description(&body.description), Some(group.revision)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Deletes a group of Cairn's own directory: its memberships and
+/// assignments go too.
+#[utoipa::path(delete, path = "/directory-groups/{id}", params(("id" = String, Path)), responses(
+    (status = 204, description = "Deleted"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_directory_group(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+    let group = check_group(&app, &actor, "identitystore:DeleteGroup", &id).await?;
+    ic::delete_group(&app.pool.get().await?, &group, None).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A user to put in a group.
+#[derive(Deserialize, ToSchema)]
+struct NewGroupMember {
+    /// The user's ID in the identity store.
+    user_id: String,
+}
+
+/// Puts a directory user (any, a source's too) in a group of Cairn's own
+/// directory, as identitystore's CreateGroupMembership.
+#[utoipa::path(post, path = "/directory-groups/{id}/members", params(("id" = String, Path)), request_body = NewGroupMember, responses(
+    (status = 201, description = "Added"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn add_group_member(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+    Json(body): Json<NewGroupMember>,
+) -> Result<StatusCode> {
+    let group = check_group(&app, &actor, "identitystore:CreateGroupMembership", &id).await?;
+    let user = check_user(&app, &actor, "identitystore:CreateGroupMembership", &body.user_id).await?;
+    ic::add_member(&app.pool.get().await?, &group, &user).await?;
+    Ok(StatusCode::CREATED)
+}
+
+/// Takes a user out of a group of Cairn's own directory, by the
+/// membership's ID, as identitystore's DeleteGroupMembership.
+#[utoipa::path(delete, path = "/directory-groups/{id}/members/{membership}", params(("id" = String, Path), ("membership" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn remove_group_member(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path((id, membership)): Path<(String, String)>,
+) -> Result<StatusCode> {
+    management(&app, &actor).await?;
+    let missing = || ApiError::NotFound(format!("there's no membership {membership}"));
+    let group = Uuid::parse_str(&id).map_err(|_| missing())?;
+    let membership = Uuid::parse_str(&membership).map_err(|_| missing())?;
+    actor.check(&app, "identitystore:DeleteGroupMembership", On::Arn(ic::membership_arn(membership))).await?;
+    let client = app.pool.get().await?;
+    if !ic::memberships(&client, Some(group), None).await?.iter().any(|m| m.id == membership) {
+        return Err(missing());
+    }
+    ic::remove_membership(&client, membership).await?;
+    Ok(StatusCode::NO_CONTENT)
 }

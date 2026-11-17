@@ -1439,6 +1439,185 @@ mod e2e {
         assert_eq!(admin.send("DELETE", &format!("/api/accounts/{id}"), None).await.0, StatusCode::BAD_REQUEST);
     }
 
+    /// Identity Center is the management account's: a member account's
+    /// principals, whatever their policies allow, see none of its directory
+    /// and change none of it (a setup link of theirs would take a
+    /// management account's directory user over), as sso-admin and
+    /// identitystore refuse them.
+    #[tokio::test]
+    async fn a_member_account_has_no_identity_center() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = console_of(&app);
+        let client = app.pool.get().await.unwrap();
+        let mut admin = signed_in(&console, "admin", true).await;
+        let (status, made) = admin.send("POST", "/api/accounts", Some(json!({ "name": "Team C", "email": "team-c@example.com" }))).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        let member = made["id"].as_str().unwrap().to_owned();
+        users::create_for(&client, &member, "intruder", None, true).await.unwrap();
+        let token = store::create_enrollment(&client, &member, "intruder").await.unwrap();
+        let mut intruder = enrolled(&console, &token).await;
+        let (_, me) = intruder.send("GET", "/api/me", None).await;
+        assert_eq!((&me["identity"]["account_id"], &me["identity"]["management"]), (&json!(member), &json!(false)));
+        assert_eq!(admin.send("GET", "/api/me", None).await.1["identity"]["management"], json!(true));
+        // Its own account it administers.
+        assert_eq!(intruder.send("GET", "/api/users", None).await.0, StatusCode::OK);
+
+        let grace = json!({ "user_name": "grace", "display_name": "Grace Hopper" });
+        let (_, made) = admin.send("POST", "/api/directory-users", Some(grace.clone())).await;
+        let id = made["id"].as_str().unwrap().to_owned();
+        let (_, group) = admin.send("POST", "/api/directory-groups", Some(json!({ "name": "admins" }))).await;
+        let group = group["id"].as_str().unwrap().to_owned();
+        for (method, path, body) in [
+            ("GET", "/api/directory-users".to_owned(), None),
+            ("POST", "/api/directory-users".to_owned(), Some(json!({ "user_name": "mallory", "display_name": "Mallory" }))),
+            ("PUT", format!("/api/directory-users/{id}"), Some(grace)),
+            ("POST", format!("/api/directory-users/{id}/setup-link"), None),
+            ("DELETE", format!("/api/directory-users/{id}/passkeys"), None),
+            ("DELETE", format!("/api/directory-users/{id}"), None),
+            ("GET", "/api/directory-groups".to_owned(), None),
+            ("POST", "/api/directory-groups".to_owned(), Some(json!({ "name": "mallory" }))),
+            ("POST", format!("/api/directory-groups/{group}/members"), Some(json!({ "user_id": id }))),
+            ("DELETE", format!("/api/directory-groups/{group}"), None),
+            ("GET", "/api/permission-sets".to_owned(), None),
+            ("POST", "/api/permission-sets".to_owned(), Some(json!({ "name": "Mallory" }))),
+            ("GET", "/api/assignments".to_owned(), None),
+            ("GET", "/api/organization".to_owned(), None),
+        ] {
+            let (status, answer) = intruder.send(method, &path, body).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method} {path}: {answer}");
+        }
+        assert!(store::directory_access(&client).await.unwrap().get(&uuid::Uuid::parse_str(&id).unwrap()).is_none_or(|a| !a.link_pending));
+        assert_eq!(admin.send("GET", "/api/directory-users", None).await.1.as_array().unwrap().len(), 1);
+    }
+
+    /// Cairn's own directory in the console: users changed, groups made,
+    /// changed and deleted, members put in and taken out; and a permission
+    /// set whose roles don't hold its latest version provisioned again.
+    #[tokio::test]
+    async fn manages_the_own_directory_and_provisions() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = console_of(&app);
+        let client = app.pool.get().await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
+        let mut admin = signed_in(&console, "admin", true).await;
+        let mut tenant = signed_in(&console, "tenant", false).await;
+
+        let grace = json!({ "user_name": "grace", "display_name": "Grace", "email": "grace@example.com" });
+        let (_, made) = admin.send("POST", "/api/directory-users", Some(grace)).await;
+        let id = made["id"].as_str().unwrap().to_owned();
+        let change = json!({ "user_name": "ghopper", "display_name": "Grace Hopper", "given_name": "Grace", "family_name": "Hopper" });
+        assert_eq!(tenant.send("PUT", &format!("/api/directory-users/{id}"), Some(change.clone())).await.0, StatusCode::FORBIDDEN);
+        let (status, err) = admin.send("PUT", &format!("/api/directory-users/{id}"), Some(change)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{err}");
+        let (_, users) = admin.send("GET", "/api/directory-users", None).await;
+        let user = &users[0];
+        assert_eq!(
+            (&user["user_name"], &user["display_name"], &user["given_name"], &user["family_name"], &user["email"]),
+            (&json!("ghopper"), &json!("Grace Hopper"), &json!("Grace"), &json!("Hopper"), &Value::Null)
+        );
+        let bad = json!({ "user_name": "has space", "display_name": "x" });
+        assert_eq!(admin.send("PUT", &format!("/api/directory-users/{id}"), Some(bad)).await.0, StatusCode::BAD_REQUEST);
+
+        assert_eq!(tenant.send("POST", "/api/directory-groups", Some(json!({ "name": "data" }))).await.0, StatusCode::FORBIDDEN);
+        let (status, made) = admin.send("POST", "/api/directory-groups", Some(json!({ "name": "data", "description": "Analysts" }))).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        let group = made["id"].as_str().unwrap().to_owned();
+        assert_eq!(admin.send("POST", "/api/directory-groups", Some(json!({ "name": "data" }))).await.0, StatusCode::CONFLICT);
+        let renamed = json!({ "name": "analysts", "description": null });
+        assert_eq!(admin.send("PUT", &format!("/api/directory-groups/{group}"), Some(renamed)).await.0, StatusCode::NO_CONTENT);
+        let members = format!("/api/directory-groups/{group}/members");
+        assert_eq!(admin.send("POST", &members, Some(json!({ "user_id": id }))).await.0, StatusCode::CREATED);
+        assert_eq!(admin.send("POST", &members, Some(json!({ "user_id": id }))).await.0, StatusCode::CONFLICT);
+        let (_, groups) = admin.send("GET", "/api/directory-groups", None).await;
+        assert_eq!((&groups[0]["name"], &groups[0]["description"], &groups[0]["members"]), (&json!("analysts"), &Value::Null, &json!(1)));
+        assert_eq!(groups[0]["memberships"][0]["user_name"], "ghopper");
+        let membership = groups[0]["memberships"][0]["id"].as_str().unwrap().to_owned();
+        assert_eq!(admin.send("DELETE", &format!("/api/directory-groups/x/members/{membership}"), None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(admin.send("DELETE", &format!("{members}/{membership}"), None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("GET", "/api/directory-groups", None).await.1[0]["members"], json!(0));
+        assert_eq!(admin.send("DELETE", &format!("/api/directory-groups/{group}"), None).await.0, StatusCode::NO_CONTENT);
+        assert!(admin.send("GET", "/api/directory-groups", None).await.1.as_array().unwrap().is_empty());
+
+        // A set changed without provisioning (as sso-admin's writes leave
+        // it) is provisioned again.
+        assert_eq!(admin.send("POST", "/api/permission-sets", Some(json!({ "name": "Readers" }))).await.0, StatusCode::CREATED);
+        let assign = json!({ "permission_set": "Readers", "principal_type": "USER", "principal_id": id });
+        assert_eq!(admin.send("POST", "/api/assignments", Some(assign)).await.0, StatusCode::CREATED);
+        let set = crate::identity_center::load(&client, &account, "Readers").await.unwrap().unwrap();
+        let document = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:ListAllMyBuckets","Resource":"*"}]}"#;
+        crate::identity_center::set_inline_policy(&client, &set, Some(document)).await.unwrap();
+        let (_, sets) = admin.send("GET", "/api/permission-sets", None).await;
+        assert_eq!((&sets[0]["account_id"], &sets[0]["provisioned"][0]["latest"]), (&json!(account), &json!(false)));
+        assert_eq!(tenant.send("POST", "/api/permission-sets/Readers/provision", None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("POST", "/api/permission-sets/Readers/provision", None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("GET", "/api/permission-sets", None).await.1[0]["provisioned"][0]["latest"], json!(true));
+    }
+
+    /// The organization's structure and SCPs in the console: units made,
+    /// renamed and deleted, accounts moved, SCPs enabled, made, attached,
+    /// detached and disabled, as Organizations' API does them.
+    #[tokio::test]
+    async fn the_organization_has_units_and_scps() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = console_of(&app);
+        let mut admin = signed_in(&console, "admin", true).await;
+        let mut tenant = signed_in(&console, "tenant", false).await;
+        assert_eq!(tenant.send("GET", "/api/organization", None).await.0, StatusCode::FORBIDDEN);
+        let (status, o) = admin.send("GET", "/api/organization", None).await;
+        assert_eq!(status, StatusCode::OK, "{o}");
+        let root = o["root_id"].as_str().unwrap().to_owned();
+        assert_eq!((&o["scps_enabled"], &o["policies"][0]["name"], &o["units"]), (&json!(false), &json!("FullAWSAccess"), &json!([])));
+
+        let (status, made) = admin.send("POST", "/api/organization/units", Some(json!({ "name": "Teams", "parent_id": root }))).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        let unit = made["id"].as_str().unwrap().to_owned();
+        assert_eq!(admin.send("POST", "/api/organization/units", Some(json!({ "name": "x", "parent_id": "ou-nope" }))).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(admin.send("PUT", &format!("/api/organization/units/{unit}"), Some(json!({ "name": "Squads" }))).await.0, StatusCode::NO_CONTENT);
+        let (_, made) = admin.send("POST", "/api/accounts", Some(json!({ "name": "Team D", "email": "team-d@example.com" }))).await;
+        let member = made["id"].as_str().unwrap().to_owned();
+        let into = json!({ "parent_id": unit });
+        assert_eq!(tenant.send("PUT", &format!("/api/accounts/{member}/parent"), Some(into.clone())).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(admin.send("PUT", &format!("/api/accounts/{member}/parent"), Some(into.clone())).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("PUT", &format!("/api/accounts/{member}/parent"), Some(into)).await.0, StatusCode::BAD_REQUEST);
+        let (_, accounts) = admin.send("GET", "/api/accounts", None).await;
+        assert_eq!(accounts[1]["parent_id"], json!(unit));
+        assert_eq!(admin.send("DELETE", &format!("/api/organization/units/{unit}"), None).await.0, StatusCode::BAD_REQUEST);
+
+        assert_eq!(admin.send("PUT", "/api/organization/scps", None).await.0, StatusCode::NO_CONTENT);
+        let (_, o) = admin.send("GET", "/api/organization", None).await;
+        assert_eq!((&o["units"][0]["name"], &o["scps_enabled"]), (&json!("Squads"), &json!(true)));
+        let full: Vec<&str> = o["attachments"].as_array().unwrap().iter().map(|a| a["target_id"].as_str().unwrap()).collect();
+        for target in [&root, &unit, &member] {
+            assert!(full.contains(&target.as_str()), "{target}: {full:?}");
+        }
+
+        let content = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:DeleteBucket","Resource":"*"}]}"#;
+        let bad = json!({ "name": "Bad", "content": r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"arn:aws:s3:::x"}]}"# });
+        assert_eq!(admin.send("POST", "/api/organization/policies", Some(bad)).await.0, StatusCode::BAD_REQUEST);
+        let (status, made) = admin.send("POST", "/api/organization/policies", Some(json!({ "name": "NoDelete", "content": content }))).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        let scp = made["id"].as_str().unwrap().to_owned();
+        assert_eq!(admin.send("GET", &format!("/api/organization/policies/{scp}"), None).await.1["content"], content);
+        let targets = format!("/api/organization/policies/{scp}/targets");
+        assert_eq!(admin.send("POST", &targets, Some(json!({ "target_id": unit }))).await.0, StatusCode::NO_CONTENT);
+        let full_access = format!("/api/organization/policies/p-FullAWSAccess/targets/{unit}");
+        assert_eq!(admin.send("DELETE", &full_access, None).await.0, StatusCode::NO_CONTENT);
+        // Every target keeps one.
+        assert_eq!(admin.send("DELETE", &format!("{targets}/{unit}"), None).await.0, StatusCode::BAD_REQUEST);
+        let renamed = json!({ "name": "NoDeleting", "description": "Keeps buckets", "content": content });
+        assert_eq!(admin.send("PUT", &format!("/api/organization/policies/{scp}"), Some(renamed)).await.0, StatusCode::NO_CONTENT);
+        let (_, o) = admin.send("GET", "/api/organization", None).await;
+        assert_eq!((&o["policies"][1]["name"], &o["policies"][1]["description"]), (&json!("NoDeleting"), &json!("Keeps buckets")));
+        assert_eq!(admin.send("DELETE", &format!("/api/organization/policies/{scp}"), None).await.0, StatusCode::BAD_REQUEST);
+
+        assert_eq!(admin.send("DELETE", "/api/organization/scps", None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("GET", "/api/organization", None).await.1["attachments"], json!([]));
+        assert_eq!(admin.send("DELETE", &format!("/api/organization/policies/{scp}"), None).await.0, StatusCode::NO_CONTENT);
+        let back = json!({ "parent_id": root });
+        assert_eq!(admin.send("PUT", &format!("/api/accounts/{member}/parent"), Some(back)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(admin.send("DELETE", &format!("/api/organization/units/{unit}"), None).await.0, StatusCode::NO_CONTENT);
+    }
+
     /// Bucket and object tags, CORS and websites, set as S3 sets them (and
     /// checked as it checks them), by whom S3's actions allow.
     #[tokio::test]
