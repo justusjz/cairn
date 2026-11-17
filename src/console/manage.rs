@@ -3233,11 +3233,11 @@ async fn detach_policy(
 /// A one-time link for a user to register its first passkey for the
 /// console, valid 24 hours.
 #[derive(Serialize, ToSchema)]
-struct EnrollmentLink {
+pub(super) struct EnrollmentLink {
     /// The link, if this node serves the console (and so knows its URL).
-    url: Option<String>,
+    pub(super) url: Option<String>,
     /// The link's path, for the console's URL.
-    path: String,
+    pub(super) path: String,
 }
 
 /// Makes a user an enrollment link for the console, replacing its last.

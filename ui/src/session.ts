@@ -54,8 +54,10 @@ export const api = {
   /** Starts a sign-in at an identity source, as a directory user: the URL to
    * send the browser to. */
   oidcStart: (provider: string) => ok(client.POST("/oidc/{provider}/start", { params: { path: { provider } } })),
-  /** Has a directory user's session act as one of its permission sets. */
-  choosePermissionSet: (name: string) => ok(client.POST("/directory/permission-set", { body: { name } })),
+  /** Has a directory user's session act as one of its permission sets, in
+   * an account it's assigned in. */
+  choosePermissionSet: (name: string, account_id: string) =>
+    ok(client.POST("/directory/permission-set", { body: { name, account_id } })),
   /** Temporary credentials of a directory user's permission set, for the CLI. */
   directoryCredentials: () => ok(client.POST("/directory/credentials")),
   login: (challenge_id: string, credential: Assertion) => ok(client.POST("/login", { body: { challenge_id, credential } })),

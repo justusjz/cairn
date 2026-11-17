@@ -20,7 +20,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use super::actor::Actor;
-use super::manage::{AppState, AttachedPolicy, PolicyArn, PolicyDocument, Result};
+use super::manage::{AppState, AttachedPolicy, EnrollmentLink, PolicyArn, PolicyDocument, Result};
 use super::web::{ApiError, ErrorBody};
 use crate::App;
 use crate::identity_center::{self as ic, PermissionSet, PrincipalType};
@@ -35,7 +35,10 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(put_permission_set_boundary, delete_permission_set_boundary))
         .routes(routes!(list_assignments, create_assignment))
         .routes(routes!(delete_assignment))
-        .routes(routes!(list_directory_users))
+        .routes(routes!(list_directory_users, create_directory_user))
+        .routes(routes!(delete_directory_user))
+        .routes(routes!(create_setup_link))
+        .routes(routes!(delete_directory_passkeys))
         .routes(routes!(list_directory_groups))
 }
 
@@ -48,6 +51,21 @@ fn instance(actor: &Actor) -> On {
 /// on.
 fn store(actor: &Actor) -> On {
     On::Arn(ic::identity_store_arn(actor.account()))
+}
+
+/// Provisions `set`, just changed, to the accounts it's provisioned to, so
+/// that saving it in the console takes effect there, if the session may
+/// (`sso:ProvisionPermissionSet` on it); else their roles keep what they
+/// hold, until it's provisioned. Saved, but not provisioned to one of them,
+/// it answers why.
+async fn reprovision(app: &Arc<App>, actor: &Actor, set: &PermissionSet) -> Result<StatusCode> {
+    if !actor.allows(app, "sso:ProvisionPermissionSet", On::Arn(set.arn())).await? {
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    match ic::provision_all(&app.pool.get().await?, set).await? {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(why) => Err(ApiError::BadRequest(format!("saved, but not provisioned: {why}"))),
+    }
 }
 
 /// The session's permission set `name`, allowed `action` on it.
@@ -67,9 +85,11 @@ struct PermissionSetSummary {
     description: String,
     /// How long its sessions (and credentials) last, in seconds.
     session_duration: i32,
-    /// The role it's provisioned as (which IAM can't change).
+    /// The name of its role in each account it's provisioned to (which IAM
+    /// can't change).
     role_name: String,
-    role_arn: String,
+    /// The accounts it's provisioned to (none until it's first assigned).
+    provisioned: Vec<ProvisionSummary>,
     /// Whether it has an inline policy.
     inline_policy: bool,
     /// Its managed policies: AWS's (Cairn's), and the account's (customer
@@ -82,6 +102,15 @@ struct PermissionSetSummary {
     created_at: f64,
 }
 
+/// A permission set's provisioning to an account.
+#[derive(Serialize, ToSchema)]
+struct ProvisionSummary {
+    account_id: String,
+    role_arn: String,
+    /// Whether its role there holds the set as it is now.
+    latest: bool,
+}
+
 #[utoipa::path(get, path = "/permission-sets", responses(
     (status = 200, body = Vec<PermissionSetSummary>),
     (status = "4XX", body = ErrorBody),
@@ -90,25 +119,29 @@ struct PermissionSetSummary {
 async fn list_permission_sets(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<PermissionSetSummary>>> {
     actor.check(&app, "sso:ListPermissionSets", instance(&actor)).await?;
     let client = app.pool.get().await?;
-    let assignments = ic::assignments(&client, actor.account(), None, None).await?;
+    let assignments = ic::assignments(&client, actor.account(), None, None, None).await?;
     let mut out = Vec::new();
     for set in ic::list(&client, actor.account()).await? {
-        let role = set.role(&client).await?;
+        let provisioned = ic::provisions(&client, &set)
+            .await?
+            .into_iter()
+            .map(|p| ProvisionSummary { role_arn: p.role_arn(), account_id: p.account, latest: p.latest })
+            .collect();
         out.push(PermissionSetSummary {
             arn: set.arn(),
-            role_arn: set.role_arn(),
+            role_name: set.role_name(),
+            provisioned,
             inline_policy: ic::inline_policy(&client, &set).await?.is_some(),
             attached: ic::managed_policies(&client, &set)
                 .await?
                 .into_iter()
                 .map(|a| AttachedPolicy { name: a.name, arn: a.arn })
                 .collect(),
-            boundary: role.boundary,
+            boundary: ic::boundary(&client, &set).await?,
             assignments: assignments.iter().filter(|a| a.permission_set == set.name).count() as i64,
             name: set.name,
             description: set.description,
             session_duration: set.session_duration,
-            role_name: set.role_name,
             created_at: set.created,
         });
     }
@@ -169,10 +202,10 @@ async fn update_permission_set(
     let set = check_set(&app, &actor, "sso:UpdatePermissionSet", &name).await?;
     let change = ic::Change { description: Some(&body.description), session_duration: Some(body.session_duration), relay_state: None };
     ic::update(&app.pool.get().await?, &set, &change).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
-/// Deletes a permission set: its assignments and its role go too.
+/// Deletes a permission set: its assignments and its roles go too.
 #[utoipa::path(delete, path = "/permission-sets/{name}", params(("name" = String, Path)), responses(
     (status = 204, description = "Deleted"),
     (status = "4XX", body = ErrorBody),
@@ -212,7 +245,7 @@ async fn put_inline_policy(
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:PutInlinePolicyToPermissionSet", &name).await?;
     ic::set_inline_policy(&app.pool.get().await?, &set, Some(&body.document)).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// Removes a permission set's inline policy.
@@ -224,7 +257,7 @@ async fn put_inline_policy(
 async fn delete_inline_policy(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:DeleteInlinePolicyFromPermissionSet", &name).await?;
     ic::set_inline_policy(&app.pool.get().await?, &set, None).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// The action that attaches or detaches a managed policy: AWS's, or a
@@ -252,7 +285,7 @@ async fn attach_managed_policy(
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, attach_action(&body.arn, true), &name).await?;
     ic::attach(&app.pool.get().await?, &set, &body.arn, true).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// Detaches a managed policy from a permission set.
@@ -269,7 +302,7 @@ async fn detach_managed_policy(
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, attach_action(&query.arn, false), &name).await?;
     ic::attach(&app.pool.get().await?, &set, &query.arn, false).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// Sets a permission set's permissions boundary: a managed policy (AWS's,
@@ -287,7 +320,7 @@ async fn put_permission_set_boundary(
 ) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:PutPermissionsBoundaryToPermissionSet", &name).await?;
     ic::set_boundary(&app.pool.get().await?, &set, Some(&body.arn)).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
 /// Removes a permission set's permissions boundary.
@@ -299,13 +332,16 @@ async fn put_permission_set_boundary(
 async fn delete_permission_set_boundary(State(app): AppState, Extension(actor): Extension<Actor>, Path(name): Path<String>) -> Result<StatusCode> {
     let set = check_set(&app, &actor, "sso:DeletePermissionsBoundaryFromPermissionSet", &name).await?;
     ic::set_boundary(&app.pool.get().await?, &set, None).await?;
-    Ok(StatusCode::NO_CONTENT)
+    reprovision(&app, &actor, &set).await
 }
 
-/// A permission set's assignment to a directory user or group.
+/// A permission set's assignment to a directory user or group, in an
+/// account.
 #[derive(Serialize, ToSchema)]
 struct AssignmentSummary {
     id: String,
+    /// The account it gives the permission set in, by ID.
+    account_id: String,
     permission_set: String,
     /// `USER` or `GROUP`.
     principal_type: String,
@@ -313,8 +349,8 @@ struct AssignmentSummary {
     principal_id: String,
     /// A user's user name, or a group's name.
     principal_name: String,
-    /// Its identity source.
-    provider: String,
+    /// Its identity source; none for Cairn's own directory.
+    provider: Option<String>,
     /// A user's e-mail.
     email: Option<String>,
     created_at: f64,
@@ -327,12 +363,13 @@ struct AssignmentSummary {
 ))]
 async fn list_assignments(State(app): AppState, Extension(actor): Extension<Actor>) -> Result<Json<Vec<AssignmentSummary>>> {
     actor.check(&app, "sso:ListAccountAssignments", instance(&actor)).await?;
-    let assignments = ic::assignments(&app.pool.get().await?, actor.account(), None, None).await?;
+    let assignments = ic::assignments(&app.pool.get().await?, actor.account(), None, None, None).await?;
     Ok(Json(
         assignments
             .into_iter()
             .map(|a| AssignmentSummary {
                 id: a.id.to_string(),
+                account_id: a.account,
                 permission_set: a.permission_set,
                 principal_type: a.principal_type.as_str().to_owned(),
                 principal_id: a.principal_id.to_string(),
@@ -352,9 +389,12 @@ struct NewAssignment {
     principal_type: String,
     /// The user's or group's ID in the identity store.
     principal_id: String,
+    /// The account to give it in, by ID: the instance's own, if not given
+    /// (the only one so far).
+    account_id: Option<String>,
 }
 
-/// Assigns a permission set to a directory user or group.
+/// Assigns a permission set to a directory user or group, in an account.
 #[utoipa::path(post, path = "/assignments", request_body = NewAssignment, responses(
     (status = 201, description = "Assigned"),
     (status = "4XX", body = ErrorBody),
@@ -367,7 +407,10 @@ async fn create_assignment(State(app): AppState, Extension(actor): Extension<Act
     let principal = Uuid::parse_str(&body.principal_id)
         .map_err(|_| ApiError::NotFound(format!("there's no {} {} in the identity store", kind.as_str().to_lowercase(), body.principal_id)))?;
     let set = check_set(&app, &actor, "sso:CreateAccountAssignment", &body.permission_set).await?;
-    ic::assign(&app.pool.get().await?, &set, kind, principal).await?;
+    let account = body.account_id.as_deref().unwrap_or(actor.account());
+    if let Err(why) = ic::assign(&app.pool.get().await?, &set, account, kind, principal).await? {
+        return Err(ApiError::BadRequest(format!("{} can't be provisioned to {account}: {why}", set.name)));
+    }
     Ok(StatusCode::CREATED)
 }
 
@@ -382,13 +425,13 @@ async fn delete_assignment(State(app): AppState, Extension(actor): Extension<Act
     let missing = || ApiError::NotFound("no such assignment".into());
     let id = Uuid::parse_str(&id).map_err(|_| missing())?;
     let client = app.pool.get().await?;
-    let assignment = ic::assignments(&client, actor.account(), None, None)
+    let assignment = ic::assignments(&client, actor.account(), None, None, None)
         .await?
         .into_iter()
         .find(|a| a.id == id)
         .ok_or_else(missing)?;
     let set = check_set(&app, &actor, "sso:DeleteAccountAssignment", &assignment.permission_set).await?;
-    if !ic::unassign(&client, &set, assignment.principal_type, assignment.principal_id).await? {
+    if !ic::unassign(&client, &set, &assignment.account, assignment.principal_type, assignment.principal_id).await? {
         return Err(missing());
     }
     Ok(StatusCode::NO_CONTENT)
@@ -402,16 +445,25 @@ struct DirectoryUserSummary {
     user_name: String,
     display_name: String,
     email: Option<String>,
-    /// Its identity source, and its subject there.
-    provider: String,
-    subject: String,
-    /// Its groups, by name, as its last sign-in said.
+    /// Its identity source, and its subject there; none for a user of
+    /// Cairn's own directory.
+    provider: Option<String>,
+    subject: Option<String>,
+    /// Its groups, by name (a source's: as its last sign-in said).
     groups: Vec<String>,
+    /// When it was first in the identity store, and when it last changed
+    /// (a source's: signed in).
     first_signed_in: f64,
     last_signed_in: f64,
+    /// A user of Cairn's own directory's passkeys, when it last signed in
+    /// with one, and whether a setup link for it is out.
+    passkeys: i64,
+    last_passkey_use: Option<f64>,
+    setup_link_pending: bool,
 }
 
-/// The directory users that have signed in, most recent first.
+/// The identity store's users: Cairn's own directory's, and those of
+/// identity sources that have signed in, most recent first.
 #[utoipa::path(get, path = "/directory-users", responses(
     (status = 200, body = Vec<DirectoryUserSummary>),
     (status = "4XX", body = ErrorBody),
@@ -422,6 +474,7 @@ async fn list_directory_users(State(app): AppState, Extension(actor): Extension<
     let client = app.pool.get().await?;
     let groups = ic::groups(&client, None).await?;
     let memberships = ic::memberships(&client, None, None).await?;
+    let access = crate::console::store::directory_access(&client).await?;
     let mut users = ic::users(&client, None).await?;
     users.sort_by(|a, b| b.updated.total_cmp(&a.updated));
     Ok(Json(
@@ -434,7 +487,11 @@ async fn list_directory_users(State(app): AppState, Extension(actor): Extension<
                     .filter_map(|m| groups.iter().find(|g| g.id == m.group_id).map(|g| g.name.clone()))
                     .collect();
                 names.sort();
+                let own = access.get(&u.id).cloned().unwrap_or_default();
                 DirectoryUserSummary {
+                    passkeys: own.passkeys,
+                    last_passkey_use: own.last_sign_in,
+                    setup_link_pending: own.link_pending,
                     id: u.id.to_string(),
                     user_name: u.user_name,
                     display_name: u.display_name,
@@ -450,13 +507,117 @@ async fn list_directory_users(State(app): AppState, Extension(actor): Extension<
     ))
 }
 
+#[derive(Deserialize, ToSchema)]
+struct NewDirectoryUser {
+    /// Its user name: 1 to 128 characters, no spaces.
+    user_name: String,
+    display_name: String,
+    given_name: Option<String>,
+    family_name: Option<String>,
+    email: Option<String>,
+}
+
+/// The ID of a new directory user.
+#[derive(Serialize, ToSchema)]
+struct NewDirectoryUserId {
+    id: String,
+}
+
+/// Makes a user of Cairn's own directory, as identitystore's CreateUser:
+/// it signs in with passkeys, the first of which it makes with a setup
+/// link.
+#[utoipa::path(post, path = "/directory-users", request_body = NewDirectoryUser, responses(
+    (status = 201, body = NewDirectoryUserId),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_directory_user(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Json(body): Json<NewDirectoryUser>,
+) -> Result<(StatusCode, Json<NewDirectoryUserId>)> {
+    actor.check(&app, "identitystore:CreateUser", store(&actor)).await?;
+    let present = |text: &Option<String>| text.as_deref().map(str::trim).filter(|t| !t.is_empty()).map(str::to_owned);
+    let mut name = serde_json::json!({ "Formatted": body.display_name });
+    if let Some(given) = present(&body.given_name) {
+        name["GivenName"] = given.into();
+    }
+    if let Some(family) = present(&body.family_name) {
+        name["FamilyName"] = family.into();
+    }
+    let email = present(&body.email);
+    let mut profile = serde_json::json!({ "Name": name });
+    if let Some(email) = &email {
+        profile["Emails"] = serde_json::json!([{ "Value": email, "Primary": true }]);
+    }
+    let new = ic::OwnUser { user_name: &body.user_name, display_name: &body.display_name, email: email.as_deref(), profile: &profile };
+    let user = ic::create_user(&app.pool.get().await?, &new).await?;
+    Ok((StatusCode::CREATED, Json(NewDirectoryUserId { id: user.id.to_string() })))
+}
+
+/// The directory user `id`, allowed `action` on it.
+async fn check_user(app: &Arc<App>, actor: &Actor, action: &'static str, id: &str) -> Result<ic::User> {
+    let missing = || ApiError::NotFound(format!("there's no directory user {id}"));
+    let id = Uuid::parse_str(id).map_err(|_| missing())?;
+    actor.check(app, action, On::Arn(ic::user_arn(id))).await?;
+    ic::users(&app.pool.get().await?, Some(ic::Lookup::Id(id))).await?.pop().ok_or_else(missing)
+}
+
+/// Deletes a user of Cairn's own directory: its memberships, assignments,
+/// passkeys and sessions go too.
+#[utoipa::path(delete, path = "/directory-users/{id}", params(("id" = String, Path)), responses(
+    (status = 204, description = "Deleted"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_directory_user(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+    let user = check_user(&app, &actor, "identitystore:DeleteUser", &id).await?;
+    ic::delete_user(&app.pool.get().await?, &user, None).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Makes a user of Cairn's own directory a setup link, valid 7 days, to
+/// make a passkey with (its first, or another): Cairn's way of Identity
+/// Center's one-time password. It replaces the user's last link. Checked as
+/// `identitystore:UpdateUser`, as a change of how the user signs in.
+#[utoipa::path(post, path = "/directory-users/{id}/setup-link", params(("id" = String, Path)), responses(
+    (status = 201, body = EnrollmentLink),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn create_setup_link(
+    State(app): AppState,
+    Extension(actor): Extension<Actor>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<EnrollmentLink>)> {
+    let user = check_user(&app, &actor, "identitystore:UpdateUser", &id).await?;
+    let token = crate::console::store::create_setup_link(&app.pool.get().await?, user.id).await?;
+    let path = format!("/enroll#{token}");
+    let url = app.console.origin.as_ref().map(|origin| format!("{origin}{path}"));
+    Ok((StatusCode::CREATED, Json(EnrollmentLink { url, path })))
+}
+
+/// Removes all of a directory user's passkeys, as when one is lost: its
+/// sessions end, and it needs a setup link to sign in again.
+#[utoipa::path(delete, path = "/directory-users/{id}/passkeys", params(("id" = String, Path)), responses(
+    (status = 204, description = "Removed"),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn delete_directory_passkeys(State(app): AppState, Extension(actor): Extension<Actor>, Path(id): Path<String>) -> Result<StatusCode> {
+    let user = check_user(&app, &actor, "identitystore:UpdateUser", &id).await?;
+    crate::console::store::delete_directory_passkeys(&app.pool.get().await?, user.id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 /// A group, as its users' group claims named it.
 #[derive(Serialize, ToSchema)]
 struct DirectoryGroupSummary {
     /// Its ID in the identity store.
     id: String,
     name: String,
-    provider: String,
+    /// Its identity source; none for a group of Cairn's own directory.
+    provider: Option<String>,
     /// How many users it had, as their last sign-ins said.
     members: i64,
 }

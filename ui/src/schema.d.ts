@@ -41,7 +41,7 @@ export interface paths {
         };
         get: operations["list_assignments"];
         put?: never;
-        /** Assigns a permission set to a directory user or group. */
+        /** Assigns a permission set to a directory user or group, in an account. */
         post: operations["create_assignment"];
         delete?: never;
         options?: never;
@@ -518,10 +518,80 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** The directory users that have signed in, most recent first. */
+        /**
+         * The identity store's users: Cairn's own directory's, and those of
+         *     identity sources that have signed in, most recent first.
+         */
         get: operations["list_directory_users"];
         put?: never;
+        /**
+         * Makes a user of Cairn's own directory, as identitystore's CreateUser:
+         *     it signs in with passkeys, the first of which it makes with a setup
+         *     link.
+         */
+        post: operations["create_directory_user"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory-users/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
         post?: never;
+        /**
+         * Deletes a user of Cairn's own directory: its memberships, assignments,
+         *     passkeys and sessions go too.
+         */
+        delete: operations["delete_directory_user"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory-users/{id}/passkeys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Removes all of a directory user's passkeys, as when one is lost: its
+         *     sessions end, and it needs a setup link to sign in again.
+         */
+        delete: operations["delete_directory_passkeys"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/directory-users/{id}/setup-link": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Makes a user of Cairn's own directory a setup link, valid 7 days, to
+         *     make a passkey with (its first, or another): Cairn's way of Identity
+         *     Center's one-time password. It replaces the user's last link. Checked as
+         *     `identitystore:UpdateUser`, as a change of how the user signs in.
+         */
+        post: operations["create_setup_link"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1118,7 +1188,7 @@ export interface paths {
         /** Changes a permission set's description and session duration. */
         put: operations["update_permission_set"];
         post?: never;
-        /** Deletes a permission set: its assignments and its role go too. */
+        /** Deletes a permission set: its assignments and its roles go too. */
         delete: operations["delete_permission_set"];
         options?: never;
         head?: never;
@@ -1875,8 +1945,13 @@ export interface components {
             /** @description The login the passkey is of, as the authenticator says. */
             user_handle?: string | null;
         };
-        /** @description A permission set's assignment to a directory user or group. */
+        /**
+         * @description A permission set's assignment to a directory user or group, in an
+         *     account.
+         */
         AssignmentSummary: {
+            /** @description The account it gives the permission set in, by ID. */
+            account_id: string;
             /** Format: double */
             created_at: number;
             /** @description A user's e-mail. */
@@ -1889,8 +1964,8 @@ export interface components {
             principal_name: string;
             /** @description `USER` or `GROUP`. */
             principal_type: string;
-            /** @description Its identity source. */
-            provider: string;
+            /** @description Its identity source; none for Cairn's own directory. */
+            provider?: string | null;
         };
         AttachedPolicy: {
             arn: string;
@@ -2084,6 +2159,11 @@ export interface components {
             options: Record<string, never>;
         };
         ChosenPermissionSet: {
+            /**
+             * @description The account to act in, by ID: one the set is assigned to the user
+             *     in. Needed only when it's assigned in more than one.
+             */
+            account_id?: string | null;
             /** @description One of the session's permission sets, by name. */
             name: string;
         };
@@ -2260,22 +2340,33 @@ export interface components {
              */
             members: number;
             name: string;
-            provider: string;
+            /** @description Its identity source; none for a group of Cairn's own directory. */
+            provider?: string | null;
         };
         /** @description A directory user, signed in at an identity source. */
         DirectoryMe: {
             email?: string | null;
             /** @description Its groups, as the source's group claim said when it signed in. */
             groups: string[];
-            /** @description The permission set it acts as, if it picked one. */
+            /**
+             * @description The permission set it acts as, and the account (by ID) it acts in
+             *     there, if it picked one.
+             */
             permission_set?: string | null;
-            /** @description The permission sets assigned to it or its groups, to pick from. */
+            permission_set_account_id?: string | null;
+            /**
+             * @description The permission sets assigned to it or its groups, in the accounts
+             *     they're assigned in, to pick from.
+             */
             permission_sets: components["schemas"]["PermissionSetChoice"][];
-            /** @description The identity source's name and label. */
-            provider: string;
-            provider_label: string;
-            /** @description Its subject there (`sub`), which assignments name it by. */
-            subject: string;
+            /**
+             * @description The identity source's name and label, and its subject there (`sub`);
+             *     none for a user of Cairn's own directory, which signs in with
+             *     passkeys.
+             */
+            provider?: string | null;
+            provider_label?: string | null;
+            subject?: string | null;
             /** @description Its ID in the identity store, and its user name there. */
             user_id: string;
             user_name: string;
@@ -2284,17 +2375,33 @@ export interface components {
         DirectoryUserSummary: {
             display_name: string;
             email?: string | null;
-            /** Format: double */
+            /**
+             * Format: double
+             * @description When it was first in the identity store, and when it last changed
+             *     (a source's: signed in).
+             */
             first_signed_in: number;
-            /** @description Its groups, by name, as its last sign-in said. */
+            /** @description Its groups, by name (a source's: as its last sign-in said). */
             groups: string[];
             /** @description Its ID in the identity store. */
             id: string;
             /** Format: double */
+            last_passkey_use?: number | null;
+            /** Format: double */
             last_signed_in: number;
-            /** @description Its identity source, and its subject there. */
-            provider: string;
-            subject: string;
+            /**
+             * Format: int64
+             * @description A user of Cairn's own directory's passkeys, when it last signed in
+             *     with one, and whether a setup link for it is out.
+             */
+            passkeys: number;
+            /**
+             * @description Its identity source, and its subject there; none for a user of
+             *     Cairn's own directory.
+             */
+            provider?: string | null;
+            setup_link_pending: boolean;
+            subject?: string | null;
             user_name: string;
         };
         Disk: {
@@ -2339,7 +2446,12 @@ export interface components {
          *     login instead).
          */
         EnrollCeremony: components["schemas"]["Ceremony"] & {
-            /** @description The identity: `user @ account`, or `root @ account`. */
+            /**
+             * @description Whether the link is a directory user's setup link (whose passkey is
+             *     its own, never a login's).
+             */
+            directory: boolean;
+            /** @description The identity: `user @ account`, or a directory user's user name. */
             identity: string;
         };
         Enrollment: {
@@ -2915,6 +3027,11 @@ export interface components {
             started_at: number;
         };
         NewAssignment: {
+            /**
+             * @description The account to give it in, by ID: the instance's own, if not given
+             *     (the only one so far).
+             */
+            account_id?: string | null;
             permission_set: string;
             /** @description The user's or group's ID in the identity store. */
             principal_id: string;
@@ -2928,6 +3045,18 @@ export interface components {
              *     start: it can't be disabled again.
              */
             object_lock?: boolean;
+        };
+        NewDirectoryUser: {
+            display_name: string;
+            email?: string | null;
+            family_name?: string | null;
+            given_name?: string | null;
+            /** @description Its user name: 1 to 128 characters, no spaces. */
+            user_name: string;
+        };
+        /** @description The ID of a new directory user. */
+        NewDirectoryUserId: {
+            id: string;
         };
         NewIdentityProvider: {
             /** @description The audiences its tokens may be for (`sts.amazonaws.com`, say). */
@@ -3260,8 +3389,11 @@ export interface components {
              */
             session_duration: number;
         };
-        /** @description A permission set a directory user may use. */
+        /** @description A permission set a directory user may use, in an account. */
         PermissionSetChoice: {
+            account: string;
+            /** @description The account's ID and name. */
+            account_id: string;
             description: string;
             name: string;
             /**
@@ -3291,8 +3423,12 @@ export interface components {
             /** @description Whether it has an inline policy. */
             inline_policy: boolean;
             name: string;
-            role_arn: string;
-            /** @description The role it's provisioned as (which IAM can't change). */
+            /** @description The accounts it's provisioned to (none until it's first assigned). */
+            provisioned: components["schemas"]["ProvisionSummary"][];
+            /**
+             * @description The name of its role in each account it's provisioned to (which IAM
+             *     can't change).
+             */
             role_name: string;
             /**
              * Format: int32
@@ -3367,6 +3503,13 @@ export interface components {
         ProviderButton: {
             label: string;
             name: string;
+        };
+        /** @description A permission set's provisioning to an account. */
+        ProvisionSummary: {
+            account_id: string;
+            /** @description Whether its role there holds the set as it is now. */
+            latest: boolean;
+            role_arn: string;
         };
         Published: {
             message_id: string;
@@ -5407,6 +5550,154 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["DirectoryUserSummary"][];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_directory_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewDirectoryUser"];
+            };
+        };
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NewDirectoryUserId"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_directory_user: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    delete_directory_passkeys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Removed */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    create_setup_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EnrollmentLink"];
                 };
             };
             "4XX": {

@@ -245,6 +245,9 @@ const MIGRATIONS: &[&str] = &[
     BATCH_JOB_RESULTS,
     DIRECTORY_USERS,
     BATCH_INVENTORY_MANIFESTS,
+    PERMISSION_SET_ACCOUNTS,
+    PERMISSION_SET_DEFINITIONS,
+    OWN_DIRECTORY,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3092,6 +3095,160 @@ ALTER TABLE batch_jobs ADD COLUMN prepared_file int NOT NULL DEFAULT 0,
 ALTER TABLE batch_job_results ADD COLUMN file int NOT NULL DEFAULT 0;
 ALTER TABLE batch_job_results DROP CONSTRAINT batch_job_results_pkey;
 ALTER TABLE batch_job_results ADD PRIMARY KEY (job_id, file, start_at, status);
+"#;
+
+/// Migration 65: permission sets across accounts, as Identity Center's (see
+/// `identity_center`). A permission set is the instance's (its account's,
+/// `permission_sets.account_id`), and is provisioned to accounts as a role
+/// in each: `permission_set_provisions`, which take over the set's role.
+/// An assignment gives a set to a user or group in an account (its target),
+/// which the set must be provisioned to; a directory user's console session
+/// acts as a set in an account, and sso-admin's requests note the account
+/// they targeted. Every row so far is the one account's.
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const PERMISSION_SET_ACCOUNTS: &str = r#"
+CREATE TABLE permission_set_provisions (
+    permission_set_id uuid NOT NULL REFERENCES permission_sets (id) ON DELETE CASCADE,
+    account_id        text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    role_id           uuid NOT NULL UNIQUE REFERENCES iam_roles (id),
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (permission_set_id, account_id)
+);
+CREATE INDEX permission_set_provisions_account ON permission_set_provisions (account_id);
+CREATE TRIGGER permission_set_provisions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON permission_set_provisions
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+INSERT INTO permission_set_provisions (permission_set_id, account_id, role_id, created_at)
+SELECT id, account_id, role_id, created_at FROM permission_sets;
+ALTER TABLE permission_sets DROP COLUMN role_id;
+
+ALTER TABLE permission_set_assignments ADD COLUMN account_id text;
+UPDATE permission_set_assignments a SET account_id = p.account_id FROM permission_sets p WHERE p.id = a.permission_set_id;
+ALTER TABLE permission_set_assignments ALTER COLUMN account_id SET NOT NULL;
+ALTER TABLE permission_set_assignments
+    ADD FOREIGN KEY (permission_set_id, account_id) REFERENCES permission_set_provisions (permission_set_id, account_id) ON DELETE CASCADE,
+    DROP CONSTRAINT permission_set_assignments_permission_set_id_user_id_key,
+    DROP CONSTRAINT permission_set_assignments_permission_set_id_group_id_key,
+    ADD UNIQUE (permission_set_id, account_id, user_id),
+    ADD UNIQUE (permission_set_id, account_id, group_id);
+CREATE INDEX permission_set_assignments_account ON permission_set_assignments (account_id);
+
+ALTER TABLE console_directory_sessions ADD COLUMN target_account_id text;
+UPDATE console_directory_sessions SET target_account_id = account_id WHERE permission_set_id IS NOT NULL;
+ALTER TABLE console_directory_sessions
+    DROP CONSTRAINT console_directory_sessions_permission_set_id_fkey,
+    ADD FOREIGN KEY (permission_set_id, target_account_id)
+        REFERENCES permission_set_provisions (permission_set_id, account_id) ON DELETE SET NULL,
+    ADD CHECK ((permission_set_id IS NULL) = (target_account_id IS NULL));
+
+ALTER TABLE sso_operations ADD COLUMN target_account_id text;
+UPDATE sso_operations SET target_account_id = account_id;
+"#;
+
+/// Migration 66: a permission set is what it holds, as Identity Center's:
+/// its inline policy, AWS managed policies (by name), customer managed
+/// policy references (by name and path, which each account it's
+/// provisioned to must have) and permissions boundary (AWS's, or a
+/// reference) are the set's, which provisioning copies into its role in an
+/// account (see `identity_center`). Its version rises with every change to
+/// them (or to its session duration); a provisioning notes the version its
+/// role holds, which is the latest until the set changes again. Each set so
+/// far is what its role in its own account holds, as provisioned there.
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const PERMISSION_SET_DEFINITIONS: &str = r#"
+ALTER TABLE permission_sets
+    ADD COLUMN inline_policy text,
+    ADD COLUMN boundary_aws  text,
+    ADD COLUMN boundary_name text,
+    ADD COLUMN boundary_path text,
+    ADD COLUMN version       bigint NOT NULL DEFAULT 1,
+    ADD CONSTRAINT permission_sets_one_boundary CHECK (boundary_aws IS NULL OR boundary_name IS NULL),
+    ADD CONSTRAINT permission_sets_boundary_reference CHECK ((boundary_name IS NULL) = (boundary_path IS NULL));
+ALTER TABLE permission_set_provisions ADD COLUMN version bigint NOT NULL DEFAULT 1;
+
+CREATE TABLE permission_set_managed_policies (
+    permission_set_id uuid NOT NULL REFERENCES permission_sets (id) ON DELETE CASCADE,
+    name              text NOT NULL,
+    PRIMARY KEY (permission_set_id, name)
+);
+CREATE TRIGGER permission_set_managed_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON permission_set_managed_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TABLE permission_set_customer_policies (
+    permission_set_id uuid NOT NULL REFERENCES permission_sets (id) ON DELETE CASCADE,
+    name              text NOT NULL,
+    path              text NOT NULL,
+    PRIMARY KEY (permission_set_id, path, name)
+);
+CREATE TRIGGER permission_set_customer_policies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON permission_set_customer_policies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+UPDATE permission_sets p SET inline_policy = rp.document
+FROM permission_set_provisions v JOIN iam_role_policies rp ON rp.role_id = v.role_id AND rp.name = 'AwsSSOInlinePolicy'
+WHERE v.permission_set_id = p.id AND v.account_id = p.account_id;
+INSERT INTO permission_set_managed_policies (permission_set_id, name)
+SELECT p.id, x.aws_policy FROM permission_sets p
+JOIN permission_set_provisions v ON v.permission_set_id = p.id AND v.account_id = p.account_id
+JOIN iam_role_attached_policies x ON x.role_id = v.role_id WHERE x.aws_policy IS NOT NULL;
+INSERT INTO permission_set_customer_policies (permission_set_id, name, path)
+SELECT p.id, m.name, m.path FROM permission_sets p
+JOIN permission_set_provisions v ON v.permission_set_id = p.id AND v.account_id = p.account_id
+JOIN iam_role_attached_policies x ON x.role_id = v.role_id JOIN managed_policies m ON m.id = x.policy_id;
+UPDATE permission_sets p SET boundary_aws = r.boundary_aws, boundary_name = m.name, boundary_path = m.path
+FROM permission_set_provisions v JOIN iam_roles r ON r.id = v.role_id LEFT JOIN managed_policies m ON m.id = r.boundary_policy_id
+WHERE v.permission_set_id = p.id AND v.account_id = p.account_id;
+"#;
+
+/// Migration 67: Cairn's own directory, as Identity Center's: users and
+/// groups of no identity source (`provider` NULL), which identitystore's
+/// writes make and change, as opposed to those sign-ins at a source fill.
+/// A user of its own keeps the attributes it was given as Identity Center
+/// has them (`profile`); it signs in with passkeys (`directory_passkeys`),
+/// the first of which it makes with a setup link (`directory_setup_links`,
+/// one per user), and its console sessions note the passkey they were
+/// signed in with, and when. Its own groups' names are unique, as
+/// display names, whatever their case; its own users' user names were
+/// unique already. Users and groups have revisions, which every change
+/// raises (identitystore's `Revision`).
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const OWN_DIRECTORY: &str = r#"
+ALTER TABLE identity_users
+    ALTER COLUMN provider DROP NOT NULL,
+    ALTER COLUMN subject DROP NOT NULL,
+    ADD COLUMN profile jsonb NOT NULL DEFAULT '{}',
+    ADD COLUMN revision bigint NOT NULL DEFAULT 1,
+    ADD CONSTRAINT identity_users_source CHECK ((provider IS NULL) = (subject IS NULL));
+ALTER TABLE identity_groups
+    ALTER COLUMN provider DROP NOT NULL,
+    ADD COLUMN description text,
+    ADD COLUMN revision bigint NOT NULL DEFAULT 1;
+CREATE UNIQUE INDEX identity_groups_own_name ON identity_groups (lower(name)) WHERE provider IS NULL;
+
+CREATE TABLE directory_passkeys (
+    credential_id   bytea PRIMARY KEY,
+    user_id         uuid NOT NULL REFERENCES identity_users (id) ON DELETE CASCADE,
+    public_key      bytea NOT NULL,
+    sign_count      bigint NOT NULL,
+    name            text NOT NULL,
+    backup_eligible boolean NOT NULL,
+    backed_up       boolean NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    last_used_at    timestamptz
+);
+CREATE INDEX directory_passkeys_user ON directory_passkeys (user_id);
+CREATE TRIGGER directory_passkeys_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON directory_passkeys
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE directory_setup_links (
+    token_hash bytea PRIMARY KEY,
+    user_id    uuid NOT NULL UNIQUE REFERENCES identity_users (id) ON DELETE CASCADE,
+    expires_at timestamptz NOT NULL
+);
+CREATE TRIGGER directory_setup_links_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON directory_setup_links
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+ALTER TABLE console_directory_sessions
+    ADD COLUMN credential_id bytea REFERENCES directory_passkeys (credential_id) ON DELETE CASCADE,
+    ADD COLUMN verified_at   timestamptz,
+    ADD CHECK ((credential_id IS NULL) = (verified_at IS NULL));
 "#;
 
 #[cfg(test)]

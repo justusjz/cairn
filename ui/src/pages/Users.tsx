@@ -644,7 +644,7 @@ function EditUserDialog(props: { user: User; policies: ManagedPolicy[]; onClose:
 }
 
 /** A user's enrollment link for the console, shown once. */
-export function EnrollmentDialog(props: { user: string; url?: string | null; path: string; onClose: () => void }) {
+export function EnrollmentDialog(props: { user: string; url?: string | null; path: string; valid?: string; onClose: () => void }) {
   let dialog!: HTMLDialogElement;
   let input!: HTMLInputElement;
   onMount(() => {
@@ -666,8 +666,8 @@ export function EnrollmentDialog(props: { user: string; url?: string | null; pat
         Console link for <span class="mono">{props.user}</span>
       </h2>
       <p class="subtle">
-        Send it to <span class="mono">{props.user}</span>: it sets up a passkey for the console, and works once, for 24
-        hours. A new link replaces this one.
+        Send it to <span class="mono">{props.user}</span>: it sets up a passkey for the console, and works once, for{" "}
+        {props.valid ?? "24 hours"}. A new link replaces this one.
       </p>
       <Show when={!props.url}>
         <p class="subtle small">

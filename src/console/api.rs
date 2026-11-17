@@ -144,8 +144,11 @@ struct Enrollment {
 /// login instead).
 #[derive(Serialize, ToSchema)]
 struct EnrollCeremony {
-    /// The identity: `user @ account`, or `root @ account`.
+    /// The identity: `user @ account`, or a directory user's user name.
     identity: String,
+    /// Whether the link is a directory user's setup link (whose passkey is
+    /// its own, never a login's).
+    directory: bool,
     #[serde(flatten)]
     ceremony: Ceremony,
 }
@@ -157,13 +160,17 @@ struct EnrollCeremony {
 ))]
 async fn enroll_options(State(console): ConsoleState, Json(body): Json<Enrollment>) -> Result<Json<EnrollCeremony>> {
     let client = console.app.pool.get().await?;
-    let Some(identity) = store::enrollment(&client, &body.token).await? else {
-        return Err(ApiError::BadRequest("this enrollment link has been used, or has expired".into()));
+    let (handle, label, directory) = match store::enrollment(&client, &body.token).await? {
+        Some(identity) => (None, identity.label(), false),
+        // A directory user's setup link: its passkeys' user handle is its ID.
+        None => match store::setup_link(&client, &body.token).await? {
+            Some((user, name)) => (Some(user), name, true),
+            None => return Err(ApiError::BadRequest("this enrollment link has been used, or has expired".into())),
+        },
     };
     let (id, challenge) = store::create_challenge(&client, store::Purpose::Enroll, None).await?;
-    let label = identity.label();
-    let options = creation_options(&console, new_login_id(&challenge), &label, &challenge, &[]);
-    Ok(Json(EnrollCeremony { identity: label, ceremony: Ceremony { challenge_id: id.to_string(), options } }))
+    let options = creation_options(&console, handle.unwrap_or_else(|| new_login_id(&challenge)), &label, &challenge, &[]);
+    Ok(Json(EnrollCeremony { identity: label, directory, ceremony: Ceremony { challenge_id: id.to_string(), options } }))
 }
 
 #[utoipa::path(post, path = "/login/options", responses(
@@ -247,12 +254,62 @@ fn new_passkey<'a>(credential: &'a webauthn::NewCredential, name: &'a str) -> st
     }
 }
 
-/// Checks an assertion against its challenge: the login whose passkey made
-/// it, whose use is recorded.
-async fn asserted(console: &Console, client: &deadpool_postgres::Object, challenge: &[u8], a: &Assertion) -> Result<(Uuid, Vec<u8>)> {
+/// Who signed with a passkey: a login, or a user of Cairn's own directory
+/// (its ID), and the passkey's credential ID.
+enum Signer {
+    Login(Uuid, Vec<u8>),
+    Directory(Uuid, Vec<u8>),
+}
+
+/// Checks an assertion against its challenge, with a directory user's
+/// passkey: who signed, whose use is recorded.
+async fn asserted_directory(
+    console: &Console,
+    client: &deadpool_postgres::Object,
+    challenge: &[u8],
+    a: &Assertion,
+    credential_id: Vec<u8>,
+    passkey: store::DirectoryPasskey,
+) -> Result<Signer> {
+    let unknown = || ApiError::BadRequest("this passkey isn't registered with this console (anymore)".into());
+    if let Some(handle) = &a.user_handle
+        && unb64(handle, "user_handle")? != passkey.user.as_bytes()
+    {
+        return Err(unknown());
+    }
+    let asserted = webauthn::verify_assertion(
+        &console.party,
+        challenge,
+        &passkey.public_key,
+        &unb64(&a.client_data_json, "client_data_json")?,
+        &unb64(&a.authenticator_data, "authenticator_data")?,
+        &unb64(&a.signature, "signature")?,
+    )
+    .map_err(refused)?;
+    if !store::record_directory_use(client, &credential_id, asserted.sign_count, asserted.backed_up).await? {
+        eprintln!(
+            "console: a passkey of directory user {} signed with counter {} after {}: refused, as it may be a clone",
+            passkey.user, asserted.sign_count, passkey.sign_count
+        );
+        return Err(ApiError::BadRequest(
+            "this passkey's signature counter went backwards, so it may have been copied; it's refused".into(),
+        ));
+    }
+    Ok(Signer::Directory(passkey.user, credential_id))
+}
+
+/// Checks an assertion against its challenge: who signed (a login, or a
+/// user of Cairn's own directory), whose passkey's use is recorded.
+async fn asserted(console: &Console, client: &deadpool_postgres::Object, challenge: &[u8], a: &Assertion) -> Result<Signer> {
     let credential_id = unb64(&a.id, "id")?;
     let unknown = || ApiError::BadRequest("this passkey isn't registered with this console (anymore)".into());
-    let passkey = store::passkey(client, &credential_id).await?.ok_or_else(unknown)?;
+    let passkey = match store::passkey(client, &credential_id).await? {
+        Some(passkey) => passkey,
+        None => match store::directory_passkey(client, &credential_id).await? {
+            Some(passkey) => return asserted_directory(console, client, challenge, a, credential_id, passkey).await,
+            None => return Err(unknown()),
+        },
+    };
     if let Some(handle) = &a.user_handle
         && unb64(handle, "user_handle")? != passkey.login.as_bytes()
     {
@@ -276,7 +333,7 @@ async fn asserted(console: &Console, client: &deadpool_postgres::Object, challen
             "this passkey's signature counter went backwards, so it may have been copied; it's refused".into(),
         ));
     }
-    Ok((passkey.login, credential_id))
+    Ok(Signer::Login(passkey.login, credential_id))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -307,6 +364,13 @@ async fn enroll(State(console): ConsoleState, Json(body): Json<Enroll>) -> Resul
     let name = store::check_name(&p.name)?;
     let (challenge, _) = take_challenge(&client, &p.challenge_id, store::Purpose::Enroll).await?;
     let Some(identity) = store::enrollment(&client, &body.token).await? else {
+        // A directory user's setup link: its first (or another) passkey,
+        // and it's signed in with it.
+        if store::setup_link(&client, &body.token).await?.is_some() {
+            let credential = registered(&console, &challenge, &p.credential)?;
+            let user = store::new_directory_passkey(&client, &body.token, &new_passkey(&credential, name)).await?;
+            return directory_signed_in(&console, &client, user, &credential.id).await;
+        }
         return Err(ApiError::BadRequest("this enrollment link has been used, or has expired".into()));
     };
     let credential = registered(&console, &challenge, &p.credential)?;
@@ -331,6 +395,28 @@ async fn signed_in(
     Ok(([(header::SET_COOKIE, session_cookie(&token))], Json(me)).into_response())
 }
 
+/// Starts a session for directory user `user` of Cairn's own directory,
+/// signed in with passkey `credential` (just now), as Identity Center's
+/// access portal would let it in: with one of the permission sets assigned
+/// to it (picked for it if it has one), none, if it has none.
+async fn directory_signed_in(console: &Console, client: &deadpool_postgres::Object, user: Uuid, credential: &[u8]) -> Result<Response> {
+    let account = crate::users::account(client).await?;
+    let eligible = crate::identity_center::eligible(client, &account, user).await?;
+    if eligible.is_empty() {
+        return Err(ApiError::Forbidden(
+            "your passkey works, but no permission set is assigned to you: ask an administrator for one".into(),
+        ));
+    }
+    let chosen = match eligible.as_slice() {
+        [only] => Some((only.set.id, only.account.as_str())),
+        _ => None,
+    };
+    let token = store::create_directory_session(client, &account, user, chosen, Some(credential)).await?;
+    let session = store::directory_session(client, &token).await?.ok_or_else(|| anyhow::anyhow!("a new session is gone"))?;
+    let me = directory_me(console, client, &session).await?;
+    Ok(([(header::SET_COOKIE, session_cookie(&token))], Json(me)).into_response())
+}
+
 #[derive(Deserialize, ToSchema)]
 struct Login {
     challenge_id: String,
@@ -346,7 +432,10 @@ struct Login {
 async fn login(State(console): ConsoleState, Json(body): Json<Login>) -> Result<Response> {
     let client = console.app.pool.get().await?;
     let (challenge, _) = take_challenge(&client, &body.challenge_id, store::Purpose::Login).await?;
-    let (login, credential) = asserted(&console, &client, &challenge, &body.credential).await?;
+    let (login, credential) = match asserted(&console, &client, &challenge, &body.credential).await? {
+        Signer::Login(login, credential) => (login, credential),
+        Signer::Directory(user, credential) => return directory_signed_in(&console, &client, user, &credential).await,
+    };
     let identities = store::identities(&client, login).await?;
     let Some(first) = identities.first() else {
         return Err(ApiError::Forbidden(
@@ -417,6 +506,9 @@ async fn logout(State(console): ConsoleState, headers: HeaderMap) -> Result<Resp
 ))]
 async fn enroll_link(State(console): ConsoleState, signed: Signed, Json(body): Json<Enrollment>) -> Result<Json<Me>> {
     let client = console.app.pool.get().await?;
+    if store::setup_link(&client, &body.token).await?.is_some() {
+        return Err(ApiError::BadRequest("this is a directory user's link: make a passkey of its own with it".into()));
+    }
     store::enroll(&client, signed.session.login, &body.token).await?;
     let session = store::session(&client, &signed.token).await?.ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
     Ok(Json(me_of(&console, &client, &session).await?))
@@ -478,23 +570,30 @@ struct DirectoryMe {
     /// Its ID in the identity store, and its user name there.
     user_id: String,
     user_name: String,
-    /// The identity source's name and label.
-    provider: String,
-    provider_label: String,
-    /// Its subject there (`sub`), which assignments name it by.
-    subject: String,
+    /// The identity source's name and label, and its subject there (`sub`);
+    /// none for a user of Cairn's own directory, which signs in with
+    /// passkeys.
+    provider: Option<String>,
+    provider_label: Option<String>,
+    subject: Option<String>,
     email: Option<String>,
     /// Its groups, as the source's group claim said when it signed in.
     groups: Vec<String>,
-    /// The permission set it acts as, if it picked one.
+    /// The permission set it acts as, and the account (by ID) it acts in
+    /// there, if it picked one.
     permission_set: Option<String>,
-    /// The permission sets assigned to it or its groups, to pick from.
+    permission_set_account_id: Option<String>,
+    /// The permission sets assigned to it or its groups, in the accounts
+    /// they're assigned in, to pick from.
     permission_sets: Vec<PermissionSetChoice>,
 }
 
-/// A permission set a directory user may use.
+/// A permission set a directory user may use, in an account.
 #[derive(Serialize, ToSchema)]
 struct PermissionSetChoice {
+    /// The account's ID and name.
+    account_id: String,
+    account: String,
     name: String,
     description: String,
     /// How long its sessions (and credentials) last, in seconds.
@@ -570,23 +669,37 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
 /// session, if it picked one that's still its.
 async fn directory_me(console: &Console, client: &deadpool_postgres::Object, session: &store::DirectorySession) -> Result<Me> {
     let eligible = crate::identity_center::eligible(client, &session.account_id, session.user_id).await?;
-    let chosen = eligible.iter().find(|set| Some(set.id) == session.permission_set);
-    let (arn, user, cluster) = match chosen {
-        Some(set) => {
+    let chosen = eligible.iter().find(|e| session.permission_set.as_ref() == Some(&(e.set.id, e.account.clone())));
+    let (identity, cluster) = match chosen {
+        Some(chosen) => {
             let user = super::directory::user(client, session, axum::http::Method::GET, HeaderMap::new(), String::new(), None).await?;
             let arn = user.principal.arn();
             let actor = super::Actor(Arc::new(user));
             let cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
-            (arn, set.role_name.clone(), cluster)
+            let identity = IdentitySummary {
+                account_id: chosen.account.clone(),
+                account: chosen.account_name.clone(),
+                user: chosen.role_name.clone(),
+                arn,
+            };
+            (identity, cluster)
         }
-        None => (String::new(), String::new(), false),
+        None => {
+            let identity = IdentitySummary {
+                account_id: session.account_id.clone(),
+                account: session.account.clone(),
+                user: String::new(),
+                arn: String::new(),
+            };
+            (identity, false)
+        }
     };
     Ok(Me {
         name: session.name.clone(),
         root: false,
         expires_at: Some(session.expires_at),
-        identity: IdentitySummary { account_id: session.account_id.clone(), account: session.account.clone(), user, arn },
-        mfa: false,
+        identity,
+        mfa: session.mfa_age.is_some(),
         cluster,
         passkeys: Vec::new(),
         directory: Some(DirectoryMe {
@@ -597,13 +710,16 @@ async fn directory_me(console: &Console, client: &deadpool_postgres::Object, ses
             subject: session.subject.clone(),
             email: session.email.clone(),
             groups: session.groups.clone(),
-            permission_set: chosen.map(|set| set.name.clone()),
+            permission_set: chosen.map(|e| e.set.name.clone()),
+            permission_set_account_id: chosen.map(|e| e.account.clone()),
             permission_sets: eligible
                 .iter()
-                .map(|set| PermissionSetChoice {
-                    name: set.name.clone(),
-                    description: set.description.clone(),
-                    session_duration: set.session_duration,
+                .map(|e| PermissionSetChoice {
+                    account_id: e.account.clone(),
+                    account: e.account_name.clone(),
+                    name: e.set.name.clone(),
+                    description: e.set.description.clone(),
+                    session_duration: e.set.session_duration,
                 })
                 .collect(),
         }),
@@ -614,6 +730,9 @@ async fn directory_me(console: &Console, client: &deadpool_postgres::Object, ses
 struct ChosenPermissionSet {
     /// One of the session's permission sets, by name.
     name: String,
+    /// The account to act in, by ID: one the set is assigned to the user
+    /// in. Needed only when it's assigned in more than one.
+    account_id: Option<String>,
 }
 
 /// Has a directory user's session act as one of its permission sets.
@@ -630,10 +749,19 @@ async fn choose_permission_set(
     let client = console.app.pool.get().await?;
     let session = &signed.session;
     let eligible = crate::identity_center::eligible(&client, &session.account_id, session.user_id).await?;
-    let Some(set) = eligible.into_iter().find(|set| set.name == body.name) else {
-        return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you", body.name)));
+    let matching: Vec<_> = eligible
+        .into_iter()
+        .filter(|e| e.set.name == body.name && body.account_id.as_ref().is_none_or(|id| *id == e.account))
+        .collect();
+    let chosen = match matching.as_slice() {
+        [] => match &body.account_id {
+            Some(id) => return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you in account {id}", body.name))),
+            None => return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you", body.name))),
+        },
+        [one] => one,
+        _ => return Err(ApiError::BadRequest(format!("the permission set {:?} is yours in several accounts: say which", body.name))),
     };
-    store::choose_permission_set(&client, &signed.token, set.id).await?;
+    store::choose_permission_set(&client, &signed.token, chosen.set.id, &chosen.account).await?;
     let session = store::directory_session(&client, &signed.token).await?.ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
     Ok(Json(directory_me(&console, &client, &session).await?))
 }
@@ -658,12 +786,17 @@ struct Credentials {
 ))]
 async fn directory_credentials(State(console): ConsoleState, signed: DirectorySigned) -> Result<Json<Credentials>> {
     let client = console.app.pool.get().await?;
-    let set = super::directory::permission_set(&client, &signed.session).await?;
-    let mut session = super::directory::role_session(&set, &signed.session)?;
+    let chosen = super::directory::permission_set(&client, &signed.session).await?;
+    let mut session = super::directory::role_session(&chosen, &signed.session)?;
     let token = console.app.sessions.seal(&client, &mut session).await?;
     eprintln!(
-        "console: credentials {} of permission set {} for directory user {} ({} of {})",
-        session.key_id, set.name, signed.session.user_name, signed.session.subject, signed.session.provider
+        "console: credentials {} of permission set {} in account {} for directory user {} ({} of {})",
+        session.key_id,
+        chosen.set.name,
+        chosen.account,
+        signed.session.user_name,
+        signed.session.subject.as_deref().unwrap_or("-"),
+        signed.session.provider.as_deref().unwrap_or("Cairn's own directory")
     );
     Ok(Json(Credentials {
         access_key_id: session.key_id,
@@ -883,14 +1016,15 @@ async fn oidc_callback(State(console): ConsoleState, headers: HeaderMap, Query(a
             &format!("no permission set is assigned to you at {}: ask an administrator for one", done.provider.label),
         ));
     }
-    // Picked for it when it has one only; else it picks.
+    // Picked for it when it has one only (one set, in one account); else it
+    // picks.
     let chosen = match eligible.as_slice() {
-        [only] => Some(only.id),
+        [only] => Some((only.set.id, only.account.as_str())),
         _ => None,
     };
     if let Some(old) = session_token(&headers) {
         store::end_session(&client, &old).await?;
     }
-    let token = store::create_directory_session(&client, &account, user, chosen).await?;
+    let token = store::create_directory_session(&client, &account, user, chosen, None).await?;
     Ok(redirect("/", Some(session_cookie(&token))))
 }

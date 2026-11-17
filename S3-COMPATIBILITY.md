@@ -77,7 +77,7 @@ supported.
 | Bucket ABAC (bucket tags in policies) | ✅ | |
 | S3 Access Grants | 🟡 | IAM grantees only: [Access Grants](#access-grants) |
 | MFA delete | 🟡 | [MFA delete](#mfa-delete) |
-| IAM Identity Center (directory users, permission sets, sso-admin, identitystore) | 🟡 | OIDC sources, one account: [Identity Center](#identity-center) |
+| IAM Identity Center (directory users, permission sets, sso-admin, identitystore) | 🟡 | Own directory and OIDC sources, one account: [Identity Center](#identity-center) |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
 ### Not implemented
@@ -93,8 +93,7 @@ S3 reports a bucket that doesn't use it:
 - Directory users and groups as grantees, and cross-account S3 Access
   Grants ([Access Grants](#access-grants)).
 - Identity Center's access portal APIs (`sso`, `sso-oidc`, so `aws sso
-  login`), applications and identitystore's writes ([Identity
-  Center](#identity-center)).
+  login`) and applications ([Identity Center](#identity-center)).
 
 ---
 
@@ -398,42 +397,66 @@ Differences:
 Directory users, as IAM Identity Center has them: people who sign in to the
 console at an identity source, and act as a session of the role of a
 permission set assigned to them or a group of theirs (see the README's
-*Directory users*). As in Identity Center, a permission set is a role at
+*Directory users*). As in Identity Center, a permission set is provisioned
+to an account (when it's first assigned there, and again by
+ProvisionPermissionSet once it has changed) as a role at
 `/aws-reserved/sso.amazonaws.com/` named `AWSReservedSSO_<set>_<suffix>`,
 which IAM refuses to change (`UnmodifiableEntity`), with an inline policy
 named `AwsSSOInlinePolicy`. sso-admin's API covers the instance,
 permission sets (their inline, AWS managed and customer managed policies,
 boundaries, relay states and tags), assignments, and provisioning;
 identitystore's, its reads (users, groups, memberships, by IDs, user
-names, display names and external IDs). This, too, wasn't checked against
+names, display names and external IDs) and writes (of Cairn's own
+directory). This, too, wasn't checked against
 AWS. It differs in that:
 
-- **Identity sources are OpenID Connect providers,** not SAML, and there's
-  no directory sync (SCIM) and no built-in directory: a user, and its
-  groups (from a claim of its ID token), are in the identity store once it
-  has signed in, and its memberships are what its last sign-in said. So
-  identitystore's writes (CreateUser, CreateGroup, CreateGroupMembership,
-  …) answer `501`, and a user or group can be assigned only once someone
-  has signed in with it. A cluster may have several sources: a user's
-  external ID is its source's issuer and its subject; a group's, its
-  source's issuer and its name (its display name, which several sources'
-  groups may share: GetGroupId then wants the external ID).
+- **Cairn's own directory and identity sources, side by side.** Identity
+  Center has one identity source at a time; Cairn has its own directory
+  (Identity Center's built-in one) and any number of OpenID Connect
+  providers (not SAML) at once.
+  - identitystore's writes make and change the own directory's users,
+    groups and memberships, and refuse a source's (`ValidationException`).
+    A group of its own may have any directory user as a member.
+  - A source's user, and its groups (from a claim of its ID token), are in
+    the identity store once it has signed in, and its memberships of its
+    source's groups are what its last sign-in said: there's no directory
+    sync (SCIM). A user's external ID is its source's issuer and its
+    subject; a group's, its source's issuer and its name (its display
+    name, which several sources' groups may share: GetGroupId then wants
+    the external ID).
+- **Users of the own directory sign in with passkeys,** not a password
+  and MFA, and get their first through a setup link (valid 7 days) that
+  the console or the command line makes, in place of Identity Center's
+  invitation e-mail or one-time password; there's no e-mail. A passkey
+  sign-in is multi-factor (`aws:MultiFactorAuthPresent`). CreateUser
+  requires `UserName`, `DisplayName` and `Name`, as Identity Center does;
+  `UserName` and groups' `DisplayName` are unique (a group's whatever its
+  case), and `Administrator` and `AWSAdministrators` are reserved. Each
+  attribute is kept as given, checked for its type and length only.
+  UpdateUser and UpdateGroup take attribute paths (`name.familyName`,
+  `aws:identitystore:enterprise.department`); one without a value removes
+  its attribute.
 - **One account, done at once.** The account's instance is its only one
   (CreateInstance, DeleteInstance and UpdateInstance answer `501`), and the
-  account the only target of assignments and provisioning. Their requests
-  are done when they're answered: their statuses are `SUCCEEDED` (never
-  `IN_PROGRESS`), a permission set is provisioned once it's assigned, and
-  creating an assignment there is, or deleting one there isn't, succeeds.
-  Their statuses are kept for 90 days.
-- **Customer managed policy references** must name a policy of the account
-  that exists, when attached; AWS checks only when provisioning.
+  account the only target of assignments and provisioning (assignments and
+  provisionings do name their accounts, so that member accounts can be
+  added). Their requests are done when they're answered: their statuses are
+  `SUCCEEDED` or `FAILED` (never `IN_PROGRESS`), and creating an
+  assignment there is, or deleting one there isn't, succeeds. Their
+  statuses are kept for 90 days.
+- **A provisioned set's role stays** when its last assignment in the
+  account goes, until the set is deleted.
+- **The console provisions a set again when it's saved there**, if the
+  session may (`sso:ProvisionPermissionSet`), so that edits there take
+  effect at once; sso-admin's changes wait for ProvisionPermissionSet, as
+  AWS's do.
 - **No access portal API** (`sso`, `sso-oidc`): `aws sso login` and SSO
   profiles don't work. A directory user's page hands out its session's
   credentials instead, as the access portal's "access keys" do.
 - **Not supported:** applications, trusted token issuers, regions, and
   attributes for access control (claims as session tags), which answer
   `501`; the instance's tags; and MFA at the identity source, which Cairn
-  doesn't trust: directory users' sessions never have
+  doesn't trust: the sessions of a source's users never have
   `aws:MultiFactorAuthPresent`.
 - **Console sessions** last 12 hours at most (1 hour unused); taking an
   assignment away ends a session's use of it at once.

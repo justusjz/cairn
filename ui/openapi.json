@@ -161,7 +161,7 @@
         }
       },
       "post": {
-        "summary": "Assigns a permission set to a directory user or group.",
+        "summary": "Assigns a permission set to a directory user or group, in an account.",
         "operationId": "create_assignment",
         "requestBody": {
           "content": {
@@ -1957,7 +1957,7 @@
     },
     "/directory-users": {
       "get": {
-        "summary": "The directory users that have signed in, most recent first.",
+        "summary": "The identity store's users: Cairn's own directory's, and those of\nidentity sources that have signed in, most recent first.",
         "operationId": "list_directory_users",
         "responses": {
           "200": {
@@ -1968,6 +1968,172 @@
                   "items": {
                     "$ref": "#/components/schemas/DirectoryUserSummary"
                   }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a user of Cairn's own directory, as identitystore's CreateUser:\nit signs in with passkeys, the first of which it makes with a setup\nlink.",
+        "operationId": "create_directory_user",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewDirectoryUser"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewDirectoryUserId"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/directory-users/{id}": {
+      "delete": {
+        "summary": "Deletes a user of Cairn's own directory: its memberships, assignments,\npasskeys and sessions go too.",
+        "operationId": "delete_directory_user",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/directory-users/{id}/passkeys": {
+      "delete": {
+        "summary": "Removes all of a directory user's passkeys, as when one is lost: its\nsessions end, and it needs a setup link to sign in again.",
+        "operationId": "delete_directory_passkeys",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/directory-users/{id}/setup-link": {
+      "post": {
+        "summary": "Makes a user of Cairn's own directory a setup link, valid 7 days, to\nmake a passkey with (its first, or another): Cairn's way of Identity\nCenter's one-time password. It replaces the user's last link. Checked as\n`identitystore:UpdateUser`, as a change of how the user signs in.",
+        "operationId": "create_setup_link",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnrollmentLink"
                 }
               }
             }
@@ -3732,7 +3898,7 @@
         }
       },
       "delete": {
-        "summary": "Deletes a permission set: its assignments and its role go too.",
+        "summary": "Deletes a permission set: its assignments and its roles go too.",
         "operationId": "delete_permission_set",
         "parameters": [
           {
@@ -6615,17 +6781,21 @@
       },
       "AssignmentSummary": {
         "type": "object",
-        "description": "A permission set's assignment to a directory user or group.",
+        "description": "A permission set's assignment to a directory user or group, in an\naccount.",
         "required": [
           "id",
+          "account_id",
           "permission_set",
           "principal_type",
           "principal_id",
           "principal_name",
-          "provider",
           "created_at"
         ],
         "properties": {
+          "account_id": {
+            "type": "string",
+            "description": "The account it gives the permission set in, by ID."
+          },
           "created_at": {
             "type": "number",
             "format": "double"
@@ -6656,8 +6826,11 @@
             "description": "`USER` or `GROUP`."
           },
           "provider": {
-            "type": "string",
-            "description": "Its identity source."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its identity source; none for Cairn's own directory."
           }
         }
       },
@@ -7123,6 +7296,13 @@
           "name"
         ],
         "properties": {
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account to act in, by ID: one the set is assigned to the user\nin. Needed only when it's assigned in more than one."
+          },
           "name": {
             "type": "string",
             "description": "One of the session's permission sets, by name."
@@ -7551,7 +7731,6 @@
         "required": [
           "id",
           "name",
-          "provider",
           "members"
         ],
         "properties": {
@@ -7568,7 +7747,11 @@
             "type": "string"
           },
           "provider": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its identity source; none for a group of Cairn's own directory."
           }
         }
       },
@@ -7578,9 +7761,6 @@
         "required": [
           "user_id",
           "user_name",
-          "provider",
-          "provider_label",
-          "subject",
           "groups",
           "permission_sets"
         ],
@@ -7603,25 +7783,39 @@
               "string",
               "null"
             ],
-            "description": "The permission set it acts as, if it picked one."
+            "description": "The permission set it acts as, and the account (by ID) it acts in\nthere, if it picked one."
+          },
+          "permission_set_account_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "permission_sets": {
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/PermissionSetChoice"
             },
-            "description": "The permission sets assigned to it or its groups, to pick from."
+            "description": "The permission sets assigned to it or its groups, in the accounts\nthey're assigned in, to pick from."
           },
           "provider": {
-            "type": "string",
-            "description": "The identity source's name and label."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The identity source's name and label, and its subject there (`sub`);\nnone for a user of Cairn's own directory, which signs in with\npasskeys."
           },
           "provider_label": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "subject": {
-            "type": "string",
-            "description": "Its subject there (`sub`), which assignments name it by."
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "user_id": {
             "type": "string",
@@ -7639,11 +7833,11 @@
           "id",
           "user_name",
           "display_name",
-          "provider",
-          "subject",
           "groups",
           "first_signed_in",
-          "last_signed_in"
+          "last_signed_in",
+          "passkeys",
+          "setup_link_pending"
         ],
         "properties": {
           "display_name": {
@@ -7657,29 +7851,51 @@
           },
           "first_signed_in": {
             "type": "number",
-            "format": "double"
+            "format": "double",
+            "description": "When it was first in the identity store, and when it last changed\n(a source's: signed in)."
           },
           "groups": {
             "type": "array",
             "items": {
               "type": "string"
             },
-            "description": "Its groups, by name, as its last sign-in said."
+            "description": "Its groups, by name (a source's: as its last sign-in said)."
           },
           "id": {
             "type": "string",
             "description": "Its ID in the identity store."
           },
+          "last_passkey_use": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
           "last_signed_in": {
             "type": "number",
             "format": "double"
           },
+          "passkeys": {
+            "type": "integer",
+            "format": "int64",
+            "description": "A user of Cairn's own directory's passkeys, when it last signed in\nwith one, and whether a setup link for it is out."
+          },
           "provider": {
-            "type": "string",
-            "description": "Its identity source, and its subject there."
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its identity source, and its subject there; none for a user of\nCairn's own directory."
+          },
+          "setup_link_pending": {
+            "type": "boolean"
           },
           "subject": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "user_name": {
             "type": "string"
@@ -7780,12 +7996,17 @@
           {
             "type": "object",
             "required": [
-              "identity"
+              "identity",
+              "directory"
             ],
             "properties": {
+              "directory": {
+                "type": "boolean",
+                "description": "Whether the link is a directory user's setup link (whose passkey is\nits own, never a login's)."
+              },
               "identity": {
                 "type": "string",
-                "description": "The identity: `user @ account`, or `root @ account`."
+                "description": "The identity: `user @ account`, or a directory user's user name."
               }
             }
           }
@@ -9217,6 +9438,13 @@
           "principal_id"
         ],
         "properties": {
+          "account_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account to give it in, by ID: the instance's own, if not given\n(the only one so far)."
+          },
           "permission_set": {
             "type": "string"
           },
@@ -9242,6 +9470,52 @@
           "object_lock": {
             "type": "boolean",
             "description": "Whether it has Object Lock enabled (and so is versioned) from the\nstart: it can't be disabled again."
+          }
+        }
+      },
+      "NewDirectoryUser": {
+        "type": "object",
+        "required": [
+          "user_name",
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "family_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "given_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_name": {
+            "type": "string",
+            "description": "Its user name: 1 to 128 characters, no spaces."
+          }
+        }
+      },
+      "NewDirectoryUserId": {
+        "type": "object",
+        "description": "The ID of a new directory user.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
           }
         }
       },
@@ -10083,13 +10357,22 @@
       },
       "PermissionSetChoice": {
         "type": "object",
-        "description": "A permission set a directory user may use.",
+        "description": "A permission set a directory user may use, in an account.",
         "required": [
+          "account_id",
+          "account",
           "name",
           "description",
           "session_duration"
         ],
         "properties": {
+          "account": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string",
+            "description": "The account's ID and name."
+          },
           "description": {
             "type": "string"
           },
@@ -10112,7 +10395,7 @@
           "description",
           "session_duration",
           "role_name",
-          "role_arn",
+          "provisioned",
           "inline_policy",
           "attached",
           "assignments",
@@ -10155,12 +10438,16 @@
           "name": {
             "type": "string"
           },
-          "role_arn": {
-            "type": "string"
+          "provisioned": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ProvisionSummary"
+            },
+            "description": "The accounts it's provisioned to (none until it's first assigned)."
           },
           "role_name": {
             "type": "string",
-            "description": "The role it's provisioned as (which IAM can't change)."
+            "description": "The name of its role in each account it's provisioned to (which IAM\ncan't change)."
           },
           "session_duration": {
             "type": "integer",
@@ -10361,6 +10648,27 @@
             "type": "string"
           },
           "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ProvisionSummary": {
+        "type": "object",
+        "description": "A permission set's provisioning to an account.",
+        "required": [
+          "account_id",
+          "role_arn",
+          "latest"
+        ],
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "latest": {
+            "type": "boolean",
+            "description": "Whether its role there holds the set as it is now."
+          },
+          "role_arn": {
             "type": "string"
           }
         }

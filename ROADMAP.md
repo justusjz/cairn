@@ -63,9 +63,17 @@ Done:
   S3 Access Grants (IAM grantees): implemented. Directory users, as
   Identity Center's (OIDC identity sources, permission sets as reserved
   roles, assignments to users and groups, sso-admin's API and
-  identitystore's reads): implemented. Next: directory
-  users and groups as Access Grants grantees, and the access portal's APIs
-  for `aws sso login`.
+  identitystore's reads): implemented. Permission sets provisioned per
+  account (as roles made at their first assignment there, updated by
+  provisioning), and assignments and directory users' sessions in an
+  account: implemented, with the one account. Cairn's own directory
+  (users and groups made with identitystore's writes, or the console;
+  passkeys set up with links): implemented. Next, toward accounts as AWS
+  Organizations has them (the existing account as the management
+  account): member accounts, which
+  permission sets are provisioned to as they're assigned there, and
+  cross-account access. Also: directory users and groups as Access Grants
+  grantees, and the access portal's APIs for `aws sso login`.
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes
