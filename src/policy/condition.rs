@@ -438,6 +438,11 @@ const GLOBAL_KEYS: &[(&str, Support)] = &[
 /// The `s3:` keys Cairn's requests carry, lowercase; a trailing `/` takes
 /// any suffix (a tag key).
 const S3_EVALUATED: &[&str] = &[
+    // S3 Access Grants' (see `s3::access_grants`): a grant's scope, a
+    // location's, and the instance that vended a session.
+    "s3:accessgrantscope",
+    "s3:accessgrantsinstancearn",
+    "s3:accessgrantslocationscope",
     "s3:authtype",
     // A bucket's tags, with its ABAC enabled (see `s3::access`).
     "s3:buckettag/",
@@ -477,12 +482,9 @@ const S3_EVALUATED: &[&str] = &[
     "s3:x-amz-website-redirect-location",
 ];
 
-/// The `s3:` keys of what Cairn doesn't have: access points, access grants,
-/// batch jobs, replication, log delivery, annotations.
+/// The `s3:` keys of what Cairn doesn't have: access points, batch jobs,
+/// replication, log delivery, annotations.
 const S3_ABSENT: &[&str] = &[
-    "s3:accessgrantscope",
-    "s3:accessgrantsinstancearn",
-    "s3:accessgrantslocationscope",
     "s3:accesspointnetworkorigin",
     "s3:accesspointtag/",
     "s3:annotation-prefix",

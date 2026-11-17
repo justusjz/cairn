@@ -74,6 +74,7 @@ supported.
 | ACLs | 🟡 | Disabled, as on new S3 buckets: [ACLs](#acls) |
 | Object Ownership | 🟡 | Always `BucketOwnerEnforced`: [ACLs](#acls) |
 | Bucket ABAC (bucket tags in policies) | ✅ | |
+| S3 Access Grants | 🟡 | IAM grantees only: [Access Grants](#access-grants) |
 | MFA delete | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
@@ -276,12 +277,14 @@ trust policies.
   `s3:x-amz-object-ownership`, `s3:x-amz-object-if-match`,
   `s3:x-amz-bucket-namespace` and `s3:resourceArnBeingAuthorized`.
 - **Keys that are never present,** because what they describe doesn't exist:
-  VPC, organization, service, access point, access grant, replication and
-  batch job keys. `aws:SourceAccount` and `aws:SourceArn` are present only
-  in what Cairn does as `s3.amazonaws.com`.
+  VPC, organization, service, access point, replication and batch job
+  keys. `aws:SourceAccount` and `aws:SourceArn` are present only in what
+  Cairn does as `s3.amazonaws.com`, and in Access Grants' assuming a
+  location's role.
 - **Principals:** `Service` principals match only what Cairn does as that
-  service: `s3.amazonaws.com` delivering inventory reports. As in AWS, `"*"`
-  covers it too. `CanonicalUser` principals are refused.
+  service: `s3.amazonaws.com` delivering inventory reports, and
+  `access-grants.s3.amazonaws.com` assuming a location's role. As in AWS,
+  `"*"` covers it too. `CanonicalUser` principals are refused.
 - **Managed policies:** of AWS's, only `AdministratorAccess`,
   `AmazonS3FullAccess` and `AmazonS3ReadOnlyAccess` exist, plus Cairn's
   `CairnOperatorAccess`.
@@ -318,6 +321,38 @@ Differences:
 - **OpenID Connect providers:** Cairn fetches the issuer's discovery document
   when a provider is created, and refuses one it can't reach. Thumbprints are
   enforced as certificate pins, which lets issuers on private CAs work.
+
+### Access Grants
+
+S3 Control's Access Grants API: instances, locations, grants,
+GetDataAccess, ListCallerAccessGrants, GetAccessGrantsInstanceForPrefix,
+and tags on all three (TagResource, at creation too). Its responses parse
+in AWS's SDKs and CLI. Unlike the rest of this document, its behavior was
+**not checked against S3**, only against AWS's documentation and API model,
+so the points below are Cairn's reading of them:
+
+- **IAM grantees only.** There's no IAM Identity Center:
+  `DIRECTORY_USER` and `DIRECTORY_GROUP` grantees, applications and
+  Identity Center instances are refused with `501`. So is the instance's
+  resource policy, which is for other accounts (there's one).
+- **Scopes.** A grant's scope is its location's joined with its
+  sub-prefix; without one, `<location>/*`. A trailing `*` is optional; one
+  elsewhere is refused. A grantee's narrowest matching grant is the one
+  GetDataAccess uses.
+- **Vended sessions** are sessions of the location's role, whose trust
+  policy must let `access-grants.s3.amazonaws.com` take `sts:AssumeRole`
+  (with `aws:SourceAccount` and `aws:SourceArn` to condition on). Their
+  session policy allows: `READ`, GetObject(Version)(Acl),
+  ListMultipartUploadParts, ListBucket and ListBucketVersions; `WRITE`,
+  PutObject(Version)Acl, PutObject, DeleteObject(Version),
+  AbortMultipartUpload, ListMultipartUploadParts and
+  ListBucketMultipartUploads (the actions that take
+  `s3:AccessGrantsInstanceArn`). Listing is allowed under the scope's
+  prefix (`s3:prefix`) only. The session's name is the grantee's unique ID.
+- **Errors** for missing, duplicate and non-empty resources use the codes
+  AWS documents, with `404` and `409`; their messages are Cairn's.
+- `s3:AccessGrantScope`, `s3:AccessGrantsLocationScope` and
+  `s3:AccessGrantsInstanceArn` are evaluated.
 
 ### Event notifications
 

@@ -60,6 +60,7 @@ Done:
   policies, permissions boundaries, paths and tags, groups, and the IAM
   API. Open: policy templates (a team, a service user, the MFA guard), tag
   conditions, and STS with roles (`AssumeRoleWithWebIdentity`).
+  S3 Access Grants (IAM grantees; no IAM Identity Center): implemented.
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes

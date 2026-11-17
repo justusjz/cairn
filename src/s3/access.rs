@@ -633,6 +633,10 @@ fn context(
                 if let Some(provider) = &session.provider {
                     context.set("aws:FederatedProvider", provider);
                 }
+                // Vended by S3 Access Grants (see `s3::access_grants`).
+                if let Some(instance) = &session.access_grants {
+                    context.set("s3:AccessGrantsInstanceArn", instance);
+                }
                 context.set("aws:MultiFactorAuthPresent", "false");
             }
         }

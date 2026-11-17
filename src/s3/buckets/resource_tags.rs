@@ -17,7 +17,9 @@
 //!   bucket's (an object's, say) is InvalidURI.
 //!
 //! Like S3 Control's other requests here (see `public_access`), only the
-//! signer's own account's: it names it in `x-amz-account-id`.
+//! signer's own account's: it names it in `x-amz-account-id`. Access Grants'
+//! instances, locations and grants are tagged here too (see
+//! `access_grants::tag_resource`).
 
 use http_body_util::Full;
 use hyper::{Method, Request, Response, StatusCode, body::Bytes};
@@ -96,9 +98,13 @@ pub async fn handle(
     if principal.is_none_or(|p| named != Some(p.account.as_str())) {
         return Ok(format_s3_error(StatusCode::FORBIDDEN, "AccessDenied", "Access Denied"));
     }
-    let Some(bucket) = bucket_of(req.uri().path()) else {
+    // An Access Grants resource's (see `access_grants`), or a bucket's.
+    let arn = req.uri().path().strip_prefix(PREFIX).and_then(|arn| percent_decode_str(arn).decode_utf8().ok()).map(|a| a.into_owned());
+    let grants = arn.as_deref().and_then(crate::s3::access_grants::resource_of);
+    let bucket = bucket_of(req.uri().path());
+    if bucket.is_none() && grants.is_none() {
         return Ok(format_s3_error(StatusCode::BAD_REQUEST, "InvalidURI", "Couldn't parse the specified URI."));
-    };
+    }
     // What it changes, which its checks may test.
     let change = match req.method().clone() {
         Method::POST => {
@@ -128,6 +134,15 @@ pub async fn handle(
         }
         _ => None,
     };
+    if let Some((owner, resource)) = grants {
+        let account = principal.expect("checked above").account.clone();
+        if owner != account {
+            return Ok(no_such_resource());
+        }
+        let arn = arn.expect("it named the resource");
+        return crate::s3::access_grants::tag_resource(app, access, &account, &arn, &resource, action, change).await;
+    }
+    let bucket = bucket.expect("checked above");
     let exists = access.load(app, &bucket).await?;
     let check = Check { action, on: On::Bucket(bucket.clone()) };
     if let Some((check, verdict)) = access.first_denied(std::slice::from_ref(&check)) {

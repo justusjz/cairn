@@ -64,6 +64,7 @@ pub async fn run(app: &Arc<App>, args: AccountArgs, out: &mut Output) -> anyhow:
                 chained: false,
                 provider: None,
                 directory: None,
+                access_grants: None,
             };
             let token = app.sessions.seal(&client, &mut session).await?;
             eprintln!(

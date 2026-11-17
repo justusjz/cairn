@@ -239,6 +239,7 @@ const MIGRATIONS: &[&str] = &[
     NOTIFICATIONS,
     BUCKET_LOGGING,
     ROOT_SESSIONS,
+    ACCESS_GRANTS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2786,6 +2787,58 @@ CREATE TABLE console_root_sessions (
 );
 CREATE INDEX console_root_sessions_account ON console_root_sessions (account_id);
 CREATE TRIGGER console_root_sessions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_root_sessions
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 59: S3 Access Grants (see `s3::access_grants`): an account's
+/// instance (at most one, as S3 has one per account and region), its
+/// locations (a scope, and the role whose sessions it vends), and the
+/// grants on them. A location's grants keep it (no cascade), and its
+/// locations keep an instance, as S3 refuses to delete either while it has
+/// any. Grantees are kept by their ARNs, as S3 keeps them; tags as
+/// buckets' are (see `s3::tags`), NULL for none. No new lock
+/// protocol: they're plain rows, written by single statements, which no
+/// other table's writes wait on.
+const ACCESS_GRANTS: &str = r#"
+CREATE TABLE access_grants_instances (
+    account_id text PRIMARY KEY REFERENCES accounts (id),
+    tags       text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER access_grants_instances_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON access_grants_instances
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE access_grants_locations (
+    account_id text NOT NULL REFERENCES access_grants_instances (account_id),
+    id         text COLLATE "C" NOT NULL,
+    scope      text COLLATE "C" NOT NULL,
+    role_arn   text NOT NULL,
+    tags       text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, id),
+    UNIQUE (account_id, scope)
+);
+CREATE TRIGGER access_grants_locations_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON access_grants_locations
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE access_grants (
+    account_id   text NOT NULL,
+    id           text COLLATE "C" NOT NULL,
+    location_id  text COLLATE "C" NOT NULL,
+    sub_prefix   text,
+    object       boolean NOT NULL DEFAULT false,
+    grantee_type text NOT NULL CHECK (grantee_type IN ('IAM', 'DIRECTORY_USER', 'DIRECTORY_GROUP')),
+    grantee      text NOT NULL,
+    permission   text NOT NULL CHECK (permission IN ('READ', 'WRITE', 'READWRITE')),
+    scope        text COLLATE "C" NOT NULL,
+    tags         text,
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (account_id, id),
+    FOREIGN KEY (account_id, location_id) REFERENCES access_grants_locations (account_id, id),
+    UNIQUE (account_id, grantee_type, grantee, scope, object, permission)
+);
+CREATE INDEX access_grants_location ON access_grants (account_id, location_id);
+CREATE TRIGGER access_grants_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON access_grants
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

@@ -51,6 +51,7 @@ use crate::{
 };
 
 pub(crate) mod abac;
+pub(crate) mod access_grants;
 pub(crate) mod buckets;
 pub(crate) mod certificates;
 pub(crate) mod checksums;
@@ -142,6 +143,7 @@ fn logged<B>(
     if bucket.is_empty()
         || buckets::resource_tags::is_control(req.uri().path(), req.headers())
         || public_access::is_control(req.uri().path(), req.headers())
+        || access_grants::is_control(req.uri().path(), req.headers())
     {
         return None;
     }
@@ -306,6 +308,11 @@ async fn handle_request(
     // The secret the request's body (aws-chunked, trailers) is signed with;
     // none for an anonymous one, whose body can't be signed.
     let secret = principal.as_ref().map(|p| p.secret.clone()).unwrap_or_default();
+    // S3 Control's, on Access Grants (see `access_grants`).
+    if access_grants::is_control(req.uri().path(), req.headers()) {
+        let response = access_grants::handle(&app, req, principal.as_ref(), &mut access, &secret).await?;
+        return Ok(box_response(response));
+    }
     // S3 Control's, on a bucket's tags (see `resource_tags`).
     if buckets::resource_tags::is_control(req.uri().path(), req.headers()) {
         let response = buckets::resource_tags::handle(&app, req, principal.as_ref(), &mut access, &secret).await?;

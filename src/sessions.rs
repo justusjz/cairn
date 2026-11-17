@@ -111,6 +111,11 @@ pub struct Session {
     /// `s3::directory`).
     #[serde(rename = "d", default, skip_serializing_if = "Option::is_none")]
     pub directory: Option<Directory>,
+    /// The S3 Access Grants instance (its ARN) whose GetDataAccess vended
+    /// it, if one did: its requests carry it as `s3:AccessGrantsInstanceArn`
+    /// (see `s3::access_grants`).
+    #[serde(rename = "ag", default, skip_serializing_if = "Option::is_none")]
+    pub access_grants: Option<String>,
 }
 
 /// What a directory bucket's session is for: the bucket, in a mode, as
@@ -395,6 +400,7 @@ mod tests {
             chained: false,
             provider: None,
             directory: None,
+            access_grants: None,
         };
         let token = keys.seal(&client, &mut session).await.unwrap();
         // The secret is AWS's shape, derived, not in the token.
