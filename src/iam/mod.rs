@@ -102,6 +102,7 @@ impl From<anyhow::Error> for Error {
             Ok(Refused::Invalid(m)) => return invalid(m),
             Ok(Refused::Validation(m)) => return validation(m),
             Ok(Refused::Unsupported(m)) => return error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", m),
+            Ok(Refused::Unmodifiable(m)) => return error(StatusCode::BAD_REQUEST, "UnmodifiableEntity", m),
             Err(e) => e,
         };
         let e = match e.downcast::<users::TooManyTags>() {

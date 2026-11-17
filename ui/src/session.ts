@@ -9,6 +9,8 @@ type Schemas = components["schemas"];
 export type Me = Schemas["Me"];
 export type Passkey = Schemas["PasskeySummary"];
 export type Identity = Schemas["IdentitySummary"];
+export type DirectoryMe = Schemas["DirectoryMe"];
+export type Credentials = Schemas["Credentials"];
 
 const client = createClient<paths>({
   baseUrl: "/api",
@@ -49,10 +51,13 @@ export const api = {
   oidcProviders: () => ok(client.GET("/oidc/providers")),
   /** Whether anyone has enrolled yet. */
   setup: () => ok(client.GET("/setup")),
-  /** Starts a sign-in at an OIDC provider: the URL to send the browser to. */
-  oidcStart: (provider: string, purpose: "login" | "enroll" | "link", extra: { token?: string } = {}) =>
-    ok(client.POST("/oidc/{provider}/start", { params: { path: { provider } }, body: { purpose, token: extra.token ?? null } })),
-  oidcUnlink: (provider: string) => ok(client.DELETE("/oidc/{provider}", { params: { path: { provider } } })),
+  /** Starts a sign-in at an identity source, as a directory user: the URL to
+   * send the browser to. */
+  oidcStart: (provider: string) => ok(client.POST("/oidc/{provider}/start", { params: { path: { provider } } })),
+  /** Has a directory user's session act as one of its permission sets. */
+  choosePermissionSet: (name: string) => ok(client.POST("/directory/permission-set", { body: { name } })),
+  /** Temporary credentials of a directory user's permission set, for the CLI. */
+  directoryCredentials: () => ok(client.POST("/directory/credentials")),
   login: (challenge_id: string, credential: Assertion) => ok(client.POST("/login", { body: { challenge_id, credential } })),
   logout: () => ok(client.POST("/logout")),
   /** Signs in as the account's root user, with a link from `cairn account root-link`. */

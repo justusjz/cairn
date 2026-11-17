@@ -59,6 +59,10 @@ async fn check_role(app: &Arc<App>, actor: &Actor, action: &'static str, name: &
     let mut context = role.context(action);
     context.extend(&extra);
     actor.check_with(app, action, role.on(), &context).await?;
+    // Reading a permission set's role is fine; changing it isn't.
+    if !(action.starts_with("iam:Get") || action.starts_with("iam:List")) {
+        roles::protected(&role)?;
+    }
     Ok(role)
 }
 
@@ -197,6 +201,7 @@ async fn create_role(State(app): AppState, Extension(actor): Extension<Actor>, J
     if !tags.is_empty() {
         actor.check_with(&app, "iam:TagRole", on, &context).await?;
     }
+    roles::reserved_path(&path)?;
     let client = app.pool.get().await?;
     let trust = roles::check_trust(&client, &account, &body.trust).await?;
     let boundary = match &boundary_arn {

@@ -7,8 +7,9 @@
 //! (see `plans/single-account.md`).
 //!
 //! A session signed in with a passkey has `aws:MultiFactorAuthPresent` (and
-//! `aws:MultiFactorAuthAge`, since it was); one signed in at an OIDC
-//! provider has it `false`, as AWS's federated sessions without MFA, and so
+//! `aws:MultiFactorAuthAge`, since it was); a directory user's, signed in
+//! at an identity source, has it `false`, as AWS's federated sessions
+//! without MFA, and so
 //! does the account's root user's (signed in with a link the command line
 //! made: no second factor), as AWS's root without MFA.
 
@@ -45,7 +46,7 @@ pub(crate) struct User {
     pub query: String,
     pub peer: Option<IpAddr>,
     /// Seconds since the session was signed in with a passkey; `None`:
-    /// it was signed in at an OIDC provider.
+    /// it wasn't (a directory user's, or the root user's).
     pub mfa_age: Option<i64>,
 }
 

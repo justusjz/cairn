@@ -77,6 +77,7 @@ supported.
 | Bucket ABAC (bucket tags in policies) | ✅ | |
 | S3 Access Grants | 🟡 | IAM grantees only: [Access Grants](#access-grants) |
 | MFA delete | 🟡 | [MFA delete](#mfa-delete) |
+| IAM Identity Center (directory users, permission sets) | 🟡 | In the console, with OIDC sources: [Identity Center](#identity-center) |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
 ### Not implemented
@@ -89,8 +90,11 @@ S3 reports a bucket that doesn't use it:
 - S3 Select, torrents.
 - S3 Express's metadata tables, access points for directory buckets.
 - Requester pays, Transfer Acceleration.
-- IAM Identity Center grantees and cross-account S3 Access Grants
-  ([Access Grants](#access-grants)).
+- Directory users and groups as grantees, and cross-account S3 Access
+  Grants ([Access Grants](#access-grants)).
+- Identity Center's APIs (`sso-admin`, `identitystore`, and the access
+  portal's `sso` and `sso-oidc`, so `aws sso login`): directory users are
+  managed in the console ([Identity Center](#identity-center)).
 
 ---
 
@@ -378,10 +382,42 @@ Differences:
   `MaxItems` and `Marker`, as IAM's do.)
 - `iam:PassRole` is checked only where a role is passed to a service:
   an Access Grants location's role ([Access Grants](#access-grants)).
+- Roles under `/aws-reserved/` are permission sets' ([Identity
+  Center](#identity-center)): IAM won't make them, and refuses to change
+  them with `UnmodifiableEntity`.
 - `RoleLastUsed` and `PasswordLastUsed` are never reported.
 - **OpenID Connect providers:** Cairn fetches the issuer's discovery document
   when a provider is created, and refuses one it can't reach. Thumbprints are
   enforced as certificate pins, which lets issuers on private CAs work.
+
+### Identity Center
+
+Directory users, as IAM Identity Center has them: people who sign in to the
+console at an identity source, and act as a session of the role of a
+permission set assigned to them or a group of theirs (see the README's
+*Directory users*). As in Identity Center, a permission set is a role at
+`/aws-reserved/sso.amazonaws.com/` named `AWSReservedSSO_<set>_<suffix>`,
+which IAM refuses to change (`UnmodifiableEntity`), with an inline policy
+named `AwsSSOInlinePolicy`. This, too, wasn't checked against AWS. It
+differs in that:
+
+- **Identity sources are OpenID Connect providers,** not SAML, and there's
+  no directory sync (SCIM) and no built-in directory: a user, and its
+  groups (from a claim of its ID token), are known when it signs in. A
+  cluster may have several sources; a user is its subject at one.
+- **The console only.** There's no `sso-admin` or `identitystore` API
+  (Terraform's Identity Center resources don't work), and no access portal
+  API (`sso`, `sso-oidc`): `aws sso login` and SSO profiles don't work. A
+  directory user's page hands out its session's credentials instead, as
+  the access portal's "access keys" do.
+- **One account,** so an assignment is to a permission set alone.
+- **Not supported:** permission sets' customer managed policy references and
+  permissions boundaries (attach the account's managed policies instead),
+  their relay states and tags; attributes for access control (claims as
+  session tags); and MFA at the identity source, which Cairn doesn't trust:
+  directory users' sessions never have `aws:MultiFactorAuthPresent`.
+- **Console sessions** last 12 hours at most (1 hour unused); taking an
+  assignment away ends a session's use of it at once.
 
 ### Access Grants
 
@@ -392,9 +428,9 @@ in AWS's SDKs and CLI. Unlike the rest of this document, its behavior was
 **not checked against S3**, only against AWS's documentation and API model,
 so the points below are Cairn's reading of them:
 
-- **IAM grantees only.** There's no IAM Identity Center:
-  `DIRECTORY_USER` and `DIRECTORY_GROUP` grantees, applications and
-  Identity Center instances are refused with `501`. So is the instance's
+- **IAM grantees only.** Cairn's [directory users](#identity-center) aren't
+  grantees yet: `DIRECTORY_USER` and `DIRECTORY_GROUP` grantees,
+  applications and Identity Center instances are refused with `501`. So is the instance's
   resource policy, which is for other accounts (there's one).
 - **Scopes.** A grant's scope is its location's joined with its
   sub-prefix; without one, `<location>/*`. A trailing `*` is optional; one
@@ -429,8 +465,8 @@ so the points below are Cairn's reading of them:
 
 Not implemented:
 
-- **IAM Identity Center** and what Access Grants does with it: directory
-  users and groups as grantees (a group of an IdP, rather than an IAM
+- **Identity Center** in Access Grants: directory users and groups as
+  grantees (a group of an IdP, rather than an IAM
   principal, granted a prefix), applications (`ApplicationArn`,
   `allowedByApplication`), and sessions carrying a person's identity
   (`sts:SetContext`, trusted identity propagation).

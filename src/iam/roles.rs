@@ -109,7 +109,13 @@ impl Iam<'_> {
         };
         context.extend(&extra);
         self.check_with(action, on, &context, Shown::Role(name.clone())).await?;
-        role.ok_or_else(|| missing(&name))
+        let role = role.ok_or_else(|| missing(&name))?;
+        // Reading a permission set's role is fine; changing it isn't.
+        let reads = action.starts_with("iam:Get") || action.starts_with("iam:List");
+        if !reads {
+            roles::protected(&role)?;
+        }
+        Ok(role)
     }
 
     async fn role(&mut self, params: &Params, action: &'static str) -> Result<Role> {
@@ -169,6 +175,7 @@ impl Iam<'_> {
             context.set("iam:PermissionsBoundary", arn);
         }
         self.check_with("iam:CreateRole", on.clone(), &context, Shown::Arn).await?;
+        roles::reserved_path(&path)?;
         if tags.is_some() {
             self.check_with("iam:TagRole", on, &context, Shown::Arn).await?;
         }

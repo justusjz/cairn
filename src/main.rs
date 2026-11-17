@@ -45,6 +45,7 @@ mod grants;
 mod groups;
 mod iam;
 mod iam_oidc;
+mod identity_center;
 mod inventory;
 mod kms;
 mod managed;

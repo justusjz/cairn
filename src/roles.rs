@@ -41,6 +41,36 @@ pub fn unique_id(id: Uuid) -> String {
     crate::users::unique_id("AROA", id)
 }
 
+/// The paths of roles that AWS's services keep, and IAM's users can't make
+/// or change: Cairn's permission sets' (see `identity_center`).
+pub const RESERVED_PATH: &str = "/aws-reserved/";
+
+/// Whether a role at `path` is one only Cairn changes.
+pub fn reserved(path: &str) -> bool {
+    path.starts_with(RESERVED_PATH)
+}
+
+/// Refuses to change `role` if it's reserved: a permission set's, which only
+/// the permission set changes, as IAM refuses changes to Identity Center's
+/// roles.
+pub fn protected(role: &Role) -> anyhow::Result<()> {
+    match reserved(&role.path) {
+        true => refused(Refused::Unmodifiable(format!(
+            "Cannot perform the operation on the protected role '{}' - this role is only modifiable by AWS",
+            role.name
+        ))),
+        false => Ok(()),
+    }
+}
+
+/// Refuses a new role at `path` if it's reserved.
+pub fn reserved_path(path: &str) -> anyhow::Result<()> {
+    match reserved(path) {
+        true => refused(Refused::Invalid(format!("The path {path} is reserved for roles AWS's services make."))),
+        false => Ok(()),
+    }
+}
+
 /// Whether `name` is a role's name as IAM takes one (probed).
 pub fn valid_name(name: &str) -> bool {
     (1..=64).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"+=,.@_-".contains(&b))

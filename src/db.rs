@@ -243,6 +243,7 @@ const MIGRATIONS: &[&str] = &[
     MFA_DELETE,
     BATCH_JOBS,
     BATCH_JOB_RESULTS,
+    DIRECTORY_USERS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2950,6 +2951,84 @@ CREATE TABLE batch_job_results (
     PRIMARY KEY (job_id, start_at, status)
 );
 CREATE TRIGGER batch_job_results_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON batch_job_results
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 63: directory users, as IAM Identity Center's (see
+/// `identity_center`). People sign in at the console's OIDC providers (the
+/// account's identity sources, each with the claim its groups are in) as
+/// themselves, no longer as an IAM user's login: `login_oidc`, and the
+/// sessions and sign-ins in progress of that, go. A permission set is a role
+/// of the account's, at `/aws-reserved/sso.amazonaws.com/`, which only it
+/// changes; assignments give it to a directory user (by its subject) or
+/// group (by its name in the group claim) of a source. `directory_users`
+/// are who signed in, as they last did; `console_directory_sessions` their
+/// sessions, acting as the permission set picked (none, until one is).
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const DIRECTORY_USERS: &str = r#"
+DROP TABLE login_oidc;
+DELETE FROM console_sessions WHERE credential_id IS NULL;
+ALTER TABLE console_sessions ALTER COLUMN credential_id SET NOT NULL;
+ALTER TABLE console_sessions DROP COLUMN oidc_provider;
+DELETE FROM oidc_flows;
+ALTER TABLE oidc_flows DROP COLUMN login_id, DROP COLUMN enrollment, DROP COLUMN account_id, DROP COLUMN session;
+ALTER TABLE oidc_flows DROP CONSTRAINT oidc_flows_purpose_check;
+ALTER TABLE oidc_flows ADD CONSTRAINT oidc_flows_purpose_check CHECK (purpose = 'login');
+ALTER TABLE oidc_providers ADD COLUMN group_claim text NOT NULL DEFAULT 'groups';
+
+CREATE TABLE permission_sets (
+    id               uuid PRIMARY KEY,
+    account_id       text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    name             text NOT NULL,
+    description      text NOT NULL DEFAULT '',
+    session_duration integer NOT NULL,
+    role_id          uuid NOT NULL REFERENCES iam_roles (id),
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (account_id, name)
+);
+CREATE TRIGGER permission_sets_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON permission_sets
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE permission_set_assignments (
+    id                uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+    permission_set_id uuid NOT NULL REFERENCES permission_sets (id) ON DELETE CASCADE,
+    principal_type    text NOT NULL CHECK (principal_type IN ('USER', 'GROUP')),
+    provider          text NOT NULL REFERENCES oidc_providers (name) ON DELETE CASCADE,
+    principal_id      text NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (permission_set_id, principal_type, provider, principal_id)
+);
+CREATE INDEX permission_set_assignments_principal ON permission_set_assignments (provider, principal_type, principal_id);
+CREATE TRIGGER permission_set_assignments_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON permission_set_assignments
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE directory_users (
+    provider       text NOT NULL REFERENCES oidc_providers (name) ON DELETE CASCADE,
+    subject        text NOT NULL,
+    name           text NOT NULL,
+    email          text,
+    groups         text[] NOT NULL DEFAULT '{}',
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    last_signed_in timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (provider, subject)
+);
+CREATE TRIGGER directory_users_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON directory_users
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+CREATE TABLE console_directory_sessions (
+    token_hash        bytea PRIMARY KEY,
+    account_id        text NOT NULL REFERENCES accounts (id) ON DELETE CASCADE,
+    provider          text NOT NULL,
+    subject           text NOT NULL,
+    groups            text[] NOT NULL DEFAULT '{}',
+    permission_set_id uuid REFERENCES permission_sets (id) ON DELETE SET NULL,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    last_seen_at      timestamptz NOT NULL DEFAULT now(),
+    expires_at        timestamptz NOT NULL,
+    FOREIGN KEY (provider, subject) REFERENCES directory_users (provider, subject) ON DELETE CASCADE
+);
+CREATE INDEX console_directory_sessions_user ON console_directory_sessions (provider, subject);
+CREATE TRIGGER console_directory_sessions_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_directory_sessions
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

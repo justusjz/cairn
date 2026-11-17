@@ -613,6 +613,8 @@ pub mod mock {
         pub email: String,
         pub nonce: String,
         pub challenge: String,
+        /// Its groups (the `groups` claim), if it has any.
+        pub groups: Vec<String>,
     }
 
     pub struct Mock {
@@ -718,8 +720,9 @@ pub mod mock {
         }
 
         /// A code for the sign-in that `authorize_url` (Cairn's redirect to
-        /// the provider) starts, as `subject`.
-        pub fn code_for(&self, authorize_url: &str, subject: &str, email: &str) -> (String, String) {
+        /// the provider) starts, as `subject`, whose ID token lists `groups`
+        /// in its `groups` claim.
+        pub fn code_with_groups(&self, authorize_url: &str, subject: &str, email: &str, groups: &[&str]) -> (String, String) {
             let query = authorize_url.split_once('?').unwrap().1;
             let param = |name: &str| {
                 query.split('&').find_map(|p| p.strip_prefix(&format!("{name}="))).unwrap().to_owned()
@@ -732,6 +735,7 @@ pub mod mock {
                 email: email.to_owned(),
                 nonce: param("nonce"),
                 challenge: param("code_challenge"),
+                groups: groups.iter().map(|g| g.to_string()).collect(),
             };
             self.grants.lock().unwrap().insert(code.clone(), grant);
             (param("state"), code)
@@ -779,7 +783,7 @@ pub mod mock {
             json!({
                 "iss": mock.issuer, "sub": grant.subject, "aud": *mock.audience.lock().unwrap(),
                 "exp": now + 300, "iat": now, "nonce": grant.nonce,
-                "email": grant.email, "email_verified": true, "name": "Test Person",
+                "email": grant.email, "email_verified": true, "name": "Test Person", "groups": grant.groups,
             })
             .to_string(),
         );

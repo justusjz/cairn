@@ -1,7 +1,8 @@
 //! The console's JSON API, under `/api`: signing in with a passkey (a new
 //! login's first through an enrollment link, which adds its identity to a
-//! signed-in login instead), switching between the login's accounts,
-//! signing out, and the login's own passkeys. Its OpenAPI spec, with
+//! signed-in login instead), or at an identity source as a directory user
+//! (who picks a permission set, and may take its credentials), signing out,
+//! and the login's own passkeys. Its OpenAPI spec, with
 //! `manage`'s routes, is committed as `ui/openapi.json`, which the UI's
 //! types are generated from.
 //!
@@ -26,7 +27,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use super::{Console, Signed, cleared_cookie, root_cookie, session_cookie, session_token, store, webauthn};
+use super::{Console, DirectorySigned, Signed, cleared_cookie, root_cookie, session_cookie, session_token, store, webauthn};
 use super::web::{ApiError, ErrorBody};
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -57,7 +58,8 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
         .routes(routes!(setup))
         .routes(routes!(oidc_start))
         .routes(routes!(oidc_callback))
-        .routes(routes!(oidc_unlink))
+        .routes(routes!(choose_permission_set))
+        .routes(routes!(directory_credentials))
 }
 
 /// The API's OpenAPI spec, as committed in `ui/openapi.json`.
@@ -310,20 +312,20 @@ async fn enroll(State(console): ConsoleState, Json(body): Json<Enroll>) -> Resul
     let credential = registered(&console, &challenge, &p.credential)?;
     let login = new_login_id(&challenge);
     let account = store::new_login(&client, login, &identity.label(), &body.token, &new_passkey(&credential, name)).await?;
-    signed_in(&console, &client, login, &account, store::Way::Passkey(&credential.id)).await
+    signed_in(&console, &client, login, &account, &credential.id).await
 }
 
-/// Starts a session for `login`, signed in `way` (just now), as its
-/// identity in `account`: the response with its cookie, and who's signed
-/// in.
+/// Starts a session for `login`, signed in with passkey `credential` (just
+/// now), as its identity in `account`: the response with its cookie, and
+/// who's signed in.
 async fn signed_in(
     console: &Console,
     client: &deadpool_postgres::Object,
     login: Uuid,
     account: &str,
-    way: store::Way<'_>,
+    credential: &[u8],
 ) -> Result<Response> {
-    let token = store::create_session(client, login, account, way).await?;
+    let token = store::create_session(client, login, account, credential).await?;
     let session = store::session(client, &token).await?.ok_or_else(|| anyhow::anyhow!("a new session is gone"))?;
     let me = me_of(console, client, &session).await?;
     Ok(([(header::SET_COOKIE, session_cookie(&token))], Json(me)).into_response())
@@ -351,7 +353,7 @@ async fn login(State(console): ConsoleState, Json(body): Json<Login>) -> Result<
             "this login isn't in any account (anymore): ask an administrator for an enrollment link".into(),
         ));
     };
-    signed_in(&console, &client, login, &first.account_id, store::Way::Passkey(&credential)).await
+    signed_in(&console, &client, login, &first.account_id, &credential).await
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -445,10 +447,11 @@ impl IdentitySummary {
 }
 
 /// The signed-in login: who it acts as, its passkeys. Or the account's
-/// root user (`root`), which has no login: no passkeys or providers.
+/// root user (`root`), or a directory user (`directory`), which have no
+/// login: no passkeys.
 #[derive(Serialize, ToSchema)]
 struct Me {
-    /// The login's name (`root` for the root user).
+    /// The login's name (`root` for the root user; a directory user's own).
     name: String,
     /// Whether the session is the account's root user's, which no identity
     /// policy restricts (only resource policies' denies do).
@@ -458,24 +461,41 @@ struct Me {
     expires_at: Option<f64>,
     /// Who the session acts as.
     identity: IdentitySummary,
-    /// Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`;
-    /// else at an OIDC provider).
+    /// Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`).
     mfa: bool,
     /// Whether it may see the cluster (`cairn:GetCluster`): it's an
     /// operator, and the console shows it the cluster's pages.
     cluster: bool,
     passkeys: Vec<PasskeySummary>,
-    /// Its identities at OIDC providers, which sign it in too.
-    oidc: Vec<LinkedProvider>,
-    /// The OIDC provider this session was signed in at, if it was.
-    signed_in_at: Option<String>,
+    /// A directory user's session: who it is at its identity source, and
+    /// its permission sets.
+    directory: Option<DirectoryMe>,
 }
 
+/// A directory user, signed in at an identity source.
 #[derive(Serialize, ToSchema)]
-struct LinkedProvider {
+struct DirectoryMe {
+    /// The identity source's name and label.
     provider: String,
-    label: String,
+    provider_label: String,
+    /// Its subject there (`sub`), which assignments name it by.
+    subject: String,
     email: Option<String>,
+    /// Its groups, as the source's group claim said when it signed in.
+    groups: Vec<String>,
+    /// The permission set it acts as, if it picked one.
+    permission_set: Option<String>,
+    /// The permission sets assigned to it or its groups, to pick from.
+    permission_sets: Vec<PermissionSetChoice>,
+}
+
+/// A permission set a directory user may use.
+#[derive(Serialize, ToSchema)]
+struct PermissionSetChoice {
+    name: String,
+    description: String,
+    /// How long its sessions (and credentials) last, in seconds.
+    session_duration: i32,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -502,20 +522,18 @@ async fn me_of(console: &Console, client: &deadpool_postgres::Object, session: &
         None => false,
     };
     let passkeys = store::passkeys(client, session.login).await?;
-    let oidc = super::oidc::linked(client, session.login).await?;
     Ok(Me {
-        oidc: oidc.into_iter().map(|(provider, label, email)| LinkedProvider { provider, label, email }).collect(),
-        signed_in_at: session.oidc_provider.clone(),
+        directory: None,
         name: session.login_name.clone(),
         root: false,
         expires_at: None,
         identity: IdentitySummary::of(&session.identity),
-        mfa: session.mfa_age.is_some(),
+        mfa: true,
         cluster,
         passkeys: passkeys
             .into_iter()
             .map(|p| PasskeySummary {
-                current: Some(&p.credential_id) == session.credential_id.as_ref(),
+                current: p.credential_id == session.credential_id,
                 id: b64(&p.credential_id),
                 name: p.name,
                 backed_up: p.backed_up,
@@ -538,8 +556,118 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
     if let Some(session) = store::session(&client, &token).await? {
         return Ok(Json(me_of(&console, &client, &session).await?));
     }
+    if let Some(session) = store::directory_session(&client, &token).await? {
+        return Ok(Json(directory_me(&console, &client, &session).await?));
+    }
     let root = store::root_session(&client, &token).await?.ok_or_else(unauthorized)?;
     Ok(Json(root_me(&console, &root).await?))
+}
+
+/// Who a directory user's session is: as its permission set's role's
+/// session, if it picked one that's still its.
+async fn directory_me(console: &Console, client: &deadpool_postgres::Object, session: &store::DirectorySession) -> Result<Me> {
+    let eligible =
+        crate::identity_center::eligible(client, &session.account_id, &session.provider, &session.subject, &session.groups).await?;
+    let chosen = eligible.iter().find(|set| Some(set.id) == session.permission_set);
+    let (arn, user, cluster) = match chosen {
+        Some(set) => {
+            let user = super::directory::user(client, session, axum::http::Method::GET, HeaderMap::new(), String::new(), None).await?;
+            let arn = user.principal.arn();
+            let actor = super::Actor(Arc::new(user));
+            let cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
+            (arn, set.role_name.clone(), cluster)
+        }
+        None => (String::new(), String::new(), false),
+    };
+    Ok(Me {
+        name: session.name.clone(),
+        root: false,
+        expires_at: Some(session.expires_at),
+        identity: IdentitySummary { account_id: session.account_id.clone(), account: session.account.clone(), user, arn },
+        mfa: false,
+        cluster,
+        passkeys: Vec::new(),
+        directory: Some(DirectoryMe {
+            provider: session.provider.clone(),
+            provider_label: session.provider_label.clone(),
+            subject: session.subject.clone(),
+            email: session.email.clone(),
+            groups: session.groups.clone(),
+            permission_set: chosen.map(|set| set.name.clone()),
+            permission_sets: eligible
+                .iter()
+                .map(|set| PermissionSetChoice {
+                    name: set.name.clone(),
+                    description: set.description.clone(),
+                    session_duration: set.session_duration,
+                })
+                .collect(),
+        }),
+    })
+}
+
+#[derive(Deserialize, ToSchema)]
+struct ChosenPermissionSet {
+    /// One of the session's permission sets, by name.
+    name: String,
+}
+
+/// Has a directory user's session act as one of its permission sets.
+#[utoipa::path(post, path = "/directory/permission-set", request_body = ChosenPermissionSet, responses(
+    (status = 200, body = Me),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn choose_permission_set(
+    State(console): ConsoleState,
+    signed: DirectorySigned,
+    Json(body): Json<ChosenPermissionSet>,
+) -> Result<Json<Me>> {
+    let client = console.app.pool.get().await?;
+    let session = &signed.session;
+    let eligible =
+        crate::identity_center::eligible(&client, &session.account_id, &session.provider, &session.subject, &session.groups).await?;
+    let Some(set) = eligible.into_iter().find(|set| set.name == body.name) else {
+        return Err(ApiError::Forbidden(format!("the permission set {:?} isn't assigned to you", body.name)));
+    };
+    store::choose_permission_set(&client, &signed.token, set.id).await?;
+    let session = store::directory_session(&client, &signed.token).await?.ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+    Ok(Json(directory_me(&console, &client, &session).await?))
+}
+
+/// Temporary credentials of a session's role, for the CLI and SDKs.
+#[derive(Serialize, ToSchema)]
+struct Credentials {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: String,
+    /// When they expire (seconds since the epoch).
+    expiration: u64,
+}
+
+/// Hands a directory user credentials of its permission set's role, for its
+/// session duration, as Identity Center's access portal does. They work
+/// until they expire, whatever becomes of the console's session.
+#[utoipa::path(post, path = "/directory/credentials", responses(
+    (status = 200, body = Credentials),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn directory_credentials(State(console): ConsoleState, signed: DirectorySigned) -> Result<Json<Credentials>> {
+    let client = console.app.pool.get().await?;
+    let set = super::directory::permission_set(&client, &signed.session).await?;
+    let mut session = super::directory::role_session(&set, &signed.session)?;
+    let token = console.app.sessions.seal(&client, &mut session).await?;
+    eprintln!(
+        "console: credentials {} of permission set {} for directory user {} of {}",
+        session.key_id, set.name, signed.session.subject, signed.session.provider
+    );
+    Ok(Json(Credentials {
+        access_key_id: session.key_id,
+        secret_access_key: session.secret,
+        session_token: token,
+        expiration: session.expires,
+    }))
 }
 
 /// Who the account's root user's session `root` is.
@@ -560,8 +688,7 @@ async fn root_me(console: &Console, root: &store::RootSession) -> Result<Me> {
         mfa: false,
         cluster,
         passkeys: Vec::new(),
-        oidc: Vec::new(),
-        signed_in_at: None,
+        directory: None,
     })
 }
 
@@ -662,55 +789,24 @@ pub(super) fn redirect_uri(console: &Console) -> String {
     format!("{}/api/oidc/callback", console.party.origin)
 }
 
-#[derive(Deserialize, ToSchema)]
-struct OidcStart {
-    /// `login`, `enroll` (with `token`), or `link` (signed in).
-    purpose: String,
-    token: Option<String>,
-}
-
 #[derive(Serialize, ToSchema)]
 struct OidcRedirect {
     /// Where to send the browser: the provider's sign-in.
     url: String,
 }
 
-/// Starts a sign-in at a provider.
-#[utoipa::path(post, path = "/oidc/{provider}/start", params(("provider" = String, Path)), request_body = OidcStart, responses(
+/// Starts a sign-in at an identity source, as a directory user.
+#[utoipa::path(post, path = "/oidc/{provider}/start", params(("provider" = String, Path)), responses(
     (status = 200, body = OidcRedirect),
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn oidc_start(
-    State(console): ConsoleState,
-    Path(provider): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<OidcStart>,
-) -> Result<Json<OidcRedirect>> {
-    use super::oidc::{Carried, Purpose};
+async fn oidc_start(State(console): ConsoleState, Path(provider): Path<String>) -> Result<Json<OidcRedirect>> {
     let client = console.app.pool.get().await?;
     let Some(provider) = super::oidc::provider(&client, &provider).await? else {
         return Err(ApiError::NotFound("no such sign-in provider".into()));
     };
-    let token = session_token(&headers);
-    let session = match &token {
-        Some(token) => store::session(&client, token).await?,
-        None => None,
-    };
-    let signed_in = || session.as_ref().ok_or_else(|| ApiError::Unauthorized("sign in first".into()));
-    let (purpose, carried) = match body.purpose.as_str() {
-        "login" => (Purpose::Login, Carried::default()),
-        "enroll" => {
-            let token = body.token.as_deref().ok_or_else(|| ApiError::BadRequest("the enrollment link's token is missing".into()))?;
-            if store::enrollment(&client, token).await?.is_none() {
-                return Err(ApiError::BadRequest("this enrollment link has been used, or has expired".into()));
-            }
-            (Purpose::Enroll, Carried { enrollment: Some(token), ..Default::default() })
-        }
-        "link" => (Purpose::Link, Carried { login: Some(signed_in()?.login), ..Default::default() }),
-        other => return Err(ApiError::BadRequest(format!("no purpose {other:?}"))),
-    };
-    let url = super::oidc::start(&client, &provider, &redirect_uri(&console), purpose, carried)
+    let url = super::oidc::start(&client, &provider, &redirect_uri(&console))
         .await
         .map_err(|e| ApiError::BadRequest(format!("{} can't be reached: {e:#}", provider.label)))?;
     Ok(Json(OidcRedirect { url }))
@@ -741,12 +837,13 @@ fn failed(page: &str, message: &str) -> Response {
 }
 
 /// Where providers send the browser back to (register it with them): ends
-/// the sign-in, and goes on to the console.
+/// the sign-in, as the directory user the provider vouches for, and goes on
+/// to the console, replacing the browser's session if it had one. One with
+/// no permission set assigned to it, or its groups, doesn't get in.
 #[utoipa::path(get, path = "/oidc/callback", params(OidcAnswer), responses(
     (status = 303, description = "On to the console, signed in (or to the sign-in page, with what went wrong)"),
 ))]
-async fn oidc_callback(State(console): ConsoleState, Query(answer): Query<OidcAnswer>) -> Result<Response> {
-    use super::oidc::Purpose;
+async fn oidc_callback(State(console): ConsoleState, headers: HeaderMap, Query(answer): Query<OidcAnswer>) -> Result<Response> {
     if let Some(error) = &answer.error {
         let why = answer.error_description.as_deref().unwrap_or(error);
         return Ok(failed("/login", &format!("the provider refused the sign-in: {why}")));
@@ -764,57 +861,24 @@ async fn oidc_callback(State(console): ConsoleState, Query(answer): Query<OidcAn
         }
     };
     let provider = done.provider.name.as_str();
-    let to_text = |e: anyhow::Error| match e.downcast::<crate::users::Invalid>() {
-        Ok(invalid) => Ok(invalid.0),
-        Err(e) => Err(e),
-    };
-    match done.purpose {
-        Purpose::Login => {
-            let Some(login) = super::oidc::login_of(&client, provider, &done.subject, done.email.as_deref()).await? else {
-                return Ok(failed(
-                    "/login",
-                    &format!(
-                        "your {} identity doesn't sign in a login yet: open an enrollment link, or sign in otherwise and \
-                         link it on your account page",
-                        done.provider.label
-                    ),
-                ));
-            };
-            let Some(first) = store::identities(&client, login).await?.into_iter().next() else {
-                return Ok(failed("/login", "this login isn't in any account (anymore): ask an administrator for an enrollment link"));
-            };
-            let token = store::create_session(&client, login, &first.account_id, store::Way::Oidc(provider)).await?;
-            Ok(redirect("/", Some(session_cookie(&token))))
-        }
-        Purpose::Enroll => {
-            let enrollment = done.enrollment.as_deref().unwrap_or_default();
-            let name = done.name.clone().or(done.email.clone()).unwrap_or_else(|| done.subject.clone());
-            match super::oidc::new_login(&client, &name, enrollment, provider, &done.subject, done.email.as_deref()).await {
-                Ok((login, account)) => {
-                    let token = store::create_session(&client, login, &account, store::Way::Oidc(provider)).await?;
-                    Ok(redirect("/account", Some(session_cookie(&token))))
-                }
-                Err(e) => Ok(failed("/login", &to_text(e)?)),
-            }
-        }
-        Purpose::Link => {
-            let login = done.login.ok_or_else(|| anyhow::anyhow!("a link's sign-in carries no login"))?;
-            match super::oidc::link(&client, login, provider, &done.subject, done.email.as_deref()).await {
-                Ok(()) => Ok(redirect("/account", None)),
-                Err(e) => Ok(failed("/account", &to_text(e)?)),
-            }
-        }
+    let name = done.name.clone().or(done.email.clone()).unwrap_or_else(|| done.subject.clone());
+    crate::identity_center::signed_in(&client, provider, &done.subject, &name, done.email.as_deref(), &done.groups).await?;
+    let account = crate::users::account(&client).await?;
+    let eligible = crate::identity_center::eligible(&client, &account, provider, &done.subject, &done.groups).await?;
+    if eligible.is_empty() {
+        return Ok(failed(
+            "/login",
+            &format!("no permission set is assigned to you at {}: ask an administrator for one", done.provider.label),
+        ));
     }
-}
-
-/// Unlinks the signed-in login's identity at a provider (not its last way
-/// in).
-#[utoipa::path(delete, path = "/oidc/{provider}", params(("provider" = String, Path)), responses(
-    (status = 204, description = "Unlinked"),
-    (status = "4XX", body = ErrorBody),
-    (status = "5XX", body = ErrorBody),
-))]
-async fn oidc_unlink(State(console): ConsoleState, signed: Signed, Path(provider): Path<String>) -> Result<StatusCode> {
-    super::oidc::unlink(&console.app.pool.get().await?, signed.session.login, &provider).await?;
-    Ok(StatusCode::NO_CONTENT)
+    // Picked for it when it has one only; else it picks.
+    let chosen = match eligible.as_slice() {
+        [only] => Some(only.id),
+        _ => None,
+    };
+    if let Some(old) = session_token(&headers) {
+        store::end_session(&client, &old).await?;
+    }
+    let token = store::create_directory_session(&client, &account, provider, &done.subject, &done.groups, chosen).await?;
+    Ok(redirect("/", Some(session_cookie(&token))))
 }

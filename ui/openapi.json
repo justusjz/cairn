@@ -124,6 +124,119 @@
         }
       }
     },
+    "/assignments": {
+      "get": {
+        "operationId": "list_assignments",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AssignmentSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Assigns a permission set to a directory user or group.",
+        "operationId": "create_assignment",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewAssignment"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Assigned"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/assignments/{id}": {
+      "delete": {
+        "summary": "Removes an assignment: the sessions it let in lose the permission set at\nonce.",
+        "operationId": "delete_assignment",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/buckets": {
       "get": {
         "operationId": "list_buckets",
@@ -1804,6 +1917,124 @@
         }
       }
     },
+    "/directory-users": {
+      "get": {
+        "summary": "The directory users that have signed in, most recent first.",
+        "operationId": "list_directory_users",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/DirectoryUserSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/directory/credentials": {
+      "post": {
+        "summary": "Hands a directory user credentials of its permission set's role, for its\nsession duration, as Identity Center's access portal does. They work\nuntil they expire, whatever becomes of the console's session.",
+        "operationId": "directory_credentials",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Credentials"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/directory/permission-set": {
+      "post": {
+        "summary": "Has a directory user's session act as one of its permission sets.",
+        "operationId": "choose_permission_set",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChosenPermissionSet"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/enroll": {
       "post": {
         "summary": "Makes a new login, with a first passkey, for an enrollment link's\nidentity (using the link up), and signs in with it.",
@@ -3025,7 +3256,7 @@
         }
       },
       "delete": {
-        "summary": "Removes an OIDC provider: the identities at it no longer sign anyone in.",
+        "summary": "Removes an OIDC provider: its directory users, their sessions, and the\nassignments to them and its groups go too.",
         "operationId": "delete_oidc_provider",
         "parameters": [
           {
@@ -3064,7 +3295,7 @@
     },
     "/oidc/callback": {
       "get": {
-        "summary": "Where providers send the browser back to (register it with them): ends\nthe sign-in, and goes on to the console.",
+        "summary": "Where providers send the browser back to (register it with them): ends\nthe sign-in, as the directory user the provider vouches for, and goes on\nto the console, replacing the browser's session if it had one. One with\nno permission set assigned to it, or its groups, doesn't get in.",
         "operationId": "oidc_callback",
         "parameters": [
           {
@@ -3136,48 +3367,9 @@
         }
       }
     },
-    "/oidc/{provider}": {
-      "delete": {
-        "summary": "Unlinks the signed-in login's identity at a provider (not its last way\nin).",
-        "operationId": "oidc_unlink",
-        "parameters": [
-          {
-            "name": "provider",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "204": {
-            "description": "Unlinked"
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/oidc/{provider}/start": {
       "post": {
-        "summary": "Starts a sign-in at a provider.",
+        "summary": "Starts a sign-in at an identity source, as a directory user.",
         "operationId": "oidc_start",
         "parameters": [
           {
@@ -3189,16 +3381,6 @@
             }
           }
         ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/OidcStart"
-              }
-            }
-          },
-          "required": true
-        },
         "responses": {
           "200": {
             "content": {
@@ -3357,6 +3539,389 @@
         "parameters": [
           {
             "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/permission-sets": {
+      "get": {
+        "operationId": "list_permission_sets",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/PermissionSetSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a permission set, and its role.",
+        "operationId": "create_permission_set",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewPermissionSet"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/permission-sets/{name}": {
+      "put": {
+        "summary": "Changes a permission set's description and session duration.",
+        "operationId": "update_permission_set",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PermissionSetChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a permission set: its assignments and its role go too.",
+        "operationId": "delete_permission_set",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/permission-sets/{name}/attached": {
+      "post": {
+        "summary": "Attaches a managed policy (AWS's, or the account's) to a permission set.",
+        "operationId": "attach_managed_policy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyArn"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Attached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Detaches a managed policy from a permission set.",
+        "operationId": "detach_managed_policy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "arn",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Detached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/permission-sets/{name}/inline-policy": {
+      "get": {
+        "summary": "A permission set's inline policy.",
+        "operationId": "get_inline_policy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PolicyDocument"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Sets a permission set's inline policy.",
+        "operationId": "put_inline_policy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyDocument"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Removes a permission set's inline policy.",
+        "operationId": "delete_inline_policy",
+        "parameters": [
+          {
+            "name": "name",
             "in": "path",
             "required": true,
             "schema": {
@@ -5924,6 +6489,55 @@
           }
         }
       },
+      "AssignmentSummary": {
+        "type": "object",
+        "description": "A permission set's assignment to a directory user or group.",
+        "required": [
+          "id",
+          "permission_set",
+          "principal_type",
+          "provider",
+          "principal_id",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "id": {
+            "type": "string"
+          },
+          "permission_set": {
+            "type": "string"
+          },
+          "principal_id": {
+            "type": "string",
+            "description": "A user's subject (`sub`), or a group's name in the group claim."
+          },
+          "principal_type": {
+            "type": "string",
+            "description": "`USER` or `GROUP`."
+          },
+          "provider": {
+            "type": "string",
+            "description": "The identity source."
+          },
+          "user_email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A user's name and e-mail, as it last signed in, if it has."
+          }
+        }
+      },
       "AttachedPolicy": {
         "type": "object",
         "required": [
@@ -6380,6 +6994,18 @@
           }
         }
       },
+      "ChosenPermissionSet": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "One of the session's permission sets, by name."
+          }
+        }
+      },
       "Cluster": {
         "type": "object",
         "required": [
@@ -6544,7 +7170,6 @@
         "required": [
           "enrolled",
           "passkeys",
-          "providers",
           "link_pending"
         ],
         "properties": {
@@ -6566,13 +7191,6 @@
           "passkeys": {
             "type": "integer",
             "format": "int64"
-          },
-          "providers": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "The OIDC providers (their labels) it signs in at."
           }
         }
       },
@@ -6765,6 +7383,33 @@
           }
         }
       },
+      "Credentials": {
+        "type": "object",
+        "description": "Temporary credentials of a session's role, for the CLI and SDKs.",
+        "required": [
+          "access_key_id",
+          "secret_access_key",
+          "session_token",
+          "expiration"
+        ],
+        "properties": {
+          "access_key_id": {
+            "type": "string"
+          },
+          "expiration": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When they expire (seconds since the epoch).",
+            "minimum": 0
+          },
+          "secret_access_key": {
+            "type": "string"
+          },
+          "session_token": {
+            "type": "string"
+          }
+        }
+      },
       "DefaultVersion": {
         "type": "object",
         "required": [
@@ -6774,6 +7419,100 @@
           "version": {
             "type": "integer",
             "format": "int32"
+          }
+        }
+      },
+      "DirectoryMe": {
+        "type": "object",
+        "description": "A directory user, signed in at an identity source.",
+        "required": [
+          "provider",
+          "provider_label",
+          "subject",
+          "groups",
+          "permission_sets"
+        ],
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Its groups, as the source's group claim said when it signed in."
+          },
+          "permission_set": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The permission set it acts as, if it picked one."
+          },
+          "permission_sets": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PermissionSetChoice"
+            },
+            "description": "The permission sets assigned to it or its groups, to pick from."
+          },
+          "provider": {
+            "type": "string",
+            "description": "The identity source's name and label."
+          },
+          "provider_label": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string",
+            "description": "Its subject there (`sub`), which assignments name it by."
+          }
+        }
+      },
+      "DirectoryUserSummary": {
+        "type": "object",
+        "description": "A directory user, as it last signed in.",
+        "required": [
+          "provider",
+          "subject",
+          "name",
+          "groups",
+          "first_signed_in",
+          "last_signed_in"
+        ],
+        "properties": {
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "first_signed_in": {
+            "type": "number",
+            "format": "double"
+          },
+          "groups": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "last_signed_in": {
+            "type": "number",
+            "format": "double"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
           }
         }
       },
@@ -8014,27 +8753,6 @@
         },
         "additionalProperties": false
       },
-      "LinkedProvider": {
-        "type": "object",
-        "required": [
-          "provider",
-          "label"
-        ],
-        "properties": {
-          "email": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "label": {
-            "type": "string"
-          },
-          "provider": {
-            "type": "string"
-          }
-        }
-      },
       "Listing": {
         "type": "object",
         "description": "A page of a bucket's keys, rolled up at `/` like a directory listing.",
@@ -8237,20 +8955,30 @@
       },
       "Me": {
         "type": "object",
-        "description": "The signed-in login: who it acts as, its passkeys. Or the account's\nroot user (`root`), which has no login: no passkeys or providers.",
+        "description": "The signed-in login: who it acts as, its passkeys. Or the account's\nroot user (`root`), or a directory user (`directory`), which have no\nlogin: no passkeys.",
         "required": [
           "name",
           "root",
           "identity",
           "mfa",
           "cluster",
-          "passkeys",
-          "oidc"
+          "passkeys"
         ],
         "properties": {
           "cluster": {
             "type": "boolean",
             "description": "Whether it may see the cluster (`cairn:GetCluster`): it's an\noperator, and the console shows it the cluster's pages."
+          },
+          "directory": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DirectoryMe",
+                "description": "A directory user's session: who it is at its identity source, and\nits permission sets."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "expires_at": {
             "type": [
@@ -8266,18 +8994,11 @@
           },
           "mfa": {
             "type": "boolean",
-            "description": "Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`;\nelse at an OIDC provider)."
+            "description": "Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`)."
           },
           "name": {
             "type": "string",
-            "description": "The login's name (`root` for the root user)."
-          },
-          "oidc": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/LinkedProvider"
-            },
-            "description": "Its identities at OIDC providers, which sign it in too."
+            "description": "The login's name (`root` for the root user; a directory user's own)."
           },
           "passkeys": {
             "type": "array",
@@ -8288,13 +9009,6 @@
           "root": {
             "type": "boolean",
             "description": "Whether the session is the account's root user's, which no identity\npolicy restricts (only resource policies' denies do)."
-          },
-          "signed_in_at": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "The OIDC provider this session was signed in at, if it was."
           }
         }
       },
@@ -8322,6 +9036,32 @@
           "started_at": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "NewAssignment": {
+        "type": "object",
+        "required": [
+          "permission_set",
+          "principal_type",
+          "provider",
+          "principal_id"
+        ],
+        "properties": {
+          "permission_set": {
+            "type": "string"
+          },
+          "principal_id": {
+            "type": "string",
+            "description": "A user's subject (`sub`), or a group's name in the group claim."
+          },
+          "principal_type": {
+            "type": "string",
+            "description": "`USER` or `GROUP`."
+          },
+          "provider": {
+            "type": "string",
+            "description": "The identity source."
           }
         }
       },
@@ -8420,6 +9160,13 @@
             ],
             "description": "The client's secret; none for a public client. Left out when\nchanging a provider: it keeps its secret."
           },
+          "group_claim": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The ID token's claim that lists a person's groups; `groups` if not\ngiven."
+          },
           "issuer": {
             "type": "string",
             "description": "The issuer's URL: its discovery document is at\n`<issuer>/.well-known/openid-configuration`."
@@ -8454,6 +9201,28 @@
           "name": {
             "type": "string",
             "description": "What to call it, e.g. \"Laptop\"."
+          }
+        }
+      },
+      "NewPermissionSet": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "session_duration": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "In seconds, from 3600 to 43200; 3600 if not given."
           }
         }
       },
@@ -8872,7 +9641,7 @@
       },
       "OidcProvider": {
         "type": "object",
-        "description": "An OpenID Connect provider people may sign in to the console at (see\n`console::oidc`); never its client secret.",
+        "description": "An OpenID Connect provider people sign in to the console at, as\ndirectory users: an identity source (see `console::oidc`,\n`identity_center`); never its client secret.",
         "required": [
           "name",
           "label",
@@ -8880,11 +9649,16 @@
           "client_id",
           "has_secret",
           "scopes",
-          "logins"
+          "group_claim",
+          "users"
         ],
         "properties": {
           "client_id": {
             "type": "string"
+          },
+          "group_claim": {
+            "type": "string",
+            "description": "The ID token's claim that lists a person's groups."
           },
           "has_secret": {
             "type": "boolean",
@@ -8896,16 +9670,16 @@
           "label": {
             "type": "string"
           },
-          "logins": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Logins it signs in."
-          },
           "name": {
             "type": "string"
           },
           "scopes": {
             "type": "string"
+          },
+          "users": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The directory users that have signed in at it."
           }
         }
       },
@@ -8940,24 +9714,6 @@
           "url": {
             "type": "string",
             "description": "Where to send the browser: the provider's sign-in."
-          }
-        }
-      },
-      "OidcStart": {
-        "type": "object",
-        "required": [
-          "purpose"
-        ],
-        "properties": {
-          "purpose": {
-            "type": "string",
-            "description": "`login`, `enroll` (with `token`), or `link` (signed in)."
-          },
-          "token": {
-            "type": [
-              "string",
-              "null"
-            ]
           }
         }
       },
@@ -9140,6 +9896,104 @@
           },
           "name": {
             "type": "string"
+          }
+        }
+      },
+      "PermissionSetChange": {
+        "type": "object",
+        "required": [
+          "description",
+          "session_duration"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "session_duration": {
+            "type": "integer",
+            "format": "int32",
+            "description": "In seconds, from 3600 to 43200."
+          }
+        }
+      },
+      "PermissionSetChoice": {
+        "type": "object",
+        "description": "A permission set a directory user may use.",
+        "required": [
+          "name",
+          "description",
+          "session_duration"
+        ],
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "session_duration": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How long its sessions (and credentials) last, in seconds."
+          }
+        }
+      },
+      "PermissionSetSummary": {
+        "type": "object",
+        "description": "A permission set: the policies directory users act with, as its role.",
+        "required": [
+          "name",
+          "arn",
+          "description",
+          "session_duration",
+          "role_name",
+          "role_arn",
+          "inline_policy",
+          "attached",
+          "assignments",
+          "created_at"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "assignments": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its assignments."
+          },
+          "attached": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachedPolicy"
+            },
+            "description": "Its managed policies."
+          },
+          "created_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "description": {
+            "type": "string"
+          },
+          "inline_policy": {
+            "type": "boolean",
+            "description": "Whether it has an inline policy."
+          },
+          "name": {
+            "type": "string"
+          },
+          "role_arn": {
+            "type": "string"
+          },
+          "role_name": {
+            "type": "string",
+            "description": "The role it's provisioned as (which IAM can't change)."
+          },
+          "session_duration": {
+            "type": "integer",
+            "format": "int32",
+            "description": "How long its sessions (and credentials) last, in seconds."
           }
         }
       },

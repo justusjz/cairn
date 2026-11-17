@@ -121,6 +121,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .merge(super::templates::router())
         .merge(super::sns::router())
         .merge(super::inventory::router())
+        .merge(super::sso::router())
 }
 
 // ─── Cluster ─────────────────────────────────────────────────────────────────
@@ -1807,8 +1808,9 @@ async fn set_versioning(
 
 // ─── OIDC providers ──────────────────────────────────────────────────────────
 
-/// An OpenID Connect provider people may sign in to the console at (see
-/// `console::oidc`); never its client secret.
+/// An OpenID Connect provider people sign in to the console at, as
+/// directory users: an identity source (see `console::oidc`,
+/// `identity_center`); never its client secret.
 #[derive(Serialize, ToSchema)]
 struct OidcProvider {
     name: String,
@@ -1818,8 +1820,10 @@ struct OidcProvider {
     /// Whether it has a client secret (else it's a public client).
     has_secret: bool,
     scopes: String,
-    /// Logins it signs in.
-    logins: i64,
+    /// The ID token's claim that lists a person's groups.
+    group_claim: String,
+    /// The directory users that have signed in at it.
+    users: i64,
 }
 
 /// The providers, and the redirect URI to register with them.
@@ -1839,7 +1843,7 @@ async fn list_oidc_providers(State(app): AppState, Extension(actor): Extension<A
     actor.check(&app, "cairn:GetCluster", On::Cluster).await?;
     let client = app.pool.get().await?;
     let counts: HashMap<String, i64> = client
-        .query_cached("SELECT provider, count(*) FROM login_oidc GROUP BY provider", &[])
+        .query_cached("SELECT provider, count(*) FROM directory_users GROUP BY provider", &[])
         .await?
         .iter()
         .map(|r| (r.get(0), r.get(1)))
@@ -1848,7 +1852,8 @@ async fn list_oidc_providers(State(app): AppState, Extension(actor): Extension<A
         .await?
         .into_iter()
         .map(|p| OidcProvider {
-            logins: counts.get(&p.name).copied().unwrap_or(0),
+            users: counts.get(&p.name).copied().unwrap_or(0),
+            group_claim: p.group_claim,
             has_secret: p.client_secret.is_some(),
             name: p.name,
             label: p.label,
@@ -1874,6 +1879,9 @@ struct NewOidcProvider {
     client_secret: Option<String>,
     /// `openid email profile` if not given.
     scopes: Option<String>,
+    /// The ID token's claim that lists a person's groups; `groups` if not
+    /// given.
+    group_claim: Option<String>,
 }
 
 /// Sets an OIDC provider, after checking its discovery document and keys.
@@ -1901,12 +1909,14 @@ async fn set_oidc_provider(
         client_id: body.client_id,
         client_secret: secret,
         scopes: body.scopes.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "openid email profile".to_owned()),
+        group_claim: body.group_claim.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "groups".to_owned()),
     };
     crate::console::oidc::set_provider(&client, &provider).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Removes an OIDC provider: the identities at it no longer sign anyone in.
+/// Removes an OIDC provider: its directory users, their sessions, and the
+/// assignments to them and its groups go too.
 #[utoipa::path(delete, path = "/oidc-providers/{name}", params(("name" = String, Path)), responses(
     (status = 204, description = "Removed"),
     (status = "4XX", body = ErrorBody),
@@ -2425,8 +2435,6 @@ struct ConsoleAccess {
     /// Whether it enrolled (a login is linked to it).
     enrolled: bool,
     passkeys: i64,
-    /// The OIDC providers (their labels) it signs in at.
-    providers: Vec<String>,
     last_sign_in: Option<f64>,
     /// Whether an enrollment link for it is out, and works still.
     link_pending: bool,
@@ -2487,7 +2495,6 @@ async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) ->
             console: console.remove(&r.id).map(|c| ConsoleAccess {
                 enrolled: c.enrolled,
                 passkeys: c.passkeys,
-                providers: c.providers,
                 last_sign_in: c.last_sign_in,
                 link_pending: c.link_pending,
             }),
