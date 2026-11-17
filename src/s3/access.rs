@@ -324,6 +324,13 @@ impl Access {
         self.object_tags.insert((bucket.to_owned(), key.to_owned()), tags);
     }
 
+    /// Forgets the versions' tags `set_object_tags` set: for checks on
+    /// other versions, made with the same access (a batch job's tasks, see
+    /// `batch`).
+    pub fn forget_object_tags(&mut self) {
+        self.object_tags.clear();
+    }
+
     /// Sets the policy of the topic `arn` (see `sns`), which checks on it
     /// are decided by as their resource's.
     pub fn set_topic_policy(&mut self, arn: &str, policy: Arc<Policy>) {

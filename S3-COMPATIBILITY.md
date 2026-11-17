@@ -59,6 +59,7 @@ supported.
 | Event notifications, to SNS topics | 🟡 | Over HTTP(S) subscriptions: [Event notifications](#event-notifications) |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
 | Server access logging | 🟡 | [Server access logging](#server-access-logging) |
+| Batch Operations | 🟡 | Tagging, from CSV manifests: [Batch Operations](#batch-operations) |
 
 ### Security
 
@@ -85,7 +86,7 @@ S3 reports a bucket that doesn't use it:
 
 - Replication.
 - Analytics, metrics, Intelligent-Tiering, Storage Lens.
-- S3 Select, torrents, S3 Batch Operations.
+- S3 Select, torrents.
 - S3 Express's metadata tables, access points for directory buckets.
 - Requester pays, Transfer Acceleration.
 - IAM Identity Center grantees and cross-account S3 Access Grants
@@ -205,6 +206,30 @@ once it's been configured.
   within 48 hours, and reports go at the cluster's `lifecycle-rate`, which
   they share with lifecycle sweeps (see the [README](README.md#inventory)).
 - **Failed deliveries** are tried again hourly. S3 skips that day's report.
+
+### Batch Operations
+
+- **Operations.** `S3PutObjectTagging` and `S3DeleteObjectTagging` only;
+  a job of another operation is refused with `501 NotImplemented`.
+- **Manifests.** CSV manifests (`S3BatchOperations_CSV_20180820`) only;
+  inventory reports' (`S3InventoryReport_CSV_20161130`) and manifest
+  generators are refused with `501 NotImplemented`. A manifest's lines must
+  have exactly the columns its `Fields` name.
+- **No completion reports.** A job's `Report` must have `Enabled` false
+  (else `501 NotImplemented`): its counts of tasks that succeeded and failed
+  are all it tells, and the node that ran it logs the first task of each
+  turn that failed, and why.
+- **Statuses.** A job is never `Completing`, `Failing`, `Pausing` or
+  `Paused`: it goes straight to `Complete`, `Failed` or `Cancelled`.
+- **Errors.** CreateJob checks the request, and then `s3:CreateJob` and
+  `iam:PassRole`; its role and manifest are first used while the job is
+  prepared, which fails it (with `FailureReasons`) if they can't be. The
+  errors' codes are those of S3 Control's API model (`BadRequestException`,
+  `NotFoundException`, `JobStatusException`, `IdempotencyException`, …);
+  their statuses and messages, and the failure codes, are Cairn's own.
+- **Timing.** A job is prepared and run in the steps lifecycle sweeps and
+  inventory reports take turns in, at the cluster's `lifecycle-rate` (each
+  task counts as a version read; see the [README](README.md#batch-operations)).
 
 ### Server access logging
 

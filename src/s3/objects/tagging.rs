@@ -74,9 +74,61 @@ async fn set(
     tags: &Tags,
     status: StatusCode,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
+    let tagging = if status == StatusCode::NO_CONTENT { Tagging::Delete } else { Tagging::Put };
+    Ok(match set_tags(app, bucket, key, version_id, tags, tagging).await? {
+        Outcome::Tagged(reported) => {
+            let response = Response::builder().status(status).body(Full::new(Bytes::new())).unwrap();
+            with_version_id(response, reported.as_deref())
+        }
+        Outcome::DeleteMarker(reported) => delete_marker(reported.as_deref()),
+        Outcome::NoSuchVersion => no_such_version(),
+        Outcome::NoSuchKey => no_such_key(),
+        Outcome::NoSuchBucket => {
+            format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
+        }
+        Outcome::Contended => slow_down(),
+    })
+}
+
+/// Which tagging a change of a version's tags is, as its event says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tagging {
+    Put,
+    Delete,
+}
+
+/// What setting a version's tags came to.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// Set; the version's ID, as a response reports it.
+    Tagged(Option<String>),
+    /// The version is a delete marker, which has no tags; its ID, likewise.
+    DeleteMarker(Option<String>),
+    NoSuchVersion,
+    NoSuchKey,
+    NoSuchBucket,
+    /// Other writes to the key kept getting in its way.
+    Contended,
+}
+
+/// Sets the tags of the version `version_id` of `key` (the current one if
+/// `None`) to `tags` (`cairn_set_tags`), retrying on a conflict: what
+/// PutObjectTagging and DeleteObjectTagging do (`tagging` says which), and
+/// batch jobs' tasks (see `batch`).
+pub async fn set_tags(
+    app: &App,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    tags: &Tags,
+    tagging: Tagging,
+) -> anyhow::Result<Outcome> {
     let stored = tags.stored();
     // A deletion of its tags is one event, a setting another.
-    let notify = crate::notifications::tagging_context(if status == StatusCode::NO_CONTENT { "Delete" } else { "Put" });
+    let notify = crate::notifications::tagging_context(match tagging {
+        Tagging::Delete => "Delete",
+        Tagging::Put => "Put",
+    });
     let client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
@@ -96,20 +148,15 @@ async fn set(
             .zip(row.get::<_, Option<&str>>(2))
             .and_then(|(versioning, id)| Versioning::from_db(versioning).reported(id));
         return Ok(match row.get::<_, &str>(0) {
-            "tagged" => {
-                let response = Response::builder().status(status).body(Full::new(Bytes::new())).unwrap();
-                with_version_id(response, reported.as_deref())
-            }
-            "delete_marker" => delete_marker(reported.as_deref()),
-            "no_such_version" => no_such_version(),
-            "no_such_key" => no_such_key(),
-            "no_such_bucket" => {
-                format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist")
-            }
+            "tagged" => Outcome::Tagged(reported),
+            "delete_marker" => Outcome::DeleteMarker(reported),
+            "no_such_version" => Outcome::NoSuchVersion,
+            "no_such_key" => Outcome::NoSuchKey,
+            "no_such_bucket" => Outcome::NoSuchBucket,
             other => anyhow::bail!("cairn_set_tags: unexpected status {other}"),
         });
     }
-    Ok(slow_down())
+    Ok(Outcome::Contended)
 }
 
 /// S3's answer for a delete marker's tags: 405, as for any method but

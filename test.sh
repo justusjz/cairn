@@ -2543,6 +2543,54 @@ account_block_ok() {
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
+# S3 Batch Operations' jobs (S3 Control's, through the vhost client, as the
+# account's public access block): created, described, listed, re-prioritized,
+# tagged and cancelled. They run in the lifecycle steps, minutes apart, so
+# running them is left to the end-to-end tests (`batch::e2e`).
+batch_jobs_ok() {
+    local b="batch-$(date +%s)" r="batch-role-$(date +%s)" account etag job out manifest \
+        trust="$WORK_DIR/batch-trust.json"
+    account=$(awss3 sts get-caller-identity --query Account --output text 2>/dev/null)
+    [ -n "$account" ] || return 1
+    awss3 s3api create-bucket --bucket "$b" >/dev/null 2>&1 || return 1
+    printf '%s,a\n%s,b\n' "$b" "$b" > "$WORK_DIR/batch.csv"
+    etag=$(awss3 s3api put-object --bucket "$b" --key manifest.csv --body "$WORK_DIR/batch.csv" \
+        --query ETag --output text 2>/dev/null) || return 1
+    printf '%s' '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"batchoperations.s3.amazonaws.com"},"Action":"sts:AssumeRole"}]}' > "$trust"
+    awss3 iam create-role --role-name "$r" --assume-role-policy-document "file://$trust" >/dev/null 2>&1 || return 1
+    manifest='{"Spec":{"Format":"S3BatchOperations_CSV_20180820","Fields":["Bucket","Key"]},"Location":{"ObjectArn":"arn:aws:s3:::'"$b"'/manifest.csv","ETag":'"$etag"'}}'
+    job=$(awsvhost s3control create-job --account-id "$account" --confirmation-required --priority 10 \
+        --role-arn "arn:aws:iam::$account:role/$r" --report '{"Enabled":false}' \
+        --operation '{"S3PutObjectTagging":{"TagSet":[{"Key":"team","Value":"red"}]}}' \
+        --manifest "$manifest" --tags Key=owner,Value=test --query JobId --output text 2>/dev/null) || return 1
+    [ -n "$job" ] || return 1
+    [ "$(awsvhost s3control describe-job --account-id "$account" --job-id "$job" \
+        --query 'Job.[Operation.S3PutObjectTagging.TagSet[0].Value,Priority,Manifest.Spec.Fields[1]]' \
+        --output text 2>/dev/null)" = "$(printf 'red\t10\tKey')" ] || return 1
+    awsvhost s3control list-jobs --account-id "$account" --query 'Jobs[].JobId' --output text 2>/dev/null \
+        | grep -q "$job" || return 1
+    [ "$(awsvhost s3control update-job-priority --account-id "$account" --job-id "$job" --priority 20 \
+        --query Priority --output text 2>/dev/null)" = 20 ] || return 1
+    [ "$(awsvhost s3control get-job-tagging --account-id "$account" --job-id "$job" \
+        --query 'Tags[0].Value' --output text 2>/dev/null)" = test ] || return 1
+    # Operations, manifests and reports Cairn doesn't do yet are 501s.
+    out=$(awsvhost s3control create-job --account-id "$account" --no-confirmation-required --priority 10 \
+        --role-arn "arn:aws:iam::$account:role/$r" --report '{"Enabled":false}' \
+        --operation '{"S3PutObjectLegalHold":{"LegalHold":{"Status":"ON"}}}' --manifest "$manifest" 2>&1) && return 1
+    echo "$out" | grep -q NotImplemented || return 1
+    [ "$(awsvhost s3control update-job-status --account-id "$account" --job-id "$job" \
+        --requested-job-status Cancelled --query Status --output text 2>/dev/null)" = Cancelled ] || return 1
+    out=$(awsvhost s3control update-job-status --account-id "$account" --job-id "$job" \
+        --requested-job-status Ready 2>&1) && return 1
+    echo "$out" | grep -q JobStatusException || return 1
+    out=$(awsvhost s3control describe-job --account-id "$account" \
+        --job-id 00000000-0000-0000-0000-000000000000 2>&1) && return 1
+    echo "$out" | grep -q NotFoundException || return 1
+    awss3 iam delete-role --role-name "$r" >/dev/null 2>&1
+    awss3 s3api delete-object --bucket "$b" --key manifest.csv >/dev/null 2>&1
+    awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
+}
+
 # A user's access keys: a second one signs as the user until it's
 # deactivated; and an inline policy denies what a grant allows.
 user_keys_and_policies_ok() {
@@ -3126,6 +3174,7 @@ run_test    "Missing bucket 404, no grant 403"      missing_bucket_404_ok
 run_test    "Revoked grant takes effect"            revoke_takes_effect_ok
 run_test    "Bucket policies, anonymous and signed" bucket_policy_ok
 run_test    "An account's public access block"      account_block_ok
+run_test    "Batch Operations jobs"                 batch_jobs_ok
 run_test    "Users' access keys and policies"       user_keys_and_policies_ok
 run_test    "Overwrite object, new content wins"    bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&

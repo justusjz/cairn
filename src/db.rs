@@ -241,6 +241,7 @@ const MIGRATIONS: &[&str] = &[
     ROOT_SESSIONS,
     ACCESS_GRANTS,
     MFA_DELETE,
+    BATCH_JOBS,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2873,6 +2874,62 @@ CREATE TABLE root_mfa_devices (
     created_at timestamptz NOT NULL DEFAULT now()
 );
 CREATE TRIGGER root_mfa_devices_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON root_mfa_devices
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+/// Migration 61: S3 Batch Operations' jobs (see `batch`). A job's row is
+/// all there is of it: what CreateJob asked for (its operation, manifest
+/// and report, as JSON, and its role's ARN), the token it was created with
+/// (`ClientRequestToken`, unique in its account, with a digest of the
+/// request, which tells a client's retry from another request with the
+/// same token), its status and how it got there, and where it has got to:
+/// how far through its manifest preparing it (`prepared`, a byte offset;
+/// `total`, the tasks found so far) and running it (`cursor`, a byte
+/// offset, with the tasks that succeeded and failed before it) have got.
+/// Counts move with the cursor, in the same UPDATE, so that a task done
+/// again after a node dies is counted once.
+///
+/// `waiting_since` is when it last had a turn: jobs take turns in the
+/// lifecycle steps (see `lifecycle`) with sweeps and inventory reports, the
+/// one that has waited longest first, and among jobs the highest priority.
+///
+/// Changed by plain writes, keyed by the job (each a single statement,
+/// conditioned on the job's status, so that a change of status made
+/// meanwhile, a cancellation say, isn't undone): no new lock protocol.
+const BATCH_JOBS: &str = r#"
+CREATE TABLE batch_jobs (
+    id              uuid PRIMARY KEY,
+    account_id      text NOT NULL REFERENCES accounts (id),
+    token           text NOT NULL,
+    digest          text NOT NULL,
+    status          text NOT NULL,
+    description     text,
+    priority        int NOT NULL,
+    confirmation    boolean NOT NULL,
+    operation       text NOT NULL,
+    manifest        text NOT NULL,
+    report          text NOT NULL,
+    role_arn        text NOT NULL,
+    tags            text NOT NULL DEFAULT '[]',
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    terminated_at   timestamptz,
+    suspended_at    timestamptz,
+    suspended_cause text,
+    status_reason   text,
+    failures        text NOT NULL DEFAULT '[]',
+    prepared        bigint NOT NULL DEFAULT 0,
+    total           bigint NOT NULL DEFAULT 0,
+    cursor          bigint NOT NULL DEFAULT 0,
+    succeeded       bigint NOT NULL DEFAULT 0,
+    failed          bigint NOT NULL DEFAULT 0,
+    active_seconds  double precision NOT NULL DEFAULT 0,
+    waiting_since   timestamptz NOT NULL DEFAULT now(),
+    UNIQUE (account_id, token)
+);
+CREATE INDEX batch_jobs_runnable ON batch_jobs (priority DESC, waiting_since)
+    WHERE status IN ('New', 'Preparing', 'Ready', 'Active', 'Cancelling');
+CREATE INDEX batch_jobs_listed ON batch_jobs (account_id, created_at DESC, id);
+CREATE INDEX batch_jobs_terminated ON batch_jobs (terminated_at) WHERE terminated_at IS NOT NULL;
+CREATE TRIGGER batch_jobs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON batch_jobs
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

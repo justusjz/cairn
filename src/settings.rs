@@ -28,8 +28,8 @@ pub const LIFECYCLE_RATE: Setting = Setting {
     default: 1_000_000,
     min: 0,
     max: i64::MAX,
-    help: "object versions lifecycle sweeps and inventory reports read per hour, across the cluster \
-           (0 pauses them)",
+    help: "object versions lifecycle sweeps and inventory reports read, and batch jobs' tasks, per hour, \
+           across the cluster (0 pauses them)",
     unset: None,
 };
 

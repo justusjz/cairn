@@ -29,7 +29,9 @@
 //! rate: a step serves whichever sweep or report has waited longest, and a
 //! report's turn writes a whole data file, however little is left of the
 //! step's share; what it reads beyond that is a debt (`lifecycle_runs.debt`),
-//! which the next steps pay off before they read anything.
+//! which the next steps pay off before they read anything. Batch Operations'
+//! jobs (see `batch`) take turns in them too: a job's task is a version read,
+//! and a job's turn does as many as are left of the step's share.
 //!
 //! Each step expires the due versions of its pages (`cairn_lifecycle_expire`),
 //! checking each again under the locks a delete takes: a version written
@@ -171,47 +173,67 @@ async fn take_step(app: &Arc<App>, now: SystemTime) -> anyhow::Result<Vec<Result
     let mut results = Vec::new();
     let mut visited = Vec::new();
     let mut reports = Vec::new();
+    let mut jobs = Vec::new();
     let mut read = 0;
     // Whatever happens, the claim is let go of after, rather than holding up
     // every step until its lease runs out.
     let walked: anyhow::Result<()> = async {
+        crate::batch::forget_old(&client, now).await?;
         while budget > 0 {
-            // The lifecycle sweep or inventory report that has waited
-            // longest; a sweep first, of two due at once.
+            // The lifecycle sweep, inventory report or batch job that has
+            // waited longest; of two that have waited as long, a sweep
+            // before a report before a job.
             let sweep = next_sweep(&client, now, &visited).await?;
             let report = crate::inventory::next(&client, now, &reports).await?;
-            let report = match (sweep, report) {
-                (None, None) => break,
-                (Some(sweep), Some((due, report))) if due < sweep.due => {
-                    drop(sweep);
-                    report
-                }
-                (Some(sweep), _) => {
+            let job = crate::batch::next(&client, &jobs).await?;
+            let dues = [sweep.as_ref().map(|s| s.due), report.as_ref().map(|(due, _)| *due), job.as_ref().map(|(due, _)| *due)];
+            let Some(next) = (0..dues.len()).filter(|&i| dues[i].is_some()).min_by_key(|&i| dues[i]) else { break };
+            match next {
+                0 => {
+                    let sweep = sweep.expect("it's due");
                     visited.push(sweep.bucket.clone());
                     let bucket = sweep.bucket.clone();
                     let result = turn(app, &client, sweep, now, &mut budget).await;
                     read += result.as_ref().map_or(0, |report| report.read);
                     results.push(result.map_err(|e| (bucket, e)));
-                    continue;
                 }
-                (None, Some((_, report))) => report,
-            };
-            reports.push(report.name());
-            let name = report.name();
-            // A whole data file, however little is left of the budget: what
-            // it reads beyond it is a debt the next steps pay off.
-            match crate::inventory::turn(app, &client, report, now, rows).await {
-                Ok(turn) => {
-                    read += turn.read;
-                    budget -= turn.read;
-                    if turn.file || turn.finished || turn.failure.is_some() || turn.interrupted {
-                        eprintln!("inventory: {turn}");
+                1 => {
+                    let (_, report) = report.expect("it's due");
+                    reports.push(report.name());
+                    let name = report.name();
+                    // A whole data file, however little is left of the
+                    // budget: what it reads beyond it is a debt the next
+                    // steps pay off.
+                    match crate::inventory::turn(app, &client, report, now, rows).await {
+                        Ok(turn) => {
+                            read += turn.read;
+                            budget -= turn.read;
+                            if turn.file || turn.finished || turn.failure.is_some() || turn.interrupted {
+                                eprintln!("inventory: {turn}");
+                            }
+                            app.metrics.inventory_done(&turn);
+                        }
+                        Err(e) => {
+                            eprintln!("inventory: {name}: report failed: {e:#}");
+                            app.metrics.inventory_failed(format!("{name}: report failed: {e:#}"));
+                        }
                     }
-                    app.metrics.inventory_done(&turn);
                 }
-                Err(e) => {
-                    eprintln!("inventory: {name}: report failed: {e:#}");
-                    app.metrics.inventory_failed(format!("{name}: report failed: {e:#}"));
+                _ => {
+                    let (_, job) = job.expect("it's due");
+                    jobs.push(job.id);
+                    let id = job.id;
+                    // As much of the budget as it has tasks for.
+                    match crate::batch::turn(app, &client, job, now, &mut budget).await {
+                        Ok(turn) => {
+                            read += turn.tasks;
+                            let ended = crate::batch::TERMINAL.contains(&turn.status.as_str());
+                            if turn.tasks > 0 || turn.prepared > 0 || ended {
+                                eprintln!("batch: {turn}");
+                            }
+                        }
+                        Err(e) => eprintln!("batch: job {id}: turn failed: {e:#}"),
+                    }
                 }
             }
         }

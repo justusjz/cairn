@@ -114,6 +114,14 @@ impl Tags {
         })
     }
 
+    /// Tags from key-value pairs (S3 Control's `<member>` elements, say),
+    /// checked as `on`'s, as `from_elements` checks them.
+    pub fn from_pairs(pairs: Vec<(String, String)>, on: On) -> Result<Tags, Response<Full<Bytes>>> {
+        Tags::checked(pairs, on, || {
+            format_s3_error(StatusCode::BAD_REQUEST, "InvalidTag", "Cannot provide multiple Tags with the same key")
+        })
+    }
+
     /// These tags with `other`'s set over them (TagResource's merge).
     pub fn merged(&self, other: &Tags) -> Tags {
         let mut pairs = self.0.clone();
