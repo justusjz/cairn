@@ -133,6 +133,10 @@ pub struct Access {
     /// The policies of the topics checks are on, by their ARNs (see
     /// `set_topic_policy`).
     topics: HashMap<String, Arc<Policy>>,
+    /// The organization's management account, which owns the cluster (see
+    /// `set_management`): unset, the cluster is no one's, and every check
+    /// on it denied.
+    management: Option<String>,
 }
 
 /// Who makes a request, as policies see it (an owned `policy::Principal`).
@@ -238,7 +242,15 @@ impl Access {
             granted: None,
             writes: None,
             topics: HashMap::new(),
+            management: None,
         })
+    }
+
+    /// Says which account is the organization's management account, which
+    /// owns the cluster: its principals' policies may allow them `cairn:`
+    /// actions, a member account's never do.
+    pub fn set_management(&mut self, account: &str) {
+        self.management = Some(account.to_owned());
     }
 
     /// Allows the request every check on directory bucket `bucket` but
@@ -404,9 +416,10 @@ impl Access {
             On::Topic(account, _) => Some(account.as_str()),
             // Cairn's (AWS's) policies are no account's: as the principal's own.
             On::Policy(account, _) if account != "aws" => Some(account.as_str()),
-            // The account's, whose operators' policies allow them `cairn:`
-            // actions (see `plans/single-account.md`); never anonymously.
-            On::Cluster => Some(self.account().unwrap_or("")),
+            // The management account's, whose operators' policies allow
+            // them `cairn:` actions; never anonymously, nor to a member
+            // account's (see `organizations`).
+            On::Cluster => Some(self.management.as_deref().unwrap_or("")),
             _ => loaded
                 .and_then(|loaded| loaded.account.as_deref())
                 .filter(|_| !matches!(check.action, "s3:CreateBucket" | "s3express:CreateBucket")),
@@ -471,14 +484,17 @@ impl Access {
         let principal = self.user.as_ref().map_or(Who::Anonymous, Who_::as_policy);
         let mut context = self.context.clone();
         context.extend(extra);
-        if let Some(account) = self.account() {
+        // The role's account (which may be another than the principal's).
+        let owner = trust_account(role).or(self.account());
+        if let Some(account) = owner {
             context.set("aws:ResourceAccount", account);
         }
         let request = crate::policy::Request { principal, action, resource: role, context: &context };
         let boundary = self.boundary.as_ref().map(|(policy, _)| &**policy);
         let session: Option<Vec<&Policy>> = self.session.as_ref().map(|policies| policies.iter().map(|p| &**p).collect());
         let caps = crate::policy::Caps { boundary, session: session.as_deref() };
-        crate::policy::trust_allows(self.identity.iter().map(|p| &**p), caps, trust, &request)
+        let cross = owner.is_some_and(|owner| self.account() != Some(owner));
+        crate::policy::trust_allows(self.identity.iter().map(|p| &**p), caps, trust, &request, cross)
     }
 
     /// Whether `trust` lets a web identity of the OIDC provider `provider`
@@ -493,7 +509,7 @@ impl Access {
         }
         let request = crate::policy::Request { principal: Who::WebIdentity { provider }, action, resource: role, context: &context };
         let caps = crate::policy::Caps { boundary: None, session: None };
-        crate::policy::trust_allows(std::iter::empty(), caps, trust, &request)
+        crate::policy::trust_allows(std::iter::empty(), caps, trust, &request, false)
     }
 
     /// The account the principal acts in; `None` if anonymous.

@@ -21,6 +21,7 @@ import Overview from "./pages/Overview";
 import Policies, { PolicyPage } from "./pages/Policies";
 import Groups, { GroupPage } from "./pages/Groups";
 import IdentityCenter, { PermissionSetPage } from "./pages/IdentityCenter";
+import Organization from "./pages/Organization";
 import Roles, { RolePage } from "./pages/Roles";
 import Storage from "./pages/Storage";
 import Topics, { TopicPage } from "./pages/Topics";
@@ -149,7 +150,10 @@ const CLUSTER_NAV: [string, string][] = [
 ];
 
 /** ... and last: how people sign in. */
-const OPERATOR_NAV: [string, string][] = [["/sign-in", "Sign-in"]];
+const OPERATOR_NAV: [string, string][] = [
+  ["/organization", "Organization"],
+  ["/sign-in", "Sign-in"],
+];
 
 /** Who the session acts as: the user's name, or a directory user's
  * permission set (or its own name, until it picks one). */
@@ -758,6 +762,7 @@ render(
       <Route path="/integrity" component={Guarded(Integrity)} />
       <Route path="/jobs" component={Guarded(Jobs)} />
       <Route path="/sign-in" component={Guarded(SignIn)} />
+      <Route path="/organization" component={Guarded(Organization)} />
       <Route path="/users" component={Guarded(Users)} />
       <Route path="/users/:name" component={Guarded(UserPage)} />
       <Route path="/groups" component={Guarded(Groups)} />

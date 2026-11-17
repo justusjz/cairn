@@ -170,7 +170,7 @@ pub async fn convert(client: &Object) -> anyhow::Result<usize> {
             "SELECT g.bucket, g.role, g.permission, r.account_id
              FROM role_grants g JOIN users r ON r.name = g.role
              -- From before accounts: the first tenant account's users.
-             WHERE r.account_id = (SELECT id FROM accounts WHERE NOT operator)
+             WHERE r.account_id = (SELECT id FROM accounts WHERE management)
              ORDER BY g.bucket",
             &[],
         )

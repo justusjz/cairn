@@ -124,6 +124,125 @@
         }
       }
     },
+    "/accounts": {
+      "get": {
+        "operationId": "list_accounts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/AccountSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a member account, with `OrganizationAccountAccessRole` (as\nCreateAccount).",
+        "operationId": "create_account",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewAccount"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewAccountId"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/accounts/{id}": {
+      "delete": {
+        "summary": "Closes a member account, at once (it must have no buckets): its users,\nroles and sessions are no one from then on.",
+        "operationId": "close_account",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Closed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/assignments": {
       "get": {
         "operationId": "list_assignments",
@@ -6748,6 +6867,56 @@
           }
         }
       },
+      "AccountSummary": {
+        "type": "object",
+        "description": "An account of the organization.",
+        "required": [
+          "id",
+          "name",
+          "management",
+          "status",
+          "joined_at",
+          "buckets"
+        ],
+        "properties": {
+          "buckets": {
+            "type": "integer",
+            "format": "int64",
+            "description": "How many buckets it has (which keep it from being closed)."
+          },
+          "closed_at": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "joined_at": {
+            "type": "number",
+            "format": "double"
+          },
+          "management": {
+            "type": "boolean",
+            "description": "Whether it's the management account."
+          },
+          "name": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "description": "`ACTIVE`, or (closed) `SUSPENDED`."
+          }
+        }
+      },
       "Assertion": {
         "type": "object",
         "description": "What `navigator.credentials.get()` gave the page.",
@@ -9427,6 +9596,40 @@
           "started_at": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "NewAccount": {
+        "type": "object",
+        "required": [
+          "name",
+          "email"
+        ],
+        "properties": {
+          "email": {
+            "type": "string",
+            "description": "Unique among the organization's accounts."
+          },
+          "name": {
+            "type": "string",
+            "description": "1 to 50 printable characters."
+          }
+        }
+      },
+      "NewAccountId": {
+        "type": "object",
+        "description": "A new account's ID.",
+        "required": [
+          "id",
+          "role_arn"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "role_arn": {
+            "type": "string",
+            "description": "The role the management account's principals may assume into it."
           }
         }
       },

@@ -327,7 +327,11 @@ where
             Some((signature, principal, policy))
         }
     };
-    let account = crate::users::account(&client).await?;
+    // The signer's own account; anonymously, the management account's.
+    let account = match signed.as_ref().map(|(_, principal, _)| principal) {
+        Some(principal) => principal.account.clone(),
+        None => crate::users::account(&client).await?,
+    };
     drop(client);
     let key = match field(&fields, "key") {
         Some(key) if !key.is_empty() => key.to_owned(),

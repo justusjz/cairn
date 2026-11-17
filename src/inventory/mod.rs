@@ -199,7 +199,7 @@ impl Report {
 struct Target<'a> {
     report: &'a Report,
     config: &'a Configuration,
-    /// The account, which owns every bucket.
+    /// The account that owns the source bucket.
     account: String,
     started: SystemTime,
     /// The step's time (see `lifecycle`).
@@ -224,7 +224,7 @@ pub(crate) async fn turn(app: &Arc<App>, client: &Object, report: Report, now: S
     let config = Configuration::from_json(&report.config).map_err(|e| {
         anyhow::anyhow!("its inventory configuration isn't one this Cairn knows (written by a newer one?): {e}")
     })?;
-    let account = crate::users::account(client).await?;
+    let account = crate::s3::util::bucket_owner(client, &report.bucket).await?;
     let target = Target { report: &report, config: &config, account, started: report.started.unwrap_or(now), now };
     let source = Source::load(client, &report.bucket).await?;
     let after = report.cursor.clone().unwrap_or_default();

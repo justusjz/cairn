@@ -870,7 +870,7 @@ fn trust_policies_decide_who_assumes_a_role() {
     let context = Context::default();
     let role = format!("arn:aws:iam::{ACCOUNT}:role/r");
     let request = Request { principal: user("alice"), action: "sts:AssumeRole", resource: &role, context: &context };
-    let decide = |trust: &Policy, identity: &[&Policy], caps: Caps| trust_allows(identity.iter().copied(), caps, trust, &request);
+    let decide = |trust: &Policy, identity: &[&Policy], caps: Caps| trust_allows(identity.iter().copied(), caps, trust, &request, false);
     let alice = trusting(&format!("arn:aws:iam::{ACCOUNT}:user/alice"));
     let account = trusting(&format!("arn:aws:iam::{ACCOUNT}:root"));
     let other = trusting(&format!("arn:aws:iam::{ACCOUNT}:user/bob"));

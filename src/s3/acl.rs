@@ -104,7 +104,7 @@ pub async fn get_object_acl(
     version_id: Option<&str>,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
-    let owner_id = crate::s3::util::canonical_id(&crate::users::account(&client).await?);
+    let owner_id = crate::s3::util::canonical_id(&crate::s3::util::bucket_owner(&client, bucket).await?);
     Ok(
         match crate::s3::objects::get::lookup_version(&client, bucket, key, version_id).await? {
             Ok(_) => crate::s3::util::stub_acl(&owner_id),

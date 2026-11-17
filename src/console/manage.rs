@@ -122,6 +122,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .merge(super::sns::router())
         .merge(super::inventory::router())
         .merge(super::sso::router())
+        .merge(super::organizations::router())
 }
 
 // ─── Cluster ─────────────────────────────────────────────────────────────────

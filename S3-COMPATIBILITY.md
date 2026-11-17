@@ -77,7 +77,8 @@ supported.
 | Bucket ABAC (bucket tags in policies) | ✅ | |
 | S3 Access Grants | 🟡 | IAM grantees only: [Access Grants](#access-grants) |
 | MFA delete | 🟡 | [MFA delete](#mfa-delete) |
-| IAM Identity Center (directory users, permission sets, sso-admin, identitystore) | 🟡 | Own directory and OIDC sources, one account: [Identity Center](#identity-center) |
+| IAM Identity Center (directory users, permission sets, sso-admin, identitystore) | 🟡 | Own directory and OIDC sources: [Identity Center](#identity-center) |
+| AWS Organizations (member accounts) | 🟡 | Accounts only: [Organizations](#organizations) |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
 ### Not implemented
@@ -108,9 +109,10 @@ S3 reports a bucket that doesn't use it:
   `us-east-1`, not `409 BucketAlreadyOwnedByYou`, as in other regions.)
   CreateBucket ignores its `LocationConstraint`. ListBuckets has no
   `BucketRegion`.
-- **One account.** A cluster has one account, which owns every bucket, user,
-  role and policy. Its canonical user ID is derived from the account ID.
-  There are no Organizations, so no SCPs, RCPs or organization condition keys.
+- **Accounts.** A cluster has an organization: its management account,
+  and member accounts made from it ([Organizations](#organizations)). An
+  account's canonical user ID is derived from its ID. There are no SCPs,
+  RCPs or organization condition keys yet.
 - **The root user is made on a node, for a while.** It has no password or
   long-term access keys, and no MFA device but MFA delete's ([MFA
   delete](#mfa-delete)): `cairn account root-link` prints a
@@ -392,6 +394,33 @@ Differences:
   when a provider is created, and refuses one it can't reach. Thumbprints are
   enforced as certificate pins, which lets issuers on private CAs work.
 
+### Organizations
+
+Accounts as AWS Organizations has them: the account a cluster starts with
+is the organization's management account, which makes member accounts
+(see the README's *Accounts*). Organizations' API covers
+DescribeOrganization (any account's principals), and, the management
+account's only, ListAccounts, DescribeAccount, CreateAccount (with
+DescribeCreateAccountStatus and ListCreateAccountStatus) and CloseAccount.
+This wasn't checked against AWS. It differs in that:
+
+- **Accounts only:** organizational units, roots, policies (SCPs, RCPs,
+  tag and backup policies), invitations, delegated administrators and
+  trusted services answer `501`, and so does CreateAccount with `Tags`.
+- **Done at once.** CreateAccount's status is `SUCCEEDED` (or `FAILED`, with
+  `EMAIL_ALREADY_EXISTS`) when it's answered, and kept for 90 days.
+- **No member root users,** as AWS's centralized root access has it: a
+  member account's way in is `OrganizationAccountAccessRole` (or the role
+  named in `RoleName`) and Identity Center's permission sets.
+- **Closing is at once,** and only of an account without buckets: its
+  status is `SUSPENDED` from then on, and its users, roles and sessions are
+  no one. AWS keeps a closed account for 90 days, and its data with it.
+- **No e-mail is sent,** and the management account has none (so
+  DescribeOrganization has no `MasterAccountEmail`).
+- **Cross-account access** works as AWS's, by bucket policies and role
+  trust: an `AssumeRole` into another account needs both the role's trust
+  policy and the caller's own policies to allow it.
+
 ### Identity Center
 
 Directory users, as IAM Identity Center has them: people who sign in to the
@@ -436,11 +465,12 @@ AWS. It differs in that:
   UpdateUser and UpdateGroup take attribute paths (`name.familyName`,
   `aws:identitystore:enterprise.department`); one without a value removes
   its attribute.
-- **One account, done at once.** The account's instance is its only one
-  (CreateInstance, DeleteInstance and UpdateInstance answer `501`), and the
-  account the only target of assignments and provisioning (assignments and
-  provisionings do name their accounts, so that member accounts can be
-  added). Their requests are done when they're answered: their statuses are
+- **The organization's instance, done at once.** The management account's
+  instance is the only one (CreateInstance, DeleteInstance and
+  UpdateInstance answer `501`; a member account's principals may not call
+  sso-admin or identitystore), and the organization's open accounts the
+  targets of assignments and provisioning. Their requests are done when
+  they're answered: their statuses are
   `SUCCEEDED` or `FAILED` (never `IN_PROGRESS`), and creating an
   assignment there is, or deleting one there isn't, succeeds. Their
   statuses are kept for 90 days.
@@ -514,7 +544,7 @@ Not implemented:
   (`sts:SetContext`, trusted identity propagation).
 - **Other accounts' grantees:** the instance's resource policy
   (Put/Get/DeleteAccessGrantsInstanceResourcePolicy), and so cross-account
-  GetDataAccess. A cluster has one account.
+  GetDataAccess.
 - **Auditing:** there's no CloudTrail, and S3 Control's requests aren't in
   [server access logs](#server-access-logging), so who got data access
   when isn't recorded (the session's name, the grantee's unique ID, is in

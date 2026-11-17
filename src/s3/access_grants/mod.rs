@@ -490,7 +490,7 @@ pub fn trusts_access_grants(role: &Role, account: &str) -> anyhow::Result<bool> 
         context: &context,
     };
     let caps = crate::policy::Caps { boundary: None, session: None };
-    Ok(crate::policy::trust_allows(std::iter::empty(), caps, &trust, &request))
+    Ok(crate::policy::trust_allows(std::iter::empty(), caps, &trust, &request, false))
 }
 
 /// A request in progress: who makes it, in which account, as `access`

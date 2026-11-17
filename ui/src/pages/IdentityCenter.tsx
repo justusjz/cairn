@@ -6,7 +6,7 @@
 
 import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type Assignment, type DirectoryGroup, type DirectoryUser, type ManagedPolicy, type PermissionSet, api } from "../api";
+import { type Assignment, type DirectoryGroup, type DirectoryUser, type OrgAccount, type ManagedPolicy, type PermissionSet, api } from "../api";
 import { AttachDialog, DetailHead, Gone, InlinePolicyDialog, PermissionsPanel, PolicyChips, PolicySelect, roleHref } from "../components/Iam";
 import { EnrollmentDialog } from "./Users";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
@@ -288,15 +288,28 @@ function AssignDialog(props: {
   const [kind, setKind] = createSignal<"GROUP" | "USER">(props.groups.length ? "GROUP" : "USER");
   const options = () =>
     kind() === "GROUP"
-      ? props.groups.map((g) => ({ id: g.id, label: `${g.name} (${g.provider})` }))
+      ? props.groups.map((g) => ({ id: g.id, label: `${g.name} (${g.provider ?? "Cairn"})` }))
       : props.users.map((u) => ({ id: u.id, label: `${u.display_name} (${u.user_name})` }));
   const [chosen, setChosen] = createSignal("");
   const principal = () => (options().some((o) => o.id === chosen()) ? chosen() : (options()[0]?.id ?? ""));
+  // The organization's open accounts, to assign in (this one's only, if
+  // the session can't list them).
+  const [accounts, setAccounts] = createSignal<OrgAccount[]>([]);
+  const [account, setAccount] = createSignal("");
+  onMount(async () => {
+    try {
+      const all = (await api.accounts()).filter((a) => a.status === "ACTIVE");
+      setAccounts(all);
+      setAccount(all.find((a) => a.management)?.id ?? all[0]?.id ?? "");
+    } catch {
+      setAccounts([]);
+    }
+  });
   const [error, setError] = createSignal<string>();
   const assign = async (e: SubmitEvent) => {
     e.preventDefault();
     try {
-      await api.assign(set(), kind(), principal());
+      await api.assign(set(), kind(), principal(), account() || undefined);
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
       return;
@@ -316,6 +329,14 @@ function AssignDialog(props: {
               <For each={props.sets}>{(s) => <option value={s.name}>{s.name}</option>}</For>
             </select>
           </label>
+          <Show when={accounts().length > 1}>
+            <label class="field">
+              In account
+              <select value={account()} onChange={(e) => setAccount(e.currentTarget.value)}>
+                <For each={accounts()}>{(a) => <option value={a.id}>{`${a.name} (${a.id})`}</option>}</For>
+              </select>
+            </label>
+          </Show>
           <label class="field">
             To
             <select value={kind()} onChange={(e) => setKind(e.currentTarget.value as "GROUP" | "USER")}>

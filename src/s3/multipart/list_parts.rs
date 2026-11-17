@@ -110,8 +110,8 @@ pub async fn list_parts(
     // nothing (probed).
     let truncated = rows.len() as i64 > max_parts && max_parts > 0;
     let kept = kept_rows(&rows, max_parts);
-    // The account's, as the ACL stub has it.
-    let account = crate::users::account(&app.pool.get().await?).await?;
+    // The bucket owner's, as the ACL stub has it.
+    let account = crate::s3::util::bucket_owner(&app.pool.get().await?, bucket).await?;
     let owner_id = crate::s3::util::canonical_id(&account);
     let owner = format!("<ID>{owner_id}</ID>");
     let initiator = crate::s3::multipart::initiator_xml(initiator.as_deref(), &owner_id);

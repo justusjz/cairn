@@ -535,9 +535,8 @@ async fn run(
         .execute_cached("UPDATE batch_jobs SET status = 'Active' WHERE id = $1 AND status = 'Ready'", &[&job.id])
         .await?;
     turn.status = "Active".to_owned();
-    let account = crate::users::account(client).await?;
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let mut access = Access::new(Some(&principal), &account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
+    let mut access = Access::new(Some(&principal), &principal.account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
     let tags = match &job.operation {
         Operation::PutTagging { tags } => match Tags::from_pairs(tags.clone(), crate::s3::tags::On::Object) {
             Ok(tags) => tags,
@@ -826,9 +825,8 @@ async fn may_read(
     version_id: Option<&str>,
     arn: &str,
 ) -> anyhow::Result<Result<(), Failure>> {
-    let account = crate::users::account(&app.pool.get().await?).await?;
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let mut access = Access::new(Some(principal), &account, &Method::GET, &HeaderMap::new(), "", &origin)?;
+    let mut access = Access::new(Some(principal), &principal.account, &Method::GET, &HeaderMap::new(), "", &origin)?;
     let query = match version_id {
         Some(v) => format!("versionId={}", percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)),
         None => String::new(),

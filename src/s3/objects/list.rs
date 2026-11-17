@@ -228,7 +228,7 @@ pub async fn list_objects(
         | ListVersion::V2 {
             fetch_owner: true, ..
         } => {
-            let account = crate::users::account(&app.pool.get().await?).await?;
+            let account = crate::s3::util::bucket_owner(&app.pool.get().await?, bucket).await?;
             format!("<Owner><ID>{}</ID></Owner>", crate::s3::util::canonical_id(&account))
         }
         ListVersion::V2 { .. } => String::new(),

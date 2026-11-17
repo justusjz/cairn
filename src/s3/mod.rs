@@ -214,6 +214,9 @@ async fn handle_request(
     }
     // Identity Center's sso-admin and identitystore (signed for `sso`,
     // `identitystore`; see `sso`).
+    if let Some(signed) = signed.as_ref().filter(|s| crate::organizations::wants(s)) {
+        return Ok(box_response(crate::organizations::handle(&app, req, signed.clone(), peer).await));
+    }
     if let Some(signed) = signed.as_ref().filter(|s| crate::sso::wants(s)) {
         return Ok(box_response(crate::sso::handle(&app, req, signed.clone(), peer).await));
     }
@@ -288,7 +291,12 @@ async fn handle_request(
     if req.headers().contains_key(hyper::header::TRANSFER_ENCODING) {
         return Ok(box_response(util::header_not_implemented("Transfer-Encoding", None)));
     }
-    let account = crate::users::account(&app.pool.get().await?).await?;
+    // The signer's own account; anonymously, the management account's.
+    // Once the bucket's known, its owner's, if it's there (see below).
+    let account = match &principal {
+        Some(principal) => principal.account.clone(),
+        None => crate::users::account(&app.pool.get().await?).await?,
+    };
     // Who makes it, as its writes' events say (see `notifications`).
     if let Some(principal) = &principal {
         crate::access_log::set_requester(principal.arn());
@@ -395,6 +403,17 @@ async fn handle_request(
     let (bucket, key) = match path.split_once('/') {
         Some((bucket, key)) => (decode_path_param(bucket), decode_path_param(key)),
         None => (decode_path_param(path), "".to_owned()),
+    };
+    // The bucket's account from here on, as expected-owner headers, its
+    // ACL's owner and its ARNs name it: its owner's, if it's there (else,
+    // to create it, the signer's).
+    let owner = {
+        use crate::db::Cached as _;
+        app.pool.get().await?.query_opt_cached("SELECT account_id FROM buckets WHERE name = $1", &[&bucket]).await?
+    };
+    let account = match owner {
+        Some(row) => row.get(0),
+        None => account,
     };
     let query = req.uri().query().unwrap_or("");
     if key.len() > util::MAX_KEY_LENGTH {

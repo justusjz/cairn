@@ -54,8 +54,9 @@ Done:
   every change.
 
 - **Console and IAM.** Implemented: a web UI with passkey and OIDC sign-in
-  on a listener of its own, which replaced the dashboard; one account,
-  whose operators are users with `cairn:` policies; IAM policies, inline
+  on a listener of its own, which replaced the dashboard; accounts in an
+  organization, whose management account's operators are users with
+  `cairn:` policies; IAM policies, inline
   and managed (Cairn's with AWS's names, and the account's own), bucket
   policies, permissions boundaries, paths and tags, groups, and the IAM
   API. Open: policy templates (a team, a service user, the MFA guard), tag
@@ -66,14 +67,15 @@ Done:
   identitystore's reads): implemented. Permission sets provisioned per
   account (as roles made at their first assignment there, updated by
   provisioning), and assignments and directory users' sessions in an
-  account: implemented, with the one account. Cairn's own directory
-  (users and groups made with identitystore's writes, or the console;
-  passkeys set up with links): implemented. Next, toward accounts as AWS
-  Organizations has them (the existing account as the management
-  account): member accounts, which
-  permission sets are provisioned to as they're assigned there, and
-  cross-account access. Also: directory users and groups as Access Grants
-  grantees, and the access portal's APIs for `aws sso login`.
+  account. Cairn's own directory (users and groups made with
+  identitystore's writes, or the console; passkeys set up with links):
+  implemented. Member accounts, as AWS Organizations has them (the
+  existing account as the management account, CreateAccount with
+  `OrganizationAccountAccessRole`, cross-account AssumeRole, CloseAccount):
+  implemented. Next: cross-account access to KMS keys, SNS topics and
+  Access Grants; then organizational units and SCPs. Also: directory users
+  and groups as Access Grants grantees, switching roles in the console,
+  and the access portal's APIs for `aws sso login`.
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes

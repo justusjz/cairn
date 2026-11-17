@@ -31,6 +31,8 @@ mod paging_tests;
 #[cfg(test)]
 mod root_tests;
 #[cfg(test)]
+mod organizations_tests;
+#[cfg(test)]
 mod web_identity_tests;
 
 use std::collections::HashMap;
@@ -233,7 +235,20 @@ async fn respond_unsigned(app: &Arc<App>, req: Request<crate::listen::ClientBody
         return Err(error(StatusCode::FORBIDDEN, "MissingAuthenticationToken", "Request is missing Authentication Token"));
     }
     let client = app.pool.get().await?;
-    let account = users::account(&client).await?;
+    // The role's account (it's unsigned: no one's own), an open one; else
+    // the management account's, where the role is then no one.
+    let named = params
+        .0
+        .get("RoleArn")
+        .and_then(|arn| arn.strip_prefix("arn:aws:iam::"))
+        .and_then(|rest| rest.split(':').next())
+        .map(str::to_owned);
+    let account = match named {
+        Some(account) if client.query_opt_cached("SELECT 1 FROM accounts WHERE id = $1 AND closed_at IS NULL", &[&account]).await?.is_some() => {
+            account
+        }
+        _ => users::account(&client).await?,
+    };
     let origin = Origin { peer: Some(peer), trusted_proxies: &app.trusted_proxies, signed: None, form: false };
     let access = Access::new(None, &account, &parts.method, &parts.headers, "", &origin)?;
     let sts = sts::Sts { app, client: &client, account: &account };

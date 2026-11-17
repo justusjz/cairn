@@ -73,8 +73,8 @@ pub async fn list_multipart_uploads(
     let truncated = rows.len() as i64 > max_uploads && max_uploads > 0;
     let kept = &rows[..(max_uploads as usize).min(rows.len())];
 
-    // The account's, as the ACL stub has it.
-    let owner_id = crate::s3::util::canonical_id(&crate::users::account(&app.pool.get().await?).await?);
+    // The bucket owner's, as the ACL stub has it.
+    let owner_id = crate::s3::util::canonical_id(&crate::s3::util::bucket_owner(&app.pool.get().await?, bucket).await?);
     let mut uploads = String::new();
     let mut prefixes = String::new();
     for row in kept {
