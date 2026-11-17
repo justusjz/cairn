@@ -4,9 +4,12 @@
 //!
 //! Only some of S3's operations, and not all of how they're asked for:
 //!
-//! - Operations: `S3PutObjectTagging` (replacing each version's tags) and
-//!   `S3DeleteObjectTagging`. Doing either twice does no harm, which a job
-//!   relies on (below). Others are refused with 501 NotImplemented.
+//! - Operations: `S3PutObjectTagging` (replacing each version's tags),
+//!   `S3DeleteObjectTagging`, `S3PutObjectRetention` and
+//!   `S3PutObjectLegalHold` (see `s3::object_lock`). Doing any of them twice
+//!   does no harm, which a job relies on (below): a retention set again is
+//!   set to the same date, which isn't shortening it. Others are refused
+//!   with 501 NotImplemented.
 //! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`) only; not
 //!   inventory reports' `manifest.json`, nor manifests S3 generates.
 //! - Completion reports: as S3 writes them, of all tasks or only those that
@@ -70,6 +73,7 @@ use crate::{
     s3::{
         access::{Access, Origin},
         actions, conditional::Preconditions,
+        object_lock::{Change, Mode, Outcome as LockOutcome, parse_date},
         objects::{get::get_object, tagging::{self, Outcome, Tagging}},
         tags::Tags,
     },
@@ -125,6 +129,15 @@ pub enum Operation {
     /// Removes each version's tags.
     #[serde(rename = "delete_tagging")]
     DeleteTagging,
+    /// Sets each version's retention: a mode (`GOVERNANCE`, `COMPLIANCE`)
+    /// and the time it lasts until, as given (ISO 8601); neither removes it.
+    /// With `bypass`, it may shorten or remove a GOVERNANCE one, if the
+    /// role is allowed `s3:BypassGovernanceRetention`.
+    #[serde(rename = "put_retention")]
+    PutRetention { mode: Option<String>, until: Option<String>, bypass: bool },
+    /// Puts each version's legal hold on, or lifts it.
+    #[serde(rename = "put_legal_hold")]
+    PutLegalHold { on: bool },
 }
 
 impl Operation {
@@ -133,6 +146,8 @@ impl Operation {
         match self {
             Operation::PutTagging { .. } => "S3PutObjectTagging",
             Operation::DeleteTagging => "S3DeleteObjectTagging",
+            Operation::PutRetention { .. } => "S3PutObjectRetention",
+            Operation::PutLegalHold { .. } => "S3PutObjectLegalHold",
         }
     }
 }
@@ -470,10 +485,18 @@ async fn run(
             Ok(tags) => tags,
             Err(_) => anyhow::bail!("job {}: its stored tags aren't an object's", job.id),
         },
-        Operation::DeleteTagging => Tags::default(),
+        _ => Tags::default(),
     };
-    if matches!(job.operation, Operation::PutTagging { .. }) {
-        crate::s3::abac::request_tags(&mut access, &tags);
+    // What the tasks ask for, which policies may test.
+    match &job.operation {
+        Operation::PutTagging { .. } => crate::s3::abac::request_tags(&mut access, &tags),
+        Operation::PutRetention { mode, until, .. } => {
+            crate::s3::object_lock::set_context(&mut access.context, mode.as_deref(), until.as_deref(), None)
+        }
+        Operation::PutLegalHold { on } => {
+            crate::s3::object_lock::set_context(&mut access.context, None, None, Some(if *on { "ON" } else { "OFF" }))
+        }
+        Operation::DeleteTagging => {}
     }
     let fields = job.manifest.fields();
     let writer = Writer::of(&job.report, job.id);
@@ -611,29 +634,91 @@ async fn run_task(
         return Ok(Err(TaskFailure::new(400, "InvalidArgument", "Invalid version id specified")));
     }
     if crate::s3::directory::is_directory(bucket) {
-        return Ok(Err(TaskFailure::new(501, "NotImplemented", "A directory bucket's objects have no tags.")));
+        let what = format!("{} isn't done to a directory bucket's objects.", operation.name());
+        return Ok(Err(TaskFailure::new(501, "NotImplemented", what)));
     }
-    let (method, tagging) = match operation {
-        Operation::PutTagging { .. } => (Method::PUT, Tagging::Put),
-        Operation::DeleteTagging => (Method::DELETE, Tagging::Delete),
+    // The request the task is, as policies see it.
+    let query = |subresource: &str| match version_id {
+        Some(v) => format!("{subresource}&versionId={}", percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)),
+        None => subresource.to_owned(),
     };
-    let mut query = "tagging".to_owned();
-    if let Some(v) = version_id {
-        query.push_str(&format!("&versionId={}", percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)));
-    }
-    if let Err(failure) = authorize(app, access, who, &method, bucket, key, &query).await? {
-        return Ok(Err(failure));
-    }
-    Ok(match tagging::set_tags(app, bucket, key, version_id.as_deref(), tags, tagging).await? {
-        Outcome::Tagged(_) => Ok(()),
-        Outcome::DeleteMarker(_) => {
-            Err(TaskFailure::new(405, "MethodNotAllowed", "The specified method is not allowed against this resource."))
+    let version_id = version_id.as_deref();
+    let change = match operation {
+        Operation::PutTagging { .. } | Operation::DeleteTagging => {
+            let (method, tagging) = match operation {
+                Operation::PutTagging { .. } => (Method::PUT, Tagging::Put),
+                _ => (Method::DELETE, Tagging::Delete),
+            };
+            if let Err(failure) = authorize(app, access, who, &method, bucket, key, &query("tagging")).await? {
+                return Ok(Err(failure));
+            }
+            return Ok(match tagging::set_tags(app, bucket, key, version_id, tags, tagging).await? {
+                Outcome::Tagged(_) => Ok(()),
+                Outcome::DeleteMarker(_) => Err(delete_marker()),
+                Outcome::NoSuchVersion => Err(no_such_version()),
+                Outcome::NoSuchKey => Err(no_such_key()),
+                Outcome::NoSuchBucket => Err(no_such_bucket()),
+                Outcome::Contended => Err(slow_down()),
+            });
         }
-        Outcome::NoSuchVersion => Err(TaskFailure::new(404, "NoSuchVersion", "The specified version does not exist.")),
-        Outcome::NoSuchKey => Err(TaskFailure::new(404, "NoSuchKey", "The specified key does not exist.")),
-        Outcome::NoSuchBucket => Err(TaskFailure::new(404, "NoSuchBucket", "The specified bucket does not exist")),
-        Outcome::Contended => Err(TaskFailure::new(503, "SlowDown", "Please reduce your request rate.")),
+        Operation::PutRetention { mode, until, bypass } => {
+            if let Err(failure) = authorize(app, access, who, &Method::PUT, bucket, key, &query("retention")).await? {
+                return Ok(Err(failure));
+            }
+            let retention = match (mode.as_deref().and_then(Mode::parse), until.as_deref().and_then(parse_date)) {
+                (Some(mode), Some(until)) => Some((mode, until)),
+                _ => None,
+            };
+            if retention.is_some_and(|(_, until)| until <= SystemTime::now()) {
+                return Ok(Err(TaskFailure::new(400, "InvalidArgument", crate::s3::object_lock::IN_THE_PAST)));
+            }
+            // As a request asking to bypass GOVERNANCE mode: only if the
+            // role may.
+            let check = actions::Check {
+                action: "s3:BypassGovernanceRetention",
+                on: actions::On::Object(bucket.clone(), key.clone()),
+            };
+            Change::Retention { retention, bypass: *bypass && access.allows(&check) }
+        }
+        Operation::PutLegalHold { on } => {
+            if let Err(failure) = authorize(app, access, who, &Method::PUT, bucket, key, &query("legal-hold")).await? {
+                return Ok(Err(failure));
+            }
+            Change::LegalHold(*on)
+        }
+    };
+    Ok(match crate::s3::object_lock::change_lock(app, bucket, key, version_id, change).await? {
+        LockOutcome::Set => Ok(()),
+        LockOutcome::Locked => Err(TaskFailure::new(403, "AccessDenied", crate::s3::object_lock::LOCKED_MESSAGE)),
+        LockOutcome::DeleteMarker(_) => Err(delete_marker()),
+        LockOutcome::NoSuchVersion => Err(no_such_version()),
+        LockOutcome::NoSuchKey => Err(no_such_key()),
+        LockOutcome::NoObjectLock => {
+            Err(TaskFailure::new(400, "InvalidRequest", "Bucket is missing Object Lock Configuration"))
+        }
+        LockOutcome::NoSuchBucket => Err(no_such_bucket()),
+        LockOutcome::Contended => Err(slow_down()),
     })
+}
+
+fn delete_marker() -> TaskFailure {
+    TaskFailure::new(405, "MethodNotAllowed", "The specified method is not allowed against this resource.")
+}
+
+fn no_such_version() -> TaskFailure {
+    TaskFailure::new(404, "NoSuchVersion", "The specified version does not exist.")
+}
+
+fn no_such_key() -> TaskFailure {
+    TaskFailure::new(404, "NoSuchKey", "The specified key does not exist.")
+}
+
+fn no_such_bucket() -> TaskFailure {
+    TaskFailure::new(404, "NoSuchBucket", "The specified bucket does not exist")
+}
+
+fn slow_down() -> TaskFailure {
+    TaskFailure::new(503, "SlowDown", "Please reduce your request rate.")
 }
 
 /// Whether `access` (of `who`, by its ARN) allows the request (`method` on
@@ -658,7 +743,7 @@ async fn authorize(
     crate::s3::abac::prepare(app, access, &operation, bucket, key, query, &headers).await?;
     Ok(match access.first_denied(&operation.checks) {
         None => Ok(()),
-        Some(_) if !exists => Err(TaskFailure::new(404, "NoSuchBucket", "The specified bucket does not exist")),
+        Some(_) if !exists => Err(no_such_bucket()),
         Some((check, _)) => Err(TaskFailure::new(
             403,
             "AccessDenied",

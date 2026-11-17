@@ -501,3 +501,119 @@ async fn a_cancelled_job_reports_what_it_did() {
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].1.lines().count(), 10);
 }
+
+/// Enables Object Lock on the test bucket (and versioning, which it needs).
+async fn lock_bucket(app: &App) {
+    use crate::s3::{buckets::versioning::put_bucket_versioning, object_lock::put_object_lock_configuration};
+    let versioning = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    let response =
+        put_bucket_versioning(app, BUCKET, Bytes::from(versioning), crate::mfa::Presented::Absent).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let lock = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled></ObjectLockConfiguration>";
+    assert_eq!(put_object_lock_configuration(app, BUCKET, Bytes::from(lock)).await.unwrap().status(), StatusCode::OK);
+}
+
+/// The current version of `key`'s lock: its mode, retain-until date (to the
+/// second) and legal hold.
+async fn lock_of(app: &App, key: &str) -> (Option<String>, Option<i64>, Option<bool>) {
+    let client = app.pool.get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT retain_mode, extract(epoch FROM retain_until)::bigint, legal_hold FROM objects
+             WHERE bucket = $1 AND key = $2 AND is_latest",
+            &[&BUCKET, &key],
+        )
+        .await
+        .unwrap();
+    (row.get(0), row.get(1), row.get(2))
+}
+
+/// S3PutObjectRetention's operation, retaining until `days` from now.
+fn retention(mode: &str, days: u64, bypass: bool) -> (String, i64) {
+    let until = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + days * 86_400;
+    let bypass = if bypass { "<BypassGovernanceRetention>true</BypassGovernanceRetention>" } else { "" };
+    let operation = format!(
+        "<S3PutObjectRetention>{bypass}<Retention><RetainUntilDate>{}</RetainUntilDate><Mode>{mode}</Mode></Retention>\
+         </S3PutObjectRetention>",
+        crate::sessions::iso(until)
+    );
+    (operation, until as i64)
+}
+
+/// Jobs set versions' retention and legal holds, as PutObjectRetention and
+/// PutObjectLegalHold would: a job done again does no harm, and shortening
+/// a GOVERNANCE retention needs the role to bypass it.
+#[tokio::test]
+async fn jobs_set_retention_and_legal_holds() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(
+        &app,
+        super::SERVICE,
+        r#"["s3:GetObject","s3:PutObject","s3:PutObjectRetention","s3:PutObjectLegalHold"]"#,
+    )
+    .await;
+    put(&app, "a", b"a".to_vec()).await;
+    let etag = manifest(&app, "manifest.csv", &format!("{BUCKET},a\n")).await;
+    // Each job two steps, later than the last's.
+    let run = |token: &'static str, operation: String, report: bool| {
+        let minute = 2 * token[1..].parse::<u32>().unwrap() + 1;
+        let app = app.clone();
+        let admin = &admin;
+        let etag = etag.clone();
+        let account = account.clone();
+        async move {
+            let mut request = create_request(token, &operation, "manifest.csv", &etag, false, &account);
+            if report {
+                request = with_report(&request, &self::report("FailedTasksOnly"));
+            }
+            let id = create(&app, admin, &request).await;
+            step(&app, minute).await;
+            step(&app, minute + 1).await;
+            let job = describe(&app, admin, &id).await;
+            assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+            (id, element(&job, "NumberOfTasksFailed").unwrap().to_owned())
+        }
+    };
+
+    // Without Object Lock on the bucket, as PutObjectRetention fails.
+    let (id, failed) = run("t0", retention("GOVERNANCE", 2, false).0, true).await;
+    assert_eq!(failed, "1");
+    let (_, files) = report_of(&app, &id).await;
+    assert!(files[0].1.contains(",failed,400,InvalidRequest,Bucket is missing Object Lock Configuration"), "{files:?}");
+
+    lock_bucket(&app).await;
+    let (operation, until) = retention("GOVERNANCE", 2, false);
+    assert_eq!(run("t1", operation.clone(), false).await.1, "0");
+    assert_eq!(lock_of(&app, "a").await, (Some("GOVERNANCE".to_owned()), Some(until), None));
+    // Again, as a page done again after its node died would be.
+    assert_eq!(run("t2", operation, false).await.1, "0");
+
+    // Shortening it: refused, unless the job asks to bypass GOVERNANCE mode
+    // and the role may.
+    let (shorter, _) = retention("GOVERNANCE", 1, true);
+    let (id, failed) = run("t3", shorter.clone(), true).await;
+    assert_eq!(failed, "1");
+    let (_, files) = report_of(&app, &id).await;
+    assert!(files[0].1.contains(",failed,403,AccessDenied,"), "{files:?}");
+    assert_eq!(lock_of(&app, "a").await.1, Some(until));
+    let client = app.pool.get().await.unwrap();
+    let role = roles::Role::load(&client, &account, ROLE).await.unwrap().unwrap();
+    let bypass = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:BypassGovernanceRetention","Resource":"arn:aws:s3:::{BUCKET}/*"}}]}}"#
+    );
+    roles::put_policy(&client, &role, "bypass", &bypass).await.unwrap();
+    let (shorter, until) = retention("GOVERNANCE", 1, true);
+    assert_eq!(run("t4", shorter, false).await.1, "0");
+    assert_eq!(lock_of(&app, "a").await.1, Some(until));
+
+    // Legal holds.
+    let hold = |status: &str| {
+        format!("<S3PutObjectLegalHold><LegalHold><Status>{status}</Status></LegalHold></S3PutObjectLegalHold>")
+    };
+    assert_eq!(run("t5", hold("ON"), false).await.1, "0");
+    assert_eq!(lock_of(&app, "a").await.2, Some(true));
+    assert_eq!(run("t6", hold("OFF"), false).await.1, "0");
+    assert_eq!(lock_of(&app, "a").await.2, Some(false));
+}

@@ -69,9 +69,9 @@ Done:
 - **Inventory and Batch Operations.** S3 Inventory: daily or weekly reports
   of a bucket's objects, as S3 writes them (CSV or Parquet; not ORC),
   paced by the rate lifecycle sweeps go at, which they share. Implemented. Batch
-  Operations: jobs that tag objects (or remove their tags) from CSV
-  manifests, as a role, at that rate too, with completion reports.
-  Implemented. Next: Object Lock retention and legal holds, inventory
+  Operations: jobs that tag objects (or remove their tags) and set their
+  Object Lock retention and legal holds, from CSV manifests, as a role, at
+  that rate too, with completion reports. Implemented. Next: inventory
   reports as manifests, then copies (once a copy done twice, when a node dies mid-page,
   makes no second version).
 - **Lifecycle transitions.** Moving objects between storage classes by

@@ -59,7 +59,7 @@ supported.
 | Event notifications, to SNS topics | 🟡 | Over HTTP(S) subscriptions: [Event notifications](#event-notifications) |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
 | Server access logging | 🟡 | [Server access logging](#server-access-logging) |
-| Batch Operations | 🟡 | Tagging, from CSV manifests, with completion reports: [Batch Operations](#batch-operations) |
+| Batch Operations | 🟡 | Tagging and Object Lock, from CSV manifests: [Batch Operations](#batch-operations) |
 
 ### Security
 
@@ -209,8 +209,11 @@ once it's been configured.
 
 ### Batch Operations
 
-- **Operations.** `S3PutObjectTagging` and `S3DeleteObjectTagging` only;
-  a job of another operation is refused with `501 NotImplemented`.
+- **Operations.** `S3PutObjectTagging`, `S3DeleteObjectTagging`,
+  `S3PutObjectRetention` and `S3PutObjectLegalHold` only; a job of another
+  operation is refused with `501 NotImplemented`, as is a retention with an
+  event hold (Cairn has none). A retention's date must be in the future
+  when the job is created, and is checked again by each task.
 - **Manifests.** CSV manifests (`S3BatchOperations_CSV_20180820`) only;
   inventory reports' (`S3InventoryReport_CSV_20161130`) and manifest
   generators are refused with `501 NotImplemented`. A manifest's lines must
