@@ -633,6 +633,17 @@ async fn handle_request(
     if let Some(refused) = util::unexpected_owner(req.headers(), &account) {
         return Ok(box_response(refused));
     }
+    // The root's code, which MFA delete wants of what deletes versions or
+    // changes versioning (see `mfa`). Directory buckets have neither.
+    let mfa = match operation.name {
+        "PutBucketVersioning" | "DeleteObject" | "DeleteObjects" if !is_directory => {
+            match crate::mfa::presented(&app, principal.as_ref(), req.headers()).await? {
+                Ok(mfa) => mfa,
+                Err(refused) => return Ok(box_response(refused)),
+            }
+        }
+        _ => crate::mfa::Presented::Absent,
+    };
     // A key (or version) that isn't there is a 403 to whom may not list the
     // bucket, as in S3 (probed), so that keys can't be found by guessing.
     let hides_missing = |status: StatusCode| {
@@ -811,7 +822,7 @@ async fn handle_request(
             // <VersioningConfiguration> body.
             hyper::Method::PUT if operation.name == "PutBucketVersioning" => {
                 match read_body(req, &secret, true).await? {
-                    Ok(body) => put_bucket_versioning(&app, &bucket, body).await?,
+                    Ok(body) => put_bucket_versioning(&app, &bucket, body, mfa).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }
@@ -957,7 +968,7 @@ async fn handle_request(
                             access.allows(&actions::Check { action: actions::delete(version), on })
                         };
                         let bypass = |key: &str| asks_to_bypass && access.allows(&bypass_check(&bucket, key));
-                        delete_objects(&app, &bucket, body, &allowed, &bypass).await?
+                        delete_objects(&app, &bucket, body, &allowed, &bypass, mfa).await?
                     }
                     Err(rejection) => util::rejection_response(&rejection),
                 }
@@ -1315,7 +1326,7 @@ async fn handle_request(
                 return Ok(box_response(refused));
             }
             let if_match = req.headers().get(hyper::header::IF_MATCH).map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned());
-            delete_object(&app, &bucket, &key, version_id.as_deref(), bypass, if_match.as_deref()).await?
+            delete_object(&app, &bucket, &key, version_id.as_deref(), bypass, if_match.as_deref(), mfa).await?
         }
         // CreateMultipartUpload
         hyper::Method::POST if query_param(&query, "uploads").is_some() => {

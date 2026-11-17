@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "7";
+pub(crate) const PROTOCOL: &str = "8";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -240,6 +240,7 @@ const MIGRATIONS: &[&str] = &[
     BUCKET_LOGGING,
     ROOT_SESSIONS,
     ACCESS_GRANTS,
+    MFA_DELETE,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -2839,6 +2840,39 @@ CREATE TABLE access_grants (
 );
 CREATE INDEX access_grants_location ON access_grants (account_id, location_id);
 CREATE TRIGGER access_grants_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON access_grants
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 60: MFA delete (see `mfa`): whether a bucket has it (NULL if
+/// it was never configured, which GetBucketVersioning tells apart, as S3
+/// does), and the account's root user's virtual MFA device, whose codes it
+/// takes, which `cairn account root-mfa` makes. A bucket with MFA delete
+/// has no lifecycle configuration, as S3 supports none on one; the check
+/// keeps lifecycle's expirations from ever deleting its versions.
+///
+/// The protocol goes to 8, so that no older node deletes a version, or
+/// changes versioning, without the code MFA delete wants.
+const MFA_DELETE: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '8' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE buckets
+    ADD COLUMN mfa_delete boolean,
+    ADD CONSTRAINT buckets_mfa_delete_lifecycle CHECK (mfa_delete IS NOT TRUE OR lifecycle IS NULL);
+
+CREATE TABLE root_mfa_devices (
+    account_id text PRIMARY KEY REFERENCES accounts (id) ON DELETE CASCADE,
+    secret     bytea NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER root_mfa_devices_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON root_mfa_devices
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

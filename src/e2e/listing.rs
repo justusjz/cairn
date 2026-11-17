@@ -290,7 +290,7 @@ async fn a_version_marker_may_be_gone() {
     let delete_version = |v: String| {
         let app = app.clone();
         async move {
-            let response = delete_object(&app, BUCKET, "k", Some(&v), false, None).await.unwrap();
+            let response = delete_object(&app, BUCKET, "k", Some(&v), false, None, crate::mfa::Presented::Absent).await.unwrap();
             assert_eq!(response.status(), StatusCode::NO_CONTENT);
         }
     };

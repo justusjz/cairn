@@ -55,7 +55,7 @@ async fn configure(app: &App, rules: &str) {
 
 async fn enable_versioning(app: &App) {
     let body = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
-    let response = put_bucket_versioning(app, BUCKET, Bytes::from(body)).await.unwrap();
+    let response = put_bucket_versioning(app, BUCKET, Bytes::from(body), crate::mfa::Presented::Absent).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
 

@@ -3,7 +3,8 @@
 //! (paths, permissions boundaries). `cairn account root-link` and
 //! `root-key` make its root user, for a while: a link to sign in to the
 //! console, or temporary credentials. They're the only ways to be the root,
-//! and the way out of policies that lock everyone else out.
+//! and the way out of policies that lock everyone else out. `root-mfa`
+//! makes its virtual MFA device, whose codes MFA delete wants (see `mfa`).
 
 use std::sync::Arc;
 
@@ -25,6 +26,8 @@ pub struct AccountArgs {
 }
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
+// The commands' names, which are the root's things.
+#[allow(clippy::enum_variant_names)]
 enum AccountCommand {
     /// Print a one-time link (valid 15 minutes) to sign in to the console
     /// as the account's root user, whom no identity policy restricts (only
@@ -37,6 +40,20 @@ enum AccountCommand {
     /// identity policy restricts (only buckets' policies' denies, but not
     /// of the policies themselves). `cairn sessions revoke-all` ends them.
     RootKey,
+    /// Make the account's root user's virtual MFA device, and print its
+    /// serial number and secret (as an `otpauth://` URI, for an
+    /// authenticator app). Its codes, with the root's credentials (`cairn
+    /// account root-key`), enable MFA delete on a bucket, and then delete
+    /// its versions and change its versioning (in `x-amz-mfa`, over HTTPS).
+    /// The device is no way in: it's only ever asked for with the root's
+    /// credentials.
+    RootMfa {
+        /// Replace the device the root has: the old one's codes stop
+        /// working. (Losing it, there's no other way to MFA delete's
+        /// buckets.)
+        #[arg(long)]
+        replace: bool,
+    },
 }
 
 /// How long the root user's temporary credentials work, as AWS's
@@ -77,6 +94,26 @@ pub async fn run(app: &Arc<App>, args: AccountArgs, out: &mut Output) -> anyhow:
             outln!(out, "export AWS_ACCESS_KEY_ID={}", session.key_id);
             outln!(out, "export AWS_SECRET_ACCESS_KEY={}", session.secret);
             outln!(out, "export AWS_SESSION_TOKEN={token}");
+        }
+        AccountCommand::RootMfa { replace } => {
+            let account = crate::users::account(&client).await?;
+            let Some(secret) = crate::mfa::make_device(&client, &account, replace).await? else {
+                anyhow::bail!(
+                    "the root user of account {account} has an MFA device already; \
+                     `cairn account root-mfa --replace` makes a new one, and the old one's codes stop working"
+                );
+            };
+            eprintln!(
+                "cairn account root-mfa: {} an MFA device for the root user of account {account}",
+                if replace { "made (or replaced)" } else { "made" }
+            );
+            out.warn("add the device to an authenticator app now: its secret isn't shown again");
+            let serial = crate::mfa::serial(&account);
+            outln!(out, "# the root user of account {account}'s virtual MFA device, for MFA delete");
+            outln!(out, "# x-amz-mfa (aws --mfa): \"{serial} <code>\", with `cairn account root-key`'s credentials");
+            outln!(out, "serial: {serial}");
+            outln!(out, "secret: {}", crate::mfa::base32(&secret));
+            outln!(out, "{}", crate::mfa::uri(&account, &secret));
         }
         AccountCommand::RootLink => {
             let account = crate::users::account(&client).await?;

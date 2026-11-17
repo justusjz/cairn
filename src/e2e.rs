@@ -37,6 +37,7 @@ mod listing;
 mod locking;
 mod logging;
 mod metadata;
+mod mfa_delete;
 mod multipart;
 mod object_lock;
 mod post_object;
@@ -374,7 +375,7 @@ pub async fn get_sealed(
 }
 
 pub async fn delete(app: &Arc<App>, key: &str) {
-    let response = objects::delete::delete_object(app, BUCKET, key, None, false, None)
+    let response = objects::delete::delete_object(app, BUCKET, key, None, false, None, crate::mfa::Presented::Absent)
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::NO_CONTENT);

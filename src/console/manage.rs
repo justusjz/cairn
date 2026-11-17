@@ -1767,7 +1767,7 @@ async fn delete_object(
 ) -> Result<StatusCode> {
     let action = crate::s3::actions::delete(params.version.is_some());
     actor.check(&app, action, On::Object(bucket.clone(), params.key.clone())).await?;
-    let resp = crate::s3::objects::delete::delete_object(&app, &bucket, &params.key, params.version.as_deref(), false, None).await?;
+    let resp = crate::s3::objects::delete::delete_object(&app, &bucket, &params.key, params.version.as_deref(), false, None, crate::mfa::Presented::Absent).await?;
     match resp.status() {
         StatusCode::NO_CONTENT | StatusCode::OK => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),
@@ -1798,7 +1798,7 @@ async fn set_versioning(
     }
     actor.check(&app, "s3:PutBucketVersioning", On::Bucket(bucket.clone())).await?;
     let xml = format!("<VersioningConfiguration><Status>{}</Status></VersioningConfiguration>", body.status);
-    let resp = crate::s3::buckets::versioning::put_bucket_versioning(&app, &bucket, xml.into()).await?;
+    let resp = crate::s3::buckets::versioning::put_bucket_versioning(&app, &bucket, xml.into(), crate::mfa::Presented::Absent).await?;
     match resp.status() {
         StatusCode::OK => Ok(StatusCode::NO_CONTENT),
         _ => Err(s3_error(resp).await),
@@ -4217,9 +4217,11 @@ async fn put_bucket_lifecycle(
 ) -> Result<StatusCode> {
     actor.check(&app, "s3:PutLifecycleConfiguration", On::Bucket(bucket.clone())).await?;
     let configuration = body.check().map_err(ApiError::BadRequest)?;
+    use crate::s3::buckets::lifecycle::Set;
     match crate::s3::buckets::lifecycle::set(&app, &bucket, Some(&configuration.to_json())).await? {
-        true => Ok(StatusCode::NO_CONTENT),
-        false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+        Set::Done => Ok(StatusCode::NO_CONTENT),
+        Set::NoSuchBucket => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+        Set::MfaDelete => Err(ApiError::Conflict("a bucket with MFA delete enabled can't have lifecycle rules".into())),
     }
 }
 
@@ -4237,8 +4239,10 @@ async fn delete_bucket_lifecycle(
 ) -> Result<StatusCode> {
     // DeleteBucketLifecycle is authorized as its put, in S3.
     actor.check(&app, "s3:PutLifecycleConfiguration", On::Bucket(bucket.clone())).await?;
+    use crate::s3::buckets::lifecycle::Set;
     match crate::s3::buckets::lifecycle::set(&app, &bucket, None).await? {
-        true => Ok(StatusCode::NO_CONTENT),
-        false => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+        Set::Done => Ok(StatusCode::NO_CONTENT),
+        Set::NoSuchBucket => Err(ApiError::NotFound(format!("no bucket named {bucket:?}"))),
+        Set::MfaDelete => unreachable!("removing a configuration is never refused"),
     }
 }

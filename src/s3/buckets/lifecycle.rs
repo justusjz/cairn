@@ -62,8 +62,9 @@ pub async fn put_bucket_lifecycle(app: &App, bucket: &str, body: Bytes) -> anyho
         }
     };
     Ok(match set(app, bucket, Some(&config.to_json())).await? {
-        true => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
-        false => no_such_bucket(),
+        Set::Done => Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap(),
+        Set::NoSuchBucket => no_such_bucket(),
+        Set::MfaDelete => mfa_delete(),
     })
 }
 
@@ -71,20 +72,48 @@ pub async fn put_bucket_lifecycle(app: &App, bucket: &str, body: Bytes) -> anyho
 /// then on; a run in progress stops before its next expiration.
 pub async fn delete_bucket_lifecycle(app: &App, bucket: &str) -> anyhow::Result<Response<Full<Bytes>>> {
     Ok(match set(app, bucket, None).await? {
-        true => Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap(),
-        false => no_such_bucket(),
+        Set::Done => Response::builder().status(StatusCode::NO_CONTENT).body(Full::new(Bytes::new())).unwrap(),
+        Set::NoSuchBucket => no_such_bucket(),
+        Set::MfaDelete => unreachable!("removing a configuration is never refused"),
     })
 }
 
-/// Sets the bucket's configuration (`cairn_set_lifecycle`). Whether it exists.
-pub(crate) async fn set(app: &App, bucket: &str, config: Option<&str>) -> anyhow::Result<bool> {
-    Ok(app
+/// What setting a bucket's configuration came to.
+pub(crate) enum Set {
+    Done,
+    NoSuchBucket,
+    /// The bucket has MFA delete, which S3 supports no lifecycle
+    /// configuration on (see `mfa`; migration 60's check).
+    MfaDelete,
+}
+
+/// The constraint that keeps a bucket with MFA delete without a lifecycle
+/// configuration (migration 60).
+const MFA_DELETE_CHECK: &str = "buckets_mfa_delete_lifecycle";
+
+/// Sets the bucket's configuration (`cairn_set_lifecycle`), or removes it.
+pub(crate) async fn set(app: &App, bucket: &str, config: Option<&str>) -> anyhow::Result<Set> {
+    let set = app
         .pool
         .get()
         .await?
         .query_one_cached("SELECT pg_temp.cairn_set_lifecycle($1, $2)", &[&bucket, &config])
-        .await?
-        .get(0))
+        .await;
+    match set {
+        Ok(row) => Ok(if row.get(0) { Set::Done } else { Set::NoSuchBucket }),
+        Err(e) if e.as_db_error().and_then(|e| e.constraint()) == Some(MFA_DELETE_CHECK) => Ok(Set::MfaDelete),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// S3 supports no lifecycle configuration on a bucket with MFA delete (as
+/// its docs say; how it refuses one is unprobed).
+pub(crate) fn mfa_delete() -> Response<Full<Bytes>> {
+    format_s3_error(
+        StatusCode::CONFLICT,
+        "InvalidBucketState",
+        "Lifecycle configuration is not supported on a bucket with MFA delete enabled.",
+    )
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {

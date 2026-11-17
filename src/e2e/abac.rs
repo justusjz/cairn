@@ -234,7 +234,7 @@ async fn object_tags_decide() {
     let Some(app) = node().await else { return };
     let bucket = bucket(&app, "abac-obj").await;
     let versioning = Bytes::from_static(b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>");
-    put_bucket_versioning(&app, &bucket, versioning).await.unwrap();
+    put_bucket_versioning(&app, &bucket, versioning, crate::mfa::Presented::Absent).await.unwrap();
     let existing = user(
         &app,
         "eot",

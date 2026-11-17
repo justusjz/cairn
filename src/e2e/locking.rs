@@ -499,7 +499,7 @@ async fn a_copy_keeps_its_source_blob_from_a_delete() {
     assert_eq!(copy_object(&tx, &src, "dst").await, "committed");
 
     let app2 = app.clone();
-    let deleting = tokio::spawn(async move { delete_object(&app2, BUCKET, "src", None, false, None).await.unwrap() });
+    let deleting = tokio::spawn(async move { delete_object(&app2, BUCKET, "src", None, false, None, crate::mfa::Presented::Absent).await.unwrap() });
     assert_waits(&deleting).await;
     tx.commit().await.unwrap();
     assert_eq!(deleting.await.unwrap().status(), StatusCode::NO_CONTENT);

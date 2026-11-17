@@ -457,7 +457,22 @@ As in AWS:
 - it's no user: IAM's actions on the signer's own user (CreateAccessKey or
   ListAccessKeys without `UserName`, say) must name one, and STS makes no
   sessions of it (GetSessionToken, GetFederationToken, AssumeRole), nor S3
-  Express of its directory buckets.
+  Express of its directory buckets;
+- only it can enable **MFA delete** on a bucket, with a code of its virtual
+  MFA device, which `cairn account root-mfa` makes (and prints, for an
+  authenticator app). Then deleting a version, or changing the bucket's
+  versioning, takes the root's credentials and a code, over HTTPS; and the
+  bucket can't have a lifecycle configuration. The device is a second
+  factor, not a way in: it's only asked for with the root's credentials.
+
+```sh
+cairn account root-mfa             # once: add it to an authenticator app
+eval "$(cairn account root-key)"
+SERIAL=arn:aws:iam::<account>:mfa/root-account-mfa-device
+aws s3api put-bucket-versioning --bucket my-bucket \
+  --versioning-configuration Status=Enabled,MFADelete=Enabled --mfa "$SERIAL 123456"
+aws s3api delete-object --bucket my-bucket --key k --version-id <version> --mfa "$SERIAL 654321"
+```
 
 So the root is how to undo whatever policies lock: an admin's
 `AdministratorAccess` taken away, a boundary or a group's deny that keeps
@@ -574,6 +589,7 @@ user](#users-and-permissions) is the way back in:
 | `cairn user create <name> [--admin] [--key [--id <ID>] [--secret <S>]]` | Create a person: a user without access keys, and print a link (valid 24 hours) for it to sign in to the [console](#console) with: made from the console URL of the node the command runs on; one that serves no console prints the link's path. With `--key` (or `--id`, `--secret`), a service instead: a user with an access key of a random 20-char ID (or `--id`), whose ID is printed, with a generated 40-char secret unless `--secret` is given (min. 8 chars). `cairn role create` does the same. |
 | `cairn account root-link` | Print a one-time link (15 minutes) to sign in to the console as the account's root user. |
 | `cairn account root-key` | Print temporary credentials (15 minutes) of the account's root user, as shell `export`s. |
+| `cairn account root-mfa [--replace]` | Make the account's root user's virtual MFA device, for MFA delete, and print its serial number and secret (as an `otpauth://` URI). `--replace` makes a new one; the old one's codes stop working. |
 | `cairn sessions revoke-all` | End every temporary credential issued so far (AssumeRole's, GetSessionToken's, root keys, ...). |
 
 **The IAM API** is on the S3 endpoint too: requests signed for the `iam`
