@@ -28,7 +28,7 @@ supported.
 | Streaming uploads (aws-chunked, signed and unsigned, with trailing checksums) | ✅ | |
 | Anonymous requests | ✅ | Allowed by bucket policies. |
 | Temporary credentials (STS) | ✅ | [STS](#sts) |
-| SigV2 (header, presigned URLs) | ✅ | Not for POST forms. |
+| SigV2 (header, presigned URLs, browser POST forms) | ✅ | |
 | SigV4A | ❌ | |
 | Dual-stack, FIPS, Transfer Acceleration and access-point endpoints | ❌ | |
 

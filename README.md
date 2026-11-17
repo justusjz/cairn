@@ -724,16 +724,18 @@ them.
 (`aws s3 presign`, boto3's `generate_presigned_url` without a
 `signature_version`). It signs neither the host nor the body (but for a
 `Content-MD5`) nor any query parameter but a subresource's, so prefer SigV4
-where a client lets you choose. A SigV2 URL may expire at most a week ahead,
-as a SigV4 one may (S3 sets it no limit), and a header-signed request must
-be within the same 15 minutes of its `Date` or `x-amz-date`. Policies tell
-it apart by `s3:signatureversion`, `AWS` (SigV4's is `AWS4-HMAC-SHA256`),
-and can deny it everywhere with a `StringNotEquals` on that key. POST forms
-signed with SigV2 are refused.
+where a client lets you choose. A SigV2 URL is valid until its `Expires`,
+however far away, as in S3 (a SigV4 one for at most a week), and a
+header-signed request must be within the same 15 minutes of its `Date` or
+`x-amz-date`. POST forms may be signed with SigV2 too (`AWSAccessKeyId`,
+`signature`, as boto3's `generate_presigned_post` makes them by default).
+Policies tell it apart by `s3:signatureversion`, `AWS` (SigV4's is
+`AWS4-HMAC-SHA256`), and can deny it everywhere with a `StringNotEquals` on
+that key.
 
 **POST Object** (browser-based uploads) works as in S3: a `multipart/form-data`
 form posted to a bucket, with a POST policy signed with a user's credentials
-(SigV4, as boto3's `generate_presigned_post` makes them), uploads its file as
+(SigV4, or SigV2, as boto3's `generate_presigned_post` makes them), uploads its file as
 that user, if the policy allows the form (and the user may make that
 PutObject): until its expiration, with a key
 under a prefix, say, or of a size in `content-length-range`. A file over the

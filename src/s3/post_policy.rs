@@ -31,6 +31,8 @@ pub fn field<'a>(fields: &'a Fields, name: &str) -> Option<&'a str> {
 
 /// The fields that need no condition, as in S3.
 const EXEMPT: [&str; 3] = ["x-amz-signature", "file", "policy"];
+/// Nor, in a form signed with SigV2, do its signature's.
+const EXEMPT_SIGV2: [&str; 2] = ["awsaccesskeyid", "signature"];
 /// Nor do fields with this prefix.
 const IGNORED_PREFIX: &str = "x-ignore-";
 /// Nor, as in MinIO, do SSE-C's (see the module's documentation).
@@ -126,9 +128,9 @@ impl Policy {
     }
 
     /// Whether a form of `fields`, posted to `bucket` at `now` (Unix
-    /// seconds), is one the policy allows. The file's size is checked as it
-    /// arrives (`length_range`).
-    pub fn check(&self, fields: &Fields, bucket: &str, now: i64) -> Result<(), Rejection> {
+    /// seconds), is one the policy allows; `sigv2` if the form is signed with
+    /// SigV2. The file's size is checked as it arrives (`length_range`).
+    pub fn check(&self, fields: &Fields, bucket: &str, now: i64, sigv2: bool) -> Result<(), Rejection> {
         if now >= self.expiration {
             return Err(refused("Policy expired."));
         }
@@ -159,6 +161,7 @@ impl Policy {
             .iter()
             .map(|(name, _)| name.as_str())
             .filter(|name| !EXEMPT.contains(name) && !SSE_C.contains(name) && !name.starts_with(IGNORED_PREFIX))
+            .filter(|name| !(sigv2 && EXEMPT_SIGV2.contains(name)))
             .filter(|name| {
                 !self.conditions.iter().any(|c| matches!(c, Condition::Eq(n, _) | Condition::StartsWith(n, _) if n == name))
             })
@@ -308,33 +311,33 @@ mod tests {
     #[test]
     fn expires() {
         let p = policy("");
-        assert_eq!(code(p.check(&vec![], "b", NOW)), None);
-        assert_eq!(code(p.check(&vec![], "b", NOW + 1)).unwrap(), "AccessDenied Invalid according to Policy: Policy expired.");
+        assert_eq!(code(p.check(&vec![], "b", NOW, false)), None);
+        assert_eq!(code(p.check(&vec![], "b", NOW + 1, false)).unwrap(), "AccessDenied Invalid according to Policy: Policy expired.");
     }
 
     #[test]
     fn checks_conditions() {
         let p = policy(r#"{"bucket": "b", "Key": "a/b"}, ["EQ", "$X-Amz-Meta-Tag", "v"], ["starts-with", "$acl", ""]"#);
         let good = fields(&[("key", "a/b"), ("x-amz-meta-tag", "v"), ("acl", "private")]);
-        assert_eq!(code(p.check(&good, "b", NOW)), None);
+        assert_eq!(code(p.check(&good, "b", NOW, false)), None);
         assert_eq!(
-            code(p.check(&good, "c", NOW)).unwrap(),
+            code(p.check(&good, "c", NOW, false)).unwrap(),
             r#"AccessDenied Invalid according to Policy: Policy Condition failed: ["eq","$bucket","b"]"#
         );
         // Values are case-sensitive; a missing field is "".
         let upper = fields(&[("key", "A/b"), ("x-amz-meta-tag", "v"), ("acl", "private")]);
-        assert!(code(p.check(&upper, "b", NOW)).unwrap().contains(r#"["eq","$key","a/b"]"#));
+        assert!(code(p.check(&upper, "b", NOW, false)).unwrap().contains(r#"["eq","$key","a/b"]"#));
         let missing = fields(&[("key", "a/b"), ("acl", "private")]);
-        assert!(code(p.check(&missing, "b", NOW)).unwrap().contains("$x-amz-meta-tag"));
+        assert!(code(p.check(&missing, "b", NOW, false)).unwrap().contains("$x-amz-meta-tag"));
         // starts-with "" holds for a missing field too.
         let no_acl = fields(&[("key", "a/b"), ("x-amz-meta-tag", "v")]);
-        assert_eq!(code(p.check(&no_acl, "b", NOW)), None);
+        assert_eq!(code(p.check(&no_acl, "b", NOW, false)), None);
     }
 
     #[test]
     fn starts_with() {
         let p = policy(r#"["starts-with", "$key", "user/"], ["starts-with", "$Content-Type", "image/"]"#);
-        let check = |key: &str, ct: &str| code(p.check(&fields(&[("key", key), ("content-type", ct)]), "b", NOW));
+        let check = |key: &str, ct: &str| code(p.check(&fields(&[("key", key), ("content-type", ct)]), "b", NOW, false));
         assert_eq!(check("user/x", "image/png"), None);
         assert!(check("users/x", "image/png").is_some());
         assert!(check("user/x", "text/plain").is_some());
@@ -343,7 +346,7 @@ mod tests {
         assert!(check("user/x", "image/jpg,text/plain").is_some());
         // Any other field is a plain value.
         let p = policy(r#"["starts-with", "$key", "a"]"#);
-        assert_eq!(code(p.check(&fields(&[("key", "ab,c")]), "b", NOW)), None);
+        assert_eq!(code(p.check(&fields(&[("key", "ab,c")]), "b", NOW, false)), None);
     }
 
     #[test]
@@ -358,17 +361,21 @@ mod tests {
             ("x-amz-server-side-encryption-customer-key", "..."),
             ("x-amz-server-side-encryption-customer-key-md5", "..."),
         ]);
-        assert_eq!(code(p.check(&form, "b", NOW)), None);
+        assert_eq!(code(p.check(&form, "b", NOW, false)), None);
         form.push(("x-amz-date".into(), "d".into()));
         form.push(("x-amz-server-side-encryption-aws-kms-key-id".into(), "k".into()));
         assert_eq!(
-            code(p.check(&form, "b", NOW)).unwrap(),
+            code(p.check(&form, "b", NOW, false)).unwrap(),
             "AccessDenied Invalid according to Policy: Extra input fields: x-amz-date, \
              x-amz-server-side-encryption-aws-kms-key-id"
         );
+        // A SigV2 form's signature fields are exempt, a SigV4 form's aren't.
+        let v2 = fields(&[("key", "k"), ("policy", "..."), ("awsaccesskeyid", "a"), ("signature", "s")]);
+        assert_eq!(code(p.check(&v2, "b", NOW, true)), None);
+        assert!(code(p.check(&v2, "b", NOW, false)).unwrap().contains("awsaccesskeyid, signature"));
         // A condition on an exempt field is checked all the same.
         let p = policy(r#"{"key": "k"}, {"x-amz-server-side-encryption-customer-key-md5": "m"}"#);
-        assert!(code(p.check(&fields(&[("key", "k")]), "b", NOW)).is_some());
+        assert!(code(p.check(&fields(&[("key", "k")]), "b", NOW, false)).is_some());
     }
 
     #[test]
@@ -400,7 +407,7 @@ mod tests {
             ("x-amz-signature", "8afdbf4008c03f22c2cd3cdb72e4afbb1f6a588f3255ac628749a66d7f09699e"),
         ]);
         let at = parse_time("2015-12-29T00:00:00Z").unwrap();
-        assert_eq!(code(p.check(&form, "sigv4examplebucket", at)), None);
-        assert!(code(p.check(&form, "sigv4examplebucket", parse_time("2015-12-30T12:00:00Z").unwrap())).is_some());
+        assert_eq!(code(p.check(&form, "sigv4examplebucket", at, false)), None);
+        assert!(code(p.check(&form, "sigv4examplebucket", parse_time("2015-12-30T12:00:00Z").unwrap(), false)).is_some());
     }
 }

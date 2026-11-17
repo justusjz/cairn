@@ -1,7 +1,7 @@
 //! POST Object: an upload in a `multipart/form-data` form, posted to its
 //! bucket, as S3 takes it. The form is signed instead of the request: its
 //! `policy` field (see `post_policy`) says what it may hold, and is signed
-//! with SigV4 by the role it's uploaded as (see `auth::PostSignature`), so
+//! with SigV4 (or SigV2) by the role it's uploaded as (see `auth::PostSignature`), so
 //! one server can let another upload under conditions (a size range, a key
 //! prefix, the encryption to use) without giving it a key. A form without
 //! any signature (and so without a policy) is anonymous, as in S3: only a
@@ -321,7 +321,7 @@ where
                 Err(rejection) => return Ok(rejection_response(&rejection)),
             };
             let now = SystemTime::now().duration_since(UNIX_EPOCH).expect("clock after 1970").as_secs() as i64;
-            if let Err(rejection) = policy.check(&fields, &bucket, now) {
+            if let Err(rejection) = policy.check(&fields, &bucket, now, signature.sigv2) {
                 return Ok(rejection_response(&rejection));
             }
             Some((signature, principal, policy))
@@ -447,7 +447,7 @@ where
     Ok(respond(response, &fields, &bucket, &key, location))
 }
 
-/// The fields that sign a form (SigV4's, and SigV2's, which Cairn refuses):
+/// The fields that sign a form (SigV4's, and SigV2's):
 /// a form with none of them is anonymous.
 const SIGNING_FIELDS: [&str; 7] =
     ["policy", "x-amz-signature", "x-amz-credential", "x-amz-algorithm", "x-amz-date", "awsaccesskeyid", "signature"];

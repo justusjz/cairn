@@ -750,7 +750,8 @@ fn verify_presigned_at(
 
 /// The signature of a POST Object form (see `s3::objects::post`): its policy
 /// signed with SigV4, in the fields `x-amz-algorithm`, `x-amz-credential`,
-/// `x-amz-date` and `x-amz-signature`.
+/// `x-amz-date` and `x-amz-signature`; or with SigV2, in `AWSAccessKeyId` and
+/// `signature` (base64 HMAC-SHA1 of the policy, as sent).
 #[derive(Debug)]
 pub struct PostSignature {
     pub access_key: String,
@@ -762,6 +763,9 @@ pub struct PostSignature {
     signature: String,
     /// The session token of temporary credentials (`x-amz-security-token`).
     pub token: Option<String>,
+    /// Signed with SigV2 (no scope: `date`, `region` and `service` are
+    /// empty).
+    pub sigv2: bool,
 }
 
 impl PostSignature {
@@ -772,22 +776,51 @@ impl PostSignature {
         Signed {
             access_key: self.access_key.clone(),
             service: "s3".to_owned(),
-            region: self.region.clone(),
+            region: match self.sigv2 {
+                true => crate::s3::buckets::head::REGION.to_owned(),
+                false => self.region.clone(),
+            },
             presigned: false,
             date: None,
             token: self.token.clone(),
             directory_token: None,
-            sigv2: false,
+            sigv2: self.sigv2,
         }
     }
 
     /// The signature a form's fields (`field` by lowercase name) carry, or
     /// why they don't carry one. Its time has to be its credential's day; the
     /// policy's expiration bounds how long it's valid, not the clock skew.
+    /// SigV2's, if it has no `x-amz-algorithm`, but an `AWSAccessKeyId` or a
+    /// `signature`.
     pub fn from_fields<'a>(field: impl Fn(&str) -> Option<&'a str>) -> Result<PostSignature, Rejection> {
         let parameters_error = |message: &str| {
             Rejection::new(StatusCode::BAD_REQUEST, "AuthorizationQueryParametersError", message)
         };
+        if field("x-amz-algorithm").is_none()
+            && (field("awsaccesskeyid").is_some() || field("signature").is_some())
+        {
+            let (Some(policy), Some(signature)) = (field("policy"), field("signature")) else {
+                return Err(Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", "the form is not signed"));
+            };
+            let access_key = field("awsaccesskeyid").filter(|key| !key.is_empty()).ok_or_else(|| {
+                Rejection::new(
+                    StatusCode::BAD_REQUEST,
+                    "InvalidArgument",
+                    "Bucket POST must contain a field named 'AWSAccessKeyId'.  If it is specified, please check the order of the fields.",
+                )
+            })?;
+            return Ok(PostSignature {
+                access_key: access_key.to_owned(),
+                date: String::new(),
+                region: String::new(),
+                service: String::new(),
+                policy: policy.to_owned(),
+                signature: signature.to_owned(),
+                token: field("x-amz-security-token").map(str::to_owned),
+                sigv2: true,
+            });
+        }
         let (Some(policy), Some(signature)) = (field("policy"), field("x-amz-signature")) else {
             return Err(Rejection::new(StatusCode::FORBIDDEN, "AccessDenied", "the form is not signed"));
         };
@@ -820,13 +853,13 @@ impl PostSignature {
             policy: policy.to_owned(),
             signature: signature.to_owned(),
             token: field("x-amz-security-token").map(str::to_owned),
+            sigv2: false,
         })
     }
 
     /// Checks the signature of the policy under the key `secret` derives for
-    /// the credential's scope.
+    /// the credential's scope (SigV2's: under `secret` itself).
     pub fn verify(&self, secret: &str) -> Result<(), Rejection> {
-        let key = derive_signing_key(secret, &self.date, &self.region, &self.service);
         let mismatch = || {
             Rejection::new(
                 StatusCode::FORBIDDEN,
@@ -834,6 +867,14 @@ impl PostSignature {
                 "The request signature we calculated does not match the signature you provided.",
             )
         };
+        if self.sigv2 {
+            use base64::Engine as _;
+            let sig = base64::engine::general_purpose::STANDARD.decode(self.signature.trim()).map_err(|_| mismatch())?;
+            let mut mac = HmacSha1::new_from_slice(secret.as_bytes()).expect("any key length");
+            mac.update(self.policy.as_bytes());
+            return mac.verify_slice(&sig).map_err(|_| mismatch());
+        }
+        let key = derive_signing_key(secret, &self.date, &self.region, &self.service);
         let sig = hex_decode(&self.signature).ok_or_else(mismatch)?;
         let mut mac = HmacSha256::new_from_slice(&key).expect("any key length");
         mac.update(self.policy.as_bytes());
@@ -1068,8 +1109,8 @@ fn sigv2_string_to_sign(
 /// `Authorization` header (`AWS <akid>:<signature>`), within the clock skew
 /// S3 allows of its `x-amz-date` or `Date`; or in its query (a presigned
 /// URL: `AWSAccessKeyId`, `Expires`, `Signature`), until `Expires` (Unix
-/// seconds), which may be at most a week away, as a SigV4 URL's may (S3 sets
-/// no limit). `resource` is the request's path-style path as sent
+/// seconds), however far away, as in S3 (unlike a SigV4 URL's, which is
+/// valid for at most a week). `resource` is the request's path-style path as sent
 /// (`/bucket/key`, with the bucket of a virtual-hosted request's host), which
 /// the signature covers instead of the host.
 pub fn verify_sigv2(method: &str, resource: &str, query: &str, headers: &HeaderMap, secret: &str) -> Result<(), Rejection> {
@@ -1127,9 +1168,6 @@ fn verify_sigv2_at(
             let at: i64 = expires.parse().map_err(|_| access_denied("Invalid date (should be seconds since epoch)"))?;
             if now > at {
                 return Err(access_denied("Request has expired"));
-            }
-            if at - now > MAX_PRESIGNED_SECS {
-                return Err(access_denied("Expires must be less than a week (in seconds) that is 604800 from now"));
             }
             (signature, expires)
         }
@@ -1583,6 +1621,45 @@ pub(crate) mod tests {
         assert_eq!(code(&[("x-amz-date", "20151230T000000Z")]), "AccessDenied");
     }
 
+    /// A form signed with SigV2: its policy (base64, as sent), HMAC-SHA1'd
+    /// with the secret itself.
+    #[test]
+    fn verifies_a_sigv2_post_form() {
+        use base64::Engine as _;
+        let mut mac = HmacSha1::new_from_slice(AWS_SECRET.as_bytes()).unwrap();
+        mac.update(AWS_POST_POLICY.as_bytes());
+        let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        let form = |changed: &[(&'static str, &str)]| {
+            let mut fields: Vec<(&str, String)> = vec![
+                ("policy", AWS_POST_POLICY.to_owned()),
+                ("awsaccesskeyid", "AKIAIOSFODNN7EXAMPLE".to_owned()),
+                ("signature", signature.clone()),
+                ("x-amz-security-token", "tok".to_owned()),
+            ];
+            for (name, value) in changed {
+                fields.retain(|(n, _)| n != name);
+                fields.push((name, value.to_string()));
+            }
+            fields
+        };
+        let parse = |fields: &[(&str, String)]| {
+            PostSignature::from_fields(|name| fields.iter().find(|(n, _)| *n == name).map(|(_, v)| v.as_str()))
+        };
+        let signature = parse(&form(&[])).unwrap();
+        assert!(signature.sigv2 && signature.signed().sigv2);
+        assert_eq!((signature.access_key.as_str(), signature.token.as_deref()), ("AKIAIOSFODNN7EXAMPLE", Some("tok")));
+        assert_eq!(signature.verify(AWS_SECRET), Ok(()));
+        assert_eq!(signature.verify(SECRET).unwrap_err().code, "SignatureDoesNotMatch");
+        // Another policy than it signed.
+        let other = parse(&form(&[("policy", "e30=")])).unwrap();
+        assert_eq!(other.verify(AWS_SECRET).unwrap_err().code, "SignatureDoesNotMatch");
+        let code = |changed: &[(&'static str, &str)]| parse(&form(changed)).unwrap_err().code;
+        assert_eq!(code(&[("awsaccesskeyid", "")]), "InvalidArgument");
+        let mut unsigned = form(&[]);
+        unsigned.retain(|(n, _)| *n != "signature");
+        assert_eq!(parse(&unsigned).unwrap_err().code, "AccessDenied");
+    }
+
     /// The headers `pairs` make, in order (a name may repeat).
     fn headers_of(pairs: &[(&str, &str)]) -> HeaderMap {
         let mut h = HeaderMap::new();
@@ -1697,9 +1774,8 @@ pub(crate) mod tests {
         assert_eq!(verify(resource, query, 1175139620 - 3600), Ok(()));
         assert_eq!(verify(resource, query, 1175139620), Ok(()));
         assert_eq!(verify(resource, query, 1175139621).unwrap_err().message, "Request has expired");
-        // Not for longer than a week from now.
-        let rejection = verify(resource, query, 1175139620 - MAX_PRESIGNED_SECS - 1).unwrap_err();
-        assert_eq!(rejection.code, "AccessDenied");
+        // However long before it expires, as in S3.
+        assert_eq!(verify(resource, query, 1175139620 - 10 * MAX_PRESIGNED_SECS), Ok(()));
         // Its expiry, or its object, changed.
         let later = query.replace("1175139620", "1175139720");
         assert_eq!(verify(resource, &later, 1175139620).unwrap_err().code, "SignatureDoesNotMatch");
