@@ -202,7 +202,7 @@ async fn handle_request(
         return Ok(box_response(objects::post::post_object(&app, req, &path, route.virtual_host, Some(peer)).await?));
     }
     // Authenticate every other S3 request up front: look up the user whose
-    // access key the SigV4 credential names, and verify the header signature
+    // access key the SigV4 credential (or SigV2's) names, and verify the signature
     // with its secret. Needs only the method/URI/query/headers, so it runs
     // before any body is read. A request without any signature is anonymous:
     // only buckets' policies can allow it. The peer endpoint is a separate
@@ -251,13 +251,25 @@ async fn handle_request(
             drop(client);
             // Against the path the client signed, which isn't the route's if
             // the bucket was in its host.
-            if let Err(rejection) = crate::auth::verify_sigv4(
-                req.method().as_str(),
-                req.uri().path(),
-                req.uri().query().unwrap_or(""),
-                req.headers(),
-                &principal.secret,
-            ) {
+            // SigV2 signs the path-style path instead of the host: the
+            // route's.
+            let verified = match signed.sigv2 {
+                true => crate::auth::verify_sigv2(
+                    req.method().as_str(),
+                    &route.path,
+                    req.uri().query().unwrap_or(""),
+                    req.headers(),
+                    &principal.secret,
+                ),
+                false => crate::auth::verify_sigv4(
+                    req.method().as_str(),
+                    req.uri().path(),
+                    req.uri().query().unwrap_or(""),
+                    req.headers(),
+                    &principal.secret,
+                ),
+            };
+            if let Err(rejection) = verified {
                 return Ok(box_response(util::rejection_response(&rejection)));
             }
             Some(principal)
@@ -268,9 +280,10 @@ async fn handle_request(
             let rejection = crate::auth::malformed_authorization(req.headers()).expect("just checked");
             return Ok(box_response(util::rejection_response(&rejection)));
         }
-        // A signature that isn't one (not SigV4).
+        // A signature that isn't one (neither SigV4 nor SigV2).
         None if req.headers().contains_key(hyper::header::AUTHORIZATION)
-            || query_param(req.uri().query().unwrap_or(""), "X-Amz-Signature").is_some() =>
+            || query_param(req.uri().query().unwrap_or(""), "X-Amz-Signature").is_some()
+            || query_param(req.uri().query().unwrap_or(""), "Signature").is_some() =>
         {
             return Ok(forbidden("AccessDenied", "request is not signed"));
         }

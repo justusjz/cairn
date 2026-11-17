@@ -125,7 +125,7 @@ cairn serve \
     --data-dir /var/lib/cairn/data
 ```
 
-The S3 API is now served on `:9000`. Every request must be signed (SigV4) with
+The S3 API is now served on `:9000`. Every request must be signed (SigV4, or SigV2) with
 the credentials of a user, and a fresh database has none. Create the first
 admin (see [Users and permissions](#users-and-permissions)):
 
@@ -699,7 +699,7 @@ account's [root user](#users-and-permissions) can always change or remove it,
 as in AWS: `eval "$(cairn account root-key)"`, then `aws s3api
 delete-bucket-policy --bucket <bucket>`.
 
-Secrets are stored in plaintext in the `access_keys` table: SigV4 is an HMAC scheme,
+Secrets are stored in plaintext in the `access_keys` table: SigV4 (as SigV2) is an HMAC scheme,
 so verifying a signature needs the secret itself. Restrict access to the
 database accordingly.
 
@@ -714,10 +714,22 @@ long as it says (`X-Amz-Expires`, at most 7 days), with nothing but an HTTP
 client, a browser say. Its body is unsigned. GetObject and HeadObject take
 S3's `response-*` parameters (`response-content-disposition`,
 `response-content-type`, …), which set those headers of the response, so that
-a link can download an object under a name of its own. Only SigV4 is
-supported: `aws s3 presign` makes SigV2 URLs unless its config has
-`signature_version = s3v4` under `s3`. For an SSE-C object, the URL has to be
-signed with the key's headers, and the client has to send them.
+a link can download an object under a name of its own. For an SSE-C object,
+the URL has to be signed with the key's headers, and the client has to send
+them.
+
+**SigV2** is taken as well, in the `Authorization` header (`AWS
+<key>:<signature>`) or a presigned URL (`AWSAccessKeyId`, `Expires`,
+`Signature`), since some clients still presign with it by default
+(`aws s3 presign`, boto3's `generate_presigned_url` without a
+`signature_version`). It signs neither the host nor the body (but for a
+`Content-MD5`) nor any query parameter but a subresource's, so prefer SigV4
+where a client lets you choose. A SigV2 URL may expire at most a week ahead,
+as a SigV4 one may (S3 sets it no limit), and a header-signed request must
+be within the same 15 minutes of its `Date` or `x-amz-date`. Policies tell
+it apart by `s3:signatureversion`, `AWS` (SigV4's is `AWS4-HMAC-SHA256`),
+and can deny it everywhere with a `StringNotEquals` on that key. POST forms
+signed with SigV2 are refused.
 
 **POST Object** (browser-based uploads) works as in S3: a `multipart/form-data`
 form posted to a bucket, with a POST policy signed with a user's credentials

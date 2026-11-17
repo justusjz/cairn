@@ -40,7 +40,7 @@ pub struct Record {
     pub referer: Option<String>,
     pub user_agent: Option<String>,
     pub version_id: Option<String>,
-    /// `SigV4`, if signed.
+    /// `SigV4` or `SigV2`, if signed.
     pub signature_version: Option<&'static str>,
     /// `AuthHeader` or `QueryString`, if signed.
     pub authentication_type: Option<&'static str>,
@@ -150,6 +150,12 @@ pub fn signing(headers: &HeaderMap, query: &str) -> (Option<&'static str>, Optio
     }
     if crate::s3::util::query_param(query, "X-Amz-Algorithm").is_some() {
         return (Some("SigV4"), Some("QueryString"));
+    }
+    if header.is_some_and(|h| h.starts_with("AWS ")) {
+        return (Some("SigV2"), Some("AuthHeader"));
+    }
+    if header.is_none() && crate::s3::util::query_param(query, "AWSAccessKeyId").is_some() {
+        return (Some("SigV2"), Some("QueryString"));
     }
     (None, None)
 }
