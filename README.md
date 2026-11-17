@@ -434,8 +434,11 @@ Organizations' API (`aws organizations create-account`, with
 management account, as AWS's does: the management account's principals
 whose own policies allow `sts:AssumeRole` on it get into the member account
 by assuming it, and directory users with the permission sets assigned to
-them there ([Directory users](#directory-users)). Member accounts have no
-root user, as AWS recommends. Closing one (`close-account`, or the console)
+them there ([Directory users](#directory-users)). Between accounts,
+resource policies decide, as in AWS: a bucket's policy, a role's trust
+policy, an SNS topic's (`aws sns add-permission`), an Access Grants
+instance's; the caller's own policies must allow it too. Member accounts
+have no root user, as AWS recommends. Closing one (`close-account`, or the console)
 is at once, once it has no buckets: its users, roles and sessions stop
 working.
 
@@ -966,9 +969,20 @@ multipart uploads. Each operation needs its `s3:` action (`s3:CreateAccessGrant`
 `list-caller-access-grants` shows a grantee its own grants. The root user
 may manage all of it, but is no grantee.
 
+**Another account's** users and roles may be grantees too. They call
+GetDataAccess with the instance's account ID, and need it allowed both by
+their own policies and by the instance's **resource policy**:
+
+```sh
+aws s3control put-access-grants-instance-resource-policy --account-id 123456789012 --policy '{
+  "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": {"AWS": "444455556666"},
+    "Action": ["s3:GetDataAccess", "s3:ListCallerAccessGrants"],
+    "Resource": "arn:aws:s3:us-east-1:123456789012:access-grants/default"}]}'
+```
+
 These are AWS's *Access Grants*, not Cairn's old [grants](#users-and-permissions),
-which were managed policies. Grantees are IAM users and roles only: Cairn
-has no IAM Identity Center (see
+which were managed policies. Grantees are IAM users and roles only:
+Identity Center's directory users and groups aren't, yet (see
 [S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#access-grants)).
 
 ## Console

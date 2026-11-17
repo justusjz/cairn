@@ -72,10 +72,12 @@ Done:
   implemented. Member accounts, as AWS Organizations has them (the
   existing account as the management account, CreateAccount with
   `OrganizationAccountAccessRole`, cross-account AssumeRole, CloseAccount):
-  implemented. Next: cross-account access to KMS keys, SNS topics and
-  Access Grants; then organizational units and SCPs. Also: directory users
-  and groups as Access Grants grantees, switching roles in the console,
-  and the access portal's APIs for `aws sso login`.
+  implemented. Cross-account access to SNS topics (their policies) and
+  Access Grants (instances' resource policies): implemented (KMS keys are
+  OpenBao's, whose policies decide their use). Next: organizational units
+  and SCPs. Also: directory users and groups as Access Grants grantees,
+  switching roles in the console, and the access portal's APIs for `aws
+  sso login`.
 
 - **Object Lock.** Retention periods and legal holds, which keep versions
   from being deleted, by anyone or by lifecycle rules, as in S3: what makes

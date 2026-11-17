@@ -493,3 +493,47 @@ async fn racing_writes_have_their_events_in_order() {
     assert_eq!(by_sequencer.len(), 16);
     assert_eq!(by_sequencer, by_commit);
 }
+
+/// Another account's topic, as AWS's: what its policy allows that account
+/// (AddPermission), if the caller's own policies allow it too; nothing
+/// else, and it's not in the caller's ListTopics.
+#[tokio::test]
+async fn other_accounts_use_topics_as_their_policies_allow() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let account = users::account(&client).await.unwrap();
+    let (admin, _) = users::create_for(&client, &account, "boss", None, true).await.unwrap();
+    let made = crate::organizations::create(&client, &account, "Team D", "team-d@example.com", "OrganizationAccountAccessRole").await.unwrap();
+    let member = made.account_id.unwrap();
+    let (mel, _) = users::create_for(&client, &member, "mel", None, false).await.unwrap();
+    let allowed = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sns:*","Resource":"*"}]}"#;
+    users::put_policy(&client, &member, "mel", "p", allowed).await.unwrap();
+    let (nora, _) = users::create_for(&client, &member, "nora", None, false).await.unwrap();
+    let arn = element(&ok(call(&app, &admin, "CreateTopic", &[("Name", "shared")]).await), "TopicArn");
+
+    // Its default policy is its own account's.
+    refused(call(&app, &mel, "GetTopicAttributes", &[("TopicArn", &arn)]).await, "AuthorizationError");
+    ok(call(
+        &app,
+        &admin,
+        "AddPermission",
+        &[
+            ("TopicArn", &arn),
+            ("Label", "team-d"),
+            ("AWSAccountId.member.1", &member),
+            ("ActionName.member.1", "GetTopicAttributes"),
+            ("ActionName.member.2", "Subscribe"),
+        ],
+    )
+    .await);
+    let attributes = ok(call(&app, &mel, "GetTopicAttributes", &[("TopicArn", &arn)]).await);
+    assert_eq!(attribute(&attributes, "Owner").as_deref(), Some(account.as_str()));
+    // Not what the topic's policy doesn't allow, nor whom its own don't.
+    refused(call(&app, &mel, "Publish", &[("TopicArn", &arn), ("Message", "hi")]).await, "AuthorizationError");
+    refused(call(&app, &nora, "GetTopicAttributes", &[("TopicArn", &arn)]).await, "AuthorizationError");
+    let listed = ok(call(&app, &mel, "ListTopics", &[]).await);
+    assert!(!listed.contains(&arn), "{listed}");
+    // An account that isn't the organization's has no topics.
+    let elsewhere = arn.replace(&account, "999999999999");
+    refused(call(&app, &mel, "GetTopicAttributes", &[("TopicArn", &elsewhere)]).await, "InvalidClientTokenId");
+}

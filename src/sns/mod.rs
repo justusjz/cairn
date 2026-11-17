@@ -111,9 +111,14 @@ impl Topic {
         })
     }
 
-    /// `account`'s topic `name`, if there's one.
+    /// `account`'s topic `name`, if there's one (a closed account's are
+    /// none: see `organizations`).
     pub async fn load(client: &impl deadpool_postgres::GenericClient, account: &str, name: &str) -> anyhow::Result<Option<Topic>> {
-        let sql = format!("SELECT {} FROM sns_topics WHERE account_id = $1 AND name = $2", Self::COLUMNS);
+        let sql = format!(
+            "SELECT {} FROM sns_topics WHERE account_id = $1 AND name = $2
+               AND NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = account_id AND a.closed_at IS NOT NULL)",
+            Self::COLUMNS
+        );
         client.query_opt(&sql, &[&account, &name]).await?.map(|r| Topic::from_row(&r)).transpose()
     }
 
@@ -455,10 +460,12 @@ impl Sns<'_> {
     }
 
     /// The topic `arn` names: SNS's 400 for an ARN that isn't one, its 404
-    /// for a topic that isn't there.
+    /// for a topic that isn't there. Another account's (of the
+    /// organization's, open), as AWS's: what it may do with it, its topic's
+    /// policy and its own policies both decide (see `check`).
     async fn topic(&mut self, arn: &str) -> Result<Topic> {
         let (account, name) = parse_arn(arn, "TopicArn")?;
-        if account != self.account() {
+        if account != self.account() && !crate::organizations::open(self.client, &account).await? {
             return Err(error(StatusCode::FORBIDDEN, "InvalidClientTokenId", "No account found for the given parameters"));
         }
         Topic::load(self.client, &account, &name).await?.ok_or_else(|| not_found("Topic does not exist"))

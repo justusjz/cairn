@@ -366,6 +366,11 @@ pub enum Kind<'a> {
     /// An SNS topic's (by its ARN): every statement names its principals,
     /// and only SNS's actions, on SNS's resources (see `sns`).
     Topic(&'a str),
+    /// An S3 Access Grants instance's resource policy (by the instance's
+    /// ARN): every statement names its principals, and only Access Grants'
+    /// actions, on the instance and its locations and grants (see
+    /// `s3::access_grants`).
+    AccessGrants(&'a str),
 }
 
 /// The actions a trust policy may name (probed: no wildcards, not
@@ -792,6 +797,7 @@ fn s3_actions(name: &str, kind: Kind) -> Vec<&'static (&'static str, Applies, &'
             Kind::Identity | Kind::Trust => true,
             Kind::Bucket(_) => matches!(applies, Applies::Bucket | Applies::Object) && *action != "CreateBucket",
             Kind::Topic(_) => false,
+            Kind::AccessGrants(_) => action.contains("AccessGrant") || matches!(*action, "GetDataAccess"),
         })
         .filter(|(action, _, _)| pattern.matches(action, true))
         .collect()
@@ -852,10 +858,10 @@ impl Statement {
         let principals = match (kind, either("Principal")) {
             (Kind::Identity, Some(_)) => return Err(Invalid::malformed("Policy document should not specify a principal.")),
             (Kind::Identity, None) => None,
-            (Kind::Bucket(_) | Kind::Trust | Kind::Topic(_), None) => {
+            (Kind::Bucket(_) | Kind::Trust | Kind::Topic(_) | Kind::AccessGrants(_), None) => {
                 return Err(Invalid::malformed("Missing required field Principal"));
             }
-            (Kind::Bucket(_) | Kind::Trust | Kind::Topic(_), Some((not, value))) => {
+            (Kind::Bucket(_) | Kind::Trust | Kind::Topic(_) | Kind::AccessGrants(_), Some((not, value))) => {
                 if not && allow {
                     return Err(Invalid::malformed("Allow with NotPrincipal is not allowed."));
                 }
@@ -913,10 +919,10 @@ impl Statement {
                     return Err(invalid());
                 }
                 named.push(actions);
-            } else if let Kind::Bucket(_) = kind {
-                // A bucket policy is about S3's actions only; an identity
-                // policy may name other services' (which no request to
-                // Cairn is).
+            } else if let Kind::Bucket(_) | Kind::AccessGrants(_) = kind {
+                // A bucket policy (or an Access Grants instance's) is about
+                // S3's actions only; an identity policy may name other
+                // services' (which no request to Cairn is).
                 return Err(invalid());
             }
         }
@@ -995,7 +1001,7 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
     if resource == "*" {
         return match kind {
             Kind::Identity | Kind::Trust | Kind::Topic(_) => Ok(None),
-            Kind::Bucket(_) => Err(invalid()),
+            Kind::Bucket(_) | Kind::AccessGrants(_) => Err(invalid()),
         };
     }
     let [prefix, partition, service, region, account, path] = arn_parts(resource).ok_or_else(invalid)?;
@@ -1012,6 +1018,14 @@ fn resource_kind(resource: &str, kind: Kind) -> Result<Option<Applies>, Invalid>
             return Err(invalid());
         }
         return Ok(Some(Applies::Other));
+    }
+    if let Kind::AccessGrants(instance) = kind {
+        // The instance, and its locations and grants, only.
+        let named = resource == instance || resource.strip_prefix(instance).is_some_and(|rest| rest.starts_with('/'));
+        return match named {
+            true => Ok(Some(Applies::Other)),
+            false => Err(invalid()),
+        };
     }
     if let Kind::Topic(_) = kind {
         // SNS's resources (topics) only.

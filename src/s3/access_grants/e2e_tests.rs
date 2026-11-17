@@ -62,13 +62,20 @@ fn trusting_access_grants(condition: &str) -> String {
     format!(r#"{{"Effect":"Allow","Principal":{{"Service":"{SERVICE}"}},"Action":"sts:AssumeRole"{condition}}}"#)
 }
 
-/// What `principal` was answered for `op`: its status, and its body.
+/// What `principal` was answered for `op` on its own account's instance:
+/// its status, and its body.
 async fn call(app: &App, principal: &Principal, op: Op, query: &str, body: &str) -> (StatusCode, String) {
-    let account = account(app).await;
+    let account = principal.account.clone();
+    call_in(app, principal, &account, op, query, body).await
+}
+
+/// What `principal` was answered for `op` on `account`'s instance (another
+/// account's, if it's not its own).
+async fn call_in(app: &App, principal: &Principal, account: &str, op: Op, query: &str, body: &str) -> (StatusCode, String) {
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let mut access = Access::new(Some(principal), &account, &Method::GET, &HeaderMap::new(), query, &origin).unwrap();
+    let mut access = Access::new(Some(principal), &principal.account, &Method::GET, &HeaderMap::new(), query, &origin).unwrap();
     let body = (!body.is_empty()).then(|| Bytes::from(body.to_owned()));
-    let response = answer(app, op, principal, &mut access, query, body).await.unwrap();
+    let response = answer(app, op, principal, account, &mut access, query, body).await.unwrap();
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     (status, String::from_utf8(body.to_vec()).unwrap())
@@ -351,4 +358,80 @@ async fn roles_must_trust_access_grants() {
         let (status, xml) = call(&app, &alice, Op::GetDataAccess, &format!("target={scope}*&permission=READ"), "").await;
         assert_eq!(status == StatusCode::OK, trusted, "{trust}: {xml}");
     }
+}
+
+/// Another account's principals use an instance as its resource policy
+/// lets them, if their own policies do too: GetDataAccess for a grant
+/// naming them, in the instance's account (whose role it vends).
+#[tokio::test]
+async fn other_accounts_use_an_instance_as_its_policy_allows() {
+    let Some(app) = node().await else { return };
+    let admin = user(&app, "admin", ADMIN).await;
+    let management = account(&app).await;
+    let client = app.pool.get().await.unwrap();
+    let made = crate::organizations::create(&client, &management, "Team C", "team-c@example.com", "OrganizationAccountAccessRole").await.unwrap();
+    let member = made.account_id.unwrap();
+    // Carol of the member account, allowed GetDataAccess on the instance.
+    let carol = {
+        let (key, _) = users::create_for(&client, &member, "carol", None, false).await.unwrap();
+        let policy = format!(r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:GetDataAccess","Resource":"{}"}}]}}"#, instance_arn(&management));
+        users::put_policy(&client, &member, "carol", "p", &policy).await.unwrap();
+        Principal::load(&client, &key).await.unwrap().unwrap()
+    };
+    let dave = {
+        let (key, _) = users::create_for(&client, &member, "dave", None, false).await.unwrap();
+        Principal::load(&client, &key).await.unwrap().unwrap()
+    };
+    let role = role(&app, &trusting_access_grants(""), "s3:Get*").await;
+    call(&app, &admin, Op::CreateInstance, "", "").await;
+    call(&app, &admin, Op::CreateLocation, "", &location("s3://", &role.arn())).await;
+    // A grant may name another account's user (not one that isn't there).
+    let (status, xml) = call(&app, &admin, Op::CreateGrant, "", &grant("default", Some("shared/*"), &carol.arn(), "READ", false)).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    let ghost = format!("arn:aws:iam::{member}:user/ghost");
+    assert_eq!(call(&app, &admin, Op::CreateGrant, "", &grant("default", None, &ghost, "READ", false)).await.0, StatusCode::BAD_REQUEST);
+    call(&app, &admin, Op::CreateGrant, "", &grant("default", Some("shared/*"), &dave.arn(), "READ", false)).await;
+
+    // Without the instance's resource policy: no.
+    let target = "target=s3://shared/*&permission=READ";
+    assert_eq!(call_in(&app, &carol, &management, Op::GetDataAccess, target, "").await.0, StatusCode::FORBIDDEN);
+    let (status, xml) = call(&app, &admin, Op::GetPolicy, "", "").await;
+    assert_eq!((status, xml.contains("<Policy>")), (StatusCode::OK, false), "{xml}");
+
+    // Its policy names the instance, Access Grants' actions, and accounts
+    // of the organization's.
+    let put = |statement: String| {
+        let policy = format!(r#"{{"Version":"2012-10-17","Statement":[{statement}]}}"#).replace('&', "&amp;").replace('<', "&lt;");
+        format!("<PutAccessGrantsInstanceResourcePolicyRequest><Policy>{policy}</Policy></PutAccessGrantsInstanceResourcePolicyRequest>")
+    };
+    let allow = |who: &str, action: &str, resource: &str| {
+        format!(r#"{{"Effect":"Allow","Principal":{{"AWS":"{who}"}},"Action":"{action}","Resource":"{resource}"}}"#)
+    };
+    let instance = instance_arn(&management);
+    let (status, xml) = call(&app, &admin, Op::PutPolicy, "", &put(allow(&member, "s3:GetObject", &instance))).await;
+    assert_eq!((status, code(&xml)), (StatusCode::BAD_REQUEST, "MalformedPolicy".to_owned()));
+    let (status, xml) = call(&app, &admin, Op::PutPolicy, "", &put(allow(&member, "s3:GetDataAccess", "arn:aws:s3:::shared/*"))).await;
+    assert_eq!((status, code(&xml)), (StatusCode::BAD_REQUEST, "MalformedPolicy".to_owned()));
+    let (status, xml) = call(&app, &admin, Op::PutPolicy, "", &put(allow("999999999999", "s3:GetDataAccess", &instance))).await;
+    assert_eq!((status, code(&xml)), (StatusCode::BAD_REQUEST, "MalformedPolicy".to_owned()));
+    let (status, xml) = call(&app, &admin, Op::PutPolicy, "", &put(allow(&member, "s3:GetDataAccess", &instance))).await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    assert!(field(&xml, "Policy").contains("s3:GetDataAccess"), "{xml}");
+    let (_, xml) = call(&app, &admin, Op::GetPolicy, "", "").await;
+    assert!(field(&xml, "Policy").contains(&member), "{xml}");
+
+    // Now Carol may: a session of the instance account's role.
+    let (status, xml) = call_in(&app, &carol, &management, Op::GetDataAccess, target, "").await;
+    assert_eq!(status, StatusCode::OK, "{xml}");
+    let session = session_of(&app, &xml).await;
+    assert_eq!((session.account.as_str(), session.principal_arn()), (management.as_str(), role.arn()));
+    // Dave's own policies don't allow it.
+    assert_eq!(call_in(&app, &dave, &management, Op::GetDataAccess, target, "").await.0, StatusCode::FORBIDDEN);
+    // Nor what the policy doesn't allow.
+    assert_eq!(call_in(&app, &carol, &management, Op::ListGrants, "", "").await.0, StatusCode::FORBIDDEN);
+
+    // Deleted, it's no again.
+    let (status, _) = call(&app, &admin, Op::DeletePolicy, "", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(call_in(&app, &carol, &management, Op::GetDataAccess, target, "").await.0, StatusCode::FORBIDDEN);
 }

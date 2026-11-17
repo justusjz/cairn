@@ -63,7 +63,8 @@ async fn verdict(app: &App, principal: &Principal, management: &str, action: &'s
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
     let mut access = Access::new(Some(principal), &principal.account, &Method::GET, &HeaderMap::new(), "", &origin).unwrap();
     access.set_management(management);
-    if let On::Bucket(bucket) = &on {
+    // As a request does: its bucket loaded first (an object's too).
+    if let Some(bucket) = on.bucket() {
         access.load(app, bucket).await.unwrap();
     }
     access.verdict(&Check { action, on })
@@ -171,4 +172,36 @@ async fn the_account_becomes_the_management_account() {
         client.query("SELECT id, management FROM accounts", &[]).await.unwrap().iter().map(|r| (r.get(0), r.get(1))).collect();
     assert_eq!(rows, [(account.clone(), true)], "{before} before");
     assert_eq!(users::account(&client).await.unwrap(), account);
+}
+
+/// Another account's bucket, as S3's: what its bucket policy allows that
+/// account, if the caller's own policies allow it too; never its policy.
+#[tokio::test]
+async fn other_accounts_use_buckets_as_their_policies_allow() {
+    let Some(app) = node().await else { return };
+    let client = app.pool.get().await.unwrap();
+    let management = users::account(&client).await.unwrap();
+    let made = org::create(&client, &management, "Team E", "team-e@example.com", org::ACCESS_ROLE).await.unwrap();
+    let member = made.account_id.unwrap();
+    crate::s3::buckets::create::create(&app, "shared-data", &management, false).await.unwrap();
+    let reads = r#"{"Effect":"Allow","Action":["s3:GetObject","s3:GetBucketPolicy"],"Resource":"*"}"#;
+    let erin = user(&app, &member, "erin", reads).await;
+    let fred = user(&app, &member, "fred", "").await;
+    let object = || On::Object("shared-data".into(), "report.csv".into());
+    assert_ne!(verdict(&app, &erin, &management, "s3:GetObject", object()).await, Verdict::Allow);
+
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{member}:root"}},"Action":["s3:GetObject","s3:GetBucketPolicy"],"Resource":["arn:aws:s3:::shared-data","arn:aws:s3:::shared-data/*"]}}]}}"#
+    );
+    let response = crate::s3::buckets::policy::put_bucket_policy(&app, "shared-data", policy.into()).await.unwrap();
+    assert!(response.status().is_success(), "{:?}", response.status());
+    assert_eq!(verdict(&app, &erin, &management, "s3:GetObject", object()).await, Verdict::Allow);
+    // Both must allow it: Fred's own policies don't.
+    assert_ne!(verdict(&app, &fred, &management, "s3:GetObject", object()).await, Verdict::Allow);
+    assert_ne!(verdict(&app, &erin, &management, "s3:PutObject", object()).await, Verdict::Allow);
+    // A bucket's policy is its own account's, whatever it allows (S3's 405).
+    let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
+    let mut access = Access::new(Some(&erin), &erin.account, &Method::GET, &HeaderMap::new(), "", &origin).unwrap();
+    access.load(&app, "shared-data").await.unwrap();
+    assert!(access.foreign(&Check { action: "s3:GetBucketPolicy", on: On::Bucket("shared-data".into()) }));
 }
