@@ -144,6 +144,7 @@ fn logged<B>(
         || buckets::resource_tags::is_control(req.uri().path(), req.headers())
         || public_access::is_control(req.uri().path(), req.headers())
         || access_grants::is_control(req.uri().path(), req.headers())
+        || crate::batch::control::is_control(req.uri().path(), req.headers())
     {
         return None;
     }
@@ -311,6 +312,11 @@ async fn handle_request(
     // S3 Control's, on Access Grants (see `access_grants`).
     if access_grants::is_control(req.uri().path(), req.headers()) {
         let response = access_grants::handle(&app, req, principal.as_ref(), &mut access, &secret).await?;
+        return Ok(box_response(response));
+    }
+    // S3 Control's, on Batch Operations' jobs (see `batch::control`).
+    if crate::batch::control::is_control(req.uri().path(), req.headers()) {
+        let response = crate::batch::control::handle(&app, req, principal.as_ref(), &mut access, &secret).await?;
         return Ok(box_response(response));
     }
     // S3 Control's, on a bucket's tags (see `resource_tags`).
@@ -1516,7 +1522,7 @@ const MAX_WHOLE_BODY: usize = 8 << 20;
 /// refuses one too large. `checksum_headers` says whether its
 /// `x-amz-checksum-*` header is one of the body. `Err` holds why it was
 /// refused.
-async fn read_body(
+pub(crate) async fn read_body(
     req: Request<crate::listen::ClientBody>,
     secret: &str,
     checksum_headers: bool,

@@ -30,6 +30,7 @@ mod accounts;
 mod admin;
 mod auth;
 mod aws_chunked;
+mod batch;
 mod blob_file;
 mod blobs;
 mod body;

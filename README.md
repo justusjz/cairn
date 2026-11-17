@@ -1400,6 +1400,60 @@ however large the bucket is: a CSV report a page of versions, a Parquet one at
 most a row group (about 16 MiB of rows) besides. Like S3's, it's as of no single moment: what's
 written or deleted while it's made may or may not be in it.
 
+## Batch Operations
+
+S3 Batch Operations: a job (S3 Control's `CreateJob`,
+`aws s3control create-job`) does one operation to every object a manifest
+lists, as a role. Cairn does `S3PutObjectTagging` (replacing each object's
+tags) and `S3DeleteObjectTagging`, from a CSV manifest: an object of lines
+`bucket,key` (or `bucket,key,versionId`, as its `Fields` say), keys
+URL-encoded. Other operations, inventory reports as manifests, and
+completion reports aren't done yet (see
+[S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#batch-operations)).
+
+A job acts as its role, as S3 does: the role's trust policy must let the
+`batchoperations.s3.amazonaws.com` service assume it, and its policies must
+let it read the manifest and do the operation on each object. Whoever
+creates the job needs `s3:CreateJob` and `iam:PassRole` on the role:
+
+```sh
+aws iam create-role --role-name batch --assume-role-policy-document \
+  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+    "Principal":{"Service":"batchoperations.s3.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+aws iam put-role-policy --role-name batch --policy-name tagging --policy-document \
+  '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Resource":"arn:aws:s3:::photos/*",
+    "Action":["s3:GetObject","s3:PutObjectTagging","s3:PutObjectVersionTagging"]}]}'
+printf 'photos,a.jpg\nphotos,b.jpg\n' > manifest.csv
+etag=$(aws s3api put-object --bucket photos --key manifest.csv --body manifest.csv \
+    --query ETag --output text)
+aws s3control create-job --account-id <account ID> --priority 10 --no-confirmation-required \
+  --role-arn arn:aws:iam::<account ID>:role/batch --report '{"Enabled":false}' \
+  --operation '{"S3PutObjectTagging":{"TagSet":[{"Key":"team","Value":"red"}]}}' \
+  --manifest '{"Spec":{"Format":"S3BatchOperations_CSV_20180820","Fields":["Bucket","Key"]},
+    "Location":{"ObjectArn":"arn:aws:s3:::photos/manifest.csv","ETag":'"$etag"'}}'
+```
+
+(S3 Control's clients put the account ID in the host name, so it must
+resolve to Cairn too, as for the account's public access block.)
+
+A job is first prepared: its manifest is read through, each line checked
+and counted. A job created with `--confirmation-required` then waits
+(`Suspended`) until `aws s3control update-job-status --requested-job-status
+Ready` confirms it; `--requested-job-status Cancelled` cancels a job that
+hasn't ended. Then its tasks run, and `describe-job` shows how many
+succeeded and failed. A job fails, saying why in its `FailureReasons`, if
+its role or manifest can't be used, if its manifest changes (it's pinned to
+the ETag it was created with), or if more than half its tasks fail once a
+thousand have run. Jobs are kept for 90 days after they end.
+
+Jobs take turns with [lifecycle sweeps](#lifecycle-rules) and
+[inventory reports](#inventory), and share their rate (`lifecycle-rate`):
+each task counts as a version read. Among jobs, the highest priority goes
+first. Where a job has got to in its manifest is saved after each page of
+a thousand tasks, so if its node dies, another carries on from there; the
+tasks of the page it was on are done again, which is harmless for the
+operations Cairn does.
+
 ## Event notifications
 
 S3's event notifications, delivered through SNS topics, which Cairn has on
