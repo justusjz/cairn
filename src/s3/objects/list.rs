@@ -216,7 +216,8 @@ pub async fn list_objects(
         totals: false,
     };
     let Some(listing) = list(app, bucket, &query).await? else {
-        return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", ""));
+        // Not an empty message: aws-cli's error-message hook crashes on one.
+        return Ok(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist"));
     };
     let key_count = listing.entries.len();
     // A page of none tells nothing about what's left, so S3 says there's

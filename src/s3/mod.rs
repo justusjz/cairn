@@ -1632,19 +1632,24 @@ pub fn error_response(e: &anyhow::Error) -> Response<ResBody> {
     box_response(resp)
 }
 
-/// Why a request is refused by policy, if it is: as S3 refuses it, a
-/// bucket that doesn't exist is a 404 to anyone (bucket names aren't
-/// secret, only what's in them is), but to CreateBucket, which is about a
-/// bucket that isn't there yet.
+/// Why a request is refused, if it is: as S3 refuses it, a bucket that
+/// doesn't exist is a 404 to anyone (bucket names aren't secret, only
+/// what's in them is), whether or not policies allow the request, but to
+/// CreateBucket, which is about a bucket that isn't there yet. Otherwise,
+/// whatever policies deny.
+///
+/// The 404 comes first for allowed requests too, so that no operation
+/// answers for a missing bucket on its own: GetObject would say
+/// `NoSuchKey`, and the stubs (`util::bucket_subresource_stub`) a `200`.
 fn refusal(
     access: &access::Access,
     operation: &actions::Operation,
     exists: bool,
 ) -> Option<hyper::Response<http_body_util::Full<hyper::body::Bytes>>> {
-    let (check, verdict) = access.first_denied(&operation.checks)?;
     if !exists && operation.name != "CreateBucket" {
         return Some(format_s3_error(StatusCode::NOT_FOUND, "NoSuchBucket", "The specified bucket does not exist"));
     }
+    let (check, verdict) = access.first_denied(&operation.checks)?;
     Some(access.denied(check, verdict))
 }
 
