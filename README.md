@@ -460,7 +460,9 @@ them attaches AWS's `FullAWSAccess` (allowing everything) to the root,
 every OU and every account, and to each made later; every one keeps an SCP
 at least, so replace it before detaching it. The management account is
 under none. SCPs are an identity policy's language, with a `Version`, and
-only `"Resource": "*"` in an Allow.
+only `"Resource": "*"` in an Allow. The console's Organization page makes,
+renames and deletes OUs, moves accounts, enables and disables SCPs, and
+makes, edits, attaches and detaches them, as Organizations' API does.
 
 ```sh
 root=$(aws organizations list-roots --query 'Roots[0].Id' --output text)
@@ -1117,9 +1119,14 @@ out.
   A bucket's *Access and policy* shows which of the account's users its
   policies give access to the whole bucket, and what, besides its bucket
   policy and public access block.
-- **Identity Center:** permission sets, their policies and assignments to
-  [directory users](#directory-users) and groups, and who has signed in, as
-  Identity Center's actions allow.
+- **Identity Center** (the management account's only): permission sets,
+  their policies, the accounts they're provisioned to (and provisioning
+  them again, when their roles don't hold their latest version), and their
+  assignments to [directory users](#directory-users) and groups in the
+  organization's accounts; Cairn's own directory's users (made, changed,
+  their setup links and passkeys) and groups (made, changed, their
+  members); and the identity sources' users and groups that have signed
+  in. As Identity Center's actions allow.
 
 ### The operators' pages
 
@@ -1146,6 +1153,9 @@ users). Whichever node answers shows the whole cluster:
   doing on each node, what they still have to do, and what they did recently;
   and the [lifecycle](#lifecycle-rules) sweeps: each bucket's, how long a
   round of them takes, and the rate they go at, which can be changed there.
+- **Organization:** the organization's accounts (made, moved and closed),
+  its organizational units and its service control policies (see
+  [Users and permissions](#users-and-permissions)).
 - **Sign-in:** the identity sources directory users sign in at.
 
 Request metrics are kept in memory by each node, so they start over when it
@@ -1179,8 +1189,8 @@ Identity Center's APIs (below):
   account). Each has an ID of its own, as Identity Center's users and
   groups do. The identity store holds:
   - **Cairn's own directory's** users and groups, which an administrator
-    makes in the console (users) or with identitystore's API (users,
-    groups and their members, who may be any directory users).
+    makes in the console or with identitystore's API (users, groups and
+    their members, who may be any directory users).
   - **Identity sources'**: the users that have signed in, and the groups
     their sources' group claims (`groups` by default; set per source)
     named. A user's user name is its `preferred_username`, e-mail or

@@ -1,8 +1,9 @@
-// Identity Center (see `src/identity_center.rs`): the permission sets
-// directory users act with, as their roles, the assignments that give them
-// to users and groups of the identity sources (set up on the Sign-in page),
-// and the directory users that have signed in. The page, and a permission
-// set's own page.
+// Identity Center (see `src/identity_center.rs`), the management account's:
+// the permission sets directory users act with, provisioned as roles to the
+// accounts they're assigned in, the assignments that give them to users and
+// groups in an account, and the directory: Cairn's own users and groups, and
+// those of the identity sources (set up on the Sign-in page) that have signed
+// in. The page, and a permission set's own page.
 
 import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
@@ -42,6 +43,17 @@ export default function IdentityCenter() {
     if (!confirm(`Delete ${u.user_name}? Their assignments, group memberships and passkeys go too.`)) return;
     if (await act(() => api.deleteDirectoryUser(u.id), `Deleted ${u.user_name}`)) data.refresh();
   };
+  const deleteGroup = async (g: DirectoryGroup) => {
+    if (!confirm(`Delete group ${g.name}? Its assignments go too, and with them its members' access through it.`)) return;
+    if (await act(() => api.deleteDirectoryGroup(g.id), `Deleted ${g.name}`)) data.refresh();
+  };
+  const removeMember = async (g: DirectoryGroup, m: DirectoryGroup["memberships"][number]) => {
+    if (!confirm(`Take ${m.user_name} out of ${g.name}? They lose what its assignments gave them at once.`)) return;
+    if (await act(() => api.removeGroupMember(g.id, m.id), `Took ${m.user_name} out of ${g.name}`)) data.refresh();
+  };
+  const [editingUser, setEditingUser] = createSignal<DirectoryUser>();
+  const [editingGroup, setEditingGroup] = createSignal<DirectoryGroup | "new">();
+  const [addingTo, setAddingTo] = createSignal<DirectoryGroup>();
   const unassign = async (a: Assignment) => {
     const who = a.principal_type === "GROUP" ? `group ${a.principal_name}` : a.principal_name;
     if (!confirm(`Take ${a.permission_set} from ${who}? Their sessions lose it at once.`)) return;
@@ -59,10 +71,12 @@ export default function IdentityCenter() {
         </div>
       </div>
       <p class="subtle small">
-        People who sign in at an identity source (set up on the <A href="/sign-in">Sign-in</A> page) are directory
-        users, as in IAM Identity Center: they have no IAM user, but use the permission sets assigned to them or to
-        their groups. Each permission set is a role at <span class="mono">/aws-reserved/sso.amazonaws.com/</span>, which
-        only this page changes; signed in, a directory user acts as a session of its role.
+        As in IAM Identity Center, directory users have no IAM user: users of Cairn's own directory, made here, who
+        sign in with passkeys, and people who sign in at an identity source (set up on the{" "}
+        <A href="/sign-in">Sign-in</A> page). They use the permission sets assigned to them, or to their groups, in an
+        account of the organization. A permission set is provisioned to each account it's assigned in, as a role at{" "}
+        <span class="mono">/aws-reserved/sso.amazonaws.com/</span> there, which only Identity Center changes; signed in,
+        a directory user acts as a session of that role.
       </p>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
         {(d) => (
@@ -114,7 +128,7 @@ export default function IdentityCenter() {
                           <Show when={a.email}>{(e) => <div class="subtle small mono">{e()}</div>}</Show>
                         </Show>
                       </td>
-                      <td class="mono small">{a.provider}</td>
+                      <td class="mono small">{a.provider ?? "Cairn"}</td>
                       <td>{date(a.created_at)}</td>
                       <td class="actions">
                         <button class="small danger" onClick={() => unassign(a)}>
@@ -161,6 +175,9 @@ export default function IdentityCenter() {
                       </td>
                       <td class="actions">
                         <Show when={!u.provider}>
+                          <button class="small" onClick={() => setEditingUser(u)}>
+                            Edit…
+                          </button>
                           <button class="small" onClick={() => setupLink(u)}>
                             Setup link
                           </button>
@@ -181,7 +198,7 @@ export default function IdentityCenter() {
               <p class="subtle small">
                 Users of Cairn's own directory sign in with passkeys, which they make with a setup link (valid 7 days).
                 Those of an identity source are here once they've signed in there, with their groups as it last said:
-                there's no directory sync. Groups of Cairn's own, and their members, are identitystore's API's.
+                there's no directory sync.
               </p>
             </Panel>
             <Show when={newUser()}>
@@ -194,19 +211,71 @@ export default function IdentityCenter() {
               />
             </Show>
             <Show when={link()}>{(l) => <EnrollmentDialog {...l()} valid="7 days" onClose={() => setLink(undefined)} />}</Show>
+            <Show when={editingUser()} keyed>
+              {(u) => <EditDirectoryUserDialog user={u} onClose={() => setEditingUser(undefined)} changed={data.refresh} />}
+            </Show>
             <Panel title="Groups" note={`${d()[3].length}`}>
-              <Table count={d()[3].length} empty="No group yet: none was in a group claim of anyone who signed in." columns={["Name", "Source", { label: "Members", num: true }]}>
+              <div class="buttons">
+                <button onClick={() => setEditingGroup("new")}>New group…</button>
+              </div>
+              <Table count={d()[3].length} empty="No group yet." columns={["Name", "Source", "Members", ""]}>
                 <For each={d()[3]}>
                   {(g) => (
                     <tr>
-                      <td class="mono">{g.name}</td>
-                      <td class="mono small">{g.provider}</td>
-                      <td class="num">{g.members}</td>
+                      <td>
+                        <span class="mono">{g.name}</span>
+                        <Show when={g.description}>{(text) => <div class="subtle small">{text()}</div>}</Show>
+                      </td>
+                      <td class="small">
+                        <Show when={g.provider} fallback="Cairn">
+                          {(p) => <span class="mono">{p()}</span>}
+                        </Show>
+                      </td>
+                      <td>
+                        <For each={g.memberships} fallback={<span class="subtle">none</span>}>
+                          {(m) => (
+                            <span class="chip mono">
+                              {m.user_name}
+                              <Show when={!g.provider}>
+                                {" "}
+                                <button class="link small" title={`Take ${m.user_name} out`} onClick={() => removeMember(g, m)}>
+                                  ×
+                                </button>
+                              </Show>
+                            </span>
+                          )}
+                        </For>
+                      </td>
+                      <td class="actions">
+                        <Show when={!g.provider}>
+                          <button class="small" onClick={() => setAddingTo(g)}>
+                            Add member…
+                          </button>
+                          <button class="small" onClick={() => setEditingGroup(g)}>
+                            Edit…
+                          </button>
+                          <button class="small danger" onClick={() => deleteGroup(g)}>
+                            Delete
+                          </button>
+                        </Show>
+                      </td>
                     </tr>
                   )}
                 </For>
               </Table>
+              <p class="subtle small">
+                Groups of Cairn's own directory may have any directory user as a member, an identity source's too, whose
+                sign-ins leave those memberships alone. An identity source's groups are what its group claim last said.
+              </p>
             </Panel>
+            <Show when={editingGroup()} keyed>
+              {(g) => (
+                <GroupDialog group={g === "new" ? undefined : g} onClose={() => setEditingGroup(undefined)} changed={data.refresh} />
+              )}
+            </Show>
+            <Show when={addingTo()} keyed>
+              {(g) => <AddMemberDialog group={g} users={d()[2]} onClose={() => setAddingTo(undefined)} changed={data.refresh} />}
+            </Show>
             <Show when={creating()}>
               <NewPermissionSetDialog onClose={() => setCreating(false)} changed={data.refresh} />
             </Show>
@@ -348,8 +417,8 @@ function AssignDialog(props: {
             when={options().length}
             fallback={
               <p class="subtle small">
-                No {kind() === "GROUP" ? "group" : "user"} yet: users and groups are here once someone has signed in
-                with them.
+                No {kind() === "GROUP" ? "group" : "user"} yet: make one on the Identity Center page, or have someone
+                sign in at an identity source.
               </p>
             }
           >
@@ -407,8 +476,11 @@ export function PermissionSetPage() {
     if (!confirm(`Detach ${policy} from ${name()}? Its users lose what it allowed them at once.`)) return;
     if (await act(() => api.detachFromPermissionSet(name(), arn), `Detached ${policy}`)) data.refresh();
   };
+  const provision = async () => {
+    if (await act(() => api.provisionPermissionSet(name()), `Provisioned ${name()}`)) data.refresh();
+  };
   const remove = async () => {
-    if (!confirm(`Delete permission set ${name()}? Its assignments and its role go too, and with them its users' access.`)) return;
+    if (!confirm(`Delete permission set ${name()}? Its assignments and its roles in every account go too, and with them its users' access.`)) return;
     if (await act(() => api.deletePermissionSet(name()), `Deleted ${name()}`)) navigate("/identity-center");
   };
   const empty = '{\n  "Version": "2012-10-17",\n  "Statement": []\n}';
@@ -454,15 +526,26 @@ export function PermissionSetPage() {
                     {(p) => (
                       <div>
                         <span class="mono small">{p.account_id}</span>{" "}
-                        <A class="mono" href={roleHref(s().role_name)} title={p.role_arn}>
-                          {s().role_name}
-                        </A>{" "}
+                        <Show when={p.account_id === s().account_id} fallback={<span class="mono" title={p.role_arn}>{s().role_name}</span>}>
+                          <A class="mono" href={roleHref(s().role_name)} title={p.role_arn}>
+                            {s().role_name}
+                          </A>
+                        </Show>{" "}
                         <Show when={!p.latest}>
                           <Badge tone="warn">not the latest</Badge>
                         </Show>
                       </div>
                     )}
                   </For>
+                  <Show when={s().provisioned.some((p) => !p.latest)}>
+                    <button class="small" onClick={provision}>
+                      Provision again
+                    </button>
+                    <div class="subtle small">
+                      Some roles don't hold the set as it is now: it was changed by a session that may not provision it,
+                      or through sso-admin, or provisioning failed.
+                    </div>
+                  </Show>
                 </dd>
               </dl>
             </Panel>
@@ -476,16 +559,17 @@ export function PermissionSetPage() {
               note={<p class="subtle small">A permission set has one inline policy, {INLINE}, as in Identity Center.</p>}
             />
             <Panel title="Assignments" note={`${assignments().length}`}>
-              <Table count={assignments().length} empty="None: no one uses it." columns={["To", "Source"]}>
+              <Table count={assignments().length} empty="None: no one uses it." columns={["Account", "To", "Source"]}>
                 <For each={assignments()}>
                   {(a) => (
                     <tr>
+                      <td class="mono small">{a.account_id}</td>
                       <td>
                         <Show when={a.principal_type === "USER"} fallback={<><Badge>group</Badge> <span class="mono">{a.principal_name}</span></>}>
                           {a.principal_name}
                         </Show>
                       </td>
-                      <td class="mono small">{a.provider}</td>
+                      <td class="mono small">{a.provider ?? "Cairn"}</td>
                     </tr>
                   )}
                 </For>
@@ -687,6 +771,168 @@ function NewDirectoryUserDialog(props: { onClose: () => void; created: (user: st
           </button>
           <button class="primary" type="submit">
             Create
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+/** Changes a user of Cairn's own directory. */
+function EditDirectoryUserDialog(props: { user: DirectoryUser; onClose: () => void; changed: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const [userName, setUserName] = createSignal(props.user.user_name);
+  const [displayName, setDisplayName] = createSignal(props.user.display_name);
+  const [givenName, setGivenName] = createSignal(props.user.given_name ?? "");
+  const [familyName, setFamilyName] = createSignal(props.user.family_name ?? "");
+  const [email, setEmail] = createSignal(props.user.email ?? "");
+  const [error, setError] = createSignal<string>();
+  const save = async (e: SubmitEvent) => {
+    e.preventDefault();
+    setError(undefined);
+    try {
+      await api.updateDirectoryUser(props.user.id, {
+        user_name: userName(),
+        display_name: displayName() || userName(),
+        given_name: givenName() || null,
+        family_name: familyName() || null,
+        email: email() || null,
+      });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    toast(`Saved ${userName()}`);
+    props.changed();
+    dialog.close();
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={save}>
+        <h2>
+          Edit <span class="mono">{props.user.user_name}</span>
+        </h2>
+        <label class="field">
+          User name
+          <input type="text" required maxLength={128} pattern="\S+" value={userName()} onInput={(e) => setUserName(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          Display name
+          <input type="text" maxLength={1024} placeholder={userName()} value={displayName()} onInput={(e) => setDisplayName(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          Given name
+          <input type="text" maxLength={1024} value={givenName()} onInput={(e) => setGivenName(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          Family name
+          <input type="text" maxLength={1024} value={familyName()} onInput={(e) => setFamilyName(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          E-mail
+          <input type="email" maxLength={1024} value={email()} onInput={(e) => setEmail(e.currentTarget.value)} />
+        </label>
+        <p class="subtle small">Sessions already signed in keep the user name they were named after.</p>
+        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit">
+            Save
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+/** Makes a group of Cairn's own directory, or changes one. */
+function GroupDialog(props: { group?: DirectoryGroup; onClose: () => void; changed: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const [name, setName] = createSignal(props.group?.name ?? "");
+  const [description, setDescription] = createSignal(props.group?.description ?? "");
+  const [error, setError] = createSignal<string>();
+  const save = async (e: SubmitEvent) => {
+    e.preventDefault();
+    setError(undefined);
+    try {
+      if (props.group) await api.updateDirectoryGroup(props.group.id, name(), description());
+      else await api.createDirectoryGroup(name(), description());
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+      return;
+    }
+    toast(props.group ? `Saved ${name()}` : `Made group ${name()}`);
+    props.changed();
+    dialog.close();
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={save}>
+        <h2>{props.group ? <>Edit <span class="mono">{props.group.name}</span></> : "New group"}</h2>
+        <label class="field">
+          Name
+          <input type="text" required maxLength={1024} value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+        </label>
+        <label class="field">
+          Description
+          <input type="text" maxLength={1024} value={description()} onInput={(e) => setDescription(e.currentTarget.value)} />
+        </label>
+        <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit">
+            {props.group ? "Save" : "Create"}
+          </button>
+        </div>
+      </form>
+    </dialog>
+  );
+}
+
+/** Puts a directory user (any, an identity source's too) in a group of
+ * Cairn's own directory. */
+function AddMemberDialog(props: { group: DirectoryGroup; users: DirectoryUser[]; onClose: () => void; changed: () => void }) {
+  let dialog!: HTMLDialogElement;
+  onMount(() => dialog.showModal());
+  const candidates = () => props.users.filter((u) => !props.group.memberships.some((m) => m.user_id === u.id));
+  const [chosen, setChosen] = createSignal(candidates()[0]?.id ?? "");
+  const add = async (e: SubmitEvent) => {
+    e.preventDefault();
+    const user = props.users.find((u) => u.id === chosen());
+    if (await act(() => api.addGroupMember(props.group.id, chosen()), `Added ${user?.user_name ?? "them"} to ${props.group.name}`)) {
+      props.changed();
+      dialog.close();
+    }
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <form onSubmit={add}>
+        <h2>
+          Add a member to <span class="mono">{props.group.name}</span>
+        </h2>
+        <Show when={candidates().length} fallback={<p class="subtle">Every directory user is in it already.</p>}>
+          <label class="field">
+            User
+            <select value={chosen()} onChange={(e) => setChosen(e.currentTarget.value)}>
+              <For each={candidates()}>
+                {(u) => <option value={u.id}>{`${u.display_name} (${u.user_name}, ${u.provider ?? "Cairn"})`}</option>}
+              </For>
+            </select>
+          </label>
+        </Show>
+        <p class="subtle small">They get what the group's assignments give it at once.</p>
+        <div class="buttons">
+          <button type="button" onClick={() => dialog.close()}>
+            Cancel
+          </button>
+          <button class="primary" type="submit" disabled={!chosen()}>
+            Add
           </button>
         </div>
       </form>

@@ -243,6 +243,55 @@
         }
       }
     },
+    "/accounts/{id}/parent": {
+      "put": {
+        "summary": "Moves an account to the root or a unit.",
+        "operationId": "move_account",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountParent"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Moved"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/assignments": {
       "get": {
         "operationId": "list_assignments",
@@ -2072,6 +2121,231 @@
             }
           }
         }
+      },
+      "post": {
+        "summary": "Makes a group of Cairn's own directory, as identitystore's CreateGroup.",
+        "operationId": "create_directory_group",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryGroupChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewDirectoryGroupId"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/directory-groups/{id}": {
+      "put": {
+        "summary": "Changes a group of Cairn's own directory, as identitystore's UpdateGroup.",
+        "operationId": "update_directory_group",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryGroupChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a group of Cairn's own directory: its memberships and\nassignments go too.",
+        "operationId": "delete_directory_group",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/directory-groups/{id}/members": {
+      "post": {
+        "summary": "Puts a directory user (any, a source's too) in a group of Cairn's own\ndirectory, as identitystore's CreateGroupMembership.",
+        "operationId": "add_group_member",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewGroupMember"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Added"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/directory-groups/{id}/members/{membership}": {
+      "delete": {
+        "summary": "Takes a user out of a group of Cairn's own directory, by the\nmembership's ID, as identitystore's DeleteGroupMembership.",
+        "operationId": "remove_group_member",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "membership",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
       }
     },
     "/directory-users": {
@@ -2156,6 +2430,53 @@
       }
     },
     "/directory-users/{id}": {
+      "put": {
+        "summary": "Changes a user of Cairn's own directory, as identitystore's UpdateUser.",
+        "operationId": "update_directory_user",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryUserChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
       "delete": {
         "summary": "Deletes a user of Cairn's own directory: its memberships, assignments,\npasskeys and sessions go too.",
         "operationId": "delete_directory_user",
@@ -3735,6 +4056,497 @@
         }
       }
     },
+    "/organization": {
+      "get": {
+        "operationId": "get_organization",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OrganizationOverview"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/organization/policies": {
+      "post": {
+        "summary": "Makes a service control policy (attached nowhere yet).",
+        "operationId": "create_scp",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScpChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewScpId"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/organization/policies/{id}": {
+      "get": {
+        "summary": "A service control policy's document.",
+        "operationId": "get_scp",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScpContent"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "summary": "Changes a service control policy: at once, wherever it's attached.",
+        "operationId": "update_scp",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScpChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Changed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a service control policy, which must be attached nowhere.",
+        "operationId": "delete_scp",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/organization/policies/{id}/targets": {
+      "post": {
+        "summary": "Attaches a service control policy to the root, a unit or an account.",
+        "operationId": "attach_scp",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScpTarget"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Attached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/organization/policies/{id}/targets/{target}": {
+      "delete": {
+        "summary": "Detaches a service control policy from a target, which must keep one.",
+        "operationId": "detach_scp",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "target",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Detached"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/organization/scps": {
+      "put": {
+        "summary": "Enables service control policies: FullAWSAccess is attached to the\nroot, every unit and every account.",
+        "operationId": "enable_scps",
+        "responses": {
+          "204": {
+            "description": "Enabled"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Disables service control policies: every SCP is detached.",
+        "operationId": "disable_scps",
+        "responses": {
+          "204": {
+            "description": "Disabled"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/organization/units": {
+      "post": {
+        "summary": "Makes an organizational unit, in the root or another unit (five deep at\nmost).",
+        "operationId": "create_unit",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewUnit"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NewUnitId"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/organization/units/{id}": {
+      "put": {
+        "summary": "Renames an organizational unit.",
+        "operationId": "rename_unit",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnitName"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Renamed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes an organizational unit, which must be empty.",
+        "operationId": "delete_unit",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/passkeys": {
       "post": {
         "summary": "Adds a passkey to the signed-in login.",
@@ -4341,6 +5153,45 @@
         "responses": {
           "204": {
             "description": "Removed"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/permission-sets/{name}/provision": {
+      "post": {
+        "summary": "Provisions a permission set again to every account it's provisioned to,\nas sso-admin's `ProvisionPermissionSet` for `ALL_PROVISIONED_ACCOUNTS`:\ntheir roles hold it as it is now. For a set whose roles don't, as when\nit was changed by a session that may not provision it, or through\nsso-admin.",
+        "operationId": "provision_permission_set",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Provisioned"
           },
           "4XX": {
             "content": {
@@ -6867,6 +7718,18 @@
           }
         }
       },
+      "AccountParent": {
+        "type": "object",
+        "required": [
+          "parent_id"
+        ],
+        "properties": {
+          "parent_id": {
+            "type": "string",
+            "description": "The root's or a unit's ID."
+          }
+        }
+      },
       "AccountSummary": {
         "type": "object",
         "description": "An account of the organization.",
@@ -6910,6 +7773,13 @@
           },
           "name": {
             "type": "string"
+          },
+          "parent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The organizational unit it's in; none for the root."
           },
           "status": {
             "type": "string",
@@ -7894,15 +8764,41 @@
           }
         }
       },
+      "DirectoryGroupChange": {
+        "type": "object",
+        "description": "A group of Cairn's own directory, as it's made or changed.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string",
+            "description": "Its display name, unique among Cairn's own groups."
+          }
+        }
+      },
       "DirectoryGroupSummary": {
         "type": "object",
-        "description": "A group, as its users' group claims named it.",
+        "description": "A group: an identity source's, as its users' group claims named it, or\none of Cairn's own directory.",
         "required": [
           "id",
           "name",
-          "members"
+          "members",
+          "memberships"
         ],
         "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string",
             "description": "Its ID in the identity store."
@@ -7910,7 +8806,14 @@
           "members": {
             "type": "integer",
             "format": "int64",
-            "description": "How many users it had, as their last sign-ins said."
+            "description": "How many users it has (a source's: as their last sign-ins said)."
+          },
+          "memberships": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GroupMember"
+            },
+            "description": "Its members."
           },
           "name": {
             "type": "string"
@@ -7995,6 +8898,41 @@
           }
         }
       },
+      "DirectoryUserChange": {
+        "type": "object",
+        "description": "What a user of Cairn's own directory becomes: its attributes as the\nconsole has them (others it has, set with identitystore's API, stay).",
+        "required": [
+          "user_name",
+          "display_name"
+        ],
+        "properties": {
+          "display_name": {
+            "type": "string"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "family_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "given_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "user_name": {
+            "type": "string",
+            "description": "Its user name: 1 to 128 characters, no spaces."
+          }
+        }
+      },
       "DirectoryUserSummary": {
         "type": "object",
         "description": "A directory user, as it last signed in.",
@@ -8018,10 +8956,23 @@
               "null"
             ]
           },
+          "family_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "first_signed_in": {
             "type": "number",
             "format": "double",
             "description": "When it was first in the identity store, and when it last changed\n(a source's: signed in)."
+          },
+          "given_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "A user of Cairn's own directory's names (its `Name`'s parts)."
           },
           "groups": {
             "type": "array",
@@ -8441,6 +9392,27 @@
           }
         }
       },
+      "GroupMember": {
+        "type": "object",
+        "description": "A user's membership of a group.",
+        "required": [
+          "id",
+          "user_id",
+          "user_name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "The membership's ID."
+          },
+          "user_id": {
+            "type": "string"
+          },
+          "user_name": {
+            "type": "string"
+          }
+        }
+      },
       "GroupSummary": {
         "type": "object",
         "description": "A group: users whose policies include the group's.",
@@ -8615,7 +9587,8 @@
           "account_id",
           "account",
           "user",
-          "arn"
+          "arn",
+          "management"
         ],
         "properties": {
           "account": {
@@ -8627,6 +9600,10 @@
           "arn": {
             "type": "string",
             "description": "The user's ARN, which policies name it by."
+          },
+          "management": {
+            "type": "boolean",
+            "description": "Whether its account is the organization's management account, whose\nalone Identity Center and the organization are."
           },
           "user": {
             "type": "string",
@@ -9676,6 +10653,18 @@
           }
         }
       },
+      "NewDirectoryGroupId": {
+        "type": "object",
+        "description": "The ID of a new group.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        }
+      },
       "NewDirectoryUser": {
         "type": "object",
         "required": [
@@ -9719,6 +10708,19 @@
         "properties": {
           "id": {
             "type": "string"
+          }
+        }
+      },
+      "NewGroupMember": {
+        "type": "object",
+        "description": "A user to put in a group.",
+        "required": [
+          "user_id"
+        ],
+        "properties": {
+          "user_id": {
+            "type": "string",
+            "description": "The user's ID in the identity store."
           }
         }
       },
@@ -9913,6 +10915,18 @@
           }
         }
       },
+      "NewScpId": {
+        "type": "object",
+        "description": "The ID of a new SCP.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          }
+        }
+      },
       "NewSetting": {
         "type": "object",
         "description": "Sets the rate lifecycle sweeps go at, for the whole cluster.\nA cluster setting's new value; `null` unsets it (it's back to its\ndefault, or for `parity-shards`, every node goes by its flag again).",
@@ -9967,6 +10981,35 @@
             "type": "string"
           },
           "name": {
+            "type": "string"
+          }
+        }
+      },
+      "NewUnit": {
+        "type": "object",
+        "required": [
+          "name",
+          "parent_id"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "1 to 128 characters."
+          },
+          "parent_id": {
+            "type": "string",
+            "description": "The root's or a unit's ID."
+          }
+        }
+      },
+      "NewUnitId": {
+        "type": "object",
+        "description": "The ID of a new unit.",
+        "required": [
+          "id"
+        ],
+        "properties": {
+          "id": {
             "type": "string"
           }
         }
@@ -10377,6 +11420,47 @@
           }
         ]
       },
+      "OrganizationOverview": {
+        "type": "object",
+        "description": "The organization's structure and its SCPs.",
+        "required": [
+          "root_id",
+          "scps_enabled",
+          "units",
+          "policies",
+          "attachments"
+        ],
+        "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScpAttachment"
+            },
+            "description": "Which SCPs each target (the root, a unit, an account) has."
+          },
+          "policies": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ScpSummary"
+            },
+            "description": "FullAWSAccess first."
+          },
+          "root_id": {
+            "type": "string",
+            "description": "The root's ID (`r-…`), which units and accounts are under."
+          },
+          "scps_enabled": {
+            "type": "boolean",
+            "description": "Whether service control policies are enabled."
+          },
+          "units": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UnitSummary"
+            }
+          }
+        }
+      },
       "PackerSettings": {
         "type": "object",
         "required": [
@@ -10595,6 +11679,7 @@
         "required": [
           "name",
           "arn",
+          "account_id",
           "description",
           "session_duration",
           "role_name",
@@ -10605,6 +11690,10 @@
           "created_at"
         ],
         "properties": {
+          "account_id": {
+            "type": "string",
+            "description": "The instance's account (the management account), whose roles the\nconsole's IAM pages show."
+          },
           "arn": {
             "type": "string"
           },
@@ -11231,6 +12320,93 @@
         },
         "additionalProperties": false
       },
+      "ScpAttachment": {
+        "type": "object",
+        "description": "An SCP attached to a target.",
+        "required": [
+          "target_id",
+          "policy_id"
+        ],
+        "properties": {
+          "policy_id": {
+            "type": "string"
+          },
+          "target_id": {
+            "type": "string"
+          }
+        }
+      },
+      "ScpChange": {
+        "type": "object",
+        "description": "An SCP, as it's made or changed.",
+        "required": [
+          "name",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string",
+            "description": "The policy's JSON, at most 10,240 characters; an Allow statement's\nresource is `*` only."
+          },
+          "description": {
+            "type": "string",
+            "description": "At most 512 characters."
+          },
+          "name": {
+            "type": "string",
+            "description": "1 to 128 characters."
+          }
+        }
+      },
+      "ScpContent": {
+        "type": "object",
+        "description": "An SCP's document.",
+        "required": [
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "type": "string"
+          }
+        }
+      },
+      "ScpSummary": {
+        "type": "object",
+        "description": "A service control policy.",
+        "required": [
+          "id",
+          "name",
+          "description",
+          "aws_managed"
+        ],
+        "properties": {
+          "aws_managed": {
+            "type": "boolean",
+            "description": "AWS's FullAWSAccess, which can't be changed or deleted."
+          },
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "ScpTarget": {
+        "type": "object",
+        "required": [
+          "target_id"
+        ],
+        "properties": {
+          "target_id": {
+            "type": "string",
+            "description": "The root's, a unit's or an account's ID."
+          }
+        }
+      },
       "ScrubTotals": {
         "type": "object",
         "description": "What the scrubber did since the node started: the copies it checked (and\ntheir bytes), how many of them it found damaged or missing, how many of\nthose it repaired, and how many have data that's intact nowhere, and how\nmany of its passes failed.",
@@ -11595,6 +12771,40 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "UnitName": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "UnitSummary": {
+        "type": "object",
+        "description": "An organizational unit.",
+        "required": [
+          "id",
+          "name"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "parent_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its parent unit; none for the root."
           }
         }
       },

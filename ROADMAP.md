@@ -76,8 +76,8 @@ Done:
   Access Grants (instances' resource policies): implemented (KMS keys are
   OpenBao's, whose policies decide their use). Organizational units and
   service control policies: implemented. Next: organization condition
-  keys (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`), and the console's
-  OUs and SCPs. Also: directory users and groups as Access Grants
+  keys (`aws:PrincipalOrgID`, `aws:PrincipalOrgPaths`). The console's
+  OUs and SCPs: implemented. Also: directory users and groups as Access Grants
   grantees, switching roles in the console, and the access portal's APIs
   for `aws sso login`.
 

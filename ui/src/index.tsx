@@ -92,7 +92,7 @@ function Layout(props: RouteSectionProps) {
         <nav>
           <Show when={me()}>
             {(m) => (
-              <For each={m().cluster ? [...CLUSTER_NAV, ...ACCOUNT_NAV, ...OPERATOR_NAV] : ACCOUNT_NAV}>
+              <For each={nav(m())}>
                 {([href, label]) => (
                   <A href={href} end={href === "/"} activeClass="active">
                     {label}
@@ -154,6 +154,13 @@ const OPERATOR_NAV: [string, string][] = [
   ["/organization", "Organization"],
   ["/sign-in", "Sign-in"],
 ];
+
+/** The pages `m` sees: Identity Center only in the management account,
+ * whose alone it is; the cluster's and the operators' to operators. */
+function nav(m: Me): [string, string][] {
+  const account = ACCOUNT_NAV.filter(([href]) => href !== "/identity-center" || m.identity.management);
+  return m.cluster ? [...CLUSTER_NAV, ...account, ...OPERATOR_NAV] : account;
+}
 
 /** Who the session acts as: the user's name, or a directory user's
  * permission set (or its own name, until it picks one). */

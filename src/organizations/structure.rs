@@ -184,6 +184,59 @@ pub async fn attach_default(client: &Object, target: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+/// An organizational unit, as the console shows it.
+pub struct Unit {
+    pub id: String,
+    pub name: String,
+    /// Its parent unit; `None` for the root.
+    pub parent: Option<String>,
+}
+
+/// An SCP, as the console shows it.
+pub struct Scp {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    /// Whether it's AWS's (FullAWSAccess), which can't be changed.
+    pub aws_managed: bool,
+}
+
+/// The organization's structure at once, for the console: its root's ID,
+/// whether SCPs are enabled, its units, its SCPs (FullAWSAccess first), and
+/// which SCPs each target has (target ID, policy ID).
+pub struct Overview {
+    pub root_id: String,
+    pub scps_enabled: bool,
+    pub units: Vec<Unit>,
+    pub policies: Vec<Scp>,
+    pub attachments: Vec<(String, String)>,
+}
+
+pub async fn overview(client: &Object, management: &str) -> anyhow::Result<Overview> {
+    let units = client
+        .query_cached("SELECT id, name, parent_id FROM organizational_units ORDER BY name", &[])
+        .await?
+        .iter()
+        .map(|r| Unit { id: r.get(0), name: r.get(1), parent: r.get(2) })
+        .collect();
+    let mut policies = vec![Scp {
+        id: FULL_ACCESS.to_owned(),
+        name: "FullAWSAccess".to_owned(),
+        description: "Allows access to every operation".to_owned(),
+        aws_managed: true,
+    }];
+    for r in client.query_cached("SELECT id, name, description FROM organization_policies ORDER BY name", &[]).await? {
+        policies.push(Scp { id: r.get(0), name: r.get(1), description: r.get(2), aws_managed: false });
+    }
+    let attachments = client
+        .query_cached("SELECT target_id, policy_id FROM organization_policy_attachments ORDER BY target_id, policy_id", &[])
+        .await?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    Ok(Overview { root_id: root_id(management), scps_enabled: scps_enabled(client).await?, units, policies, attachments })
+}
+
 // ─── The API ─────────────────────────────────────────────────────────────────
 
 /// The operations of this part, with their actions.
