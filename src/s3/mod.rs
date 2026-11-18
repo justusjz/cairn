@@ -1103,6 +1103,17 @@ async fn handle_request(
         },
         _ => object_lock::Lock::default(),
     };
+    // The storage class a write asks for (see `classes`).
+    let storage_class = match operation.name {
+        "PutObject" | "CopyObject" | "CreateMultipartUpload" => {
+            let header = req.headers().get("x-amz-storage-class").and_then(|v| v.to_str().ok());
+            match crate::classes::resolve(&app, header).await? {
+                Ok(class) => class,
+                Err(name) => return Ok(box_response(crate::classes::invalid(&name))),
+            }
+        }
+        _ => crate::classes::STANDARD.to_owned(),
+    };
     if let Some(v) = version_id.as_deref().filter(|v| addresses_version && !is_version_id(v)) {
         return Ok(box_response(invalid_version_id("versionId", v)));
     }
@@ -1387,7 +1398,7 @@ async fn handle_request(
                         let initiator = principal.as_ref().map(Principal::arn);
                         create_multipart_upload(
                             &app, &bucket, &key, &content_type, &metadata, &tags, wanted, role, checksum, lock,
-                            initiator.as_deref(),
+                            initiator.as_deref(), &storage_class,
                         )
                         .await?
                     }
@@ -1526,6 +1537,7 @@ async fn handle_request(
                     restates: ["x-amz-storage-class", "x-amz-website-redirect-location"]
                         .iter()
                         .any(|name| req.headers().contains_key(*name)),
+                    storage_class: Some(&storage_class),
                 },
             )
             .await?
@@ -1541,7 +1553,7 @@ async fn handle_request(
                 let body = req.into_body();
                 put_object(
                     &app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &preconditions, wanted, role,
-                    lock,
+                    lock, &storage_class,
                 )
                 .await?
             }

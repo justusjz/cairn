@@ -30,7 +30,7 @@ async fn node() -> Option<Arc<App>> {
 /// Writes `key` with `body` and the request headers `pairs`' metadata, as
 /// PutObject does.
 async fn put(app: &Arc<App>, key: &str, body: &str, pairs: &[(&str, &str)]) {
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "text/html".to_owned(),

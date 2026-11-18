@@ -75,7 +75,7 @@ pub async fn list_object_versions(
                     to_char(last_modified AT TIME ZONE 'UTC',
                             'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"') AS last_modified,
                     sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed,
-                    checksum_algorithm, checksum_type
+                    checksum_algorithm, checksum_type, storage_class
              FROM pg_temp.cairn_list_versions($1, $2, $3, $4, $5, $6)",
             &[&bucket, &prefix, &delim, &key_marker, &marker_id, &limit],
         )
@@ -122,8 +122,9 @@ pub async fn list_object_versions(
             let checksum = crate::s3::checksums::listed(row, 12);
             entries.push_str(&format!(
                 "<Version>{common}<ETag>\"{}\"</ETag>{checksum}<Size>{size}</Size>\
-                 <StorageClass>STANDARD</StorageClass>{owner}</Version>",
+                 <StorageClass>{}</StorageClass>{owner}</Version>",
                 xml_escape(etag),
+                row.get::<_, &str>("storage_class"),
             ));
         }
     }

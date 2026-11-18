@@ -42,11 +42,11 @@ pub async fn list_parts(
         .await?;
     // It must belong to the request's bucket and key: authorization only
     // checked the bucket.
-    let Some((encryption, checksum, initiator, initiated, lifecycle)) = tx
+    let Some((encryption, checksum, initiator, initiated, lifecycle, storage_class)) = tx
         .query_opt_cached(
             "SELECT u.sse_c_key, u.sse_kms_key_id, u.sse_kms_data_key, u.sse_kms_sealed, u.sse_kms_context,
                     u.sse_s3, u.checksum_algorithm, u.checksum_type, u.initiator,
-                    extract(epoch FROM u.initiated_at)::float8, b.lifecycle
+                    extract(epoch FROM u.initiated_at)::float8, b.lifecycle, u.storage_class
              FROM multipart_uploads u JOIN buckets b ON b.name = u.bucket
              WHERE u.upload_id = $1 AND u.bucket = $2 AND u.key = $3",
             &[&upload, &bucket, &key],
@@ -54,12 +54,19 @@ pub async fn list_parts(
         .await?
         .map(|row| {
             let initiated = crate::s3::expiration::from_epoch(row.get(9));
-            (Stored::from_row(&row, 0), checksum_columns(&row, 6), row.get::<_, Option<String>>(8), initiated, row.get::<_, Option<String>>(10))
+            (
+                Stored::from_row(&row, 0),
+                checksum_columns(&row, 6),
+                row.get::<_, Option<String>>(8),
+                initiated,
+                row.get::<_, Option<String>>(10),
+                row.get::<_, String>(11),
+            )
         })
     else {
         return Ok(crate::s3::multipart::no_such_upload(&upload_id.to_string()));
     };
-    let upload_info = Upload { encryption, checksum };
+    let upload_info = Upload { encryption, checksum, storage_class: storage_class.clone() };
     // One more than a page, to tell whether there's more.
     let limit = max_parts + 1;
     let rows = tx
@@ -120,7 +127,7 @@ pub async fn list_parts(
          <ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Bucket>{}</Bucket><Key>{}</Key><UploadId>{upload}</UploadId>\
          {initiator}<Owner>{owner}</Owner>\
-         <StorageClass>STANDARD</StorageClass>{}\
+         <StorageClass>{storage_class}</StorageClass>{}\
          <PartNumberMarker>{part_number_marker}</PartNumberMarker>",
         xml_escape(bucket),
         xml_escape(key),

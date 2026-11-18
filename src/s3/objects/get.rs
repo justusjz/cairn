@@ -55,6 +55,8 @@ pub(crate) struct ObjectVersion {
     /// only for the current version read without naming it, as in S3
     /// (see `s3::expiration`).
     pub expiration: Option<hyper::header::HeaderValue>,
+    /// Its storage class (see `classes`).
+    pub storage_class: String,
 }
 
 /// Why a read found nothing to read. Each read reports it differently.
@@ -125,7 +127,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
                     o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed, o.sse_kms_context,
                     o.sse_s3, o.checksum_algorithm, o.checksum_type, o.checksum, o.tags, {},
                     CASE WHEN $3::text IS NULL THEN b.lifecycle END,
-                    extract(epoch FROM o.last_modified)::float8
+                    extract(epoch FROM o.last_modified)::float8, o.storage_class
              FROM objects o JOIN buckets b ON b.name = o.bucket
              WHERE o.bucket = $1 AND o.key = $2
                AND CASE WHEN $3::text IS NULL THEN o.is_latest ELSE o.version_id = $3 END",
@@ -172,6 +174,7 @@ pub(crate) async fn lookup_version<C: GenericClient>(
                 crate::s3::expiration::from_epoch(row.get(at + 1)),
             )
         },
+        storage_class: row.get(26),
     }))
 }
 
@@ -231,6 +234,7 @@ pub async fn get_object(
         tags,
         lock,
         expiration,
+        storage_class,
         ..
     } = version;
     // An SSE-C object only with its key; before the conditions, which would
@@ -316,6 +320,7 @@ pub async fn get_object(
         .header(header::LAST_MODIFIED, last_modified);
     let builder = metadata::apply(builder, &metadata);
     let builder = tag_count(builder, &tags);
+    let builder = storage_class_header(builder, &storage_class);
     let builder = lock.headers(builder);
     let builder = sse::echo(builder, &encryption, customer_key);
     let builder = match (&part, checksum.filter(|_| checksum_mode)) {
@@ -756,6 +761,7 @@ pub async fn head_object(
         tags,
         lock,
         expiration,
+        storage_class,
         ..
     } = match lookup_version(&client, bucket, key, version_id).await? {
         Ok(version) => version,
@@ -810,6 +816,7 @@ pub async fn head_object(
         .header(header::LAST_MODIFIED, last_modified);
     let builder = metadata::apply(builder, &metadata);
     let builder = tag_count(builder, &tags);
+    let builder = storage_class_header(builder, &storage_class);
     let builder = lock.headers(builder);
     let builder = sse::echo(builder, &encryption, customer_key);
     // Its checksum, if asked for: an encrypted one's sealed under its key,
@@ -962,6 +969,18 @@ impl PartRead {
             (Some(_), None) => anyhow::bail!("a part of an encrypted object has no salt"),
         };
         Ok(Checksum { algorithm: checksum.algorithm, kind: Type::Composite, value }.headers(builder))
+    }
+}
+
+/// `x-amz-storage-class`, as S3 tells it on GET and HEAD: for an object
+/// that isn't STANDARD.
+pub(crate) fn storage_class_header(
+    builder: hyper::http::response::Builder,
+    storage_class: &str,
+) -> hyper::http::response::Builder {
+    match storage_class {
+        crate::classes::STANDARD => builder,
+        class => builder.header("x-amz-storage-class", class),
     }
 }
 

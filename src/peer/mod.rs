@@ -261,7 +261,7 @@ async fn get_blob(
     let query = query.unwrap_or_default();
     let range = parse_range(&query);
     let expected = parse_layout(&query, blob_id);
-    let Some(mut file) = app.store.open_blob(blob_id).await? else {
+    let Some(mut file) = open(&app, &query, blob_id).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
     let crcs = match (expected, range) {
@@ -308,12 +308,21 @@ async fn get_table(
     ) else {
         return Ok(StatusCode::BAD_REQUEST.into_response());
     };
-    let Some(mut file) = app.store.open_blob(blob_id).await? else {
+    let Some(mut file) = open(&app, &query, blob_id).await? else {
         return Ok(StatusCode::NOT_FOUND.into_response());
     };
     match blob_file::read_table(&mut file, &expected, of, offset, length).await {
         Ok(crcs) => Ok(Body::from(crcs).into_response()),
         Err(e) => Err(damaged(&app, blob_id, e)),
+    }
+}
+
+/// Opens our file of a blob, in the pool `?pool=` names, or in any pool
+/// without one (a reader from before pools).
+async fn open(app: &App, query: &str, blob_id: Uuid) -> anyhow::Result<Option<tokio::fs::File>> {
+    match param(query, "pool") {
+        Some(pool) => app.store.open_in(&pool, blob_id).await,
+        None => app.store.open_blob_anywhere(blob_id).await,
     }
 }
 
@@ -329,7 +338,7 @@ fn damaged(app: &App, blob_id: Uuid, e: std::io::Error) -> Failed {
 
 /// Streams the body straight to disk (and announces the location), without
 /// buffering the whole blob in memory: our shard of the blob, `?shard=`,
-/// moved here from node `?replaces=`, or a further copy of a replicated blob
+/// in pool `?pool=` (`default` if it names none), moved here from node `?replaces=`, or a further copy of a replicated blob
 /// of `?adds_to=` parity shards, if given (see `write_blob_streaming`).
 /// Answers with the CRC of the file we stored, so the writer can check that
 /// we got exactly the bytes it sent.
@@ -354,7 +363,8 @@ async fn put_blob(
         (None, Some(Ok(parity_shards))) => crate::Placement::Add { parity_shards },
         _ => return Ok(StatusCode::BAD_REQUEST.into_response()),
     };
-    let crc = crate::write_blob_streaming(&app, &shard, placement, body).await?;
+    let pool = param(&query, "pool").unwrap_or_else(|| crate::classes::DEFAULT_POOL.to_owned());
+    let crc = crate::write_blob_streaming(&app, &shard, &pool, placement, body).await?;
     let crc = HeaderValue::from_str(&format!("{crc:016x}"))?;
     Ok(([(CRC64_HEADER, crc)], ()).into_response())
 }

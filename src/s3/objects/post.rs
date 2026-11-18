@@ -427,10 +427,19 @@ where
         Ok(lock) => lock,
         Err(refused) => return Ok(refused),
     };
+    // Its storage class, as a PutObject's header asks for it.
+    let class = headers.get("x-amz-storage-class").and_then(|v| v.to_str().ok());
+    let storage_class = match crate::classes::resolve(app, class).await? {
+        Ok(class) => class,
+        Err(name) => return Ok(crate::classes::invalid(&name)),
+    };
     let conditions = Preconditions::default();
     let role = principal.and_then(|principal| principal.kms_role());
     let body = FileBody(file);
-    let response = match put_object(app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &conditions, wanted, role, lock)
+    let response = match put_object(
+        app, &bucket, &key, &content_type, &metadata, &tags, body, payload, &conditions, wanted, role, lock,
+        &storage_class,
+    )
         .await
     {
         Ok(response) => response,

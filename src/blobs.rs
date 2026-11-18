@@ -31,12 +31,14 @@ use crate::{
 };
 
 /// A node holding a shard of a blob: the node's number (`nodes.id`), its
-/// peer URL, and which shard it holds.
+/// peer URL, which shard it holds, and in which of its pools (the blob's,
+/// see `classes`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Location {
     pub node: i32,
     pub peer_url: String,
     pub shard: u32,
+    pub pool: String,
 }
 
 /// The columns a blob's layout is read from, of `blobs b`, in the order
@@ -57,9 +59,9 @@ pub(crate) fn layout_at(row: &tokio_postgres::Row, first: usize) -> Option<Layou
     })
 }
 
-/// The columns a location is read from (`blob_locations bl`, `nodes n`), in
-/// the order `location_at` takes them.
-pub(crate) const LOCATION_COLUMNS: &str = "bl.node, n.peer_url, bl.shard";
+/// The columns a location is read from (`blob_locations bl`, `nodes n`,
+/// `blobs b`), in the order `location_at` takes them.
+pub(crate) const LOCATION_COLUMNS: &str = "bl.node, n.peer_url, bl.shard, b.pool";
 
 /// A location, from `LOCATION_COLUMNS` starting at column `first` of `row`.
 pub(crate) fn location_at(row: &tokio_postgres::Row, first: usize) -> Location {
@@ -67,6 +69,7 @@ pub(crate) fn location_at(row: &tokio_postgres::Row, first: usize) -> Location {
         node: row.get(first),
         peer_url: row.get(first + 1),
         shard: row.get::<_, i16>(first + 2) as u32,
+        pool: row.get(first + 3),
     }
 }
 
@@ -165,7 +168,8 @@ impl Drop for DiscardOnDrop {
 
 /// Deletes this node's file of a blob, unless the catalog places a shard of
 /// it here, or it's being written: a reap may come after a shard of the blob
-/// moved here (see `mover`), whose file it mustn't take. Under the file's
+/// moved here (see `mover`), whose file it mustn't take. Its files in
+/// pools other than the blob's are deleted either way. Under the file's
 /// lock, which a shard moving here holds from before its location moves until
 /// its file has the blob's name, so the check and the deletion can't straddle
 /// a move.
@@ -174,20 +178,20 @@ pub(crate) async fn remove_unplaced(app: &App, blob_id: Uuid) -> anyhow::Result<
     if app.writing.contains(blob_id) {
         return Ok(());
     }
-    let placed = app
+    // The pool the catalog places it in here, if it does: its files in
+    // the node's other pools are strays.
+    let placed: Option<String> = app
         .pool
         .get()
         .await?
         .query_opt_cached(
-            "SELECT 1 FROM blob_locations WHERE blob_id = $1 AND node = $2",
+            "SELECT b.pool FROM blob_locations bl JOIN blobs b ON b.blob_id = bl.blob_id
+             WHERE bl.blob_id = $1 AND bl.node = $2",
             &[&blob_id, &app.node],
         )
         .await?
-        .is_some();
-    if !placed {
-        app.store.remove_blob(blob_id).await?;
-    }
-    Ok(())
+        .map(|row| row.get(0));
+    app.store.remove_blob_except(blob_id, placed.as_deref()).await
 }
 
 /// Best-effort: once a set of blobs has been removed from the catalog, ask each
@@ -784,7 +788,7 @@ pub(crate) async fn fetch_table(
 ) -> io::Result<Vec<u8>> {
     let file = ShardFile { shard: location.shard, ..*file };
     if location.node == app.node {
-        let Some(mut f) = app.store.open_blob(file.blob_id).await.map_err(io::Error::other)? else {
+        let Some(mut f) = app.store.open_in(&location.pool, file.blob_id).await.map_err(io::Error::other)? else {
             return Err(io::Error::new(io::ErrorKind::NotFound, "the node doesn't have it"));
         };
         return blob_file::read_table(&mut f, &file, of, offset, len).await;
@@ -792,10 +796,11 @@ pub(crate) async fn fetch_table(
     let req = Request::builder()
         .method(Method::GET)
         .uri(format!(
-            "{}/blobs/{}/table?of={of}&offset={offset}&length={len}{}",
+            "{}/blobs/{}/table?of={of}&offset={offset}&length={len}{}&pool={}",
             location.peer_url,
             file.blob_id,
-            crate::peer::layout_query(&file)
+            crate::peer::layout_query(&file),
+            location.pool
         ))
         .body(PeerClient::empty())
         .map_err(io::Error::other)?;
@@ -846,21 +851,22 @@ impl Source {
         length: u64,
     ) -> io::Result<Opened> {
         if location.node == app.node {
-            Source::local(app, blob_id, file, offset, length).await
+            Source::local(app, &location.pool, blob_id, file, offset, length).await
         } else {
-            Source::remote(&app.peers, &location.peer_url, blob_id, file, offset, length).await
+            Source::remote(&app.peers, location, blob_id, file, offset, length).await
         }
     }
 
     /// Opens the local shard.
     async fn local(
         app: &App,
+        pool: &str,
         blob_id: Uuid,
         expected: Option<&ShardFile>,
         offset: u64,
         length: u64,
     ) -> io::Result<Opened> {
-        let Some(mut file) = app.store.open_blob(blob_id).await.map_err(io::Error::other)? else {
+        let Some(mut file) = app.store.open_in(pool, blob_id).await.map_err(io::Error::other)? else {
             return Ok(None);
         };
         let crcs = match expected {
@@ -882,17 +888,18 @@ impl Source {
     /// its file against the layout we send, which comes from the catalog.
     async fn remote(
         peers: &PeerClient,
-        peer_url: &str,
+        location: &Location,
         blob_id: Uuid,
         expected: Option<&ShardFile>,
         offset: u64,
         length: u64,
     ) -> io::Result<Opened> {
         let checksums = expected.map_or(String::new(), crate::peer::layout_query);
+        let Location { peer_url, pool, .. } = location;
         let req = Request::builder()
             .method(Method::GET)
             .uri(format!(
-                "{peer_url}/blobs/{blob_id}?offset={offset}&length={length}{checksums}"
+                "{peer_url}/blobs/{blob_id}?offset={offset}&length={length}{checksums}&pool={pool}"
             ))
             .body(PeerClient::empty())
             .map_err(io::Error::other)?;

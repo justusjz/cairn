@@ -702,7 +702,7 @@ async fn part_copies_of_and_into_sse_c() {
         let app = app.clone();
         let customer = customer.map(|c| customer_key(c.key()));
         async move {
-            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", "", Wanted::new(customer.as_ref(), None), None, None, Default::default(), None)
+            let response = create_multipart_upload(&app, BUCKET, "dst", "x", "", "", Wanted::new(customer.as_ref(), None), None, None, Default::default(), None, crate::classes::STANDARD)
                 .await
                 .unwrap();
             use http_body_util::BodyExt;

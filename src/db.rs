@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "8";
+pub(crate) const PROTOCOL: &str = "9";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -251,6 +251,7 @@ const MIGRATIONS: &[&str] = &[
     ORGANIZATIONS,
     ACCESS_GRANTS_POLICIES,
     ORGANIZATIONAL_UNITS,
+    STORAGE_CLASSES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3358,6 +3359,80 @@ CREATE TABLE organization_policy_types (
 );
 CREATE TRIGGER organization_policy_types_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON organization_policy_types
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 71: storage classes and pools (see `classes`). A node keeps
+/// its data in one or more pools (a data dir each, `node_pools`), and a
+/// storage class says which pool its blobs go to, and in how many data and
+/// parity shards (NULL: as the cluster's `data-shards` and `parity-shards`
+/// settings say, as STANDARD's do). Every blob is of a class, and in a pool,
+/// all of its shards; an object version and a multipart upload are of the
+/// class their parts' blobs are. What there was is STANDARD, in the pool
+/// `default`.
+///
+/// Lock protocol 9: the protocol itself doesn't change, but a node of
+/// protocol 8 would place shards on nodes without their pool, and pack blobs
+/// of different classes together. The gate goes first.
+const STORAGE_CLASSES: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '9' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE TABLE storage_classes (
+    name           text PRIMARY KEY CHECK (name ~ '^[A-Z][A-Z0-9_]{0,63}$'),
+    pool           text NOT NULL CHECK (pool ~ '^[a-z0-9][a-z0-9_-]{0,31}$'),
+    data_shards    smallint CHECK (data_shards >= 1),
+    parity_shards  smallint CHECK (parity_shards >= 0),
+    created_at     timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER storage_classes_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON storage_classes
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+INSERT INTO storage_classes (name, pool) VALUES ('STANDARD', 'default');
+
+-- A node's pools, as of its last heartbeat, and their disks' space.
+CREATE TABLE node_pools (
+    node        int NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,
+    pool        text NOT NULL CHECK (pool ~ '^[a-z0-9][a-z0-9_-]{0,31}$'),
+    free_space  bigint NOT NULL,
+    PRIMARY KEY (node, pool)
+);
+CREATE TRIGGER node_pools_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON node_pools
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+INSERT INTO node_pools (node, pool, free_space) SELECT id, 'default', free_space FROM nodes;
+
+-- NOT VALID: every existing row is STANDARD, which exists, and checking
+-- that would read every row. New rows are checked.
+ALTER TABLE blobs
+    ADD COLUMN storage_class text NOT NULL DEFAULT 'STANDARD',
+    ADD COLUMN pool text NOT NULL DEFAULT 'default';
+ALTER TABLE blobs ADD CONSTRAINT blobs_storage_class
+    FOREIGN KEY (storage_class) REFERENCES storage_classes(name) NOT VALID;
+ALTER TABLE objects ADD COLUMN storage_class text NOT NULL DEFAULT 'STANDARD';
+ALTER TABLE objects ADD CONSTRAINT objects_storage_class
+    FOREIGN KEY (storage_class) REFERENCES storage_classes(name) NOT VALID;
+ALTER TABLE multipart_uploads ADD COLUMN storage_class text NOT NULL DEFAULT 'STANDARD';
+ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_storage_class
+    FOREIGN KEY (storage_class) REFERENCES storage_classes(name) NOT VALID;
+
+-- The packer's and the mover's candidates, a class at a time (see
+-- `cairn_claim`, `cairn_claim_copies`): as before, by class first. And the
+-- blobs not in their class's pool, which the packer rewrites there.
+DROP INDEX blobs_small;
+CREATE INDEX blobs_small ON blobs (storage_class, created_at)
+    WHERE state = 'committed' AND size <= 67108864;
+DROP INDEX blobs_large;
+CREATE INDEX blobs_large ON blobs (storage_class, data_shards, parity_shards)
+    WHERE state = 'committed' AND block_size IS NOT NULL AND size > 67108864;
+DROP INDEX blobs_copies;
+CREATE INDEX blobs_copies ON blobs (storage_class, parity_shards)
+    WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL;
+CREATE INDEX blobs_pool ON blobs (storage_class, pool) WHERE state = 'committed';
 "#;
 
 #[cfg(test)]

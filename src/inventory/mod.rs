@@ -334,7 +334,7 @@ impl Source {
 const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, etag,
     sse_s3, sse_kms_key_id, sse_kms_data_key, sse_kms_sealed, last_modified,
     sse_c_key IS NOT NULL, checksum_algorithm, retain_mode, retain_until,
-    legal_hold, upload_id IS NOT NULL, tags";
+    legal_hold, upload_id IS NOT NULL, tags, storage_class";
 
 /// The next page of up to `limit` of the bucket's versions (or current
 /// objects) under the configuration's prefix, after `after`: a key, and
@@ -636,7 +636,7 @@ async fn values(
             Column::Field(field) => match field {
                 Field::Size => Value::Int(row.get(5)),
                 Field::ETag => optional(crate::s3::objects::list::listed_etag(app, bucket, key, row, 6, 7).await?),
-                Field::StorageClass => text("STANDARD"),
+                Field::StorageClass => text(row.get(19)),
                 Field::IsMultipartUploaded => Value::Bool(row.get(17)),
                 Field::EncryptionStatus => {
                     let sse_s3: bool = row.get(7);
@@ -920,6 +920,7 @@ where
         Wanted::new(None, server.as_ref()),
         target.report.setter,
         Lock::default(),
+        crate::classes::STANDARD,
     )
     .await?;
     if response.status() == StatusCode::OK {

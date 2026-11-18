@@ -93,9 +93,15 @@ Done:
   reports, as a role, at that rate too, with completion reports.
   Implemented. Next: copies (once a copy done twice, when a node dies mid-page,
   makes no second version).
+- **Storage classes.** Classes of the operator's, each in a pool of the
+  nodes' disks (`--data-dir <pool>=<path>`, several per node) with a layout
+  of its own; objects ask for one with `x-amz-storage-class`, and change
+  class by being copied; the packer rewrites a class's data after a change
+  of its pool or layout. Implemented.
 - **Lifecycle transitions.** Moving objects between storage classes by
-  lifecycle rules, once Cairn has more than one (erasure-coded storage, say).
-  Expiration rules are done.
+  lifecycle rules (`Transition`, `NoncurrentVersionTransition`), as a
+  rewrite of their data into the class, paced as sweeps are. Expiration
+  rules are done.
 
 ## Ideas
 

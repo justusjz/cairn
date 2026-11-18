@@ -215,40 +215,49 @@ async fn delete_blobs(
     }
 }
 
-/// Deletes the files in directory `dir` whose blobs the catalog doesn't place on
-/// this node, then the directory if that leaves it empty.
+/// Deletes the files in directory `dir` of every pool whose blobs the
+/// catalog doesn't place on this node, in that pool, then the directory if
+/// that leaves it empty.
 async fn sweep_dir(app: &App, dir: u32, report: &mut Report) -> anyhow::Result<()> {
+    for pool in app.store.pools() {
+        sweep_pool_dir(app, pool, dir, report).await?;
+    }
+    Ok(())
+}
+
+async fn sweep_pool_dir(app: &App, pool: &crate::store::Pool, dir: u32, report: &mut Report) -> anyhow::Result<()> {
     // A file being written has no location yet. A writer leaves the writing
     // set only after its location is committed, so checking the set before
     // the catalog never mistakes a new blob for an orphan.
-    let listing = app.store.list_dir(dir).await?;
+    let listing = pool.list_dir(dir).await?;
     let files: Vec<Uuid> = listing
         .blobs
         .into_iter()
         .filter(|&blob_id| !app.writing.contains(blob_id))
         .collect();
     if !files.is_empty() {
-        delete_orphans(app, files, report).await?;
+        delete_orphans(app, &pool.name, files, report).await?;
     }
     for (name, blob_id, modified) in listing.staged {
         if modified.elapsed().is_ok_and(|age| age > STALE_REPAIR) {
             eprintln!("gc: deleting {name}, a repaired copy or moving shard of blob {blob_id} a crash left");
-            app.store.remove_stale(dir, &name).await?;
+            pool.remove_stale(dir, &name).await?;
             report.files += 1;
         }
     }
-    report.dirs += app.store.remove_dir_if_empty(dir).await;
+    report.dirs += pool.remove_dir_if_empty(dir).await;
     Ok(())
 }
 
-/// Deletes those of `files` (local blob files) whose blobs the catalog doesn't
-/// place on this node.
-async fn delete_orphans(app: &App, files: Vec<Uuid>, report: &mut Report) -> anyhow::Result<()> {
+/// Deletes those of `files` (local blob files, in pool `pool`) whose blobs
+/// the catalog doesn't place on this node, in that pool.
+async fn delete_orphans(app: &App, pool: &str, files: Vec<Uuid>, report: &mut Report) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     let held: HashSet<Uuid> = client
         .query_cached(
-            "SELECT blob_id FROM blob_locations WHERE node = $1 AND blob_id = ANY($2)",
-            &[&app.node, &files],
+            "SELECT bl.blob_id FROM blob_locations bl JOIN blobs b ON b.blob_id = bl.blob_id
+             WHERE bl.node = $1 AND bl.blob_id = ANY($2) AND b.pool = $3",
+            &[&app.node, &files, &pool],
         )
         .await?
         .iter()
@@ -259,7 +268,7 @@ async fn delete_orphans(app: &App, files: Vec<Uuid>, report: &mut Report) -> any
         if !held.contains(&blob_id) {
             // Checked again, under the file's lock: a shard may have moved
             // here since (see `mover`).
-            eprintln!("gc: deleting orphaned file of blob {blob_id}");
+            eprintln!("gc: deleting orphaned file of blob {blob_id} in pool {pool}");
             crate::blobs::remove_unplaced(app, blob_id).await?;
             report.files += 1;
         }

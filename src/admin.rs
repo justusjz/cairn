@@ -1,5 +1,5 @@
 //! The CLI's commands about the cluster (`cairn user`, `account`, `oidc`,
-//! `bucket-policy`, `config` and `node`) run on a node, not against the
+//! `bucket-policy`, `config`, `node` and `class`) run on a node, not against the
 //! database: the CLI sends the command it parsed to a node's peer endpoint
 //! (`--peer-url`, as `cairn serve` has it), which carries it out as the CLI
 //! used to, and answers with what to print. So the CLI needs no database
@@ -51,6 +51,7 @@ pub enum Command {
     Oidc(crate::console::oidc::OidcArgs),
     Config(crate::settings::ConfigArgs),
     Node(crate::nodes::NodeArgs),
+    Class(crate::classes::ClassArgs),
     Sessions(crate::sessions::SessionsArgs),
 }
 
@@ -94,6 +95,7 @@ pub async fn run(app: &Arc<App>, command: Command) -> Output {
         Command::Oidc(args) => crate::console::oidc::run(app, args, &mut out).await,
         Command::Config(args) => crate::settings::run(app, args, &mut out).await,
         Command::Node(args) => crate::nodes::run(app, args, &mut out).await,
+        Command::Class(args) => crate::classes::run(app, args, &mut out).await,
         Command::Sessions(args) => crate::sessions::run(app, args, &mut out).await,
     };
     if let Err(e) = result {
@@ -226,7 +228,7 @@ pub(crate) mod e2e {
 
         // Settings: the node answering goes by them at once.
         let out = cairn(&app, &["config", "set", "parity-shards", "2"]).await;
-        assert!(out.stderr.contains("warning: a blob takes 3 nodes"), "{}", out.stderr);
+        assert!(out.stderr.contains("warning: STANDARD's blobs take 3 nodes"), "{}", out.stderr);
         assert_eq!(app.parity_shards(), 2);
         assert_eq!(cairn(&app, &["config", "unset", "parity-shards"]).await.error, None);
         assert_eq!(app.parity_shards(), 0);

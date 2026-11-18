@@ -689,6 +689,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_kms_data_key text, p_kms_sealed bytea, p_kms_context text, p_sse_s3 boolean,
     p_checksum_algorithm text, p_checksum_type text, p_checksum text, p_tags text,
     p_new_version_id text, p_lock_mode text, p_lock_until timestamptz, p_legal_hold boolean,
+    p_storage_class text,
     OUT id bigint, OUT version_id text
 ) LANGUAGE plpgsql AS $$
 DECLARE
@@ -715,11 +716,11 @@ BEGIN
                          size, etag, content_type, metadata, sse_c_key, sse_kms_key_id,
                          sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
                          checksum_algorithm, checksum_type, checksum, tags, last_modified,
-                         retain_mode, retain_until, legal_hold)
+                         retain_mode, retain_until, legal_hold, storage_class)
     VALUES (p_bucket, p_key, v_version_id, true, false, p_size, p_etag, p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
             p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags,
-            NOW(), v_mode, v_until, p_legal_hold)
+            NOW(), v_mode, v_until, p_legal_hold, p_storage_class)
     RETURNING objects.id INTO id;
     -- A write's version ID is reported only where it's a new one: S3 reports
     -- none for the null version (unversioned or suspended).
@@ -848,7 +849,8 @@ BEGIN
         p_bucket, p_key, v_versioning, coalesce(p_plain_size, p_size), p_etag, p_content_type,
         p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
         p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags, p_new_version_id,
-        p_lock_mode, p_lock_until, p_legal_hold);
+        p_lock_mode, p_lock_until, p_legal_hold,
+        (SELECT b.storage_class FROM blobs b WHERE b.blob_id = p_blob));
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -1026,7 +1028,9 @@ BEGIN
         p_bucket, p_key, v_versioning, p_size, p_etag, p_content_type, p_metadata,
         p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
         p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags, p_new_version_id,
-        p_lock_mode, p_lock_until, p_legal_hold);
+        p_lock_mode, p_lock_until, p_legal_hold,
+        -- Of the class of the bytes it shares, its source's.
+        coalesce((SELECT b.storage_class FROM blobs b WHERE b.blob_id = s.blob_ids[1]), 'STANDARD'));
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -1196,7 +1200,7 @@ BEGIN
         p_bucket, p_key, v_versioning, v_total, p_etag, u.content_type, u.metadata,
         u.sse_c_key, u.sse_kms_key_id, u.sse_kms_data_key, u.sse_kms_sealed, u.sse_kms_context,
         u.sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, u.tags, p_new_version_id,
-        u.retain_mode, u.retain_until, u.legal_hold);
+        u.retain_mode, u.retain_until, u.legal_hold, u.storage_class);
     version_id := v.version_id;
     UPDATE objects SET upload_id = p_upload WHERE id = v.id;
     UPDATE parts SET upload_id = NULL, object_id = v.id WHERE id = ANY(v_listed);
@@ -2339,10 +2343,12 @@ END
 $$;
 
 -- T14: claims the source blobs for a packing job, if there's one worth
--- running (see `packer::claim`): `p_kind` is 'compact', 'consolidate',
--- 'upgrade' (a blob from before checksums, one at a time) or 'convert'
--- (blobs of more than `p_small_size` live bytes not in `p_data_shards` data
--- shards and, if it isn't NULL, `p_parity_shards` parity shards).
+-- running (see `packer::claim`), all of storage class `p_class`: `p_kind` is
+-- 'compact', 'consolidate', 'upgrade' (a blob from before checksums, one at
+-- a time) or 'convert' (blobs of more than `p_small_size` live bytes not in
+-- `p_data_shards` data shards and, if it isn't NULL, `p_parity_shards`
+-- parity shards, unless `p_data_shards` is NULL; then blobs of any size not
+-- in the pool `p_pool`, the class's, see `classes`).
 -- Takes candidates, skipping those another transaction has locked (it never
 -- waits), until their live bytes would exceed `p_budget`, and leases them.
 -- Returns them, or an empty array if the job isn't worth it. The lease is a
@@ -2363,7 +2369,7 @@ $$;
 CREATE OR REPLACE FUNCTION pg_temp.cairn_claim(
     p_kind text, p_compact_threshold float8, p_max_sources bigint, p_small_size bigint,
     p_target_size bigint, p_budget bigint, p_lease_secs float8, p_data_shards smallint,
-    p_parity_shards smallint
+    p_parity_shards smallint, p_class text, p_pool text
 ) RETURNS uuid[] LANGUAGE plpgsql AS $$
 DECLARE
     v_sources uuid[] := '{}';
@@ -2380,7 +2386,7 @@ BEGIN
         FOR r IN
             SELECT blob_id, size - dead_size AS live FROM blobs
             WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * 0.25
-              AND dead_size >= size * p_compact_threshold
+              AND dead_size >= size * p_compact_threshold AND storage_class = p_class
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
               AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
                               WHERE l.blob_id = blobs.blob_id
@@ -2400,6 +2406,7 @@ BEGIN
         FOR r IN
             SELECT blob_id, size - dead_size AS live FROM blobs
             WHERE state = 'committed' AND dead_size > 0 AND dead_size >= size * p_compact_threshold
+              AND storage_class = p_class
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
               AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
                               WHERE l.blob_id = blobs.blob_id
@@ -2410,6 +2417,30 @@ BEGIN
             EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
             v_total := v_total + r.live;
             v_sources := v_sources || r.blob_id;
+        END LOOP;
+        IF cardinality(v_sources) = 0 THEN
+            RETURN '{}';
+        END IF;
+    ELSIF p_kind = 'convert' AND p_data_shards IS NULL THEN
+        -- Blobs of the class outside its pool, of any size: those in pools
+        -- that sort before it, then after it, two ranges of `blobs_pool`.
+        FOR v_dir IN 1..2 LOOP
+            FOR r IN EXECUTE format(
+                'SELECT blob_id, size - dead_size AS live FROM blobs
+                 WHERE state = ''committed'' AND block_size IS NOT NULL
+                   AND storage_class = $1 AND pool %s $2
+                   AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+                   AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                                   WHERE l.blob_id = blobs.blob_id
+                                     AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
+                 LIMIT $3 FOR UPDATE SKIP LOCKED',
+                CASE v_dir WHEN 1 THEN '<' ELSE '>' END)
+            USING p_class, p_pool, p_max_sources
+            LOOP
+                EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
+                v_total := v_total + r.live;
+                v_sources := v_sources || r.blob_id;
+            END LOOP;
         END LOOP;
         IF cardinality(v_sources) = 0 THEN
             RETURN '{}';
@@ -2431,6 +2462,7 @@ BEGIN
             FOR r IN EXECUTE format(
                 'SELECT blob_id, size - dead_size AS live FROM blobs
                  WHERE state = ''committed'' AND block_size IS NOT NULL %s
+                   AND storage_class = $6
                    AND (data_shards, parity_shards) %s ($1, $2)
                    AND size - dead_size > $3 AND dead_size < size * $4
                    AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
@@ -2447,7 +2479,7 @@ BEGIN
                   CASE WHEN p_parity_shards IS NULL OR p_data_shards = 1 THEN
                       CASE v_dir WHEN 1 THEN 0 ELSE 32767 END
                   ELSE p_parity_shards END,
-                  p_small_size, p_compact_threshold, p_max_sources
+                  p_small_size, p_compact_threshold, p_max_sources, p_class
             LOOP
                 EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;
                 v_total := v_total + r.live;
@@ -2461,7 +2493,7 @@ BEGIN
         -- One blob from before checksums, the oldest, off `blobs_legacy`.
         FOR r IN
             SELECT blob_id FROM blobs
-            WHERE state = 'committed' AND block_size IS NULL
+            WHERE state = 'committed' AND block_size IS NULL AND storage_class = p_class
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
               AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
                               WHERE l.blob_id = blobs.blob_id
@@ -2481,6 +2513,7 @@ BEGIN
         SELECT coalesce(sum(c.size), 0), count(*) INTO v_total, v_count FROM (
             SELECT size FROM blobs
             WHERE state = 'committed' AND size <= 67108864 AND size <= p_small_size
+              AND storage_class = p_class
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
               AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
                               WHERE l.blob_id = blobs.blob_id
@@ -2498,6 +2531,7 @@ BEGIN
         FOR r IN
             SELECT blob_id, size AS live FROM blobs
             WHERE state = 'committed' AND size <= 67108864 AND size <= p_small_size
+              AND storage_class = p_class
               AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
               AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
                               WHERE l.blob_id = blobs.blob_id
@@ -2592,12 +2626,13 @@ $$;
 -- `p_to` stored is the shard the catalog describes (its CRC64/NVME is the
 -- shard's, 'mismatch' otherwise), that the shard is still on `p_from`
 -- ('gone' otherwise: another move took it), and that `p_to` holds no shard
--- of the blob ('occupied'). Then swaps the location, resolves the old copy's
+-- of the blob ('occupied'), and stored it in the blob's pool ('mismatch'
+-- otherwise, see `classes`). Then swaps the location, resolves the old copy's
 -- open scrub findings ('moved'), and returns the old node's peer URL, to
 -- reap its file. Locations are only removed together with their blob, or
 -- here (I5).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_move_shard(
-    p_blob uuid, p_shard smallint, p_from int, p_to int, p_crc bigint,
+    p_blob uuid, p_shard smallint, p_from int, p_to int, p_crc bigint, p_pool text,
     OUT status text, OUT reap_peer text
 ) LANGUAGE plpgsql AS $$
 BEGIN
@@ -2607,7 +2642,7 @@ BEGIN
         status := 'gone';
         RETURN;
     END IF;
-    PERFORM 1 FROM blobs WHERE blob_id = p_blob AND shard_crcs[p_shard + 1] = p_crc;
+    PERFORM 1 FROM blobs WHERE blob_id = p_blob AND shard_crcs[p_shard + 1] = p_crc AND pool = p_pool;
     IF NOT FOUND THEN
         status := 'mismatch';
         RETURN;
@@ -2674,15 +2709,15 @@ BEGIN
 END
 $$;
 
--- T24: claims up to `p_limit` replicated blobs whose copies don't number
--- `p_parity_shards` + 1 (see `mover`), skipping those another transaction
+-- T24: claims up to `p_limit` replicated blobs of storage class `p_class`
+-- whose copies don't number `p_parity_shards` + 1 (see `mover`), skipping those another transaction
 -- has locked (it never waits) or a job has leased, and those larger than
 -- `p_coded_above`, if it isn't NULL, which the packer converts (see
 -- `cairn_claim`). Those with too few copies first, the fewest first, off
 -- `blobs_copies`, read in its order, so that a claim reads only as far as it
 -- takes. Leases them, as the packer's claim does (I8).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_claim_copies(
-    p_parity_shards smallint, p_coded_above bigint, p_limit int, p_lease_secs float8
+    p_class text, p_parity_shards smallint, p_coded_above bigint, p_limit int, p_lease_secs float8
 ) RETURNS uuid[] LANGUAGE plpgsql AS $$
 DECLARE
     v_claimed uuid[] := '{}';
@@ -2691,7 +2726,7 @@ BEGIN
     FOR r IN
         SELECT blob_id FROM blobs
         WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
-          AND parity_shards < p_parity_shards
+          AND storage_class = p_class AND parity_shards < p_parity_shards
           AND (p_coded_above IS NULL OR size <= p_coded_above)
           AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
         ORDER BY parity_shards
@@ -2703,7 +2738,7 @@ BEGIN
     FOR r IN
         SELECT blob_id FROM blobs
         WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
-          AND parity_shards > p_parity_shards
+          AND storage_class = p_class AND parity_shards > p_parity_shards
           AND (p_coded_above IS NULL OR size <= p_coded_above)
           AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
         ORDER BY parity_shards DESC
@@ -2723,12 +2758,13 @@ $$;
 -- the blob is committed, replicated, and still has `p_parity_shards` parity
 -- shards, of which the new copy is the next ('changed' otherwise: deleted,
 -- or another job got there first), that the file is the blob's (its
--- CRC64/NVME is every copy's, 'mismatch' otherwise), and that `p_node` holds
+-- CRC64/NVME is every copy's, and it's in the blob's pool: 'mismatch'
+-- otherwise), and that `p_node` holds
 -- no copy yet ('occupied'). Then adds the location and the parity shard
 -- ('added'). Every location is added under X(x) exclusive, or by a pending
 -- blob's sinks (I9).
 CREATE OR REPLACE FUNCTION pg_temp.cairn_add_copy(
-    p_blob uuid, p_shard smallint, p_node int, p_crc bigint, p_parity_shards smallint
+    p_blob uuid, p_shard smallint, p_node int, p_crc bigint, p_parity_shards smallint, p_pool text
 ) RETURNS text LANGUAGE plpgsql AS $$
 BEGIN
     PERFORM pg_temp.cairn_lock_blobs(ARRAY[p_blob], ARRAY[true]);
@@ -2738,7 +2774,7 @@ BEGIN
     IF NOT FOUND THEN
         RETURN 'changed';
     END IF;
-    PERFORM 1 FROM blobs WHERE blob_id = p_blob AND shard_crcs[1] = p_crc;
+    PERFORM 1 FROM blobs WHERE blob_id = p_blob AND shard_crcs[1] = p_crc AND pool = p_pool;
     IF NOT FOUND THEN
         RETURN 'mismatch';
     END IF;
@@ -2883,7 +2919,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_list_current(
     OUT name text, OUT is_prefix boolean, OUT objects bigint, OUT size bigint, OUT etag text,
     OUT last_modified timestamptz, OUT is_delete_marker boolean,
     OUT sse_s3 boolean, OUT sse_kms_key_id text, OUT sse_kms_data_key text, OUT sse_kms_sealed bytea,
-    OUT checksum_algorithm text, OUT checksum_type text
+    OUT checksum_algorithm text, OUT checksum_type text, OUT storage_class text
 ) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_pfx text COLLATE "C" := p_prefix;
@@ -2905,7 +2941,7 @@ BEGIN
             OPEN c FOR
                 SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker, o.sse_s3,
                        o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed,
-                       o.checksum_algorithm, o.checksum_type FROM objects o
+                       o.checksum_algorithm, o.checksum_type, o.storage_class FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_from
                   AND (p_delete_markers OR NOT o.is_delete_marker)
                 ORDER BY o.key LIMIT p_limit - v_count;
@@ -2913,7 +2949,7 @@ BEGIN
             OPEN c FOR
                 SELECT o.key, o.size, o.etag, o.last_modified, o.is_delete_marker, o.sse_s3,
                        o.sse_kms_key_id, o.sse_kms_data_key, o.sse_kms_sealed,
-                       o.checksum_algorithm, o.checksum_type FROM objects o
+                       o.checksum_algorithm, o.checksum_type, o.storage_class FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.is_latest AND o.key >= v_from
                   AND o.key < v_end AND (p_delete_markers OR NOT o.is_delete_marker)
                 ORDER BY o.key LIMIT p_limit - v_count;
@@ -2937,6 +2973,7 @@ BEGIN
             sse_kms_sealed := r.sse_kms_sealed;
             checksum_algorithm := r.checksum_algorithm;
             checksum_type := r.checksum_type;
+            storage_class := r.storage_class;
             RETURN NEXT;
             v_count := v_count + 1;
         END LOOP;
@@ -2959,6 +2996,7 @@ BEGIN
             sse_kms_sealed := NULL;
             checksum_algorithm := NULL;
             checksum_type := NULL;
+            storage_class := NULL;
             IF p_totals AND v_past IS NULL THEN
                 SELECT count(*), coalesce(sum(o.size), 0), max(o.last_modified)
                 INTO objects, size, last_modified
@@ -2991,7 +3029,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_list_versions(
     OUT name text, OUT is_prefix boolean, OUT version_id text, OUT is_latest boolean,
     OUT is_delete_marker boolean, OUT size bigint, OUT etag text, OUT last_modified timestamptz,
     OUT sse_s3 boolean, OUT sse_kms_key_id text, OUT sse_kms_data_key text, OUT sse_kms_sealed bytea,
-    OUT checksum_algorithm text, OUT checksum_type text
+    OUT checksum_algorithm text, OUT checksum_type text, OUT storage_class text
 ) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_pfx text COLLATE "C" := p_prefix;
@@ -3011,7 +3049,7 @@ BEGIN
         RETURN QUERY
             SELECT o.key::text, false, o.version_id, o.is_latest, o.is_delete_marker, o.size,
                    o.etag, o.last_modified, o.sse_s3, o.sse_kms_key_id, o.sse_kms_data_key,
-                   o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type
+                   o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type, o.storage_class
             FROM objects o
             WHERE o.bucket = p_bucket COLLATE "default" AND o.key = v_marker
               AND o.id < p_id_marker
@@ -3025,7 +3063,7 @@ BEGIN
             OPEN c FOR
                 SELECT o.key, o.version_id, o.is_latest, o.is_delete_marker, o.size, o.etag,
                        o.last_modified, o.sse_s3, o.sse_kms_key_id, o.sse_kms_data_key,
-                       o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type
+                       o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type, o.storage_class
                 FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from
                 ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
@@ -3033,7 +3071,7 @@ BEGIN
             OPEN c FOR
                 SELECT o.key, o.version_id, o.is_latest, o.is_delete_marker, o.size, o.etag,
                        o.last_modified, o.sse_s3, o.sse_kms_key_id, o.sse_kms_data_key,
-                       o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type
+                       o.sse_kms_sealed, o.checksum_algorithm, o.checksum_type, o.storage_class
                 FROM objects o
                 WHERE o.bucket = p_bucket COLLATE "default" AND o.key >= v_from AND o.key < v_end
                 ORDER BY o.key, o.id DESC LIMIT p_limit - v_count;
@@ -3058,6 +3096,7 @@ BEGIN
             sse_kms_sealed := r.sse_kms_sealed;
             checksum_algorithm := r.checksum_algorithm;
             checksum_type := r.checksum_type;
+            storage_class := r.storage_class;
             RETURN NEXT;
             v_count := v_count + 1;
         END LOOP;
@@ -3079,6 +3118,7 @@ BEGIN
             sse_kms_sealed := NULL;
             checksum_algorithm := NULL;
             checksum_type := NULL;
+            storage_class := NULL;
             RETURN NEXT;
             v_count := v_count + 1;
         END IF;
@@ -3098,7 +3138,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_list_uploads(
     p_bucket text, p_prefix text, p_delimiter text, p_key_marker text, p_upload_marker uuid,
     p_limit int,
     OUT name text, OUT is_prefix boolean, OUT upload_id uuid, OUT initiated_at timestamptz,
-    OUT checksum_algorithm text, OUT checksum_type text, OUT initiator text
+    OUT checksum_algorithm text, OUT checksum_type text, OUT initiator text, OUT storage_class text
 ) RETURNS SETOF record LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_pfx text COLLATE "C" := p_prefix;
@@ -3115,7 +3155,7 @@ BEGIN
        AND pg_temp.cairn_common_prefix(v_marker, v_pfx, v_delim) IS NULL THEN
         RETURN QUERY
             SELECT u.key::text, false, u.upload_id, u.initiated_at, u.checksum_algorithm,
-                   u.checksum_type, u.initiator
+                   u.checksum_type, u.initiator, u.storage_class
             FROM multipart_uploads u
             WHERE u.bucket = p_bucket COLLATE "default" AND u.key = v_marker
               AND u.upload_id > p_upload_marker
@@ -3126,14 +3166,14 @@ BEGIN
         IF v_end IS NULL THEN
             OPEN c FOR
                 SELECT u.key, u.upload_id, u.initiated_at, u.checksum_algorithm, u.checksum_type,
-                       u.initiator
+                       u.initiator, u.storage_class
                 FROM multipart_uploads u
                 WHERE u.bucket = p_bucket COLLATE "default" AND u.key >= v_from
                 ORDER BY u.key, u.upload_id LIMIT p_limit - v_count;
         ELSE
             OPEN c FOR
                 SELECT u.key, u.upload_id, u.initiated_at, u.checksum_algorithm, u.checksum_type,
-                       u.initiator
+                       u.initiator, u.storage_class
                 FROM multipart_uploads u
                 WHERE u.bucket = p_bucket COLLATE "default" AND u.key >= v_from AND u.key < v_end
                 ORDER BY u.key, u.upload_id LIMIT p_limit - v_count;
@@ -3151,6 +3191,7 @@ BEGIN
             checksum_algorithm := r.checksum_algorithm;
             checksum_type := r.checksum_type;
             initiator := r.initiator;
+            storage_class := r.storage_class;
             RETURN NEXT;
             v_count := v_count + 1;
         END LOOP;
@@ -3164,6 +3205,7 @@ BEGIN
             checksum_algorithm := NULL;
             checksum_type := NULL;
             initiator := NULL;
+            storage_class := NULL;
             RETURN NEXT;
             v_count := v_count + 1;
         END IF;

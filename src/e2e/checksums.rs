@@ -71,7 +71,7 @@ async fn told(app: &Arc<App>, key: &str, customer: Option<&CustomerKey>, range: 
 
 /// Writes `data` as `key` with the request `pairs` a PUT would have.
 async fn put_with(app: &Arc<App>, key: &str, data: Vec<u8>, pairs: &[(&str, &str)]) -> UploadResult {
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: BUCKET.to_owned(),
         key: key.to_owned(),
         content_type: "x".to_owned(),
@@ -149,7 +149,7 @@ async fn an_sse_c_objects_checksum_is_sealed() {
 /// it's given. Its ID.
 async fn create(app: &Arc<App>, key: &str, checksum: Option<(Algorithm, Type)>, customer: Option<&CustomerKey>) -> String {
     let wanted = sse::Wanted::new(customer, None);
-    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, None, checksum, Default::default(), None).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "x", "", "", wanted, None, checksum, Default::default(), None, crate::classes::STANDARD).await.unwrap();
     let (status, headers, body) = text(response).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -178,7 +178,7 @@ async fn upload_part(
         return Err("InvalidRequest".into());
     }
     let upload_key = sse::open(app, &upload.encryption, customer, None, BUCKET, key).await.unwrap().ok().unwrap();
-    let attach = AttachTarget::MultipartPart {
+    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
         upload_id: id,
         part_number: number,
         key: upload_key,

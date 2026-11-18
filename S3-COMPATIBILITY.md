@@ -50,8 +50,8 @@ supported.
 | Versioning | ✅ | |
 | Object Lock: retention, legal holds, default retention | ✅ | No event-based holds. |
 | Lifecycle: expiration, noncurrent expiration, delete markers, incomplete uploads | 🟡 | [Lifecycle](#lifecycle) |
-| Lifecycle transitions | ❌ | There are no other storage classes. |
-| Storage classes other than STANDARD, restore | ❌ | [Storage classes](#storage-classes) |
+| Storage classes | 🟡 | The operator's, by any name: [Storage classes](#storage-classes) |
+| Lifecycle transitions, restore | ❌ | [Storage classes](#storage-classes) |
 | CORS | ✅ | |
 | Static website hosting | ✅ | [Endpoints](#endpoints-and-domains) |
 | Directory buckets (S3 Express One Zone), `CreateSession` | 🟡 | [Directory buckets](#directory-buckets) |
@@ -153,8 +153,23 @@ S3 reports a bucket that doesn't use it:
 
 ### Storage classes
 
-Every object is STANDARD. `x-amz-storage-class` is accepted and ignored,
-whatever its value; S3 refuses one it doesn't know.
+The classes are the operator's (`cairn class`, see the README): each keeps
+its data in a pool of the nodes' disks, with redundancy of its own. They may
+have S3's names or others.
+
+- An object is of the class its write's `x-amz-storage-class` names
+  (PutObject, POST Object, CreateMultipartUpload, CopyObject), else STANDARD.
+  One of S3's classes that isn't defined is taken as STANDARD, as before
+  Cairn had classes; any other undefined class is refused with
+  `InvalidStorageClass`, as in S3.
+- An object reports its class as in S3: `x-amz-storage-class` on GET and
+  HEAD for any class but STANDARD, `StorageClass` in listings,
+  GetObjectAttributes, ListParts, ListMultipartUploads and inventory reports.
+- Every class is read as STANDARD is: none needs a restore, and none has a
+  minimum duration or size.
+- A copy into another class writes the data again; a copy without
+  `x-amz-storage-class` is STANDARD, as in S3.
+- Lifecycle transitions aren't supported (`501`).
 
 ### ACLs
 
@@ -642,7 +657,6 @@ message signatures and retries are as AWS's.
 
 Differences that are open, and should be fixed:
 
-- Unknown storage classes are accepted ([Storage classes](#storage-classes)).
 - S3 applies some `x-amz-*` query parameters as headers (`x-amz-meta-*`,
   `x-amz-tagging`, `x-amz-acl`, `x-amz-storage-class`,
   `x-amz-server-side-encryption`); Cairn ignores them.

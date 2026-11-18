@@ -17,7 +17,8 @@ use crate::{
 /// `s3::tags`): an upload's tags are fixed now, as in S3, as is the Object
 /// Lock it asks for (`lock`, see `s3::object_lock`). `initiator` is the ARN
 /// of the principal that begins it (`None`: anonymous), as `Initiator`
-/// tells it.
+/// tells it. Its parts, and so the object, are of storage class
+/// `storage_class`, which exists (see `classes`).
 #[allow(clippy::too_many_arguments)]
 pub async fn create_multipart_upload(
     app: &App,
@@ -31,6 +32,7 @@ pub async fn create_multipart_upload(
     checksum: Option<(Algorithm, Type)>,
     lock: Lock,
     initiator: Option<&str>,
+    storage_class: &str,
 ) -> anyhow::Result<Response<Full<Bytes>>> {
     let client = app.pool.get().await?;
     let Some(bucket_row) = client
@@ -67,8 +69,8 @@ pub async fn create_multipart_upload(
                                             sse_c_key, sse_kms_key_id, sse_kms_data_key,
                                             sse_kms_sealed, sse_kms_context, sse_s3,
                                             checksum_algorithm, checksum_type, tags, initiated_at,
-                                            retain_mode, retain_until, legal_hold, initiator)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17, $18)
+                                            retain_mode, retain_until, legal_hold, initiator, storage_class)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), $15, $16, $17, $18, $19)
              RETURNING extract(epoch FROM initiated_at)::float8",
             &[
                 &upload_id,
@@ -89,6 +91,7 @@ pub async fn create_multipart_upload(
                 &lock_until,
                 &legal_hold,
                 &initiator,
+                &storage_class,
             ],
         )
         .await?;

@@ -247,6 +247,34 @@ pub(super) struct Storage {
     backlog: Backlog,
     packer: PackerSettings,
     integrity: Coverage,
+    /// The storage classes (see `classes`), and what each holds.
+    classes: Vec<ClassUsage>,
+}
+
+/// A storage class, as this node goes by it, and what it holds.
+#[derive(Clone, Serialize, ToSchema)]
+struct ClassUsage {
+    name: String,
+    pool: String,
+    /// Its own data and parity shards, if it sets them (else the
+    /// settings').
+    data_shards: Option<i64>,
+    parity_shards: Option<i64>,
+    /// The layout its large blobs are to have: in so many data shards (1:
+    /// replicated) and parity shards.
+    layout_data_shards: i64,
+    layout_parity_shards: i64,
+    /// Whether they're brought to it now: it takes as many live nodes with
+    /// its pool as shards.
+    coding: bool,
+    /// Active nodes with its pool, and of them, the live ones.
+    nodes: i64,
+    live_nodes: i64,
+    blobs: i64,
+    bytes: i64,
+    /// Committed blobs outside its pool, which the packer rewrites into it.
+    misplaced: i64,
+    misplaced_bytes: i64,
 }
 
 /// How much of the data the scrubber has checked (see `scrub`).
@@ -328,12 +356,13 @@ struct Backlog {
     /// Blobs with enough garbage to be compacted.
     compact: i64,
     compact_garbage_bytes: i64,
-    /// Blobs large enough to be coded that aren't in the cluster's layout,
-    /// which the packer converts (see `packer::Layouts`).
+    /// Blobs large enough to be coded that aren't in their class's layout,
+    /// and blobs outside their class's pool, which the packer converts (see
+    /// `packer::Layouts`).
     convert: i64,
     convert_bytes: i64,
-    /// Replicated blobs with more or fewer copies than the `parity-shards`
-    /// setting says (none while it isn't set), and how many copies the
+    /// Replicated blobs with more or fewer copies than their class says
+    /// (none while that isn't settled), and how many copies the
     /// mover is to add and to drop (see `mover`).
     copies: i64,
     copies_to_add: i64,
@@ -357,9 +386,10 @@ struct PackerSettings {
     small_size: u64,
     compact_threshold: f64,
     max_sources: i64,
-    /// What blobs larger than `small_size` are erasure-coded into (the
-    /// `data-shards` setting, and the parity shards). One data shard: they
-    /// aren't.
+    /// What STANDARD's blobs larger than `small_size` are erasure-coded
+    /// into (its data shards, or the `data-shards` setting, and the parity
+    /// shards). One data shard: they aren't. Other classes' are in
+    /// `classes`.
     data_shards: i64,
     parity_shards: u32,
     /// The `parity-shards` setting, if it's set; else every node goes by its
@@ -407,16 +437,24 @@ const SHARD_BYTES: &str = "CASE
 END";
 
 /// Of a committed blob of `blobs`, whether the packer is to convert it into
-/// $3 data shards and, unless it's NULL, $4 parity shards (see
-/// `cairn_claim`), if it's large enough.
-const CONVERT: &str = "(data_shards <> $3 OR ($3 > 1 AND $4::smallint IS NOT NULL AND parity_shards <> $4))";
+/// its class `c`'s `c.k` data shards and, unless it's NULL, `c.m` parity
+/// shards (see `cairn_claim`), if it's large enough; or into its pool,
+/// whatever its size.
+const CONVERT: &str = "(blobs.pool <> c.pool OR (size - dead_size > $1 AND (data_shards <> c.k
+    OR (c.k > 1 AND c.m IS NOT NULL AND parity_shards <> c.m))))";
 
 /// Of a blob of `blobs`, whether the mover is to add or drop copies of it,
-/// to $4 parity shards, unless that's NULL: unless the packer is to code it,
-/// as it is any larger than $1 while there are $3 > 1 data shards (see
-/// `cairn_claim_copies`).
+/// to its class `c`'s `c.m` parity shards, unless that's NULL: unless the
+/// packer is to code it, as it is any larger than $1 while there are
+/// `c.k` > 1 data shards (see `cairn_claim_copies`).
 const COPIES: &str = "state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL
-    AND $4::smallint IS NOT NULL AND parity_shards <> $4 AND NOT ($3 > 1 AND size > $1)";
+    AND c.m IS NOT NULL AND parity_shards <> c.m AND NOT (c.k > 1 AND size > $1)";
+
+/// The classes' layouts as `CONVERT` and `COPIES` take them, `c`: parallel
+/// arrays $2 (names), $3 (data shards), $4 (parity shards, NULL where
+/// they aren't settled), $5 (pools).
+const CLASS_TARGETS: &str = "JOIN unnest($2::text[], $3::smallint[], $4::smallint[], $5::text[])
+    AS c(name, k, m, pool) ON c.name = blobs.storage_class";
 
 pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
     let client = app.pool.get().await?;
@@ -467,14 +505,77 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
         .collect();
     let small_size = app.pack.small_size as i64;
     let threshold = app.pack.compact_threshold;
-    // The layout blobs are to have: as the packer's and mover's claims see
-    // it (see `cairn_claim`, `cairn_claim_copies`).
-    let wanted = crate::packer::wanted_layouts(app).await?;
-    let data_shards = wanted.data_shards as i16;
-    let parity_shards = wanted.parity_settled.then_some(wanted.parity_shards as i16);
+    // The layouts blobs are to have: as the packer's and mover's claims see
+    // them (see `cairn_claim`, `cairn_claim_copies`).
+    crate::refresh_settings(app).await?;
+    let classes = app.classes.all();
+    let mut names = Vec::new();
+    let mut ks = Vec::new();
+    let mut ms = Vec::new();
+    let mut pools = Vec::new();
+    for class in classes.values() {
+        let wanted = crate::packer::wanted_layouts(app, class);
+        names.push(class.name.clone());
+        ks.push(wanted.data_shards as i16);
+        ms.push(wanted.parity_settled.then_some(wanted.parity_shards as i16));
+        pools.push(class.pool.clone());
+    }
+    let standard = app.classes.get(crate::classes::STANDARD);
+    let wanted = crate::packer::wanted_layouts(app, &standard);
+    let t = client
+        .query_one_cached(
+            &format!("SELECT count(*) FILTER (WHERE state = 'committed' AND block_size IS NOT NULL AND {CONVERT}),
+                    coalesce(sum(size) FILTER (WHERE state = 'committed' AND block_size IS NOT NULL
+                                     AND {CONVERT}), 0)::bigint,
+                    count(*) FILTER (WHERE {COPIES}),
+                    coalesce(sum(greatest(c.m - parity_shards, 0)) FILTER (WHERE {COPIES}), 0)::bigint,
+                    coalesce(sum(greatest(parity_shards - c.m, 0)) FILTER (WHERE {COPIES}), 0)::bigint
+             FROM blobs {CLASS_TARGETS}"),
+            &[&small_size, &names, &ks, &ms, &pools],
+        )
+        .await?;
+    let usage = client
+        .query_cached(
+            "SELECT c.name,
+                    (SELECT count(*) FROM node_pools np JOIN nodes n ON n.id = np.node
+                     WHERE np.pool = c.pool AND n.state = 'active'),
+                    (SELECT count(*) FROM node_pools np JOIN nodes n ON n.id = np.node
+                     WHERE np.pool = c.pool AND n.state = 'active'
+                       AND n.last_seen > NOW() - INTERVAL '10 seconds'),
+                    count(b.blob_id), coalesce(sum(b.size), 0)::bigint,
+                    count(b.blob_id) FILTER (WHERE b.pool <> c.pool),
+                    coalesce(sum(b.size) FILTER (WHERE b.pool <> c.pool), 0)::bigint
+             FROM storage_classes c
+             LEFT JOIN blobs b ON b.storage_class = c.name AND b.state = 'committed'
+             GROUP BY c.name, c.pool ORDER BY c.name",
+            &[],
+        )
+        .await?;
+    let mut class_usage = Vec::new();
+    for r in &usage {
+        let name: String = r.get(0);
+        let class = app.classes.get(&name);
+        let wanted = crate::packer::wanted_layouts(app, &class);
+        let live: i64 = r.get(2);
+        class_usage.push(ClassUsage {
+            data_shards: class.data_shards.map(i64::from),
+            parity_shards: class.parity_shards.map(i64::from),
+            layout_data_shards: wanted.data_shards as i64,
+            layout_parity_shards: wanted.parity_shards as i64,
+            coding: live >= (wanted.data_shards + wanted.parity_shards) as i64,
+            nodes: r.get(1),
+            live_nodes: live,
+            blobs: r.get(3),
+            bytes: r.get(4),
+            misplaced: r.get(5),
+            misplaced_bytes: r.get(6),
+            pool: class.pool,
+            name,
+        });
+    }
     let b = client
         .query_one_cached(
-            &format!("SELECT count(*) FILTER (WHERE state = 'committed'),
+            "SELECT count(*) FILTER (WHERE state = 'committed'),
                     coalesce(sum(size) FILTER (WHERE state = 'committed'), 0)::bigint,
                     coalesce(sum(dead_size), 0)::bigint,
                     count(*) FILTER (WHERE state = 'pending'),
@@ -489,16 +590,9 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
                     count(*) FILTER (WHERE state = 'committed' AND dead_size > 0
                                      AND dead_size >= size * $2::float8),
                     coalesce(sum(dead_size) FILTER (WHERE state = 'committed' AND dead_size > 0
-                                     AND dead_size >= size * $2::float8), 0)::bigint,
-                    count(*) FILTER (WHERE state = 'committed' AND block_size IS NOT NULL
-                                     AND size - dead_size > $1 AND {CONVERT}),
-                    coalesce(sum(size) FILTER (WHERE state = 'committed' AND block_size IS NOT NULL
-                                     AND size - dead_size > $1 AND {CONVERT}), 0)::bigint,
-                    count(*) FILTER (WHERE {COPIES}),
-                    coalesce(sum(greatest($4 - parity_shards, 0)) FILTER (WHERE {COPIES}), 0)::bigint,
-                    coalesce(sum(greatest(parity_shards - $4, 0)) FILTER (WHERE {COPIES}), 0)::bigint
-             FROM blobs"),
-            &[&small_size, &threshold, &data_shards, &parity_shards],
+                                     AND dead_size >= size * $2::float8), 0)::bigint
+             FROM blobs",
+            &[&small_size, &threshold],
         )
         .await?;
     let o = client
@@ -592,11 +686,11 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             consolidate_bytes: b.get(8),
             compact: b.get(9),
             compact_garbage_bytes: b.get(10),
-            convert: b.get(11),
-            convert_bytes: b.get(12),
-            copies: b.get(13),
-            copies_to_add: b.get(14),
-            copies_to_drop: b.get(15),
+            convert: t.get(0),
+            convert_bytes: t.get(1),
+            copies: t.get(2),
+            copies_to_add: t.get(3),
+            copies_to_drop: t.get(4),
             moves,
             repair_after,
             garbage_log: m.get(3),
@@ -610,12 +704,13 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             compact_threshold: app.pack.compact_threshold,
             max_sources: app.pack.max_sources,
             data_shards: wanted.data_shards as i64,
-            parity_shards: app.parity_shards(),
+            parity_shards: wanted.parity_shards,
             parity_setting: crate::settings::PARITY_SHARDS.get_set(&client).await?,
             max_data_shards: crate::settings::DATA_SHARDS.max,
             max_parity_shards: crate::settings::PARITY_SHARDS.max,
-            coding: crate::packer::layouts(app).await?.is_some(),
+            coding: crate::packer::layouts(app, &standard).await?.is_some(),
         },
+        classes: class_usage,
         integrity: Coverage {
             nodes: coverage,
             legacy_blobs: legacy.get(0),
@@ -1737,6 +1832,7 @@ async fn upload(
         crate::s3::sse::Wanted::Plain,
         actor.kms_role(),
         Default::default(),
+        crate::classes::STANDARD,
     )
     .await?;
     match resp.status() {
@@ -1985,6 +2081,7 @@ async fn create_upload(
         None,
         Default::default(),
         Some(&actor.0.principal.arn()),
+        crate::classes::STANDARD,
     )
     .await?;
     if resp.status() != StatusCode::OK {
@@ -4108,7 +4205,7 @@ async fn set_setting(
     let warnings = if !redundancy.contains(&setting.name) {
         Vec::new()
     } else {
-        crate::settings::placement_warnings(&client).await?
+        crate::settings::placement_warnings(&app, &client).await?
     };
     Ok(Json(SettingChanged { warnings }))
 }

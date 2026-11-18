@@ -487,6 +487,15 @@ async fn crash_mid_job_is_recoverable() {
         .execute("UPDATE blobs SET pack_lease_until = NOW() - INTERVAL '1 second'", &[])
         .await
         .unwrap();
+    // Live, as a running node's heartbeat would keep it, however long this
+    // took (a busy test machine takes more than 10 seconds).
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute("UPDATE nodes SET last_seen = NOW() WHERE id = $1", &[&app.node])
+        .await
+        .unwrap();
     assert_eq!(pass(&app).await.unwrap().len(), 1);
     assert_files(&app, 2).await;
     assert_objects(&app, 100, &[]).await;

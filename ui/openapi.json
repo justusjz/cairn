@@ -7930,7 +7930,7 @@
           "convert": {
             "type": "integer",
             "format": "int64",
-            "description": "Blobs large enough to be coded that aren't in the cluster's layout,\nwhich the packer converts (see `packer::Layouts`)."
+            "description": "Blobs large enough to be coded that aren't in their class's layout,\nand blobs outside their class's pool, which the packer converts (see\n`packer::Layouts`)."
           },
           "convert_bytes": {
             "type": "integer",
@@ -7939,7 +7939,7 @@
           "copies": {
             "type": "integer",
             "format": "int64",
-            "description": "Replicated blobs with more or fewer copies than the `parity-shards`\nsetting says (none while it isn't set), and how many copies the\nmover is to add and to drop (see `mover`)."
+            "description": "Replicated blobs with more or fewer copies than their class says\n(none while that isn't settled), and how many copies the\nmover is to add and to drop (see `mover`)."
           },
           "copies_to_add": {
             "type": "integer",
@@ -8345,6 +8345,85 @@
           "name": {
             "type": "string",
             "description": "One of the session's permission sets, by name."
+          }
+        }
+      },
+      "ClassUsage": {
+        "type": "object",
+        "description": "A storage class, as this node goes by it, and what it holds.",
+        "required": [
+          "name",
+          "pool",
+          "layout_data_shards",
+          "layout_parity_shards",
+          "coding",
+          "nodes",
+          "live_nodes",
+          "blobs",
+          "bytes",
+          "misplaced",
+          "misplaced_bytes"
+        ],
+        "properties": {
+          "blobs": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "coding": {
+            "type": "boolean",
+            "description": "Whether they're brought to it now: it takes as many live nodes with\nits pool as shards."
+          },
+          "data_shards": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Its own data and parity shards, if it sets them (else the\nsettings')."
+          },
+          "layout_data_shards": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The layout its large blobs are to have: in so many data shards (1:\nreplicated) and parity shards."
+          },
+          "layout_parity_shards": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "live_nodes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "misplaced": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Committed blobs outside its pool, which the packer rewrites into it."
+          },
+          "misplaced_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "name": {
+            "type": "string"
+          },
+          "nodes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Active nodes with its pool, and of them, the live ones."
+          },
+          "parity_shards": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "pool": {
+            "type": "string"
           }
         }
       },
@@ -11173,14 +11252,15 @@
               "version",
               "replication_factor",
               "scrub_rate",
-              "now"
+              "now",
+              "pools"
             ],
             "properties": {
               "disk": {
                 "oneOf": [
                   {
                     "$ref": "#/components/schemas/Disk",
-                    "description": "The filesystem of its data dir, if it could tell."
+                    "description": "The filesystems of its data dirs, together (each counted once), if\nit could tell."
                   },
                   {
                     "type": "null"
@@ -11215,6 +11295,13 @@
                 "type": "number",
                 "format": "double",
                 "description": "The node's clock, in seconds since the Unix epoch."
+              },
+              "pools": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/PoolDisk"
+                },
+                "description": "Its pools (see `classes`), and their filesystems."
               },
               "replication_factor": {
                 "type": "integer",
@@ -11486,7 +11573,7 @@
           "data_shards": {
             "type": "integer",
             "format": "int64",
-            "description": "What blobs larger than `small_size` are erasure-coded into (the\n`data-shards` setting, and the parity shards). One data shard: they\naren't."
+            "description": "What STANDARD's blobs larger than `small_size` are erasure-coded\ninto (its data shards, or the `data-shards` setting, and the parity\nshards). One data shard: they aren't. Other classes' are in\n`classes`."
           },
           "max_data_shards": {
             "type": "integer",
@@ -11925,6 +12012,34 @@
             "type": "integer",
             "format": "int32",
             "description": "Its number (`v1`, ...)."
+          }
+        }
+      },
+      "PoolDisk": {
+        "type": "object",
+        "description": "A pool of a node, and the filesystem of its data dir.",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "disk": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/Disk"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "disk_error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
           }
         }
       },
@@ -12527,7 +12642,8 @@
           "objects",
           "backlog",
           "packer",
-          "integrity"
+          "integrity",
+          "classes"
         ],
         "properties": {
           "backlog": {
@@ -12535,6 +12651,13 @@
           },
           "blobs": {
             "$ref": "#/components/schemas/BlobTotals"
+          },
+          "classes": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/ClassUsage"
+            },
+            "description": "The storage classes (see `classes`), and what each holds."
           },
           "integrity": {
             "$ref": "#/components/schemas/Coverage"

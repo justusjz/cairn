@@ -233,7 +233,8 @@ pub async fn run(
             let setting = find(&name)?;
             setting.set(&client, value).await?;
             if [DATA_SHARDS.name, PARITY_SHARDS.name].contains(&setting.name) {
-                for warning in placement_warnings(&client).await? {
+                crate::refresh_settings(app).await?;
+                for warning in placement_warnings(app, &client).await? {
                     out.warn(warning);
                 }
             }
@@ -247,31 +248,16 @@ pub async fn run(
 }
 
 /// What's wrong with the layouts that `data-shards` and `parity-shards` ask
-/// for: they take more active nodes than the cluster has, so uploads fail,
-/// or coding waits, until it has. For whoever just changed them.
-pub async fn placement_warnings<C: GenericClient>(client: &C) -> anyhow::Result<Vec<String>> {
-    let active: i64 = client
-        .query_one_cached("SELECT count(*) FROM nodes WHERE state = 'active'", &[])
-        .await?
-        .get(0);
-    let Some(parity) = PARITY_SHARDS.get_set(client).await? else {
-        return Ok(Vec::new());
-    };
-    let data = DATA_SHARDS.get(client).await?;
+/// of the storage classes that go by them (see `classes`): they take more
+/// active nodes with a class's pool than the cluster has, so uploads into it
+/// fail, or coding waits, until it has. For whoever just changed them, once
+/// the node goes by the change (`refresh_settings`).
+pub async fn placement_warnings<C: GenericClient>(app: &crate::App, client: &C) -> anyhow::Result<Vec<String>> {
     let mut warnings = Vec::new();
-    if active < 1 + parity {
-        warnings.push(format!(
-            "a blob takes {} nodes, but the cluster has {active} active: uploads fail until it has",
-            1 + parity
-        ));
-    } else if data > 1 && parity > 0 && active < data + parity {
-        warnings.push(format!(
-            "coding {data}+{parity} takes {} nodes, but the cluster has {active} active: \
-             blobs stay replicated until it has",
-            data + parity
-        ));
-    } else if data > 1 && parity == 0 {
-        warnings.push("with no parity shards, nothing is coded: it would survive no lost node".to_owned());
+    for class in app.classes.all().values() {
+        if class.data_shards.is_none() || class.parity_shards.is_none() {
+            warnings.extend(crate::classes::placement_warnings(app, client, class).await?);
+        }
     }
     Ok(warnings)
 }

@@ -26,37 +26,168 @@ pub struct Dir {
     pub staged: Vec<(String, Uuid, std::time::SystemTime)>,
 }
 
+/// A node's data: one or more pools (see `classes`), each a data dir of
+/// its own, which holds the files of the blobs in that pool. The node's
+/// identity is bound to its data dirs: each holds its ID, and they must agree.
 pub struct Store {
     node_id: Uuid,
-    data_dir: PathBuf,
+    pools: Vec<Pool>,
 }
 
 impl Store {
-    pub fn new(data_dir: String) -> anyhow::Result<Store> {
-        let data_dir = PathBuf::from(data_dir);
-        std::fs::create_dir_all(&data_dir)?;
-        // A node's identity is bound to its data dir: read it back if present,
-        // otherwise mint one and persist it so it's stable across restarts.
-        let id_path = data_dir.join("node_id");
-        let node_id = match std::fs::read_to_string(&id_path) {
-            Ok(s) => Uuid::parse_str(s.trim())?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let id = Uuid::new_v4();
-                std::fs::write(&id_path, id.to_string())?;
-                id
+    /// The store of the pools `dirs` names, (pool, data dir), in the order
+    /// given. Each dir is made if it's missing, and given the node's ID if it
+    /// has none: the ID one of the others has, or else a new one.
+    pub fn new(dirs: Vec<(String, PathBuf)>) -> anyhow::Result<Store> {
+        anyhow::ensure!(!dirs.is_empty(), "a node needs a --data-dir");
+        let mut ids = Vec::new();
+        for (pool, dir) in &dirs {
+            anyhow::ensure!(
+                crate::classes::valid_pool(pool),
+                "{pool:?} can't name a pool: up to 32 lowercase letters, digits, - and _"
+            );
+            anyhow::ensure!(
+                dirs.iter().filter(|(p, _)| p == pool).count() == 1,
+                "pool {pool} has more than one --data-dir"
+            );
+            std::fs::create_dir_all(dir)?;
+            match std::fs::read_to_string(dir.join("node_id")) {
+                Ok(s) => ids.push((Uuid::parse_str(s.trim())?, dir.clone())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
-        };
-        Ok(Store { node_id, data_dir })
+        }
+        // Each pool's files are its own: the GC takes a file in one pool's
+        // dir that the catalog places in no blob of that pool for an orphan.
+        let canonical: Vec<PathBuf> = dirs.iter().map(|(_, dir)| dir.canonicalize()).collect::<Result<_, _>>()?;
+        for (i, a) in canonical.iter().enumerate() {
+            for b in &canonical[i + 1..] {
+                anyhow::ensure!(
+                    !a.starts_with(b) && !b.starts_with(a),
+                    "the data dirs {} and {} overlap: every pool needs a dir of its own",
+                    a.display(),
+                    b.display()
+                );
+            }
+        }
+        if let Some((first, first_dir)) = ids.first()
+            && let Some((other, other_dir)) = ids.iter().find(|(id, _)| id != first)
+        {
+            anyhow::bail!(
+                "{} and {} belong to different nodes ({first} and {other}): a node's data dirs must be its own",
+                first_dir.display(),
+                other_dir.display()
+            );
+        }
+        // A node's identity is bound to its data dirs: read it back if
+        // present, otherwise mint one and persist it so it's stable across
+        // restarts.
+        let node_id = ids.first().map_or_else(Uuid::new_v4, |(id, _)| *id);
+        for (_, dir) in &dirs {
+            let path = dir.join("node_id");
+            if !path.exists() {
+                std::fs::write(&path, node_id.to_string())?;
+            }
+        }
+        let pools = dirs
+            .into_iter()
+            .map(|(name, data_dir)| Pool { name, data_dir })
+            .collect();
+        Ok(Store { node_id, pools })
     }
 
     pub fn get_node_id(&self) -> Uuid {
         self.node_id
     }
 
+    /// Pool `name`, if this node has it.
+    pub fn pool(&self, name: &str) -> Option<&Pool> {
+        self.pools.iter().find(|p| p.name == name)
+    }
+
+    /// Pool `name`, or an error saying this node hasn't it.
+    pub fn need(&self, name: &str) -> anyhow::Result<&Pool> {
+        self.pool(name)
+            .ok_or_else(|| anyhow::anyhow!("this node has no pool {name} (--data-dir {name}=<path>)"))
+    }
+
+    /// The node's pools, in the order they were given.
+    pub fn pools(&self) -> &[Pool] {
+        &self.pools
+    }
+
+    /// The node's first data dir, which keeps what isn't a blob's (the
+    /// access logs' spool).
+    pub fn data_dir(&self) -> &std::path::Path {
+        &self.pools[0].data_dir
+    }
+
+    /// Opens a blob's file in pool `pool`, or `None` if this node doesn't
+    /// have it there (or hasn't the pool).
+    pub async fn open_in(&self, pool: &str, blob_id: Uuid) -> anyhow::Result<Option<fs::File>> {
+        match self.pool(pool) {
+            Some(pool) => pool.open_blob(blob_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Opens a blob's file in whichever pool has one: for a reader that
+    /// didn't say which (a node from before pools).
+    pub async fn open_blob_anywhere(&self, blob_id: Uuid) -> anyhow::Result<Option<fs::File>> {
+        for pool in &self.pools {
+            if let Some(file) = pool.open_blob(blob_id).await? {
+                return Ok(Some(file));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Deletes a blob's file from every pool, but `keep`'s. Idempotent.
+    pub async fn remove_blob_except(&self, blob_id: Uuid, keep: Option<&str>) -> anyhow::Result<()> {
+        for pool in &self.pools {
+            if Some(pool.name.as_str()) != keep {
+                pool.remove_blob(blob_id).await?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// For tests of a node of one pool: its blobs' files, in its first pool.
+#[cfg(test)]
+impl Store {
+    pub fn blob_path(&self, blob_id: Uuid) -> PathBuf {
+        self.pools[0].blob_path(blob_id)
+    }
+
+    pub async fn open_blob(&self, blob_id: Uuid) -> anyhow::Result<Option<fs::File>> {
+        self.pools[0].open_blob(blob_id).await
+    }
+
+    pub async fn create_blob(&self, blob_id: Uuid) -> anyhow::Result<fs::File> {
+        self.pools[0].create_blob(blob_id).await
+    }
+
+    /// Every blob with a local file, in any pool.
+    pub async fn list_local_blobs(&self) -> anyhow::Result<Vec<Uuid>> {
+        let mut blobs = Vec::new();
+        for pool in &self.pools {
+            blobs.extend(pool.list_local_blobs().await?);
+        }
+        Ok(blobs)
+    }
+}
+
+/// A pool of a node: a data dir, which holds the files of its blobs.
+pub struct Pool {
+    pub name: String,
+    data_dir: PathBuf,
+}
+
+impl Pool {
     /// Bytes available on the filesystem backing the data dir (what an
-    /// unprivileged process may write). Reported in heartbeats for replica
-    /// selection.
+    /// unprivileged process may write). Reported in heartbeats for shard
+    /// placement.
     pub fn available_space(&self) -> anyhow::Result<u64> {
         Ok(self.disk_space()?.1)
     }
@@ -224,7 +355,7 @@ impl Store {
         }
     }
 
-    /// The node's data dir.
+    /// The pool's data dir.
     pub fn data_dir(&self) -> &std::path::Path {
         &self.data_dir
     }
@@ -312,8 +443,8 @@ mod tests {
 
     #[test]
     fn blobs_spread_by_random_digits() {
-        let store = Store {
-            node_id: Uuid::nil(),
+        let store = Pool {
+            name: "default".to_owned(),
             data_dir: PathBuf::from("/d"),
         };
         let v4 = Uuid::parse_str("3f2a9c1e-0000-4000-8000-000000000000").unwrap();

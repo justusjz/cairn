@@ -152,6 +152,8 @@ struct Copy {
     layout: Option<Layout>,
     /// Which shard it is.
     shard: u32,
+    /// The pool it's in (the blob's).
+    pool: String,
     /// The catalog's CRC64/NVME of the whole file.
     crc: Option<u64>,
     /// `checked_at` as the pass found it, in seconds since the epoch (NULL,
@@ -297,7 +299,7 @@ async fn due(app: &App, until: f64) -> anyhow::Result<(f64, Vec<Copy>)> {
     let select = format!(
         "SELECT bl.blob_id, bl.shard, b.shard_crcs[bl.shard + 1],
                 extract(epoch FROM bl.checked_at)::float8,
-                extract(epoch FROM NOW())::float8, {LAYOUT_COLUMNS}
+                extract(epoch FROM NOW())::float8, {LAYOUT_COLUMNS}, b.pool
          FROM blob_locations bl JOIN blobs b ON b.blob_id = bl.blob_id"
     );
     // Two queries, so that each reads the index in order: flagged copies
@@ -335,6 +337,7 @@ async fn due(app: &App, until: f64) -> anyhow::Result<(f64, Vec<Copy>)> {
             crc: r.get::<_, Option<i64>>(2).map(|crc| crc as u64),
             checked_at: r.get(3),
             layout: layout_at(r, 5),
+            pool: r.get(10),
         })
         .collect();
     Ok((now, copies))
@@ -345,7 +348,12 @@ async fn check(app: &App, copy: &Copy, pacer: &Arc<Mutex<Pacer>>) -> anyhow::Res
     let (Some(file), Some(crc)) = (copy.file(), copy.crc) else {
         return Ok(Verdict::Legacy);
     };
-    let path = app.store.blob_path(copy.blob_id);
+    let Some(pool) = app.store.pool(&copy.pool) else {
+        // A pool the node had when it started holds nothing (see
+        // `check_pools`), and it can't lose one while it runs.
+        return Ok(Verdict::Missing);
+    };
+    let path = pool.blob_path(copy.blob_id);
     let pacer = pacer.clone();
     Ok(tokio::task::spawn_blocking(move || check_file(path, &file, crc, &pacer)).await?)
 }

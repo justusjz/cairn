@@ -229,6 +229,7 @@ impl Writer {
             Wanted::new(None, server.as_ref()),
             Some(principal.id),
             Lock::default(),
+            crate::classes::STANDARD,
         )
         .await?;
         if response.status() == StatusCode::OK {

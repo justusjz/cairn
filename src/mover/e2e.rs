@@ -218,7 +218,7 @@ async fn a_move_racing_a_delete_moves_nothing() {
         async move {
             let write = crate::ShardWrite::Replica { blob_id, shard: 0 };
             let body = http_body_util::Full::new(hyper::body::Bytes::from(body));
-            crate::write_blob_streaming(&target, &write, crate::Placement::Move { from }, body).await
+            crate::write_blob_streaming(&target, &write, crate::classes::DEFAULT_POOL, crate::Placement::Move { from }, body).await
         }
     });
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -243,7 +243,7 @@ async fn a_move_never_touches_another_shards_file() {
     let shard = std::fs::read(cluster.nodes[holders[1]].store.blob_path(blob_id)).unwrap();
     let body_of_shard = http_body_util::Full::new(hyper::body::Bytes::from(shard));
     let from = cluster.nodes[holders[1]].node;
-    let result = crate::write_blob_streaming(target, &write, crate::Placement::Move { from }, body_of_shard).await;
+    let result = crate::write_blob_streaming(target, &write, crate::classes::DEFAULT_POOL, crate::Placement::Move { from }, body_of_shard).await;
     assert!(result.is_err());
     assert_intact(&cluster, blob_id).await;
     assert_reads(target, "k", &body).await;

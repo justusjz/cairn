@@ -35,6 +35,7 @@ mod blob_file;
 mod blobs;
 mod body;
 mod checksum;
+mod classes;
 mod console;
 mod db;
 #[cfg(test)]
@@ -86,6 +87,8 @@ pub struct App {
     parity_setting: std::sync::atomic::AtomicI64,
     /// The `data-shards` setting as of the last heartbeat.
     data_setting: std::sync::atomic::AtomicI64,
+    /// The storage classes as of the last heartbeat (see `classes`).
+    classes: classes::Classes,
     /// How many bytes per second the scrubber reads; 0 if it's off.
     scrub_rate: u64,
     writing: WritingSet,
@@ -138,17 +141,40 @@ impl App {
         self.parity_shards() as usize + 1
     }
 
-    /// How many data shards a new blob of `size` bytes (if that's known up
-    /// front) is written in: the `data-shards` setting for one larger than
-    /// [`packer::SMALL_SIZE`] while coding is on (see `shards`), else 1
+    /// How many parity shards a new blob of storage class `class` gets: its
+    /// own, if it sets them, else the cluster's (`parity_shards`).
+    pub(crate) fn parity_shards_of(&self, class: &classes::Class) -> u32 {
+        class.parity_shards.unwrap_or_else(|| self.parity_shards())
+    }
+
+    /// Whether the parity shards of class `class` are the cluster's to say,
+    /// rather than this node's `--replication-factor`: its own, or the
+    /// `parity-shards` setting. Only then are blobs rewritten (or copies
+    /// added or dropped) for their parity shards alone, since nodes that go
+    /// by their own flags may disagree.
+    pub(crate) fn parity_settled(&self, class: &classes::Class) -> bool {
+        class.parity_shards.is_some() || self.parity_setting.load(std::sync::atomic::Ordering::Relaxed) >= 0
+    }
+
+    /// How many data shards class `class` codes its large blobs into, if
+    /// it codes them: its own data shards, else the `data-shards` setting,
+    /// if that's more than 1 and the class has parity shards.
+    pub(crate) fn coding_of(&self, class: &classes::Class) -> Option<u32> {
+        let setting = self.data_setting.load(std::sync::atomic::Ordering::Relaxed).max(1) as u32;
+        let data_shards = class.data_shards.unwrap_or(setting);
+        (data_shards > 1 && self.parity_shards_of(class) > 0).then_some(data_shards)
+    }
+
+    /// How many data shards a new blob of class `class` and `size` bytes (if
+    /// that's known up front) is written in: the class's coding (see
+    /// `coding_of`) for one larger than [`packer::SMALL_SIZE`], else 1
     /// (replicated). A smaller blob is consolidated before long, and one
     /// whose size isn't known is replicated, then converted by the packer.
     /// Either way, it may still be replicated, when there are fewer live
     /// nodes than shards (see `BlobWriter::begin`).
-    pub(crate) fn data_shards_for(&self, size: Option<u64>) -> u32 {
-        let data_shards = self.data_setting.load(std::sync::atomic::Ordering::Relaxed).max(1) as u32;
-        match size {
-            Some(size) if size > self.pack.small_size && self.parity_shards() > 0 => data_shards,
+    pub(crate) fn data_shards_for(&self, class: &classes::Class, size: Option<u64>) -> u32 {
+        match (size, self.coding_of(class)) {
+            (Some(size), Some(data_shards)) if size > self.pack.small_size => data_shards,
             _ => 1,
         }
     }
@@ -158,8 +184,9 @@ impl App {
 /// heartbeats: `parity-shards` and `data-shards`, which uploads would
 /// otherwise read every time. Says so when `parity-shards` overrides
 /// `--replication-factor`.
-async fn refresh_settings(app: &App) -> anyhow::Result<()> {
+pub(crate) async fn refresh_settings(app: &App) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
+    app.classes.set(classes::load(&client).await?);
     let data_shards = settings::DATA_SHARDS.get(&client).await?;
     app.data_setting.store(data_shards, std::sync::atomic::Ordering::Relaxed);
     let parity = settings::PARITY_SHARDS.get_set(&client).await?.unwrap_or(-1);
@@ -203,6 +230,9 @@ enum Command {
     Config(settings::ConfigArgs),
     /// List the cluster's nodes, or remove one.
     Node(nodes::NodeArgs),
+    /// Define the storage classes: the pool each keeps its data in, and how
+    /// much redundancy it has.
+    Class(classes::ClassArgs),
     /// Temporary credentials (STS's sessions): end all of them.
     Sessions(sessions::SessionsArgs),
 }
@@ -233,9 +263,13 @@ struct ServeArgs {
     /// plus 1), which overrides this on every node.
     #[arg(long, env = "CAIRN_REPLICATION_FACTOR", default_value_t = 1)]
     replication_factor: usize,
-    /// Local directory for blobs.
-    #[arg(long, env = "CAIRN_DATA_DIR")]
-    data_dir: String,
+    /// Local directory for blobs: a path, the pool `default`, or
+    /// <pool>=<path>, for the pool of that name, which storage classes keep
+    /// their data in (see `cairn class`). May be given several times, a
+    /// pool each (or comma-separated, in the environment).
+    #[arg(long = "data-dir", env = "CAIRN_DATA_DIR", value_delimiter = ',', required = true,
+          value_parser = parse_data_dir)]
+    data_dirs: Vec<(String, std::path::PathBuf)>,
     /// Accept SSE-C keys in requests that didn't come over HTTPS (that no
     /// proxy marked `X-Forwarded-Proto: https`). Only for a network that's
     /// encrypted itself: the key travels in a header.
@@ -317,8 +351,32 @@ fn remote_command(command: Command) -> anyhow::Result<(admin::Remote, admin::Com
         Command::Oidc(args) => (args.remote.clone(), admin::Command::Oidc(args)),
         Command::Config(args) => (args.remote.clone(), admin::Command::Config(args)),
         Command::Node(args) => (args.remote.clone(), admin::Command::Node(args)),
+        Command::Class(args) => (args.remote.clone(), admin::Command::Class(args)),
         Command::Sessions(args) => (args.remote.clone(), admin::Command::Sessions(args)),
     })
+}
+
+/// A `--data-dir`: `<pool>=<path>`, or a bare path, the pool `default`.
+fn parse_data_dir(text: &str) -> Result<(String, std::path::PathBuf), String> {
+    let text = text.trim();
+    // What comes before a `=` is a pool's name, unless it's a path itself.
+    if let Some((pool, path)) = text.split_once('=')
+        && !pool.contains('/')
+    {
+        if !classes::valid_pool(pool) {
+            return Err(format!(
+                "{pool:?} can't name a pool: up to 32 lowercase letters, digits, - and _, starting with a letter or digit"
+            ));
+        }
+        if path.is_empty() {
+            return Err(format!("the pool {pool} needs a path"));
+        }
+        return Ok((pool.to_owned(), path.into()));
+    }
+    if text.is_empty() {
+        return Err("a data dir needs a path".to_owned());
+    }
+    Ok((classes::DEFAULT_POOL.to_owned(), text.into()))
 }
 
 /// A `--trusted-proxy`: an address, or a CIDR block.
@@ -355,7 +413,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     if moved > 0 {
         eprintln!("moved {moved} grants from buckets' policies into managed policies");
     }
-    let store = Store::new(args.data_dir)?;
+    let store = Store::new(args.data_dirs)?;
+    check_pools(&pool, &store).await?;
     // The URL peers use to reach us: explicit if given, otherwise derived from
     // the (always-set) peer bind address.
     let peer_url = args
@@ -373,6 +432,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
         replication_flag: args.replication_factor,
         parity_setting: std::sync::atomic::AtomicI64::new(-1),
         data_setting: std::sync::atomic::AtomicI64::new(1),
+        classes: classes::Classes::default(),
         scrub_rate: args.scrub_rate,
         writing: WritingSet::default(),
         pack: packer::Config::default(),
@@ -586,10 +646,20 @@ async fn apply_lifecycles(app: Arc<App>) {
 /// Upserts this node's row in `nodes`, returning its number. Used both for the
 /// initial registration and for each heartbeat, since both are the same "I'm
 /// alive, here's my state" statement.
+///
+/// Its pools (`node_pools`) are those it has now, with their free space:
+/// shards are placed in a pool by it (see `live_nodes`). `free_space` is
+/// all of theirs.
 async fn register_node(pool: &Pool, store: &Store, peer_url: &str) -> anyhow::Result<i32> {
     let client = pool.get().await?;
     let node_id = store.get_node_id().to_string();
-    let free_space = store.available_space()? as i64;
+    let mut pools = Vec::new();
+    let mut spaces = Vec::new();
+    for pool in store.pools() {
+        pools.push(pool.name.clone());
+        spaces.push(pool.available_space()? as i64);
+    }
+    let free_space: i64 = spaces.iter().sum();
     let row = client
         .query_one_cached(
             "INSERT INTO nodes (node_id, peer_url, last_seen, free_space)
@@ -600,7 +670,42 @@ async fn register_node(pool: &Pool, store: &Store, peer_url: &str) -> anyhow::Re
             &[&node_id, &peer_url, &free_space],
         )
         .await?;
-    Ok(row.get(0))
+    let node: i32 = row.get(0);
+    client
+        .execute_cached(
+            "WITH gone AS (DELETE FROM node_pools WHERE node = $1 AND pool <> ALL($2))
+             INSERT INTO node_pools (node, pool, free_space)
+             SELECT $1, p.pool, p.free_space FROM unnest($2::text[], $3::bigint[]) AS p(pool, free_space)
+             ON CONFLICT (node, pool) DO UPDATE SET free_space = EXCLUDED.free_space",
+            &[&node, &pools, &spaces],
+        )
+        .await?;
+    Ok(node)
+}
+
+/// Refuses to start a node without a pool it had, while it holds shards in
+/// it: they'd be lost to it. Its data dir has to be given again, or the node
+/// removed (`cairn node remove`, with the pool) first.
+async fn check_pools(pool: &Pool, store: &Store) -> anyhow::Result<()> {
+    let client = pool.get().await?;
+    let pools: Vec<String> = store.pools().iter().map(|p| p.name.clone()).collect();
+    let dropped = client
+        .query_cached(
+            "SELECT np.pool FROM node_pools np JOIN nodes n ON n.id = np.node
+             WHERE n.node_id = $1 AND np.pool <> ALL($2)
+               AND EXISTS (SELECT 1 FROM blob_locations bl JOIN blobs b ON b.blob_id = bl.blob_id
+                           WHERE bl.node = n.id AND b.pool = np.pool)",
+            &[&store.get_node_id().to_string(), &pools],
+        )
+        .await?;
+    if let Some(row) = dropped.first() {
+        let pool: String = row.get(0);
+        anyhow::bail!(
+            "this node holds shards in the pool {pool}, which it has no --data-dir for anymore: \
+             give it --data-dir {pool}=<path> again (or remove the node with cairn node remove first)"
+        );
+    }
+    Ok(())
 }
 
 async fn heartbeat(app: Arc<App>, peer_url: String) {
@@ -706,27 +811,27 @@ async fn serve_peer(
     Ok(())
 }
 
-/// The nodes that may take the shards of a new blob: the live ones, those
-/// with the most free space first. Nodes being removed get none (see
-/// `mover`).
-async fn live_nodes(client: &Object) -> anyhow::Result<Vec<(i32, String)>> {
+/// The nodes that may take the shards of a new blob in pool `pool`: the
+/// live ones that have it, those with the most free space in it first.
+/// Nodes being removed get none (see `mover`).
+async fn live_nodes(client: &Object, pool: &str) -> anyhow::Result<Vec<(i32, String)>> {
     let nodes = client
         .query_cached(
-            "SELECT id, peer_url FROM nodes
-             WHERE state = 'active' AND last_seen > NOW() - INTERVAL '10 seconds'
-             ORDER BY free_space DESC",
-            &[],
+            "SELECT n.id, n.peer_url FROM nodes n JOIN node_pools np ON np.node = n.id AND np.pool = $1
+             WHERE n.state = 'active' AND n.last_seen > NOW() - INTERVAL '10 seconds'
+             ORDER BY np.free_space DESC",
+            &[&pool],
         )
         .await?;
     Ok(nodes.iter().map(|n| (n.get(0), n.get(1))).collect())
 }
 
-/// Chooses `count` of the `live` nodes for the shards of a new blob, in
-/// their order: the node for shard i is the i-th.
-fn choose_nodes(live: &[(i32, String)], count: usize) -> anyhow::Result<Vec<Location>> {
+/// Chooses `count` of the `live` nodes for the shards of a new blob in
+/// pool `pool`, in their order: the node for shard i is the i-th.
+fn choose_nodes(live: &[(i32, String)], pool: &str, count: usize) -> anyhow::Result<Vec<Location>> {
     if live.len() < count {
         return Err(Unavailable(format!(
-            "need {count} nodes for a blob's shards but only {} are live",
+            "need {count} nodes with the pool {pool} for a blob's shards but only {} are live",
             live.len()
         ))
         .into());
@@ -738,6 +843,7 @@ fn choose_nodes(live: &[(i32, String)], count: usize) -> anyhow::Result<Vec<Loca
             node: *node,
             peer_url: peer_url.clone(),
             shard,
+            pool: pool.to_owned(),
         })
         .collect())
 }
@@ -800,18 +906,20 @@ pub(crate) enum Placement {
 }
 
 /// Streams a shard (one side of the writer's fan-out, or one the mover
-/// places, as `placement` says) to the node at `peer_url`, returning the
+/// places, as `placement` says) to the node at `peer_url`, into its pool
+/// `pool`, returning the
 /// CRC64/NVME it reports for the file it stored.
 pub(crate) async fn upload_to_peer(
     peers: &peer::PeerClient,
     peer_url: &str,
     write: &ShardWrite,
+    pool: &str,
     placement: Placement,
     body: body::ResBody,
 ) -> anyhow::Result<u64> {
     let req = Request::builder()
         .method(Method::PUT)
-        .uri(format!("{peer_url}/blobs/{}{}", write.blob_id(), write.query(placement)))
+        .uri(format!("{peer_url}/blobs/{}{}&pool={pool}", write.blob_id(), write.query(placement)))
         .body(body)?;
     let res = peers.request(req).await?;
     if res.status() != StatusCode::OK {
@@ -838,6 +946,7 @@ pub(crate) async fn upload_to_peer(
 async fn write_blob_streaming<B>(
     app: &App,
     write: &ShardWrite,
+    pool: &str,
     placement: Placement,
     body: B,
 ) -> anyhow::Result<u64>
@@ -846,6 +955,7 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
 {
     let blob_id = write.blob_id();
+    let pool = app.store.need(pool)?;
     // Mark the blob as being written for the whole write→announce window, so the
     // GC's file sweep won't treat this in-flight file (no location yet) as an
     // orphan. The guard drops after the location insert below.
@@ -853,8 +963,8 @@ where
     // A shard placed here by the mover is written to a file of its own, and
     // only becomes the blob's file once its location is here: the node may
     // hold another shard of the blob already, whose file mustn't be touched.
-    let staged = (placement != Placement::New).then(|| app.store.move_path(blob_id));
-    match write_and_announce(app, write, placement, staged.as_deref(), body).await {
+    let staged = (placement != Placement::New).then(|| pool.move_path(blob_id));
+    match write_and_announce(app, write, pool, placement, staged.as_deref(), body).await {
         Ok(crc) => Ok(crc),
         Err(failure) => {
             // Delete the file right away, unless its location may have been
@@ -863,10 +973,10 @@ where
             // error Postgres reports means the insert was rolled back.
             match &staged {
                 None if !failure.maybe_announced => {
-                    let _ = app.store.remove_blob(blob_id).await;
+                    let _ = pool.remove_blob(blob_id).await;
                 }
                 None => {}
-                Some(path) => settle_move(app, write, path, failure.maybe_announced).await,
+                Some(path) => settle_move(app, write, pool, path, failure.maybe_announced).await,
             }
             Err(failure.error)
         }
@@ -878,7 +988,7 @@ where
 /// the catalog is asked: if the shard's location is here, the file becomes
 /// the blob's; if the catalog can't be asked, it's left to the GC, and a
 /// location without its file is the scrubber's to repair.
-async fn settle_move(app: &App, write: &ShardWrite, path: &std::path::Path, maybe_moved: bool) {
+async fn settle_move(app: &App, write: &ShardWrite, pool: &store::Pool, path: &std::path::Path, maybe_moved: bool) {
     let blob_id = write.blob_id();
     let _file = app.writing.lock_file(blob_id).await;
     let moved = if maybe_moved {
@@ -904,9 +1014,9 @@ async fn settle_move(app: &App, write: &ShardWrite, path: &std::path::Path, mayb
         false
     };
     let settled = if moved {
-        app.store.install_move(path, blob_id).await
+        pool.install_move(path, blob_id).await
     } else {
-        app.store.remove_at(path).await
+        pool.remove_at(path).await
     };
     if let Err(e) = settled {
         eprintln!("blob {blob_id}: settling a shard that moved here failed: {e:#}");
@@ -933,6 +1043,7 @@ impl<E: Into<anyhow::Error>> From<E> for WriteFailure {
 async fn write_and_announce<B>(
     app: &App,
     write: &ShardWrite,
+    pool: &store::Pool,
     placement: Placement,
     staged: Option<&std::path::Path>,
     mut body: B,
@@ -943,8 +1054,8 @@ where
 {
     let blob_id = write.blob_id();
     let mut file = match staged {
-        Some(path) => app.store.create_at(path).await?,
-        None => app.store.create_blob(blob_id).await?,
+        Some(path) => pool.create_at(path).await?,
+        None => pool.create_blob(blob_id).await?,
     };
     // The checksums are computed from the bytes as received, before they hit
     // the disk, so the table catches anything that goes wrong on the way down.
@@ -1024,8 +1135,8 @@ where
             file_lock = Some(app.writing.lock_file(blob_id).await);
             client
                 .query_one_cached(
-                    "SELECT status FROM pg_temp.cairn_move_shard($1, $2, $3, $4, $5)",
-                    &[&blob_id, &shard, &from, &app.node, &(crc as i64)],
+                    "SELECT status FROM pg_temp.cairn_move_shard($1, $2, $3, $4, $5, $6)",
+                    &[&blob_id, &shard, &from, &app.node, &(crc as i64), &pool.name],
                 )
                 .await
                 .map(|row| Some(row.get::<_, String>(0)))
@@ -1034,8 +1145,8 @@ where
             file_lock = Some(app.writing.lock_file(blob_id).await);
             client
                 .query_one_cached(
-                    "SELECT pg_temp.cairn_add_copy($1, $2, $3, $4, $5)",
-                    &[&blob_id, &shard, &app.node, &(crc as i64), &(parity_shards as i16)],
+                    "SELECT pg_temp.cairn_add_copy($1, $2, $3, $4, $5, $6)",
+                    &[&blob_id, &shard, &app.node, &(crc as i64), &(parity_shards as i16), &pool.name],
                 )
                 .await
                 .map(|row| Some(row.get::<_, String>(0)))
@@ -1048,10 +1159,10 @@ where
             // the location has no file, which reads fail over from, and the
             // scrubber repairs.
             if let Some(path) = staged
-                && let Err(e) = app.store.install_move(path, blob_id).await
+                && let Err(e) = pool.install_move(path, blob_id).await
             {
                 eprintln!("CORRUPTION: blob {blob_id}: shard {shard} was placed here, but its file couldn't be installed: {e:#}");
-                let _ = app.store.remove_at(path).await;
+                let _ = pool.remove_at(path).await;
                 crate::scrub::suspect(app, blob_id, app.node);
                 return Err(e.into());
             }
@@ -1111,9 +1222,10 @@ pub(crate) struct BlobWriter {
 }
 
 impl BlobWriter {
-    /// Creates a pending replicated blob, and starts a sink for each shard.
-    pub(crate) async fn begin(app: &Arc<App>) -> anyhow::Result<BlobWriter> {
-        let writer = Self::start(app, None, 1, None, false).await?;
+    /// Creates a pending replicated blob of class `class`, and starts a
+    /// sink for each shard.
+    pub(crate) async fn begin(app: &Arc<App>, class: &classes::Class) -> anyhow::Result<BlobWriter> {
+        let writer = Self::start(app, None, class, 1, None, false).await?;
         Ok(writer.expect("only a bucket can be missing"))
     }
 
@@ -1128,16 +1240,22 @@ impl BlobWriter {
     pub(crate) async fn begin_upload(
         app: &Arc<App>,
         bucket: Option<&str>,
+        class: &classes::Class,
         size: Option<u64>,
     ) -> anyhow::Result<Option<BlobWriter>> {
-        Self::start(app, bucket, app.data_shards_for(size), size, true).await
+        Self::start(app, bucket, class, app.data_shards_for(class, size), size, true).await
     }
 
     /// Creates a pending blob of `size` bytes in `data_shards` data shards
     /// (and the cluster's parity shards), and starts a sink for each shard.
     /// With one data shard, it's replicated.
-    pub(crate) async fn begin_coded(app: &Arc<App>, data_shards: u32, size: u64) -> anyhow::Result<BlobWriter> {
-        let writer = Self::start(app, None, data_shards, Some(size), false).await?;
+    pub(crate) async fn begin_coded(
+        app: &Arc<App>,
+        class: &classes::Class,
+        data_shards: u32,
+        size: u64,
+    ) -> anyhow::Result<BlobWriter> {
+        let writer = Self::start(app, None, class, data_shards, Some(size), false).await?;
         Ok(writer.expect("only a bucket can be missing"))
     }
 
@@ -1147,6 +1265,7 @@ impl BlobWriter {
     async fn start(
         app: &Arc<App>,
         bucket: Option<&str>,
+        class: &classes::Class,
         data_shards: u32,
         size: Option<u64>,
         or_replicated: bool,
@@ -1160,10 +1279,10 @@ impl BlobWriter {
         let insert = async {
             client
                 .execute_cached(
-                    "INSERT INTO blobs (blob_id, size, state, created_at)
-                     SELECT $1, 0, 'pending', NOW()
+                    "INSERT INTO blobs (blob_id, size, state, created_at, storage_class, pool)
+                     SELECT $1, 0, 'pending', NOW(), $3, $4
                      WHERE $2::text IS NULL OR EXISTS (SELECT 1 FROM buckets WHERE name = $2)",
-                    &[&blob_id, &bucket],
+                    &[&blob_id, &bucket, &class.name, &class.pool],
                 )
                 .await
         };
@@ -1172,10 +1291,10 @@ impl BlobWriter {
         // before the insert, since that may have happened by then; if the
         // insert is still underway when the discard runs, the GC has the row.
         let mut pending = blobs::DiscardOnDrop::new(app, blob_id);
-        let parity_shards = app.parity_shards();
+        let parity_shards = app.parity_shards_of(class);
         // Independent of each other, so they're sent together, and take one
         // round trip between them.
-        let (inserted, live) = tokio::join!(insert, live_nodes(&client));
+        let (inserted, live) = tokio::join!(insert, live_nodes(&client, &class.pool));
         if inserted? == 0 {
             pending.disarm();
             return Ok(None);
@@ -1186,7 +1305,7 @@ impl BlobWriter {
             _ => data_shards,
         };
         let shard_count = (data_shards + parity_shards) as usize;
-        let locations = match live.and_then(|live| choose_nodes(&live, shard_count)) {
+        let locations = match live.and_then(|live| choose_nodes(&live, &class.pool, shard_count)) {
             Ok(locations) => locations,
             Err(e) => {
                 // No sink has started, so there are only the row's to delete.
@@ -1233,12 +1352,14 @@ impl BlobWriter {
             let shard = location.shard;
             if location.node == app.node {
                 let app = app.clone();
-                sinks.spawn(async move { Ok((shard, write_blob_streaming(&app, &write, Placement::New, body).await?)) });
+                sinks.spawn(async move {
+                    Ok((shard, write_blob_streaming(&app, &write, &location.pool, Placement::New, body).await?))
+                });
             } else {
                 let peers = app.peers.clone();
                 sinks.spawn(async move {
                     let peer_url = location.peer_url;
-                    match upload_to_peer(&peers, &peer_url, &write, Placement::New, body).await {
+                    match upload_to_peer(&peers, &peer_url, &write, &location.pool, Placement::New, body).await {
                         Ok(crc) => Ok((shard, crc)),
                         Err(e) => Err(Unavailable(format!("node {peer_url}: {e:#}")).into()),
                     }
@@ -1505,6 +1626,8 @@ enum AttachTarget {
         tags: String,
         /// The Object Lock it asks for (see `s3::object_lock`).
         lock: s3::object_lock::Lock,
+        /// Its storage class (see `classes`), which exists.
+        storage_class: String,
     },
     /// A part staged under an in-progress multipart upload, encrypted with
     /// `key` if the upload is encrypted (SSE-C, SSE-KMS or SSE-S3), whose
@@ -1516,10 +1639,21 @@ enum AttachTarget {
         sse_s3: bool,
         /// The checksum it's stored with: its upload's algorithm's.
         checksum: s3::checksums::Wanted,
+        /// Its upload's storage class.
+        storage_class: String,
     },
 }
 
 impl AttachTarget {
+    /// The storage class its blob is written in.
+    fn storage_class(&self) -> &str {
+        match self {
+            AttachTarget::Object { storage_class, .. } | AttachTarget::MultipartPart { storage_class, .. } => {
+                storage_class
+            }
+        }
+    }
+
     fn checksum(&self) -> s3::checksums::Wanted {
         match self {
             AttachTarget::Object { checksum, .. } | AttachTarget::MultipartPart { checksum, .. } => *checksum,
@@ -1595,7 +1729,8 @@ where
         AttachTarget::Object { bucket, .. } => Some(bucket.as_str()),
         AttachTarget::MultipartPart { .. } => None,
     };
-    let Some(mut writer) = BlobWriter::begin_upload(app, bucket, size).await? else {
+    let class = app.classes.get(attach.storage_class());
+    let Some(mut writer) = BlobWriter::begin_upload(app, bucket, &class, size).await? else {
         return Ok(UploadResult::NoSuchBucket);
     };
     let blob_id = writer.blob_id;

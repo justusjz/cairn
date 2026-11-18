@@ -202,7 +202,7 @@ async fn created_buckets_take_their_tags() {
 /// Writes `key` to `bucket` with the tags of `x-amz-tagging: header`; its
 /// version ID.
 async fn put_tagged(app: &Arc<App>, bucket: &str, key: &str, header: &str) -> Option<String> {
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: bucket.to_owned(),
         key: key.to_owned(),
         content_type: "application/octet-stream".to_owned(),
@@ -312,7 +312,7 @@ async fn object_tags_decide() {
     let upload = |stored: String| {
         let (app, bucket) = (&app, &bucket);
         async move {
-            let response = create_multipart_upload(app, bucket, "m", "x", "", &stored, Wanted::Plain, None, None, Default::default(), None)
+            let response = create_multipart_upload(app, bucket, "m", "x", "", &stored, Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD)
                 .await
                 .unwrap();
             let (_, body) = text(response).await;

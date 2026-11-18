@@ -415,7 +415,7 @@ async fn a_conditional_write_decides_again_if_the_object_changed() {
     let writing = tokio::spawn(async move {
         let mut headers = hyper::HeaderMap::new();
         headers.insert("if-match", format!("\"{one}\"").parse().unwrap());
-        let attach = AttachTarget::Object {
+        let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
             bucket: BUCKET.to_owned(),
             key: "k".to_owned(),
             content_type: "x".to_owned(),
@@ -539,7 +539,7 @@ async fn a_copy_after_a_delete_finds_the_source_changed() {
 
 /// Creates an upload for `key`, returning its ID.
 async fn create_upload(app: &App, key: &str) -> Uuid {
-    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", "", Wanted::Plain, None, None, Default::default(), None).await.unwrap();
+    let response = create_multipart_upload(app, BUCKET, key, "text/plain", "", "", Wanted::Plain, None, None, Default::default(), None, crate::classes::STANDARD).await.unwrap();
     let body = http_body_util::BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
     let body = String::from_utf8(body.to_vec()).unwrap();
     let start = body.find("<UploadId>").unwrap() + "<UploadId>".len();
@@ -549,7 +549,7 @@ async fn create_upload(app: &App, key: &str) -> Uuid {
 
 /// Uploads `data` as part `number` of the upload.
 async fn upload_part(app: &Arc<App>, upload_id: Uuid, number: i32, data: &[u8]) -> UploadResult {
-    let attach = AttachTarget::MultipartPart {
+    let attach = AttachTarget::MultipartPart { storage_class: crate::classes::STANDARD.to_owned(),
         upload_id,
         part_number: number,
         key: None,
@@ -718,7 +718,7 @@ async fn the_packer_keeps_a_blob_that_a_copy_references() {
 #[tokio::test]
 async fn a_put_into_a_missing_bucket_writes_nothing() {
     let Some(app) = node().await else { return };
-    let attach = AttachTarget::Object {
+    let attach = AttachTarget::Object { storage_class: crate::classes::STANDARD.to_owned(),
         bucket: "missing".to_owned(),
         key: "k".to_owned(),
         content_type: "text/plain".to_owned(),

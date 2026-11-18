@@ -270,9 +270,11 @@ async fn permission_sets_are_provisioned_to_their_account() {
     let client = pool.get().await.unwrap();
     // (Not `users::account`, which wants migration 68's management account.)
     let account: String = client.query_one("SELECT id FROM accounts WHERE NOT operator", &[]).await.unwrap().get(0);
+    // As a Cairn of migration 64's time, whose protocol the gate requires.
     client
         .batch_execute(&format!(
-            "INSERT INTO oidc_providers (name, label, issuer, client_id) VALUES ('mock', 'Mock', 'https://idp.example', 'c');
+            "BEGIN; SET LOCAL cairn.protocol = '8';
+             INSERT INTO oidc_providers (name, label, issuer, client_id) VALUES ('mock', 'Mock', 'https://idp.example', 'c');
              INSERT INTO identity_users (id, provider, subject, user_name, display_name)
                  VALUES ('00000000-0000-4000-8000-000000000001', 'mock', 'sub-ada', 'ada', 'Ada');
              INSERT INTO iam_roles (id, account_id, name, path, trust_policy)
@@ -295,7 +297,8 @@ async fn permission_sets_are_provisioned_to_their_account() {
                          now() + interval '1 hour'),
                         ('\\x02', '{account}', '00000000-0000-4000-8000-000000000001', NULL, now() + interval '1 hour');
              INSERT INTO sso_operations (request_id, account_id, kind, permission_set_arn, status)
-                 VALUES ('00000000-0000-4000-8000-000000000004', '{account}', 'PROVISION', 'arn', 'SUCCEEDED');"
+                 VALUES ('00000000-0000-4000-8000-000000000004', '{account}', 'PROVISION', 'arn', 'SUCCEEDED');
+             COMMIT;"
         ))
         .await
         .unwrap();
