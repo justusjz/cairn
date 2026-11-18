@@ -39,14 +39,14 @@ impl Rejection {
     }
 }
 
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(data);
     mac.finalize().into_bytes().into()
 }
 
 /// Derives a SigV4 signing key: the HMAC chain over date, region, and service.
-fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
+pub(crate) fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> [u8; 32] {
     let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
@@ -359,7 +359,7 @@ pub fn signed(headers: &HeaderMap, query: &str) -> Option<Signed> {
     })
 }
 
-fn sha256_hex(data: &[u8]) -> String {
+pub(crate) fn sha256_hex(data: &[u8]) -> String {
     Sha256::digest(data).iter().map(|b| format!("{b:02x}")).collect()
 }
 
@@ -465,7 +465,7 @@ fn check_request_time(signed_at: i64, scope_date: &str, now: i64) -> Result<(), 
 }
 
 /// The day of a Unix time, as a credential scope names it (`YYYYMMDD`).
-fn day_of(t: i64) -> String {
+pub(crate) fn day_of(t: i64) -> String {
     // Howard Hinnant's civil_from_days.
     let z = t.div_euclid(86_400) + 719_468;
     let era = z.div_euclid(146_097);

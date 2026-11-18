@@ -63,6 +63,13 @@ pub(crate) fn layout_at(row: &tokio_postgres::Row, first: usize) -> Option<Layou
 /// `blobs b`), in the order `location_at` takes them.
 pub(crate) const LOCATION_COLUMNS: &str = "bl.node, n.peer_url, bl.shard, b.pool";
 
+/// A location, from `LOCATION_COLUMNS` starting at column `first` of `row`,
+/// if there is one there (a blob of a restore that no node holds yet has
+/// none: a left join's NULLs).
+pub(crate) fn location_at_opt(row: &tokio_postgres::Row, first: usize) -> Option<Location> {
+    row.get::<_, Option<i32>>(first).is_some().then(|| location_at(row, first))
+}
+
 /// A location, from `LOCATION_COLUMNS` starting at column `first` of `row`.
 pub(crate) fn location_at(row: &tokio_postgres::Row, first: usize) -> Location {
     Location {
@@ -296,6 +303,11 @@ pub(crate) async fn stream_blob_range(
     slice: &mut BlobSlice,
     tx: &FrameSender,
 ) -> io::Result<()> {
+    // A blob no node holds may be one that's still in the backup a restore
+    // copies from (see `backup::restore`).
+    if slice.locations.is_empty() && crate::backup::restore::stream(app, slice, tx).await? {
+        return Ok(());
+    }
     match slice.layout {
         Some(layout) if !layout.replicated() => stream_coded(app, slice, layout, tx).await,
         _ => stream_replicated(app, slice, tx).await,

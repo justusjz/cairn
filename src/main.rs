@@ -32,6 +32,7 @@ mod auth;
 mod aws_chunked;
 mod batch;
 mod blob_file;
+mod backup;
 mod blobs;
 mod body;
 mod checksum;
@@ -235,6 +236,11 @@ enum Command {
     Class(classes::ClassArgs),
     /// Temporary credentials (STS's sessions): end all of them.
     Sessions(sessions::SessionsArgs),
+    /// Back the cluster up to another S3 service, continuously.
+    Backup(backup::BackupArgs),
+    /// Restore a cluster from its backup, into a new database (run before
+    /// starting its nodes).
+    Restore(backup::restore::RestoreArgs),
 }
 
 // Every flag can also be set through the environment variable named in its
@@ -332,6 +338,7 @@ pub(crate) const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60);
 async fn main() -> anyhow::Result<()> {
     match Cli::parse().command {
         Command::Serve(args) => serve_main(args).await,
+        Command::Restore(args) => backup::restore::restore_main(args).await,
         // The rest run on a node (see `admin`).
         command => {
             let (remote, command) = remote_command(command)?;
@@ -345,6 +352,7 @@ async fn main() -> anyhow::Result<()> {
 fn remote_command(command: Command) -> anyhow::Result<(admin::Remote, admin::Command)> {
     Ok(match command {
         Command::Serve(_) => anyhow::bail!("`cairn serve` runs here"),
+        Command::Restore(_) => anyhow::bail!("`cairn restore` runs here"),
         Command::User(args) => (args.remote.clone(), admin::Command::User(args)),
         Command::Account(args) => (args.remote.clone(), admin::Command::Account(args)),
         Command::DirectoryUser(args) => (args.remote.clone(), admin::Command::DirectoryUser(args)),
@@ -353,6 +361,7 @@ fn remote_command(command: Command) -> anyhow::Result<(admin::Remote, admin::Com
         Command::Node(args) => (args.remote.clone(), admin::Command::Node(args)),
         Command::Class(args) => (args.remote.clone(), admin::Command::Class(args)),
         Command::Sessions(args) => (args.remote.clone(), admin::Command::Sessions(args)),
+        Command::Backup(args) => (args.remote.clone(), admin::Command::Backup(args)),
     })
 }
 
@@ -460,6 +469,8 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(mover::run(app.clone()));
     tokio::spawn(notifications::delivery::run(app.clone()));
     tokio::spawn(access_log::run(app.clone()));
+    tokio::spawn(backup::run(app.clone()));
+    tokio::spawn(backup::restore::run(app.clone()));
     // The users' identities in the KMS, now rather than in a minute.
     let identifying = app.clone();
     tokio::spawn(async move {

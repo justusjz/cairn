@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::db::Cached;
 use crate::{
     App,
-    blobs::{BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, layout_at, location_at, stream_blob_range},
+    blobs::{BlobSlice, LAYOUT_COLUMNS, LOCATION_COLUMNS, Location, layout_at, location_at_opt, stream_blob_range},
     shards::Layout,
     body::{FrameSender, ResBody, box_response, channel_body},
     encryption::{Key, Opener, Salt, Storing, segment_range},
@@ -381,8 +381,7 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
                         p.enc_salt, {LAYOUT_COLUMNS}, {LOCATION_COLUMNS}
                  FROM parts p
                  JOIN blobs b ON b.blob_id = p.blob_id
-                 JOIN blob_locations bl ON bl.blob_id = p.blob_id
-                 JOIN nodes n ON n.id = bl.node
+                 LEFT JOIN (blob_locations bl JOIN nodes n ON n.id = bl.node) ON bl.blob_id = p.blob_id
                  WHERE p.object_id = $1
                  ORDER BY p.part_number, n.last_seen DESC"
             ),
@@ -411,7 +410,7 @@ pub(crate) async fn resolve_object_parts<C: GenericClient>(
             });
             current = Some(part_number);
         }
-        parts.last_mut().unwrap().locations.push(location_at(row, 12));
+        parts.last_mut().unwrap().locations.extend(location_at_opt(row, 12));
     }
     Ok(parts)
 }
@@ -644,8 +643,7 @@ async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSli
                 "SELECT p.blob_id, p.blob_offset, {LAYOUT_COLUMNS}, {LOCATION_COLUMNS}
                  FROM parts p
                  JOIN blobs b ON b.blob_id = p.blob_id
-                 JOIN blob_locations bl ON bl.blob_id = p.blob_id
-                 JOIN nodes n ON n.id = bl.node
+                 LEFT JOIN (blob_locations bl JOIN nodes n ON n.id = bl.node) ON bl.blob_id = p.blob_id
                  WHERE p.id = $1
                  ORDER BY n.last_seen DESC"
             ),
@@ -663,7 +661,7 @@ async fn relocate(app: &App, slice: &BlobSlice) -> anyhow::Result<Option<BlobSli
     Ok(Some(BlobSlice {
         blob_id,
         layout: layout_at(row, 2),
-        locations: rows.iter().map(|r| location_at(r, 7)).collect(),
+        locations: rows.iter().filter_map(|r| location_at_opt(r, 7)).collect(),
         // The slice keeps its offset within the part.
         offset: blob_offset + (slice.offset - old_offset),
         length: slice.length,
