@@ -1863,6 +1863,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/switch-role": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Has the session act as a session of a role, in its account or another
+         *     of the organization's, as STS's AssumeRole would let who it signed in
+         *     as (see `switch`), for an hour at most.
+         */
+        post: operations["switch_role"];
+        /** Has the session act as who it signed in as again. */
+        delete: operations["switch_back"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/templates": {
         parameters: {
             query?: never;
@@ -3410,6 +3432,7 @@ export interface components {
              *     policy restricts (only resource policies' denies do).
              */
             root: boolean;
+            switched?: components["schemas"]["SwitchedMe"] | null;
         };
         /** @description A node's metrics. Times are seconds since the Unix epoch. */
         MetricsReport: {
@@ -4224,6 +4247,25 @@ export interface components {
             removed: number;
             /** Format: double */
             started: number;
+        };
+        SwitchRole: {
+            /** @description The role's account, by its ID. */
+            account: string;
+            /** @description The role's name, after its path if it has one (`team/deployer`). */
+            role: string;
+        };
+        /** @description A role a session switched to. */
+        SwitchedMe: {
+            /**
+             * Format: double
+             * @description When it ends, and the session acts as who it signed in as again
+             *     (seconds since the epoch).
+             */
+            expires_at: number;
+            /** @description Who the session signed in as: its ARN. */
+            from: string;
+            /** @description Its session's name. */
+            session_name: string;
         };
         /**
          * @description A tag of a bucket, an object version (see `s3::tags`) or a user (whose
@@ -9911,6 +9953,80 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Storage"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    switch_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SwitchRole"];
+            };
+        };
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+            "5XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
+                };
+            };
+        };
+    };
+    switch_back: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Me"];
+                };
+            };
+            "4XX": {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorBody"];
                 };
             };
             "5XX": {

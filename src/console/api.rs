@@ -60,6 +60,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
         .routes(routes!(oidc_callback))
         .routes(routes!(choose_permission_set))
         .routes(routes!(directory_credentials))
+        .routes(routes!(switch_role, switch_back))
 }
 
 /// The API's OpenAPI spec, as committed in `ui/openapi.json`.
@@ -571,6 +572,21 @@ struct Me {
     /// A directory user's session: who it is at its identity source, and
     /// its permission sets.
     directory: Option<DirectoryMe>,
+    /// The role the session switched to, if it did: then `identity` and
+    /// `cluster` are its session's.
+    switched: Option<SwitchedMe>,
+}
+
+/// A role a session switched to.
+#[derive(Serialize, ToSchema)]
+struct SwitchedMe {
+    /// Who the session signed in as: its ARN.
+    from: String,
+    /// Its session's name.
+    session_name: String,
+    /// When it ends, and the session acts as who it signed in as again
+    /// (seconds since the epoch).
+    expires_at: f64,
 }
 
 /// A directory user, signed in at an identity source.
@@ -635,6 +651,7 @@ async fn me_of(console: &Console, client: &deadpool_postgres::Object, session: &
     let passkeys = store::passkeys(client, session.login).await?;
     Ok(Me {
         directory: None,
+        switched: None,
         name: session.login_name.clone(),
         root: false,
         expires_at: None,
@@ -665,13 +682,82 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
     let token = session_token(&headers).ok_or_else(unauthorized)?;
     let client = console.app.pool.get().await?;
     if let Some(session) = store::session(&client, &token).await? {
-        return Ok(Json(me_of(&console, &client, &session).await?));
+        let me = me_of(&console, &client, &session).await?;
+        return Ok(Json(switched_me(&console, &client, &headers, me).await?));
     }
     if let Some(session) = store::directory_session(&client, &token).await? {
-        return Ok(Json(directory_me(&console, &client, &session).await?));
+        let me = directory_me(&console, &client, &session).await?;
+        return Ok(Json(switched_me(&console, &client, &headers, me).await?));
     }
     let root = store::root_session(&client, &token).await?.ok_or_else(unauthorized)?;
     Ok(Json(root_me(&console, &root).await?))
+}
+
+/// `me`, as the role its session switched to, if it did and that lasts.
+async fn switched_me(console: &Console, client: &deadpool_postgres::Object, headers: &HeaderMap, mut me: Me) -> Result<Me> {
+    let token = session_token(headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+    let Some(switched) = store::switched(client, &token).await? else { return Ok(me) };
+    // As a page of the console would ask it; a role that's gone falls back.
+    let user = super::user_of(console, axum::http::Method::GET, headers.clone(), String::new(), None).await?;
+    if store::switched(client, &token).await?.is_none() {
+        return Ok(me);
+    }
+    let arn = user.principal.arn();
+    let account = user.account.clone();
+    let name = client
+        .query_opt("SELECT name FROM accounts WHERE id = $1", &[&account])
+        .await?
+        .map(|r| r.get::<_, String>(0))
+        .unwrap_or_default();
+    let management = crate::users::account(client).await?;
+    let role = user.principal.name.clone();
+    let actor = super::Actor(Arc::new(user));
+    me.cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
+    me.switched = Some(SwitchedMe { from: me.identity.arn.clone(), session_name: switched.session_name, expires_at: switched.expires_at });
+    me.identity = IdentitySummary { management: account == management, account_id: account, account: name, user: role, arn };
+    Ok(me)
+}
+
+#[derive(Deserialize, ToSchema)]
+struct SwitchRole {
+    /// The role's account, by its ID.
+    account: String,
+    /// The role's name, after its path if it has one (`team/deployer`).
+    role: String,
+}
+
+/// Has the session act as a session of a role, in its account or another
+/// of the organization's, as STS's AssumeRole would let who it signed in
+/// as (see `switch`), for an hour at most.
+#[utoipa::path(post, path = "/switch-role", request_body = SwitchRole, responses(
+    (status = 200, body = Me),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn switch_role(
+    State(console): ConsoleState,
+    headers: HeaderMap,
+    peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    Json(body): Json<SwitchRole>,
+) -> Result<Json<Me>> {
+    let token = session_token(&headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+    let peer = peer.map(|p| p.0.0.ip());
+    let base = super::signed_in_user_of(&console, axum::http::Method::POST, headers.clone(), String::new(), peer).await?;
+    let client = console.app.pool.get().await?;
+    super::switch::switch(&console.app, &client, &token, base, body.account.trim(), body.role.trim()).await?;
+    me(State(console), headers).await
+}
+
+/// Has the session act as who it signed in as again.
+#[utoipa::path(delete, path = "/switch-role", responses(
+    (status = 200, body = Me),
+    (status = "4XX", body = ErrorBody),
+    (status = "5XX", body = ErrorBody),
+))]
+async fn switch_back(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>> {
+    let token = session_token(&headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+    store::switch_back(&console.app.pool.get().await?, &token).await?;
+    me(State(console), headers).await
 }
 
 /// Who a directory user's session is: as its permission set's role's
@@ -749,6 +835,7 @@ async fn directory_me(console: &Console, client: &deadpool_postgres::Object, ses
                 })
                 .collect(),
         }),
+        switched: None,
     })
 }
 
@@ -788,6 +875,8 @@ async fn choose_permission_set(
         _ => return Err(ApiError::BadRequest(format!("the permission set {:?} is yours in several accounts: say which", body.name))),
     };
     store::choose_permission_set(&client, &signed.token, chosen.set.id, &chosen.account).await?;
+    // Another identity: a role it switched to was the old one's to take.
+    store::switch_back(&client, &signed.token).await?;
     let session = store::directory_session(&client, &signed.token).await?.ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
     Ok(Json(directory_me(&console, &client, &session).await?))
 }
@@ -853,6 +942,7 @@ async fn root_me(console: &Console, root: &store::RootSession) -> Result<Me> {
         cluster,
         passkeys: Vec::new(),
         directory: None,
+        switched: None,
     })
 }
 

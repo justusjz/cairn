@@ -528,6 +528,18 @@ aws sts assume-role --role-arn arn:aws:iam::<member>:role/OrganizationAccountAcc
     --role-session-name setup
 ```
 
+In the console, **Switch role** (in the menu at the top right, or by an
+account on the Organization page) does the same, as AWS's console does: the
+session acts as a session of the role
+(`arn:aws:sts::<member>:assumed-role/OrganizationAccountAccessRole/<you>`)
+for an hour at most, or until it switches back. Who may switch to a role is
+who may assume it with STS: the role's trust policy must allow them, and for
+another account's role their own policies must too (`AdministratorAccess`
+does). That's checked when they switch, from who they signed in as (a user,
+or a directory user's permission set's role's session); the root user
+switches to no role, as in AWS. The roles switched to lately are kept in the
+browser.
+
 Accounts are grouped in **organizational units** (OUs), nested under the
 organization's root (five deep at most), and **service control policies**
 (SCPs) set the most that a member account's principals may do, as AWS's:

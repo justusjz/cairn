@@ -474,7 +474,7 @@ pub async fn session(client: &Object, token: &str) -> anyhow::Result<Option<Sess
 /// Ends the session of `token`: a login's, the root user's, or a directory
 /// user's.
 pub async fn end_session(client: &Object, token: &str) -> anyhow::Result<()> {
-    for table in ["console_sessions", "console_root_sessions", "console_directory_sessions"] {
+    for table in ["console_sessions", "console_root_sessions", "console_directory_sessions", "console_switched_roles"] {
         client.execute_cached(&format!("DELETE FROM {table} WHERE token_hash = $1"), &[&hash(token)]).await?;
     }
     Ok(())
@@ -920,10 +920,54 @@ pub async fn delete_passkey(client: &Object, login: Uuid, credential_id: &[u8]) 
     }
 }
 
+// ─── Switched roles ──────────────────────────────────────────────────────────
+
+/// The role the session of `token` switched to (see `console::switch`).
+#[derive(Clone, Debug)]
+pub struct Switched {
+    pub role_id: Uuid,
+    pub session_name: String,
+    /// When it ends (seconds since the epoch).
+    pub expires_at: f64,
+}
+
+/// The role the session of `token` switched to, while that lasts.
+pub async fn switched(client: &Object, token: &str) -> anyhow::Result<Option<Switched>> {
+    let row = client
+        .query_opt_cached(
+            "SELECT role_id, session_name, extract(epoch FROM expires_at)::float8
+             FROM console_switched_roles WHERE token_hash = $1 AND expires_at > now()",
+            &[&hash(token)],
+        )
+        .await?;
+    Ok(row.map(|r| Switched { role_id: r.get(0), session_name: r.get(1), expires_at: r.get(2) }))
+}
+
+/// Has the session of `token` act as a session of role `role`, named
+/// `name`, for `seconds`, in place of any role it switched to before.
+pub async fn switch_role(client: &Object, token: &str, role: Uuid, name: &str, seconds: i32) -> anyhow::Result<()> {
+    client
+        .execute_cached(
+            "INSERT INTO console_switched_roles (token_hash, role_id, session_name, expires_at)
+             VALUES ($1, $2, $3, now() + make_interval(secs => $4))
+             ON CONFLICT (token_hash) DO UPDATE
+                 SET role_id = EXCLUDED.role_id, session_name = EXCLUDED.session_name, expires_at = EXCLUDED.expires_at",
+            &[&hash(token), &role, &name, &f64::from(seconds)],
+        )
+        .await?;
+    Ok(())
+}
+
+/// Has the session of `token` act as who it was signed in as again.
+pub async fn switch_back(client: &Object, token: &str) -> anyhow::Result<()> {
+    client.execute_cached("DELETE FROM console_switched_roles WHERE token_hash = $1", &[&hash(token)]).await?;
+    Ok(())
+}
+
 /// Removes what has expired: challenges, enrollment links, sessions.
 pub async fn reap(client: &Object) -> anyhow::Result<u64> {
     let mut reaped = 0;
-    for table in ["console_challenges", "console_enrollments", "console_root_links", "directory_setup_links"] {
+    for table in ["console_challenges", "console_enrollments", "console_root_links", "directory_setup_links", "console_switched_roles"] {
         reaped += client.execute_cached(&format!("DELETE FROM {table} WHERE expires_at <= now()"), &[]).await?;
     }
     reaped += client

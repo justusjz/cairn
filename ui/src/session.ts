@@ -69,6 +69,11 @@ export const api = {
     ok(client.POST("/passkeys", { body: { challenge_id, name, credential } })),
   renamePasskey: (id: string, name: string) => ok(client.PUT("/passkeys/{id}", { ...passkeyPath(id), body: { name } })),
   deletePasskey: (id: string) => ok(client.DELETE("/passkeys/{id}", passkeyPath(id))),
+  /** Has the session act as a session of a role (by its account's ID, and
+   * its name after its path), as STS's AssumeRole would let it. */
+  switchRole: (account: string, role: string) => ok(client.POST("/switch-role", { body: { account, role } })),
+  /** Has the session act as who it signed in as again. */
+  switchBack: () => ok(client.DELETE("/switch-role")),
 };
 
 export type Registration = Schemas["Registration"];

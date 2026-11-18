@@ -51,6 +51,7 @@ mod manage;
 mod organizations;
 mod sns;
 mod sso;
+mod switch;
 mod templates;
 pub mod oidc;
 pub mod store;
@@ -239,7 +240,23 @@ async fn as_user(State(console): State<Arc<Console>>, mut req: Request, next: Ne
     }
 }
 
+/// Who a request's session acts as: who it was signed in as, or a session
+/// of the role it switched to (see `switch`).
 async fn user_of(
+    console: &Console,
+    method: Method,
+    headers: HeaderMap,
+    query: String,
+    peer: Option<std::net::IpAddr>,
+) -> Result<actor::User, ApiError> {
+    let token = session_token(&headers).ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
+    let base = signed_in_user_of(console, method, headers, query, peer).await?;
+    switch::apply(&console.app.pool.get().await?, &token, base).await
+}
+
+/// Who a request's session was signed in as: a login's user, a directory
+/// user's permission set's role's session, or the account's root user.
+async fn signed_in_user_of(
     console: &Console,
     method: Method,
     headers: HeaderMap,
@@ -1505,6 +1522,85 @@ mod e2e {
         let (_, accounts) = admin.send("GET", "/api/accounts", None).await;
         assert_eq!(accounts[1]["status"], "SUSPENDED");
         assert_eq!(admin.send("DELETE", &format!("/api/accounts/{id}"), None).await.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// Switching roles: an administrator of the management account takes a
+    /// member account's OrganizationAccountAccessRole, and acts in that
+    /// account as its session, until it switches back; who may not assume
+    /// a role (by its own policies, or the role's trust) can't switch to
+    /// it, whether it's there or not. A directory user switches from its
+    /// permission set's role's session, which its assignment still decides.
+    #[tokio::test]
+    async fn switches_roles_across_accounts() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
+        let console = console_of(&app);
+        let client = app.pool.get().await.unwrap();
+        let management = crate::users::account(&client).await.unwrap();
+        let mut admin = signed_in(&console, "admin", true).await;
+        let mut tenant = signed_in(&console, "tenant", false).await;
+        let (status, made) = admin.send("POST", "/api/accounts", Some(json!({ "name": "Team B", "email": "b@example.com" }))).await;
+        assert_eq!(status, StatusCode::CREATED, "{made}");
+        let member = made["id"].as_str().unwrap().to_owned();
+        let access = json!({ "account": member, "role": "OrganizationAccountAccessRole" });
+
+        // The tenant's policies don't allow it; nor is a role that isn't there.
+        let (status, err) = tenant.send("POST", "/api/switch-role", Some(access.clone())).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{err}");
+        assert!(err["error"].as_str().unwrap().contains("sts:AssumeRole"), "{err}");
+        let missing = json!({ "account": member, "role": "Nobody" });
+        assert_eq!(admin.send("POST", "/api/switch-role", Some(missing)).await.0, StatusCode::FORBIDDEN);
+        let bad = json!({ "account": "12", "role": "OrganizationAccountAccessRole" });
+        assert_eq!(admin.send("POST", "/api/switch-role", Some(bad)).await.0, StatusCode::BAD_REQUEST);
+
+        // The administrator switches, and acts in the member account.
+        let (status, me) = admin.send("POST", "/api/switch-role", Some(access.clone())).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["identity"]["arn"], format!("arn:aws:sts::{member}:assumed-role/OrganizationAccountAccessRole/admin"));
+        assert_eq!((&me["identity"]["account"], &me["identity"]["management"]), (&json!("Team B"), &json!(false)));
+        assert_eq!(me["switched"]["from"], format!("arn:aws:iam::{management}:user/admin"));
+        let (status, roles) = admin.send("GET", "/api/roles", None).await;
+        assert_eq!(status, StatusCode::OK, "{roles}");
+        assert!(roles.to_string().contains("OrganizationAccountAccessRole"), "{roles}");
+        let (_, users) = admin.send("GET", "/api/users", None).await;
+        assert!(!users.to_string().contains("tenant"), "{users}");
+        // Not the management account's anymore: its organization is not the role's to see.
+        assert_eq!(admin.send("GET", "/api/accounts", None).await.0, StatusCode::FORBIDDEN);
+
+        // Back.
+        let (status, me) = admin.send("DELETE", "/api/switch-role", None).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!((&me["identity"]["account_id"], &me["switched"]), (&json!(management), &Value::Null));
+        assert_eq!(admin.send("GET", "/api/accounts", None).await.0, StatusCode::OK);
+
+        // A directory user with an administrator's permission set switches
+        // from its role's session; taking the set away ends both.
+        let grace = json!({ "user_name": "grace", "display_name": "Grace Hopper", "given_name": "Grace" });
+        let (_, made) = admin.send("POST", "/api/directory-users", Some(grace)).await;
+        let id = made["id"].as_str().unwrap().to_owned();
+        let (_, link) = admin.send("POST", &format!("/api/directory-users/{id}/setup-link"), None).await;
+        let token = link["path"].as_str().unwrap().strip_prefix("/enroll#").unwrap().to_owned();
+        assert_eq!(admin.send("POST", "/api/permission-sets", Some(json!({ "name": "Admins" }))).await.0, StatusCode::CREATED);
+        let full = json!({ "arn": "arn:aws:iam::aws:policy/AdministratorAccess" });
+        assert_eq!(admin.send("POST", "/api/permission-sets/Admins/attached", Some(full)).await.0, StatusCode::NO_CONTENT);
+        let assign = json!({ "permission_set": "Admins", "principal_type": "USER", "principal_id": id });
+        let (status, assigned) = admin.send("POST", "/api/assignments", Some(assign)).await;
+        assert_eq!(status, StatusCode::CREATED, "{assigned}");
+        let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let (_, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
+        let mut body = registration(&mut Authenticator::ed25519(), &ceremony, "Laptop");
+        body["token"] = json!(token);
+        let (status, me) = browser.send("POST", "/api/enroll", Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        let (status, me) = browser.send("POST", "/api/switch-role", Some(access)).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        assert_eq!(me["identity"]["arn"], format!("arn:aws:sts::{member}:assumed-role/OrganizationAccountAccessRole/grace"));
+        assert!(me["switched"]["from"].as_str().unwrap().contains(":assumed-role/AWSReservedSSO_Admins_"), "{me}");
+        assert_eq!(browser.send("GET", "/api/roles", None).await.0, StatusCode::OK);
+        let (_, assignments) = admin.send("GET", "/api/assignments", None).await;
+        let assignment = assignments.as_array().unwrap().iter().find(|a| a["principal_id"] == json!(id)).unwrap().clone();
+        let removed = admin.send("DELETE", &format!("/api/assignments/{}", assignment["id"].as_str().unwrap()), None).await;
+        assert_eq!(removed.0, StatusCode::NO_CONTENT, "{}", removed.1);
+        assert_eq!(browser.send("GET", "/api/roles", None).await.0, StatusCode::FORBIDDEN);
     }
 
     /// Identity Center is the management account's: a member account's

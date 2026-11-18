@@ -6347,6 +6347,84 @@
         }
       }
     },
+    "/switch-role": {
+      "post": {
+        "summary": "Has the session act as a session of a role, in its account or another\nof the organization's, as STS's AssumeRole would let who it signed in\nas (see `switch`), for an hour at most.",
+        "operationId": "switch_role",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SwitchRole"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Has the session act as who it signed in as again.",
+        "operationId": "switch_back",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Me"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/templates": {
       "get": {
         "summary": "The templates there are.",
@@ -10625,6 +10703,17 @@
           "root": {
             "type": "boolean",
             "description": "Whether the session is the account's root user's, which no identity\npolicy restricts (only resource policies' denies do)."
+          },
+          "switched": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SwitchedMe",
+                "description": "The role the session switched to, if it did: then `identity` and\n`cluster` are its session's."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         }
       },
@@ -12742,6 +12831,47 @@
           "started": {
             "type": "number",
             "format": "double"
+          }
+        }
+      },
+      "SwitchRole": {
+        "type": "object",
+        "required": [
+          "account",
+          "role"
+        ],
+        "properties": {
+          "account": {
+            "type": "string",
+            "description": "The role's account, by its ID."
+          },
+          "role": {
+            "type": "string",
+            "description": "The role's name, after its path if it has one (`team/deployer`)."
+          }
+        }
+      },
+      "SwitchedMe": {
+        "type": "object",
+        "description": "A role a session switched to.",
+        "required": [
+          "from",
+          "session_name",
+          "expires_at"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "number",
+            "format": "double",
+            "description": "When it ends, and the session acts as who it signed in as again\n(seconds since the epoch)."
+          },
+          "from": {
+            "type": "string",
+            "description": "Who the session signed in as: its ARN."
+          },
+          "session_name": {
+            "type": "string",
+            "description": "Its session's name."
           }
         }
       },

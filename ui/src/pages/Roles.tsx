@@ -279,6 +279,17 @@ export function RolePage() {
   );
 }
 
+/** An AWS principal of a trust policy, as a chip says it: an account
+ * (`arn:aws:iam::<id>:root`, which is the account, not its root user), or a
+ * user or role, by name, and by its account too when that's another. */
+function awsPrincipal(id: string): string {
+  const account = /^\d{12}$/.test(id) ? id : id.match(/^arn:aws:iam::(\d{12}):/)?.[1];
+  const own = account === accountId();
+  if (/^\d{12}$/.test(id) || id.endsWith(":root")) return own ? "this account" : `account ${account}`;
+  const name = id.split(":").pop() ?? id;
+  return own || !account ? name : `${name} (account ${account})`;
+}
+
 /** Who a trust policy lets in, as chips: its principals, by kind. */
 function trusted(trust: string): { label: string; title: string; deny: boolean }[] {
   try {
@@ -297,7 +308,7 @@ function trusted(trust: string): { label: string; title: string; deny: boolean }
         for (const id of ([] as string[]).concat(ids as string | string[])) {
           let label = id;
           if (kind === "AWS") {
-            label = id === "*" ? "anyone" : id.endsWith(":root") ? "this account" : (id.split(":").pop() ?? id);
+            label = id === "*" ? "anyone" : awsPrincipal(id);
           } else if (kind === "Federated") {
             label = `web identity: ${id.split(":oidc-provider/").pop()}`;
           }

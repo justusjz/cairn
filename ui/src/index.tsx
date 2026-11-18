@@ -26,6 +26,7 @@ import Roles, { RolePage } from "./pages/Roles";
 import Storage from "./pages/Storage";
 import Topics, { TopicPage } from "./pages/Topics";
 import SignIn from "./pages/SignIn";
+import SwitchRole from "./pages/SwitchRole";
 import Users, { UserPage } from "./pages/Users";
 import { userHref } from "./components/Iam";
 import "./styles.css";
@@ -165,14 +166,26 @@ function nav(m: Me): [string, string][] {
 /** Who the session acts as: the user's name, or a directory user's
  * permission set (or its own name, until it picks one). */
 function label(m: Me): string {
+  if (m.switched) return m.identity.user;
   return m.directory ? (m.directory.permission_set ?? m.name) : m.identity.user;
 }
 
 /** The account the session acts in: none for a directory user until it
  * picks a permission set (and with it an account). */
 function actingAccount(m: Me): { name: string; id: string } | undefined {
-  if (m.directory && !m.directory.permission_set) return undefined;
+  if (m.directory && !m.directory.permission_set && !m.switched) return undefined;
   return { name: m.identity.account, id: m.identity.account_id };
+}
+
+/** Has the session act as who it signed in as again, and starts over
+ * there (every page's data was the role's). */
+async function switchBack() {
+  try {
+    await api.switchBack();
+    location.assign("/");
+  } catch (e) {
+    toast(explain(e), true);
+  }
 }
 
 /** The person signed in: who the session acts as, their own sign-in
@@ -225,6 +238,13 @@ function UserMenu(props: { me: Me; logout: () => void }) {
                 </div>
               )}
             </Show>
+            <Show when={props.me.switched}>
+              {(s) => (
+                <div>
+                  As role <strong>{props.me.identity.user}</strong> until {clock(s().expires_at)}
+                </div>
+              )}
+            </Show>
           </div>
           <hr />
           <A role="menuitem" class="menu-item" href="/account" onClick={() => setOpen(false)}>
@@ -236,6 +256,16 @@ function UserMenu(props: { me: Me; logout: () => void }) {
                   : "Permission sets, credentials and passkeys"
                 : "Passkeys and sign-in"}
           </A>
+          <Show when={!props.me.root && (!props.me.directory || props.me.directory.permission_set)}>
+            <A role="menuitem" class="menu-item" href="/switch-role" onClick={() => setOpen(false)}>
+              Switch role
+            </A>
+          </Show>
+          <Show when={props.me.switched}>
+            <button role="menuitem" class="menu-item" onClick={switchBack}>
+              Switch back
+            </button>
+          </Show>
           <button role="menuitem" class="menu-item" onClick={props.logout}>
             Sign out
           </button>
@@ -823,6 +853,7 @@ render(
       <Route path="/identity-center" component={Guarded(IdentityCenter)} />
       <Route path="/identity-center/:name" component={Guarded(PermissionSetPage)} />
       <Route path="/account" component={Home} />
+      <Route path="/switch-role" component={Guarded(SwitchRole)} />
       <Route path="/buckets" component={Guarded(BucketList)} />
       <Route path="/buckets/:bucket" component={Guarded(BucketBrowser)} />
       <Route path="/buckets/:bucket/object" component={Guarded(ObjectPage)} />

@@ -672,7 +672,8 @@ Differences that are open, and should be fixed:
 
 - **The console:** a web UI with passkey or OpenID Connect sign-in. It acts
   as the signed-in user: every operation is authorized as its `s3:`, `iam:`
-  or `cairn:` action.
+  or `cairn:` action. It switches roles as AWS's console does: a role the
+  signed-in user may assume with STS, for an hour at most.
 - **Operators:** the cluster's settings and nodes are managed through `cairn:`
   actions on `arn:aws:cairn:::cluster`, granted like any other permission
   (`CairnOperatorAccess` allows them all).

@@ -4,6 +4,7 @@
 // is); and its service control policies, which cap what member accounts'
 // principals may do.
 
+import { A } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
 import { type OrgAccount, type OrganizationOverview, type OrgUnit, type Scp, api } from "../api";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
@@ -121,6 +122,11 @@ export default function Organization() {
                             <button class="small" onClick={() => setMoving(a)}>
                               Move…
                             </button>
+                          </Show>
+                          <Show when={!a.management && a.status === "ACTIVE"}>
+                            <A class="button small" href={`/switch-role?account=${a.id}&role=OrganizationAccountAccessRole`}>
+                              Switch role
+                            </A>
                           </Show>
                           <Show when={!a.management && a.status === "ACTIVE"}>
                             <button class="small danger" disabled={a.buckets > 0} title={a.buckets > 0 ? "Delete its buckets first" : ""} onClick={() => close(a)}>

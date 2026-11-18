@@ -253,6 +253,7 @@ const MIGRATIONS: &[&str] = &[
     ORGANIZATIONAL_UNITS,
     STORAGE_CLASSES,
     DIRECTORY_PASSKEY_CHALLENGES,
+    SWITCHED_ROLES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3444,6 +3445,26 @@ const DIRECTORY_PASSKEY_CHALLENGES: &str = r#"
 ALTER TABLE console_challenges
     ADD COLUMN directory_user_id uuid REFERENCES identity_users (id) ON DELETE CASCADE;
 CREATE INDEX console_challenges_directory_user ON console_challenges (directory_user_id);
+"#;
+
+/// Migration 73: the console's role switching, as AWS's console has it: a
+/// session (a login's or a directory user's, by its token's hash, as their
+/// tables key them) that switched to a role acts as a session of that role
+/// (`role_id`, named `session_name`) until `expires_at`, an hour at most,
+/// or until it switches back. No foreign keys: a role that's gone is no
+/// one's, and the session falls back to who it was (see `console::switch`);
+/// a row outlives its session by an hour at most, until the reaper takes it.
+/// No new lock protocol: plain rows, which no catalog transaction touches.
+const SWITCHED_ROLES: &str = r#"
+CREATE TABLE console_switched_roles (
+    token_hash   bytea PRIMARY KEY,
+    role_id      uuid NOT NULL,
+    session_name text NOT NULL,
+    expires_at   timestamptz NOT NULL
+);
+CREATE INDEX console_switched_roles_expires ON console_switched_roles (expires_at);
+CREATE TRIGGER console_switched_roles_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_switched_roles
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]
