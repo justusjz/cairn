@@ -61,6 +61,8 @@ supported.
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
 | Server access logging | 🟡 | [Server access logging](#server-access-logging) |
 | Batch Operations | 🟡 | Tagging and Object Lock: [Batch Operations](#batch-operations) |
+| Replication, to buckets in the cluster | 🟡 | [Replication](#replication) |
+| Replication to other clusters or providers, Batch Replication, RTC | ❌ | |
 
 ### Security
 
@@ -87,7 +89,6 @@ supported.
 These answer `501 NotImplemented`, or report the feature as unconfigured, as
 S3 reports a bucket that doesn't use it:
 
-- Replication.
 - Analytics, metrics, Intelligent-Tiering, Storage Lens.
 - S3 Select, torrents.
 - S3 Express's metadata tables, access points for directory buckets.
@@ -222,8 +223,9 @@ once it's been configured.
 - **Configuration IDs** are 1 to 64 letters, digits, `.`, `-` and `_`.
 - **Data files** list keys in order, each key's versions newest first. S3
   promises no order.
-- **Event holds, replication, Intelligent-Tiering and bucket keys** don't
-  exist, so their fields are always empty.
+- **Event holds, Intelligent-Tiering and bucket keys** don't exist, so
+  their fields are always empty. `ReplicationStatus` is a version's
+  ([Replication](#replication)).
 - **Timing.** A configuration's first report starts within minutes, not
   within 48 hours, and reports go at the cluster's `lifecycle-rate`, which
   they share with lifecycle sweeps (see the [README](README.md#inventory)).
@@ -362,12 +364,12 @@ trust policies.
   `s3:x-amz-object-ownership`, `s3:x-amz-object-if-match`,
   `s3:x-amz-bucket-namespace` and `s3:resourceArnBeingAuthorized`.
 - **Keys that are never present,** because what they describe doesn't exist:
-  VPC, organization, service, access point, replication and batch job
-  keys. `aws:SourceAccount` and `aws:SourceArn` are present only in what
+  VPC, organization, service, access point and batch job keys. `aws:SourceAccount` and `aws:SourceArn` are present only in what
   Cairn does as `s3.amazonaws.com`, and in Access Grants' assuming a
   location's role.
 - **Principals:** `Service` principals match only what Cairn does as that
-  service: `s3.amazonaws.com` delivering inventory reports, and
+  service: `s3.amazonaws.com` delivering inventory reports and assuming a
+  replication configuration's role, and
   `access-grants.s3.amazonaws.com` assuming a location's role. As in AWS,
   `"*"` covers it too. `CanonicalUser` principals are refused.
 - **Managed policies:** of AWS's, only `AdministratorAccess`,
@@ -631,6 +633,51 @@ message signatures and retries are as AWS's.
   request to Cairn carries, so a topic's users need identity policies
   allowing `sns:` actions, and S3 needs a statement allowing it to publish,
   as on AWS.
+
+### Replication
+
+A bucket's replication configuration (`?replication`, both of S3's
+schemas) replicates to other buckets of the cluster, of any account, as
+S3's same-region replication does. The role is assumed as
+`s3.amazonaws.com`, and must be allowed `s3:GetObjectVersionForReplication`,
+`s3:ReplicateObject`, `s3:ReplicateDelete` and `s3:ReplicateTags`, by its
+policies and the buckets' policies. The caller of PutBucketReplication must
+be allowed `iam:PassRole` on it. Both buckets must be versioned, and the
+source can't be suspended while it has a configuration. A replica keeps
+its source's version ID, last-modified time, ETag, metadata, tags and
+Object Lock. `x-amz-replication-status` is `PENDING`, `COMPLETED` or
+`FAILED` on the source, and `REPLICA` on the replica.
+
+- **Within the cluster only.** A destination is a bucket of the cluster,
+  named by its ARN. There's no replication to other Cairn clusters or
+  other S3 providers yet.
+- **Replicas share their source's bytes.** A replica is a new version
+  that points at the source's data, so it takes no space and no data is
+  copied. It's written again only into another storage class
+  (`StorageClass`). So a replica protects against deletes, overwrites
+  and, with Object Lock, tampering, but not against losing the data:
+  erasure coding and the replication factor guard that.
+- **Asynchronous,** usually within a second: versions are queued in their
+  write's own transaction, so none is lost to a crash. A key's versions
+  are replicated in the order they were written. A replica becomes its
+  key's current version when it lands, even if the destination had a
+  newer version written directly.
+- **Failures** are final, as in S3: a version the role may not replicate,
+  or whose destination is gone or no longer versioned, is `FAILED`.
+  Transient errors are retried with backoff, for about 40 minutes.
+- **Not replicated, as in S3:** versions written before their rule,
+  replicas, delete markers made by lifecycle rules, deletes of a version
+  by ID, and SSE-KMS objects unless their rule replicates them
+  (`SseKmsEncryptedObjects`, under its `ReplicaKmsKeyID`).
+- **Not replicated, unlike S3:** SSE-C objects, because Cairn can't
+  re-encrypt them without the client's key; and later changes to a
+  version's tags, retention or legal hold. `ReplicaModifications` is kept
+  and returned, but has no effect.
+- **Refused:** `ExistingObjectReplication`, `ReplicationTime` and
+  `Metrics` (`501 NotImplemented`). There's no Batch Replication.
+- **Ownership:** replicas are always owned by the destination bucket's
+  account, since ACLs are disabled. `AccessControlTranslation` is taken,
+  but it needs `s3:ObjectOwnerOverrideToBucketOwner`, as in S3.
 
 ### STS
 

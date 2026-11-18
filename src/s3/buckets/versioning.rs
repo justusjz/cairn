@@ -88,8 +88,9 @@ fn parse_versioning(body: &str) -> Option<Requested> {
 /// state and lands, so each lands entirely before or entirely after the change
 /// (I2 in `catalog.sql`). Returns its status: 'set', 'no_such_bucket',
 /// 'mfa' (MFA delete wants the root's code), 'lifecycle' (MFA delete on a
-/// bucket with a lifecycle configuration) or 'locked' (a bucket with Object
-/// Lock stays versioned).
+/// bucket with a lifecycle configuration), 'locked' (a bucket with Object
+/// Lock stays versioned) or 'replicated' (as does one with a replication
+/// configuration).
 async fn try_update(
     client: &mut Object,
     bucket: &str,
@@ -109,7 +110,8 @@ async fn try_update(
 /// PutBucketVersioning: `PUT /{bucket}?versioning` with a
 /// `<VersioningConfiguration>` body. Enables or suspends versioning. Suspending
 /// keeps every existing version; it only changes how new writes and deletes land.
-/// A bucket with Object Lock can't be suspended, as in S3.
+/// A bucket with Object Lock, or with a replication configuration, can't be
+/// suspended, as in S3.
 /// Enabling MFA delete, and any change to a bucket that has it, takes the
 /// root's code (`mfa`, from `x-amz-mfa`; see `mfa`).
 /// The body has been checked against its integrity headers (see `Payload`).
@@ -152,6 +154,13 @@ pub async fn put_bucket_versioning(
                     StatusCode::CONFLICT,
                     "InvalidBucketState",
                     "An Object Lock configuration is present on this bucket, so the versioning state cannot be changed.",
+                ));
+            }
+            Ok("replicated") => {
+                return Ok(format_s3_error(
+                    StatusCode::CONFLICT,
+                    "InvalidBucketState",
+                    "A replication configuration is present on this bucket, so the versioning state cannot be changed.",
                 ));
             }
             Ok(_) => return Ok(no_such_bucket()),

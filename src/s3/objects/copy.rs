@@ -102,8 +102,13 @@ pub struct CopyKeys<'a> {
     /// (probed).
     pub restates: bool,
     /// The storage class its destination is stored in (see `classes`), as
-    /// it asks for it: `None` is STANDARD, as in S3, whatever its source's.
+    /// it asks for it: `None` is STANDARD, as in S3, whatever its source's
+    /// (but a replica's, which is its source's).
     pub storage_class: Option<&'a str>,
+    /// Whether it's a replica (see `replication`), which keeps its
+    /// source's storage class (unless it names one) and ETag, and isn't
+    /// held to CopyObject's size limit: it shares its source's bytes.
+    pub replica: bool,
 }
 
 impl CopyKeys<'_> {
@@ -266,7 +271,7 @@ pub async fn copy_object(
         }
         drop(client);
         // As in S3: a larger object is copied part by part (UploadPartCopy).
-        if version.size as u64 > MAX_UPLOAD {
+        if version.size as u64 > MAX_UPLOAD && !keys.replica {
             return Ok(format_s3_error(
                 StatusCode::BAD_REQUEST,
                 "InvalidRequest",
@@ -317,9 +322,15 @@ pub async fn copy_object(
             .checksum
             .or(version.checksum.as_ref().map(|checksum| checksum.algorithm))
             .unwrap_or(Algorithm::Crc64Nvme);
+        // The class it's stored in: a replica's is its source's, unless its
+        // rule names one.
+        let storage_class = match (keys.storage_class, keys.replica) {
+            (None, true) => version.storage_class.as_str(),
+            _ => keys.storage_class(),
+        };
         // Its bytes are shared only within a storage class: a copy into
         // another one writes them again, in its pool and layout.
-        if !keys.shares(encryption) || version.storage_class != keys.storage_class() {
+        if !keys.shares(encryption) || version.storage_class != storage_class {
             let dest = Dest {
                 bucket: dest_bucket,
                 key: dest_key,
@@ -329,7 +340,7 @@ pub async fn copy_object(
                 checksum: checksum_algorithm,
                 lock: keys.lock,
                 conditions: dest_conditions,
-                storage_class: keys.storage_class(),
+                storage_class,
             };
             let sealing = match sse::seal(app, keys.dest, keys.role, dest_bucket, dest_key).await? {
                 Ok(sealing) => sealing,
@@ -362,6 +373,8 @@ pub async fn copy_object(
                 (source_etag.clone(), stored)
             }
             [part] => (part.etag.clone(), part.etag.clone()),
+            // A replica's is its source's, multipart or not.
+            _ if keys.replica => (version.etag.clone(), version.etag.clone()),
             _ => {
                 let size = version.size as u64;
                 match hash_range(app, source.locations.clone(), 0, size, Hashing::default()).await {
@@ -419,7 +432,7 @@ pub async fn copy_object(
             checksum: checksum_algorithm,
             lock: keys.lock,
             conditions: dest_conditions,
-            storage_class: keys.storage_class(),
+            storage_class,
         };
         let (version_id, last_modified) =
             match commit_object_copy(app, &source, &dest, &stored_etag, &etag, &stored, &copied, expected).await? {

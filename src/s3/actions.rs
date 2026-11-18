@@ -203,7 +203,11 @@ const CONFIGURATION: &[(&str, Read, Option<Write>)] = &[
         ("GetBucketWebsite", "s3:GetBucketWebsite"),
         Some(("PutBucketWebsite", "s3:PutBucketWebsite", "DeleteBucketWebsite", "s3:DeleteBucketWebsite")),
     ),
-    ("replication", ("GetBucketReplication", "s3:GetReplicationConfiguration"), None),
+    (
+        "replication",
+        ("GetBucketReplication", "s3:GetReplicationConfiguration"),
+        Some(("PutBucketReplication", "s3:PutReplicationConfiguration", "DeleteBucketReplication", "s3:PutReplicationConfiguration")),
+    ),
     ("accelerate", ("GetBucketAccelerateConfiguration", "s3:GetAccelerateConfiguration"), None),
     ("requestPayment", ("GetBucketRequestPayment", "s3:GetBucketRequestPayment"), None),
     (
