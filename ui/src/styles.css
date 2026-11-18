@@ -363,6 +363,12 @@ pre.credentials { white-space: pre-wrap; word-break: break-all; }
 .user-menu { position: relative; margin-left: auto; flex-shrink: 0; }
 .user-button { border-color: transparent; background: none; padding: 4px 8px; max-width: 46vw; }
 .user-button > .mono { overflow: hidden; text-overflow: ellipsis; }
+/* The account the session acts in, beside who it acts as. */
+.account-chip {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 18vw;
+  padding: 1px 8px; border: 1px solid var(--border); border-radius: 999px;
+  background: var(--panel-2); color: var(--muted); font-size: 12px;
+}
 .avatar {
   display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0;
   width: 26px; height: 26px; border-radius: 50%;
@@ -384,7 +390,7 @@ pre.credentials { white-space: pre-wrap; word-break: break-all; }
 .menu-item:hover { background: var(--panel-2); text-decoration: none; }
 .check-mark { width: 14px; color: var(--accent); }
 .user-menu hr { border: none; border-top: 1px solid var(--border); margin: 6px 0; }
-@media (max-width: 700px) { .user-button > .mono, .user-button .badge { display: none; } }
+@media (max-width: 700px) { .user-button > .mono, .user-button .badge, .user-button .account-chip { display: none; } }
 label.field { display: flex; flex-direction: column; gap: 4px; margin: 12px 0; font-size: 13px; color: var(--muted); }
 label.field input { font-size: 14px; }
 label.field textarea { font-family: var(--mono); font-size: 13px; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); color: var(--text); resize: vertical; }

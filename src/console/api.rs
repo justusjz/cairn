@@ -27,7 +27,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use super::{Console, DirectorySigned, Signed, cleared_cookie, root_cookie, session_cookie, session_token, store, webauthn};
+use super::{Console, DirectorySigned, PasskeyHolder, Signed, cleared_cookie, root_cookie, session_cookie, session_token, store, webauthn};
 use super::web::{ApiError, ErrorBody};
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -189,13 +189,22 @@ async fn login_options(State(console): ConsoleState) -> Result<Json<Ceremony>> {
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn passkey_options(State(console): ConsoleState, signed: Signed) -> Result<Json<Ceremony>> {
+async fn passkey_options(State(console): ConsoleState, holder: PasskeyHolder) -> Result<Json<Ceremony>> {
     let client = console.app.pool.get().await?;
-    let session = signed.session;
-    let (id, challenge) = store::create_challenge(&client, store::Purpose::Add, Some(session.login)).await?;
-    let existing = store::credential_ids(&client, session.login).await?;
-    let options = creation_options(&console, session.login, &session.login_name, &challenge, &existing);
-    Ok(Json(Ceremony { challenge_id: id.to_string(), options }))
+    let options = match holder {
+        PasskeyHolder::Login(session) => {
+            let (id, challenge) = store::create_challenge(&client, store::Purpose::Add, Some(session.login)).await?;
+            let existing = store::credential_ids(&client, session.login).await?;
+            (id, creation_options(&console, session.login, &session.login_name, &challenge, &existing))
+        }
+        // Its passkeys' user handle is its ID, as its setup link's.
+        PasskeyHolder::Directory(session) => {
+            let (id, challenge) = store::create_directory_challenge(&client, session.user_id).await?;
+            let existing = store::directory_credential_ids(&client, session.user_id).await?;
+            (id, creation_options(&console, session.user_id, &session.user_name, &challenge, &existing))
+        }
+    };
+    Ok(Json(Ceremony { challenge_id: options.0.to_string(), options: options.1 }))
 }
 
 // ─── Responses ───────────────────────────────────────────────────────────────
@@ -220,12 +229,8 @@ struct Assertion {
     user_handle: Option<String>,
 }
 
-/// Takes challenge `id` for `purpose`: its bytes, and whose it is.
-async fn take_challenge(
-    client: &deadpool_postgres::Object,
-    id: &str,
-    purpose: store::Purpose,
-) -> Result<(Vec<u8>, Option<Uuid>)> {
+/// Takes challenge `id` for `purpose`.
+async fn take_challenge(client: &deadpool_postgres::Object, id: &str, purpose: store::Purpose) -> Result<store::Challenge> {
     let expired = || ApiError::BadRequest("this took too long, or was done already; try again".into());
     let id: Uuid = id.parse().map_err(|_| expired())?;
     store::take_challenge(client, id, purpose).await?.ok_or_else(expired)
@@ -362,7 +367,7 @@ async fn enroll(State(console): ConsoleState, Json(body): Json<Enroll>) -> Resul
     let client = console.app.pool.get().await?;
     let p = &body.passkey;
     let name = store::check_name(&p.name)?;
-    let (challenge, _) = take_challenge(&client, &p.challenge_id, store::Purpose::Enroll).await?;
+    let challenge = take_challenge(&client, &p.challenge_id, store::Purpose::Enroll).await?.bytes;
     let Some(identity) = store::enrollment(&client, &body.token).await? else {
         // A directory user's setup link: its first (or another) passkey,
         // and it's signed in with it.
@@ -431,7 +436,7 @@ struct Login {
 ))]
 async fn login(State(console): ConsoleState, Json(body): Json<Login>) -> Result<Response> {
     let client = console.app.pool.get().await?;
-    let (challenge, _) = take_challenge(&client, &body.challenge_id, store::Purpose::Login).await?;
+    let challenge = take_challenge(&client, &body.challenge_id, store::Purpose::Login).await?.bytes;
     let (login, credential) = match asserted(&console, &client, &challenge, &body.credential).await? {
         Signer::Login(login, credential) => (login, credential),
         Signer::Directory(user, credential) => return directory_signed_in(&console, &client, user, &credential).await,
@@ -708,7 +713,21 @@ async fn directory_me(console: &Console, client: &deadpool_postgres::Object, ses
         identity,
         mfa: session.mfa_age.is_some(),
         cluster,
-        passkeys: Vec::new(),
+        passkeys: match session.provider {
+            Some(_) => Vec::new(),
+            None => store::directory_passkeys(client, session.user_id)
+                .await?
+                .into_iter()
+                .map(|p| PasskeySummary {
+                    current: session.credential_id.as_ref() == Some(&p.credential_id),
+                    id: b64(&p.credential_id),
+                    name: p.name,
+                    backed_up: p.backed_up,
+                    created_at: p.created_at,
+                    last_used_at: p.last_used_at,
+                })
+                .collect(),
+        },
         directory: Some(DirectoryMe {
             user_id: session.user_id.to_string(),
             user_name: session.user_name.clone(),
@@ -837,22 +856,29 @@ async fn root_me(console: &Console, root: &store::RootSession) -> Result<Me> {
     })
 }
 
-/// Adds a passkey to the signed-in login.
+/// Adds a passkey to the signed-in login, or user of Cairn's own directory.
 #[utoipa::path(post, path = "/passkeys", request_body = NewPasskey, responses(
     (status = 204, description = "Added"),
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn add_passkey(State(console): ConsoleState, signed: Signed, Json(body): Json<NewPasskey>) -> Result<StatusCode> {
+async fn add_passkey(State(console): ConsoleState, holder: PasskeyHolder, Json(body): Json<NewPasskey>) -> Result<StatusCode> {
     let client = console.app.pool.get().await?;
-    let login = signed.session.login;
     let name = store::check_name(&body.name)?;
-    let (challenge, owner) = take_challenge(&client, &body.challenge_id, store::Purpose::Add).await?;
-    if owner != Some(login) {
+    let challenge = take_challenge(&client, &body.challenge_id, store::Purpose::Add).await?;
+    let (login, user) = match &holder {
+        PasskeyHolder::Login(session) => (Some(session.login), None),
+        PasskeyHolder::Directory(session) => (None, Some(session.user_id)),
+    };
+    if (challenge.login, challenge.directory_user) != (login, user) {
         return Err(ApiError::BadRequest("this challenge isn't yours".into()));
     }
-    let credential = registered(&console, &challenge, &body.credential)?;
-    store::add_passkey(&client, login, &new_passkey(&credential, name)).await?;
+    let credential = registered(&console, &challenge.bytes, &body.credential)?;
+    let key = new_passkey(&credential, name);
+    match holder {
+        PasskeyHolder::Login(session) => store::add_passkey(&client, session.login, &key).await?,
+        PasskeyHolder::Directory(session) => store::add_directory_passkey(&client, session.user_id, &key).await?,
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -861,7 +887,7 @@ struct PasskeyName {
     name: String,
 }
 
-/// Renames one of the signed-in login's passkeys.
+/// Renames one of the signed-in login's (or own directory user's) passkeys.
 #[utoipa::path(put, path = "/passkeys/{id}", params(("id" = String, Path)), request_body = PasskeyName, responses(
     (status = 204, description = "Renamed"),
     (status = "4XX", body = ErrorBody),
@@ -869,26 +895,34 @@ struct PasskeyName {
 ))]
 async fn rename_passkey(
     State(console): ConsoleState,
-    signed: Signed,
+    holder: PasskeyHolder,
     Path(id): Path<String>,
     Json(body): Json<PasskeyName>,
 ) -> Result<StatusCode> {
     let name = store::check_name(&body.name)?;
     let client = console.app.pool.get().await?;
-    store::rename_passkey(&client, signed.session.login, &unb64(&id, "id")?, name).await?;
+    let id = unb64(&id, "id")?;
+    match holder {
+        PasskeyHolder::Login(session) => store::rename_passkey(&client, session.login, &id, name).await?,
+        PasskeyHolder::Directory(session) => store::rename_directory_passkey(&client, session.user_id, &id, name).await?,
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Removes one of the signed-in login's passkeys (not its last), and ends
-/// the sessions signed in with it.
+/// Removes one of the signed-in login's (or own directory user's) passkeys
+/// (not its last), and ends the sessions signed in with it.
 #[utoipa::path(delete, path = "/passkeys/{id}", params(("id" = String, Path)), responses(
     (status = 204, description = "Removed"),
     (status = "4XX", body = ErrorBody),
     (status = "5XX", body = ErrorBody),
 ))]
-async fn delete_passkey(State(console): ConsoleState, signed: Signed, Path(id): Path<String>) -> Result<StatusCode> {
+async fn delete_passkey(State(console): ConsoleState, holder: PasskeyHolder, Path(id): Path<String>) -> Result<StatusCode> {
     let client = console.app.pool.get().await?;
-    store::delete_passkey(&client, signed.session.login, &unb64(&id, "id")?).await?;
+    let id = unb64(&id, "id")?;
+    match holder {
+        PasskeyHolder::Login(session) => store::delete_passkey(&client, session.login, &id).await?,
+        PasskeyHolder::Directory(session) => store::delete_directory_passkey(&client, session.user_id, &id).await?,
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

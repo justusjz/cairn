@@ -1380,7 +1380,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Adds a passkey to the signed-in login. */
+        /** Adds a passkey to the signed-in login, or user of Cairn's own directory. */
         post: operations["add_passkey"];
         delete?: never;
         options?: never;
@@ -1412,12 +1412,12 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Renames one of the signed-in login's passkeys. */
+        /** Renames one of the signed-in login's (or own directory user's) passkeys. */
         put: operations["rename_passkey"];
         post?: never;
         /**
-         * Removes one of the signed-in login's passkeys (not its last), and ends
-         *     the sessions signed in with it.
+         * Removes one of the signed-in login's (or own directory user's) passkeys
+         *     (not its last), and ends the sessions signed in with it.
          */
         delete: operations["delete_passkey"];
         options?: never;

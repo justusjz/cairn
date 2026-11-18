@@ -1277,11 +1277,13 @@ Identity Center's APIs (below):
     they're there once someone has signed in with them, and a user's
     groups of its source are what its last sign-in said.
 
-A user of Cairn's own directory makes a passkey with a **setup link**,
-valid 7 days and working once: the console makes one when it makes the
-user, and the user's row makes more (for another passkey, or after
-removing a lost one), as does the command line on a node. Their passkeys
-sign them in as a login's do, as multi-factor.
+A user of Cairn's own directory makes its first passkey with a **setup
+link**, valid 7 days and working once: the console makes one when it
+makes the user, and the user's row makes more (after an administrator
+removed a lost passkey, say), as does the command line on a node. Signed
+in, they add more passkeys on their own page (at most 8), rename them and
+remove them, but never their last, as a login does. Their passkeys sign
+them in as a login's do, as multi-factor.
 
 ```sh
 cairn directory-user link grace

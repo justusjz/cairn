@@ -252,6 +252,7 @@ const MIGRATIONS: &[&str] = &[
     ACCESS_GRANTS_POLICIES,
     ORGANIZATIONAL_UNITS,
     STORAGE_CLASSES,
+    DIRECTORY_PASSKEY_CHALLENGES,
 ];
 
 /// Applies every pending migration in a single transaction, so a failure leaves
@@ -3433,6 +3434,16 @@ DROP INDEX blobs_copies;
 CREATE INDEX blobs_copies ON blobs (storage_class, parity_shards)
     WHERE state = 'committed' AND data_shards = 1 AND block_size IS NOT NULL;
 CREATE INDEX blobs_pool ON blobs (storage_class, pool) WHERE state = 'committed';
+"#;
+
+/// Migration 72: users of Cairn's own directory manage their own passkeys
+/// in the console, as logins do: the challenge of a passkey a signed-in
+/// user adds is that user's (`directory_user_id`), as a login's is the
+/// login's. No new lock protocol: a column older nodes leave NULL.
+const DIRECTORY_PASSKEY_CHALLENGES: &str = r#"
+ALTER TABLE console_challenges
+    ADD COLUMN directory_user_id uuid REFERENCES identity_users (id) ON DELETE CASCADE;
+CREATE INDEX console_challenges_directory_user ON console_challenges (directory_user_id);
 "#;
 
 #[cfg(test)]

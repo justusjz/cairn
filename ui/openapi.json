@@ -4549,7 +4549,7 @@
     },
     "/passkeys": {
       "post": {
-        "summary": "Adds a passkey to the signed-in login.",
+        "summary": "Adds a passkey to the signed-in login, or user of Cairn's own directory.",
         "operationId": "add_passkey",
         "requestBody": {
           "content": {
@@ -4622,7 +4622,7 @@
     },
     "/passkeys/{id}": {
       "put": {
-        "summary": "Renames one of the signed-in login's passkeys.",
+        "summary": "Renames one of the signed-in login's (or own directory user's) passkeys.",
         "operationId": "rename_passkey",
         "parameters": [
           {
@@ -4669,7 +4669,7 @@
         }
       },
       "delete": {
-        "summary": "Removes one of the signed-in login's passkeys (not its last), and ends\nthe sessions signed in with it.",
+        "summary": "Removes one of the signed-in login's (or own directory user's) passkeys\n(not its last), and ends the sessions signed in with it.",
         "operationId": "delete_passkey",
         "parameters": [
           {

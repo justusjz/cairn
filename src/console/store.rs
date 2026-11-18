@@ -239,17 +239,40 @@ pub async fn create_challenge(client: &Object, purpose: Purpose, login: Option<U
     Ok((id, challenge))
 }
 
-/// Uses up challenge `id`, if it's for `purpose` and still works: its bytes,
-/// and whose it is.
-pub async fn take_challenge(client: &Object, id: Uuid, purpose: Purpose) -> anyhow::Result<Option<(Vec<u8>, Option<Uuid>)>> {
+/// A new challenge for directory user `user` (of Cairn's own directory),
+/// signed in, to add a passkey with: its ID and bytes.
+pub async fn create_directory_challenge(client: &Object, user: Uuid) -> anyhow::Result<(Uuid, Vec<u8>)> {
+    let mut challenge = vec![0u8; 32];
+    getrandom::fill(&mut challenge).map_err(|e| anyhow::anyhow!("generating a challenge: {e}"))?;
+    let id = Uuid::new_v4();
+    client
+        .execute_cached(
+            "INSERT INTO console_challenges (id, challenge, purpose, directory_user_id, expires_at)
+             VALUES ($1, $2, $3, $4, now() + make_interval(secs => $5))",
+            &[&id, &challenge, &Purpose::Add.as_str(), &user, &secs(CHALLENGE_TTL)],
+        )
+        .await?;
+    Ok((id, challenge))
+}
+
+/// A challenge, used up: its bytes, and whose it is (a login's, or a
+/// directory user's), if anyone's.
+pub struct Challenge {
+    pub bytes: Vec<u8>,
+    pub login: Option<Uuid>,
+    pub directory_user: Option<Uuid>,
+}
+
+/// Uses up challenge `id`, if it's for `purpose` and still works.
+pub async fn take_challenge(client: &Object, id: Uuid, purpose: Purpose) -> anyhow::Result<Option<Challenge>> {
     let row = client
         .query_opt_cached(
             "DELETE FROM console_challenges WHERE id = $1 AND purpose = $2 AND expires_at > now()
-             RETURNING challenge, login_id",
+             RETURNING challenge, login_id, directory_user_id",
             &[&id, &purpose.as_str()],
         )
         .await?;
-    Ok(row.map(|r| (r.get(0), r.get(1))))
+    Ok(row.map(|r| Challenge { bytes: r.get(0), login: r.get(1), directory_user: r.get(2) }))
 }
 
 /// A passkey to add.
@@ -509,6 +532,8 @@ pub struct DirectorySession {
     /// Seconds since it was signed in with a passkey, if it was (a user of
     /// Cairn's own directory): `aws:MultiFactorAuthAge`.
     pub mfa_age: Option<i64>,
+    /// The passkey it was signed in with, if it was.
+    pub credential_id: Option<Vec<u8>>,
 }
 
 /// The directory user's session of `token`, while it lasts; it was used just
@@ -522,7 +547,8 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
                     s.permission_set_id, extract(epoch FROM s.expires_at)::float8, s.last_seen_at < now() - interval '1 minute',
                     s.target_account_id,
                     -- Not greatest(0, …), which is 0 for NULL: signed in at a source, none.
-                    CASE WHEN s.verified_at IS NULL THEN NULL ELSE greatest(0, extract(epoch FROM now() - s.verified_at))::bigint END
+                    CASE WHEN s.verified_at IS NULL THEN NULL ELSE greatest(0, extract(epoch FROM now() - s.verified_at))::bigint END,
+                    s.credential_id
              FROM console_directory_sessions s JOIN accounts a ON a.id = s.account_id
              JOIN identity_users u ON u.id = s.user_id
              LEFT JOIN oidc_providers p ON p.name = u.provider
@@ -551,6 +577,7 @@ pub async fn directory_session(client: &Object, token: &str) -> anyhow::Result<O
         permission_set: row.get::<_, Option<Uuid>>(10).zip(row.get::<_, Option<String>>(13)),
         expires_at: row.get(11),
         mfa_age: row.get(14),
+        credential_id: row.get(15),
     }))
 }
 
@@ -601,29 +628,31 @@ pub async fn setup_link(client: &Object, token: &str) -> anyhow::Result<Option<(
 /// Gives the directory user of setup link `token` passkey `key`, using the
 /// link up: the user's ID.
 pub async fn new_directory_passkey(client: &Object, token: &str, key: &NewPasskey<'_>) -> anyhow::Result<Uuid> {
-    let Some((user, _)) = setup_link(client, token).await? else { return Err(no_enrollment()) };
+    add_directory_passkey_as(client, None, Some(token), key).await
+}
+
+/// Gives directory user `user`, signed in, passkey `key`.
+pub async fn add_directory_passkey(client: &Object, user: Uuid, key: &NewPasskey<'_>) -> anyhow::Result<()> {
+    add_directory_passkey_as(client, Some(user), None, key).await.map(|_| ())
+}
+
+/// T65: gives a directory user a passkey, signed in (`user`) or with its
+/// setup link (`token`): the user's ID.
+async fn add_directory_passkey_as(client: &Object, user: Option<Uuid>, token: Option<&str>, key: &NewPasskey<'_>) -> anyhow::Result<Uuid> {
     let taken = || Invalid("this passkey is registered already".into());
-    let count: i64 =
-        client.query_one_cached("SELECT count(*) FROM directory_passkeys WHERE user_id = $1", &[&user]).await?.get(0);
-    if count >= i64::from(MAX_PASSKEYS) {
-        return Err(Invalid(format!("a user has at most {MAX_PASSKEYS} passkeys: ask for the ones you don't use to be removed")).into());
-    }
-    if client.query_opt_cached("SELECT 1 FROM passkeys WHERE credential_id = $1", &[&key.credential_id]).await?.is_some() {
-        return Err(taken().into());
-    }
     let row = client
-        .query_opt_cached(
-            "WITH l AS (DELETE FROM directory_setup_links WHERE token_hash = $1 AND expires_at > now() RETURNING user_id)
-             INSERT INTO directory_passkeys (credential_id, user_id, public_key, sign_count, name, backup_eligible, backed_up)
-             SELECT $2, l.user_id, $3, $4, $5, $6, $7 FROM l RETURNING user_id",
+        .query_one_cached(
+            "SELECT * FROM pg_temp.cairn_add_directory_passkey($1, $2, $3, $4, $5, $6, $7, $8, $9)",
             &[
-                &hash(token),
+                &user,
+                &token.map(hash),
                 &key.credential_id,
                 &key.public_key,
                 &i64::from(key.sign_count),
                 &key.name,
                 &key.backup_eligible,
                 &key.backed_up,
+                &MAX_PASSKEYS,
             ],
         )
         .await
@@ -631,7 +660,70 @@ pub async fn new_directory_passkey(client: &Object, token: &str, key: &NewPasske
             true => taken().into(),
             false => anyhow::Error::from(e),
         })?;
-    row.map(|r| r.get(0)).ok_or_else(no_enrollment)
+    match row.get::<_, &str>(0) {
+        "added" => Ok(row.get(1)),
+        "no_link" => Err(no_enrollment()),
+        "no_such_user" => Err(Invalid("sign in again".into()).into()),
+        "too_many" => Err(Invalid(format!("a user has at most {MAX_PASSKEYS} passkeys; remove one first")).into()),
+        "taken" => Err(taken().into()),
+        status => unreachable!("cairn_add_directory_passkey: unknown status {status}"),
+    }
+}
+
+/// Directory user `user`'s passkeys, oldest first.
+pub async fn directory_passkeys(client: &Object, user: Uuid) -> anyhow::Result<Vec<PasskeyInfo>> {
+    let rows = client
+        .query_cached(
+            "SELECT credential_id, name, backed_up, extract(epoch FROM created_at)::float8,
+                    extract(epoch FROM last_used_at)::float8
+             FROM directory_passkeys WHERE user_id = $1 ORDER BY created_at, credential_id",
+            &[&user],
+        )
+        .await?;
+    Ok(rows
+        .iter()
+        .map(|r| PasskeyInfo {
+            credential_id: r.get(0),
+            name: r.get(1),
+            backed_up: r.get(2),
+            created_at: r.get(3),
+            last_used_at: r.get(4),
+        })
+        .collect())
+}
+
+/// The credential IDs of directory user `user`'s passkeys.
+pub async fn directory_credential_ids(client: &Object, user: Uuid) -> anyhow::Result<Vec<Vec<u8>>> {
+    let rows = client.query_cached("SELECT credential_id FROM directory_passkeys WHERE user_id = $1", &[&user]).await?;
+    Ok(rows.iter().map(|r| r.get(0)).collect())
+}
+
+/// Renames one of directory user `user`'s passkeys.
+pub async fn rename_directory_passkey(client: &Object, user: Uuid, credential_id: &[u8], name: &str) -> anyhow::Result<()> {
+    let updated = client
+        .execute_cached(
+            "UPDATE directory_passkeys SET name = $3 WHERE user_id = $1 AND credential_id = $2",
+            &[&user, &credential_id, &name],
+        )
+        .await?;
+    if updated == 0 {
+        return Err(Invalid("no such passkey".into()).into());
+    }
+    Ok(())
+}
+
+/// Removes one of directory user `user`'s passkeys, and ends the sessions
+/// signed in with it, unless it's the user's last (T66).
+pub async fn delete_directory_passkey(client: &Object, user: Uuid, credential_id: &[u8]) -> anyhow::Result<()> {
+    let status = client
+        .query_one_cached("SELECT pg_temp.cairn_delete_directory_passkey($1, $2)", &[&user, &credential_id])
+        .await?;
+    match status.get::<_, &str>(0) {
+        "deleted" => Ok(()),
+        "no_such_passkey" => Err(Invalid("no such passkey".into()).into()),
+        "last" => Err(Invalid("it's your last way to sign in: add another passkey first".into()).into()),
+        status => unreachable!("cairn_delete_directory_passkey: unknown status {status}"),
+    }
 }
 
 /// A directory user's passkey, to check an assertion by.

@@ -356,6 +356,36 @@ impl FromRequestParts<Arc<Console>> for Signed {
     }
 }
 
+/// Whose passkeys a request's session manages: a login's, or a user of
+/// Cairn's own directory's. Handlers that take it answer 401 without a
+/// session, and 403 to the root user and to users of identity sources,
+/// which have none.
+pub(crate) enum PasskeyHolder {
+    Login(store::Session),
+    Directory(store::DirectorySession),
+}
+
+impl FromRequestParts<Arc<Console>> for PasskeyHolder {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, console: &Arc<Console>) -> Result<Self, ApiError> {
+        let unauthorized = || ApiError::Unauthorized("sign in first".into());
+        let token = session_token(&parts.headers).ok_or_else(unauthorized)?;
+        let client = console.app.pool.get().await?;
+        if let Some(session) = store::session(&client, &token).await? {
+            return Ok(PasskeyHolder::Login(session));
+        }
+        match store::directory_session(&client, &token).await? {
+            Some(session) if session.provider.is_none() => Ok(PasskeyHolder::Directory(session)),
+            Some(_) => Err(ApiError::Forbidden("you sign in at your identity source: you have no passkeys here".into())),
+            None if store::root_session(&client, &token).await?.is_some() => {
+                Err(ApiError::Forbidden("the root user has no passkeys: it signs in with a link from a node".into()))
+            }
+            None => Err(unauthorized()),
+        }
+    }
+}
+
 /// A directory user's signed-in session: handlers that take it answer 401
 /// without a session, and 403 to any other.
 pub(crate) struct DirectorySigned {
@@ -1387,6 +1417,44 @@ mod e2e {
         assert_eq!((&me["directory"]["permission_set"], &me["directory"]["provider_label"]), (&json!("Readers"), &Value::Null));
         assert!(me["identity"]["arn"].as_str().unwrap().starts_with(&format!("arn:aws:sts::{account}:assumed-role/AWSReservedSSO_Readers_")));
         assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::OK);
+
+        // Her own passkeys: she adds, renames and removes them, as a login does.
+        assert_eq!((me["passkeys"][0]["name"].as_str(), &me["passkeys"][0]["current"]), (Some("Laptop"), &json!(true)));
+        let (status, ceremony) = browser.send("POST", "/api/passkeys/options", None).await;
+        assert_eq!(status, StatusCode::OK, "{ceremony}");
+        assert_eq!(ceremony["options"]["user"]["id"], handle);
+        assert_eq!(ceremony["options"]["excludeCredentials"].as_array().unwrap().len(), 1);
+        let mut phone = Authenticator::p256();
+        // A login's challenge isn't hers, nor hers a login's.
+        let (_, theirs) = tenant.send("POST", "/api/passkeys/options", None).await;
+        let (status, err) = browser.send("POST", "/api/passkeys", Some(registration(&mut phone, &theirs, "Phone"))).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("isn't yours"), "{err}");
+        let body = registration(&mut phone, &ceremony, "Phone");
+        assert_eq!(tenant.send("POST", "/api/passkeys", Some(body)).await.0, StatusCode::BAD_REQUEST);
+        let (_, ceremony) = browser.send("POST", "/api/passkeys/options", None).await;
+        let body = registration(&mut phone, &ceremony, "Phone");
+        assert_eq!(browser.send("POST", "/api/passkeys", Some(body)).await.0, StatusCode::NO_CONTENT);
+        let (_, ceremony) = browser.send("POST", "/api/passkeys/options", None).await;
+        let (status, err) = browser.send("POST", "/api/passkeys", Some(registration(&mut phone, &ceremony, "Again"))).await;
+        assert_eq!((status, err["error"].as_str()), (StatusCode::BAD_REQUEST, Some("this passkey is registered already")));
+        let mut other = Browser { console: console.clone(), cookie: None, origin: party().origin };
+        let (status, me) = sign_in(&mut other, &mut phone).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        let current: Vec<_> = me["passkeys"].as_array().unwrap().iter().map(|p| p["current"].as_bool().unwrap()).collect();
+        assert_eq!(current, [false, true]);
+        let phone_path = format!("/api/passkeys/{}", URL_SAFE_NO_PAD.encode(&phone.credential_id));
+        assert_eq!(browser.send("PUT", &phone_path, Some(json!({ "name": "Old phone" }))).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(browser.send("GET", "/api/me", None).await.1["passkeys"][1]["name"], "Old phone");
+        // Not someone else's.
+        assert_eq!(tenant.send("DELETE", &phone_path, None).await.0, StatusCode::BAD_REQUEST);
+        // Removing one ends the sessions signed in with it; never her last.
+        assert_eq!(browser.send("DELETE", &phone_path, None).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(other.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
+        let laptop_path = format!("/api/passkeys/{}", URL_SAFE_NO_PAD.encode(&key.credential_id));
+        let (status, err) = browser.send("DELETE", &laptop_path, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("last way"), "{err}");
 
         // The command line makes links too.
         let args: crate::identity_center::DirectoryUserArgs =

@@ -168,6 +168,13 @@ function label(m: Me): string {
   return m.directory ? (m.directory.permission_set ?? m.name) : m.identity.user;
 }
 
+/** The account the session acts in: none for a directory user until it
+ * picks a permission set (and with it an account). */
+function actingAccount(m: Me): { name: string; id: string } | undefined {
+  if (m.directory && !m.directory.permission_set) return undefined;
+  return { name: m.identity.account, id: m.identity.account_id };
+}
+
 /** The person signed in: who the session acts as, their own sign-in
  * settings, and signing out. */
 function UserMenu(props: { me: Me; logout: () => void }) {
@@ -197,16 +204,37 @@ function UserMenu(props: { me: Me; logout: () => void }) {
           {props.me.name.slice(0, 1).toUpperCase()}
         </span>
         <span class="mono">{label(props.me)}</span>
+        <Show when={actingAccount(props.me)}>
+          {(a) => (
+            <span class="account-chip" title={`Account ${a().id}`}>
+              {a().name}
+            </span>
+          )}
+        </Show>
         <span aria-hidden="true">▾</span>
       </button>
       <Show when={open()}>
         <div class="menu" role="menu">
           <div class="menu-head">
             Signed in as <strong>{props.me.name}</strong>
+            <Show when={actingAccount(props.me)}>
+              {(a) => (
+                <div>
+                  In account <strong>{a().name}</strong> <span class="mono">{a().id}</span>
+                  <Show when={props.me.identity.management}> (management)</Show>
+                </div>
+              )}
+            </Show>
           </div>
           <hr />
           <A role="menuitem" class="menu-item" href="/account" onClick={() => setOpen(false)}>
-            {props.me.root ? "Who you are" : props.me.directory ? "Permission sets and credentials" : "Passkeys and sign-in"}
+            {props.me.root
+              ? "Who you are"
+              : props.me.directory
+                ? props.me.directory.provider
+                  ? "Permission sets and credentials"
+                  : "Permission sets, credentials and passkeys"
+                : "Passkeys and sign-in"}
           </A>
           <button role="menuitem" class="menu-item" onClick={props.logout}>
             Sign out
@@ -589,8 +617,8 @@ function DirectoryHome(props: { me: Me }) {
         <Table count={1} columns={["User name", "Source", "Subject", "E-mail", "Groups"]}>
           <tr>
             <td class="mono">{d().user_name}</td>
-            <td>{d().provider_label}</td>
-            <td class="mono small">{d().subject}</td>
+            <td>{d().provider_label ?? "Cairn's own directory"}</td>
+            <td class="mono small">{d().subject ?? <span class="subtle">none</span>}</td>
             <td>{d().email ?? <span class="subtle">none given</span>}</td>
             <td>
               <For each={d().groups} fallback={<span class="subtle">none</span>}>
@@ -599,13 +627,27 @@ function DirectoryHome(props: { me: Me }) {
             </td>
           </tr>
         </Table>
-        <p class="subtle small">
-          You're a directory user: {d().provider_label} vouches for you, with these groups, as of when you signed in.
-          You have no passkeys or access keys of your own here. A session signed in at an identity source isn't
-          multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span> is false). Your console session ends at{" "}
-          {clock(props.me.expires_at ?? 0)} at the latest.
-        </p>
+        <Show
+          when={d().provider_label}
+          fallback={
+            <p class="subtle small">
+              You're a user of Cairn's own directory: you sign in with your passkeys, so your session counts as
+              multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span>). Your console session ends at{" "}
+              {clock(props.me.expires_at ?? 0)} at the latest.
+            </p>
+          }
+        >
+          <p class="subtle small">
+            You're a directory user: {d().provider_label} vouches for you, with these groups, as of when you signed
+            in. You have no passkeys or access keys of your own here. A session signed in at an identity source isn't
+            multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span> is false). Your console session ends
+            at {clock(props.me.expires_at ?? 0)} at the latest.
+          </p>
+        </Show>
       </Panel>
+      <Show when={!d().provider}>
+        <Passkeys passkeys={props.me.passkeys} />
+      </Show>
     </>
   );
 }

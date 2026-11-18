@@ -92,6 +92,9 @@
 --           deleting a version, or setting its default (I13).
 --   L(l)    A console login's row (see `console`). Exclusive: giving it a
 --           passkey, removing one, linking an identity to it (I10).
+--   Y(y)    A user of Cairn's own directory's row (`identity_users`; see
+--           `identity_center`). Exclusive: giving it a passkey (signed in,
+--           or with a setup link), removing one (I10).
 --   E(e)    An enrollment link's row: locked by the transaction that uses
 --           it up, so that it's used once.
 --   X(x)    The blob's row. Shared: referencing it, changing or deleting
@@ -192,7 +195,10 @@
 --     under D(d) too (T52). Likewise a console login
 --     has at most 8 passkeys, as IAM's MFA devices, and at least one, but
 --     by being deleted, under L(l) (T30, T31); and at most one identity per
---     account (T33, T34; the login_identities indexes are a backstop). Deleting a key or a
+--     account (T33, T34; the login_identities indexes are a backstop). So
+--     does a user of Cairn's own directory, under Y(y) (T65, T66), but
+--     it may have none (until it uses a setup link, or after an
+--     administrator removed them all). Deleting a key or a
 --     policy only takes from them. The console's enrollments, challenges and
 --     sessions are each used up or ended by a single DELETE, whose condition
 --     is on its own row (F2), so each is used once.
@@ -231,7 +237,7 @@
 -- There are none, by three rules, which every transaction follows:
 --
 -- A. All of a transaction's locks are taken up front, in one global order:
---    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, O, Q, D, M, X (by
+--    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, O, Q, D, M, L, Y, X (by
 --    blob id), each stripe in one mode, each blob
 --    in its final mode (exclusive wins over shared). A transaction that waits
 --    for a lock therefore only ever waits for one that comes later in the
@@ -2042,6 +2048,76 @@ BEGIN
     IF NOT FOUND THEN
         RETURN 'no_such_version';
     END IF;
+    RETURN 'deleted';
+END
+$$;
+
+-- T65: gives a user of Cairn's own directory a passkey, unless it has
+-- `p_max` already (I10): signed in (`p_link` NULL), or with its setup link
+-- `p_link` (by its hash), which it uses up. Takes Y(y) exclusively, then
+-- counts, then uses the link up by a DELETE whose condition is on its own
+-- row (F2), so that it's used once. A credential registered meanwhile fails
+-- the insert's unique index, and so the whole statement. Returns 'added',
+-- 'no_such_user', 'no_link' (used, or expired), 'too_many' or 'taken', and
+-- the user's ID.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_add_directory_passkey(
+    p_user uuid, p_link bytea, p_credential bytea, p_public_key bytea, p_sign_count bigint,
+    p_name text, p_backup_eligible boolean, p_backed_up boolean, p_max integer,
+    OUT status text, OUT o_user uuid)
+LANGUAGE plpgsql AS $$
+BEGIN
+    o_user := p_user;
+    IF p_link IS NOT NULL THEN
+        SELECT l.user_id INTO o_user FROM directory_setup_links l WHERE l.token_hash = p_link AND l.expires_at > now();
+        IF NOT FOUND THEN
+            status := 'no_link';
+            RETURN;
+        END IF;
+    END IF;
+    PERFORM 1 FROM identity_users u WHERE u.id = o_user AND u.provider IS NULL FOR UPDATE;
+    IF NOT FOUND THEN
+        status := CASE WHEN p_link IS NULL THEN 'no_such_user' ELSE 'no_link' END;
+        RETURN;
+    END IF;
+    IF (SELECT count(*) FROM directory_passkeys d WHERE d.user_id = o_user) >= p_max THEN
+        status := 'too_many';
+        RETURN;
+    END IF;
+    IF EXISTS (SELECT 1 FROM directory_passkeys WHERE credential_id = p_credential)
+       OR EXISTS (SELECT 1 FROM passkeys WHERE credential_id = p_credential) THEN
+        status := 'taken';
+        RETURN;
+    END IF;
+    IF p_link IS NOT NULL THEN
+        DELETE FROM directory_setup_links l
+        WHERE l.token_hash = p_link AND l.user_id = o_user AND l.expires_at > now();
+        IF NOT FOUND THEN
+            status := 'no_link';
+            RETURN;
+        END IF;
+    END IF;
+    INSERT INTO directory_passkeys (credential_id, user_id, public_key, sign_count, name, backup_eligible, backed_up)
+    VALUES (p_credential, o_user, p_public_key, p_sign_count, p_name, p_backup_eligible, p_backed_up);
+    status := 'added';
+END
+$$;
+
+-- T66: removes one of a directory user's passkeys (and so the sessions
+-- signed in with it), unless it's the user's last, so that no one locks
+-- themselves out (an administrator still may: `delete_directory_passkeys`).
+-- Takes Y(y) exclusively, then counts. Returns 'deleted', 'no_such_passkey'
+-- or 'last'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_directory_passkey(p_user uuid, p_credential bytea)
+RETURNS text LANGUAGE plpgsql AS $$
+BEGIN
+    PERFORM 1 FROM identity_users WHERE id = p_user FOR UPDATE;
+    IF NOT EXISTS (SELECT 1 FROM directory_passkeys WHERE user_id = p_user AND credential_id = p_credential) THEN
+        RETURN 'no_such_passkey';
+    END IF;
+    IF (SELECT count(*) FROM directory_passkeys WHERE user_id = p_user) <= 1 THEN
+        RETURN 'last';
+    END IF;
+    DELETE FROM directory_passkeys WHERE user_id = p_user AND credential_id = p_credential;
     RETURN 'deleted';
 END
 $$;
