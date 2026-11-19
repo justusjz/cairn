@@ -2229,11 +2229,36 @@ run (`get-table-maintenance-job-status`):
   (10) after that; the files of expired snapshots are noncurrent at once.
   What's referenced is read from the table's manifests; if one can't be
   read, nothing is deleted, and the job fails, saying why.
+- **Compaction**, on by default, hourly (and again soon while there's more
+  to do): small data files (under 75% of `targetFileSizeMB`, 512 by
+  default), oversized ones (over 180%), and those with deletes are
+  rewritten into files of the target size, per partition, their deletes
+  applied, as a `replace` snapshot: the same rows, in fewer files. Delete
+  files that apply to nothing any more go with them. A partition's files
+  are rewritten when there are 5 or more of them, or 2 that together reach
+  the target, or any has deletes. Its `strategy`:
+  - `binpack`: rows as they are;
+  - `sort`: by the table's sort order (`write-order`, or Spark's
+    `WRITE ORDERED BY`);
+  - `z-order`: by the z-order of the sort order's columns, which clusters
+    rows by all of them at once;
+  - `auto` (the default): `sort` if the table has a sort order, else
+    `binpack`.
 
-Compaction can't be enabled: engines compact tables themselves meanwhile
-(Spark's `rewrite_data_files`, say). Maintenance acts as Cairn, which can't
-open SSE-KMS keys: a table encrypted with SSE-KMS isn't maintained (its jobs
-fail, saying so). See [S3 compatibility](S3-COMPATIBILITY.md#s3-tables) for
+  Compaction takes little memory whatever the files' sizes: input files
+  are read one at a time, sorting what's more than 64 MiB spills to the
+  node's first data dir, and files being written are spooled there too
+  (past 8 MiB) and streamed into the object store as they're closed. What
+  a crash leaves there is removed as the node starts.
+  Files are written as Parquet, in row groups of at most 32 MiB (or the
+  table's `write.parquet.row-group-size-bytes`, if less), compressed as the
+  table's `write.parquet.compression-codec` says (zstd by default); a format
+  version 3 table's rows keep their lineage (`_row_id`). A commit that came
+  in while compaction ran is fine if it only appended; any other drops the
+  rewrite, which is tried again at the next run.
+
+Maintenance acts as Cairn, which can't open SSE-KMS keys: a table encrypted
+with SSE-KMS isn't maintained (its jobs fail, saying so). See [S3 compatibility](S3-COMPATIBILITY.md#s3-tables) for
 the rest.
 
 ## Server access logs

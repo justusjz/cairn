@@ -989,9 +989,10 @@ async fn configurations() {
         Value::Null,
     )
     .await;
+    // Compaction is on by default, as AWS's.
     assert_eq!(
         maintenance["configuration"]["icebergCompaction"]["status"],
-        "disabled"
+        "enabled"
     );
     assert_eq!(
         maintenance["configuration"]["icebergSnapshotManagement"]["status"],
@@ -1003,13 +1004,23 @@ async fn configurations() {
         Method::PUT,
         &format!("{base}/maintenance/icebergCompaction"),
         "",
-        json!({ "value": { "status": "enabled" } }),
+        json!({ "value": { "status": "enabled", "settings": { "icebergCompaction": { "targetFileSizeMB": 32 } } } }),
     )
     .await;
     assert_eq!(
         (status, body["code"].as_str()),
-        (StatusCode::NOT_IMPLEMENTED, Some("NotImplemented"))
+        (StatusCode::BAD_REQUEST, Some("BadRequestException"))
     );
+    let (status, _) = call(
+        &app,
+        &admin,
+        Method::PUT,
+        &format!("{base}/maintenance/icebergCompaction"),
+        "",
+        json!({ "value": { "status": "enabled", "settings": { "icebergCompaction": { "targetFileSizeMB": 128, "strategy": "sort" } } } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
     let (status, _) = call(
         &app,
         &admin,
@@ -1824,7 +1835,7 @@ async fn maintenance_expires_snapshots_and_removes_files() {
     assert!(exists("data/a.parquet").await);
 
     // Jobs taken by a pass, and their status told.
-    assert_eq!(pass(&app, now + 30 * day).await.unwrap(), 2);
+    assert_eq!(pass(&app, now + 30 * day).await.unwrap(), 3);
     assert_eq!(pass(&app, now + 30 * day).await.unwrap(), 0);
     let (_, status) = call(
         &app,
@@ -1840,7 +1851,11 @@ async fn maintenance_expires_snapshots_and_removes_files() {
         "Successful"
     );
     assert!(status["status"]["icebergUnreferencedFileRemoval"]["lastRunTimestamp"].is_string());
-    assert_eq!(status["status"]["icebergCompaction"]["status"], "Disabled");
+    // Two tiny files: nothing worth compacting.
+    assert_eq!(
+        status["status"]["icebergCompaction"]["status"],
+        "Successful"
+    );
 
     // A table that keeps its files: refused, saying why.
     let (status, _) = call(
@@ -1874,4 +1889,607 @@ async fn maintenance_expires_snapshots_and_removes_files() {
         "{outcome:?}"
     );
     assert!(exists("data/b.parquet").await);
+}
+
+// ─── Compaction ──────────────────────────────────────────────────────────────
+
+/// Makes namespace `n` and table `t` in a new bucket of `admin`'s, with
+/// `body`'s schema and settings (a REST create's): its storage.
+async fn compaction_table(app: &Arc<App>, admin: &Principal, body: Value) -> (String, String) {
+    let arn = bucket(app, admin, &bucket_name()).await;
+    let v1 = format!("/iceberg/v1/{arn}");
+    call(
+        app,
+        admin,
+        Method::POST,
+        &format!("{v1}/namespaces"),
+        "",
+        json!({ "namespace": ["n"] }),
+    )
+    .await;
+    let (status, created) = call(
+        app,
+        admin,
+        Method::POST,
+        &format!("{v1}/namespaces/n/tables"),
+        "",
+        body,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let location = created["metadata"]["location"].as_str().unwrap().to_owned();
+    (arn, location.strip_prefix("s3://").unwrap().to_owned())
+}
+
+/// The table's iceberg `Table`, to read and write it with.
+async fn iceberg_table(app: &Arc<App>, storage: &str) -> ::iceberg::table::Table {
+    let (table, metadata) = table_of(app, storage).await;
+    ::iceberg::table::Table::builder()
+        .metadata(metadata)
+        .identifier(::iceberg::TableIdent::from_strs(["n", "t"]).unwrap())
+        .file_io(super::iceberg::io::file_io(app, &table, None))
+        .runtime(::iceberg::Runtime::current())
+        .build()
+        .unwrap()
+}
+
+/// Appends `batch` (in partition `partition`, if the table has one) as a
+/// client does: a data file, a manifest of it, and a manifest list of it and
+/// the current snapshot's manifests, committed through the catalog.
+async fn append_batch(
+    app: &Arc<App>,
+    admin: &Principal,
+    arn: &str,
+    storage: &str,
+    batch: arrow_array::RecordBatch,
+    partition: Option<::iceberg::spec::Struct>,
+) {
+    use ::iceberg::spec::{
+        DataFileFormat, ManifestListWriter, ManifestWriterBuilder, PartitionKey,
+    };
+    use ::iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
+    use ::iceberg::writer::file_writer::ParquetWriterBuilder;
+    use ::iceberg::writer::file_writer::location_generator::{
+        DefaultFileNameGenerator, DefaultLocationGenerator,
+    };
+    use ::iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
+    use ::iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
+    let table = iceberg_table(app, storage).await;
+    let metadata = table.metadata();
+    let schema = metadata.current_schema().clone();
+    let spec = metadata.default_partition_spec().as_ref().clone();
+    let key = partition.map(|p| PartitionKey::new(spec.clone(), schema.clone(), p));
+    let rolling = RollingFileWriterBuilder::new_with_default_file_size(
+        ParquetWriterBuilder::new(Default::default(), schema.clone()),
+        table.file_io().clone(),
+        DefaultLocationGenerator::new(metadata).unwrap(),
+        DefaultFileNameGenerator::new(
+            format!("w-{}", uuid::Uuid::new_v4()),
+            None,
+            DataFileFormat::Parquet,
+        ),
+    );
+    let mut writer = DataFileWriterBuilder::new(rolling)
+        .build(key)
+        .await
+        .unwrap();
+    writer.write(batch).await.unwrap();
+    let files = writer.close().await.unwrap();
+    let snapshot_id = (uuid::Uuid::new_v4().as_u128() as i64 & i64::MAX).max(1);
+    let sequence = metadata.next_sequence_number();
+    let warehouse = metadata.location().to_owned();
+    let v3 = metadata.format_version() >= ::iceberg::spec::FormatVersion::V3;
+    let path = format!("{warehouse}/metadata/{}-m0.avro", uuid::Uuid::new_v4());
+    let builder = ManifestWriterBuilder::new(
+        table.file_io().new_output(&path).unwrap(),
+        Some(snapshot_id),
+        schema,
+        spec,
+    );
+    let mut manifest = if v3 {
+        builder.build_v3_data()
+    } else {
+        builder.build_v2_data()
+    };
+    let mut records = 0;
+    for file in files {
+        records += file.record_count();
+        manifest.add_file(file, -1).unwrap();
+    }
+    let mut manifests = vec![manifest.write_manifest_file().await.unwrap()];
+    let parent = metadata.current_snapshot().map(|s| s.snapshot_id());
+    if let Some(current) = metadata.current_snapshot() {
+        manifests.extend(
+            table
+                .manifest_list_reader(current)
+                .load()
+                .await
+                .unwrap()
+                .entries()
+                .iter()
+                .cloned(),
+        );
+    }
+    let list = format!(
+        "{warehouse}/metadata/snap-{snapshot_id}-1-{}.avro",
+        uuid::Uuid::new_v4()
+    );
+    let output = table.file_io().new_output(&list).unwrap();
+    let first_row_id = metadata.next_row_id();
+    let mut list_writer = match v3 {
+        true => ManifestListWriter::v3(
+            output.writer().await.unwrap(),
+            snapshot_id,
+            parent,
+            sequence,
+            Some(first_row_id),
+        ),
+        false => ManifestListWriter::v2(
+            output.writer().await.unwrap(),
+            snapshot_id,
+            parent,
+            sequence,
+        ),
+    };
+    list_writer.add_manifests(manifests.into_iter()).unwrap();
+    let next_row_id = list_writer.next_row_id();
+    list_writer.close().await.unwrap();
+    let mut snapshot = json!({
+        "snapshot-id": snapshot_id, "parent-snapshot-id": parent, "sequence-number": sequence,
+        "timestamp-ms": now_ms(), "manifest-list": list, "schema-id": metadata.current_schema_id(),
+        "summary": { "operation": "append", "added-records": records.to_string() },
+    });
+    if v3 {
+        snapshot["first-row-id"] = json!(first_row_id);
+        snapshot["added-rows"] = json!(next_row_id.unwrap() - first_row_id);
+    }
+    let (status, body) = call(app, admin, Method::POST, &format!("/iceberg/v1/{arn}/namespaces/n/tables/t"), "", json!({
+        "requirements": [{ "type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": parent }],
+        "updates": [
+            { "action": "add-snapshot", "snapshot": snapshot },
+            { "action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": snapshot_id },
+        ],
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// A batch of rows (id, name) of the table's schema.
+fn rows(table: &::iceberg::table::Table, ids: &[i64], names: &[&str]) -> arrow_array::RecordBatch {
+    let schema = Arc::new(
+        ::iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema()).unwrap(),
+    );
+    arrow_array::RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(arrow_array::Int64Array::from(ids.to_vec())),
+            Arc::new(arrow_array::StringArray::from(names.to_vec())),
+        ],
+    )
+    .unwrap()
+}
+
+/// The table's rows (`columns`, as i64s or strings), in its files' order;
+/// and how many data files it has.
+async fn scan(app: &Arc<App>, storage: &str, columns: &[&str]) -> (Vec<Vec<String>>, usize) {
+    use futures_util::StreamExt;
+    let table = iceberg_table(app, storage).await;
+    let scan = table
+        .scan()
+        .select(columns.iter().copied())
+        .build()
+        .unwrap();
+    let mut files = 0;
+    let mut tasks = scan.plan_files().await.unwrap();
+    while let Some(task) = tasks.next().await {
+        task.unwrap();
+        files += 1;
+    }
+    let mut out = Vec::new();
+    let mut batches = scan.to_arrow().await.unwrap();
+    while let Some(batch) = batches.next().await {
+        let batch = batch.unwrap();
+        for row in 0..batch.num_rows() {
+            out.push(
+                (0..batch.num_columns())
+                    .map(|c| arrow_cast_value(batch.column(c), row))
+                    .collect(),
+            );
+        }
+    }
+    (out, files)
+}
+
+fn arrow_cast_value(column: &arrow_array::ArrayRef, row: usize) -> String {
+    use arrow_array::cast::AsArray;
+    if column.is_null(row) {
+        return "null".into();
+    }
+    match column.data_type() {
+        arrow_schema::DataType::Int64 => column
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(row)
+            .to_string(),
+        arrow_schema::DataType::Utf8 => column.as_string::<i32>().value(row).to_owned(),
+        other => format!("{other}"),
+    }
+}
+
+fn compaction_schema() -> Value {
+    json!({ "type": "struct", "fields": [
+        { "id": 1, "name": "id", "required": false, "type": "long" },
+        { "id": 2, "name": "name", "required": false, "type": "string" },
+    ]})
+}
+
+/// The id of the table whose storage is `storage`.
+async fn table_id(app: &Arc<App>, storage: &str) -> uuid::Uuid {
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .query_one("SELECT id FROM tables WHERE storage = $1", &[&storage])
+        .await
+        .unwrap()
+        .get(0)
+}
+
+#[tokio::test]
+async fn compaction_binpacks_and_sorts() {
+    use crate::tables::compaction::COMPACTION;
+    use crate::tables::maintenance::{Outcome, run_job};
+    let Some(app) = node().await else { return };
+    let admin = user(&app, "admin", ADMIN).await;
+    let (arn, storage) = compaction_table(
+        &app,
+        &admin,
+        json!({ "name": "t", "schema": compaction_schema() }),
+    )
+    .await;
+    let id = table_id(&app, &storage).await;
+    // Nothing yet.
+    let now = std::time::SystemTime::now();
+    assert_eq!(
+        run_job(&app, id, COMPACTION, now).await.unwrap(),
+        Outcome::Successful("nothing to compact".into())
+    );
+    // Six small files.
+    for i in 0..6i64 {
+        let table = iceberg_table(&app, &storage).await;
+        let batch = rows(
+            &table,
+            &[i * 10 + 2, i * 10 + 1, i * 10 + 3],
+            &["a", "b", "c"],
+        );
+        append_batch(&app, &admin, &arn, &storage, batch, None).await;
+    }
+    let (before, files) = scan(&app, &storage, &["id", "name"]).await;
+    assert_eq!((before.len(), files), (18, 6));
+    let outcome = run_job(&app, id, COMPACTION, now).await.unwrap();
+    assert_eq!(
+        outcome,
+        Outcome::Successful("6 file(s) rewritten into 1".into())
+    );
+    let (after, files) = scan(&app, &storage, &["id", "name"]).await;
+    assert_eq!(files, 1);
+    let (mut b, mut a) = (before.clone(), after.clone());
+    b.sort();
+    a.sort();
+    assert_eq!(a, b);
+    let (_, loaded) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("/iceberg/v1/{arn}/namespaces/n/tables/t"),
+        "",
+        Value::Null,
+    )
+    .await;
+    let current = loaded["metadata"]["current-snapshot-id"].clone();
+    let snapshot = loaded["metadata"]["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["snapshot-id"] == current)
+        .unwrap()
+        .clone();
+    assert_eq!(snapshot["summary"]["operation"], "replace");
+    assert_eq!(snapshot["summary"]["deleted-data-files"], "6");
+    // One file: nothing more to do.
+    assert_eq!(
+        run_job(&app, id, COMPACTION, now).await.unwrap(),
+        Outcome::Successful("nothing to compact".into())
+    );
+
+    // Sorted by id, descending: `auto` sorts, as the table has a sort
+    // order.
+    let (status, body) = call(&app, &admin, Method::POST, &format!("/iceberg/v1/{arn}/namespaces/n/tables/t"), "", json!({
+        "requirements": [],
+        "updates": [
+            { "action": "add-sort-order", "sort-order": { "order-id": 1, "fields": [
+                { "source-id": 1, "transform": "identity", "direction": "desc", "null-order": "nulls-last" } ] } },
+            { "action": "set-default-sort-order", "sort-order-id": -1 },
+        ],
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    for i in 0..5i64 {
+        let table = iceberg_table(&app, &storage).await;
+        append_batch(
+            &app,
+            &admin,
+            &arn,
+            &storage,
+            rows(&table, &[100 + i, 200 + i], &["x", "y"]),
+            None,
+        )
+        .await;
+    }
+    // Six small files again (the compacted one is small too).
+    let outcome = run_job(&app, id, COMPACTION, now).await.unwrap();
+    assert_eq!(
+        outcome,
+        Outcome::Successful("6 file(s) rewritten into 1".into())
+    );
+    let (after, files) = scan(&app, &storage, &["id"]).await;
+    assert_eq!((after.len(), files), (28, 1));
+    let ids: Vec<i64> = after.iter().map(|r| r[0].parse().unwrap()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(ids, sorted);
+
+    // Disabled: nothing.
+    let (status, _) = call(
+        &app,
+        &admin,
+        Method::PUT,
+        &format!("/tables/{arn}/n/t/maintenance/icebergCompaction"),
+        "",
+        json!({ "value": { "status": "disabled" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        run_job(&app, id, COMPACTION, now).await.unwrap(),
+        Outcome::Disabled
+    );
+    // z-order without a sort order: refused, saying why.
+    let (_, storage2) = compaction_table(
+        &app,
+        &admin,
+        json!({ "name": "t", "schema": compaction_schema() }),
+    )
+    .await;
+    let arn2 = {
+        let client = app.pool.get().await.unwrap();
+        let row = client
+            .query_one("SELECT b.account_id, b.name FROM tables t JOIN table_buckets b ON b.id = t.table_bucket_id WHERE t.storage = $1", &[&storage2])
+            .await
+            .unwrap();
+        super::names::bucket_arn(row.get(0), row.get(1))
+    };
+    let (status, _) = call(&app, &admin, Method::PUT, &format!("/tables/{arn2}/n/t/maintenance/icebergCompaction"), "",
+        json!({ "value": { "status": "enabled", "settings": { "icebergCompaction": { "strategy": "z-order" } } } })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let table = iceberg_table(&app, &storage2).await;
+    append_batch(
+        &app,
+        &admin,
+        &arn2,
+        &storage2,
+        rows(&table, &[1], &["a"]),
+        None,
+    )
+    .await;
+    let outcome = run_job(&app, table_id(&app, &storage2).await, COMPACTION, now)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&outcome, Outcome::Failed(m) if m.contains("sort order")),
+        "{outcome:?}"
+    );
+}
+
+#[tokio::test]
+async fn compaction_z_orders_partitions() {
+    use crate::tables::compaction::COMPACTION;
+    use crate::tables::maintenance::{Outcome, run_job};
+    let Some(app) = node().await else { return };
+    let admin = user(&app, "admin", ADMIN).await;
+    let (arn, storage) = compaction_table(&app, &admin, json!({
+        "name": "t", "schema": compaction_schema(),
+        "partition-spec": { "fields": [{ "source-id": 2, "transform": "identity", "name": "name" }] },
+        "write-order": { "order-id": 1, "fields": [
+            { "source-id": 1, "transform": "identity", "direction": "asc", "null-order": "nulls-first" },
+            { "source-id": 2, "transform": "identity", "direction": "asc", "null-order": "nulls-first" } ] },
+    })).await;
+    let id = table_id(&app, &storage).await;
+    let (status, _) = call(&app, &admin, Method::PUT, &format!("/tables/{arn}/n/t/maintenance/icebergCompaction"), "",
+        json!({ "value": { "status": "enabled", "settings": { "icebergCompaction": { "strategy": "z-order", "targetFileSizeMB": 64 } } } })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    // Five small files in each of two partitions, and one in a third.
+    for name in ["p", "q"] {
+        for i in 0..5i64 {
+            let table = iceberg_table(&app, &storage).await;
+            let partition =
+                ::iceberg::spec::Struct::from_iter([Some(::iceberg::spec::Literal::string(name))]);
+            append_batch(
+                &app,
+                &admin,
+                &arn,
+                &storage,
+                rows(&table, &[50 - i, i], &[name, name]),
+                Some(partition),
+            )
+            .await;
+        }
+    }
+    let table = iceberg_table(&app, &storage).await;
+    let partition =
+        ::iceberg::spec::Struct::from_iter([Some(::iceberg::spec::Literal::string("r"))]);
+    append_batch(
+        &app,
+        &admin,
+        &arn,
+        &storage,
+        rows(&table, &[7], &["r"]),
+        Some(partition),
+    )
+    .await;
+    let outcome = run_job(&app, id, COMPACTION, std::time::SystemTime::now())
+        .await
+        .unwrap();
+    // Each worth it partition's files into one; r's alone stays.
+    assert_eq!(
+        outcome,
+        Outcome::Successful("10 file(s) rewritten into 2".into())
+    );
+    let (after, files) = scan(&app, &storage, &["id", "name"]).await;
+    assert_eq!((after.len(), files), (21, 3));
+    for name in ["p", "q"] {
+        let ids: Vec<i64> = after
+            .iter()
+            .filter(|r| r[1] == name)
+            .map(|r| r[0].parse().unwrap())
+            .collect();
+        let mut sorted = ids.clone();
+        sorted.sort();
+        // One column varies in a partition: z-order is its order.
+        assert_eq!(ids, sorted, "{name}");
+    }
+}
+
+#[tokio::test]
+async fn compaction_keeps_row_lineage() {
+    use crate::tables::compaction::COMPACTION;
+    use crate::tables::maintenance::{Outcome, run_job};
+    let Some(app) = node().await else { return };
+    let admin = user(&app, "admin", ADMIN).await;
+    let (arn, storage) = compaction_table(
+        &app,
+        &admin,
+        json!({
+            "name": "t", "schema": compaction_schema(), "properties": { "format-version": "3" },
+        }),
+    )
+    .await;
+    let id = table_id(&app, &storage).await;
+    for i in 0..5i64 {
+        let table = iceberg_table(&app, &storage).await;
+        append_batch(
+            &app,
+            &admin,
+            &arn,
+            &storage,
+            rows(&table, &[i, i + 100], &["a", "b"]),
+            None,
+        )
+        .await;
+    }
+    let (mut before, files) = scan(
+        &app,
+        &storage,
+        &["id", "_row_id", "_last_updated_sequence_number"],
+    )
+    .await;
+    assert_eq!((before.len(), files), (10, 5));
+    let outcome = run_job(&app, id, COMPACTION, std::time::SystemTime::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        Outcome::Successful("5 file(s) rewritten into 1".into())
+    );
+    let (mut after, files) = scan(
+        &app,
+        &storage,
+        &["id", "_row_id", "_last_updated_sequence_number"],
+    )
+    .await;
+    assert_eq!(files, 1);
+    before.sort();
+    after.sort();
+    // Each row with the ID and sequence number it had.
+    assert_eq!(after, before);
+    assert!(after.iter().all(|r| r[1] != "null"));
+}
+
+#[tokio::test]
+async fn compaction_commits_on_appends_only() {
+    use crate::tables::compaction::commit;
+    let Some(app) = node().await else { return };
+    let admin = user(&app, "admin", ADMIN).await;
+    let (arn, storage) = compaction_table(
+        &app,
+        &admin,
+        json!({ "name": "t", "schema": compaction_schema() }),
+    )
+    .await;
+    let id = table_id(&app, &storage).await;
+    let table = iceberg_table(&app, &storage).await;
+    append_batch(
+        &app,
+        &admin,
+        &arn,
+        &storage,
+        rows(&table, &[1], &["a"]),
+        None,
+    )
+    .await;
+    let planned = iceberg_table(&app, &storage)
+        .await
+        .metadata()
+        .current_snapshot()
+        .unwrap()
+        .snapshot_id();
+    let rewritten = std::collections::HashSet::new();
+    // An append since: fine, made on top of it.
+    let table = iceberg_table(&app, &storage).await;
+    append_batch(
+        &app,
+        &admin,
+        &arn,
+        &storage,
+        rows(&table, &[2], &["b"]),
+        None,
+    )
+    .await;
+    commit(
+        &app,
+        id,
+        planned,
+        &rewritten,
+        Vec::new(),
+        std::time::SystemTime::now(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let after = iceberg_table(&app, &storage).await;
+    let planned = after.metadata().current_snapshot().unwrap();
+    assert_eq!(planned.summary().operation.as_str(), "replace");
+    // An overwrite since: refused.
+    let (status, body) = call(&app, &admin, Method::POST, &format!("/iceberg/v1/{arn}/namespaces/n/tables/t"), "", json!({
+        "requirements": [],
+        "updates": [
+            { "action": "add-snapshot", "snapshot": {
+                "snapshot-id": 99, "parent-snapshot-id": planned.snapshot_id(), "sequence-number": after.metadata().next_sequence_number(),
+                "timestamp-ms": now_ms(), "manifest-list": planned.manifest_list(), "schema-id": 0,
+                "summary": { "operation": "overwrite" } } },
+            { "action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": 99 },
+        ],
+    })).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let refused = commit(
+        &app,
+        id,
+        planned.snapshot_id(),
+        &rewritten,
+        Vec::new(),
+        std::time::SystemTime::now(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(&refused, Err(m) if m.contains("overwrite")),
+        "{refused:?}"
+    );
 }

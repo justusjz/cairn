@@ -23,16 +23,17 @@
 //! `iceberg::rest`), and CreateTable with `metadata` writes the table's
 //! first metadata file as it does.
 //!
-//! Maintenance runs in the background (see `maintenance`): snapshot
-//! management and unreferenced file removal.
+//! Maintenance runs in the background (see `maintenance`): compaction (see
+//! `compaction`), snapshot management and unreferenced file removal.
 //!
-//! Not here: compaction, replication,
+//! Not here: replication,
 //! server access logging, record expiration (AWS's own tables only), and
 //! migrations from Glue (see `plans/s3-tables.md`). Where AWS's answers
 //! weren't known (and couldn't be probed), they follow its API model and
 //! documentation, or the nearest case.
 
 mod buckets;
+pub mod compaction;
 #[cfg(test)]
 mod e2e;
 pub mod iceberg;

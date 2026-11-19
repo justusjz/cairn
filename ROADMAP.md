@@ -144,9 +144,10 @@ Done:
   `s3tables` API, each table's storage as a bucket of the cluster's, table
   bucket and table policies, and Iceberg's REST catalog (signed for
   `s3tables`) for PyIceberg, Spark, Trino and DuckDB, and the
-  maintenance S3 does itself: snapshot expiry and removing unreferenced
-  files. Implemented. Next: compaction, if it's needed. See
-  `plans/s3-tables.md`.
+  maintenance S3 does itself: compaction (`binpack`, `sort`, `z-order`),
+  snapshot expiry and removing unreferenced files. Implemented. Next:
+  maintaining SSE-KMS tables, replication of tables, and table buckets'
+  access logs. See `plans/s3-tables.md`.
 
 - **S3 Select.** SelectObjectContent over CSV and JSON, uncompressed or
   gzipped, with `ScanRange`s (which AWS SDK for pandas splits objects

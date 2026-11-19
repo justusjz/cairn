@@ -365,23 +365,50 @@ reader. Tests are now written with the crate's own manifest writers.
 
 ## Phase 4: compaction
 
-Rewriting a table's small data files into large ones, as a commit of
-`replace` snapshots. This is a query engine's work, and the most of this
-plan by far:
+Done (`tables::compaction`), on the `iceberg` crate, with all of AWS's
+strategies: `binpack`, `sort`, `z-order` and `auto`. On by default, as
+AWS's. Choices made on the way:
 
-- reading and writing Parquet with Iceberg's types, field IDs and
-  partitioning, beyond what `inventory` and `batch` do with the `parquet`
-  crate's low-level API: Arrow, or its record reader;
-- applying positional and equality deletes, and v3's deletion vectors
-  (Puffin);
-- metrics for the new files' manifests;
-- sort and z-order.
+- **Which files**, as Iceberg's Java rewrites choose them: under 75% of
+  the target size, over 180%, or with deletes; a partition's when there
+  are 5, or 2 that reach the target, or any with deletes or oversized. A
+  run rewrites at most 16 GiB, and comes again in 5 minutes while there's
+  more.
+- **Reading** with the crate's Arrow reader, deletes applied (position,
+  equality, deletion vectors), in the current schema. Of format version 3,
+  `_row_id` and `_last_updated_sequence_number` too, written into the new
+  files (the reader gives the latter run-end encoded: made plain).
+- **Ordering** (`compaction::order`): Arrow's row format, and an external
+  merge sort that spills sorted runs (Parquet) past 64 MiB to the node's
+  first data dir, so a group of any size is sorted whole. A chunk is sorted
+  as indices into its batches (no copy of it), given out in small
+  interleaved batches; runs are written in small row groups and pages, and
+  merged with batches sized so all runs' together are about the budget. Z-order as
+  Iceberg's Spark z-order (8 ordered bytes a column, bits interleaved),
+  but floats' bits flipped exactly.
+- **Writing** with the crate's rolling Parquet writer, at the target size,
+  in the group's partition, compressed as the table says (zstd by
+  default; also gzip, snappy, none), in row groups of at most 32 MiB (a
+  row group is held in memory until it's complete). The storage adapter
+  keeps up to 8 MiB of a file being written in memory, then spools it to
+  `<data dir>/table-writes` and streams it into `put_object` as it's
+  closed (with its length); `table-writes` and `table-compaction` are
+  emptied as the node starts.
+- **Memory**: input files are read one at a time. Measured on 217 MiB of
+  data rewritten into 64 MiB files: the job's live memory is about
+  125 MiB (binpack) to 135 MiB (sort), down from 860 MiB of peak RSS
+  for a sort before; glibc's per-thread arenas keep more RSS than that.
+- **Committing** a `replace` snapshot by hand (the crate has no rewrite
+  action): manifests with rewritten files rewritten (those deleted), new
+  manifests for the new files, and dangling delete files removed (none of
+  the data they could apply to is left older than them). Validation:
+  commits that came in meanwhile must be appends (the replace is made
+  again on top of them); anything else drops the rewrite until the next
+  run.
+- Parquet's zstd and LZ4 are enabled, to read files engines write.
 
-Next, on the `iceberg` crate (which reads data files with their deletes
-applied, writes data files with their metrics, and writes manifests): all
-of AWS's strategies, `binpack`, `sort` and `z-order`, and `auto`. Until
-then, compaction stays refused (501 to enabling it, and `Disabled` in its
-status), as S3-COMPATIBILITY.md says.
+Not yet: sorting in a blocking thread (it runs on the job's task), and
+writing a sort order's ID into the files it sorted.
 
 ## Phase 5: the rest, as needed
 
