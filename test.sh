@@ -66,7 +66,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=116
+TOTAL=117
 STEP=0
 PASS=0
 FAIL=0
@@ -159,6 +159,8 @@ trap 'exit 143' TERM
 for tool in podman cargo s3cmd curl openssl python3 mcli aws; do
     command -v "$tool" >/dev/null 2>&1 || fatal "'$tool' not found in PATH"
 done
+python3 -I -c 'import pyiceberg, pyarrow, pyiceberg_core' 2>/dev/null \
+    || fatal "PyIceberg not found: pip install 'pyiceberg[pyarrow,pyiceberg-core]'"
 
 # ─── 1. Postgres ─────────────────────────────────────────────────────────────
 info "Starting Postgres ($PG_IMAGE) on port $PG_PORT..."
@@ -2614,6 +2616,47 @@ s3_tables_ok() {
     awss3 s3tables delete-table-bucket --table-bucket-arn "$arn"
 }
 
+# Iceberg's REST catalog (`/iceberg`), as PyIceberg uses it, signed with
+# SigV4 for s3tables: a table made, appended to, its schema evolved, read
+# back, two writers racing (the stale one's commit refused, and retried by
+# PyIceberg), renamed and purged.
+iceberg_catalog_ok() {
+    AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" AWS_REGION=us-east-1 \
+    python3 -I - "http://${SERVER_HOST}:${SERVER_PORT}" "iceberg-$$" <<'PYEOF'
+import sys
+import boto3, pyarrow as pa
+from pyiceberg.catalog import load_catalog
+from pyiceberg.schema import Schema
+from pyiceberg.types import NestedField, LongType, StringType, DoubleType
+endpoint, name = sys.argv[1:3]
+tables = boto3.client("s3tables", endpoint_url=endpoint, region_name="us-east-1")
+arn = tables.create_table_bucket(name=name)["arn"]
+def catalog():
+    return load_catalog("cairn", **{
+        "type": "rest", "uri": endpoint + "/iceberg", "warehouse": arn,
+        "rest.sigv4-enabled": "true", "rest.signing-name": "s3tables", "rest.signing-region": "us-east-1"})
+cat = catalog()
+cat.create_namespace("sales")
+table = cat.create_table("sales.orders", schema=Schema(
+    NestedField(1, "id", LongType(), required=True), NestedField(2, "name", StringType())))
+rows = lambda *fields: pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("name", pa.string()), *fields])
+table.append(pa.table({"id": [1, 2], "name": ["a", "b"]}, schema=rows()))
+with table.update_schema() as update:
+    update.add_column("price", DoubleType())
+price = pa.field("price", pa.float64())
+first, second = catalog().load_table("sales.orders"), catalog().load_table("sales.orders")
+first.append(pa.table({"id": [3], "name": ["c"], "price": [1.5]}, schema=rows(price)))
+second.append(pa.table({"id": [4], "name": ["d"], "price": [2.5]}, schema=rows(price)))
+ids = sorted(cat.load_table("sales.orders").scan().to_arrow()["id"].to_pylist())
+assert ids == [1, 2, 3, 4], ids
+cat.rename_table("sales.orders", "sales.orders2")
+assert tables.get_table(tableBucketARN=arn, namespace="sales", name="orders2")["metadataLocation"]
+cat.purge_table("sales.orders2")
+cat.drop_namespace("sales")
+tables.delete_table_bucket(tableBucketARN=arn)
+PYEOF
+}
+
 
 # S3 Batch Operations' jobs (S3 Control's, through the vhost client, as the
 # account's public access block): created, described, listed, re-prioritized,
@@ -3314,6 +3357,7 @@ run_test    "Bucket policies, anonymous and signed" bucket_policy_ok
 run_test    "An account's public access block"      account_block_ok
 run_test    "Batch Operations jobs"                 batch_jobs_ok
 run_test    "S3 Tables: tables and their storage"   s3_tables_ok
+run_test    "S3 Tables: Iceberg's REST catalog"      iceberg_catalog_ok
 run_test    "Users' access keys and policies"       user_keys_and_policies_ok
 run_test    "Overwrite object, new content wins"    bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&

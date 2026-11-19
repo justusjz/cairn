@@ -2136,9 +2136,57 @@ aws s3tables update-table-metadata-location --table-bucket-arn … --namespace s
 ```
 
 That's what AWS's Iceberg catalog for S3 Tables (`s3-tables-catalog-for-iceberg`,
-for Spark and other Java engines) does. Iceberg's REST catalog protocol,
-which PyIceberg, Trino and DuckDB use, isn't there yet: see the
-[roadmap](ROADMAP.md).
+for Spark and other Java engines) does.
+
+### Iceberg's REST catalog
+
+Engines that speak Iceberg's REST catalog protocol use the endpoint's
+`/iceberg`, as they would S3 Tables' (`https://s3tables.<region>.amazonaws.com/iceberg`):
+the warehouse is the table bucket's ARN, and requests are signed with SigV4
+for `s3tables`. The catalog writes tables' metadata files itself: a commit's
+requirements are checked, its changes applied, the new metadata file
+written into the table's storage, and the table's pointer swapped to it, so
+that of two writers racing, one's commit is refused (409) and retried by
+its engine. Its config tells engines to reach table storage at the same
+endpoint, path-style, unless they say otherwise. With PyIceberg (and the
+credentials in the environment, as for the AWS CLI):
+
+```python
+from pyiceberg.catalog import load_catalog
+
+catalog = load_catalog("lake", **{
+    "type": "rest",
+    "uri": "https://s3.example.com/iceberg",
+    "warehouse": "arn:aws:s3tables:us-east-1:<account>:bucket/lake",
+    "rest.sigv4-enabled": "true",
+    "rest.signing-name": "s3tables",
+    "rest.signing-region": "us-east-1",
+})
+catalog.create_namespace("sales")
+orders = catalog.create_table("sales.orders", schema=schema)
+orders.append(rows)
+```
+
+DuckDB's `iceberg` extension works too: it takes the service it signs for
+from the endpoint's host name, as AWS's (`s3tables.<region>.…`), so give it
+a name of that shape for Cairn, which the S3 API's wildcard name covers
+(`s3tables.us-east-1.s3.example.com`), and an S3 secret for the files:
+
+```sql
+CREATE SECRET (TYPE s3, KEY_ID '…', SECRET '…', REGION 'us-east-1',
+               ENDPOINT 's3.example.com', URL_STYLE 'path');
+ATTACH 'arn:aws:s3tables:us-east-1:<account>:bucket/lake' AS lake
+    (TYPE iceberg, ENDPOINT 'https://s3tables.us-east-1.s3.example.com/iceberg',
+     AUTHORIZATION_TYPE 'sigv4');
+SELECT * FROM lake.sales.orders;
+```
+
+Spark's and Trino's REST catalogs take the same settings (`rest.sigv4-enabled`,
+`rest.signing-name`, …, with `S3FileIO`); they haven't been tried against
+Cairn yet. As S3 Tables' catalog, it has namespaces of one level, and no
+views, staged creates, registering, multi-table transactions or OAuth;
+namespaces' properties aren't kept; and a table is dropped with its files
+only (`purge_table`, `purgeRequested=true`).
 
 As in AWS:
 

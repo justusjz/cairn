@@ -71,6 +71,7 @@ async fn call(
         client: app.pool.get().await.unwrap(),
         principal,
         access: &mut access,
+        endpoint: None,
     };
     // Each segment encoded, an ARN (with its `/`s) as one.
     let mut segments = Vec::new();
@@ -94,6 +95,7 @@ async fn call(
     match ctx.dispatch(&method, &path, query, &body).await {
         Ok(Answer::Json(value)) => (StatusCode::OK, value),
         Ok(Answer::NoContent) => (StatusCode::NO_CONTENT, Value::Null),
+        Ok(Answer::Raw(status, body)) => (status, body.unwrap_or(Value::Null)),
         Err(e) => (e.status, json!({ "code": e.code, "message": e.message })),
     }
 }
@@ -1089,14 +1091,438 @@ async fn configurations() {
     )
     .await;
     assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+}
+
+// ─── Iceberg's REST catalog ─────────────────────────────────────────────────
+
+/// A table's schema, as clients send it.
+fn iceberg_schema() -> Value {
+    json!({ "type": "struct", "schema-id": 0, "fields": [
+        { "id": 1, "name": "id", "required": true, "type": "long" },
+        { "id": 2, "name": "name", "required": false, "type": "string" },
+    ]})
+}
+
+/// An append's updates: a snapshot (`id`, after `parent`), and main at it.
+fn append(id: i64, parent: Option<i64>, sequence: i64) -> Value {
+    json!([
+        { "action": "add-snapshot", "snapshot": {
+            "snapshot-id": id, "parent-snapshot-id": parent, "sequence-number": sequence,
+            "timestamp-ms": 1_700_000_000_000i64 + id, "manifest-list": format!("s3://x/snap-{id}.avro"),
+            "summary": { "operation": "append" }, "schema-id": 0 } },
+        { "action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": id },
+    ])
+}
+
+#[tokio::test]
+async fn the_iceberg_catalog() {
+    let Some(app) = node().await else { return };
+    let admin = user(&app, "admin", ADMIN).await;
+    let arn = bucket(&app, &admin, &bucket_name()).await;
+    let v1 = format!("/iceberg/v1/{arn}");
+
+    let (status, config) = call(
+        &app,
+        &admin,
+        Method::GET,
+        "/iceberg/v1/config",
+        &format!("warehouse={}", urlencode(&arn)),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{config}");
+    assert_eq!(config["overrides"]["prefix"], json!(urlencode(&arn)));
+    assert!(
+        config["endpoints"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e == "POST /v1/{prefix}/tables/rename")
+    );
+
+    let (status, body) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces"),
+        "",
+        json!({ "namespace": ["sales"] }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces"),
+        "",
+        json!({ "namespace": ["sales"] }),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["type"].as_str()),
+        (StatusCode::CONFLICT, Some("AlreadyExistsException"))
+    );
+    let (status, body) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces"),
+        "",
+        json!({ "namespace": ["a", "b"] }),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["type"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("BadRequestException"))
+    );
+    let (_, list) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("{v1}/namespaces"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(list["namespaces"], json!([["sales"]]));
+    let (status, _) = call(
+        &app,
+        &admin,
+        Method::HEAD,
+        &format!("{v1}/namespaces/nope"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Created with its first metadata file, in its own storage.
+    let (status, created) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces/sales/tables"),
+        "",
+        json!({ "name": "orders", "schema": iceberg_schema(), "properties": { "owner": "me" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let location = created["metadata-location"].as_str().unwrap().to_owned();
+    assert!(
+        location.contains("--table-s3/metadata/00000-"),
+        "{location}"
+    );
+    assert_eq!(created["metadata"]["format-version"], 2);
+    assert_eq!(created["metadata"]["properties"]["owner"], "me");
+    let (status, body) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces/sales/tables"),
+        "",
+        json!({ "name": "orders", "schema": iceberg_schema() }),
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["type"].as_str()),
+        (StatusCode::CONFLICT, Some("AlreadyExistsException"))
+    );
+    let (status, body) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces/sales/tables"),
+        "",
+        json!({ "name": "staged", "schema": iceberg_schema(), "stage-create": true }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    // The s3tables API sees the same table.
+    let (_, pointer) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("/tables/{arn}/sales/orders/metadata-location"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(pointer["metadataLocation"], json!(location));
+
+    // Loaded: the file it points at.
+    let table = format!("{v1}/namespaces/sales/tables/orders");
+    let (status, loaded) = call(&app, &admin, Method::GET, &table, "", Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{loaded}");
+    assert_eq!(
+        loaded["metadata"]["table-uuid"],
+        created["metadata"]["table-uuid"]
+    );
+
+    // Commits, against requirements.
+    let uuid = loaded["metadata"]["table-uuid"].clone();
+    let first = json!({
+        "requirements": [{ "type": "assert-table-uuid", "uuid": uuid }, { "type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": null }],
+        "updates": append(10, None, 1),
+    });
+    let (status, committed) = call(&app, &admin, Method::POST, &table, "", first.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{committed}");
+    assert!(
+        committed["metadata-location"]
+            .as_str()
+            .unwrap()
+            .contains("/metadata/00001-")
+    );
+    assert_eq!(committed["metadata"]["current-snapshot-id"], 10);
+    assert_eq!(
+        committed["metadata"]["metadata-log"][0]["metadata-file"],
+        json!(location)
+    );
+    // The same commit again: its requirement doesn't hold any more.
+    let (status, body) = call(&app, &admin, Method::POST, &table, "", first).await;
+    assert_eq!(
+        (status, body["error"]["type"].as_str()),
+        (StatusCode::CONFLICT, Some("CommitFailedException"))
+    );
+    let (status, body) = call(&app, &admin, Method::POST, &table, "", json!({ "requirements": [], "updates": [{ "action": "set-location", "location": "s3://elsewhere" }] })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    // Who may: loading needs GetTableData too, committing PutTableData.
+    let pointer_only = user(&app, "pointer", r#"{"Effect":"Allow","Action":["s3tables:GetTableMetadataLocation","s3tables:UpdateTableMetadataLocation"],"Resource":"*"}"#).await;
+    let (status, body) = call(&app, &pointer_only, Method::GET, &table, "", Value::Null).await;
+    assert_eq!(
+        (status, body["error"]["type"].as_str()),
+        (StatusCode::FORBIDDEN, Some("ForbiddenException"))
+    );
+    let reader = user(&app, "reader", r#"{"Effect":"Allow","Action":["s3tables:GetTableMetadataLocation","s3tables:GetTableData","s3tables:UpdateTableMetadataLocation"],"Resource":"*"}"#).await;
+    let (status, _) = call(&app, &reader, Method::GET, &table, "", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = call(
+        &app,
+        &reader,
+        Method::POST,
+        &table,
+        "",
+        json!({ "requirements": [], "updates": append(11, Some(10), 2) }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Listed, renamed, dropped (purged only).
+    let (_, tables) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("{v1}/namespaces/sales/tables"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        tables["identifiers"],
+        json!([{ "namespace": ["sales"], "name": "orders" }])
+    );
+    let (status, _) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("{v1}/namespaces/nope/tables"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/tables/rename"),
+        "",
+        json!({ "source": { "namespace": ["sales"], "name": "orders" }, "destination": { "namespace": ["sales"], "name": "orders2" } }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, body) = call(&app, &admin, Method::GET, &table, "", Value::Null).await;
+    assert_eq!(
+        (status, body["error"]["type"].as_str()),
+        (StatusCode::NOT_FOUND, Some("NoSuchTableException"))
+    );
+    let renamed = format!("{v1}/namespaces/sales/tables/orders2");
+    let (status, _) = call(&app, &admin, Method::DELETE, &renamed, "", Value::Null).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, body) = call(
+        &app,
+        &admin,
+        Method::DELETE,
+        &format!("{v1}/namespaces/sales"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["type"].as_str()),
+        (StatusCode::CONFLICT, Some("NamespaceNotEmptyException"))
+    );
+    let (status, _) = call(
+        &app,
+        &admin,
+        Method::DELETE,
+        &renamed,
+        "purgeRequested=true",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = call(
+        &app,
+        &admin,
+        Method::DELETE,
+        &format!("{v1}/namespaces/sales"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("{v1}/namespaces/x/views"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        (status, body["error"]["type"].as_str()),
+        (
+            StatusCode::NOT_ACCEPTABLE,
+            Some("UnsupportedOperationException")
+        )
+    );
+}
+
+#[tokio::test]
+async fn racing_commits() {
+    let Some(app) = node().await else { return };
+    let admin = user(&app, "admin", ADMIN).await;
+    let arn = bucket(&app, &admin, &bucket_name()).await;
+    let v1 = format!("/iceberg/v1/{arn}");
+    call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces"),
+        "",
+        json!({ "namespace": ["n"] }),
+    )
+    .await;
+    let (status, _) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces/n/tables"),
+        "",
+        json!({ "name": "t", "schema": iceberg_schema() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let table = format!("{v1}/namespaces/n/tables/t");
+    let admin = Arc::new(admin);
+    // Many writers that each saw no snapshot: one wins.
+    let commits = (0..8).map(|i| {
+        let (app, admin, table) = (app.clone(), admin.clone(), table.clone());
+        tokio::spawn(async move {
+            call(&app, &admin, Method::POST, &table, "", json!({
+                "requirements": [{ "type": "assert-ref-snapshot-id", "ref": "main", "snapshot-id": null }],
+                "updates": append(100 + i, None, 1),
+            }))
+            .await
+            .0
+        })
+    });
+    let mut won = 0;
+    for commit in commits {
+        match commit.await.unwrap() {
+            StatusCode::OK => won += 1,
+            status => assert_eq!(status, StatusCode::CONFLICT),
+        }
+    }
+    assert_eq!(won, 1);
+    let (_, loaded) = call(&app, &admin, Method::GET, &table, "", Value::Null).await;
+    assert_eq!(loaded["metadata"]["snapshots"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn create_table_with_metadata() {
+    let Some(app) = node().await else { return };
+    let admin = user(&app, "admin", ADMIN).await;
+    let arn = bucket(&app, &admin, &bucket_name()).await;
+    call(
+        &app,
+        &admin,
+        Method::PUT,
+        &format!("/namespaces/{arn}"),
+        "",
+        json!({ "namespace": ["n"] }),
+    )
+    .await;
+    let (status, body) = call(
+        &app,
+        &admin,
+        Method::PUT,
+        &format!("/tables/{arn}/n"),
+        "",
+        json!({ "name": "t", "format": "ICEBERG", "metadata": { "iceberg": { "schema": { "fields": [
+            { "name": "id", "type": "long", "required": true }, { "name": "at", "type": "timestamp" },
+        ]}}}}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (_, pointer) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("/tables/{arn}/n/t/metadata-location"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(pointer["versionToken"], body["versionToken"]);
+    assert!(
+        pointer["metadataLocation"]
+            .as_str()
+            .unwrap()
+            .ends_with(".metadata.json")
+    );
+    let (_, loaded) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("/iceberg/v1/{arn}/namespaces/n/tables/t"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(loaded["metadata"]["schemas"][0]["fields"][1]["name"], "at");
+    // A schema that isn't one: refused, and no table is left behind.
     let (status, _) = call(
         &app,
         &admin,
         Method::PUT,
-        &format!("/tables/{arn}/sales"),
+        &format!("/tables/{arn}/n"),
         "",
-        json!({ "name": "with_schema", "format": "ICEBERG", "metadata": { "iceberg": { "schema": { "fields": [] } } } }),
+        json!({ "name": "bad", "format": "ICEBERG", "metadata": { "iceberg": {} } }),
     )
     .await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("/tables/{arn}/n/bad/metadata-location"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

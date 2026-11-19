@@ -76,7 +76,43 @@ fn summary_json(bucket: &TableBucket, table: &Table) -> Value {
 }
 
 impl Ctx<'_> {
+    /// CreateTable: with `metadata`, its first metadata file too, which
+    /// S3 Tables writes (see `iceberg::rest`).
     pub(super) async fn create_table(
+        &mut self,
+        arn: &str,
+        namespace: &str,
+        input: &Input,
+    ) -> Result<Answer> {
+        let Some(metadata) = input.get("metadata") else {
+            return self.create_table_plain(arn, namespace, input).await;
+        };
+        let name = input.required("name")?.to_owned();
+        names::name("table", &name).map_err(bad_request)?;
+        names::name("namespace", namespace).map_err(bad_request)?;
+        let creation = super::iceberg::rest::creation_of(metadata).map_err(bad_request)?;
+        let made = self
+            .create_with_metadata(arn, namespace, &name, &creation, Some(input))
+            .await;
+        let (table_arn, _, _) = made.map_err(super::iceberg::rest::to_tables)?;
+        let token: String =
+            self.client
+                .query_one(
+                    "SELECT version_token FROM tables WHERE id = $1",
+                    &[&Uuid::parse_str(table_arn.rsplit('/').next().unwrap_or(""))
+                        .unwrap_or_default()],
+                )
+                .await?
+                .get(0);
+        Ok(Answer::Json(json!({
+            "tableARN": table_arn,
+            "versionToken": token,
+        })))
+    }
+
+    /// CreateTable, without metadata: the table has none until its first
+    /// writer gives it.
+    pub(super) async fn create_table_plain(
         &mut self,
         arn: &str,
         namespace: &str,
@@ -92,11 +128,6 @@ impl Ctx<'_> {
                     "The table format is not valid: {other}"
                 )));
             }
-        }
-        if input.get("metadata").is_some() {
-            return Err(not_implemented(
-                "tables created with metadata (create the table, then write its first metadata file)",
-            ));
         }
         let encryption = encryption_of(input)?;
         let class = storage_class_of(input)?;
