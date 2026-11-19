@@ -140,6 +140,13 @@ Done:
   make it worth it. Implemented. Next: compacting more eagerly as pools
   fill up (see below), which moves misplaced bytes sooner too.
 
+- **S3 Tables.** Table buckets of Iceberg tables, as AWS has them: the
+  `s3tables` API, each table's storage as a bucket of the cluster's, table
+  bucket and table policies, and Iceberg's REST catalog (signed for
+  `s3tables`) for Spark, Trino, PyIceberg and DuckDB. Then the maintenance
+  S3 does itself: snapshot expiry and removing unreferenced files;
+  compaction later, if needed. See `plans/s3-tables.md`.
+
 ## Ideas
 
 Smaller improvements, done when they're needed:
