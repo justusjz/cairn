@@ -482,6 +482,9 @@ pub(super) fn parse(operation: roxmltree::Node) -> Result<Copy, Response<Full<By
     if crate::s3::directory::is_directory(bucket) {
         return Err(not_implemented("Copying into a directory bucket"));
     }
+    if crate::tables::is_storage(bucket) {
+        return Err(bad_request("A table's storage can't be a copy's target."));
+    }
     let prefix = owned(operation, "TargetKeyPrefix");
     if prefix
         .as_ref()

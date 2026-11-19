@@ -1275,6 +1275,10 @@ out.
   attachments, sandboxed, so that nothing of an object is shown in the
   console's origin; SSE-KMS objects open with the keys the user may use (an
   SSE-C object, whose key Cairn doesn't have, can't be downloaded).
+- **Table buckets:** [S3 Tables](#s3-tables)' table buckets, as their
+  actions allow: make and delete table buckets, namespaces and (empty)
+  tables, see each table's storage and current metadata file, and edit a
+  table bucket's policy.
 - **Topics:** SNS [topics](#event-notifications), as SNS's actions allow:
   make and delete them, subscribe HTTP(S) endpoints (their confirmations'
   links point to the console, at `/sns/`) and unsubscribe them, publish a
@@ -2105,6 +2109,65 @@ never wait for them. Subscriptions reach public addresses only: to deliver
 inside the cluster's network, set `cairn config set
 notification-private-endpoints 1`. See [S3 compatibility](S3-COMPATIBILITY.md#event-notifications)
 for what's not supported (SQS, Lambda, EventBridge, filter policies).
+
+## S3 Tables
+
+Table buckets of Apache Iceberg tables, as Amazon S3 Tables has them, on the
+same endpoint: requests signed for the `s3tables` service are S3 Tables'
+(`aws s3tables --endpoint-url …`, the SDKs, Terraform's
+`aws_s3tables_table_bucket`), as IAM's are. A table bucket holds namespaces
+(one level), and they hold tables. A table is a pointer to its current
+Iceberg metadata file, and has its own storage (its warehouse location,
+`s3://…--table-s3`), where clients write its data and metadata files
+through the S3 API. A commit writes a new metadata file there, and swaps
+the pointer against the table's version token, which fails (409) if
+another commit came first:
+
+```sh
+aws s3tables create-table-bucket --name lake
+aws s3tables create-namespace --table-bucket-arn arn:aws:s3tables:us-east-1:<account>:bucket/lake \
+    --namespace sales
+aws s3tables create-table --table-bucket-arn arn:aws:s3tables:us-east-1:<account>:bucket/lake \
+    --namespace sales --name orders --format ICEBERG
+aws s3tables get-table --table-bucket-arn arn:aws:s3tables:us-east-1:<account>:bucket/lake \
+    --namespace sales --name orders   # its warehouseLocation and versionToken
+aws s3tables update-table-metadata-location --table-bucket-arn … --namespace sales --name orders \
+    --version-token <token> --metadata-location s3://<warehouse>/metadata/00001-….metadata.json
+```
+
+That's what AWS's Iceberg catalog for S3 Tables (`s3-tables-catalog-for-iceberg`,
+for Spark and other Java engines) does. Iceberg's REST catalog protocol,
+which PyIceberg, Trino and DuckDB use, isn't there yet: see the
+[roadmap](ROADMAP.md).
+
+As in AWS:
+
+- Every operation is checked as its `s3tables:` action, on the table
+  bucket's ARN or the table's (`…:bucket/lake/table/<id>`, which a rename
+  keeps), by the principal's policies and the table bucket's and table's
+  own (`put-table-bucket-policy`, `put-table-policy`), with S3 Tables'
+  condition keys (`s3tables:namespace`, `s3tables:tableName`,
+  `s3tables:TableBucketTag/…`, …). Policies that would make one public are
+  refused. AWS's managed policies `AmazonS3TablesFullAccess` and
+  `AmazonS3TablesReadOnlyAccess` are there to attach.
+- A table's storage takes only what AWS's does: GetObject, HeadObject,
+  PutObject, the multipart operations and ListParts, signed with SigV4 (not
+  presigned), each checked as `s3tables:GetTableData` or
+  `s3tables:PutTableData` on the table. It isn't listed, its files aren't
+  deleted by clients, and it's in no listing of buckets. A deleted table's
+  files are deleted in the background.
+- Table buckets have an encryption configuration and a storage class, which
+  new tables get unless they ask for their own. SSE-KMS keys are
+  [Cairn's](#sse-kms), as ARNs: `arn:aws:kms:us-east-1:<account>:key/<mount>/<key>`.
+  Without a KMS, SSE-S3 (the default) leaves table files unencrypted, as
+  [Cairn's SSE-S3](#sse-s3) needs one. A storage class the operator hasn't
+  defined (`INTELLIGENT_TIERING`, say) is `STANDARD`, as for objects.
+
+Maintenance configurations are kept, but Cairn doesn't run maintenance yet:
+snapshots aren't expired, and unreferenced files aren't removed (expire
+snapshots, and remove orphan files, with your engine meanwhile); compaction
+can't be enabled. See [S3 compatibility](S3-COMPATIBILITY.md#s3-tables) for
+the rest.
 
 ## Server access logs
 

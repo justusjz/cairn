@@ -135,6 +135,7 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .merge(super::groups::router())
         .merge(super::templates::router())
         .merge(super::sns::router())
+        .merge(super::tables::router())
         .merge(super::inventory::router())
         .merge(super::sso::router())
         .merge(super::organizations::router())
@@ -4437,6 +4438,101 @@ mod e2e {
     /// A bucket's policy and public access block, and its account's block,
     /// as the account's admin edits them (and a superadmin can't).
     #[tokio::test]
+    async fn manages_table_buckets() {
+        let Some(app) = node().await else { return };
+        let mut admin = signed_in(&console_of(&app), "admin", true).await;
+        let (status, _) = admin
+            .send(
+                "POST",
+                "/api/table-buckets",
+                Some(json!({ "name": "lake" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, body) = admin
+            .send(
+                "POST",
+                "/api/table-buckets",
+                Some(json!({ "name": "Not_valid" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (_, list) = admin.send("GET", "/api/table-buckets", None).await;
+        assert_eq!(list[0]["name"], "lake");
+        let (status, _) = admin
+            .send(
+                "POST",
+                "/api/table-buckets/lake/namespaces",
+                Some(json!({ "name": "sales" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, _) = admin
+            .send(
+                "POST",
+                "/api/table-buckets/lake/tables",
+                Some(json!({ "namespace": "sales", "name": "orders" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        let (status, detail) = admin.send("GET", "/api/table-buckets/lake", None).await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        assert_eq!(detail["namespaces"][0]["name"], "sales");
+        assert_eq!(detail["tables"][0]["name"], "orders");
+        assert_eq!(detail["encryption"], "AES256");
+        assert!(
+            detail["tables"][0]["warehouse_location"]
+                .as_str()
+                .unwrap()
+                .ends_with("--table-s3")
+        );
+        assert_eq!(detail["policy"], Value::Null);
+        let arn = detail["arn"].as_str().unwrap().to_owned();
+        let document = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Deny","Principal":"*","Action":"s3tables:DeleteTableBucket","Resource":"{arn}"}}]}}"#
+        );
+        let (status, body) = admin
+            .send(
+                "PUT",
+                "/api/table-buckets/lake/policy",
+                Some(json!({ "document": document })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        // Not empty, and its policy denies it anyway.
+        let (status, _) = admin.send("DELETE", "/api/table-buckets/lake", None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let (status, _) = admin
+            .send("DELETE", "/api/table-buckets/lake/namespaces/sales", None)
+            .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        let (status, _) = admin
+            .send(
+                "DELETE",
+                "/api/table-buckets/lake/tables/sales/orders",
+                None,
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = admin
+            .send("DELETE", "/api/table-buckets/lake/namespaces/sales", None)
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = admin
+            .send(
+                "PUT",
+                "/api/table-buckets/lake/policy",
+                Some(json!({ "document": "" })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = admin.send("DELETE", "/api/table-buckets/lake", None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, _) = admin.send("GET", "/api/table-buckets/lake", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn edits_bucket_access() {
         let Some(app) = node().await else { return };
         let console = console_of(&app);
@@ -4709,6 +4805,8 @@ mod e2e {
                 "AdministratorAccess",
                 "AmazonS3FullAccess",
                 "AmazonS3ReadOnlyAccess",
+                "AmazonS3TablesFullAccess",
+                "AmazonS3TablesReadOnlyAccess",
                 "CairnOperatorAccess"
             ]
         );

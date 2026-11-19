@@ -66,7 +66,7 @@ else
     GREEN=""; RED=""; YELLOW=""; BOLD=""; DIM=""; RESET=""
 fi
 
-TOTAL=115
+TOTAL=116
 STEP=0
 PASS=0
 FAIL=0
@@ -2569,6 +2569,52 @@ account_block_ok() {
     awss3 s3api delete-bucket --bucket "$b" >/dev/null 2>&1
 }
 
+# ─── S3 Tables ────────────────────────────────────────────────────────────────
+# A table bucket, a namespace and a table (`aws s3tables`), a metadata file
+# written into the table's storage through the S3 API and committed by
+# swapping its pointer against the version token, and what table storage
+# refuses: listings, deletes, and a stale token.
+s3_tables_ok() {
+    local name="tables-$$" arn table storage token location
+    arn=$(awss3 s3tables create-table-bucket --name "$name" --query arn --output text) || return 1
+    awss3 s3tables create-namespace --table-bucket-arn "$arn" --namespace sales >/dev/null || return 1
+    token=$(awss3 s3tables create-table --table-bucket-arn "$arn" --namespace sales \
+        --name orders --format ICEBERG --query versionToken --output text) || return 1
+    storage=$(awss3 s3tables get-table --table-bucket-arn "$arn" --namespace sales --name orders \
+        --query warehouseLocation --output text) || return 1
+    storage="${storage#s3://}"
+    case "$storage" in *--table-s3) ;; *) echo "warehouse location: $storage"; return 1 ;; esac
+    printf '{"format-version":2}' >"$WORK_DIR/table.metadata.json"
+    awss3 s3api put-object --bucket "$storage" --key metadata/00000-a.metadata.json \
+        --body "$WORK_DIR/table.metadata.json" >/dev/null || return 1
+    awss3 s3api get-object --bucket "$storage" --key metadata/00000-a.metadata.json \
+        "$WORK_DIR/table.metadata.dl" >/dev/null || return 1
+    cmp -s "$WORK_DIR/table.metadata.json" "$WORK_DIR/table.metadata.dl" || return 1
+    if awss3 s3api list-objects-v2 --bucket "$storage" >/dev/null 2>&1; then
+        echo "table storage was listed"; return 1
+    fi
+    if awss3 s3api delete-object --bucket "$storage" --key metadata/00000-a.metadata.json >/dev/null 2>&1; then
+        echo "a table's file was deleted"; return 1
+    fi
+    location="s3://$storage/metadata/00000-a.metadata.json"
+    awss3 s3tables update-table-metadata-location --table-bucket-arn "$arn" --namespace sales \
+        --name orders --version-token "$token" --metadata-location "$location" >/dev/null || return 1
+    if awss3 s3tables update-table-metadata-location --table-bucket-arn "$arn" --namespace sales \
+        --name orders --version-token "$token" --metadata-location "$location" >/dev/null 2>&1; then
+        echo "a stale version token was taken"; return 1
+    fi
+    [ "$(awss3 s3tables get-table-metadata-location --table-bucket-arn "$arn" --namespace sales \
+        --name orders --query metadataLocation --output text)" = "$location" ] || return 1
+    awss3 s3tables delete-table --table-bucket-arn "$arn" --namespace sales --name orders || return 1
+    if awss3 s3api get-object --bucket "$storage" --key metadata/00000-a.metadata.json \
+        "$WORK_DIR/table.metadata.dl" >/dev/null 2>&1; then
+        echo "a deleted table's storage was read"; return 1
+    fi
+    awss3 s3tables delete-namespace --table-bucket-arn "$arn" --namespace sales || return 1
+    awss3 s3tables delete-table-bucket --table-bucket-arn "$arn"
+}
+
+
 # S3 Batch Operations' jobs (S3 Control's, through the vhost client, as the
 # account's public access block): created, described, listed, re-prioritized,
 # tagged and cancelled. They run in the lifecycle steps, minutes apart, so
@@ -3267,6 +3313,7 @@ run_test    "Revoked grant takes effect"            revoke_takes_effect_ok
 run_test    "Bucket policies, anonymous and signed" bucket_policy_ok
 run_test    "An account's public access block"      account_block_ok
 run_test    "Batch Operations jobs"                 batch_jobs_ok
+run_test    "S3 Tables: tables and their storage"   s3_tables_ok
 run_test    "Users' access keys and policies"       user_keys_and_policies_ok
 run_test    "Overwrite object, new content wins"    bash -c "
     printf 'overwritten content\n' > '$WORK_DIR/over.txt' &&

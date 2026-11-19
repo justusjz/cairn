@@ -6380,6 +6380,411 @@
         }
       }
     },
+    "/table-buckets": {
+      "get": {
+        "summary": "The account's table buckets (`s3tables:ListTableBuckets`).",
+        "operationId": "list_table_buckets",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/TableBucketSummary"
+                  }
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Makes a table bucket, as CreateTableBucket does.",
+        "operationId": "create_table_bucket",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTableBucket"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}": {
+      "get": {
+        "operationId": "get_table_bucket",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TableBucketDetail"
+                }
+              }
+            }
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "summary": "Deletes a table bucket, as DeleteTableBucket does: an empty one only.",
+        "operationId": "delete_table_bucket",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}/namespaces": {
+      "post": {
+        "summary": "Makes a namespace in a table bucket, as CreateNamespace does.",
+        "operationId": "create_table_namespace",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewNamespace"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}/namespaces/{namespace}": {
+      "delete": {
+        "summary": "Deletes an empty namespace, as DeleteNamespace does.",
+        "operationId": "delete_table_namespace",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}/policy": {
+      "put": {
+        "summary": "Sets a table bucket's policy (PutTableBucketPolicy), or deletes it\n(DeleteTableBucketPolicy), if it's empty.",
+        "operationId": "set_table_bucket_policy",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PolicyDocument"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Set"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}/tables": {
+      "post": {
+        "summary": "Makes an (empty) Iceberg table, as CreateTable does: without metadata,\nwhich its first writer makes.",
+        "operationId": "create_iceberg_table",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/NewTable"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Made"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/table-buckets/{name}/tables/{namespace}/{table}": {
+      "delete": {
+        "summary": "Deletes a table, and its files, as DeleteTable does.",
+        "operationId": "delete_iceberg_table",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted"
+          },
+          "4XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          },
+          "5XX": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/templates": {
       "get": {
         "summary": "The templates there are.",
@@ -10739,6 +11144,22 @@
           }
         }
       },
+      "NamespaceSummary": {
+        "type": "object",
+        "description": "A namespace of a table bucket.",
+        "required": [
+          "name",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "NewAccount": {
         "type": "object",
         "required": [
@@ -10949,6 +11370,17 @@
           }
         }
       },
+      "NewNamespace": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "NewOidcProvider": {
         "type": "object",
         "required": [
@@ -11116,6 +11548,32 @@
           "protocol": {
             "type": "string",
             "description": "`http` or `https`."
+          }
+        }
+      },
+      "NewTable": {
+        "type": "object",
+        "required": [
+          "namespace",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          }
+        }
+      },
+      "NewTableBucket": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
           }
         }
       },
@@ -12872,6 +13330,122 @@
           "session_name": {
             "type": "string",
             "description": "Its session's name."
+          }
+        }
+      },
+      "TableBucketDetail": {
+        "type": "object",
+        "description": "A table bucket, its configuration, and what's in it.",
+        "required": [
+          "name",
+          "arn",
+          "created_at",
+          "namespaces",
+          "tables"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "encryption": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`AES256` or `aws:kms`, and its key, if it may be seen."
+          },
+          "name": {
+            "type": "string"
+          },
+          "namespaces": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/NamespaceSummary"
+            }
+          },
+          "policy": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its policy (JSON), if it has one (and it may be seen)."
+          },
+          "storage_class": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tables": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TableSummary"
+            }
+          }
+        }
+      },
+      "TableBucketSummary": {
+        "type": "object",
+        "description": "A table bucket, as lists show it.",
+        "required": [
+          "name",
+          "arn",
+          "created_at"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "TableSummary": {
+        "type": "object",
+        "description": "A table of a table bucket.",
+        "required": [
+          "namespace",
+          "name",
+          "arn",
+          "created_at",
+          "modified_at"
+        ],
+        "properties": {
+          "arn": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "metadata_location": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Its current metadata file, if it has one (and it may be seen)."
+          },
+          "modified_at": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "warehouse_location": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Where its files are (and it may be seen)."
           }
         }
       },

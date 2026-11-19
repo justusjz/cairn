@@ -1047,6 +1047,10 @@ fn unfit(task: &Task, operation: &Operation) -> Option<TaskFailure> {
             "Invalid version id specified",
         ));
     }
+    if crate::tables::is_storage(&task.bucket) {
+        let what = format!("{} isn't done to a table's storage.", operation.name());
+        return Some(TaskFailure::new(403, "AccessDenied", what));
+    }
     if crate::s3::directory::is_directory(&task.bucket) {
         let what = format!(
             "{} isn't done to a directory bucket's objects.",

@@ -55,6 +55,8 @@ export type Scp = Schemas["ScpSummary"];
 export type Topic = Schemas["TopicSummary"];
 export type TopicDetail = Schemas["TopicDetail"];
 export type Subscription = Schemas["SubscriptionSummary"];
+export type TableBucket = Schemas["TableBucketSummary"];
+export type TableBucketDetail = Schemas["TableBucketDetail"];
 export type NotificationRule = Schemas["NotificationRule"];
 export type Inventory = Schemas["Inventory"];
 export type InventoryForm = Schemas["InventoryForm"];
@@ -347,6 +349,21 @@ export const api = {
     ok(client.DELETE("/topics/{name}/subscriptions", { params: { path: { name }, query: { arn } } })),
   publish: (name: string, message: string, subject = "") =>
     ok(client.POST("/topics/{name}/publish", { params: { path: { name } }, body: { message, subject } })),
+  tableBuckets: () => ok(client.GET("/table-buckets")),
+  createTableBucket: (name: string) => ok(client.POST("/table-buckets", { body: { name } })),
+  tableBucket: (name: string) => ok(client.GET("/table-buckets/{name}", { params: { path: { name } } })),
+  deleteTableBucket: (name: string) => ok(client.DELETE("/table-buckets/{name}", { params: { path: { name } } })),
+  /** Sets the table bucket's policy; an empty one deletes it. */
+  setTableBucketPolicy: (name: string, document: string) =>
+    ok(client.PUT("/table-buckets/{name}/policy", { params: { path: { name } }, body: { document } })),
+  createNamespace: (bucket: string, namespace: string) =>
+    ok(client.POST("/table-buckets/{name}/namespaces", { params: { path: { name: bucket } }, body: { name: namespace } })),
+  deleteNamespace: (bucket: string, namespace: string) =>
+    ok(client.DELETE("/table-buckets/{name}/namespaces/{namespace}", { params: { path: { name: bucket, namespace } } })),
+  createTable: (bucket: string, namespace: string, table: string) =>
+    ok(client.POST("/table-buckets/{name}/tables", { params: { path: { name: bucket } }, body: { namespace, name: table } })),
+  deleteTable: (bucket: string, namespace: string, table: string) =>
+    ok(client.DELETE("/table-buckets/{name}/tables/{namespace}/{table}", { params: { path: { name: bucket, namespace, table } } })),
   bucketNotifications: (bucket: string) => ok(client.GET("/buckets/{bucket}/notifications", { params: bucketPath(bucket) })),
   setBucketNotifications: (bucket: string, rules: NotificationRule[]) =>
     ok(client.PUT("/buckets/{bucket}/notifications", { params: bucketPath(bucket), body: { rules, events: [] } })),

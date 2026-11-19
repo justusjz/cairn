@@ -66,6 +66,8 @@ please report it.
 | Replication to other clusters or providers, RTC | ❌ | |
 | [Directory buckets](#directory-buckets) (S3 Express One Zone), CreateSession | 🟡 | |
 | Directory buckets: RenameObject, appends, bucket tags, Local Zones | ❌ | |
+| [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies | 🟡 | |
+| S3 Tables: Iceberg REST endpoint, maintenance, replication, logging | ❌ | |
 | Analytics, metrics, Intelligent-Tiering, Storage Lens | ❌ | |
 | S3 Select, torrents, requester pays | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
@@ -241,6 +243,23 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | Default encryption | SSE-S3 | None ([Encryption](#encryption)); a session's encryption headers are ignored. |
 | Condition keys | `s3express:` | Only `s3express:SessionMode` and `s3express:ResourceAccount`. |
 
+### S3 Tables
+
+| | S3 | Cairn |
+| --- | --- | --- |
+| Endpoint | `s3tables.<region>.amazonaws.com` | The S3 endpoint, for requests signed for `s3tables`. |
+| Table storage | Its own endpoint | The S3 endpoint, path-style or virtual-hosted, signed for `s3`. |
+| Table storage's encryption, by default | SSE-S3 | SSE-S3 with a KMS; without one, none (as for [buckets](#encryption)). |
+| SSE-KMS keys | AWS KMS keys | [OpenBao or Vault Transit](#kms-keys)'s, as `arn:aws:kms:<region>:<account>:key/<mount>/<key>`. |
+| Storage classes | `STANDARD`, `INTELLIGENT_TIERING` | The operator's, by those names; one it hasn't defined is `STANDARD`. |
+| Maintenance | Compaction, snapshot expiry, unreferenced file removal | None runs yet: configurations are kept (compaction can't be enabled), and jobs report `Not_Yet_Run`. |
+| CreateTable with `metadata` | Writes the first metadata file | `501`: create the table, then write its first metadata file. |
+| Iceberg REST endpoint (`/iceberg`) | ✅ | ❌ |
+| Replication, server access logging, Glue migrations | ✅ | `501`. |
+| Request metrics configuration | CloudWatch metrics | Kept, without effect. |
+| Table storage signed with SigV2 | Not checked | Refused, as for directory buckets. |
+| A policy that would make a table bucket or table public | Refused | Refused with `403 AccessDeniedException` (S3's code not checked). |
+
 ### Edge cases
 
 | | S3 | Cairn |
@@ -260,6 +279,10 @@ These follow AWS's documentation and API models, not real requests:
   MFA delete with a lifecycle configuration), and whether deleting a
   suspended bucket's `null` version needs a code (Cairn: no).
 - Server access logs' operation names for the rarer subresources.
+- S3 Tables, which follow AWS's API model and documentation: in particular
+  the messages of their errors, which errors a refused operation on table
+  storage gets (Cairn: S3's `405 MethodNotAllowed`), and the order of
+  ListTables' pages (Cairn: by namespace, then name).
 - Directory buckets' errors for unsupported operations, delimiters,
   prefixes, `start-after` and gaps in part numbers.
 - `411 MissingContentLength` above.

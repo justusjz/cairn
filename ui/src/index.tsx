@@ -26,6 +26,7 @@ import Organization from "./pages/Organization";
 import Roles, { RolePage } from "./pages/Roles";
 import Storage from "./pages/Storage";
 import Topics, { TopicPage } from "./pages/Topics";
+import TableBuckets, { TableBucketPage } from "./pages/TableBuckets";
 import SignIn from "./pages/SignIn";
 import SwitchRole from "./pages/SwitchRole";
 import Users, { UserPage } from "./pages/Users";
@@ -134,6 +135,7 @@ function RootBanner(props: { me: Me; logout: () => void }) {
  * shows what the identity's policies let it see). */
 const ACCOUNT_NAV: [string, string][] = [
   ["/buckets", "Buckets"],
+  ["/table-buckets", "Table buckets"],
   ["/topics", "Topics"],
   ["/users", "Users"],
   ["/groups", "Groups"],
@@ -798,6 +800,8 @@ render(
       <Route path="/buckets/:bucket/lifecycle" component={Guarded(Lifecycle)} />
       <Route path="/buckets/:bucket/notifications" component={Guarded(Notifications)} />
       <Route path="/buckets/:bucket/inventory" component={Guarded(Inventory)} />
+      <Route path="/table-buckets" component={Guarded(TableBuckets)} />
+      <Route path="/table-buckets/:name" component={Guarded(TableBucketPage)} />
       <Route path="/topics" component={Guarded(Topics)} />
       <Route path="/topics/:name" component={Guarded(TopicPage)} />
       <Route path="/login" component={Login} />

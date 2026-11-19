@@ -1083,6 +1083,11 @@ async fn the_roots_login_becomes_an_admin() {
         .unwrap()
         .get(0);
     assert_eq!(links, 0);
+    // As a node of migration 82's lock protocol would.
+    client
+        .batch_execute("SET cairn.protocol = '16'")
+        .await
+        .unwrap();
     let err = client
         .execute(
             "INSERT INTO console_enrollments (token_hash, user_id, account_id, expires_at)

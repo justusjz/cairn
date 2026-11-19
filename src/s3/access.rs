@@ -52,6 +52,7 @@ pub(crate) fn parsed(text: &str, kind: Kind, ids: Option<&str>) -> anyhow::Resul
             Kind::Trust => Some("\0trust".to_owned()),
             Kind::Topic(arn) => Some(format!("\0topic {arn}")),
             Kind::AccessGrants(arn) => Some(format!("\0access-grants {arn}")),
+            Kind::Tables(arn) => Some(format!("\0tables {arn}")),
         },
         text.to_owned(),
         ids.map(str::to_owned),
@@ -159,10 +160,11 @@ pub struct Access {
     /// `set_management`): unset, the cluster is no one's, and every check
     /// on it denied.
     management: Option<String>,
-    /// An S3 Access Grants instance the checks may be on (see
-    /// `set_grants_instance`): its ARN, its account, and its resource
-    /// policy, if it has one.
-    grants: Option<(String, String, Option<Arc<Policy>>)>,
+    /// A resource of another service the checks may be on, with what's
+    /// under it (see `set_resource`): an S3 Access Grants instance, or a
+    /// table bucket; its ARN, its account, and its resource policy, if it
+    /// has one.
+    resource: Option<(String, String, Option<Arc<Policy>>)>,
 }
 
 /// Who makes a request, as policies see it (an owned `policy::Principal`).
@@ -314,7 +316,7 @@ impl Access {
             writes: None,
             topics: HashMap::new(),
             management: None,
-            grants: None,
+            resource: None,
         })
     }
 
@@ -323,13 +325,22 @@ impl Access {
     /// `policy` decides them as a bucket's policy decides its checks:
     /// across accounts, with the principal's own policies.
     pub fn set_grants_instance(&mut self, arn: &str, account: &str, policy: Option<Arc<Policy>>) {
-        self.grants = Some((arn.to_owned(), account.to_owned(), policy));
+        self.set_resource(arn, account, policy);
     }
 
-    /// The Access Grants instance (as `set_grants_instance` said) that
-    /// `resource` (an ARN) is, or is a location or grant of.
+    /// Says that checks on the resource `arn` (or on what's under it: its
+    /// ARN, then `/`) are on `account`'s, whose resource policy `policy`
+    /// decides them as a bucket's policy decides its checks: across
+    /// accounts, with the principal's own policies. A table bucket, say,
+    /// whose policy and its table's both are (see `tables`).
+    pub fn set_resource(&mut self, arn: &str, account: &str, policy: Option<Arc<Policy>>) {
+        self.resource = Some((arn.to_owned(), account.to_owned(), policy));
+    }
+
+    /// The resource (as `set_resource` said) that `resource` (an ARN) is,
+    /// or is under.
     fn grants_of(&self, resource: &str) -> Option<&(String, String, Option<Arc<Policy>>)> {
-        self.grants.as_ref().filter(|(arn, _, _)| {
+        self.resource.as_ref().filter(|(arn, _, _)| {
             resource == arn
                 || resource
                     .strip_prefix(arn.as_str())

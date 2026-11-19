@@ -249,7 +249,7 @@ fn on_directory(check: &Check) -> bool {
     check
         .on
         .bucket()
-        .is_some_and(crate::s3::directory::is_directory)
+        .is_some_and(|b| crate::s3::directory::is_directory(b) || crate::tables::is_storage(b))
 }
 
 /// Refuses `checks` if any is on a directory bucket (see `on_directory`).
