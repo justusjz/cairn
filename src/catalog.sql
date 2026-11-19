@@ -239,7 +239,9 @@
 --     the destinations it goes to in the write's own transaction, under
 --     its K(b,k), as its events are (I14); the queue is read and leased by
 --     the replication worker only (SKIP LOCKED), and a version leaves it
---     under its key's K (T68), which is what changes its status.
+--     under its key's K (T68), which is what changes its status. A Batch
+--     Replication job's task queues a version that's there already (T69),
+--     under its key's K too.
 --
 -- DEADLOCKS
 --
@@ -742,15 +744,41 @@ BEGIN
 END
 $$;
 
+-- The destinations a version of key `p_key` goes to by the replication
+-- configuration `p_config` (see `replication`), and the rule that sends it
+-- to each: of the enabled rules whose filter it matches (a prefix of the
+-- key, tags it has, `p_tags`, in their stored form: see `s3::tags`), the one
+-- of highest priority (then the first) for each destination. A delete
+-- marker (`p_marker`) goes only where that rule replicates delete markers,
+-- and an SSE-KMS object (`p_encryption` 'kms') only where it replicates
+-- those.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_replication_targets(
+    p_config jsonb, p_key text, p_marker boolean, p_tags text, p_encryption text
+) RETURNS TABLE (destination text, rule_id text) LANGUAGE sql STABLE AS $$
+    WITH matching AS (
+        SELECT r ->> 'id' AS id, coalesce((r ->> 'priority')::int, 0) AS priority,
+               r -> 'destination' ->> 'bucket' AS destination,
+               coalesce((r ->> 'delete_markers')::boolean, false) AS markers,
+               coalesce((r ->> 'kms_objects')::boolean, false) AS kms, t.n
+        FROM jsonb_array_elements(p_config -> 'rules') WITH ORDINALITY AS t(r, n)
+        WHERE coalesce((r ->> 'enabled')::boolean, false)
+          AND starts_with(p_key, coalesce(r ->> 'prefix', ''))
+          AND ARRAY(SELECT jsonb_array_elements_text(coalesce(r -> 'stored_tags', '[]'::jsonb)))
+              <@ CASE WHEN coalesce(p_tags, '') = '' THEN '{}'::text[] ELSE string_to_array(p_tags, '&') END
+    ), chosen AS (
+        SELECT DISTINCT ON (destination) * FROM matching ORDER BY destination, priority DESC, n
+    )
+    SELECT c.destination, c.id FROM chosen c
+    WHERE CASE WHEN p_marker THEN c.markers
+               WHEN p_encryption = 'kms' THEN c.kms
+               ELSE true END
+$$;
+
 -- Queues the new version `p_version_id` of key `p_key` (row `p_object_id`;
 -- `p_marker` if it's a delete marker) for each destination of the bucket's
--- replication configuration (see `replication`) that a rule sends it to:
--- of the enabled rules whose filter it matches (a prefix of the key, tags
--- it has, in their stored form: see `s3::tags`), the one of highest
--- priority (then the first) for each destination. A delete marker goes
--- only where that rule replicates delete markers, and an SSE-KMS object
--- (`p_encryption` 'kms') only where it replicates those. A queued object is
--- PENDING. Replicas aren't replicated again, nor are a lifecycle's
+-- replication configuration that a rule sends it to (see
+-- `cairn_replication_targets`). A queued object is PENDING. Replicas
+-- aren't replicated again, nor are a lifecycle's
 -- delete markers (as in S3), nor a null version, which only a bucket that
 -- isn't versioned has (I15).
 --
@@ -765,7 +793,6 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_replicate(
 ) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     v_config jsonb;
-    v_tags text[];
     v_queued bigint;
 BEGIN
     IF p_version_id IS NULL OR p_version_id = 'null' OR pg_temp.cairn_replica() IS NOT NULL THEN
@@ -780,24 +807,9 @@ BEGIN
     IF NOT FOUND THEN
         RETURN;
     END IF;
-    v_tags := CASE WHEN coalesce(p_tags, '') = '' THEN '{}'::text[] ELSE string_to_array(p_tags, '&') END;
-    WITH matching AS (
-        SELECT r ->> 'id' AS id, coalesce((r ->> 'priority')::int, 0) AS priority,
-               r -> 'destination' ->> 'bucket' AS destination,
-               coalesce((r ->> 'delete_markers')::boolean, false) AS markers,
-               coalesce((r ->> 'kms_objects')::boolean, false) AS kms, t.n
-        FROM jsonb_array_elements(v_config -> 'rules') WITH ORDINALITY AS t(r, n)
-        WHERE coalesce((r ->> 'enabled')::boolean, false)
-          AND starts_with(p_key, coalesce(r ->> 'prefix', ''))
-          AND ARRAY(SELECT jsonb_array_elements_text(coalesce(r -> 'stored_tags', '[]'::jsonb))) <@ v_tags
-    ), chosen AS (
-        SELECT DISTINCT ON (destination) * FROM matching ORDER BY destination, priority DESC, n
-    )
     INSERT INTO replication_queue (bucket, key, version_id, marker, destination, rule_id)
-    SELECT p_bucket, p_key, p_version_id, p_marker, c.destination, c.id FROM chosen c
-    WHERE CASE WHEN p_marker THEN c.markers
-               WHEN p_encryption = 'kms' THEN c.kms
-               ELSE true END;
+    SELECT p_bucket, p_key, p_version_id, p_marker, t.destination, t.rule_id
+    FROM pg_temp.cairn_replication_targets(v_config, p_key, p_marker, p_tags, p_encryption) t;
     GET DIAGNOSTICS v_queued = ROW_COUNT;
     IF v_queued > 0 AND NOT p_marker THEN
         UPDATE objects SET replication_status = 'PENDING' WHERE id = p_object_id;
@@ -2049,6 +2061,66 @@ BEGIN
                           WHERE r.bucket = q.bucket AND r.key = q.key AND r.version_id = q.version_id);
     END IF;
     RETURN true;
+END
+$$;
+
+-- T69: a Batch Replication job's task (see `batch`): queues version
+-- `p_version_id` of key `p_key` for each destination the bucket's
+-- replication configuration sends it to now (`cairn_replication_targets`),
+-- as a write queues its version (`cairn_replicate`), but whenever it was
+-- written, and whatever its status: a version that was replicated, or
+-- failed to be, or is a replica itself, is replicated (again), as S3's
+-- Batch Replication does. Where it's queued already, it isn't again. Takes
+-- K(b,k), as a write does, and a queued object (but a replica) is PENDING
+-- (I15). Returns 'queued'; 'no_such_version' (or 'no_such_key', named
+-- by none); 'no_configuration' if the bucket has none (or is gone:
+-- 'no_such_bucket'); 'null_version' for the null version, which has no ID
+-- for its replica to keep; or 'not_eligible' if no rule sends it anywhere.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_replicate_existing(p_bucket text, p_key text, p_version_id text)
+RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    v_config text;
+    o record;
+    v_queued bigint;
+BEGIN
+    SELECT replication INTO v_config FROM buckets WHERE name = p_bucket;
+    IF NOT FOUND THEN
+        RETURN 'no_such_bucket';
+    END IF;
+    PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
+    SELECT id, version_id, is_delete_marker, tags,
+           CASE WHEN sse_c_key IS NOT NULL THEN 'customer'
+                WHEN sse_kms_key_id IS NOT NULL AND NOT coalesce(sse_s3, false) THEN 'kms'
+                ELSE 'plain' END AS encryption
+    INTO o FROM objects
+    WHERE bucket = p_bucket AND key = p_key
+      AND CASE WHEN p_version_id IS NULL THEN is_latest ELSE version_id = p_version_id END;
+    IF NOT FOUND THEN
+        RETURN CASE WHEN p_version_id IS NULL THEN 'no_such_key' ELSE 'no_such_version' END;
+    END IF;
+    IF v_config IS NULL THEN
+        RETURN 'no_configuration';
+    END IF;
+    IF o.version_id = 'null' THEN
+        RETURN 'null_version';
+    END IF;
+    INSERT INTO replication_queue (bucket, key, version_id, marker, destination, rule_id)
+    SELECT p_bucket, p_key, o.version_id, o.is_delete_marker, t.destination, t.rule_id
+    FROM pg_temp.cairn_replication_targets(v_config::jsonb, p_key, o.is_delete_marker, o.tags, o.encryption) t
+    WHERE NOT EXISTS (SELECT 1 FROM replication_queue r
+                      WHERE r.bucket = p_bucket AND r.key = p_key AND r.version_id = o.version_id
+                        AND r.destination = t.destination);
+    GET DIAGNOSTICS v_queued = ROW_COUNT;
+    IF v_queued = 0 AND NOT EXISTS (
+        SELECT 1 FROM pg_temp.cairn_replication_targets(v_config::jsonb, p_key, o.is_delete_marker, o.tags, o.encryption)
+    ) THEN
+        RETURN 'not_eligible';
+    END IF;
+    IF v_queued > 0 AND NOT o.is_delete_marker THEN
+        UPDATE objects SET replication_status = 'PENDING'
+        WHERE id = o.id AND replication_status IS DISTINCT FROM 'REPLICA';
+    END IF;
+    RETURN 'queued';
 END
 $$;
 

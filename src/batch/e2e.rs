@@ -805,3 +805,207 @@ async fn inventory_reports_that_cant_be_read_fail_jobs() {
     let job = describe(&app, &admin, &changed).await;
     assert_eq!(element(&job, "FailureCode"), Some("ManifestETagMismatch"), "{job}");
 }
+
+/// The bucket Batch Replication's tests replicate to.
+const BACKUP: &str = "backup";
+
+/// Sets up replication of the test bucket's `data/` to `BACKUP`, both
+/// versioned, as a role of its own (trusting S3, as replication's must).
+async fn replicating(app: &Arc<App>, admin: &Principal) {
+    use crate::s3::buckets::{replication, versioning::put_bucket_versioning};
+    let client = app.pool.get().await.unwrap();
+    client.execute("INSERT INTO buckets (name) VALUES ($1)", &[&BACKUP]).await.unwrap();
+    for bucket in [BUCKET, BACKUP] {
+        let body = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+        let response = put_bucket_versioning(app, bucket, Bytes::from(body), crate::mfa::Presented::Absent).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let account = users::account(&client).await.unwrap();
+    let trust = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"s3.amazonaws.com"},"Action":"sts:AssumeRole"}]}"#;
+    let trust = roles::check_trust(&client, &account, trust).await.unwrap();
+    let new = roles::New { name: "replication", path: "/", trust: &trust, description: "", max_session_duration: 3600, boundary: None, tags: &[] };
+    let id = roles::create(&client, &account, &new).await.unwrap();
+    let role = roles::Role::load_id(&client, id).await.unwrap().unwrap();
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObjectVersionForReplication","s3:ReplicateObject","s3:ReplicateDelete","s3:ReplicateTags"],"Resource":["arn:aws:s3:::{BUCKET}/*","arn:aws:s3:::{BACKUP}/*"]}}]}}"#
+    );
+    roles::put_policy(&client, &role, "p", &policy).await.unwrap();
+    let response = replication::put(app, BUCKET, Bytes::from(replication_config(&account)), &access(admin)).await.unwrap();
+    assert_eq!(body_of(response).await.0, StatusCode::OK);
+}
+
+/// The version IDs of `bucket`'s `key`, newest first, with their
+/// replication statuses.
+async fn versions_of(app: &App, bucket: &str, key: &str) -> Vec<(String, Option<String>)> {
+    let client = app.pool.get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT version_id, replication_status FROM objects WHERE bucket = $1 AND key = $2
+             ORDER BY last_modified DESC, id DESC",
+            &[&bucket, &key],
+        )
+        .await
+        .unwrap();
+    rows.iter().map(|r| (r.get(0), r.get(1))).collect()
+}
+
+/// A Batch Replication job's request, of a manifest of versions.
+fn replication_request(token: &str, key: &str, etag: &str, account: &str) -> String {
+    create_request(token, "<S3ReplicateObject/>", key, etag, false, account)
+        .replace("<member>Key</member></Fields>", "<member>Key</member><member>VersionId</member></Fields>")
+}
+
+/// Batch Replication replicates versions that were there before their
+/// rule, as their rule says, in whatever order the manifest lists them:
+/// each lands among its key's versions by its time, so the destination's
+/// are the source's, in order. What no rule replicates fails as S3 says,
+/// and so does a version that isn't there.
+#[tokio::test]
+async fn batch_replication_replicates_existing_versions() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(&app, super::SERVICE, r#"["s3:GetObject","s3:PutObject","s3:InitiateReplication"]"#).await;
+    // Written before there's a configuration: not replicated.
+    let client = app.pool.get().await.unwrap();
+    replicating(&app, &admin).await;
+    client.execute("UPDATE buckets SET replication = NULL WHERE name = $1", &[&BUCKET]).await.unwrap();
+    for data in [&b"one"[..], b"two", b"three"] {
+        put(&app, "data/a", data.to_vec()).await;
+    }
+    put(&app, "data/b", b"b".to_vec()).await;
+    let deleted = crate::s3::objects::delete::delete_object(&app, BUCKET, "data/b", None, false, None, crate::mfa::Presented::Absent)
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    put(&app, "other", b"o".to_vec()).await;
+    let response = crate::s3::buckets::replication::put(
+        &app,
+        BUCKET,
+        Bytes::from(replication_config(&account)),
+        &access(&admin),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let a = versions_of(&app, BUCKET, "data/a").await;
+    let b = versions_of(&app, BUCKET, "data/b").await;
+    assert!(a.iter().all(|(_, status)| status.is_none()), "{a:?}");
+    assert_eq!(client.query_one("SELECT count(*) FROM replication_queue", &[]).await.unwrap().get::<_, i64>(0), 0);
+
+    // Newest first, as an inventory report lists them; the marker, the
+    // object under it, a key no rule picks, a version that isn't there, and
+    // a key's current version (by none).
+    let other = &versions_of(&app, BUCKET, "other").await[0].0;
+    let mut lines: Vec<String> = a.iter().map(|(v, _)| format!("{BUCKET},data/a,{v}")).collect();
+    lines.extend(b.iter().map(|(v, _)| format!("{BUCKET},data/b,{v}")));
+    lines.push(format!("{BUCKET},other,{other}"));
+    lines.push(format!("{BUCKET},data/a,{other}"));
+    lines.push(format!("{BUCKET},data/a,"));
+    let etag = manifest(&app, "manifest.csv", &lines.join("\n")).await;
+    let id = with_report(&replication_request("t1", "manifest.csv", &etag, &account), &report("FailedTasksOnly"));
+    let id = create(&app, &admin, &id).await;
+    step(&app, 1).await;
+    step(&app, 2).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert!(job.contains("<S3ReplicateObject/>"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("6"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksFailed"), Some("2"), "{job}");
+    let (_, files) = report_of(&app, &id).await;
+    let failed: Vec<(&str, &str)> =
+        files[0].1.lines().map(|l| l.split(',').collect::<Vec<_>>()).map(|c| (c[1], c[5])).collect();
+    assert_eq!(failed, [("other", "SrcObjectNotEligible"), ("data/a", "NoSuchVersion")]);
+    // Queued once each (the current version twice in the manifest), and
+    // PENDING until they're replicated.
+    assert_eq!(client.query_one("SELECT count(*) FROM replication_queue", &[]).await.unwrap().get::<_, i64>(0), 5);
+    assert!(versions_of(&app, BUCKET, "data/a").await.iter().all(|(_, s)| s.as_deref() == Some("PENDING")));
+
+    while crate::replication::round(&app).await.unwrap() > 0 {}
+    let ids = |versions: &[(String, Option<String>)]| versions.iter().map(|(v, _)| v.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&versions_of(&app, BACKUP, "data/a").await), ids(&a));
+    assert_eq!(ids(&versions_of(&app, BACKUP, "data/b").await), ids(&b));
+    assert!(versions_of(&app, BUCKET, "data/a").await.iter().all(|(_, s)| s.as_deref() == Some("COMPLETED")));
+    let current = crate::s3::objects::get::get_object(
+        &app,
+        BACKUP,
+        "data/a",
+        None,
+        None,
+        None,
+        &crate::s3::conditional::Preconditions::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(current.into_body().collect().await.unwrap().to_bytes(), &b"three"[..]);
+    let head = crate::s3::objects::get::head_object(
+        &app,
+        BACKUP,
+        "data/b",
+        None,
+        None,
+        None,
+        &crate::s3::conditional::Preconditions::default(),
+        None,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(head.status(), StatusCode::NOT_FOUND, "the marker is current");
+
+    // Again: replicated already, so nothing changes, but they're done.
+    let id = create(&app, &admin, &replication_request("t2", "manifest.csv", &etag, &account)).await;
+    step(&app, 3).await;
+    step(&app, 4).await;
+    assert_eq!(element(&describe(&app, &admin, &id).await, "NumberOfTasksSucceeded"), Some("6"));
+    while crate::replication::round(&app).await.unwrap() > 0 {}
+    assert_eq!(versions_of(&app, BACKUP, "data/a").await.len(), 3);
+    assert!(versions_of(&app, BUCKET, "data/a").await.iter().all(|(_, s)| s.as_deref() == Some("COMPLETED")));
+}
+
+/// The replication configuration `replicating` sets.
+fn replication_config(account: &str) -> String {
+    format!(
+        "<ReplicationConfiguration><Role>arn:aws:iam::{account}:role/replication</Role>\
+         <Rule><ID>data</ID><Priority>1</Priority><Filter><Prefix>data/</Prefix></Filter><Status>Enabled</Status>\
+         <Destination><Bucket>arn:aws:s3:::{BACKUP}</Bucket></Destination>\
+         <DeleteMarkerReplication><Status>Enabled</Status></DeleteMarkerReplication></Rule></ReplicationConfiguration>"
+    )
+}
+
+/// A job's role must be allowed `s3:InitiateReplication` on each object,
+/// and its bucket must have a replication configuration.
+#[tokio::test]
+async fn batch_replication_needs_its_permission_and_a_configuration() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(&app, super::SERVICE, r#"["s3:GetObject","s3:PutObject"]"#).await;
+    put(&app, "data/a", b"a".to_vec()).await;
+    let etag = manifest(&app, "manifest.csv", &format!("{BUCKET},data/a,")).await;
+    // No configuration (nor versioning) yet.
+    let id = with_report(&replication_request("t1", "manifest.csv", &etag, &account), &report("FailedTasksOnly"));
+    let id = create(&app, &admin, &id).await;
+    step(&app, 1).await;
+    step(&app, 2).await;
+    let (_, files) = report_of(&app, &id).await;
+    assert!(files[0].1.contains(",AccessDenied,"), "{files:?}");
+    assert!(files[0].1.contains("s3:InitiateReplication"), "{files:?}");
+
+    let client = app.pool.get().await.unwrap();
+    let role = roles::Role::load(&client, &account, ROLE).await.unwrap().unwrap();
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:InitiateReplication"],"Resource":["arn:aws:s3:::{BUCKET}/*"]}}]}}"#
+    );
+    roles::put_policy(&client, &role, "p", &policy).await.unwrap();
+    let id = with_report(&replication_request("t2", "manifest.csv", &etag, &account), &report("FailedTasksOnly"));
+    let id = create(&app, &admin, &id).await;
+    step(&app, 3).await;
+    step(&app, 4).await;
+    let (_, files) = report_of(&app, &id).await;
+    assert!(files[0].1.contains(",400,SrcBucketReplicationConfigMissing,"), "{files:?}");
+}

@@ -47,13 +47,15 @@
 //! As in S3: replicas aren't replicated again; nor are versions that were
 //! there before their rule, delete markers a lifecycle rule makes, deletes
 //! of versions (by version ID), or later changes to a version's tags or
-//! Object Lock.
+//! Object Lock. A Batch Replication job (see `batch`) queues versions that
+//! are there (replicas too) as writes queue theirs, whatever their status.
 //!
 //! A replica keeps its source's last-modified time, and a key's versions
 //! are ordered by it (see `cairn_version_time`), so it lands below the
-//! destination's versions of its key that are newer (written there
-//! directly): whichever version of the key is newest is current, in
-//! whatever order they land.
+//! destination's versions of its key that are newer, written there
+//! directly, or replicas of newer versions that a Batch Replication job
+//! replicated before it: whichever version of the key is newest is current,
+//! in whatever order they land.
 //!
 //! An SSE-C version can't be opened without its client's key, so its
 //! replica keeps its sealed key and checksum as they are, sealed for the

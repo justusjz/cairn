@@ -1682,8 +1682,9 @@ written or deleted while it's made may or may not be in it.
 S3 Batch Operations: a job (S3 Control's `CreateJob`,
 `aws s3control create-job`) does one operation to every object a manifest
 lists, as a role. Cairn does `S3PutObjectTagging` (replacing each object's
-tags), `S3DeleteObjectTagging`, `S3PutObjectRetention` and
-`S3PutObjectLegalHold` ([Object Lock](#object-lock)). Its manifest is a
+tags), `S3DeleteObjectTagging`, `S3PutObjectRetention`,
+`S3PutObjectLegalHold` ([Object Lock](#object-lock)) and
+`S3ReplicateObject` ([Batch Replication](#batch-replication)). Its manifest is a
 CSV object of lines `bucket,key` (or `bucket,key,versionId`, as its
 `Fields` say), keys URL-encoded, or a CSV [inventory report](#inventory)'s
 `manifest.json` (`S3InventoryReport_CSV_20161130`, without `Fields`): its
@@ -1765,6 +1766,42 @@ another carries on from there; the tasks of the page it was on are done
 again, which is harmless for the operations Cairn does, and their report
 files written again, over the old ones.
 
+### Batch Replication
+
+A job of `S3ReplicateObject` replicates the versions its manifest lists by
+their bucket's [replication configuration](#replication), however they
+were replicated before: versions written before a rule existed, versions
+that failed, and versions that were replicated already (to backfill a new
+destination), as S3's Batch Replication does. Each is queued as a new
+version is, to the destinations its rules send it to now, and replicated
+by the configuration's role, so the task succeeds once it's queued; the
+version is `PENDING` until it's replicated, then `COMPLETED` or `FAILED`.
+A version no rule picks fails its task (`SrcObjectNotEligible`), as does
+one in a bucket with no replication configuration
+(`SrcBucketReplicationConfigMissing`). The job's role needs
+`s3:InitiateReplication` on the objects (and to read the manifest), not
+the permissions to replicate them, which are the configuration's role's:
+
+```sh
+aws iam put-role-policy --role-name batch --policy-name replicate --policy-document \
+  '{"Version":"2012-10-17","Statement":[
+    {"Effect":"Allow","Action":"s3:InitiateReplication","Resource":"arn:aws:s3:::photos/*"},
+    {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::manifests/*"}]}'
+aws s3control create-job --account-id <account ID> --priority 10 --no-confirmation-required \
+  --role-arn arn:aws:iam::<account ID>:role/batch --report '{"Enabled":false}' \
+  --operation '{"S3ReplicateObject":{}}' \
+  --manifest '{"Spec":{"Format":"S3InventoryReport_CSV_20161130"},
+    "Location":{"ObjectArn":"arn:aws:s3:::manifests/photos/all/2026-11-19T00-00Z/manifest.json",
+    "ETag":'"$etag"'}}'
+```
+
+An [inventory report](#inventory) of all versions lists every version
+there is (its `VersionId` field is needed: a task without one replicates
+the key's current version). The manifest may list a key's versions in any
+order: a replica lands among its destination's versions by its
+last-modified time, which is its source's, so the destination ends up with
+them in the source's order, and the source's current version current.
+
 ## Replication
 
 A bucket's replication configuration (`aws s3api put-bucket-replication`,
@@ -1816,8 +1853,8 @@ configuration, the source bucket's versioning can't be suspended.
 
 Replicas aren't replicated again, so two buckets can replicate to each
 other. Like S3, Cairn doesn't replicate versions written before a rule
-existed, deletes of a version by its ID, or delete markers made by
-lifecycle rules. SSE-KMS objects are replicated only if their rule asks for
+existed (a [Batch Replication](#batch-replication) job does), deletes of a
+version by its ID, or delete markers made by lifecycle rules. SSE-KMS objects are replicated only if their rule asks for
 it (`SseKmsEncryptedObjects`), sealed under its `ReplicaKmsKeyID`. SSE-C
 objects are replicated as they're stored, and open with the same customer
 key. Unlike S3, Cairn doesn't replicate later changes to a version's tags

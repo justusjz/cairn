@@ -65,7 +65,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "S3PutObjectCopy",
     "S3PutObjectAcl",
     "S3InitiateRestoreObject",
-    "S3ReplicateObject",
     "S3ComputeObjectChecksum",
     "S3UpdateObjectEncryption",
 ];
@@ -350,6 +349,7 @@ fn operation_xml(operation: &Operation) -> String {
             "<Operation><S3PutObjectLegalHold><LegalHold><Status>{}</Status></LegalHold></S3PutObjectLegalHold></Operation>",
             if *on { "ON" } else { "OFF" }
         ),
+        Operation::Replicate => "<Operation><S3ReplicateObject/></Operation>".to_owned(),
     }
 }
 
@@ -531,6 +531,7 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
                 _ => return Err(bad_request("A legal hold's Status, ON or OFF, is required.")),
             }
         }
+        "S3ReplicateObject" => Operation::Replicate,
         name if UNIMPLEMENTED.contains(&name) => return Err(not_implemented(&format!("The {name} operation"))),
         name => return Err(bad_request(&format!("{name} isn't an operation."))),
     };
@@ -1042,6 +1043,9 @@ mod tests {
         assert_eq!(job.description.as_deref(), Some("tag them"));
         let job = parse_create(request("<S3DeleteObjectTagging/>", "").as_bytes()).unwrap();
         assert_eq!(job.operation, Operation::DeleteTagging);
+        let job = parse_create(request("<S3ReplicateObject/>", "").as_bytes()).unwrap();
+        assert_eq!(job.operation, Operation::Replicate);
+        assert_eq!(super::operation_xml(&job.operation), "<Operation><S3ReplicateObject/></Operation>");
     }
 
     #[test]

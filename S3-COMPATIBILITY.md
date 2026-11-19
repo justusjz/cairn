@@ -60,9 +60,9 @@ supported.
 | Event notifications, to SNS topics | 🟡 | Over HTTP(S) subscriptions: [Event notifications](#event-notifications) |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
 | Server access logging | 🟡 | [Server access logging](#server-access-logging) |
-| Batch Operations | 🟡 | Tagging and Object Lock: [Batch Operations](#batch-operations) |
+| Batch Operations | 🟡 | Tagging, Object Lock and replication: [Batch Operations](#batch-operations) |
 | Replication, to buckets in the cluster | 🟡 | [Replication](#replication) |
-| Replication to other clusters or providers, Batch Replication, RTC | ❌ | |
+| Replication to other clusters or providers, RTC | ❌ | |
 
 ### Security
 
@@ -234,10 +234,24 @@ once it's been configured.
 ### Batch Operations
 
 - **Operations.** `S3PutObjectTagging`, `S3DeleteObjectTagging`,
-  `S3PutObjectRetention` and `S3PutObjectLegalHold` only; a job of another
-  operation is refused with `501 NotImplemented`, as is a retention with an
-  event hold (Cairn has none). A retention's date must be in the future
-  when the job is created, and is checked again by each task.
+  `S3PutObjectRetention`, `S3PutObjectLegalHold` and `S3ReplicateObject`
+  only; a job of another operation is refused with `501 NotImplemented`, as
+  is a retention with an event hold (Cairn has none). A retention's date
+  must be in the future when the job is created, and is checked again by
+  each task.
+- **Batch Replication** (`S3ReplicateObject`) replicates the versions its
+  manifest lists, whatever their replication status, by their bucket's
+  configuration as it is when the task runs. A task succeeds once its
+  version is queued (or is queued already); whether it's then replicated,
+  its status tells (`x-amz-replication-status`), not the completion
+  report. Its failures are `SrcObjectNotEligible` (no rule picks the
+  version, or it's the null version, which has no version ID for a
+  replica to keep) and `SrcBucketReplicationConfigMissing`; the role
+  needs `s3:InitiateReplication` on the object. A task without a version
+  ID replicates the key's current version (S3 requires version IDs).
+  There's no manifest generator, so no `ObjectReplicationStatuses` or
+  other filters: list what's to be replicated in the manifest, or an
+  inventory report.
 - **Manifests.** CSV manifests (`S3BatchOperations_CSV_20180820`) and CSV
   inventory reports (`S3InventoryReport_CSV_20161130`); manifest generators
   are refused with `501 NotImplemented`. A CSV manifest's lines must have
@@ -666,8 +680,9 @@ Object Lock. `x-amz-replication-status` is `PENDING`, `COMPLETED` or
 - **Failures** are final, as in S3: a version the role may not replicate,
   or whose destination is gone or no longer versioned, is `FAILED`.
   Transient errors are retried with backoff, for about 40 minutes.
-- **Not replicated, as in S3:** versions written before their rule,
-  replicas, delete markers made by lifecycle rules, deletes of a version
+- **Not replicated, as in S3:** versions written before their rule
+  (unless a [Batch Replication](#batch-operations) job replicates them),
+  replicas (likewise), delete markers made by lifecycle rules, deletes of a version
   by ID, and SSE-KMS objects unless their rule replicates them
   (`SseKmsEncryptedObjects`, under its `ReplicaKmsKeyID`).
 - **SSE-C objects** are replicated as they're stored, since Cairn
@@ -678,7 +693,8 @@ Object Lock. `x-amz-replication-status` is `PENDING`, `COMPLETED` or
   retention or legal hold. `ReplicaModifications` is kept and returned,
   but has no effect.
 - **Refused:** `ExistingObjectReplication`, `ReplicationTime` and
-  `Metrics` (`501 NotImplemented`). There's no Batch Replication.
+  `Metrics` (`501 NotImplemented`). Existing objects are replicated by
+  Batch Replication instead (see [Batch Operations](#batch-operations)).
 - **Ownership:** replicas are always owned by the destination bucket's
   account, since ACLs are disabled. `AccessControlTranslation` is taken,
   but it needs `s3:ObjectOwnerOverrideToBucketOwner`, as in S3.
