@@ -148,6 +148,12 @@ Done:
   unreferenced files; compaction later, if needed. See
   `plans/s3-tables.md`.
 
+- **S3 Select.** SelectObjectContent over CSV and JSON, uncompressed or
+  gzipped, for applications that still use it: AWS closed it to new
+  customers in 2024, and MinIO had it. Implemented. Next, if anyone needs
+  them: Parquet input, BZIP2, `ScanRange`, the date and time functions,
+  and paths into JSON documents in `FROM`.
+
 ## Ideas
 
 Smaller improvements, done when they're needed:

@@ -69,7 +69,9 @@ please report it.
 | [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies, Iceberg REST endpoint | 🟡 | |
 | S3 Tables: maintenance, replication, logging | ❌ | |
 | Analytics, metrics, Intelligent-Tiering, Storage Lens | ❌ | |
-| S3 Select, torrents, requester pays | ❌ | |
+| [S3 Select](#s3-select): CSV and JSON, uncompressed or GZIP | 🟡 | |
+| S3 Select: Parquet, BZIP2, `ScanRange`, date and time functions | ❌ | `501 NotImplemented` (the functions: `400 UnsupportedFunction`). |
+| Torrents, requester pays | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
 ## Encryption
@@ -262,6 +264,27 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | Table storage signed with SigV2 | Not checked | Refused, as for directory buckets. |
 | A policy that would make a table bucket or table public | Refused | Refused with `403 AccessDeniedException` (S3's code not checked). |
 
+### S3 Select
+
+SelectObjectContent runs AWS's SQL over CSV and JSON objects: `SELECT`
+lists (or `*`), `FROM S3Object` with an alias, `WHERE` and `LIMIT`; paths
+(`s.name`, `s."Name"`, `_1`, `s.a.b[0]`); operators, `LIKE`, `BETWEEN`,
+`IN`, `IS [NOT] NULL|MISSING`, `CASE`, `CAST`; the string and conditional
+functions; and `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`. The object is read as
+it streams, and a `LIMIT` stops reading it.
+
+| | S3 | Cairn |
+| --- | --- | --- |
+| Availability | Only to accounts that used it before July 2024 | To everyone. |
+| A string compared with a number (CSV's fields are strings) | Not checked | Compared as a number, if it reads as one (`s.age > 40`); arithmetic takes such strings too. `NULL` if it doesn't. |
+| `AllowQuotedRecordDelimiter` false | A quoted record delimiter splits the record | Ignored: a quoted field may always hold one. |
+| `\r\n` line ends, with the default `RecordDelimiter` | Not checked | Read as `\n`. |
+| JSON `DOCUMENT` | One document, or several, with paths into it in `FROM` | Values one after another, each a record of at most 1 MB; paths in `FROM` (but `S3Object[*]`) are `400 UnsupportedSyntax`. |
+| Wildcards in paths (`s.a[*]`) | Supported | `400 UnsupportedSyntax`. |
+| `DECIMAL` | A decimal | A float. |
+| Error codes and messages | AWS's | AWS's documented codes, and `EvaluatorInvalidArguments` for division by zero, which they don't cover; the messages are Cairn's. |
+| Progress events | Every so often | Every second, if asked for; Cont events after 5 seconds without one. |
+
 ### Edge cases
 
 | | S3 | Cairn |
@@ -291,6 +314,9 @@ These follow AWS's documentation and API models, not real requests:
 - Directory buckets' errors for unsupported operations, delimiters,
   prefixes, `start-after` and gaps in part numbers.
 - `411 MissingContentLength` above.
+- S3 Select, which follows AWS's user guide and API reference: in
+  particular how strictly it types values, its output of numbers (floats
+  always have a fraction: `54.0`), and its errors' codes.
 
 ---
 

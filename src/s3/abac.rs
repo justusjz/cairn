@@ -35,6 +35,7 @@ use crate::{
 const ON_EXISTING: &[&str] = &[
     "GetObject",
     "HeadObject",
+    "SelectObjectContent",
     "GetObjectAttributes",
     "GetObjectAcl",
     "PutObjectAcl",
