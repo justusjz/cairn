@@ -50,6 +50,7 @@ async fn call(
         client: app.pool.get().await?,
         principal: actor.principal(),
         access: &mut access,
+        endpoint: None,
     };
     let path: String = segments.iter().map(|s| format!("/{}", encode(s))).collect();
     let body = match body {
@@ -59,6 +60,7 @@ async fn call(
     match ctx.dispatch(&method, &path, query, &body).await {
         Ok(tables::Answer::Json(value)) => Ok(value),
         Ok(tables::Answer::NoContent) => Ok(Value::Null),
+        Ok(tables::Answer::Raw(_, body)) => Ok(body.unwrap_or(Value::Null)),
         Err(e) => Err(match e.status {
             StatusCode::NOT_FOUND => ApiError::NotFound(e.message),
             StatusCode::FORBIDDEN => ApiError::Forbidden(e.message),

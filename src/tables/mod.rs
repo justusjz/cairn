@@ -19,7 +19,11 @@
 //! `s3tables:tableName`, `s3tables:TableBucketTag/…`, …). Another account's
 //! table bucket may be used where its policies allow it, as in AWS.
 //!
-//! Not here: Iceberg's REST catalog, maintenance that runs, replication,
+//! Iceberg's REST catalog is here too, under `/iceberg` (see
+//! `iceberg::rest`), and CreateTable with `metadata` writes the table's
+//! first metadata file as it does.
+//!
+//! Not here: maintenance that runs, replication,
 //! server access logging, record expiration (AWS's own tables only), and
 //! migrations from Glue (see `plans/s3-tables.md`). Where AWS's answers
 //! weren't known (and couldn't be probed), they follow its API model and
@@ -28,6 +32,7 @@
 mod buckets;
 #[cfg(test)]
 mod e2e;
+pub mod iceberg;
 pub mod names;
 mod namespaces;
 pub mod storage;
@@ -142,8 +147,8 @@ pub fn wants(signed: &Signed) -> bool {
     signed.service == "s3tables"
 }
 
-/// The most a request's body may hold.
-const MAX_BODY: usize = 1 << 20;
+/// The most a request's body may hold: an Iceberg commit's too.
+const MAX_BODY: usize = 8 << 20;
 
 /// The most table buckets an account may have, and namespaces and tables
 /// a table bucket may (AWS's default quotas).
@@ -192,16 +197,20 @@ fn not_implemented(what: &str) -> Error {
     )
 }
 
+const NO_BUCKET: &str = "The specified bucket does not exist.";
+const NO_NAMESPACE: &str = "The specified namespace does not exist.";
+const NO_TABLE: &str = "The specified table does not exist.";
+
 fn no_bucket() -> Error {
-    not_found("The specified bucket does not exist.")
+    not_found(NO_BUCKET)
 }
 
 fn no_namespace() -> Error {
-    not_found("The specified namespace does not exist.")
+    not_found(NO_NAMESPACE)
 }
 
 fn no_table() -> Error {
-    not_found("The specified table does not exist.")
+    not_found(NO_TABLE)
 }
 
 impl From<anyhow::Error> for Error {
@@ -234,6 +243,9 @@ pub(crate) enum Answer {
     Json(Value),
     /// 204, without a body.
     NoContent,
+    /// Any status, with a body (JSON) or none: Iceberg's REST catalog's
+    /// answers, its errors too (see `iceberg::rest`).
+    Raw(StatusCode, Option<Value>),
 }
 
 /// An S3 Tables request, on the S3 port.
@@ -254,6 +266,9 @@ pub async fn handle(
         Ok(Answer::NoContent) => response
             .status(StatusCode::NO_CONTENT)
             .body(Full::new(Bytes::new())),
+        Ok(Answer::Raw(status, body)) => response.status(status).body(Full::new(
+            body.map_or_else(Bytes::new, |b| Bytes::from(b.to_string())),
+        )),
         Err(e) => response
             .status(e.status)
             .header("x-amzn-errortype", e.code)
@@ -355,6 +370,7 @@ async fn respond(
         client,
         principal: &principal,
         access: &mut access,
+        endpoint: Some(endpoint(&parts.headers)),
     };
     ctx.dispatch(&parts.method, parts.uri.path(), query, &body)
         .await
@@ -366,6 +382,23 @@ pub(crate) struct Ctx<'a> {
     pub(crate) client: deadpool_postgres::Object,
     pub(crate) principal: &'a Principal,
     pub(crate) access: &'a mut Access,
+    /// Where the client reached this endpoint, as its request says (see
+    /// `endpoint`), if it's a client's request.
+    pub(crate) endpoint: Option<String>,
+}
+
+/// The URL clients reach this endpoint at, as a request to it says: its
+/// scheme (HTTPS, if a trusted proxy says so) and `Host`.
+fn endpoint(headers: &hyper::HeaderMap) -> String {
+    let host = headers
+        .get(hyper::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("localhost");
+    let scheme = match crate::s3::sse_c::secure(headers, false) {
+        true => "https",
+        false => "http",
+    };
+    format!("{scheme}://{host}")
 }
 
 /// A request's JSON body.
@@ -837,9 +870,7 @@ pub(crate) enum Target<'b> {
 
 /// The resource policies `target` is decided by, and the condition keys of
 /// its resource, and its ARN; with its table bucket's ARN and account.
-pub(crate) fn resource_of(
-    target: &Target,
-) -> anyhow::Result<(On, Context, Option<Resource>)> {
+pub(crate) fn resource_of(target: &Target) -> anyhow::Result<(On, Context, Option<Resource>)> {
     let mut context = Context::default();
     let set_bucket_tags = |context: &mut Context, bucket: &TableBucket, resource: bool| {
         for (key, value) in &bucket.tags.0 {
@@ -1054,6 +1085,10 @@ impl Ctx<'_> {
             .map(decode_path_param)
             .collect();
         let segments: Vec<&str> = segments.iter().map(String::as_str).collect();
+        // Iceberg's REST catalog (see `iceberg::rest`).
+        if segments.first() == Some(&"iceberg") {
+            return Ok(self.iceberg(method, &segments[1..], query, body).await);
+        }
         let input = Input::parse(body)?;
         let q = |name: &str| crate::s3::util::query_param(query, name);
         use Method as M;

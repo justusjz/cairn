@@ -218,6 +218,24 @@ storage, then UpdateTableMetadataLocation).
 
 ## Phase 2: Iceberg's REST catalog
 
+Done, as below, with these choices made on the way:
+
+- New tables' IDs are fresh, as Java's `newTableMetadata` assigns them
+  (a struct's fields first, then what's in each; partition fields from
+  1000), so a table's metadata doesn't depend on its client's numbering.
+- Format versions 2 and 3; 1 is refused.
+- A table made through the `s3tables` API without metadata has none until
+  a commit gives it (as a staged creation's updates would: `assert-create`
+  holds); loading it is a 404 until then.
+- A commit with no changes writes no file.
+- The config's S3 settings are defaults, not overrides, so that an
+  engine's own (another endpoint, say) win.
+- Metrics reports are taken and dropped (`204`), as Java's engines send
+  them unless told not to; PyIceberg's commit retries work as they do with
+  AWS.
+- Making a table writes its first metadata file after the table's row is
+  committed; if that fails, the row goes again.
+
 What makes it useful to Spark, Trino, PyIceberg and DuckDB, which don't
 write `metadata.json` themselves with a REST catalog: the server applies
 a commit's changes and writes the new metadata file.

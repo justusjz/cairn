@@ -66,8 +66,8 @@ please report it.
 | Replication to other clusters or providers, RTC | ❌ | |
 | [Directory buckets](#directory-buckets) (S3 Express One Zone), CreateSession | 🟡 | |
 | Directory buckets: RenameObject, appends, bucket tags, Local Zones | ❌ | |
-| [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies | 🟡 | |
-| S3 Tables: Iceberg REST endpoint, maintenance, replication, logging | ❌ | |
+| [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies, Iceberg REST endpoint | 🟡 | |
+| S3 Tables: maintenance, replication, logging | ❌ | |
 | Analytics, metrics, Intelligent-Tiering, Storage Lens | ❌ | |
 | S3 Select, torrents, requester pays | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
@@ -253,8 +253,10 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | SSE-KMS keys | AWS KMS keys | [OpenBao or Vault Transit](#kms-keys)'s, as `arn:aws:kms:<region>:<account>:key/<mount>/<key>`. |
 | Storage classes | `STANDARD`, `INTELLIGENT_TIERING` | The operator's, by those names; one it hasn't defined is `STANDARD`. |
 | Maintenance | Compaction, snapshot expiry, unreferenced file removal | None runs yet: configurations are kept (compaction can't be enabled), and jobs report `Not_Yet_Run`. |
-| CreateTable with `metadata` | Writes the first metadata file | `501`: create the table, then write its first metadata file. |
-| Iceberg REST endpoint (`/iceberg`) | ✅ | ❌ |
+| Iceberg REST endpoint | `s3tables.<region>.amazonaws.com/iceberg` | The S3 endpoint's `/iceberg`. |
+| The REST catalog's config | Not checked | The warehouse's `prefix`, and as defaults, `s3.endpoint` (the endpoint the request reached), `s3.path-style-access`, `client.region` and `rest-metrics-reporting-enabled=false`. |
+| The REST catalog's metrics reports | Not checked | Taken, and dropped. |
+| Format versions of tables the REST catalog commits to | 1 to 3 | 2 and 3. |
 | Replication, server access logging, Glue migrations | ✅ | `501`. |
 | Request metrics configuration | CloudWatch metrics | Kept, without effect. |
 | Table storage signed with SigV2 | Not checked | Refused, as for directory buckets. |
@@ -282,7 +284,10 @@ These follow AWS's documentation and API models, not real requests:
 - S3 Tables, which follow AWS's API model and documentation: in particular
   the messages of their errors, which errors a refused operation on table
   storage gets (Cairn: S3's `405 MethodNotAllowed`), and the order of
-  ListTables' pages (Cairn: by namespace, then name).
+  ListTables' pages (Cairn: by namespace, then name). The REST catalog
+  follows Iceberg's REST spec and Java's `TableMetadata.Builder`, and the
+  operations AWS lists for its endpoint; its errors' messages, and the
+  metadata it writes, may differ from AWS's in detail.
 - Directory buckets' errors for unsupported operations, delimiters,
   prefixes, `start-after` and gaps in part numbers.
 - `411 MissingContentLength` above.
