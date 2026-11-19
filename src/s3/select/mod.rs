@@ -5,9 +5,9 @@
 //! What's supported: CSV (all of its options) and JSON (`LINES`, and
 //! `DOCUMENT` as values one after another) input, uncompressed or gzipped;
 //! CSV or JSON output; Progress events; `ScanRange`; and the SQL `sql`
-//! describes. Not (yet): Parquet input, BZIP2, the date and time functions,
-//! and paths in `FROM`, which are refused as `NotImplemented` (501) or
-//! `UnsupportedSyntax`/`UnsupportedFunction` (400).
+//! describes, timestamps (see `timestamp`) among it. Not (yet): Parquet
+//! input, BZIP2, and paths in `FROM`, which are refused as `NotImplemented`
+//! (501) or `UnsupportedSyntax` (400).
 //!
 //! A `ScanRange` reads the records whose first byte is in it, as AWS's API
 //! reference says ("A record is processed when its first byte is contained
@@ -37,6 +37,7 @@ mod input;
 mod output;
 mod request;
 mod sql;
+mod timestamp;
 mod value;
 
 use std::io::Write;

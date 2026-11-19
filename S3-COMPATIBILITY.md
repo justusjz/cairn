@@ -69,8 +69,8 @@ please report it.
 | [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies, Iceberg REST endpoint, snapshot management, unreferenced file removal | 🟡 | |
 | S3 Tables: compaction, replication, logging | ❌ | |
 | Analytics, metrics, Intelligent-Tiering, Storage Lens | ❌ | |
-| [S3 Select](#s3-select): CSV and JSON, uncompressed or GZIP, `ScanRange` | 🟡 | |
-| S3 Select: Parquet, BZIP2, date and time functions | ❌ | `501 NotImplemented` (the functions: `400 UnsupportedFunction`). |
+| [S3 Select](#s3-select): CSV and JSON, uncompressed or GZIP, `ScanRange`, timestamps and their functions | 🟡 | |
+| S3 Select: Parquet, BZIP2 | ❌ | `501 NotImplemented`. |
 | Requester pays | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
@@ -270,8 +270,10 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 SelectObjectContent runs AWS's SQL over CSV and JSON objects: `SELECT`
 lists (or `*`), `FROM S3Object` with an alias, `WHERE` and `LIMIT`; paths
 (`s.name`, `s."Name"`, `_1`, `s.a.b[0]`); operators, `LIKE`, `BETWEEN`,
-`IN`, `IS [NOT] NULL|MISSING`, `CASE`, `CAST`; the string and conditional
-functions; and `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`. The object is read as
+`IN`, `IS [NOT] NULL|MISSING`, `CASE`, `CAST`; the string, conditional,
+date and time functions, with timestamps (`` `2007-02-23T12:14Z` ``,
+`TO_TIMESTAMP`, `CAST(... AS TIMESTAMP)`); and `COUNT`, `SUM`, `AVG`, `MIN`
+and `MAX`. The object is read as
 it streams, and a `LIMIT` stops reading it.
 
 A `ScanRange` reads the records whose first byte is in it, each to its end
@@ -292,6 +294,11 @@ in both, and returned twice, as AWS's rule has it.
 | JSON `DOCUMENT` | One document, or several, with paths into it in `FROM` | Values one after another, each a record of at most 1 MB; paths in `FROM` (but `S3Object[*]`) are `400 UnsupportedSyntax`. |
 | Wildcards in paths (`s.a[*]`) | Supported | `400 UnsupportedSyntax`. |
 | `DECIMAL` | A decimal | A float. |
+| A string where a timestamp is expected (CSV and JSON have their timestamps as strings) | Not checked | Taken as the timestamp it reads as, by functions (`EXTRACT(YEAR FROM s.date)`) and comparisons (`` s.date > `2024T` ``). A comparison with one that doesn't read as one is `NULL`. |
+| A timestamp with a time and no offset (`2010-01-01T23:00`, as in AWS's `DATE_DIFF` example) | Not checked | Its offset is unknown, as `-00:00`, and counts as UTC. |
+| `TO_TIMESTAMP` with a format pattern | Not documented, but mentioned in `TO_STRING`'s table | `400 IncorrectSqlFunctionArgumentType`: only Ion's text. |
+| `TO_STRING`'s patterns | As its table has them | As Java's `DateTimeFormatter` has them, which the table is of. Where its examples look garbled, Java's: `x` is `+07` (not `7`), `SS` of 0.06 seconds is `06` (not `6`). |
+| `` DATE_DIFF(year, `2010T`, `2010-05T`) `` | `4`, by AWS's documentation, which must mean `month` | `0`: whole years. |
 | `ScanRange` that starts within a multi-character `RecordDelimiter` that repeats itself (`||` in `||||`) | Not checked (AWS takes single characters) | The first record found after the range's start may be cut differently than reading from the object's start cuts it. |
 | Keywords (`FileHeaderInfo`, `Type`, `CompressionType`, `QuoteFields`, `ExpressionType`) | Any case (`Use`, `Lines`) | Any case. |
 | Error codes and messages | AWS's | AWS's documented codes, and `EvaluatorInvalidArguments` for division by zero, which they don't cover; the messages are Cairn's. |

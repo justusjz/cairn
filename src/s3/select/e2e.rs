@@ -277,3 +277,29 @@ async fn scan_ranges_of_json_lines() {
     let refused = ranged(sql, gzip, "<Start>1</Start>");
     assert_eq!(select(&app, "ids.json", &refused, None).await.status, 400);
 }
+
+#[tokio::test]
+async fn filters_and_formats_timestamps() {
+    let Some(app) = node().await else { return };
+    let log = b"time,level\n\
+        2024-03-01T10:15:00Z,INFO\n\
+        2024-03-01T11:45:30.250+01:00,WARN\n\
+        2024-03-02T08:00:00-05:00,ERROR\n";
+    put(&app, "log.csv", log.to_vec()).await;
+    let sql = "SELECT TO_STRING(TO_TIMESTAMP(s.time), 'MMM d HH:mm X') AS at, s.level \
+               FROM S3Object s \
+               WHERE TO_TIMESTAMP(s.time) >= `2024-03-01T10:30Z` \
+               AND DATE_DIFF(hour, TO_TIMESTAMP(s.time), UTCNOW()) > 0";
+    let answer = select(&app, "log.csv", &request(sql, CSV_USE, "<CSV/>"), None).await;
+    // 11:45 at +01:00 is 10:45 UTC: in.
+    assert_eq!(
+        answer.records,
+        "Mar 1 11:45 +01,WARN\nMar 2 08:00 -05,ERROR\n"
+    );
+    let sql = "SELECT MIN(TO_TIMESTAMP(s.time)), MAX(EXTRACT(day FROM s.time)) FROM S3Object s";
+    let answer = select(&app, "log.csv", &request(sql, CSV_USE, "<JSON/>"), None).await;
+    assert_eq!(
+        answer.records,
+        "{\"_1\":\"2024-03-01T10:15:00Z\",\"_2\":2}\n"
+    );
+}

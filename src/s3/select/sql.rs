@@ -9,15 +9,17 @@
 //! ```
 //!
 //! Its expressions: literals (numbers, `'strings'`, `TRUE`, `FALSE`, `NULL`,
-//! `MISSING`); paths (`s.name`, `s."Name"`, `_1`, `s.a.b[0]`); `||`,
-//! arithmetic, comparisons, `AND`, `OR`, `NOT`, `IS [NOT] NULL|MISSING`,
-//! `[NOT] LIKE ... [ESCAPE ...]`, `[NOT] BETWEEN`, `[NOT] IN (...)`; `CASE`;
-//! `CAST`; and the functions `CHAR_LENGTH`, `CHARACTER_LENGTH`, `LOWER`,
-//! `UPPER`, `TRIM`, `SUBSTRING`, `COALESCE`, `NULLIF`, and the aggregates
-//! `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`. Not (yet) its date and time
-//! functions, nor paths into the object in `FROM`.
+//! `MISSING`, and `` `timestamps` ``); paths (`s.name`, `s."Name"`, `_1`,
+//! `s.a.b[0]`); `||`, arithmetic, comparisons, `AND`, `OR`, `NOT`,
+//! `IS [NOT] NULL|MISSING`, `[NOT] LIKE ... [ESCAPE ...]`, `[NOT] BETWEEN`,
+//! `[NOT] IN (...)`; `CASE`; `CAST`; the functions `CHAR_LENGTH`,
+//! `CHARACTER_LENGTH`, `LOWER`, `UPPER`, `TRIM`, `SUBSTRING`, `COALESCE`,
+//! `NULLIF`, `DATE_ADD`, `DATE_DIFF`, `EXTRACT`, `TO_STRING`,
+//! `TO_TIMESTAMP` and `UTCNOW`; and the aggregates `COUNT`, `SUM`, `AVG`,
+//! `MIN` and `MAX`. Not (yet) paths into the object in `FROM`.
 
 use super::SelectError;
+use super::timestamp::{Part, Timestamp};
 use super::value::Value;
 
 /// The longest expression S3 Select takes, in bytes (its documented limit).
@@ -90,6 +92,7 @@ pub enum Type {
     Int,
     Float,
     String,
+    Timestamp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +109,10 @@ pub enum Function {
     Upper,
     Coalesce,
     NullIf,
+    /// `TO_STRING(timestamp, pattern)`.
+    ToString,
+    /// `TO_TIMESTAMP(string)`.
+    ToTimestamp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +180,23 @@ pub enum Expr {
         length: Option<Box<Expr>>,
     },
     Call(Function, Vec<Expr>),
+    /// `DATE_ADD(part, quantity, timestamp)`.
+    DateAdd {
+        part: Part,
+        quantity: Box<Expr>,
+        timestamp: Box<Expr>,
+    },
+    /// `DATE_DIFF(part, from, to)`.
+    DateDiff {
+        part: Part,
+        from: Box<Expr>,
+        to: Box<Expr>,
+    },
+    /// `EXTRACT(part FROM timestamp)`.
+    Extract {
+        part: Part,
+        timestamp: Box<Expr>,
+    },
     /// The result of the query's `n`th aggregate.
     Aggregate(usize),
 }
@@ -223,6 +247,9 @@ enum Token {
     Str(String),
     Int(i64),
     Float(f64),
+    /// A `` `timestamp` ``: an Ion literal, of which S3 Select's SQL has
+    /// timestamps.
+    Timestamp(Timestamp),
     Sym(&'static str),
     End,
 }
@@ -252,6 +279,23 @@ fn lex(sql: &str) -> Result<Vec<Token>, SelectError> {
                 Some(n) => i += n + 4,
                 None => return Err(lexer("LexerInvalidChar", "an unterminated comment")),
             }
+            continue;
+        }
+        if c == b'`' {
+            let Some(n) = sql[i + 1..].find('`') else {
+                return Err(lexer("LexerInvalidLiteral", "an unterminated `literal`"));
+            };
+            let text = &sql[i + 1..i + 1 + n];
+            match Timestamp::parse(text) {
+                Ok(timestamp) => tokens.push(Token::Timestamp(timestamp)),
+                Err(_) => {
+                    return Err(lexer(
+                        "LexerInvalidLiteral",
+                        &format!("the literal `{text}`, which isn't a timestamp"),
+                    ));
+                }
+            }
+            i += n + 2;
             continue;
         }
         if c == b'\'' || c == b'"' {
@@ -390,6 +434,7 @@ fn unexpected(token: &Token) -> SelectError {
         Token::Str(s) => format!("the string '{s}'"),
         Token::Int(i) => i.to_string(),
         Token::Float(f) => f.to_string(),
+        Token::Timestamp(t) => format!("`{}`", t.to_text()),
         Token::Sym(s) => format!("'{s}'"),
     };
     SelectError::new(
@@ -836,6 +881,7 @@ impl Parser {
         match token {
             Token::Int(i) => Ok(Expr::Literal(Value::Int(i))),
             Token::Float(f) => Ok(Expr::Literal(Value::Float(f))),
+            Token::Timestamp(t) => Ok(Expr::Literal(Value::Timestamp(t))),
             Token::Str(s) => Ok(Expr::Literal(Value::Str(s))),
             Token::Sym("(") => {
                 let expr = self.expr(0)?;
@@ -942,6 +988,32 @@ impl Parser {
         })
     }
 
+    /// A date part: `YEAR` to `SECOND`, and with `timezone`,
+    /// `TIMEZONE_HOUR` and `TIMEZONE_MINUTE` (`EXTRACT`'s).
+    fn date_part(&mut self, timezone: bool) -> Result<Part, SelectError> {
+        let token = self.next();
+        let part = match &token {
+            Token::Ident(name) => Part::parse(name),
+            _ => None,
+        };
+        match part {
+            Some(Part::TimezoneHour | Part::TimezoneMinute) if !timezone => {}
+            Some(part) => return Ok(part),
+            None => {}
+        }
+        let parts = match timezone {
+            true => "YEAR, MONTH, DAY, HOUR, MINUTE, SECOND, TIMEZONE_HOUR or TIMEZONE_MINUTE",
+            false => "YEAR, MONTH, DAY, HOUR, MINUTE or SECOND",
+        };
+        Err(SelectError::new(
+            "ParseExpectedDatePart",
+            format!(
+                "The SQL expression expects a date part ({parts}) here, not {}.",
+                describe(&token)
+            ),
+        ))
+    }
+
     /// A call of the function `name` (lowercase), at its `(`.
     fn call(&mut self, name: &str) -> Result<Expr, SelectError> {
         self.expect_sym("(")?;
@@ -955,7 +1027,7 @@ impl Parser {
                         "int" | "integer" => Type::Int,
                         "float" | "decimal" | "numeric" => Type::Float,
                         "string" => Type::String,
-                        "timestamp" => return Err(unsupported_function("CAST AS TIMESTAMP")),
+                        "timestamp" => Type::Timestamp,
                         _ => return Err(expected_type(&Token::Ident(t))),
                     },
                     token => return Err(expected_type(&token)),
@@ -1055,8 +1127,42 @@ impl Parser {
                 self.aggregates.push(Aggregate { kind, arg });
                 Expr::Aggregate(self.aggregates.len() - 1)
             }
+            "date_add" => {
+                let part = self.date_part(false)?;
+                self.expect_sym(",")?;
+                let quantity = self.expr(0)?;
+                self.expect_sym(",")?;
+                Expr::DateAdd {
+                    part,
+                    quantity: Box::new(quantity),
+                    timestamp: Box::new(self.expr(0)?),
+                }
+            }
+            "date_diff" => {
+                let part = self.date_part(false)?;
+                self.expect_sym(",")?;
+                let from = self.expr(0)?;
+                self.expect_sym(",")?;
+                Expr::DateDiff {
+                    part,
+                    from: Box::new(from),
+                    to: Box::new(self.expr(0)?),
+                }
+            }
+            "extract" => {
+                let part = self.date_part(true)?;
+                self.expect("from")?;
+                Expr::Extract {
+                    part,
+                    timestamp: Box::new(self.expr(0)?),
+                }
+            }
+            // The query's start, the same for every record.
+            "utcnow" => Expr::Literal(Value::Timestamp(Timestamp::now())),
             _ => {
                 let function = match name {
+                    "to_string" => (Function::ToString, 2..=2),
+                    "to_timestamp" => (Function::ToTimestamp, 1..=1),
                     "char_length" | "character_length" => (Function::CharLength, 1..=1),
                     "lower" => (Function::Lower, 1..=1),
                     "upper" => (Function::Upper, 1..=1),
@@ -1096,6 +1202,7 @@ fn describe(token: &Token) -> String {
         Token::Str(s) => format!("'{s}'"),
         Token::Int(i) => i.to_string(),
         Token::Float(f) => f.to_string(),
+        Token::Timestamp(t) => format!("`{}`", t.to_text()),
         Token::Sym(s) => format!("'{s}'"),
     }
 }
@@ -1162,6 +1269,13 @@ fn too_deep_at(expr: &Expr, budget: usize) -> bool {
             length,
         } => deeper(expr) || deeper(start) || deeper_opt(length),
         Expr::Call(_, args) => args.iter().any(deeper),
+        Expr::DateAdd {
+            quantity,
+            timestamp,
+            ..
+        } => deeper(quantity) || deeper(timestamp),
+        Expr::DateDiff { from, to, .. } => deeper(from) || deeper(to),
+        Expr::Extract { timestamp, .. } => deeper(timestamp),
     }
 }
 
@@ -1209,6 +1323,13 @@ fn reads_record(expr: &Expr) -> bool {
             reads_record(expr) || reads_record(start) || length.as_deref().is_some_and(reads_record)
         }
         Expr::Call(_, args) => args.iter().any(reads_record),
+        Expr::DateAdd {
+            quantity,
+            timestamp,
+            ..
+        } => reads_record(quantity) || reads_record(timestamp),
+        Expr::DateDiff { from, to, .. } => reads_record(from) || reads_record(to),
+        Expr::Extract { timestamp, .. } => reads_record(timestamp),
     }
 }
 
@@ -1270,7 +1391,7 @@ mod tests {
             code("SELECT * FROM S3Object WHERE COUNT(*) > 1"),
             "ParseUnsupportedSyntax"
         );
-        assert_eq!(code("SELECT UTCNOW() FROM S3Object"), "UnsupportedFunction");
+        assert_eq!(code("SELECT ABS(1) FROM S3Object"), "UnsupportedFunction");
         assert_eq!(
             code("SELECT *, a FROM S3Object"),
             "ParseAsteriskIsNotAloneInSelectList"

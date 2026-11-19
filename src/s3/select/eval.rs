@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 
 use super::SelectError;
 use super::sql::{Aggregate, AggregateKind, BinOp, Expr, Function, Step, Trim, Type};
+use super::timestamp::Timestamp;
 use super::value::{Number, Value, compare, parse_bool};
 
 /// A record, as a query sees it.
@@ -323,8 +324,67 @@ pub fn eval(expr: &Expr, record: &Record, aggregates: &[Value]) -> Result<Value,
             for arg in args {
                 values.push(eval(arg)?);
             }
-            call(*function, values)
+            match function {
+                Function::ToString => {
+                    let pattern = values.pop().unwrap_or(Value::Null);
+                    let value = values.pop().unwrap_or(Value::Null);
+                    if value.is_absent() || pattern.is_absent() {
+                        return Ok(Value::Null);
+                    }
+                    let timestamp = timestamp_argument("TO_STRING", &value)?;
+                    Value::Str(timestamp.format(&pattern.to_text())?)
+                }
+                Function::ToTimestamp => match values.pop().unwrap_or(Value::Null) {
+                    value if value.is_absent() => Value::Null,
+                    Value::Timestamp(t) => Value::Timestamp(t),
+                    value => Value::Timestamp(Timestamp::parse(&value.to_text())?),
+                },
+                _ => call(*function, values),
+            }
         }
+        Expr::DateAdd {
+            part,
+            quantity,
+            timestamp,
+        } => {
+            let quantity = eval(quantity)?;
+            let value = eval(timestamp)?;
+            if quantity.is_absent() || value.is_absent() {
+                return Ok(Value::Null);
+            }
+            let quantity = integer_argument("DATE_ADD", &quantity)?;
+            let timestamp = timestamp_argument("DATE_ADD", &value)?;
+            Value::Timestamp(timestamp.add(*part, quantity)?)
+        }
+        Expr::DateDiff { part, from, to } => {
+            let (from, to) = (eval(from)?, eval(to)?);
+            if from.is_absent() || to.is_absent() {
+                return Ok(Value::Null);
+            }
+            let from = timestamp_argument("DATE_DIFF", &from)?;
+            let to = timestamp_argument("DATE_DIFF", &to)?;
+            Value::Int(from.diff(*part, &to))
+        }
+        Expr::Extract { part, timestamp } => match eval(timestamp)? {
+            value if value.is_absent() => Value::Null,
+            value => Value::Int(timestamp_argument("EXTRACT", &value)?.extract(*part)),
+        },
+    })
+}
+
+/// A function's timestamp argument: a timestamp, or a string that is one
+/// (CSV and JSON have their timestamps as strings).
+fn timestamp_argument(function: &str, value: &Value) -> Result<Timestamp, SelectError> {
+    let timestamp = match value {
+        Value::Timestamp(t) => Some(*t),
+        Value::Str(s) => Timestamp::parse(s).ok(),
+        _ => None,
+    };
+    timestamp.ok_or_else(|| {
+        SelectError::new(
+            "IncorrectSqlFunctionArgumentType",
+            format!("{function} expects a timestamp, not {}.", describe(value)),
+        )
     })
 }
 
@@ -428,6 +488,7 @@ fn cast(value: Value, ty: Type) -> Result<Value, SelectError> {
             Type::Int => "INT",
             Type::Float => "FLOAT",
             Type::String => "STRING",
+            Type::Timestamp => "TIMESTAMP",
         };
         SelectError::new(
             "CastFailed",
@@ -436,6 +497,11 @@ fn cast(value: Value, ty: Type) -> Result<Value, SelectError> {
     };
     Ok(match ty {
         Type::String => Value::Str(value.to_text()),
+        Type::Timestamp => match &value {
+            Value::Timestamp(t) => Value::Timestamp(*t),
+            Value::Str(s) => Value::Timestamp(Timestamp::parse(s).map_err(|_| failed(&value))?),
+            _ => return Err(failed(&value)),
+        },
         Type::Bool => match &value {
             Value::Bool(b) => Value::Bool(*b),
             Value::Int(i) => Value::Bool(*i != 0),
@@ -792,6 +858,113 @@ mod tests {
         for (sql, want) in cases {
             assert_eq!(first(sql, &r).unwrap(), want, "{sql}");
         }
+    }
+
+    /// The date and time functions, as AWS's examples have them, and on
+    /// CSV's strings.
+    #[test]
+    fn evaluates_timestamps() {
+        let r = ["2017-01-02T03:04:05+07:08", "Hello", "2.5"];
+        let cases = [
+            (
+                "SELECT DATE_ADD(year, 5, `2010-01-01T`) FROM S3Object",
+                "2015-01-01T",
+            ),
+            (
+                "SELECT DATE_ADD(hour, 1, `2017T`) FROM S3Object",
+                "2017-01-01T01:00-00:00",
+            ),
+            (
+                "SELECT DATE_ADD(MONTH, '13', `2010T`) FROM S3Object",
+                "2011-02T",
+            ),
+            (
+                "SELECT DATE_DIFF(month, `2011T`, `2010T`) FROM S3Object",
+                "-12",
+            ),
+            (
+                "SELECT DATE_DIFF(day, `2010-01-01T23:00`, `2010-01-02T01:00`) FROM S3Object",
+                "0",
+            ),
+            (
+                "SELECT EXTRACT(TIMEZONE_MINUTE FROM s.a) FROM S3Object s",
+                "8",
+            ),
+            (
+                "SELECT EXTRACT(hour FROM TO_TIMESTAMP(s.a)) FROM S3Object s",
+                "3",
+            ),
+            (
+                "SELECT TO_STRING(`1969-07-20T20:18Z`, 'MMMM d, y h:m a') FROM S3Object",
+                "'July 20, 1969 8:18 PM'",
+            ),
+            ("SELECT TO_STRING(s.a, 'yyyy') FROM S3Object s", "'2017'"),
+            (
+                "SELECT TO_TIMESTAMP('2007-02-23T12:14:33.079-08:00') FROM S3Object",
+                "2007-02-23T12:14:33.079-08:00",
+            ),
+            (
+                "SELECT CAST('2007-04-05T14:30Z' AS TIMESTAMP) FROM S3Object",
+                "2007-04-05T14:30Z",
+            ),
+            ("SELECT CAST(`2007T` AS STRING) FROM S3Object", "'2007T'"),
+            ("SELECT s.a > `2017-01-01T` FROM S3Object s", "true"),
+            (
+                "SELECT `2017-01-02T03:04Z` = `2017-01-02T04:04+01:00` FROM S3Object",
+                "true",
+            ),
+            (
+                "SELECT s.a BETWEEN `2017T` AND `2018T` FROM S3Object s",
+                "true",
+            ),
+            ("SELECT DATE_ADD(day, 1, NULL) FROM S3Object", "NULL"),
+            ("SELECT EXTRACT(year FROM s.z) FROM S3Object s", "NULL"),
+        ];
+        for (sql, want) in cases {
+            assert_eq!(first(sql, &r).unwrap(), want, "{sql}");
+        }
+        assert!(
+            first("SELECT UTCNOW() FROM S3Object", &r)
+                .unwrap()
+                .ends_with('Z')
+        );
+        let code = |sql| first(sql, &r).unwrap_err().code;
+        assert_eq!(
+            code("SELECT CAST(s.b AS TIMESTAMP) FROM S3Object s"),
+            "CastFailed"
+        );
+        assert_eq!(
+            code("SELECT TO_TIMESTAMP(s.b) FROM S3Object s"),
+            "CastFailed"
+        );
+        assert_eq!(
+            code("SELECT EXTRACT(year FROM s.b) FROM S3Object s"),
+            "IncorrectSqlFunctionArgumentType"
+        );
+        assert_eq!(
+            code("SELECT DATE_ADD(day, 1.5, `2010T`) FROM S3Object"),
+            "IncorrectSqlFunctionArgumentType"
+        );
+        assert_eq!(
+            code("SELECT DATE_ADD(year, 10000, `2010T`) FROM S3Object"),
+            "EvaluatorInvalidArguments"
+        );
+        assert_eq!(
+            code("SELECT DATE_ADD(week, 1, `2010T`) FROM S3Object"),
+            "ParseExpectedDatePart"
+        );
+        assert_eq!(
+            code("SELECT DATE_DIFF(timezone_hour, `2010T`, `2011T`) FROM S3Object"),
+            "ParseExpectedDatePart"
+        );
+        assert_eq!(
+            code("SELECT `2010-13T` FROM S3Object"),
+            "LexerInvalidLiteral"
+        );
+        assert_eq!(
+            code("SELECT TO_STRING(`2010T`, 'Q') FROM S3Object"),
+            "EvaluatorInvalidTimestampFormatPatternSymbol"
+        );
     }
 
     #[test]
