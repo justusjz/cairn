@@ -1733,10 +1733,12 @@ tags), `S3DeleteObjectTagging`, `S3PutObjectRetention`,
 `S3PutObjectLegalHold` ([Object Lock](#object-lock)) and
 `S3ReplicateObject` ([Batch Replication](#batch-replication)). Its manifest is a
 CSV object of lines `bucket,key` (or `bucket,key,versionId`, as its
-`Fields` say), keys URL-encoded, or a CSV [inventory report](#inventory)'s
-`manifest.json` (`S3InventoryReport_CSV_20161130`, without `Fields`): its
-tasks are then the report's rows, so a job can do something to every
-object (or every version) a report lists. Other operations aren't done yet
+`Fields` say), keys URL-encoded, or an [inventory report](#inventory)'s
+`manifest.json` (`S3InventoryReport_CSV_20161130`, without `Fields`), of CSV
+or Parquet: its tasks are then the report's rows, so a job can do something
+to every object (or every version) a report lists. A Parquet report's files
+are read a row group at a time, and only their `bucket`, `key` and
+`version_id` columns. Other operations aren't done yet
 (see [S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#batch-operations)).
 A job can write a completion report, of all its tasks or only those that
 failed, as S3 writes it.

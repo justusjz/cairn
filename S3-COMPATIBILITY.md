@@ -198,8 +198,8 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | `S3PutObjectTagging`, `S3DeleteObjectTagging`, `S3PutObjectRetention`, `S3PutObjectLegalHold` | ✅ | |
 | `S3ReplicateObject` (Batch Replication) | 🟡 | A task succeeds once its version is queued. A task without a version ID replicates the current version. |
 | Other operations | ❌ | |
-| CSV manifests, CSV inventory reports | ✅ | |
-| Parquet and ORC inventory reports, manifest generators | ❌ | |
+| CSV manifests, CSV and Parquet inventory reports | ✅ | A Parquet report's row group may hold at most 64 MiB of buckets, keys and version IDs. |
+| ORC inventory reports, manifest generators | ❌ | |
 | Completion reports | 🟡 | One result file per thousand tasks; messages are Cairn's. |
 | Job statuses | 🟡 | Never `Completing`, `Failing`, `Pausing` or `Paused`. |
 | Errors | 🟡 | Codes are S3 Control's; HTTP statuses, messages and failure codes are Cairn's. |

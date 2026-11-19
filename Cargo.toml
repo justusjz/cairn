@@ -52,6 +52,10 @@ flate2 = { version = "1.1", default-features = false, features = ["rust_backend"
 # and their certificates, self-signed through ring.
 rsa = { version = "0.10", features = ["sha1", "pkcs1v15"] }
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+# Parquet inventory reports (see `inventory::parquet`), and reading them as
+# Batch Operations manifests (`batch::parquet`): its low-level API, without
+# Arrow; Snappy, as S3 writes them, and gzip, which other writers use.
+parquet = { version = "60.1.0", default-features = false, features = ["snap", "flate2-rust_backend"] }
 
 [dev-dependencies]
 # The mock OIDC issuer's HTTPS (`oidc::mock`); hyper-rustls's already.

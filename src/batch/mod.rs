@@ -13,9 +13,9 @@
 //!   on (below): a retention set again is set to the same date, which isn't
 //!   shortening it, and a version is queued once. Others are refused with
 //!   501 NotImplemented.
-//! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`), and CSV
-//!   inventory reports (`S3InventoryReport_CSV_20161130`; see `source`);
-//!   not manifests S3 generates.
+//! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`), and
+//!   inventory reports (`S3InventoryReport_CSV_20161130`) of CSV or Parquet
+//!   (see `source`); not manifests S3 generates.
 //! - Completion reports: as S3 writes them, of all tasks or only those that
 //!   failed (see `report`).
 //!
@@ -57,6 +57,7 @@
 
 pub mod control;
 pub mod manifest;
+mod parquet;
 pub mod report;
 pub mod source;
 
@@ -86,7 +87,7 @@ use crate::{
 
 use manifest::{Field, Task};
 use report::{Line, TaskFailure, Writer};
-use source::{DataLines, Inventory, Position, Source};
+use source::{DataRows, Inventory, Position, Source};
 
 /// The service a job's role is assumed as.
 pub const SERVICE: &str = "batchoperations.s3.amazonaws.com";
@@ -432,34 +433,36 @@ async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, tu
                 },
             };
             // Whole data files, as far as `PREPARE_BYTES` goes.
-            let fields = inventory.fields();
             let mut file = job.prepared.file as usize;
             let mut read = 0;
             while file < inventory.files.len() && read < PREPARE_BYTES {
-                let data = &inventory.files[file];
-                let mut lines = match DataLines::open(app, data, &principal).await? {
-                    Ok(lines) => lines,
+                let key = inventory.files[file].key.clone();
+                let mut rows = match DataRows::open(app, &inventory, file, &principal).await? {
+                    Ok(rows) => rows,
                     Err(failure) => return fail(client, job, failure, now, turn).await,
                 };
                 loop {
-                    let line = match lines.line().await? {
-                        Ok(Some(line)) => line,
-                        Ok(None) => break,
+                    let entries = match rows.entries(PAGE).await? {
+                        Ok(entries) if entries.is_empty() => break,
+                        Ok(entries) => entries,
                         Err(failure) => return fail(client, job, failure, now, turn).await,
                     };
-                    if let Err(why) = check_line(&line, &fields) {
-                        let why = format!("Line {} of the data file {} isn't a task: {why}.", total + 1, data.key);
-                        return fail(client, job, Failure::new("ManifestInvalid", why), now, turn).await;
+                    for entry in entries {
+                        if let Err(bad) = entry {
+                            let why = format!("{} {} of the data file {key} isn't a task: {}.", rows.entry_name(), total + 1, bad.why);
+                            return fail(client, job, Failure::new("ManifestInvalid", why), now, turn).await;
+                        }
+                        total += 1;
+                        turn.prepared += 1;
                     }
-                    total += 1;
-                    turn.prepared += 1;
                 }
-                if lines.md5() != data.md5 {
-                    let why = format!("The data file {} isn't the one the inventory report lists (its MD5 differs).", data.key);
+                let (md5, size, etag) = rows.digest();
+                if md5 != inventory.files[file].md5 {
+                    let why = format!("The data file {key} isn't the one the inventory report lists (its MD5 differs).");
                     return fail(client, job, Failure::new("ManifestInvalid", why), now, turn).await;
                 }
-                read += lines.size;
-                inventory.files[file].etag = Some(lines.etag.clone());
+                read += size;
+                inventory.files[file].etag = Some(etag);
                 file += 1;
             }
             let done = file == inventory.files.len();
@@ -563,10 +566,10 @@ async fn run(
         }
         Operation::DeleteTagging | Operation::Replicate => {}
     }
-    let (mut source, fields) = match (&job.inventory, job.manifest.format.as_str()) {
-        (Some(inventory), _) => (Source::Inventory(inventory, None), inventory.fields()),
+    let mut source = match (&job.inventory, job.manifest.format.as_str()) {
+        (Some(inventory), _) => Source::Inventory(inventory, None),
         (None, manifest::INVENTORY) => anyhow::bail!("job {} was prepared without its inventory report's files", job.id),
-        (None, _) => (Source::Csv(&job.manifest), job.manifest.fields()),
+        (None, _) => Source::Csv(&job.manifest),
     };
     let writer = Writer::of(&job.report, job.id);
     let who = principal.arn();
@@ -581,22 +584,20 @@ async fn run(
                 Ok(page) => page,
                 Err(failure) => return fail(client, job, failure, now, turn).await,
             };
-            let (lines, finished) = (page.lines, page.finished);
-            let mut done_lines = Vec::with_capacity(lines.len());
-            for line in &lines {
-                let parsed = std::str::from_utf8(line)
-                    .map_err(|_| "it isn't UTF-8".to_owned())
-                    .and_then(|line| manifest::parse_line(line, &fields));
-                // Preparing checked every line, and the manifest is pinned
+            let (entries, finished) = (page.entries, page.finished);
+            let count = entries.len();
+            let mut done_lines = Vec::with_capacity(count);
+            for entry in entries {
+                // Preparing checked every entry, and the manifest is pinned
                 // to its ETag: one that isn't a task fails all the same.
-                let (task, result) = match parsed {
+                let (task, result) = match entry {
                     Ok(task) => {
                         let result = run_task(app, &mut access, &who, &job.operation, &tags, &task).await?;
                         (task, result)
                     }
-                    Err(why) => {
-                        let task = Task { bucket: String::new(), key: String::from_utf8_lossy(line).into_owned(), version_id: None };
-                        (task, Err(TaskFailure::new(400, "InvalidManifestLine", why)))
+                    Err(bad) => {
+                        let task = Task { bucket: bad.bucket, key: bad.key, version_id: None };
+                        (task, Err(TaskFailure::new(400, "InvalidManifestLine", bad.why)))
                     }
                 };
                 match &result {
@@ -614,7 +615,7 @@ async fn run(
                 turn.tasks += 1;
                 done_lines.push(Line { task, result });
             }
-            *budget -= lines.len().max(1) as i64;
+            *budget -= count.max(1) as i64;
             let start = cursor;
             cursor = page.end;
             let files = match &writer {
