@@ -71,7 +71,7 @@ please report it.
 | Analytics, metrics, Intelligent-Tiering, Storage Lens | ❌ | |
 | [S3 Select](#s3-select): CSV and JSON, uncompressed or GZIP | 🟡 | |
 | S3 Select: Parquet, BZIP2, `ScanRange`, date and time functions | ❌ | `501 NotImplemented` (the functions: `400 UnsupportedFunction`). |
-| Torrents, requester pays | ❌ | |
+| Requester pays | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
 ## Encryption
