@@ -378,7 +378,7 @@ async fn sse_c_uploads() {
     let salts: Vec<Salt> = parts.iter().map(|(_, salt)| salt.as_slice().try_into().unwrap()).collect();
     // The object's key, which the client's opens.
     let sealed: Vec<u8> = app.pool.get().await.unwrap().query_one("SELECT sse_c_key FROM objects WHERE key = 'c'", &[]).await.unwrap().get(0);
-    let stored = sse::Stored::Customer { sealed };
+    let stored = sse::Stored::Customer { sealed, bucket: None };
     let object_key = sse::open(&app, &stored, Some(&customer), None, BUCKET, "c").await.unwrap().ok().unwrap().unwrap();
     for (i, (part, _)) in parts.iter().enumerate() {
         assert!(*part != l1[0].1 && *part != l2[0].1, "a part's checksum is stored in plaintext");

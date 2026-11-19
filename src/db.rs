@@ -3626,6 +3626,11 @@ CREATE TRIGGER restore_blobs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNC
 /// moving it ahead, and retries a failure later (`attempt`). A key's
 /// versions go to a destination in the order they were written.
 ///
+/// An SSE-C replica's sealed key and checksum are its source's, as they
+/// are (Cairn can't open them without the client's key), sealed for the
+/// source's name: `sse_c_bucket` is the source's bucket (NULL for any
+/// other version, whose are sealed for its own).
+///
 /// The queue has no foreign keys a write could wait on (rule B). The
 /// protocol goes to 10, so that no older node writes objects without
 /// queueing them.
@@ -3643,6 +3648,7 @@ $$;
 ALTER TABLE buckets ADD COLUMN replication text;
 ALTER TABLE objects ADD COLUMN replication_status text
     CHECK (replication_status IN ('PENDING', 'COMPLETED', 'FAILED', 'REPLICA'));
+ALTER TABLE objects ADD COLUMN sse_c_bucket text;
 
 CREATE TABLE replication_queue (
     seq          bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

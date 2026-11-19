@@ -5,7 +5,8 @@
 //!
 //! The key is never stored or logged. It doesn't encrypt the data itself: an
 //! object (and an upload) has a random object key, as an SSE-KMS one has (see
-//! `sse`), which it keeps sealed under the client's key, bound to its name. A
+//! `sse`), which it keeps sealed under the client's key, bound to its name
+//! (a replica's to its source's: see `replication`). A
 //! wrong key fails to open it, so it's told from the right one before
 //! anything is read; and two objects under one key don't show that they are.
 //! A copy shares its source's parts by sealing the same object key under its

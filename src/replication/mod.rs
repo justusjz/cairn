@@ -47,8 +47,15 @@
 //! As in S3: replicas aren't replicated again; nor are versions that were
 //! there before their rule, delete markers a lifecycle rule makes, deletes
 //! of versions (by version ID), or later changes to a version's tags or
-//! Object Lock. SSE-C objects aren't replicated at all: their keys are
-//! their clients'.
+//! Object Lock.
+//!
+//! An SSE-C version can't be opened without its client's key, so its
+//! replica keeps its sealed key and checksum as they are, sealed for the
+//! source's name, which the replica records (see
+//! `s3::objects::copy::replicate_sealed`): the client's key opens it as it
+//! opens its source. Its data can't be read either, so it can't be written
+//! again into another storage class: an SSE-C version whose rule names
+//! another class than its own fails.
 
 pub mod config;
 
@@ -237,10 +244,13 @@ struct Version {
     last_modified: String,
     etag: Option<String>,
     tags: String,
-    customer: bool,
+    /// For an SSE-C version, the bucket its sealed key is sealed for: its
+    /// own, unless it's a replica itself.
+    customer: Option<String>,
     s3: bool,
     kms: bool,
     lock: Lock,
+    storage_class: String,
 }
 
 /// Replicates the queued version `q` of `source`'s, as its rule says.
@@ -286,11 +296,11 @@ async fn replicate(app: &Arc<App>, source: &Source, q: &Queued) -> anyhow::Resul
     if let Some(denied) = authorize(app, principal, rule, q, &version).await? {
         return Ok(Outcome::Failed(denied));
     }
-    let etag = version.etag.clone().filter(|_| !(version.s3 || version.kms || version.customer));
+    let etag = version.etag.clone().filter(|_| !(version.s3 || version.kms || version.customer.is_some()));
     let last_modified = version.last_modified.clone();
     crate::notifications::scope(async {
         crate::notifications::set_requester(Some(principal.unique_id()), None);
-        crate::notifications::set_replica(&q.version_id, &last_modified, etag.as_deref());
+        crate::notifications::set_replica(&q.version_id, &last_modified, etag.as_deref(), version.customer.as_deref());
         match version.marker {
             true => replicate_marker(app, q).await,
             false => replicate_object(app, principal, rule, q, &version).await,
@@ -307,9 +317,9 @@ async fn read_version(app: &App, q: &Queued) -> anyhow::Result<Option<Version>> 
         .await?
         .query_opt_cached(
             "SELECT is_delete_marker, to_char(last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"'),
-                    etag, tags, sse_c_key IS NOT NULL, coalesce(sse_s3, false),
+                    etag, tags, CASE WHEN sse_c_key IS NOT NULL THEN coalesce(sse_c_bucket, bucket) END, coalesce(sse_s3, false),
                     sse_kms_key_id IS NOT NULL AND NOT coalesce(sse_s3, false),
-                    retain_mode, retain_until, legal_hold
+                    retain_mode, retain_until, legal_hold, storage_class
              FROM objects WHERE bucket = $1 AND key = $2 AND version_id = $3",
             &[&q.bucket, &q.key, &q.version_id],
         )
@@ -328,6 +338,7 @@ async fn read_version(app: &App, q: &Queued) -> anyhow::Result<Option<Version>> 
         s3: row.get(5),
         kms: row.get(6),
         lock: Lock { retention, legal_hold: row.get::<_, Option<bool>>(9).filter(|hold| *hold) },
+        storage_class: row.get::<_, Option<String>>(10).unwrap_or_default(),
     }))
 }
 
@@ -357,9 +368,6 @@ async fn authorize(app: &App, principal: &Principal, rule: &Rule, q: &Queued, ve
 /// Replicates an object's version: a copy of it, of the version ID it has
 /// (see `notifications::set_replica`, which the task has set).
 async fn replicate_object(app: &Arc<App>, principal: &Principal, rule: &Rule, q: &Queued, version: &Version) -> anyhow::Result<Outcome> {
-    if version.customer {
-        return Ok(Outcome::Failed("SSE-C objects aren't replicated".to_owned()));
-    }
     let storage_class = match &rule.destination.storage_class {
         None => None,
         Some(name) => match crate::classes::resolve(app, Some(name)).await? {
@@ -367,6 +375,19 @@ async fn replicate_object(app: &Arc<App>, principal: &Principal, rule: &Rule, q:
             Err(name) => return Ok(Outcome::Failed(format!("there's no storage class {name}"))),
         },
     };
+    if version.customer.is_some() {
+        if storage_class.as_ref().is_some_and(|class| *class != version.storage_class) {
+            return Ok(Outcome::Failed(
+                "an SSE-C version can't be replicated into another storage class: its data can't be read without its \
+                 client's key"
+                    .to_owned(),
+            ));
+        }
+        let response =
+            crate::s3::objects::copy::replicate_sealed(app, &q.bucket, &q.key, &q.version_id, &q.destination, version.lock)
+                .await?;
+        return outcome_of(response).await;
+    }
     let kms;
     let dest = if version.kms {
         let Some(key_id) = rule.destination.kms_key.as_deref().and_then(crate::kms::KeyId::parse) else {
@@ -391,6 +412,11 @@ async fn replicate_object(app: &Arc<App>, principal: &Principal, rule: &Rule, q:
     let copy_source = format!("{}/{}?versionId={}", encode(&q.bucket), encode(&q.key), encode(&q.version_id));
     let response =
         copy_object(app, &q.destination, &q.key, &copy_source, None, "", "", None, &Preconditions::default(), keys).await?;
+    outcome_of(response).await
+}
+
+/// What a replica's write answered comes to.
+async fn outcome_of(response: hyper::Response<http_body_util::Full<hyper::body::Bytes>>) -> anyhow::Result<Outcome> {
     if response.status() == StatusCode::OK {
         return Ok(Outcome::Done);
     }

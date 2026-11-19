@@ -3643,7 +3643,7 @@ mod e2e {
     fn tells_how_a_version_is_encrypted() {
         use crate::s3::sse::{Envelope, Stored};
         assert!(EncryptionInfo::of(Stored::Plain).is_none());
-        let sse_c = EncryptionInfo::of(Stored::Customer { sealed: vec![0; 72] }).unwrap();
+        let sse_c = EncryptionInfo::of(Stored::Customer { sealed: vec![0; 72], bucket: None }).unwrap();
         assert_eq!((sse_c.kind.as_str(), sse_c.kms_key_id), ("SSE-C", None));
         let kms = EncryptionInfo::of(Stored::Kms(Envelope {
             key_id: "cairn-a".to_owned(),

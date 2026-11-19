@@ -669,10 +669,13 @@ Object Lock. `x-amz-replication-status` is `PENDING`, `COMPLETED` or
   replicas, delete markers made by lifecycle rules, deletes of a version
   by ID, and SSE-KMS objects unless their rule replicates them
   (`SseKmsEncryptedObjects`, under its `ReplicaKmsKeyID`).
-- **Not replicated, unlike S3:** SSE-C objects, because Cairn can't
-  re-encrypt them without the client's key; and later changes to a
-  version's tags, retention or legal hold. `ReplicaModifications` is kept
-  and returned, but has no effect.
+- **SSE-C objects** are replicated as they're stored, since Cairn
+  doesn't have the client's key, and open with the same key. For that
+  reason they can't be written into another storage class: an SSE-C
+  version whose rule names a different `StorageClass` fails.
+- **Not replicated, unlike S3:** later changes to a version's tags,
+  retention or legal hold. `ReplicaModifications` is kept and returned,
+  but has no effect.
 - **Refused:** `ExistingObjectReplication`, `ReplicationTime` and
   `Metrics` (`501 NotImplemented`). There's no Batch Replication.
 - **Ownership:** replicas are always owned by the destination bucket's

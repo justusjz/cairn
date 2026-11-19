@@ -411,7 +411,7 @@ pub async fn copy_object(
         };
         // Its checksum, under the key it shares with its source, if it's
         // encrypted.
-        let source_owner = Owner::Object { bucket: &src_bucket, key: &src_key };
+        let source_owner = Owner::Object { bucket: encryption.sealed_bucket(&src_bucket), key: &src_key };
         let owners = (source_owner, dest_owner);
         let copied = match copy_checksum(app, &source, checksum_algorithm, source_key.as_deref(), owners).await {
             Ok(copied) => copied,
@@ -435,7 +435,7 @@ pub async fn copy_object(
             storage_class,
         };
         let (version_id, last_modified) =
-            match commit_object_copy(app, &source, &dest, &stored_etag, &etag, &stored, &copied, expected).await? {
+            match commit_object_copy(app, &source, &dest, &stored_etag, &etag, &stored, Some(&copied), expected).await? {
                 ObjectCopy::Committed { version_id, last_modified } => (version_id, last_modified),
                 ObjectCopy::SourceChanged => continue, // copy what it is now
                 ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
@@ -445,6 +445,72 @@ pub async fn copy_object(
         return Ok(expiration::onto(resp, expiration));
     }
     Err(Contended("the copy source kept changing".to_owned()).into())
+}
+
+/// A replica of an SSE-C version (see `replication`), at the same key in
+/// `dest_bucket`, as CopyObject's commit makes a copy that shares its
+/// source's parts. Without the client's key, its object key can't be
+/// sealed again for the replica, so the replica keeps the version's
+/// encryption, ETag and checksum as they're stored, sealed for the source's
+/// name, which the replica records (`sse_c_bucket`, from the task's replica
+/// context: see `notifications::set_replica`, which the caller has set, and
+/// `Stored::sealed_bucket`). The client's key opens it as it opens its
+/// source. Its metadata, tags and storage class are the version's, and its
+/// Object Lock `lock`. CopyObject's answer, or why not.
+pub(crate) async fn replicate_sealed(
+    app: &Arc<App>,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    dest_bucket: &str,
+    lock: crate::s3::object_lock::Lock,
+) -> anyhow::Result<Response<Full<Bytes>>> {
+    if let Some(refused) = crate::s3::object_lock::check_write(app, dest_bucket, &lock).await? {
+        return Ok(refused);
+    }
+    for _ in 0..MAX_SOURCE_ATTEMPTS {
+        let source = match read_source(app, bucket, key, Some(version_id)).await? {
+            Ok(source) => source,
+            Err(missing) => return Ok(missing),
+        };
+        let version = &source.version;
+        anyhow::ensure!(
+            matches!(version.encryption, Stored::Customer { .. }),
+            "version {version_id} of {bucket}/{key} isn't SSE-C"
+        );
+        let client = app.pool.get().await?;
+        if reads_lost(&client, &source.locations, 0, version.size as u64).await? {
+            return Ok(lost_data());
+        }
+        drop(client);
+        // Its checksum as it's stored: its value is sealed, and only its
+        // stored form is written.
+        let copied = version.checksum.as_ref().map(|checksum| Copied {
+            checksum: Checksum { algorithm: checksum.algorithm, kind: checksum.kind, value: String::new() },
+            stored: checksum.stored.clone(),
+            part_checksums: true,
+        });
+        let dest = Dest {
+            bucket: dest_bucket,
+            key,
+            content_type: &version.content_type,
+            metadata: &version.metadata,
+            tags: &version.tags,
+            checksum: copied.as_ref().map_or(Algorithm::Crc64Nvme, |c| c.checksum.algorithm),
+            lock,
+            conditions: &NO_CONDITIONS,
+            storage_class: &version.storage_class,
+        };
+        let etag = &version.etag;
+        match commit_object_copy(app, &source, &dest, etag, etag, &version.encryption, copied.as_ref(), None).await? {
+            ObjectCopy::Committed { .. } => {
+                return Ok(Response::builder().status(StatusCode::OK).body(Full::new(Bytes::new())).unwrap());
+            }
+            ObjectCopy::SourceChanged => continue,
+            ObjectCopy::NoSuchBucket => return Ok(no_such_bucket()),
+        }
+    }
+    Err(Contended("the replica's source kept changing".to_owned()).into())
 }
 
 /// Decides a copy's `conditions` on its destination (If-Match,
@@ -634,7 +700,7 @@ async fn commit_object_copy(
     etag: &str,
     plain_etag: &str,
     stored: &Stored,
-    copied: &Copied,
+    copied: Option<&Copied>,
     expected: Option<Option<i64>>,
 ) -> anyhow::Result<ObjectCopy> {
     let (part_ids, part_sizes) = source.part_keys();
@@ -666,11 +732,11 @@ async fn commit_object_copy(
                         &sse.kms_sealed,
                         &sse.kms_context,
                         &sse.sse_s3,
-                        &copied.checksum.algorithm.name(),
-                        &copied.checksum.kind.name(),
-                        &copied.stored,
+                        &copied.map(|c| c.checksum.algorithm.name()),
+                        &copied.map(|c| c.checksum.kind.name()),
+                        &copied.map(|c| c.stored.as_str()),
                         &dest.tags,
-                        &copied.part_checksums,
+                        &copied.is_some_and(|c| c.part_checksums),
                         &new_version_id(),
                         &lock_mode,
                         &lock_until,

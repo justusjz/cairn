@@ -1815,9 +1815,10 @@ Replicas aren't replicated again, so two buckets can replicate to each
 other. Like S3, Cairn doesn't replicate versions written before a rule
 existed, deletes of a version by its ID, or delete markers made by
 lifecycle rules. SSE-KMS objects are replicated only if their rule asks for
-it (`SseKmsEncryptedObjects`), sealed under its `ReplicaKmsKeyID`. Unlike
-S3, Cairn never replicates SSE-C objects, or later changes to a version's
-tags or Object Lock (see
+it (`SseKmsEncryptedObjects`), sealed under its `ReplicaKmsKeyID`. SSE-C
+objects are replicated as they're stored, and open with the same customer
+key. Unlike S3, Cairn doesn't replicate later changes to a version's tags
+or Object Lock (see
 [S3-COMPATIBILITY.md](S3-COMPATIBILITY.md#replication)). Replication to
 other clusters isn't done yet.
 

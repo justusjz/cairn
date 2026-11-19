@@ -489,3 +489,71 @@ async fn replicas_are_stored_in_their_rules_class() {
         .unwrap();
     assert_eq!(read.into_body().collect().await.unwrap().to_bytes().to_vec(), data);
 }
+
+/// An SSE-C version is replicated without its client's key: the replica
+/// keeps its sealed key and checksum, sealed for the source's name, and
+/// shares its bytes, and the client's key opens it as it opens the source
+/// (its checksum too), and a copy of it.
+#[tokio::test]
+async fn sse_c_versions_are_replicated_without_their_key() {
+    use crate::s3::objects::{
+        copy::{CopyKeys, copy_object},
+        get::get_object,
+    };
+    let Some(app) = node().await else { return };
+    configure(&app, &rule("all", "", false)).await;
+    let customer = crate::e2e::customer_key(&[7; 32]);
+    let other = crate::e2e::customer_key(&[8; 32]);
+    let data = crate::shards::e2e::data(3, 200_000);
+    crate::e2e::put_sealed(&app, "secret", data.clone(), &customer).await;
+    replicate(&app).await;
+    let (source, replica) = (versions(&app, BUCKET, "secret").await.remove(0), versions(&app, BACKUP, "secret").await.remove(0));
+    assert_eq!(source.status.as_deref(), Some("COMPLETED"));
+    assert_eq!(replica.status.as_deref(), Some("REPLICA"));
+    assert_eq!((&replica.version_id, &replica.etag, &replica.parts), (&source.version_id, &source.etag, &source.parts));
+    let row = app.pool.get().await.unwrap()
+        .query_one("SELECT sse_c_bucket FROM objects WHERE bucket = $1 AND key = 'secret'", &[&BACKUP])
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, Option<String>>(0).as_deref(), Some(BUCKET));
+
+    let read = |key: Option<&'static crate::s3::sse_c::CustomerKey>, checksums: bool| {
+        let app = app.clone();
+        async move {
+            let response =
+                get_object(&app, BACKUP, "secret", None, None, None, &Preconditions::default(), key, None, checksums).await.unwrap();
+            let status = response.status();
+            let checksum = response.headers().get("x-amz-checksum-crc64nvme").map(|v| v.to_str().unwrap().to_owned());
+            (status, checksum, response.into_body().collect().await.unwrap().to_bytes().to_vec())
+        }
+    };
+    let customer: &'static _ = Box::leak(Box::new(customer));
+    let other: &'static _ = Box::leak(Box::new(other));
+    let (status, checksum, body) = read(Some(customer), true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, data);
+    let source_checksum = get_object(&app, BUCKET, "secret", None, None, None, &Preconditions::default(), Some(customer), None, true)
+        .await
+        .unwrap()
+        .headers()
+        .get("x-amz-checksum-crc64nvme")
+        .map(|v| v.to_str().unwrap().to_owned());
+    assert!(checksum.is_some());
+    assert_eq!(checksum, source_checksum);
+    // Refused without its key, or with another, as its source is.
+    for key in [None, Some(other)] {
+        let source = get_object(&app, BUCKET, "secret", None, None, None, &Preconditions::default(), key, None, false).await.unwrap();
+        assert_ne!(source.status(), StatusCode::OK);
+        assert_eq!(read(key, false).await.0, source.status());
+    }
+
+    // A copy of the replica, under another key, is sealed for its own name.
+    let keys = CopyKeys { source: Some(customer), dest: crate::s3::sse::Wanted::Customer(other), ..CopyKeys::default() };
+    let copied = copy_object(&app, BACKUP, "copy", &format!("/{BACKUP}/secret"), None, "", "", None, &Preconditions::default(), keys)
+        .await
+        .unwrap();
+    assert_eq!(copied.status(), StatusCode::OK);
+    let response = get_object(&app, BACKUP, "copy", None, None, None, &Preconditions::default(), Some(other), None, false).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.into_body().collect().await.unwrap().to_bytes().to_vec(), data);
+}

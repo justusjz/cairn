@@ -701,7 +701,8 @@ $$;
 -- What the transaction's write is a replica of, if it's one (see
 -- `replication`): its `cairn.notify` says so (`replica`), with the
 -- source's version ID, last-modified time, and (for a plain source) ETag,
--- which the replica keeps. NULL for any other write.
+-- which the replica keeps, and, for an SSE-C source, the bucket its sealed
+-- key is sealed for (`sse_c_bucket`). NULL for any other write.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_replica() RETURNS jsonb LANGUAGE plpgsql AS $$
 BEGIN
     IF coalesce(current_setting('cairn.notify', true), '') = '' THEN
@@ -717,9 +718,8 @@ $$;
 -- of the enabled rules whose filter it matches (a prefix of the key, tags
 -- it has, in their stored form: see `s3::tags`), the one of highest
 -- priority (then the first) for each destination. A delete marker goes
--- only where that rule replicates delete markers, an SSE-KMS object
--- (`p_encryption` 'kms') only where it replicates those, and an SSE-C one
--- ('customer') nowhere: its key is the client's. A queued object is
+-- only where that rule replicates delete markers, and an SSE-KMS object
+-- (`p_encryption` 'kms') only where it replicates those. A queued object is
 -- PENDING. Replicas aren't replicated again, nor are a lifecycle's
 -- delete markers (as in S3), nor a null version, which only a bucket that
 -- isn't versioned has (I15).
@@ -766,7 +766,6 @@ BEGIN
     INSERT INTO replication_queue (bucket, key, version_id, marker, destination, rule_id)
     SELECT p_bucket, p_key, p_version_id, p_marker, c.destination, c.id FROM chosen c
     WHERE CASE WHEN p_marker THEN c.markers
-               WHEN p_encryption = 'customer' THEN false
                WHEN p_encryption = 'kms' THEN c.kms
                ELSE true END;
     GET DIAGNOSTICS v_queued = ROW_COUNT;
@@ -821,13 +820,15 @@ BEGIN
                          size, etag, content_type, metadata, sse_c_key, sse_kms_key_id,
                          sse_kms_data_key, sse_kms_sealed, sse_kms_context, sse_s3,
                          checksum_algorithm, checksum_type, checksum, tags, last_modified,
-                         retain_mode, retain_until, legal_hold, storage_class, replication_status)
+                         retain_mode, retain_until, legal_hold, storage_class, replication_status,
+                         sse_c_bucket)
     VALUES (p_bucket, p_key, v_version_id, true, false, p_size,
             coalesce(v_replica ->> 'etag', p_etag), p_content_type,
             p_metadata, p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed,
             p_kms_context, p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags,
             coalesce((v_replica ->> 'last_modified')::timestamptz, NOW()), v_mode, v_until,
-            p_legal_hold, p_storage_class, CASE WHEN v_replica IS NOT NULL THEN 'REPLICA' END)
+            p_legal_hold, p_storage_class, CASE WHEN v_replica IS NOT NULL THEN 'REPLICA' END,
+            CASE WHEN p_sse_c_key IS NOT NULL THEN v_replica ->> 'sse_c_bucket' END)
     RETURNING objects.id INTO id;
     -- A write's version ID is reported only where it's a new one: S3 reports
     -- none for the null version (unversioned or suspended).

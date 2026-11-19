@@ -145,7 +145,7 @@ pub async fn get_object_attributes(
     if asked.wants("Checksum")
         && let Some(checksum) = &checksum
     {
-        let value = checksum.read(storing, bucket, key)?.value;
+        let value = checksum.read(storing, encryption.sealed_bucket(bucket), key)?.value;
         // A composite one is told without its part count.
         let value = match checksum.kind {
             Type::Composite => value.rsplit_once('-').map_or(value.clone(), |(value, _)| value.to_owned()),
