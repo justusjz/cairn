@@ -236,6 +236,18 @@ async fn handle_request(
     if let Some(rejection) = signed.as_ref().filter(|_| !express).and_then(crate::auth::wrong_service) {
         return Ok(box_response(util::rejection_response(&rejection)));
     }
+    // A directory bucket takes SigV4 only, as S3 Express does: SigV2 is
+    // refused before its signature is looked at, as S3 refuses it where it
+    // doesn't take it (probed in a SigV4-only region; S3 Express not
+    // probed). It doesn't sign `session` either: a SigV2 listing's URL
+    // would make a CreateSession with it appended.
+    if signed.as_ref().is_some_and(|s| s.sigv2) && directory::is_directory(&bucket_of(&route.path)) {
+        return Ok(box_response(format_s3_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "The authorization mechanism you have provided is not supported. Please use AWS4-HMAC-SHA256.",
+        )));
+    }
     let mut principal = match &signed {
         Some(signed) => {
             let client = app.pool.get().await?;

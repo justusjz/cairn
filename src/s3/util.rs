@@ -278,7 +278,7 @@ pub const MAX_OBJECT: u64 = 5 << 40;
 /// plain operation: that would overwrite the object with the request's XML, or
 /// delete it, or a bucket. Other parameters are ignored, as S3 ignores them
 /// (SDKs add some, like `x-id`).
-const SUBRESOURCES: &[&str] = &[
+pub(crate) const SUBRESOURCES: &[&str] = &[
     "abac",
     "accelerate",
     "acl",

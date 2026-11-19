@@ -1338,6 +1338,21 @@ directory_buckets_ok() {
     # A session of its own, read-only.
     awss3 s3api create-session --bucket "$dir" --session-mode ReadOnly --query Credentials.AccessKeyId \
         --output text 2>/dev/null | grep -q '^ASIA' || return 1
+    # SigV4 only: a SigV2 request (here a CreateSession, signed rightly) is
+    # refused before its signature is looked at.
+    local v2
+    v2=$(python3 - "$ACCESS_KEY" "$SECRET_KEY" "$dir" <<'PYEOF'
+import base64, email.utils, hashlib, hmac, sys
+key, secret, bucket = sys.argv[1:]
+date = email.utils.formatdate(usegmt=True)
+sts = f"GET\n\n\n{date}\n/{bucket}/?session"
+sig = base64.b64encode(hmac.new(secret.encode(), sts.encode(), hashlib.sha1).digest()).decode()
+print(f"Date: {date}\nAuthorization: AWS {key}:{sig}")
+PYEOF
+    ) || return 1
+    curl -s -o "$out" -w '%{http_code}' -H "$(sed -n 1p <<<"$v2")" -H "$(sed -n 2p <<<"$v2")" \
+        "http://${SERVER_HOST}:${SERVER_PORT}/${dir}/?session" | grep -q '^400$' || return 1
+    grep -q '<Code>InvalidRequest</Code>' "$out" || return 1
     awss3 s3api delete-object --bucket "$dir" --key a/b.txt >/dev/null 2>&1 || return 1
     awss3 s3api delete-bucket --bucket "$dir" >/dev/null 2>&1 || return 1
 }

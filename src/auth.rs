@@ -926,26 +926,48 @@ fn check_signature(
 type HmacSha1 = Hmac<sha1::Sha1>;
 
 /// The query parameters a SigV2 signature covers (as its resource's
-/// subresources), by name: S3's documented ones, botocore's and MinIO's.
-/// Every other parameter is unsigned.
+/// subresources), by name: the ones S3 signs. Every other parameter is
+/// unsigned.
+///
+/// AWS documents only the first few (acl through website, delete, the
+/// `response-*` overrides); S3 signs every subresource it routes on,
+/// newer ones too (`object-lock`, botocore#2468; the rest measured against
+/// S3 in amwolff/awsig#25: each appended unsigned to a presigned URL is a
+/// SignatureDoesNotMatch). Not botocore's `storageClass` and
+/// `defaultObjectAcl` (Google Cloud Storage's), which S3 doesn't sign. Every
+/// subresource Cairn routes on must be here, or a holder of a SigV2-signed
+/// URL could append it and change what the request does; but a directory
+/// bucket's (`session`, `renameObject`), which take no SigV2 at all (see
+/// `s3::handle`). `sigv2_signs_every_routed_subresource` holds it to that.
 const SIGV2_SUBRESOURCES: &[&str] = &[
+    "abac",
     "accelerate",
     "acl",
     "analytics",
+    "annotation",
+    "attributes",
     "cors",
-    "defaultObjectAcl",
     "delete",
     "encryption",
+    "intelligent-tiering",
     "inventory",
     "legal-hold",
     "lifecycle",
     "location",
     "logging",
+    "metadataAnnotationTable",
+    "metadataConfiguration",
+    "metadataInventoryTable",
+    "metadataJournalTable",
+    "metadataTable",
     "metrics",
     "notification",
     "object-lock",
+    "ownershipControls",
     "partNumber",
     "policy",
+    "policyStatus",
+    "publicAccessBlock",
     "replication",
     "requestPayment",
     "response-cache-control",
@@ -958,7 +980,6 @@ const SIGV2_SUBRESOURCES: &[&str] = &[
     "retention",
     "select",
     "select-type",
-    "storageClass",
     "tagging",
     "torrent",
     "uploadId",
@@ -1811,6 +1832,19 @@ pub(crate) mod tests {
         // routed by it: signed, not left out.
         assert_eq!(sigv2_resource("/b/k", "tagg%69ng"), "/b/k?tagging");
         assert_eq!(sigv2_resource("/b/k", "%61cl&x%2Did=GetObject"), "/b/k?acl");
+    }
+
+    /// Every subresource requests are routed by is signed, but a directory
+    /// bucket's, which SigV2 can't reach: else one appended to a SigV2 URL
+    /// would change what it does, unsigned (a listing's into CreateSession,
+    /// say).
+    #[test]
+    fn sigv2_signs_every_routed_subresource() {
+        for name in crate::s3::util::SUBRESOURCES {
+            if !["session", "renameObject"].contains(name) {
+                assert!(SIGV2_SUBRESOURCES.contains(name), "SigV2 doesn't sign {name}");
+            }
+        }
     }
 
     /// botocore's presigned SigV2 URL, with temporary credentials: their
