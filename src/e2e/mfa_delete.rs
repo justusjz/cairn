@@ -187,7 +187,7 @@ async fn mfa_delete_wants_the_roots_code() {
     }
     assert_eq!(versioning(&app, "<MfaDelete>Enabled</MfaDelete>", Presented::Valid).await.0, StatusCode::BAD_REQUEST);
     // Not on a bucket with a lifecycle configuration, which it can't have.
-    assert_eq!(put_bucket_lifecycle(&app, BUCKET, Bytes::from(LIFECYCLE)).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(put_bucket_lifecycle(&app, BUCKET, Bytes::from(LIFECYCLE), None).await.unwrap().status(), StatusCode::OK);
     let (status, body) = versioning(&app, enable, Presented::Valid).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body.contains("<Code>InvalidBucketState</Code>"), "{body}");
@@ -195,7 +195,7 @@ async fn mfa_delete_wants_the_roots_code() {
     assert_eq!(versioning(&app, enable, Presented::Valid).await.0, StatusCode::OK);
     let (_, got) = text(get_bucket_versioning(&app, BUCKET).await.unwrap()).await;
     assert!(got.ends_with("<Status>Enabled</Status><MfaDelete>Enabled</MfaDelete></VersioningConfiguration>"), "{got}");
-    let (status, body) = text(put_bucket_lifecycle(&app, BUCKET, Bytes::from(LIFECYCLE)).await.unwrap()).await;
+    let (status, body) = text(put_bucket_lifecycle(&app, BUCKET, Bytes::from(LIFECYCLE), None).await.unwrap()).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body.contains("<Code>InvalidBucketState</Code>"), "{body}");
 
@@ -246,5 +246,5 @@ async fn mfa_delete_wants_the_roots_code() {
     // without it.
     assert_eq!(delete(Some(second.clone()), Presented::Absent).await.0, StatusCode::NO_CONTENT);
     assert!(versions(&app, "k").await.is_empty());
-    assert_eq!(put_bucket_lifecycle(&app, BUCKET, Bytes::from(LIFECYCLE)).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(put_bucket_lifecycle(&app, BUCKET, Bytes::from(LIFECYCLE), None).await.unwrap().status(), StatusCode::OK);
 }

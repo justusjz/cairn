@@ -281,6 +281,12 @@ struct ClassUsage {
     /// Its blobs in tiers, and their bytes.
     remote_blobs: i64,
     remote_bytes: i64,
+    /// Its place in the classes' order, the warmest highest (see
+    /// `classes`), if it has one.
+    rank: Option<i64>,
+    /// The bytes of its blobs that belong in lower classes, since lifecycle
+    /// transitions: the packer moves them as it rewrites the blobs.
+    lower_bytes: i64,
 }
 
 /// How much of the data the scrubber has checked (see `scrub`).
@@ -558,7 +564,8 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
                     count(b.blob_id) FILTER (WHERE b.state = 'committed' AND b.pool <> c.pool),
                     coalesce(sum(b.size) FILTER (WHERE b.state = 'committed' AND b.pool <> c.pool), 0)::bigint,
                     count(b.blob_id) FILTER (WHERE b.state = 'remote'),
-                    coalesce(sum(b.size) FILTER (WHERE b.state = 'remote'), 0)::bigint
+                    coalesce(sum(b.size) FILTER (WHERE b.state = 'remote'), 0)::bigint,
+                    coalesce(sum(b.misplaced_size), 0)::bigint
              FROM unnest($1::text[], $2::text[]) AS c(name, pool)
              LEFT JOIN blobs b ON b.storage_class = c.name AND b.state IN ('committed', 'remote')
              GROUP BY c.name, c.pool ORDER BY c.name",
@@ -585,6 +592,8 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             misplaced_bytes: r.get(6),
             remote_blobs: r.get(7),
             remote_bytes: r.get(8),
+            lower_bytes: r.get(9),
+            rank: class.rank.map(i64::from),
             tier: class.tier,
             pool: class.pool,
             name,
@@ -4077,6 +4086,7 @@ struct SweepProgress {
     expired: i64,
     removed: i64,
     aborted: i64,
+    transitioned: i64,
 }
 
 /// How lifecycle sweeps are going: the rate, how long a round takes at it,
@@ -4102,7 +4112,7 @@ async fn get_lifecycle(State(app): AppState, Extension(actor): Extension<Actor>)
         .query_cached(
             "SELECT b.name, b.lifecycle, extract(epoch FROM s.due)::float8,
                     extract(epoch FROM s.started)::float8, s.cursor, s.seen,
-                    s.expired, s.removed, s.aborted, s.last
+                    s.expired, s.removed, s.aborted, s.last, s.transitioned
              FROM buckets b JOIN lifecycle_sweeps s ON s.bucket = b.name
              WHERE b.lifecycle IS NOT NULL ORDER BY b.name",
             &[],
@@ -4127,6 +4137,7 @@ async fn get_lifecycle(State(app): AppState, Extension(actor): Extension<Actor>)
             expired: row.get(6),
             removed: row.get(7),
             aborted: row.get(8),
+            transitioned: row.get(10),
         });
         let read_now = sweep.as_ref().map_or(0, |s| s.read);
         match &last {
@@ -4339,6 +4350,7 @@ async fn put_bucket_lifecycle(
 ) -> Result<StatusCode> {
     actor.check(&app, "s3:PutLifecycleConfiguration", On::Bucket(bucket.clone())).await?;
     let configuration = body.check().map_err(ApiError::BadRequest)?;
+    crate::s3::buckets::lifecycle::check_classes(&app, &configuration).await?.map_err(ApiError::BadRequest)?;
     use crate::s3::buckets::lifecycle::Set;
     match crate::s3::buckets::lifecycle::set(&app, &bucket, Some(&configuration.to_json())).await? {
         Set::Done => Ok(StatusCode::NO_CONTENT),

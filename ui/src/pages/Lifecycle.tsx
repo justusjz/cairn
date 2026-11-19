@@ -4,7 +4,7 @@
 
 import { A, useParams } from "@solidjs/router";
 import { For, Show, createEffect, createSignal, on } from "solid-js";
-import { type LifecycleRule, api } from "../api";
+import { type LifecycleConfiguration, type LifecycleRule, api } from "../api";
 import { Loading, Panel, act } from "../components/ui";
 import { bucketUrl } from "./Buckets";
 
@@ -30,7 +30,16 @@ type Draft = {
   keep: string;
   abort: boolean;
   abortDays: string;
+  /** Transitions of current versions into lower storage classes. */
+  transitions: TransitionDraft[];
+  /** Transitions of noncurrent versions. */
+  noncurrentTransitions: NoncurrentTransitionDraft[];
 };
+
+type TransitionDraft = { by: "days" | "date"; days: string; date: string; storageClass: string };
+type NoncurrentTransitionDraft = { days: string; keep: string; storageClass: string };
+
+const isoDate = (day: number) => new Date(day * DAY_MS).toISOString().slice(0, 10);
 
 const text = (n: number | null | undefined) => (n == null ? "" : String(n));
 
@@ -45,12 +54,23 @@ function fromRule(r: LifecycleRule): Draft {
     tags: (r.filter.tags ?? []).map((t) => ({ ...t })),
     current: e?.expired_object_delete_marker ? "markers" : e?.date != null ? "date" : e?.days != null ? "days" : "none",
     currentDays: text(e?.days),
-    currentDate: e?.date != null ? new Date(e.date * DAY_MS).toISOString().slice(0, 10) : "",
+    currentDate: e?.date != null ? isoDate(e.date) : "",
     noncurrent: r.noncurrent_expiration != null,
     noncurrentDays: text(r.noncurrent_expiration?.days),
     keep: text(r.noncurrent_expiration?.newer_versions),
     abort: r.abort_upload_days != null,
     abortDays: text(r.abort_upload_days),
+    transitions: (r.transitions ?? []).map((t) => ({
+      by: t.date != null ? "date" : "days",
+      days: text(t.days),
+      date: t.date != null ? isoDate(t.date) : "",
+      storageClass: t.storage_class,
+    })),
+    noncurrentTransitions: (r.noncurrent_transitions ?? []).map((t) => ({
+      days: text(t.days),
+      keep: text(t.newer_versions),
+      storageClass: t.storage_class,
+    })),
   };
 }
 
@@ -69,6 +89,8 @@ const blank = (): Draft => ({
   keep: "",
   abort: false,
   abortDays: "7",
+  transitions: [],
+  noncurrentTransitions: [],
 });
 
 /** The whole number typed in `field` of rule `n`, if any. */
@@ -85,14 +107,23 @@ function required(value: string, what: string, n: number): number {
   return v;
 }
 
+/** The day of a `YYYY-MM-DD` date typed in rule `n`. */
+function day(value: string, what: string, n: number): number {
+  const t = Date.parse(value + "T00:00:00Z");
+  if (isNaN(t)) throw new Error(`Rule ${n}: ${what} is missing.`);
+  return Math.round(t / DAY_MS);
+}
+
+function className(value: string, n: number): string {
+  const c = value.trim();
+  if (!c) throw new Error(`Rule ${n}: a transition's storage class is missing.`);
+  return c;
+}
+
 function toRule(d: Draft, n: number): LifecycleRule {
   let expiration: LifecycleRule["expiration"] = null;
   if (d.current === "days") expiration = { days: required(d.currentDays, "the days current versions are kept", n) };
-  if (d.current === "date") {
-    const t = Date.parse(d.currentDate + "T00:00:00Z");
-    if (isNaN(t)) throw new Error(`Rule ${n}: the date objects expire from is missing.`);
-    expiration = { date: Math.round(t / DAY_MS) };
-  }
+  if (d.current === "date") expiration = { date: day(d.currentDate, "the date objects expire from", n) };
   if (d.current === "markers") expiration = { expired_object_delete_marker: true };
   return {
     id: d.id.trim(),
@@ -108,6 +139,16 @@ function toRule(d: Draft, n: number): LifecycleRule {
       ? { days: required(d.noncurrentDays, "the days noncurrent versions are kept", n), newer_versions: number(d.keep, "the versions kept", n) }
       : null,
     abort_upload_days: d.abort ? required(d.abortDays, "the days uploads are kept", n) : null,
+    transitions: d.transitions.map((t) =>
+      t.by === "date"
+        ? { date: day(t.date, "the date of a transition", n), storage_class: className(t.storageClass, n) }
+        : { days: required(t.days, "the days before a transition", n), storage_class: className(t.storageClass, n) },
+    ),
+    noncurrent_transitions: d.noncurrentTransitions.map((t) => ({
+      days: required(t.days, "the days before an old version's transition", n),
+      newer_versions: number(t.keep, "the versions left", n),
+      storage_class: className(t.storageClass, n),
+    })),
   };
 }
 
@@ -130,6 +171,16 @@ function describe(d: Draft): string {
         (d.keep.trim() ? `, keeping the newest ${d.keep.trim()}` : ""),
     );
   if (d.abort) what.push(`have uploads aborted ${days(d.abortDays)} after they start`);
+  for (const t of d.transitions)
+    what.push(
+      `move to ${t.storageClass.trim() || "?"} ` +
+        (t.by === "date" ? `from ${t.date || "?"} on` : `${days(t.days)} after they're written`),
+    );
+  for (const t of d.noncurrentTransitions)
+    what.push(
+      `move old versions to ${t.storageClass.trim() || "?"} ${days(t.days)} after they're replaced` +
+        (t.keep.trim() ? `, but the newest ${t.keep.trim()}` : ""),
+    );
   if (!what.length) return "Does nothing yet: pick at least one action.";
   return `${which}: ${what.join("; ")}.` + (d.enabled ? "" : " (Disabled.)");
 }
@@ -141,11 +192,15 @@ export default function Lifecycle() {
   const [loaded, setLoaded] = createSignal(false);
   const [stored, setStored] = createSignal(false);
   const [error, setError] = createSignal<string>();
+  // Which objects are too small to transition, as S3 clients set it: kept
+  // as it is.
+  const [minimum, setMinimum] = createSignal<LifecycleConfiguration["transition_minimum"]>();
 
   const load = async () => {
     try {
       const l = await api.bucketLifecycle(bucket());
       setDrafts(l.configuration?.rules.map(fromRule) ?? []);
+      setMinimum(l.configuration?.transition_minimum);
       setStored(l.configuration != null);
       setLoaded(true);
     } catch (e) {
@@ -160,7 +215,7 @@ export default function Lifecycle() {
   const save = async () => {
     const result = await act(async () => {
       const rules = drafts().map((d, i) => toRule(d, i + 1));
-      return api.setBucketLifecycle(bucket(), { rules });
+      return api.setBucketLifecycle(bucket(), { rules, transition_minimum: minimum() });
     }, "Saved the lifecycle rules; a sweep of them starts now");
     if (result) load();
   };
@@ -182,9 +237,10 @@ export default function Lifecycle() {
         <span>lifecycle</span>
       </div>
       <p class="subtle">
-        What expires in the bucket, and when, as S3's lifecycle rules say it. Rules apply in background sweeps, once a day
-        , at the rate the operator set.{" "}
-        Days count to the next midnight UTC.
+        What expires in the bucket, and what moves into colder storage classes, and when, as S3's lifecycle rules say it.
+        Rules apply in background sweeps, once a day, at the rate the operator set.{" "}
+        Days count to the next midnight UTC. Transitions go only into lower ranked classes (cairn class set --rank), and
+        leave out objects under 128 KiB unless the rule filters by size.
       </p>
       <Show when={loaded()} fallback={<Loading error={error()} />}>
         <Show when={drafts().length} fallback={<Panel>{stored() ? "No rules left: save to remove them all." : "This bucket has no lifecycle rules."}</Panel>}>
@@ -320,6 +376,110 @@ function RuleEditor(props: { draft: Draft; n: number; update: (change: Partial<D
             {input("abortDays", "days", "Upload days", true, "90px")}
             <span class="subtle">days after they start, if not completed</span>
           </Show>
+        </div>
+        <For each={d().transitions}>
+          {(t, j) => {
+            const set = (change: Partial<TransitionDraft>) =>
+              props.update({ transitions: d().transitions.map((u, k) => (k === j() ? { ...u, ...change } : u)) });
+            return (
+              <div class="form-row">
+                <span class="label">{j() === 0 ? "Move objects" : "and"}</span>
+                <span>to</span>
+                <input
+                  type="text"
+                  placeholder="storage class"
+                  aria-label="Storage class"
+                  style={{ flex: "0 1 180px" }}
+                  value={t.storageClass}
+                  onInput={(e) => set({ storageClass: e.currentTarget.value })}
+                />
+                <select value={t.by} onChange={(e) => set({ by: e.currentTarget.value as TransitionDraft["by"] })}>
+                  <option value="days">after a number of days</option>
+                  <option value="date">from a date on</option>
+                </select>
+                <Show
+                  when={t.by === "days"}
+                  fallback={<input type="date" aria-label="Date" value={t.date} onInput={(e) => set({ date: e.currentTarget.value })} />}
+                >
+                  <input
+                    type="text"
+                    inputmode="numeric"
+                    placeholder="days"
+                    aria-label="Days"
+                    style={{ flex: "0 1 90px" }}
+                    value={t.days}
+                    onInput={(e) => set({ days: e.currentTarget.value })}
+                  />
+                </Show>
+                <button class="small" onClick={() => props.update({ transitions: d().transitions.filter((_, k) => k !== j()) })}>
+                  Remove
+                </button>
+              </div>
+            );
+          }}
+        </For>
+        <For each={d().noncurrentTransitions}>
+          {(t, j) => {
+            const set = (change: Partial<NoncurrentTransitionDraft>) =>
+              props.update({ noncurrentTransitions: d().noncurrentTransitions.map((u, k) => (k === j() ? { ...u, ...change } : u)) });
+            return (
+              <div class="form-row">
+                <span class="label">{j() === 0 ? "Move old versions" : "and"}</span>
+                <span>to</span>
+                <input
+                  type="text"
+                  placeholder="storage class"
+                  aria-label="Storage class"
+                  style={{ flex: "0 1 180px" }}
+                  value={t.storageClass}
+                  onInput={(e) => set({ storageClass: e.currentTarget.value })}
+                />
+                <input
+                  type="text"
+                  inputmode="numeric"
+                  placeholder="days"
+                  aria-label="Noncurrent days"
+                  style={{ flex: "0 1 90px" }}
+                  value={t.days}
+                  onInput={(e) => set({ days: e.currentTarget.value })}
+                />
+                <span class="subtle">days after they're replaced, but the newest</span>
+                <input
+                  type="text"
+                  inputmode="numeric"
+                  placeholder="none"
+                  aria-label="Versions left"
+                  style={{ flex: "0 1 90px" }}
+                  value={t.keep}
+                  onInput={(e) => set({ keep: e.currentTarget.value })}
+                />
+                <button
+                  class="small"
+                  onClick={() => props.update({ noncurrentTransitions: d().noncurrentTransitions.filter((_, k) => k !== j()) })}
+                >
+                  Remove
+                </button>
+              </div>
+            );
+          }}
+        </For>
+        <div class="form-row">
+          <span class="label" />
+          <button
+            class="small"
+            onClick={() => props.update({ transitions: [...d().transitions, { by: "days", days: "30", date: "", storageClass: "" }] })}
+          >
+            Add transition
+          </button>
+          <button
+            class="small"
+            onClick={() =>
+              props.update({ noncurrentTransitions: [...d().noncurrentTransitions, { days: "30", keep: "", storageClass: "" }] })
+            }
+          >
+            Add transition of old versions
+          </button>
+          <span class="subtle">into a lower ranked storage class</span>
         </div>
       </div>
     </Panel>

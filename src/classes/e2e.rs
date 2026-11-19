@@ -403,3 +403,224 @@ fn data_dirs_belong_to_one_node() {
     assert!(crate::store::Store::new(vec![("ssd".to_owned(), ssd.clone()), ("hdd".to_owned(), ssd.join("hdd"))]).is_err());
     assert!(crate::store::Store::new(vec![("ssd".to_owned(), ssd.clone()), ("hdd".to_owned(), ssd.join("."))]).is_err());
 }
+
+// ─── Lifecycle transitions (see `lifecycle`) ─────────────────────────────────
+
+/// Ranks class `name` at `rank`, and has every node of `cluster` go by it.
+async fn set_rank(cluster: &Cluster, name: &str, rank: i32) {
+    cluster.nodes[0]
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .execute("UPDATE storage_classes SET rank = $2 WHERE name = $1", &[&name, &rank])
+        .await
+        .unwrap();
+    for node in &cluster.nodes {
+        crate::refresh_settings(node).await.unwrap();
+    }
+}
+
+/// `tiered`, with COLD ranked below STANDARD.
+async fn ranked() -> Option<Cluster> {
+    let cluster = tiered().await?;
+    set_rank(&cluster, "COLD", -10).await;
+    Some(cluster)
+}
+
+/// Sets the bucket's lifecycle rules to `rules`: the answer.
+async fn set_rules(app: &App, rules: &str) -> hyper::Response<Full<Bytes>> {
+    let body = format!("<LifecycleConfiguration>{rules}</LifecycleConfiguration>");
+    crate::s3::buckets::lifecycle::put_bucket_lifecycle(app, BUCKET, Bytes::from(body), None).await.unwrap()
+}
+
+/// Transitions the objects under `prefix` into COLD the day after they're
+/// written.
+async fn transition_to_cold(app: &App, prefix: &str) {
+    let rule = format!(
+        "<Rule><ID>cold</ID><Filter><Prefix>{prefix}</Prefix></Filter><Status>Enabled</Status>\
+         <Transition><Days>1</Days><StorageClass>COLD</StorageClass></Transition></Rule>"
+    );
+    assert_eq!(set_rules(app, &rule).await.status(), StatusCode::OK);
+}
+
+/// Takes the lifecycle steps due `days` from now: how many versions they
+/// transitioned.
+async fn sweep_in(app: &Arc<App>, days: u64) -> i64 {
+    let at = std::time::SystemTime::now() + std::time::Duration::from_secs(days * 24 * 3600);
+    crate::lifecycle::pass(app, at).await.into_iter().map(|r| r.map_err(|(_, e)| e).unwrap().transitioned).sum()
+}
+
+/// A blob's misplaced bytes, as the last fold worked them out.
+async fn misplaced(app: &App, blob_id: Uuid) -> i64 {
+    let client = app.pool.get().await.unwrap();
+    client.query_one("SELECT misplaced_size FROM blobs WHERE blob_id = $1", &[&blob_id]).await.unwrap().get(0)
+}
+
+/// A transition changes only the object's class; its bytes stay in their
+/// blob, misplaced, until the packer moves them into the class's pool.
+#[tokio::test]
+async fn transitions_leave_the_bytes_for_the_packer() {
+    let Some(cluster) = ranked().await else { return };
+    let app = &cluster.nodes[0];
+    let body = data(1, 300_000);
+    put_in(app, "logs/a", "STANDARD", body.clone()).await.unwrap();
+    put_in(app, "other", "STANDARD", data(2, 300_000)).await.unwrap();
+    transition_to_cold(app, "logs/").await;
+    let before = blob_of(app, "logs/a").await;
+
+    // Not on the day it was written.
+    assert_eq!(sweep_in(app, 0).await, 0);
+    assert_eq!(sweep_in(app, 2).await, 1);
+    assert_eq!(head_class(app, "logs/a").await.as_deref(), Some("COLD"));
+    assert_eq!(head_class(app, "other").await, None);
+    assert_eq!(blob_of(app, "logs/a").await, before, "the bytes stay where they were");
+    assert_eq!(get(app, "logs/a").await.unwrap(), body);
+
+    // The packer's fold finds them misplaced, and it moves them.
+    let reports = crate::packer::pass(app).await.unwrap();
+    let relocated: usize = reports.iter().map(|r| r.relocated.parts).sum();
+    assert_eq!(relocated, 1, "{}", reports.iter().map(|r| r.to_string()).collect::<Vec<_>>().join("; "));
+    let after = blob_of(app, "logs/a").await;
+    assert_ne!(after, before);
+    assert_eq!(class_of_blob(app, after).await, ("COLD".to_owned(), "hdd".to_owned()));
+    assert_eq!(misplaced(app, after).await, 0);
+    assert_intact(&cluster, after).await;
+    assert_eq!(get(app, "logs/a").await.unwrap(), body);
+    assert_eq!(class_of_blob(app, blob_of(app, "other").await).await.0, "STANDARD");
+    // Nothing more to do, and nothing more to transition.
+    assert!(crate::packer::pass(app).await.unwrap().is_empty());
+    assert_eq!(sweep_in(app, 4).await, 0);
+}
+
+/// Bytes a version of the blob's own class still shares stay where they
+/// are: until it's gone.
+#[tokio::test]
+async fn shared_bytes_stay_in_the_highest_class_they_serve() {
+    let Some(cluster) = ranked().await else { return };
+    let app = &cluster.nodes[0];
+    let body = data(1, 300_000);
+    put_in(app, "logs/a", "STANDARD", body.clone()).await.unwrap();
+    copy_into(app, "logs/a", "copy", None).await;
+    let blob = blob_of(app, "logs/a").await;
+    assert_eq!(blob_of(app, "copy").await, blob, "shared");
+    transition_to_cold(app, "logs/").await;
+    assert_eq!(sweep_in(app, 2).await, 1);
+
+    crate::packer::pass(app).await.unwrap();
+    assert_eq!(misplaced(app, blob).await, 0, "the copy is STANDARD's");
+    assert_eq!(blob_of(app, "logs/a").await, blob);
+
+    crate::e2e::delete(app, "copy").await;
+    crate::packer::pass(app).await.unwrap();
+    let after = blob_of(app, "logs/a").await;
+    assert_eq!(class_of_blob(app, after).await.0, "COLD");
+    assert_eq!(get(app, "logs/a").await.unwrap(), body);
+}
+
+/// A copy into a lower class shares its source's bytes, which stand in for
+/// it; a copy into a higher one than its source's writes them again.
+#[tokio::test]
+async fn copies_into_lower_classes_share_bytes() {
+    let Some(cluster) = ranked().await else { return };
+    let app = &cluster.nodes[0];
+    let body = data(1, 200_000);
+    put_in(app, "k", "STANDARD", body.clone()).await.unwrap();
+    let standard = blob_of(app, "k").await;
+    copy_into(app, "k", "cold", Some("COLD")).await;
+    assert_eq!(blob_of(app, "cold").await, standard);
+    assert_eq!(head_class(app, "cold").await.as_deref(), Some("COLD"));
+    // A copy of the COLD one that names no class is STANDARD: written again,
+    // though its bytes are in STANDARD's blob, as its source's are only
+    // COLD's.
+    copy_into(app, "cold", "warm", None).await;
+    let warm = blob_of(app, "warm").await;
+    assert_ne!(warm, standard);
+    assert_eq!(head_class(app, "warm").await, None);
+    // A copy that keeps its class shares them.
+    copy_into(app, "cold", "cold2", Some("COLD")).await;
+    assert_eq!(blob_of(app, "cold2").await, standard);
+    assert_eq!(get(app, "cold2").await.unwrap(), body);
+    // Once the STANDARD ones are gone, the COLD ones' bytes move to COLD.
+    crate::e2e::delete(app, "k").await;
+    crate::packer::pass(app).await.unwrap();
+    let moved = blob_of(app, "cold").await;
+    assert_eq!(class_of_blob(app, moved).await.0, "COLD");
+    assert_eq!(blob_of(app, "cold2").await, moved, "still shared");
+    assert_eq!(get(app, "cold2").await.unwrap(), body);
+}
+
+/// Rules may only transition into classes that are defined, and ranked; and
+/// an object under 128 KiB isn't transitioned, unless the rule says so.
+#[tokio::test]
+async fn transitions_go_to_ranked_classes() {
+    let Some(cluster) = tiered().await else { return };
+    let app = &cluster.nodes[0];
+    let rule = |class: &str| {
+        format!(
+            "<Rule><ID>r</ID><Filter/><Status>Enabled</Status>\
+             <Transition><Days>1</Days><StorageClass>{class}</StorageClass></Transition></Rule>"
+        )
+    };
+    for class in ["COLD", "GLACIER"] {
+        let response = set_rules(app, &rule(class)).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{class}");
+        let body = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        assert!(body.contains("InvalidStorageClass"), "{body}");
+    }
+    // Ranked on another node since this one read the classes.
+    cluster.nodes[1]
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .execute("UPDATE storage_classes SET rank = -10 WHERE name = 'COLD'", &[])
+        .await
+        .unwrap();
+    let response = set_rules(app, &rule("COLD")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["x-amz-transition-default-minimum-object-size"],
+        "all_storage_classes_128K"
+    );
+    put_in(app, "small", "STANDARD", data(1, 1000)).await.unwrap();
+    put_in(app, "large", "STANDARD", data(2, 200_000)).await.unwrap();
+    assert_eq!(sweep_in(app, 2).await, 1);
+    assert_eq!(head_class(app, "small").await, None);
+    assert_eq!(head_class(app, "large").await.as_deref(), Some("COLD"));
+}
+
+/// Noncurrent versions transition too, and a lifecycle event tells of it.
+#[tokio::test]
+async fn noncurrent_versions_transition() {
+    let Some(cluster) = ranked().await else { return };
+    let app = &cluster.nodes[0];
+    let body = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    let response = crate::s3::buckets::versioning::put_bucket_versioning(
+        app,
+        BUCKET,
+        Bytes::from(body),
+        crate::mfa::Presented::Absent,
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    put_in(app, "k", "STANDARD", data(1, 200_000)).await.unwrap();
+    put_in(app, "k", "STANDARD", data(2, 200_000)).await.unwrap();
+    let rule = "<Rule><ID>r</ID><Filter/><Status>Enabled</Status><NoncurrentVersionTransition>\
+                <NoncurrentDays>1</NoncurrentDays><StorageClass>COLD</StorageClass>\
+                </NoncurrentVersionTransition></Rule>";
+    assert_eq!(set_rules(app, rule).await.status(), StatusCode::OK);
+    assert_eq!(sweep_in(app, 2).await, 1);
+    let client = app.pool.get().await.unwrap();
+    let classes: Vec<(bool, String)> = client
+        .query("SELECT is_latest, storage_class FROM objects WHERE key = 'k' ORDER BY id", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    assert_eq!(classes, [(false, "COLD".to_owned()), (true, "STANDARD".to_owned())]);
+    assert_eq!(head_class(app, "k").await, None);
+    assert_eq!(get(app, "k").await.unwrap(), data(2, 200_000));
+}

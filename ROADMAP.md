@@ -96,8 +96,8 @@ Done:
 - **Storage classes.** Classes of the operator's, each in a pool of the
   nodes' disks (`--data-dir <pool>=<path>`, several per node) with a layout
   of its own; objects ask for one with `x-amz-storage-class`, and change
-  class by being copied; the packer rewrites a class's data after a change
-  of its pool or layout. Implemented.
+  class by being copied, or by lifecycle transitions; the packer rewrites a
+  class's data after a change of its pool or layout. Implemented.
 - **Backups.** The whole cluster, continuously, to a bucket of another S3
   service: its database's changes in journals every few minutes (the RPO),
   with the parts' bytes, in few, large, encrypted objects, and base
@@ -130,10 +130,13 @@ Done:
   parts into the cluster for the days asked, once the tier has; reads of
   an object that isn't restored fail with `InvalidObjectState`, as in S3.
 - **Lifecycle transitions.** Moving objects between storage classes by
-  lifecycle rules (`Transition`, `NoncurrentVersionTransition`), as a
-  rewrite of their data into the class, paced as sweeps are. Expiration
-  rules are done. Needed to make use of tiers: a transition rewrites the
-  version's data (copy-on-write), since replicas and copies may share it.
+  lifecycle rules (`Transition`, `NoncurrentVersionTransition`), into
+  lower classes in the order the operator ranks them (`cairn class set
+  --rank`). A transition only relabels the version, which the blob's
+  higher class stands in for; the packer moves the bytes into their class
+  when it rewrites the blob, once its garbage and misplaced bytes together
+  make it worth it. Implemented. Next: compacting more eagerly as pools
+  fill up (see below), which moves misplaced bytes sooner too.
 
 ## Ideas
 

@@ -277,7 +277,7 @@ async fn a_parquet_report_is_delivered_as_s3_delivers_it() {
         .unwrap();
     let rule = "<LifecycleConfiguration><Rule><ID>r</ID><Filter><Prefix>photos/</Prefix></Filter>\
                 <Status>Enabled</Status><Expiration><Days>30</Days></Expiration></Rule></LifecycleConfiguration>";
-    assert_eq!(put_bucket_lifecycle(&app, BUCKET, Bytes::from(rule)).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(put_bucket_lifecycle(&app, BUCKET, Bytes::from(rule), None).await.unwrap().status(), StatusCode::OK);
     let fields = "<OptionalFields><Field>Size</Field><Field>LastModifiedDate</Field><Field>ETag</Field>\
                   <Field>ObjectLockRetainUntilDate</Field><Field>ObjectLockEventHoldDuration</Field>\
                   <Field>LifecycleExpirationDate</Field><Field>EncryptionStatus</Field></OptionalFields>";
@@ -461,7 +461,7 @@ async fn reports_and_lifecycle_sweeps_take_turns() {
     // A sweep (that expires nothing), due first, then a report.
     let rule = "<LifecycleConfiguration><Rule><ID>r</ID><Filter><Prefix>none/</Prefix></Filter>\
                 <Status>Enabled</Status><Expiration><Days>1</Days></Expiration></Rule></LifecycleConfiguration>";
-    assert_eq!(put_bucket_lifecycle(&app, BUCKET, Bytes::from(rule)).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(put_bucket_lifecycle(&app, BUCKET, Bytes::from(rule), None).await.unwrap().status(), StatusCode::OK);
     assert_eq!(configure(&app, "all", configuration("all", "All", "")).await, StatusCode::OK);
     // The sweep reads nothing (no keys under its prefix) and is done; the
     // report gets the rest of the step.

@@ -261,6 +261,7 @@ const MIGRATIONS: &[&str] = &[
     ACLS,
     BATCH_COPIES,
     CHECKSUM_ALGORITHMS,
+    TRANSITIONS,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -3925,6 +3926,37 @@ ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_checksum CHECK (
                                    'SHA512', 'MD5', 'XXHASH64', 'XXHASH3', 'XXHASH128'))
     AND (checksum_type IS NULL OR checksum_type IN ('FULL_OBJECT', 'COMPOSITE'))
 ) NOT VALID;
+"#;
+
+/// Migration 81: lifecycle transitions (see `lifecycle`), and the order of
+/// storage classes they go by (see `classes`).
+///
+/// - `storage_classes.rank`: where the class is in the order the operator
+///   gives the classes, the warmest highest. A class of a higher rank
+///   stands in for one of a lower rank: a blob of it may hold the bytes of
+///   versions of the lower one. NULL: unranked, the class of none other but
+///   itself, which lifecycle rules don't transition into or out of.
+///   STANDARD is 0; no two classes share a rank.
+/// - `blobs.misplaced_size`: the live bytes of a blob that no part of a
+///   version (or upload) of the blob's own class references: only versions
+///   of lower classes do, so they belong in a lower one. A heuristic, as
+///   `dead_size` is (I8), which the packer's compaction counts with it.
+/// - `lifecycle_sweeps.transitioned`: the versions a sweep in progress has
+///   transitioned.
+///
+/// No new lock protocol: an older node keeps a version's class its blobs'
+/// (which a version of a lower class may now differ from, and stays able
+/// to), leaves `misplaced_size` stale, which only delays the packer, and
+/// skips the sweeps of buckets whose rules transition (it doesn't know the
+/// fields).
+const TRANSITIONS: &str = r#"
+ALTER TABLE storage_classes ADD COLUMN rank integer UNIQUE;
+UPDATE storage_classes SET rank = 0 WHERE name = 'STANDARD';
+ALTER TABLE blobs ADD COLUMN misplaced_size bigint NOT NULL DEFAULT 0;
+-- The packer's candidates for moving misplaced bytes, a class at a time
+-- (see `cairn_claim`, `cairn_claim_tier`).
+CREATE INDEX blobs_misplaced ON blobs (storage_class) WHERE misplaced_size > 0;
+ALTER TABLE lifecycle_sweeps ADD COLUMN transitioned bigint NOT NULL DEFAULT 0;
 "#;
 
 #[cfg(test)]

@@ -58,6 +58,15 @@
 //! retention (an hour at least, `Config::tier_hold`), so that a restore to
 //! any time within it finds every object it points at.
 //!
+//! ## Misplaced data
+//!
+//! A version transitioned into a lower class than its tier's class (see
+//! `classes`) leaves its bytes in the tier, misplaced, until a job takes
+//! their blob: compaction does once its garbage and misplaced bytes are
+//! enough of it, and moves them into the cluster, as new blobs of their
+//! class, first (`packer::relocate`). Likewise, a job moving blobs into the
+//! tier moves the misplaced bytes on them into their class instead.
+//!
 //! ## Changing a class's tier
 //!
 //! A class moved to another tier has its remote blobs moved there too, by
@@ -327,9 +336,12 @@ async fn write_outputs(
     created: &mut Vec<Uuid>,
 ) -> anyhow::Result<JobReport> {
     let client = app.pool.get().await?;
-    let mut parts = packer::load_parts(&client, sources).await?;
+    let parts = packer::load_parts(&client, sources).await?;
     let blobs = packer::load_blobs(&client, app.node, sources).await?;
     drop(client);
+    // What belongs in a lower class than this one goes there first, into
+    // the cluster (or, by way of it, into that class's tier).
+    let (mut parts, relocated) = packer::relocate(app, sources, parts, &blobs).await?;
     let runs = if parts.is_empty() { Vec::new() } else { packer::lay_out(&mut parts, app.pack.target_size) };
     let mut outputs: Vec<NewBlob> = Vec::new();
     for run in runs {
@@ -397,6 +409,7 @@ async fn write_outputs(
         parts: parts.len(),
         bytes: outputs.iter().map(|o| o.size).sum(),
         outputs: outputs.iter().map(|o| o.blob_id).collect(),
+        relocated,
     })
 }
 

@@ -22,6 +22,27 @@
 //! first, in STANDARD's pool and layout (which it goes by, whatever its own
 //! row says), and the packer moves them into the tier.
 //!
+//! ## Their order
+//!
+//! The operator ranks classes (`cairn class set COLD --rank -10`): the
+//! warmest highest, STANDARD at 0. A class of a higher rank **stands in**
+//! for one of a lower rank: a blob of it may hold the bytes of versions of
+//! the lower one. That's the operator's promise, which Cairn doesn't check
+//! (a cold pool's disks may be less reliable, and its class have more
+//! parity shards for it): keeping bytes in a higher class than they need
+//! costs more, but is otherwise as good. A class without a rank stands in
+//! for none other, and none for it.
+//!
+//! So a version's class is its parts' blobs' class, or one they stand in
+//! for. That's how lifecycle transitions work (see `lifecycle`): a
+//! transition only changes the version's class, to a lower one, and leaves
+//! its bytes where they are. A blob's bytes that only versions of lower
+//! classes reference are **misplaced** (`blobs.misplaced_size`), and the
+//! packer moves them into the class they belong in, the highest of their
+//! versions' classes, as it rewrites the blob: once enough of it is
+//! misplaced or garbage (see `packer`). Likewise, a copy into a lower class
+//! than its source's shares the source's bytes.
+//!
 //! STANDARD always exists, in the pool `default` until it's moved. A class
 //! that's named as S3 names its classes but isn't defined is taken as
 //! STANDARD, as before Cairn had classes, so that clients that ask for one
@@ -75,6 +96,10 @@ pub struct Class {
     /// The tier it keeps its data in, if it's a tier's (see `tiers`): then
     /// its pool and layout are STANDARD's, for its data on the way there.
     pub tier: Option<String>,
+    /// Its place in the classes' order, the warmest highest (see the
+    /// module's docs); `None` if it has none.
+    #[serde(default)]
+    pub rank: Option<i32>,
 }
 
 impl Class {
@@ -86,8 +111,25 @@ impl Class {
             data_shards: None,
             parity_shards: None,
             tier: None,
+            rank: Some(0),
         }
     }
+}
+
+/// Whether a blob of class `blob` may hold the bytes of a version (or
+/// upload) of class `class`, as `classes` rank them: it's the same class,
+/// or one ranked above it.
+pub fn stands_in(classes: &BTreeMap<String, Class>, blob: &str, class: &str) -> bool {
+    blob == class || matches!(rank_pair(classes, blob, class), Some((b, c)) if b > c)
+}
+
+/// Whether class `lower` is ranked below class `upper`.
+pub fn below(classes: &BTreeMap<String, Class>, lower: &str, upper: &str) -> bool {
+    matches!(rank_pair(classes, lower, upper), Some((l, u)) if l < u)
+}
+
+fn rank_pair(classes: &BTreeMap<String, Class>, a: &str, b: &str) -> Option<(i32, i32)> {
+    Some((classes.get(a)?.rank?, classes.get(b)?.rank?))
 }
 
 /// Whether `name` may name a class.
@@ -110,7 +152,7 @@ pub fn valid_pool(name: &str) -> bool {
 /// layout (see the module's docs).
 pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<String, Class>> {
     let rows = client
-        .query_cached("SELECT name, pool, data_shards, parity_shards, tier FROM storage_classes", &[])
+        .query_cached("SELECT name, pool, data_shards, parity_shards, tier, rank FROM storage_classes", &[])
         .await?;
     let mut classes: BTreeMap<String, Class> = rows
         .iter()
@@ -121,6 +163,7 @@ pub async fn load<C: GenericClient>(client: &C) -> anyhow::Result<BTreeMap<Strin
                 data_shards: r.get::<_, Option<i16>>(2).map(|k| k as u32),
                 parity_shards: r.get::<_, Option<i16>>(3).map(|m| m as u32),
                 tier: r.get(4),
+                rank: r.get(5),
             };
             (class.name.clone(), class)
         })
@@ -235,6 +278,13 @@ enum ClassCommand {
         /// `parity-shards` setting.
         #[arg(long)]
         parity_shards: Option<String>,
+        /// Its place in the classes' order, the warmest highest (STANDARD
+        /// is 0), or `none`. Lifecycle rules transition objects into lower
+        /// classes, and a class stands in for those below it: its blobs may
+        /// hold their objects' data, as they do until the packer moves it.
+        /// No two classes share a rank.
+        #[arg(long, allow_hyphen_values = true)]
+        rank: Option<String>,
     },
     /// Delete a storage class that holds no data and no uploads. STANDARD
     /// can't be deleted.
@@ -251,6 +301,14 @@ fn shards_arg(flag: &str, value: &str, min: i64, max: i64) -> anyhow::Result<Opt
         .map_err(|_| anyhow::anyhow!("--{flag} must be a number or `default`, not {value:?}"))?;
     anyhow::ensure!((min..=max).contains(&n), "--{flag} must be between {min} and {max}");
     Ok(Some(n as i16))
+}
+
+/// A `--rank`: a number, or `none` (`None`).
+fn rank_arg(value: &str) -> anyhow::Result<Option<i32>> {
+    if value == "none" {
+        return Ok(None);
+    }
+    value.parse().map(Some).map_err(|_| anyhow::anyhow!("--rank must be a number or `none`, not {value:?}"))
 }
 
 /// `cairn class …`, on a node (see `admin`).
@@ -273,8 +331,8 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                 .await?;
             outln!(
                 out,
-                "{:<24} {:<16} {:>6} {:>6} {:>7} {:>16} {:>16}",
-                "class", "pool", "data", "parity", "nodes", "bytes", "in a tier"
+                "{:<24} {:>6} {:<16} {:>6} {:>6} {:>7} {:>16} {:>16}",
+                "class", "rank", "pool", "data", "parity", "nodes", "bytes", "in a tier"
             );
             let shards = |v: Option<u32>| v.map_or("-".to_owned(), |v| v.to_string());
             for r in rows {
@@ -296,9 +354,10 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                     Some(tier) => format!("tier:{tier}"),
                     None => class.pool.clone(),
                 };
+                let rank = class.rank.map_or("-".to_owned(), |r| r.to_string());
                 outln!(
                     out,
-                    "{name:<24} {place:<16} {:>6} {:>6} {:>7} {bytes:>16} {remote:>16}",
+                    "{name:<24} {rank:>6} {place:<16} {:>6} {:>6} {:>7} {bytes:>16} {remote:>16}",
                     shards(class.data_shards),
                     shards(class.parity_shards),
                     format!("{live}/{active}")
@@ -306,11 +365,11 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
             }
             outln!(
                 out,
-                "(data, parity: - is the cluster's setting; nodes: live/active with the pool; \
-                 a tier's class waits in STANDARD's pool and layout)"
+                "(rank: the warmest highest, - for none; data, parity: - is the cluster's setting; \
+                 nodes: live/active with the pool; a tier's class waits in STANDARD's pool and layout)"
             );
         }
-        ClassCommand::Set { name, pool, tier, data_shards, parity_shards } => {
+        ClassCommand::Set { name, pool, tier, data_shards, parity_shards, rank } => {
             anyhow::ensure!(
                 valid_name(&name),
                 "a class's name is up to 64 capitals, digits and underscores, starting with a capital"
@@ -324,6 +383,16 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
             let max_data = crate::shards::MAX_DATA_SHARDS as i64;
             let data = data_shards.as_deref().map(|v| shards_arg("data-shards", v, 1, max_data)).transpose()?;
             let parity = parity_shards.as_deref().map(|v| shards_arg("parity-shards", v, 0, 16)).transpose()?;
+            let rank = rank.as_deref().map(rank_arg).transpose()?;
+            if let Some(Some(rank)) = rank {
+                let taken: Option<String> = client
+                    .query_opt_cached("SELECT name FROM storage_classes WHERE rank = $1 AND name <> $2", &[&rank, &name])
+                    .await?
+                    .map(|r| r.get(0));
+                if let Some(other) = taken {
+                    anyhow::bail!("{other} has rank {rank} already: no two classes share one");
+                }
+            }
             if let Some(tier) = &tier {
                 anyhow::ensure!(name != STANDARD, "STANDARD can't be a tier's: tiers' classes wait in its pool");
                 anyhow::ensure!(
@@ -345,7 +414,8 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                              pool = coalesce($2, pool),
                              data_shards = CASE WHEN $3 THEN $4 ELSE data_shards END,
                              parity_shards = CASE WHEN $5 THEN $6 ELSE parity_shards END,
-                             tier = CASE WHEN $2 IS NOT NULL THEN NULL ELSE coalesce($7, tier) END
+                             tier = CASE WHEN $2 IS NOT NULL THEN NULL ELSE coalesce($7, tier) END,
+                             rank = CASE WHEN $8 THEN $9 ELSE rank END
                          WHERE name = $1",
                         &[
                             &name,
@@ -355,6 +425,8 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                             &parity.is_some(),
                             &parity.flatten(),
                             &tier,
+                            &rank.is_some(),
+                            &rank.flatten(),
                         ],
                     )
                     .await?;
@@ -368,9 +440,9 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
                 };
                 client
                     .execute_cached(
-                        "INSERT INTO storage_classes (name, pool, data_shards, parity_shards, tier)
-                         VALUES ($1, $2, $3, $4, $5)",
-                        &[&name, &pool, &data.flatten(), &parity.flatten(), &tier],
+                        "INSERT INTO storage_classes (name, pool, data_shards, parity_shards, tier, rank)
+                         VALUES ($1, $2, $3, $4, $5, $6)",
+                        &[&name, &pool, &data.flatten(), &parity.flatten(), &tier, &rank.flatten()],
                     )
                     .await?;
                 if !S3_CLASSES.contains(&name.as_str()) {
@@ -417,8 +489,12 @@ pub async fn run(app: &Arc<App>, args: ClassArgs, out: &mut Output) -> anyhow::R
 
 /// A class's pool and layout as this node goes by them, in words.
 pub fn describe(app: &App, class: &Class) -> String {
+    let rank = match class.rank {
+        Some(rank) => format!(", rank {rank}"),
+        None => ", no rank".to_owned(),
+    };
     if let Some(tier) = &class.tier {
-        return format!("{}: tier {tier}, by way of STANDARD's pool {}", class.name, class.pool);
+        return format!("{}: tier {tier}, by way of STANDARD's pool {}{rank}", class.name, class.pool);
     }
     let parity = app.parity_shards_of(class);
     let data = app.coding_of(class);
@@ -426,7 +502,7 @@ pub fn describe(app: &App, class: &Class) -> String {
         Some(k) => format!("blobs over 64 MiB coded {k}+{parity}, smaller ones {} copies", parity + 1),
         None => format!("{} copies", parity + 1),
     };
-    format!("{}: pool {}, {layout}", class.name, class.pool)
+    format!("{}: pool {}, {layout}{rank}", class.name, class.pool)
 }
 
 /// What's wrong with where class `class` keeps its data: its pool has fewer
@@ -503,5 +579,30 @@ mod tests {
         for pool in ["", "SSD", "-x", "a b", "a=b", &"a".repeat(33)] {
             assert!(!valid_pool(pool), "{pool}");
         }
+    }
+
+    #[test]
+    fn higher_classes_stand_in_for_lower_ones() {
+        let class = |name: &str, rank: Option<i32>| {
+            (name.to_owned(), Class { name: name.to_owned(), rank, ..Class::standard() })
+        };
+        let classes: BTreeMap<String, Class> =
+            [class("FAST", Some(10)), class("STANDARD", Some(0)), class("COLD", Some(-10)), class("ODD", None)]
+                .into_iter()
+                .collect();
+        assert!(stands_in(&classes, "STANDARD", "STANDARD"));
+        assert!(stands_in(&classes, "FAST", "COLD"));
+        assert!(stands_in(&classes, "STANDARD", "COLD"));
+        assert!(!stands_in(&classes, "COLD", "STANDARD"));
+        // Unranked: only itself.
+        assert!(stands_in(&classes, "ODD", "ODD"));
+        assert!(!stands_in(&classes, "ODD", "COLD"));
+        assert!(!stands_in(&classes, "FAST", "ODD"));
+        // Unknown classes stand in for nothing.
+        assert!(!stands_in(&classes, "FAST", "GONE"));
+        assert!(below(&classes, "COLD", "FAST"));
+        assert!(!below(&classes, "FAST", "COLD"));
+        assert!(!below(&classes, "ODD", "FAST"));
+        assert!(!below(&classes, "COLD", "COLD"));
     }
 }
