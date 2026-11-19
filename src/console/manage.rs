@@ -275,6 +275,12 @@ struct ClassUsage {
     /// Committed blobs outside its pool, which the packer rewrites into it.
     misplaced: i64,
     misplaced_bytes: i64,
+    /// The remote tier it keeps its data in, if it's a tier's (see `tiers`):
+    /// then its pool and layout are STANDARD's, which its data waits in.
+    tier: Option<String>,
+    /// Its blobs in tiers, and their bytes.
+    remote_blobs: i64,
+    remote_bytes: i64,
 }
 
 /// How much of the data the scrubber has checked (see `scrub`).
@@ -534,6 +540,11 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             &[&small_size, &names, &ks, &ms, &pools],
         )
         .await?;
+    // Each class's pool as this node goes by it (a tier's class's is
+    // STANDARD's, see `classes`).
+    let all = app.classes.all();
+    let (class_names, class_pools): (Vec<String>, Vec<String>) =
+        all.values().map(|c| (c.name.clone(), c.pool.clone())).unzip();
     let usage = client
         .query_cached(
             "SELECT c.name,
@@ -542,13 +553,16 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
                     (SELECT count(*) FROM node_pools np JOIN nodes n ON n.id = np.node
                      WHERE np.pool = c.pool AND n.state = 'active'
                        AND n.last_seen > NOW() - INTERVAL '10 seconds'),
-                    count(b.blob_id), coalesce(sum(b.size), 0)::bigint,
-                    count(b.blob_id) FILTER (WHERE b.pool <> c.pool),
-                    coalesce(sum(b.size) FILTER (WHERE b.pool <> c.pool), 0)::bigint
-             FROM storage_classes c
-             LEFT JOIN blobs b ON b.storage_class = c.name AND b.state = 'committed'
+                    count(b.blob_id) FILTER (WHERE b.state = 'committed'),
+                    coalesce(sum(b.size) FILTER (WHERE b.state = 'committed'), 0)::bigint,
+                    count(b.blob_id) FILTER (WHERE b.state = 'committed' AND b.pool <> c.pool),
+                    coalesce(sum(b.size) FILTER (WHERE b.state = 'committed' AND b.pool <> c.pool), 0)::bigint,
+                    count(b.blob_id) FILTER (WHERE b.state = 'remote'),
+                    coalesce(sum(b.size) FILTER (WHERE b.state = 'remote'), 0)::bigint
+             FROM unnest($1::text[], $2::text[]) AS c(name, pool)
+             LEFT JOIN blobs b ON b.storage_class = c.name AND b.state IN ('committed', 'remote')
              GROUP BY c.name, c.pool ORDER BY c.name",
-            &[],
+            &[&class_names, &class_pools],
         )
         .await?;
     let mut class_usage = Vec::new();
@@ -569,6 +583,9 @@ pub(super) async fn storage(app: &App) -> anyhow::Result<Storage> {
             bytes: r.get(4),
             misplaced: r.get(5),
             misplaced_bytes: r.get(6),
+            remote_blobs: r.get(7),
+            remote_bytes: r.get(8),
+            tier: class.tier,
             pool: class.pool,
             name,
         });

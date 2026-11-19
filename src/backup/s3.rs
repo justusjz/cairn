@@ -110,6 +110,9 @@ impl std::error::Error for Failed {}
 #[derive(Clone)]
 pub struct Target {
     pub location: Location,
+    /// The storage class objects are written in there, if not the
+    /// service's default (a tier's, see `tiers`).
+    storage_class: Option<String>,
     client: Https,
 }
 
@@ -135,19 +138,44 @@ impl Target {
             .build();
         Ok(Target {
             location,
+            storage_class: None,
             client: Client::builder(TokioExecutor::new()).build(connector),
         })
     }
 
+    /// The same, writing objects in storage class `class` there.
+    pub fn with_storage_class(mut self, class: Option<String>) -> Target {
+        self.storage_class = class;
+        self
+    }
+
+    /// The header that names the storage class objects are written in, if
+    /// there's one.
+    fn class_header(&self) -> Vec<(&str, &str)> {
+        self.storage_class.as_deref().map(|class| ("x-amz-storage-class", class)).into_iter().collect()
+    }
+
     /// Stores `body` as `name`.
     pub async fn put(&self, name: &str, body: Bytes) -> anyhow::Result<()> {
-        self.call(Method::PUT, Some(name), &[], &[], body).await?;
+        self.call(Method::PUT, Some(name), &[], &self.class_header(), body).await?;
         Ok(())
+    }
+
+    /// The size of `name`, if there's such an object.
+    pub async fn size(&self, name: &str) -> anyhow::Result<Option<u64>> {
+        match self.call(Method::HEAD, Some(name), &[], &[], Bytes::new()).await {
+            Ok(answer) => {
+                let length = answer.headers.get("content-length").and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok());
+                Ok(Some(length.ok_or_else(|| anyhow::anyhow!("the target answered a HEAD of {name} without a length"))?))
+            }
+            Err(e) if e.downcast_ref::<Failed>().is_some_and(|f| f.status == StatusCode::NOT_FOUND) => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     /// Starts a multipart upload of `name`; its upload ID.
     pub async fn create_upload(&self, name: &str) -> anyhow::Result<String> {
-        let answer = self.call(Method::POST, Some(name), &[("uploads", "")], &[], Bytes::new()).await?;
+        let answer = self.call(Method::POST, Some(name), &[("uploads", "")], &self.class_header(), Bytes::new()).await?;
         let doc = String::from_utf8_lossy(&answer.body).into_owned();
         xml_text(&doc, "UploadId").ok_or_else(|| anyhow::anyhow!("the target started an upload without an UploadId"))
     }

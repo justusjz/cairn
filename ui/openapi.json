@@ -8440,7 +8440,9 @@
           "blobs",
           "bytes",
           "misplaced",
-          "misplaced_bytes"
+          "misplaced_bytes",
+          "remote_blobs",
+          "remote_bytes"
         ],
         "properties": {
           "blobs": {
@@ -8502,6 +8504,22 @@
           },
           "pool": {
             "type": "string"
+          },
+          "remote_blobs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Its blobs in tiers, and their bytes."
+          },
+          "remote_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "tier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The remote tier it keeps its data in, if it's a tier's (see `tiers`):\nthen its pool and layout are STANDARD's, which its data waits in."
           }
         }
       },

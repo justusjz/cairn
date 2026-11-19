@@ -303,9 +303,12 @@ pub(crate) async fn stream_blob_range(
     slice: &mut BlobSlice,
     tx: &FrameSender,
 ) -> io::Result<()> {
-    // A blob no node holds may be one that's still in the backup a restore
-    // copies from (see `backup::restore`).
-    if slice.locations.is_empty() && crate::backup::restore::stream(app, slice, tx).await? {
+    // A blob no node holds is a remote one, in a tier (see `tiers`), or
+    // one that's still in the backup a restore copies from (see
+    // `backup::restore`).
+    if slice.locations.is_empty()
+        && (crate::tiers::stream(app, slice, tx).await? || crate::backup::restore::stream(app, slice, tx).await?)
+    {
         return Ok(());
     }
     match slice.layout {

@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "11";
+pub(crate) const PROTOCOL: &str = "12";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -257,6 +257,7 @@ const MIGRATIONS: &[&str] = &[
     BACKUPS,
     REPLICATION,
     VERSION_ORDER,
+    TIERS,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -3717,6 +3718,105 @@ CREATE INDEX objects_versions ON objects (bucket, key, last_modified DESC, id DE
 ALTER TABLE inventories ADD COLUMN cursor_modified timestamptz;
 UPDATE inventories i SET cursor_modified = o.last_modified
 FROM objects o WHERE o.id = i.cursor_id;
+"#;
+
+/// Migration 77: remote storage tiers (see `tiers`): buckets of other S3
+/// services that storage classes keep their data in, rather than in a pool
+/// of the nodes' disks.
+///
+/// - `tiers`: each tier's location, credentials and key, the storage class
+///   its objects are written in there, and whether this cluster may write
+///   to it and delete from it (`writable`: not after a restore, whose tier
+///   the old cluster may still use).
+/// - `storage_classes.tier`: the tier a class keeps its data in, if any.
+///   Its blobs are written into STANDARD's pool first, and moved to the
+///   tier by the packer.
+/// - A blob in the new state `remote` is an object of a tier
+///   (`tier_blobs`), which no node holds. Its row is changed and deleted
+///   under X(x), as any blob's; deleting it (and so its `tier_blobs` row,
+///   by the cascade) queues its object for deletion (`tier_garbage`, by a
+///   trigger), once the backup's retention has passed.
+/// - `backup_tier_moves`: parts that moved into or out of a tier, which
+///   the backup records anew (see `backup::cycle`), queued by the packer's
+///   commits while there's a backup; and the backup's objects of the new
+///   kind `tier`, which are the tiers' objects it points parts at, but
+///   never writes or deletes.
+///
+/// The protocol goes to 12: a node of 11 can't read remote blobs, and
+/// its backup would try to copy them.
+const TIERS: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '12' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE TABLE tiers (
+    name              text PRIMARY KEY CHECK (name ~ '^[a-z0-9][a-z0-9_-]{0,31}$'),
+    endpoint          text NOT NULL,
+    region            text NOT NULL,
+    bucket            text NOT NULL,
+    prefix            text NOT NULL,
+    path_style        boolean NOT NULL,
+    access_key_id     text NOT NULL,
+    secret_access_key text NOT NULL,
+    key               bytea NOT NULL CHECK (octet_length(key) = 32),
+    remote_class      text,
+    writable          boolean NOT NULL DEFAULT true,
+    created_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE TRIGGER tiers_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON tiers
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+
+ALTER TABLE storage_classes ADD COLUMN tier text REFERENCES tiers (name);
+
+ALTER TABLE blobs DROP CONSTRAINT blobs_state_check;
+ALTER TABLE blobs ADD CONSTRAINT blobs_state_check
+    CHECK (state = ANY (ARRAY['pending', 'committed', 'restoring', 'remote']));
+-- The packer's candidates for compacting and moving a class's remote blobs.
+CREATE INDEX blobs_remote ON blobs (storage_class, created_at) WHERE state = 'remote';
+
+CREATE TABLE tier_blobs (
+    blob_id uuid PRIMARY KEY REFERENCES blobs (blob_id) ON DELETE CASCADE,
+    tier    text NOT NULL REFERENCES tiers (name),
+    name    text NOT NULL,
+    size    bigint NOT NULL CHECK (size >= 0)
+);
+CREATE INDEX tier_blobs_tier ON tier_blobs (tier);
+CREATE TABLE tier_garbage (
+    seq        bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    tier       text NOT NULL,
+    name       text NOT NULL,
+    dropped_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX tier_garbage_dropped ON tier_garbage (dropped_at);
+CREATE FUNCTION cairn_tier_garbage() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO tier_garbage (tier, name) VALUES (OLD.tier, OLD.name);
+    RETURN NULL;
+END
+$$;
+CREATE TRIGGER tier_blobs_garbage AFTER DELETE ON tier_blobs
+    FOR EACH ROW EXECUTE FUNCTION cairn_tier_garbage();
+
+CREATE TABLE backup_tier_moves (
+    seq     bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    part_id bigint NOT NULL
+);
+ALTER TABLE backup_objects DROP CONSTRAINT backup_objects_kind_check;
+ALTER TABLE backup_objects ADD CONSTRAINT backup_objects_kind_check
+    CHECK (kind IN ('pack', 'journal', 'base', 'tier'));
+
+CREATE TRIGGER tier_blobs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON tier_blobs
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER tier_garbage_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON tier_garbage
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER backup_tier_moves_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON backup_tier_moves
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

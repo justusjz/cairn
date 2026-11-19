@@ -43,6 +43,14 @@
 //! a cycle (`backfill_after`), as are those of a parts table that was ever
 //! truncated: until that's done, a restore would lack them.
 //!
+//! Parts in remote tiers (see `tiers`) aren't copied: they're recorded as
+//! being in the tier's object, which the backup lists among its objects (of
+//! the kind `tier`, by the remote blob's ID) but never writes or deletes. The
+//! packer queues the parts it moves into or out of a tier
+//! (`backup_tier_moves`), and the next cycle records them anew: pointed at
+//! the tier, or backed up again if they came back into the cluster (whose
+//! tier object is going). A restore makes those parts remote blobs again.
+//!
 //! ## Few objects, and little rewriting
 //!
 //! Objects aren't rewritten to reclaim space, which with versioning on the
@@ -623,6 +631,7 @@ async fn enable(
             "DELETE FROM backup_parts;
              DELETE FROM backup_objects;
              DELETE FROM backup_changes;
+             DELETE FROM backup_tier_moves;
              UPDATE backup_state SET journal_seq = 0, journal_id = NULL, journal_at = NULL, base_seq = NULL,
                  base_id = NULL, base_at = NULL, base_version = NULL, base_size = NULL,
                  journals_since_base = 0, bytes_since_base = 0, backfill_after = 0, cycled_at = NULL,
@@ -736,6 +745,15 @@ async fn status(app: &Arc<App>, out: &mut Output) -> anyhow::Result<()> {
                 )
                 .await?;
             for row in rows {
+                if row.get::<_, &str>(0) == "tier" {
+                    outln!(
+                        out,
+                        "  in tiers, not copied: {} objects ({} bytes)",
+                        row.get::<_, i64>(1),
+                        row.get::<_, i64>(2)
+                    );
+                    continue;
+                }
                 outln!(
                     out,
                     "  {}s: {} ({} bytes{})",
@@ -754,7 +772,7 @@ async fn status(app: &Arc<App>, out: &mut Output) -> anyhow::Result<()> {
 }
 
 #[cfg(test)]
-mod e2e;
+pub(crate) mod e2e;
 
 #[cfg(test)]
 mod tests {

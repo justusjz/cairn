@@ -74,6 +74,7 @@ mod sso;
 mod shards;
 mod store;
 mod templates;
+mod tiers;
 mod users;
 mod writing;
 
@@ -237,6 +238,9 @@ enum Command {
     Class(classes::ClassArgs),
     /// Temporary credentials (STS's sessions): end all of them.
     Sessions(sessions::SessionsArgs),
+    /// Remote tiers: buckets of other S3 services that storage classes
+    /// keep their data in.
+    Tier(tiers::TierArgs),
     /// Back the cluster up to another S3 service, continuously.
     Backup(backup::BackupArgs),
     /// Restore a cluster from its backup, into a new database (run before
@@ -361,6 +365,7 @@ fn remote_command(command: Command) -> anyhow::Result<(admin::Remote, admin::Com
         Command::Config(args) => (args.remote.clone(), admin::Command::Config(args)),
         Command::Node(args) => (args.remote.clone(), admin::Command::Node(args)),
         Command::Class(args) => (args.remote.clone(), admin::Command::Class(args)),
+        Command::Tier(args) => (args.remote.clone(), admin::Command::Tier(args)),
         Command::Sessions(args) => (args.remote.clone(), admin::Command::Sessions(args)),
         Command::Backup(args) => (args.remote.clone(), admin::Command::Backup(args)),
     })

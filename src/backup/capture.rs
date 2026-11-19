@@ -42,6 +42,8 @@ pub const EXCLUDED: &[&str] = &[
     "blob_garbage",
     "lost_ranges",
     "scrub_findings",
+    "tier_blobs",
+    "tier_garbage",
     // The backup's own, and a restore's.
     "backup_config",
     "backup_state",
@@ -50,6 +52,7 @@ pub const EXCLUDED: &[&str] = &[
     "backup_parts",
     "restore_source",
     "restore_blobs",
+    "backup_tier_moves",
 ];
 
 /// A table's columns that say where its data is, rather than what it is:
@@ -367,7 +370,7 @@ mod tests {
         "permission_set_provisions", "permission_sets", "replication_queue", "role_grants", "root_mfa_devices",
         "session_keys",
         "settings", "sns_deliveries", "sns_signing_keys", "sns_subscriptions", "sns_tokens", "sns_topics",
-        "sso_operations", "storage_classes", "user_attached_policies", "user_policies", "user_tags", "users",
+        "sso_operations", "storage_classes", "tiers", "user_attached_policies", "user_policies", "user_tags", "users",
     ];
 
     #[tokio::test]

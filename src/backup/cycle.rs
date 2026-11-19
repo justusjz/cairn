@@ -26,6 +26,8 @@ const CHANGES_PER_JOURNAL: i64 = 200_000;
 const BACKFILL_PACKS: u64 = 16;
 /// How many such parts a cycle looks at, at most.
 const BACKFILL_ROWS: i64 = 100_000;
+/// How many parts that moved into or out of a tier a cycle takes, at most.
+const MOVES_PER_JOURNAL: i64 = 100_000;
 /// How long a journal's parts may wait to be packed: until there are a
 /// pack's worth, or a day has passed.
 const SEAL_AFTER_SECS: i64 = 24 * 3600;
@@ -277,6 +279,19 @@ impl Runner<'_> {
             changes.push((xid.parse::<u64>()?, tbl, op, key, image));
         }
         let new_ids: Vec<i64> = inserted.into_iter().filter(|id| !deleted.contains(id)).collect();
+        // Parts that moved into or out of a tier since (see `tiers`): the
+        // backup points those in a tier at its objects, and backs up
+        // anew those that came back, whose tier object is going.
+        let moves = self
+            .client()
+            .await?
+            .query(
+                "SELECT seq, part_id FROM backup_tier_moves ORDER BY seq LIMIT $1",
+                &[&MOVES_PER_JOURNAL],
+            )
+            .await?;
+        let moved_seqs: Vec<i64> = moves.iter().map(|r| r.get(0)).collect();
+        let moved_ids: Vec<i64> = moves.iter().map(|r| r.get::<_, i64>(1)).filter(|id| !deleted.contains(id)).collect();
 
         // The parts to back up: those just added (unless they're there
         // already, as copies of what is), and some of those from before.
@@ -345,6 +360,62 @@ impl Runner<'_> {
             }
             backfill = (stopped || rows.len() as i64 == BACKFILL_ROWS).then_some(last);
         }
+        // Parts that came back from a tier, whose record points at the
+        // tier's object: backed up anew.
+        if !moved_ids.is_empty() && !truncated {
+            let rows = client
+                .query(
+                    &format!(
+                        "SELECT {CANDIDATE_COLUMNS}, {LOST}
+                         FROM parts p JOIN blobs b ON b.blob_id = p.blob_id
+                         WHERE p.id = ANY($1) AND b.state <> 'remote'
+                           AND NOT EXISTS (SELECT 1 FROM backup_parts bp JOIN backup_objects o ON o.id = bp.object
+                                           WHERE bp.part_id = p.id AND o.kind <> 'tier')"
+                    ),
+                    &[&moved_ids],
+                )
+                .await?;
+            let taken: HashSet<i64> = fresh.iter().map(|c| c.part.id).collect();
+            for row in &rows {
+                let id: i64 = row.get(0);
+                if taken.contains(&id) {
+                    continue;
+                }
+                if row.get::<_, bool>(7) {
+                    unavailable.push(id);
+                } else {
+                    fresh.push(candidate(row));
+                }
+            }
+        }
+        // Parts in a tier: pointed at its objects, rather than copied.
+        let mut tier_objects: Vec<ObjectRef> = Vec::new();
+        {
+            let ids: Vec<i64> = fresh.iter().map(|c| c.part.id).chain(moved_ids.iter().copied()).collect();
+            let rows = client
+                .query(
+                    "SELECT p.id, p.blob_id, p.blob_offset, p.size, b.storage_class, tb.tier, tb.name, tb.size
+                     FROM parts p JOIN blobs b ON b.blob_id = p.blob_id JOIN tier_blobs tb ON tb.blob_id = p.blob_id
+                     WHERE p.id = ANY($1) AND b.state = 'remote'",
+                    &[&ids],
+                )
+                .await?;
+            let mut tiered: HashSet<i64> = HashSet::new();
+            let mut objects: HashSet<Uuid> = HashSet::new();
+            for row in &rows {
+                let id: i64 = row.get(0);
+                if !tiered.insert(id) {
+                    continue;
+                }
+                let blob: Uuid = row.get(1);
+                mappings.push((id, blob, row.get::<_, i64>(2) as u64, row.get::<_, i64>(3) as u64, row.get(4)));
+                if objects.insert(blob) {
+                    let (tier, name, size): (String, String, i64) = (row.get(5), row.get(6), row.get(7));
+                    tier_objects.push(ObjectRef { id: blob, name: format::tier_object_name(&tier, &name), size: size as u64 });
+                }
+            }
+            fresh.retain(|c| !tiered.contains(&c.part.id));
+        }
         // Parts whose bytes are backed up already, as another part's: a copy.
         if !fresh.is_empty() && !truncated {
             let mut blobs: Vec<Uuid> = fresh.iter().map(|c| c.part.blob_id).collect();
@@ -354,6 +425,7 @@ impl Runner<'_> {
                 .query(
                     "SELECT q.blob_id, q.blob_offset, q.size, bp.object, bp.\"offset\"
                      FROM parts q JOIN backup_parts bp ON bp.part_id = q.id
+                     JOIN backup_objects o ON o.id = bp.object AND o.kind <> 'tier'
                      WHERE q.blob_id = ANY($1)",
                     &[&blobs],
                 )
@@ -419,13 +491,14 @@ impl Runner<'_> {
                         "SELECT {CANDIDATE_COLUMNS}, {LOST}
                          FROM backup_parts bp JOIN parts p ON p.id = bp.part_id
                          JOIN blobs b ON b.blob_id = p.blob_id
-                         WHERE bp.object = ANY($1)"
+                         WHERE bp.object = ANY($1) AND b.state <> 'remote'"
                     ),
                     &[&rewrite],
                 )
                 .await?;
+            let mapped: HashSet<i64> = mappings.iter().map(|m| m.0).collect();
             for row in &rows {
-                if !deleted.contains(&row.get(0)) && !row.get::<_, bool>(7) {
+                if !deleted.contains(&row.get(0)) && !mapped.contains(&row.get(0)) && !row.get::<_, bool>(7) {
                     moved.push(candidate(row));
                 }
             }
@@ -444,10 +517,11 @@ impl Runner<'_> {
         // to be restorable.
         let base_waits = state.base_ready_seq.is_some_and(|ready| state.journal_seq <= ready);
         if changes.is_empty() && packs.is_empty() && inline.is_none() && mappings.is_empty() && !truncated && !base_waits {
-            if backfill != state.backfill_after {
-                self.commit_backfill(backfill).await?;
+            if backfill != state.backfill_after || !moved_seqs.is_empty() {
+                self.commit_backfill(backfill, &moved_seqs).await?;
             }
-            return Ok(Cycle { again: backfill.is_some(), ..Cycle::default() });
+            let more_moves = moved_seqs.len() as i64 == MOVES_PER_JOURNAL;
+            return Ok(Cycle { again: backfill.is_some() || more_moves, ..Cycle::default() });
         }
 
         // Every object is recorded before it's written, as garbage until the
@@ -480,7 +554,7 @@ impl Runner<'_> {
         let result = self
             .write_cycle(
                 state, seq, journal_id, &journal, &snapshot, version, changes, sequences, &packs, &pack_ids, inline,
-                &classes, mappings, unavailable, !full, &mut written,
+                &classes, mappings, tier_objects.clone(), unavailable, !full, &mut written,
             )
             .await;
         let (meta_parts, sizes, journal_size) = match result {
@@ -501,15 +575,16 @@ impl Runner<'_> {
         let bytes: u64 = sizes.iter().sum::<u64>() + journal_size;
         self.commit(
             state, seq, journal_id, journal_size, &consumed, &deleted, truncated, &meta_parts, &pack_ids, &sizes,
-            backfill, !full,
+            &tier_objects, &moved_seqs, backfill, !full,
         )
         .await?;
+        let more_moves = moved_seqs.len() as i64 == MOVES_PER_JOURNAL;
         Ok(Cycle {
             journal: Some(seq),
             changes: consumed.len(),
             parts,
             bytes,
-            again: full || backfill.is_some() || any_unavailable,
+            again: full || backfill.is_some() || any_unavailable || more_moves,
             needs_base: false,
         })
     }
@@ -532,6 +607,7 @@ impl Runner<'_> {
         inline: Option<Output>,
         classes: &HashMap<i64, String>,
         mut mappings: Vec<PartRef>,
+        tier_objects: Vec<ObjectRef>,
         unavailable: Vec<i64>,
         complete: bool,
         written: &mut Vec<String>,
@@ -544,7 +620,7 @@ impl Runner<'_> {
             .into_iter()
             .collect();
         let blobs = load_blobs(&self.client().await?, self.app.node, &all).await?;
-        let mut objects = Vec::new();
+        let mut objects = tier_objects;
         let mut sizes = Vec::new();
         for (output, id) in packs.iter().zip(pack_ids) {
             let name = format::pack_name(*id);
@@ -629,6 +705,8 @@ impl Runner<'_> {
         mappings: &[PartRef],
         pack_ids: &[Uuid],
         pack_sizes: &[u64],
+        tier_objects: &[ObjectRef],
+        moved_seqs: &[i64],
         backfill: Option<i64>,
         complete: bool,
     ) -> anyhow::Result<()> {
@@ -636,6 +714,19 @@ impl Runner<'_> {
         let tx = client.transaction().await?;
         self.check_generation(&tx).await?;
         tx.execute("DELETE FROM backup_changes WHERE seq = ANY($1)", &[&consumed]).await?;
+        tx.execute("DELETE FROM backup_tier_moves WHERE seq = ANY($1)", &[&moved_seqs]).await?;
+        // The tiers' objects that parts are in now: recorded, but never
+        // written or deleted by the backup.
+        let ids: Vec<Uuid> = tier_objects.iter().map(|o| o.id).collect();
+        let names: Vec<String> = tier_objects.iter().map(|o| o.name.clone()).collect();
+        let sizes: Vec<i64> = tier_objects.iter().map(|o| o.size as i64).collect();
+        tx.execute(
+            "INSERT INTO backup_objects (id, name, kind, size, dead_since)
+             SELECT id, name, 'tier', size, now() FROM unnest($1::uuid[], $2::text[], $3::bigint[]) AS t(id, name, size)
+             ON CONFLICT (id) DO NOTHING",
+            &[&ids, &names, &sizes],
+        )
+        .await?;
         if truncated {
             tx.batch_execute(
                 "DELETE FROM backup_parts;
@@ -712,11 +803,12 @@ impl Runner<'_> {
         Ok(())
     }
 
-    async fn commit_backfill(&mut self, backfill: Option<i64>) -> anyhow::Result<()> {
+    async fn commit_backfill(&mut self, backfill: Option<i64>, moved_seqs: &[i64]) -> anyhow::Result<()> {
         let mut client = self.client().await?;
         let tx = client.transaction().await?;
         self.check_generation(&tx).await?;
         tx.execute("UPDATE backup_state SET backfill_after = $1", &[&backfill]).await?;
+        tx.execute("DELETE FROM backup_tier_moves WHERE seq = ANY($1)", &[&moved_seqs]).await?;
         tx.commit().await?;
         Ok(())
     }
@@ -763,6 +855,16 @@ impl Runner<'_> {
                         AND base IS DISTINCT FROM $2)
                  LIMIT 1000",
                 &[&retention, &building],
+            )
+            .await?;
+        // The tiers' objects that nothing points at anymore, that long:
+        // forgotten, but left where they are (they're the tiers', see
+        // `tiers`).
+        client
+            .execute(
+                "DELETE FROM backup_objects WHERE kind = 'tier' AND refs = 0
+                     AND dead_since < now() - make_interval(secs => $1)",
+                &[&retention],
             )
             .await?;
         if rows.is_empty() {

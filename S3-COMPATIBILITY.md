@@ -167,7 +167,10 @@ have S3's names or others.
   HEAD for any class but STANDARD, `StorageClass` in listings,
   GetObjectAttributes, ListParts, ListMultipartUploads and inventory reports.
 - Every class is read as STANDARD is: none needs a restore, and none has a
-  minimum duration or size.
+  minimum duration or size. That holds for classes kept in a remote tier
+  too (another S3 service, see the README), whose data is read from there;
+  tiers whose objects would need a restore (`GLACIER`, `DEEP_ARCHIVE` on
+  AWS) aren't supported yet, so `RestoreObject` isn't either.
 - A copy into another class writes the data again; a copy without
   `x-amz-storage-class` is STANDARD, as in S3.
 - Lifecycle transitions aren't supported (`501`).

@@ -2546,6 +2546,18 @@ export interface components {
             /** Format: int64 */
             parity_shards?: number | null;
             pool: string;
+            /**
+             * Format: int64
+             * @description Its blobs in tiers, and their bytes.
+             */
+            remote_blobs: number;
+            /** Format: int64 */
+            remote_bytes: number;
+            /**
+             * @description The remote tier it keeps its data in, if it's a tier's (see `tiers`):
+             *     then its pool and layout are STANDARD's, which its data waits in.
+             */
+            tier?: string | null;
         };
         Cluster: {
             nodes: components["schemas"]["ClusterNode"][];

@@ -17,15 +17,15 @@ use crate::{App, packer};
 
 /// A node serving its S3 API on a port of its own, with an admin's key:
 /// the target. Stops serving when the returned sender is dropped.
-struct Target {
-    app: Arc<App>,
-    address: std::net::SocketAddr,
-    key_id: String,
-    secret: String,
+pub(crate) struct Target {
+    pub(crate) app: Arc<App>,
+    pub(crate) address: std::net::SocketAddr,
+    pub(crate) key_id: String,
+    pub(crate) secret: String,
     _stop: tokio::sync::oneshot::Sender<()>,
 }
 
-async fn target() -> Option<Target> {
+pub(crate) async fn target() -> Option<Target> {
     let app = node_with(packer::Config::default(), None).await?;
     let out = cairn(&app, &["user", "create", "backups", "--admin", "--key"]).await;
     let key_id = out.stdout.lines().find_map(|l| l.strip_prefix("access key: ")).unwrap().to_owned();
@@ -63,7 +63,7 @@ async fn target() -> Option<Target> {
 
 /// Keeps a test node live, as `cairn serve`'s heartbeat does: a node
 /// unseen for 10 seconds takes no new data.
-fn keep_alive(app: &Arc<App>) {
+pub(crate) fn keep_alive(app: &Arc<App>) {
     let app = Arc::downgrade(app);
     tokio::spawn(async move {
         loop {
@@ -77,7 +77,7 @@ fn keep_alive(app: &Arc<App>) {
 }
 
 /// A new, empty database's URL.
-async fn empty_database() -> String {
+pub(crate) async fn empty_database() -> String {
     let url = std::env::var("CAIRN_TEST_DATABASE").unwrap();
     let (admin, connection) = tokio_postgres::connect(&url, NoTls).await.unwrap();
     tokio::spawn(connection);
@@ -92,7 +92,7 @@ fn content(i: usize, len: usize) -> Vec<u8> {
 }
 
 /// Turns the backup on, to `prefix` of the target's bucket.
-async fn enable(app: &Arc<App>, target: &Target, prefix: &str, extra: &[&str]) -> String {
+pub(crate) async fn enable(app: &Arc<App>, target: &Target, prefix: &str, extra: &[&str]) -> String {
     let endpoint = format!("http://{}", target.address);
     let mut args = vec![
         "backup", "enable", "--endpoint", &endpoint, "--bucket", BUCKET, "--prefix", prefix, "--path-style",
@@ -105,7 +105,7 @@ async fn enable(app: &Arc<App>, target: &Target, prefix: &str, extra: &[&str]) -
 }
 
 /// Runs what's due of the backup, now.
-async fn cycle(app: &Arc<App>, token: Uuid) -> super::Report {
+pub(crate) async fn cycle(app: &Arc<App>, token: Uuid) -> super::Report {
     let out = cairn(app, &["backup", "now"]).await;
     assert_eq!(out.error, None);
     settle(app, token).await
@@ -113,7 +113,7 @@ async fn cycle(app: &Arc<App>, token: Uuid) -> super::Report {
 
 /// Runs steps of the backup (a base takes several, a chunk each, in tests)
 /// until there's nothing left to do.
-async fn settle(app: &Arc<App>, token: Uuid) -> super::Report {
+pub(crate) async fn settle(app: &Arc<App>, token: Uuid) -> super::Report {
     let mut report = super::Report::default();
     for _ in 0..10_000 {
         match super::step(app, token).await {
@@ -134,11 +134,11 @@ async fn settle(app: &Arc<App>, token: Uuid) -> super::Report {
 }
 
 /// The state of the backup.
-async fn state(app: &Arc<App>) -> super::State {
+pub(crate) async fn state(app: &Arc<App>) -> super::State {
     super::load_state(&app.pool.get().await.unwrap()).await.unwrap()
 }
 
-fn restore_args(database: &str, target: &Target, prefix: &str, key: &str, at: Option<i64>) -> RestoreArgs {
+pub(crate) fn restore_args(database: &str, target: &Target, prefix: &str, key: &str, at: Option<i64>) -> RestoreArgs {
     RestoreArgs {
         database: database.to_owned(),
         location: super::LocationArgs {
@@ -153,11 +153,12 @@ fn restore_args(database: &str, target: &Target, prefix: &str, key: &str, at: Op
         key: key.to_owned(),
         at,
         list: false,
+        writable_tiers: false,
     }
 }
 
 /// A node on a restored database.
-async fn restored_node(database: &str) -> Arc<App> {
+pub(crate) async fn restored_node(database: &str) -> Arc<App> {
     let pool = crate::db::connect(database).await.unwrap();
     let app = node_with_pools(&pool, "http://127.0.0.1:1", packer::Config::default(), None, 1, &[crate::classes::DEFAULT_POOL])
         .await;
