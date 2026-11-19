@@ -60,7 +60,7 @@ pub fn role_session(chosen: &Eligible, session: &store::DirectorySession) -> any
 /// in the account it picked.
 /// Signed in at an identity source, which Cairn takes as no second factor,
 /// `aws:MultiFactorAuthPresent` is false; signed in with a passkey (a user
-/// of Cairn's own directory), it's true, as a login's is.
+/// of Cairn's own directory), it's true.
 pub async fn user(
     client: &Object,
     session: &store::DirectorySession,

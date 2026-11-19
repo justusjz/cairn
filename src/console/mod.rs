@@ -1,9 +1,11 @@
-//! The console: Cairn's web UI, with a sign-in of its own (passkeys, or an
-//! OIDC provider), on its own listener (`--listen-console`) and origin
-//! (`--console-url`). People manage the account's buckets, objects and
-//! users there, and its operators (whose policies allow `cairn:` actions)
-//! watch and run the cluster. See `plans/console.md`,
-//! `plans/single-account.md`.
+//! The console: Cairn's web UI, which people sign in to as directory users
+//! (Identity Center's: with passkeys, as users of Cairn's own directory, or
+//! at an OIDC provider), on its own listener (`--listen-console`) and
+//! origin (`--console-url`). They act as the permission set they pick, in
+//! one of the organization's accounts, managing its buckets, objects and
+//! IAM there, and operators (whose policies allow `cairn:` actions) watch
+//! and run the cluster. The root user gets in with a link from a node, to
+//! get back in. See `plans/console.md`.
 //!
 //! Not on the S3 port: objects are served from the S3 origin with whatever
 //! `Content-Type` they were given, so an HTML object there could run script
@@ -19,8 +21,8 @@
 //!
 //! The UI (`ui/`) is built into `ui/dist`, embedded in the binary, and
 //! served from the root here (see `web`). Its API is under `/api`: signing
-//! in and the login's own passkeys and identities (`api`), and what the
-//! session's identity manages (`manage`), as that identity (`actor`).
+//! in and the user's own passkeys (`api`), and what the session's identity
+//! manages (`manage`), as that identity (`actor`).
 
 use std::sync::Arc;
 
@@ -76,8 +78,8 @@ pub struct Shared {
     /// The last `/storage` report, and when it was made. It takes scans of
     /// whole tables, so every page polling it shares one report a while.
     storage: tokio::sync::Mutex<Option<(std::time::Instant, manage::Storage)>>,
-    /// The console's origin, if this node serves it: enrollment links are
-    /// made from it.
+    /// The console's origin, if this node serves it: setup links are made
+    /// from it.
     origin: Option<String>,
     /// How often each client may start signing in (see `limit`).
     sign_ins: limit::Limiter,
@@ -254,8 +256,8 @@ async fn user_of(
     switch::apply(&console.app.pool.get().await?, &token, base).await
 }
 
-/// Who a request's session was signed in as: a login's user, a directory
-/// user's permission set's role's session, or the account's root user.
+/// Who a request's session was signed in as: a directory user's permission
+/// set's role's session, or the account's root user.
 async fn signed_in_user_of(
     console: &Console,
     method: Method,
@@ -266,8 +268,9 @@ async fn signed_in_user_of(
     let unauthorized = || ApiError::Unauthorized("sign in first".into());
     let token = session_token(&headers).ok_or_else(unauthorized)?;
     let client = console.app.pool.get().await?;
-    if let Some(session) = store::session(&client, &token).await? {
-        return session_user(&client, &session, method, headers, query, peer).await?.ok_or_else(unauthorized);
+    #[cfg(test)]
+    if let Some(user) = e2e::test_session(&client, &token, &method, &headers, &query, peer).await {
+        return Ok(user);
     }
     if let Some(session) = store::directory_session(&client, &token).await? {
         return directory::user(&client, &session, method, headers, query, peer).await;
@@ -290,21 +293,6 @@ fn root_user(
     actor::User { principal, account: root.account_id.clone(), method, headers, query, peer, mfa_age: None }
 }
 
-/// Who `session` acts as, for a request (`method`, `headers`, `query`, from
-/// `peer`); `None` if its user is gone.
-async fn session_user(
-    client: &deadpool_postgres::Object,
-    session: &store::Session,
-    method: Method,
-    headers: HeaderMap,
-    query: String,
-    peer: Option<std::net::IpAddr>,
-) -> Result<Option<actor::User>, ApiError> {
-    let Some(principal) = Principal::load_user(client, session.identity.user.id).await? else { return Ok(None) };
-    let account = session.identity.account_id.clone();
-    Ok(Some(actor::User { principal, account, method, headers, query, peer, mfa_age: Some(session.mfa_age) }))
-}
-
 /// A file of the console's UI, or else its page.
 async fn static_file(method: Method, uri: Uri) -> Response {
     if !matches!(method, Method::GET | Method::HEAD) {
@@ -323,7 +311,7 @@ fn session_token(headers: &HeaderMap) -> Option<String> {
         .find_map(|c| c.trim().strip_prefix(COOKIE)?.strip_prefix('=').map(str::to_owned))
 }
 
-/// A `Set-Cookie` that starts a session.
+/// A `Set-Cookie` that starts a directory user's session.
 fn session_cookie(token: &str) -> HeaderValue {
     cookie(token, store::SESSION_TTL)
 }
@@ -344,43 +332,10 @@ fn cleared_cookie() -> HeaderValue {
     HeaderValue::from_str(&format!("{COOKIE}=; Path=/; Secure; HttpOnly; SameSite=Strict; Max-Age=0")).unwrap()
 }
 
-/// The signed-in session of a request: handlers that take it answer 401
-/// without one, and 403 to the account's root user and to directory users,
-/// which have no login (no passkeys or identities of their own).
-pub(crate) struct Signed {
-    pub session: store::Session,
-    /// The session's token (to switch it).
-    pub token: String,
-}
-
-impl FromRequestParts<Arc<Console>> for Signed {
-    type Rejection = ApiError;
-
-    async fn from_request_parts(parts: &mut Parts, console: &Arc<Console>) -> Result<Self, ApiError> {
-        let unauthorized = || ApiError::Unauthorized("sign in first".into());
-        let token = session_token(&parts.headers).ok_or_else(unauthorized)?;
-        let client = console.app.pool.get().await?;
-        match store::session(&client, &token).await? {
-            Some(session) => Ok(Signed { session, token }),
-            None if store::root_session(&client, &token).await?.is_some() => {
-                Err(ApiError::Forbidden("the root user has no login: it has no passkeys or identities to manage".into()))
-            }
-            None if store::directory_session(&client, &token).await?.is_some() => Err(ApiError::Forbidden(
-                "directory users have no login: they sign in at their identity source".into(),
-            )),
-            None => Err(unauthorized()),
-        }
-    }
-}
-
-/// Whose passkeys a request's session manages: a login's, or a user of
-/// Cairn's own directory's. Handlers that take it answer 401 without a
-/// session, and 403 to the root user and to users of identity sources,
-/// which have none.
-pub(crate) enum PasskeyHolder {
-    Login(store::Session),
-    Directory(store::DirectorySession),
-}
+/// The session of a user of Cairn's own directory, which manages its
+/// passkeys. Handlers that take it answer 401 without a session, and 403 to
+/// the root user and to users of identity sources, which have none.
+pub(crate) struct PasskeyHolder(pub store::DirectorySession);
 
 impl FromRequestParts<Arc<Console>> for PasskeyHolder {
     type Rejection = ApiError;
@@ -389,11 +344,8 @@ impl FromRequestParts<Arc<Console>> for PasskeyHolder {
         let unauthorized = || ApiError::Unauthorized("sign in first".into());
         let token = session_token(&parts.headers).ok_or_else(unauthorized)?;
         let client = console.app.pool.get().await?;
-        if let Some(session) = store::session(&client, &token).await? {
-            return Ok(PasskeyHolder::Login(session));
-        }
         match store::directory_session(&client, &token).await? {
-            Some(session) if session.provider.is_none() => Ok(PasskeyHolder::Directory(session)),
+            Some(session) if session.provider.is_none() => Ok(PasskeyHolder(session)),
             Some(_) => Err(ApiError::Forbidden("you sign in at your identity source: you have no passkeys here".into())),
             None if store::root_session(&client, &token).await?.is_some() => {
                 Err(ApiError::Forbidden("the root user has no passkeys: it signs in with a link from a node".into()))
@@ -592,128 +544,6 @@ mod e2e {
         browser.send("POST", "/api/login", Some(body)).await
     }
 
-    /// `cairn user create` makes a person: a user without access keys, with
-    /// a link that enrolls it; a second of the name is refused, and makes
-    /// no link.
-    #[tokio::test]
-    async fn creates_a_person_with_a_link() {
-        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
-        let client = app.pool.get().await.unwrap();
-        let account = crate::users::account(&client).await.unwrap();
-        let token = store::create_person(&client, &account, "ada", true).await.unwrap();
-        let ada = users::list(&client).await.unwrap().into_iter().find(|u| u.name == "ada").unwrap();
-        assert!(Principal::load_user(&client, ada.id).await.unwrap().unwrap().admin);
-        assert!(ada.keys.is_empty());
-        let err = store::create_person(&client, &account, "ADA", false).await.unwrap_err();
-        assert!(err.to_string().contains("already exists"), "{err}");
-
-        let console = Arc::new(Console { app: app.clone(), party: party() });
-        let mut browser = Browser { console, cookie: None, origin: party().origin };
-        let (status, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
-        assert_eq!(status, StatusCode::OK, "{ceremony}");
-        assert_eq!(ceremony["identity"], "ada");
-    }
-
-    /// A user enrolls its first passkey through a link, signs in with it,
-    /// adds a second, can't remove its last, and signs out.
-    #[tokio::test]
-    async fn enrolls_signs_in_and_manages_passkeys() {
-        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
-        let client = app.pool.get().await.unwrap();
-        users::create(&client, "ada", None, true).await.unwrap();
-        let console = Arc::new(Console { app: app.clone(), party: party() });
-        let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
-
-        // Not signed in, and no one could yet.
-        assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(browser.send("GET", "/api/setup", None).await.1["enrolled"], false);
-
-        // The link.
-        let token = store::create_enrollment(&client, &crate::users::account(&client).await.unwrap(), "ada").await.unwrap();
-        let (status, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
-        assert_eq!(status, StatusCode::OK, "{ceremony}");
-        assert_eq!(ceremony["identity"], "ada");
-        assert_eq!(ceremony["options"]["rp"]["id"], "console.example.com");
-        assert_eq!(ceremony["options"]["authenticatorSelection"]["userVerification"], "required");
-        let mut laptop = Authenticator::p256();
-        let mut body = registration(&mut laptop, &ceremony, "Laptop");
-        body["token"] = json!(token);
-        let (status, me) = browser.send("POST", "/api/enroll", Some(body.clone())).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        assert_eq!(me["name"], "ada");
-        assert_eq!(browser.send("GET", "/api/setup", None).await.1["enrolled"], true);
-        assert_eq!(me["identity"]["user"], "ada");
-        assert!(me["identity"]["arn"].as_str().unwrap().ends_with(":user/ada"));
-        assert_eq!(me["passkeys"][0]["name"], "Laptop");
-        assert_eq!(me["passkeys"][0]["current"], true);
-        assert!(browser.cookie.is_some());
-        // The link is used up, as is the challenge.
-        let (status, err) = browser.send("POST", "/api/enroll", Some(body)).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(err["error"].as_str().unwrap().contains("try again"), "{err}");
-        let (status, _) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-
-        // Signed in, it's the user's.
-        let (status, me) = browser.send("GET", "/api/me", None).await;
-        assert_eq!((status, me["identity"]["user"].as_str()), (StatusCode::OK, Some("ada")));
-
-        // A second passkey; not the same one twice.
-        let (_, ceremony) = browser.send("POST", "/api/passkeys/options", None).await;
-        assert_eq!(ceremony["options"]["excludeCredentials"].as_array().unwrap().len(), 1);
-        let mut phone = Authenticator::ed25519();
-        let body = registration(&mut phone, &ceremony, "Phone");
-        assert_eq!(browser.send("POST", "/api/passkeys", Some(body)).await.0, StatusCode::NO_CONTENT);
-        let (_, ceremony) = browser.send("POST", "/api/passkeys/options", None).await;
-        let body = registration(&mut phone, &ceremony, "Phone again");
-        let (status, err) = browser.send("POST", "/api/passkeys", Some(body)).await;
-        assert_eq!((status, err["error"].as_str()), (StatusCode::BAD_REQUEST, Some("this passkey is registered already")));
-
-        // Signing in with either, in a browser of its own.
-        let mut other = Browser { console: console.clone(), cookie: None, origin: party().origin };
-        let (status, me) = sign_in(&mut other, &mut phone).await;
-        assert_eq!(status, StatusCode::OK, "{me}");
-        let current: Vec<_> = me["passkeys"].as_array().unwrap().iter().map(|p| p["current"].as_bool().unwrap()).collect();
-        assert_eq!(current, [false, true]);
-        // A counter that goes backwards is refused (a cloned authenticator).
-        laptop.counter = 10;
-        assert_eq!(sign_in(&mut other, &mut laptop).await.0, StatusCode::OK);
-        laptop.counter = 3;
-        let (status, err) = sign_in(&mut other, &mut laptop).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(err["error"].as_str().unwrap().contains("went backwards"), "{err}");
-        // Nor from another origin.
-        let mut evil = Browser { console: console.clone(), cookie: None, origin: "https://evil.example.com".into() };
-        let (status, _) = evil.send("POST", "/api/login/options", None).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
-
-        // Removing the phone's passkey ends the sessions signed in with it.
-        let phone_id = URL_SAFE_NO_PAD.encode(&phone.credential_id);
-        let path = format!("/api/passkeys/{phone_id}");
-        assert_eq!(browser.send("PUT", &path, Some(json!({ "name": "Old phone" }))).await.0, StatusCode::NO_CONTENT);
-        assert_eq!(browser.send("DELETE", &path, None).await.0, StatusCode::NO_CONTENT);
-        let (status, _) = sign_in(&mut other, &mut phone).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        // Not the last one.
-        let laptop_id = URL_SAFE_NO_PAD.encode(&laptop.credential_id);
-        let (status, err) = browser.send("DELETE", &format!("/api/passkeys/{laptop_id}"), None).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert!(err["error"].as_str().unwrap().contains("last way"), "{err}");
-
-        // Signing out ends the session.
-        assert_eq!(browser.send("POST", "/api/logout", None).await.0, StatusCode::NO_CONTENT);
-        assert!(browser.cookie.is_none());
-        assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
-
-        // Deleting the user ends everything.
-        laptop.counter = 20;
-        let (status, _) = sign_in(&mut browser, &mut laptop).await;
-        assert_eq!(status, StatusCode::OK);
-        users::delete(&client, &crate::users::account(&client).await.unwrap(), "ada").await.unwrap();
-        assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
-        assert_eq!(store::reap(&client).await.unwrap(), 0);
-    }
-
     /// The console of node `app`.
     pub(super) fn console_of(app: &Arc<App>) -> Arc<Console> {
         Arc::new(Console { app: app.clone(), party: party() })
@@ -730,23 +560,75 @@ mod e2e {
         browser
     }
 
-    /// A browser signed in as a new user `name` (with a passkey of its own).
+    /// Sessions that act as IAM users (by token: the user's ID), for tests
+    /// of what the console does as a principal, under its policies: no one
+    /// signs in as an IAM user (people are directory users), but what a
+    /// principal may do is the same, and IAM users' policies are the
+    /// quickest to set up. They have MFA, as passkey sessions do.
+    static TEST_SESSIONS: std::sync::Mutex<Vec<(String, uuid::Uuid)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Who the test session of `token` acts as, while its user exists.
+    pub(super) async fn test_session(
+        client: &deadpool_postgres::Object,
+        token: &str,
+        method: &Method,
+        headers: &HeaderMap,
+        query: &str,
+        peer: Option<std::net::IpAddr>,
+    ) -> Option<actor::User> {
+        let id = TEST_SESSIONS.lock().unwrap().iter().find(|(t, _)| t == token).map(|(_, id)| *id)?;
+        let principal = Principal::load_user(client, id).await.unwrap()?;
+        let account = principal.account.clone();
+        let (method, headers, query) = (method.clone(), headers.clone(), query.to_owned());
+        Some(actor::User { principal, account, method, headers, query, peer, mfa_age: Some(0) })
+    }
+
+    /// A browser signed in as a new user `name` of the management account
+    /// (see `TEST_SESSIONS`).
     pub(super) async fn signed_in(console: &Arc<Console>, name: &str, admin: bool) -> Browser {
         let client = console.app.pool.get().await.unwrap();
         users::create(&client, name, None, admin).await.unwrap();
         let account = crate::users::account(&client).await.unwrap();
-        let token = store::create_enrollment(&client, &account, name).await.unwrap();
-        enrolled(console, &token).await
+        signed_in_as(console, &account, name).await
     }
 
-    /// A browser that enrolled with link `token`, with a passkey of its own.
-    pub(super) async fn enrolled(console: &Arc<Console>, token: &str) -> Browser {
+    /// A browser signed in as user `name` of account `account` (see
+    /// `TEST_SESSIONS`).
+    pub(super) async fn signed_in_as(console: &Arc<Console>, account: &str, name: &str) -> Browser {
+        let client = console.app.pool.get().await.unwrap();
+        let id = crate::users::id_of(&client, account, name).await.unwrap();
+        let token = uuid::Uuid::new_v4().to_string();
+        TEST_SESSIONS.lock().unwrap().push((token.clone(), id));
+        Browser { console: console.clone(), cookie: Some(token), origin: party().origin }
+    }
+
+    /// An inline policy that allows everything.
+    pub(super) const ADMIN: &str = r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#;
+
+    /// A browser signed in as a new user `name` of Cairn's own directory,
+    /// with a passkey (`key`), and permission set `name` assigned to it in
+    /// the management account, with `policy` inline: a real session, as
+    /// people have them.
+    pub(super) async fn directory_user(console: &Arc<Console>, name: &str, policy: &str) -> (Browser, Authenticator) {
+        use crate::identity_center as ic;
+        let client = console.app.pool.get().await.unwrap();
+        let account = crate::users::account(&client).await.unwrap();
+        let profile = json!({});
+        let own = ic::OwnUser { user_name: name, display_name: name, email: None, profile: &profile };
+        let user = ic::create_user(&client, &own).await.unwrap();
+        let new = ic::New { name, description: "", session_duration: 3600, relay_state: None, tags: None };
+        let set = ic::create(&client, &account, &new).await.unwrap();
+        ic::set_inline_policy(&client, &set, Some(policy)).await.unwrap();
+        ic::assign(&client, &set, &account, ic::PrincipalType::User, user.id).await.unwrap().unwrap();
+        let token = store::create_setup_link(&client, user.id).await.unwrap();
         let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let (_, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
-        let mut body = registration(&mut Authenticator::ed25519(), &ceremony, "Key");
+        let mut key = Authenticator::ed25519();
+        let mut body = registration(&mut key, &ceremony, "Key");
         body["token"] = json!(token);
-        assert_eq!(browser.send("POST", "/api/enroll", Some(body)).await.0, StatusCode::OK);
-        browser
+        let (status, me) = browser.send("POST", "/api/enroll", Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{me}");
+        (browser, key)
     }
 
     impl Browser {
@@ -1024,8 +906,8 @@ mod e2e {
     /// The account's root user signs in only with a link the command line
     /// makes, once: no identity policy restricts it (a boundary, a group's
     /// deny), a bucket policy that denies everyone denies it too, but never
-    /// its own getting, setting or deleting. It has no login to manage, no
-    /// MFA, and signs out as anyone does.
+    /// its own getting, setting or deleting. It has no passkeys to manage,
+    /// no MFA, and signs out as anyone does.
     #[tokio::test]
     async fn the_root_user_gets_back_in() {
         let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else { return };
@@ -1053,7 +935,7 @@ mod e2e {
         assert!(me["expires_at"].is_number(), "{me}");
         assert_eq!(root.send("GET", "/api/me", None).await.1["root"], true);
         // Signing in as the root ends the browser's session as a user.
-        let mut was_admin = signed_in(&console, "was-admin", true).await;
+        let (mut was_admin, _) = directory_user(&console, "was-admin", ADMIN).await;
         let session = was_admin.cookie.clone();
         let token = store::create_root_link(&client, &account).await.unwrap();
         assert_eq!(was_admin.send("POST", "/api/root/sign-in", Some(json!({ "token": token }))).await.0, StatusCode::OK);
@@ -1088,7 +970,7 @@ mod e2e {
         assert_eq!(root.send("DELETE", "/api/users/boss/boundary", None).await.0, StatusCode::NO_CONTENT);
         assert_eq!(admin.send("GET", "/api/users", None).await.0, StatusCode::OK);
 
-        // It has no login: no passkeys to add.
+        // It has no passkeys to add.
         assert_eq!(root.send("POST", "/api/passkeys/options", None).await.0, StatusCode::FORBIDDEN);
         // Signing out ends the session, not just the cookie.
         let cookie = root.cookie.clone();
@@ -1140,21 +1022,22 @@ mod e2e {
         let console = Arc::new(Console { app: app.clone(), party: party() });
         let client = app.pool.get().await.unwrap();
         let account = crate::users::account(&client).await.unwrap();
-        let mut ops = signed_in(&console, "guarded", false).await;
         let guarded = r#"{"Version":"2012-10-17","Statement":[
             {"Effect":"Allow","Action":"cairn:*","Resource":"*"},
             {"Effect":"Deny","Action":"cairn:*","Resource":"*","Condition":{"BoolIfExists":{"aws:MultiFactorAuthPresent":"false"}}},
             {"Effect":"Deny","Action":"cairn:PutSetting","Resource":"*","Condition":{"NumericGreaterThan":{"aws:MultiFactorAuthAge":"600"}}}
         ]}"#;
-        users::put_policy(&client, &account, "guarded", "guarded", guarded).await.unwrap();
+        let (mut ops, _) = directory_user(&console, "guarded", guarded).await;
         let (_, me) = ops.send("GET", "/api/me", None).await;
         assert_eq!((&me["mfa"], &me["cluster"]), (&json!(true), &json!(true)));
         assert_eq!(ops.send("GET", "/api/cluster", None).await.0, StatusCode::OK);
         // Its age is since it signed in.
-        client.execute("UPDATE console_sessions SET verified_at = now() - interval '1 hour'", &[]).await.unwrap();
+        client.execute("UPDATE console_directory_sessions SET verified_at = now() - interval '1 hour'", &[]).await.unwrap();
         assert_eq!(ops.send("GET", "/api/cluster", None).await.0, StatusCode::OK);
         let rate = Some(json!({ "rate": 5 }));
         assert_eq!(ops.send("PUT", "/api/lifecycle/rate", rate).await.0, StatusCode::FORBIDDEN);
+        users::create(&client, "guarded", None, false).await.unwrap();
+        users::put_policy(&client, &account, "guarded", "guarded", guarded).await.unwrap();
         // Its access keys have neither: the guard denies them.
         let user = Principal::load_user(&client, crate::users::id_of(&client, &account, "guarded").await.unwrap()).await.unwrap().unwrap();
         let origin = crate::s3::access::Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
@@ -1319,7 +1202,7 @@ mod e2e {
         assert!(me["identity"]["arn"].as_str().unwrap().starts_with(&format!("arn:aws:sts::{account}:assumed-role/AWSReservedSSO_Admins_")));
         assert!(me["identity"]["arn"].as_str().unwrap().ends_with("/ada@example.com"), "{me}");
         assert_eq!(ada.send("GET", "/api/users", None).await.0, StatusCode::OK);
-        // She has no login: no passkeys.
+        // She signs in at her identity source: no passkeys here.
         assert_eq!(ada.send("POST", "/api/passkeys/options", None).await.0, StatusCode::FORBIDDEN);
 
         // Her credentials are a session of the role, for its duration.
@@ -1398,17 +1281,16 @@ mod e2e {
         assert_eq!(admin.send("POST", "/api/directory-users", Some(grace)).await.0, StatusCode::CONFLICT);
         let id = made["id"].as_str().unwrap().to_owned();
 
-        // Its setup link: a passkey of its own, never a login's.
+        // Its setup link: a passkey of its own.
         let link_path = format!("/api/directory-users/{id}/setup-link");
         assert_eq!(tenant.send("POST", &link_path, None).await.0, StatusCode::FORBIDDEN);
         let (status, link) = admin.send("POST", &link_path, None).await;
         assert_eq!(status, StatusCode::CREATED, "{link}");
         let token = link["path"].as_str().unwrap().strip_prefix("/enroll#").unwrap().to_owned();
-        assert_eq!(admin.send("POST", "/api/enroll/link", Some(json!({ "token": token }))).await.0, StatusCode::BAD_REQUEST);
         let mut browser = Browser { console: console.clone(), cookie: None, origin: party().origin };
         let (status, ceremony) = browser.send("POST", "/api/enroll/options", Some(json!({ "token": token }))).await;
         assert_eq!(status, StatusCode::OK, "{ceremony}");
-        assert_eq!((&ceremony["identity"], &ceremony["directory"]), (&json!("grace"), &json!(true)));
+        assert_eq!(ceremony["identity"], "grace");
         let handle = URL_SAFE_NO_PAD.encode(uuid::Uuid::parse_str(&id).unwrap().as_bytes());
         assert_eq!(ceremony["options"]["user"]["id"], handle);
         let mut key = Authenticator::ed25519();
@@ -1435,20 +1317,21 @@ mod e2e {
         assert!(me["identity"]["arn"].as_str().unwrap().starts_with(&format!("arn:aws:sts::{account}:assumed-role/AWSReservedSSO_Readers_")));
         assert_eq!(browser.send("GET", "/api/me", None).await.0, StatusCode::OK);
 
-        // Her own passkeys: she adds, renames and removes them, as a login does.
+        // Her own passkeys: she adds, renames and removes them.
         assert_eq!((me["passkeys"][0]["name"].as_str(), &me["passkeys"][0]["current"]), (Some("Laptop"), &json!(true)));
         let (status, ceremony) = browser.send("POST", "/api/passkeys/options", None).await;
         assert_eq!(status, StatusCode::OK, "{ceremony}");
         assert_eq!(ceremony["options"]["user"]["id"], handle);
         assert_eq!(ceremony["options"]["excludeCredentials"].as_array().unwrap().len(), 1);
         let mut phone = Authenticator::p256();
-        // A login's challenge isn't hers, nor hers a login's.
-        let (_, theirs) = tenant.send("POST", "/api/passkeys/options", None).await;
+        // Another's challenge isn't hers, nor hers another's.
+        let (mut eve, _) = directory_user(&console, "eve", ADMIN).await;
+        let (_, theirs) = eve.send("POST", "/api/passkeys/options", None).await;
         let (status, err) = browser.send("POST", "/api/passkeys", Some(registration(&mut phone, &theirs, "Phone"))).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(err["error"].as_str().unwrap().contains("isn't yours"), "{err}");
         let body = registration(&mut phone, &ceremony, "Phone");
-        assert_eq!(tenant.send("POST", "/api/passkeys", Some(body)).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(eve.send("POST", "/api/passkeys", Some(body)).await.0, StatusCode::BAD_REQUEST);
         let (_, ceremony) = browser.send("POST", "/api/passkeys/options", None).await;
         let body = registration(&mut phone, &ceremony, "Phone");
         assert_eq!(browser.send("POST", "/api/passkeys", Some(body)).await.0, StatusCode::NO_CONTENT);
@@ -1464,7 +1347,14 @@ mod e2e {
         assert_eq!(browser.send("PUT", &phone_path, Some(json!({ "name": "Old phone" }))).await.0, StatusCode::NO_CONTENT);
         assert_eq!(browser.send("GET", "/api/me", None).await.1["passkeys"][1]["name"], "Old phone");
         // Not someone else's.
-        assert_eq!(tenant.send("DELETE", &phone_path, None).await.0, StatusCode::BAD_REQUEST);
+        assert_eq!(eve.send("DELETE", &phone_path, None).await.0, StatusCode::BAD_REQUEST);
+        // A counter that goes backwards is refused (a cloned authenticator).
+        phone.counter = 10;
+        assert_eq!(sign_in(&mut other, &mut phone).await.0, StatusCode::OK);
+        phone.counter = 3;
+        let (status, err) = sign_in(&mut other, &mut phone).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(err["error"].as_str().unwrap().contains("went backwards"), "{err}");
         // Removing one ends the sessions signed in with it; never her last.
         assert_eq!(browser.send("DELETE", &phone_path, None).await.0, StatusCode::NO_CONTENT);
         assert_eq!(other.send("GET", "/api/me", None).await.0, StatusCode::UNAUTHORIZED);
@@ -1618,8 +1508,7 @@ mod e2e {
         assert_eq!(status, StatusCode::CREATED, "{made}");
         let member = made["id"].as_str().unwrap().to_owned();
         users::create_for(&client, &member, "intruder", None, true).await.unwrap();
-        let token = store::create_enrollment(&client, &member, "intruder").await.unwrap();
-        let mut intruder = enrolled(&console, &token).await;
+        let mut intruder = signed_in_as(&console, &member, "intruder").await;
         let (_, me) = intruder.send("GET", "/api/me", None).await;
         assert_eq!((&me["identity"]["account_id"], &me["identity"]["management"]), (&json!(member), &json!(false)));
         assert_eq!(admin.send("GET", "/api/me", None).await.1["identity"]["management"], json!(true));

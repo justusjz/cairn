@@ -112,7 +112,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<App>> {
         .routes(routes!(set_default_version))
         .routes(routes!(delete_policy_version))
         .routes(routes!(attach_policy, detach_policy))
-        .routes(routes!(create_enrollment))
         .routes(routes!(create_key))
         .routes(routes!(set_key, delete_key))
         .routes(routes!(get_policy, put_policy, delete_policy))
@@ -2537,9 +2536,6 @@ pub(super) struct UserSummary {
     keys: Vec<AccessKey>,
     /// The names of its inline policies.
     policies: Vec<String>,
-    /// How it signs in to the console, if it does (a person's); `None`:
-    /// it doesn't, and no link for it is out (a service's).
-    console: Option<ConsoleAccess>,
     /// Its path (`/`, or `/…/`), which its ARN has before its name.
     path: String,
     /// Its ARN.
@@ -2553,17 +2549,6 @@ pub(super) struct UserSummary {
 }
 
 
-
-/// How a user signs in to the console (see `store::ConsoleAccess`).
-#[derive(Serialize, ToSchema)]
-struct ConsoleAccess {
-    /// Whether it enrolled (a login is linked to it).
-    enrolled: bool,
-    passkeys: i64,
-    last_sign_in: Option<f64>,
-    /// Whether an enrollment link for it is out, and works still.
-    link_pending: bool,
-}
 
 #[derive(Serialize, ToSchema)]
 struct AccessKey {
@@ -2587,7 +2572,6 @@ async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) ->
     // or (a delegated admin's) those at the paths it may list.
     let all = actor.allows(&app, "iam:ListUsers", On::users(actor.account(), "/")).await?;
     let client = app.pool.get().await?;
-    let mut console = super::store::console_access(&client, actor.account()).await?;
     let mut attached = crate::managed::attached_all(&client, actor.account()).await?;
     let mut memberships = crate::groups::memberships(&client, actor.account()).await?;
     let mut listed = Vec::new();
@@ -2617,12 +2601,6 @@ async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) ->
             tags: r.tags.into_iter().map(|(key, value)| Tag { key, value }).collect(),
             boundary: r.boundary,
             groups: memberships.remove(&r.id).unwrap_or_default(),
-            console: console.remove(&r.id).map(|c| ConsoleAccess {
-                enrolled: c.enrolled,
-                passkeys: c.passkeys,
-                last_sign_in: c.last_sign_in,
-                link_pending: c.link_pending,
-            }),
             name: r.name,
             id: r.id.to_string(),
             kms_entity_id: r.kms_entity_id,
@@ -2647,8 +2625,8 @@ async fn list_users(State(app): AppState, Extension(actor): Extension<Actor>) ->
 #[derive(Deserialize, ToSchema)]
 struct CreateUser {
     name: String,
-    /// Whether it gets an access key (a service's), of a random ID; a person
-    /// gets none, and signs in to the console through its link.
+    /// Whether it gets an access key, of a random ID (else it has none
+    /// until one is made).
     #[serde(default)]
     access_key: bool,
     /// Managed policies to attach to it, by ARN (each checked as IAM's
@@ -3353,35 +3331,16 @@ async fn detach_policy(
     Ok(StatusCode::NO_CONTENT)
 }
 
-// ─── Console enrollment ──────────────────────────────────────────────────────
+// ─── Setup links ─────────────────────────────────────────────────────────────
 
-/// A one-time link for a user to register its first passkey for the
-/// console, valid 24 hours.
+/// A one-time link for a user of Cairn's own directory to set up a passkey
+/// for the console with, valid 7 days.
 #[derive(Serialize, ToSchema)]
 pub(super) struct EnrollmentLink {
     /// The link, if this node serves the console (and so knows its URL).
     pub(super) url: Option<String>,
     /// The link's path, for the console's URL.
     pub(super) path: String,
-}
-
-/// Makes a user an enrollment link for the console, replacing its last.
-#[utoipa::path(post, path = "/users/{user}/enrollment", params(("user" = String, Path)), responses(
-    (status = 201, body = EnrollmentLink),
-    (status = "4XX", body = ErrorBody),
-    (status = "5XX", body = ErrorBody),
-))]
-async fn create_enrollment(
-    State(app): AppState,
-    Extension(actor): Extension<Actor>,
-    Path(name): Path<String>,
-) -> Result<(StatusCode, Json<EnrollmentLink>)> {
-    // A way into the console: IAM's is a login profile.
-    let account = check_user(&app, &actor, "iam:CreateLoginProfile", &name).await?;
-    let token = crate::console::store::create_enrollment(&app.pool.get().await?, &account, &name).await?;
-    let path = format!("/enroll#{token}");
-    let url = app.console.origin.as_ref().map(|origin| format!("{origin}{path}"));
-    Ok((StatusCode::CREATED, Json(EnrollmentLink { url, path })))
 }
 
 // ─── Access keys ─────────────────────────────────────────────────────────────
@@ -3898,16 +3857,13 @@ mod e2e {
         let (status, created) = admin.send("POST", "/api/users", Some(new)).await;
         assert_eq!(status, StatusCode::CREATED);
         assert_ne!(created["access_key"]["secret"], "chosen-secret");
-        // A person: no key, and a console link, which lists them as one.
-        let (status, created) = admin.send("POST", "/api/users", Some(json!({ "name": "ui-person" }))).await;
+        // One without a key, as CreateUser makes one.
+        let (status, created) = admin.send("POST", "/api/users", Some(json!({ "name": "ui-keyless" }))).await;
         assert_eq!((status, &created["access_key"]), (StatusCode::CREATED, &Value::Null));
-        let person = |roles: Value| roles.as_array().unwrap().iter().find(|r| r["name"] == "ui-person").unwrap().clone();
-        let listed = person(admin.send("GET", "/api/users", None).await.1);
-        assert_eq!((&listed["keys"], &listed["console"]), (&json!([]), &Value::Null));
-        assert_eq!(admin.send("POST", "/api/users/ui-person/enrollment", None).await.0, StatusCode::CREATED);
-        let listed = person(admin.send("GET", "/api/users", None).await.1);
-        assert_eq!(listed["console"]["link_pending"], true);
-        assert_eq!(listed["console"]["enrolled"], false);
+        let keyless = |roles: Value| roles.as_array().unwrap().iter().find(|r| r["name"] == "ui-keyless").unwrap().clone();
+        assert_eq!(keyless(admin.send("GET", "/api/users", None).await.1)["keys"], json!([]));
+        // No console link: people sign in as directory users.
+        assert_eq!(admin.send("POST", "/api/users/ui-keyless/enrollment", None).await.0, StatusCode::NOT_FOUND);
         // Managed policies: Cairn's (AWS's), and the account's own.
         let (_, policies) = admin.send("GET", "/api/policies", None).await;
         let names: Vec<_> = policies.as_array().unwrap().iter().map(|p| p["name"].as_str().unwrap()).collect();
@@ -3946,11 +3902,6 @@ mod e2e {
         assert_eq!(admin.send("DELETE", &detach, None).await.0, StatusCode::NO_CONTENT);
         assert_eq!(admin.send("DELETE", &detach, None).await.0, StatusCode::NOT_FOUND);
         assert_eq!(admin.send("DELETE", "/api/policies/bucket-read", None).await.0, StatusCode::NO_CONTENT);
-        // A link to enroll a passkey for the console (this node serves none).
-        let (status, enrollment) = admin.send("POST", "/api/users/ui-role/enrollment", None).await;
-        assert_eq!(status, StatusCode::CREATED);
-        assert_eq!(enrollment["url"], Value::Null);
-        assert!(enrollment["path"].as_str().unwrap().starts_with("/enroll#"));
         // Its access keys and inline policies.
         let (status, key) = admin.send("POST", "/api/users/ui-role/keys", None).await;
         assert_eq!(status, StatusCode::CREATED);

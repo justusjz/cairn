@@ -9,7 +9,6 @@ import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
 import { type Assignment, type DirectoryGroup, type DirectoryUser, type OrgAccount, type ManagedPolicy, type PermissionSet, api } from "../api";
 import { AttachDialog, DetailHead, Gone, InlinePolicyDialog, PermissionsPanel, PolicyChips, PolicySelect, roleHref } from "../components/Iam";
-import { EnrollmentDialog } from "./Users";
 import { Badge, Loading, Panel, Table, act, poll, toast } from "../components/ui";
 import { ago, date } from "../format";
 
@@ -210,7 +209,7 @@ export default function IdentityCenter() {
                 }}
               />
             </Show>
-            <Show when={link()}>{(l) => <EnrollmentDialog {...l()} valid="7 days" onClose={() => setLink(undefined)} />}</Show>
+            <Show when={link()}>{(l) => <SetupLinkDialog {...l()} onClose={() => setLink(undefined)} />}</Show>
             <Show when={editingUser()} keyed>
               {(u) => <EditDirectoryUserDialog user={u} onClose={() => setEditingUser(undefined)} changed={data.refresh} />}
             </Show>
@@ -936,6 +935,50 @@ function AddMemberDialog(props: { group: DirectoryGroup; users: DirectoryUser[];
           </button>
         </div>
       </form>
+    </dialog>
+  );
+}
+
+/** A directory user's setup link for the console, shown once. */
+function SetupLinkDialog(props: { user: string; url?: string | null; path: string; onClose: () => void }) {
+  let dialog!: HTMLDialogElement;
+  let input!: HTMLInputElement;
+  onMount(() => {
+    dialog.showModal();
+    input.select();
+  });
+  const link = () => props.url ?? props.path;
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(link());
+      toast("Copied");
+    } catch {
+      input.select();
+    }
+  };
+  return (
+    <dialog ref={dialog} onClose={() => props.onClose()}>
+      <h2>
+        Setup link for <span class="mono">{props.user}</span>
+      </h2>
+      <p class="subtle">
+        Send it to <span class="mono">{props.user}</span>: it sets up a passkey for the console, and works once, for 7
+        days. A new link replaces this one.
+      </p>
+      <Show when={!props.url}>
+        <p class="subtle small">
+          This node doesn't know the console's URL (<span class="mono">--console-url</span>), so put it in front.
+        </p>
+      </Show>
+      <div class="secret">
+        <input ref={input} type="text" readOnly value={link()} />
+        <button onClick={copy}>Copy</button>
+      </div>
+      <div class="buttons">
+        <button class="primary" onClick={() => dialog.close()}>
+          Done
+        </button>
+      </div>
     </dialog>
   );
 }

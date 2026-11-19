@@ -263,6 +263,7 @@ const MIGRATIONS: &[&str] = &[
     CHECKSUM_ALGORITHMS,
     TRANSITIONS,
     BATCH_MANIFEST_GENERATORS,
+    NO_LOGINS,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -3997,6 +3998,28 @@ INSERT INTO buckets (name, account_id) SELECT 'cairn_internal', id FROM accounts
 
 ALTER TABLE batch_jobs ADD COLUMN generator text,
     ADD COLUMN generation text;
+"#;
+
+/// Migration 83: the console's logins go (see `console`): people sign in
+/// as directory users only (Identity Center's), and IAM users have access
+/// keys only (at AWS, a login profile's password signs one in; Cairn takes
+/// no passwords). The logins, their identities, passkeys, enrollment links and sessions are
+/// dropped, not made directory users: those would have no permission sets
+/// (which an IAM user's policies don't make), and the way in is the same
+/// either way: `cairn directory-user create … --admin`, or the root user's
+/// link. Challenges are no login's any more.
+///
+/// No new lock protocol: nothing that's left changes. An older node's
+/// console fails on the tables that are gone (and says so in its log) until
+/// it's upgraded too; it writes nothing wrong.
+const NO_LOGINS: &str = r#"
+DROP TABLE console_sessions;
+DROP TABLE console_enrollments;
+DROP TABLE passkeys;
+DROP TABLE login_identities;
+ALTER TABLE console_challenges DROP COLUMN login_id;
+DROP TABLE logins;
+DELETE FROM console_challenges WHERE purpose = 'add' AND directory_user_id IS NULL;
 "#;
 
 #[cfg(test)]

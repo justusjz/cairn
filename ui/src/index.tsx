@@ -1,6 +1,7 @@
-// The console (see `src/console/`): signing in, with a passkey (an IAM
-// user), or at an identity source (a directory user, who picks a permission
-// set), a first passkey through an enrollment link, one's own passkeys, and
+// The console (see `src/console/`): signing in as a directory user, who
+// picks a permission set, with a passkey (Cairn's own directory's users) or
+// at an identity source, a first passkey through a setup link, one's own
+// passkeys, and
 // the pages of what the signed-in identity manages: the account's buckets,
 // objects, users, roles and policies, and, for its operators (whose policies
 // allow `cairn:` actions), the cluster.
@@ -28,7 +29,6 @@ import Topics, { TopicPage } from "./pages/Topics";
 import SignIn from "./pages/SignIn";
 import SwitchRole from "./pages/SwitchRole";
 import Users, { UserPage } from "./pages/Users";
-import { userHref } from "./components/Iam";
 import "./styles.css";
 import { ApiError, type Credentials, type Me, type Passkey, api } from "./session";
 import { authenticate, deviceName, explain, register, supported } from "./webauthn";
@@ -346,13 +346,12 @@ function Login() {
     }
     setBusy(false);
   };
-  const [setup] = createResource(() => api.setup().catch(() => ({ enrolled: true })));
-  const [providers] = createResource(() => api.oidcProviders().catch(() => []));
+  const [setup] = createResource(() => api.setup().catch(() => ({ can_sign_in: true })));
   return (
     <div class="signin">
       <Panel title="Sign in to Cairn">
         <Show when={supported()} fallback={<NoPasskeys />}>
-          <Show when={setup()?.enrolled === false && !providers()?.length} fallback={
+          <Show when={setup()?.can_sign_in === false} fallback={
             <>
               <p class="subtle">Sign in with a passkey: your device asks for your fingerprint, face, PIN or security key.</p>
               <button class="primary" disabled={busy()} onClick={signIn}>
@@ -361,7 +360,7 @@ function Login() {
               <ProviderButtons onError={setError} />
               <Show when={error()}>{(e) => <p class="error-text">{e()}</p>}</Show>
               <p class="subtle small">
-                New here? Ask an administrator for an enrollment link.
+                New here? Ask an administrator for a link to set up your passkey.
               </p>
             </>
           }>
@@ -373,12 +372,12 @@ function Login() {
   );
 }
 
-/** How to make the first person, until anyone has enrolled. */
+/** How to make the first person, until anyone can sign in. */
 function FirstAdmin() {
-  const command = "cairn user create admin --admin";
+  const command = "cairn directory-user create admin --admin";
   return (
     <>
-      <p>No one can sign in yet. Make the first administrator on a node of the cluster, and open the link it prints to enroll a passkey:</p>
+      <p>No one can sign in yet. Make the first administrator on a node of the cluster, and open the link it prints to set up a passkey:</p>
       <pre class="command">{command}</pre>
       <p class="subtle small">
         In Docker Compose: <span class="mono">docker compose exec cairn {command}</span>. Everyone after that is made in
@@ -394,19 +393,6 @@ function Enroll() {
   // The token stays out of the history and the address bar once read.
   history.replaceState(null, "", location.pathname);
   const [ceremony] = createResource(async () => (token ? api.enrollOptions(token) : Promise.reject(new Error("This link has no token."))));
-  /** Signed in: the link's identity joins this login, with no new passkey. */
-  const link = async () => {
-    setBusy(true);
-    setError(undefined);
-    try {
-      setMe(await api.enrollLink(token));
-      toast(`Added ${ceremony()?.identity ?? "the account"} to your login`);
-      navigate("/account");
-    } catch (e) {
-      setError(explain(e));
-      setBusy(false);
-    }
-  };
   const [name, setName] = createSignal(deviceName());
   const [busy, setBusy] = createSignal(false);
   const [error, setError] = createSignal<string>();
@@ -433,20 +419,6 @@ function Enroll() {
           <Show when={ceremony()} fallback={<Loading error={ceremony.error && (ceremony.error as Error).message} />}>
             {(c) => (
               <form onSubmit={enroll}>
-                <Show when={!c().directory && me()}>
-                  {(m) => (
-                    <>
-                      <p>
-                        You're signed in as <span class="mono">{m().name}</span>. Add{" "}
-                        <span class="mono">{c().identity}</span> to this login, to switch to it with the same passkeys:
-                      </p>
-                      <button type="button" class="primary" disabled={busy()} onClick={link}>
-                        Add to my login
-                      </button>
-                      <p class="subtle small">Or make a separate login for it, with a passkey of its own:</p>
-                    </>
-                  )}
-                </Show>
                 <p>
                   Welcome, <span class="mono">{c().identity}</span>. Make a passkey for this console: your device keeps
                   it, and asks for your fingerprint, face, PIN or security key when you sign in. There's no password.
@@ -492,44 +464,10 @@ function Home() {
     <SignedIn>
       {(m) => (
         <Show when={!m.root} fallback={<RootHome me={m} />}>
-          <Show when={!m.directory} fallback={<DirectoryHome me={m} />}>
-            <UserHome me={m} />
-          </Show>
+          <DirectoryHome me={m} />
         </Show>
       )}
     </SignedIn>
-  );
-}
-
-/** An IAM user's own page: its passkeys, and who it is. */
-function UserHome(props: { me: Me }) {
-  const m = props.me;
-  return (
-    <>
-      <div class="page-head">
-        <h1>Your sign-in</h1>
-        <span class="subtle small">login {m.name}</span>
-      </div>
-      <Passkeys passkeys={m.passkeys} />
-      <Panel title="Who you are">
-        <Table count={1} columns={["As", "ARN"]}>
-          <tr>
-            <td>
-              <A class="mono" href={userHref(m.identity.user)}>
-                {m.identity.user}
-              </A>
-            </td>
-            <td class="mono small">{m.identity.arn}</td>
-          </tr>
-        </Table>
-        <p class="subtle small">
-          Policies name you by the ARN: what you may do here is what your policies allow, and what buckets'
-          policies don't deny you (your user's page shows its policies). The cluster's pages show if your
-          policies allow you its actions (<span class="mono">cairn:*</span>). Signed in with a passkey, your session
-          counts as multi-factor (<span class="mono">aws:MultiFactorAuthPresent</span>).
-        </p>
-      </Panel>
-    </>
   );
 }
 

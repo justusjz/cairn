@@ -182,7 +182,6 @@ mod e2e {
         allowed(&mut lead, "POST", "/api/users", Some(new_user("dev", "/oneai/", Some(&boundary)))).await;
         allowed(&mut lead, "POST", "/api/users/dev/attached", Some(json!({ "arn": member }))).await;
         allowed(&mut lead, "POST", "/api/users/dev/keys", None).await;
-        allowed(&mut lead, "POST", "/api/users/dev/enrollment", None).await;
         let read = json!({ "template": "bucket-access", "buckets": "oneai-dev-data", "levels": ["read"], "path": "/oneai/" });
         allowed(&mut lead, "POST", "/api/templates", Some(read)).await;
         let trust = format!(
@@ -234,7 +233,6 @@ mod e2e {
             denied(who, "POST", "/api/users/outsider/attached", Some(json!({ "arn": administrator }))).await;
             denied(who, "PUT", "/api/users/outsider/policies/p", Some(json!({ "document": anything }))).await;
             denied(who, "POST", "/api/users/outsider/keys", None).await;
-            denied(who, "POST", "/api/users/outsider/enrollment", None).await;
             // Other buckets, the account's settings, the cluster.
             denied(who, "POST", "/api/buckets", Some(json!({ "name": format!("elsewhere-{n}") }))).await;
             denied(who, "DELETE", "/api/buckets/other-data", None).await;
@@ -264,10 +262,7 @@ mod e2e {
         assert!(!names.contains(&"other-admin"), "{names:?}");
 
         // A member reads and writes the team's buckets, and its own keys.
-        let mut dev = {
-            let token = crate::console::store::create_enrollment(&client, &account, "dev").await.unwrap();
-            super::super::e2e::enrolled(&console, &token).await
-        };
+        let mut dev = super::super::e2e::signed_in_as(&console, &account, "dev").await;
         let detach = format!("/api/users/dev/attached?arn={}", administrator.replace(':', "%3A").replace('/', "%2F"));
         allowed(&mut root, "DELETE", &detach, None).await;
         allowed(&mut dev, "POST", "/api/users/dev/keys", None).await;

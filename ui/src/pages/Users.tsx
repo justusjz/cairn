@@ -1,10 +1,10 @@
-// An account's users: the list (people and services apart), a new user, and
-// a user's own page: its details, permissions, groups, console sign-in and
-// access keys.
+// An account's IAM users: the list, a new user, and a user's own page: its
+// details, permissions, groups and access keys. People aren't IAM users:
+// they sign in as directory users (see IdentityCenter).
 
 import { A, useNavigate, useParams } from "@solidjs/router";
 import { For, Show, createSignal, onMount } from "solid-js";
-import { type AccessKey, type ConsoleAccess, type Group, type ManagedPolicy, type Tag, type User, api } from "../api";
+import { type AccessKey, type Group, type ManagedPolicy, type Tag, type User, api } from "../api";
 import {
   AttachDialog,
   Checklist,
@@ -22,7 +22,7 @@ import {
   userHref,
 } from "../components/Iam";
 import { Badge, Loading, Panel, SecretDialog, Table, act, poll, toast } from "../components/ui";
-import { ago, date } from "../format";
+import { date } from "../format";
 
 /** The most access keys a user may have (as in IAM). */
 const MAX_KEYS = 2;
@@ -32,27 +32,18 @@ const MAX_GROUPS = 10;
 
 type NewSecret = { id: string; secret: string };
 
-/** A user's console link, to show. */
-type Enrollment = { user: string; url?: string | null; path: string };
-
-/** A person: someone who signs in to the console (or was sent a link to). */
-const isPerson = (u: User) => !!u.console;
-
 /** The groups the session may list; none if it may list none. */
 const listGroups = () => api.groups().catch(() => [] as Group[]);
 
-/** The account's users, people and services apart. Both are IAM users alike
- * (as in AWS); what tells them apart is how they get in: people sign in to
- * the console through a link, services sign requests with access keys.
- * Operators are users too, whose policies allow them `cairn:` actions
- * (`CairnOperatorAccess`, or `AdministratorAccess`). */
+/** The account's IAM users, which sign requests with access keys: services,
+ * and scripts. People sign in to the console as directory users, with the
+ * permission sets assigned to them (see Identity Center). */
 export default function Users() {
   // Every few seconds: a new user's identity in the KMS comes a moment later.
   const data = poll(() => Promise.all([api.users(), api.policies(), listGroups()]), 5000);
   const [creating, setCreating] = createSignal(false);
   const [secret, setSecret] = createSignal<NewSecret>();
-  const [enrollment, setEnrollment] = createSignal<Enrollment>();
-  const users = (people: boolean) => (data.data()?.[0] ?? []).filter((u) => isPerson(u) === people);
+  const users = () => data.data()?.[0] ?? [];
 
   return (
     <>
@@ -63,23 +54,15 @@ export default function Users() {
         </button>
       </div>
       <p class="subtle small">
-        People sign in to the console, through a one-time link that sets up a passkey; services sign requests with access
-        keys. What a user may do is what its policies allow: managed ones attached to it (see Policies), inline ones of its
+        IAM users sign requests with access keys: services, scripts, the CLI. People sign in to the console as directory
+        users instead, with the permission sets assigned to them (see <A href="/identity-center">Identity Center</A>).
+        What a user may do is what its policies allow: managed ones attached to it (see Policies), inline ones of its
         own, and those of its groups (see Groups). A Deny wins over any Allow, and a permissions boundary caps it all.
       </p>
       <Show when={data.data()} fallback={<Loading error={data.error()} />}>
-        <Panel title="People" note="sign in to the console">
-          <Table
-            count={users(true).length}
-            empty="No one yet: make a person, and send them their link."
-            columns={["Name", "Sign-in", "Permissions", "Created"]}
-          >
-            <For each={users(true)}>{(u) => <UserRow user={u} person />}</For>
-          </Table>
-        </Panel>
-        <Panel title="Service users" note="sign requests with access keys">
-          <Table count={users(false).length} empty="No service users." columns={["Name", "Access keys", "Permissions", "Created"]}>
-            <For each={users(false)}>{(u) => <UserRow user={u} person={false} />}</For>
+        <Panel title="Users" note="sign requests with access keys">
+          <Table count={users().length} empty="No users." columns={["Name", "Access keys", "Permissions", "Created"]}>
+            <For each={users()}>{(u) => <UserRow user={u} />}</For>
           </Table>
         </Panel>
       </Show>
@@ -90,19 +73,17 @@ export default function Users() {
           onClose={() => setCreating(false)}
           created={(made) => {
             data.refresh();
-            if ("secret" in made) setSecret(made);
-            else setEnrollment(made);
+            if (made) setSecret(made);
           }}
         />
       </Show>
       <Show when={secret()}>{(s) => <SecretDialog id={s().id} secret={s().secret} onClose={() => setSecret(undefined)} />}</Show>
-      <Show when={enrollment()}>{(e) => <EnrollmentDialog {...e()} onClose={() => setEnrollment(undefined)} />}</Show>
     </>
   );
 }
 
-/** A user in the list: who it is, how it gets in, and what it may do. */
-function UserRow(props: { user: User; person: boolean }) {
+/** A user in the list: who it is, its keys, and what it may do. */
+function UserRow(props: { user: User }) {
   const u = () => props.user;
   return (
     <tr>
@@ -124,15 +105,8 @@ function UserRow(props: { user: User; person: boolean }) {
         </Show>
       </td>
       <td>
-        <Show
-          when={props.person}
-          fallback={
-            <Show when={u().keys.length} fallback={<span class="subtle">none</span>}>
-              {u().keys.length} ({u().keys.filter((k) => k.active).length} active)
-            </Show>
-          }
-        >
-          <Show when={u().console}>{(c) => <SignInCell access={c()} />}</Show>
+        <Show when={u().keys.length} fallback={<span class="subtle">none</span>}>
+          {u().keys.length} ({u().keys.filter((k) => k.active).length} active)
         </Show>
       </td>
       <td>
@@ -143,37 +117,18 @@ function UserRow(props: { user: User; person: boolean }) {
   );
 }
 
-/** How a person signs in, or why they don't yet. */
-function SignInCell(props: { access: ConsoleAccess }) {
-  const a = () => props.access;
-  const ways = () => (a().passkeys ? [`${a().passkeys} passkey${a().passkeys === 1 ? "" : "s"}`] : []);
-  return (
-    <Show
-      when={a().enrolled}
-      fallback={
-        <Show when={a().link_pending} fallback={<Badge tone="warn">link expired</Badge>}>
-          <Badge tone="warn">link sent</Badge>
-        </Show>
-      }
-    >
-      <div>{ways().join(", ") || <span class="subtle">no way to sign in</span>}</div>
-      <div class="subtle small">{a().last_sign_in ? `signed in ${ago(a().last_sign_in!)}` : "never signed in"}</div>
-    </Show>
-  );
-}
-
-/** A new user: a person (who gets a console link) or a service (an access
- * key), with the policies and groups it starts with. */
+/** A new user, with an access key (or none, to make one later), and the
+ * policies and groups it starts with. */
 function NewUserDialog(props: {
   policies: ManagedPolicy[];
   groups: Group[];
   onClose: () => void;
-  created: (made: NewSecret | Enrollment) => void;
+  created: (made: NewSecret | undefined) => void;
 }) {
   let dialog!: HTMLDialogElement;
   onMount(() => dialog.showModal());
   const [name, setName] = createSignal("");
-  const [kind, setKind] = createSignal<"person" | "service">("person");
+  const [withKey, setWithKey] = createSignal(true);
   const [policies, setPolicies] = createSignal<string[]>([]);
   const [groups, setGroups] = createSignal<string[]>([]);
   const [path, setPath] = createSignal("");
@@ -185,7 +140,7 @@ function NewUserDialog(props: {
     let made;
     try {
       made = await api.createUser(n, {
-        accessKey: kind() === "service",
+        accessKey: withKey(),
         policies: policies(),
         groups: groups(),
         path: path().trim(),
@@ -197,12 +152,7 @@ function NewUserDialog(props: {
     }
     toast(`Created ${n}`);
     dialog.close();
-    if (made.access_key) {
-      props.created({ id: made.access_key.name, secret: made.access_key.secret });
-    } else {
-      const link = await act(() => api.createEnrollment(n));
-      if (link) props.created({ user: n, ...link.value });
-    }
+    props.created(made.access_key ? { id: made.access_key.name, secret: made.access_key.secret } : undefined);
   };
   const policyItems = () =>
     [...props.policies.filter((p) => !p.aws), ...props.policies.filter((p) => p.aws)].map((p) => ({
@@ -223,20 +173,13 @@ function NewUserDialog(props: {
           value={name()}
           onInput={(e) => setName(e.currentTarget.value)}
         />
-        <div class="form-row">
-          <label class="check">
-            <input type="radio" name="kind" checked={kind() === "person"} onChange={() => setKind("person")} />
-            A person, who signs in to the console
-          </label>
-          <label class="check">
-            <input type="radio" name="kind" checked={kind() === "service"} onChange={() => setKind("service")} />
-            A service, with an access key
-          </label>
-        </div>
+        <label class="check">
+          <input type="checkbox" checked={withKey()} onChange={(e) => setWithKey(e.currentTarget.checked)} />
+          With an access key
+        </label>
         <p class="subtle small">
-          {kind() === "person"
-            ? "A person gets a one-time console link to set up a passkey (or sign in with a provider), and no access key."
-            : `A service gets an access key, whose secret is shown once; a user may have ${MAX_KEYS}, to rotate them.`}
+          Its secret is shown once; a user may have {MAX_KEYS}, to rotate them. A person signs in to the console as a
+          directory user instead (see Identity Center).
         </p>
         <h3>Groups</h3>
         <Checklist
@@ -274,7 +217,7 @@ function NewUserDialog(props: {
             Cancel
           </button>
           <button class="primary" type="submit">
-            {kind() === "person" ? "Create and get link" : "Create with access key"}
+            {withKey() ? "Create with access key" : "Create"}
           </button>
         </div>
       </form>
@@ -292,7 +235,6 @@ export function UserPage() {
   const user = () => data.data()?.[0].find((u) => u.name === name());
   const policies = () => data.data()?.[1] ?? [];
   const [secret, setSecret] = createSignal<NewSecret>();
-  const [enrollment, setEnrollment] = createSignal<Enrollment>();
   const [editing, setEditing] = createSignal(false);
   const [attaching, setAttaching] = createSignal(false);
   const [joining, setJoining] = createSignal(false);
@@ -311,13 +253,6 @@ export function UserPage() {
     if (!res) return;
     setSecret({ id: res.value.id, secret: res.value.secret });
     data.refresh();
-  };
-  const enroll = async () => {
-    const res = await act(() => api.createEnrollment(name()));
-    if (res) {
-      setEnrollment({ user: name(), ...res.value });
-      data.refresh();
-    }
   };
   const remove = async () => {
     const groups = user()?.groups.length ? " Take it out of its groups first." : "";
@@ -402,27 +337,7 @@ export function UserPage() {
                 </button>
               </div>
             </Panel>
-            <Panel title="Console sign-in">
-              <Show when={u().console} fallback={<p class="subtle">Doesn't sign in to the console: no link was ever made.</p>}>
-                {(c) => <SignInCell access={c()} />}
-              </Show>
-              <div class="key-actions">
-                <button class="small" onClick={enroll}>
-                  {u().console ? "New console link" : "Console link"}
-                </button>
-              </div>
-              <p class="subtle small">
-                A one-time link to set up a passkey (for someone who lost theirs, say), valid for 24 hours; a new one
-                replaces the last.
-              </p>
-            </Panel>
             <Panel title="Access keys" note={`${u().keys.length} of ${MAX_KEYS}`}>
-              <Show when={isPerson(u()) && u().keys.length}>
-                <p class="small">
-                  <Badge tone="warn">a person with access keys</Badge>{" "}
-                  <span class="subtle">People sign in to the console; access keys are for programs.</span>
-                </p>
-              </Show>
               <Table count={u().keys.length} empty="No access keys." columns={["Access key ID", "State", "Made", ""]}>
                 <For each={u().keys}>{(k) => <KeyRow user={u().name} accessKey={k} changed={data.refresh} />}</For>
               </Table>
@@ -486,7 +401,6 @@ export function UserPage() {
               )}
             </Show>
             <Show when={secret()}>{(s) => <SecretDialog id={s().id} secret={s().secret} onClose={() => setSecret(undefined)} />}</Show>
-            <Show when={enrollment()}>{(e) => <EnrollmentDialog {...e()} onClose={() => setEnrollment(undefined)} />}</Show>
           </>
         )}
       </Show>
@@ -643,46 +557,3 @@ function EditUserDialog(props: { user: User; policies: ManagedPolicy[]; onClose:
   );
 }
 
-/** A user's enrollment link for the console, shown once. */
-export function EnrollmentDialog(props: { user: string; url?: string | null; path: string; valid?: string; onClose: () => void }) {
-  let dialog!: HTMLDialogElement;
-  let input!: HTMLInputElement;
-  onMount(() => {
-    dialog.showModal();
-    input.select();
-  });
-  const link = () => props.url ?? props.path;
-  const copy = async () => {
-    try {
-      await navigator.clipboard.writeText(link());
-      toast("Copied");
-    } catch {
-      input.select();
-    }
-  };
-  return (
-    <dialog ref={dialog} onClose={() => props.onClose()}>
-      <h2>
-        Console link for <span class="mono">{props.user}</span>
-      </h2>
-      <p class="subtle">
-        Send it to <span class="mono">{props.user}</span>: it sets up a passkey for the console, and works once, for{" "}
-        {props.valid ?? "24 hours"}. A new link replaces this one.
-      </p>
-      <Show when={!props.url}>
-        <p class="subtle small">
-          This node doesn't know the console's URL (<span class="mono">--console-url</span>), so put it in front.
-        </p>
-      </Show>
-      <div class="secret">
-        <input ref={input} type="text" readOnly value={link()} />
-        <button onClick={copy}>Copy</button>
-      </div>
-      <div class="buttons">
-        <button class="primary" onClick={() => dialog.close()}>
-          Done
-        </button>
-      </div>
-    </dialog>
-  );
-}

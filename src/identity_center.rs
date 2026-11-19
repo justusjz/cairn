@@ -1180,6 +1180,26 @@ pub struct DirectoryUserArgs {
 
 #[derive(clap::Subcommand, Debug, serde::Serialize, serde::Deserialize)]
 enum DirectoryUserCommand {
+    /// Make a user of Cairn's own directory, and print a link (valid 7
+    /// days, working once) for it to set up a passkey with: the first
+    /// administrator, with `--admin`, who makes everyone else in the
+    /// console.
+    Create {
+        /// Its UserName, which it's known by.
+        user_name: String,
+        /// Its DisplayName (its UserName, unless given).
+        #[arg(long)]
+        display_name: Option<String>,
+        /// Its e-mail.
+        #[arg(long)]
+        email: Option<String>,
+        /// Assign it the permission set `AdministratorAccess` (everything;
+        /// made if there's none) in the management account. A user that
+        /// exists already gets it too, and a new link: the way back in for
+        /// one locked out.
+        #[arg(long)]
+        admin: bool,
+    },
     /// Print a link (valid 7 days, working once) for a user of Cairn's own
     /// directory to make a passkey with: its first, or another, after
     /// losing one. A new link replaces the last. Made from the node's
@@ -1194,13 +1214,84 @@ enum DirectoryUserCommand {
 pub async fn run(app: &std::sync::Arc<crate::App>, args: DirectoryUserArgs, out: &mut crate::admin::Output) -> anyhow::Result<()> {
     let client = app.pool.get().await?;
     match args.command {
+        DirectoryUserCommand::Create { user_name, display_name, email, admin } => {
+            let existing = users(&client, Some(Lookup::Name(&user_name))).await?.pop();
+            let user = match existing {
+                Some(user) if admin && user.own() => user,
+                Some(_) => {
+                    return Err(crate::users::Invalid(format!(
+                        "there's a directory user named {user_name:?} already: `cairn directory-user link` makes it a link"
+                    ))
+                    .into());
+                }
+                None => {
+                    let profile = serde_json::json!({});
+                    let own = OwnUser {
+                        user_name: &user_name,
+                        display_name: display_name.as_deref().unwrap_or(&user_name),
+                        email: email.as_deref(),
+                        profile: &profile,
+                    };
+                    create_user(&client, &own).await?
+                }
+            };
+            if admin {
+                let account = crate::users::account(&client).await?;
+                make_admin(&client, &account, &user).await?;
+            }
+            let token = crate::console::store::create_setup_link(&client, user.id).await?;
+            crate::users::setup_link(app, &token, out);
+        }
         DirectoryUserCommand::Link { user_name } => {
             let Some(user) = users(&client, Some(Lookup::Name(&user_name))).await?.pop() else {
                 return Err(crate::users::Invalid(format!("there's no directory user named {user_name:?}")).into());
             };
             let token = crate::console::store::create_setup_link(&client, user.id).await?;
-            crate::users::enrollment_link(app, &token, out);
+            crate::users::setup_link(app, &token, out);
         }
+    }
+    Ok(())
+}
+
+/// The permission set the command line makes administrators with.
+const ADMINISTRATOR_ACCESS: &str = "AdministratorAccess";
+
+/// Assigns `user` the permission set `AdministratorAccess` of `account`
+/// (the management account) there, making the set (with AWS's managed
+/// policy of the name) if there's none, and giving it that policy if it
+/// lacks it. Each step is skipped once done, so that it's done again after
+/// a crash midway.
+async fn make_admin(client: &Object, account: &str, user: &User) -> anyhow::Result<()> {
+    let set = match load(client, account, ADMINISTRATOR_ACCESS).await? {
+        Some(set) => set,
+        None => {
+            let new = New {
+                name: ADMINISTRATOR_ACCESS,
+                description: "Everything, in the accounts it's assigned in.",
+                session_duration: 3600,
+                relay_state: None,
+                tags: None,
+            };
+            match create(client, account, &new).await {
+                Ok(set) => set,
+                // Made meanwhile.
+                Err(_) => load(client, account, ADMINISTRATOR_ACCESS).await?.context("a new permission set is gone")?,
+            }
+        }
+    };
+    let policy = crate::managed::aws_arn(ADMINISTRATOR_ACCESS);
+    if !managed_policies(client, &set).await?.iter().any(|a| a.arn == policy) {
+        attach(client, &set, &policy, true).await?;
+        let set = load_id(client, set.id).await?.context("the permission set is gone")?;
+        if let Err(why) = provision_all(client, &set).await? {
+            anyhow::bail!("provisioning the permission set {}: {why}", set.name);
+        }
+    }
+    let set = load_id(client, set.id).await?.context("the permission set is gone")?;
+    if assignments(client, account, Some(account), Some(set.id), Some((PrincipalType::User, user.id))).await?.is_empty()
+        && let Err(why) = assign(client, &set, account, PrincipalType::User, user.id).await?
+    {
+        anyhow::bail!("assigning the permission set {}: {why}", set.name);
     }
     Ok(())
 }

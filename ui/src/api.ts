@@ -23,7 +23,6 @@ export type Bucket = Schemas["BucketSummary"];
 export type Entry = Schemas["Entry"];
 export type ObjectInfo = Schemas["ObjectInfo"];
 export type User = Schemas["UserSummary"];
-export type ConsoleAccess = Schemas["ConsoleAccess"];
 export type OidcProvider = Schemas["OidcProvider"];
 export type CorsConfiguration = Schemas["Configuration"];
 export type WebsiteConfiguration = Schemas["Website"];
@@ -129,8 +128,8 @@ export const api = {
   object: (bucket: string, key: string) =>
     ok(client.GET("/buckets/{bucket}/object", { params: { ...bucketPath(bucket), query: { key } } })),
   users: () => ok(client.GET("/users")),
-  /** A person (no access key: they sign in through a console link), or a
-   * service (`accessKey`: one, named as it, whose secret comes back once). */
+  /** An IAM user, with an access key (`accessKey`: its secret comes back
+   * once) or none yet. */
   createUser: (
     name: string,
     opts: { accessKey?: boolean; policies?: string[]; groups?: string[]; path?: string; boundary?: string; tags?: Tag[] } = {},
@@ -246,8 +245,6 @@ export const api = {
     ok(client.POST("/organization/policies/{id}/targets", { params: { path: { id } }, body: { target_id } })),
   detachScp: (id: string, target: string) =>
     ok(client.DELETE("/organization/policies/{id}/targets/{target}", { params: { path: { id, target } } })),
-  createEnrollment: (user: string) =>
-    ok(client.POST("/users/{user}/enrollment", { params: userPath(user) })),
   createKey: (user: string) => ok(client.POST("/users/{user}/keys", { params: userPath(user) })),
   setKeyActive: (user: string, key: string, active: boolean) =>
     ok(client.PUT("/users/{user}/keys/{key}", { params: { path: { user, key } }, body: { active } })),

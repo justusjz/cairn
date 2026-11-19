@@ -52,7 +52,7 @@ docker run -d --name cairn -p 9000:9000 \
     -e CAIRN_DATABASE="postgres://user:pass@db.internal:5432/cairn" \
     -v cairn-data:/var/lib/cairn \
     ghcr.io/justusjz/cairn:<version>
-docker exec cairn cairn user create admin --admin --key
+docker exec cairn cairn user create admin --admin
 ```
 
 For a cluster, also set `CAIRN_PEER_URL` to an address the other nodes can
@@ -83,11 +83,12 @@ Encrypt as they're needed. Only Caddy is published, on ports 80 and 443.
    docker compose up -d
    ```
 
-3. Make the first admin, and enroll a passkey for the console with the link
-   it prints (the console's sign-in page says so too, until someone has):
+3. Make the first administrator, a [directory user](#directory-users), and
+   set up a passkey for the console with the link it prints (the console's
+   sign-in page says so too, until someone can sign in):
 
    ```sh
-   docker compose exec cairn cairn user create admin --admin
+   docker compose exec cairn cairn directory-user create admin --admin
    ```
 
 Caddy gets a certificate for `s3.example.com` and `console.example.com` as
@@ -131,7 +132,7 @@ the credentials of a user, and a fresh database has none. Create the first
 admin (see [Users and permissions](#users-and-permissions)):
 
 ```sh
-cairn user create admin --admin --key  # prints its access key ID and secret
+cairn user create admin --admin  # prints its access key ID and secret
 ```
 
 The `cairn` commands that manage the cluster (`user`, `account`, `oidc`,
@@ -484,7 +485,7 @@ before its name (`arn:aws:iam::<account>:user/team-a/ada`), and up to 50
 `aws:ResourceTag/<key>` (IAM's actions on the user) and
 `aws:PrincipalTag/<key>` (the user's own requests). It has **access keys**: up to two,
 as in IAM, each an access key ID and a secret. IDs are random, 20
-characters, as IAM's (`cairn user create --key` prints the first); only a role
+characters, as IAM's (`cairn user create` prints the first); only a role
 migrated from before access keys keeps a key named as it. Access key IDs are unique across the
 cluster. Users are stored in
 Postgres, so every node picks up a change on the very next request; there is
@@ -714,11 +715,10 @@ own actions, `cairn:` ones (`cairn:GetCluster`, `cairn:PutSetting`,
 them; Cairn's managed policy `CairnOperatorAccess` allows them and nothing
 else (the cluster, without the data).
 
-A console session signed in with a passkey has
-`aws:MultiFactorAuthPresent` (`true`) and `aws:MultiFactorAuthAge` (seconds
-since it was signed in), as does a [directory user's](#directory-users)
-signed in with a passkey; one signed in at an identity source has it
-`false`,
+A console session of a [directory user](#directory-users) signed in with
+a passkey has `aws:MultiFactorAuthPresent` (`true`) and
+`aws:MultiFactorAuthAge` (seconds since it was signed in); one signed in at
+an identity source has it `false`,
 and access keys never have it, as AWS's long-term keys don't. AWS's guard
 then keeps a leaked key from doing what matters, in any identity policy:
 
@@ -837,7 +837,9 @@ user](#users-and-permissions) is the way back in:
 
 | Command | Description |
 | --- | --- |
-| `cairn user create <name> [--admin] [--key [--id <ID>] [--secret <S>]]` | Create a person: a user without access keys, and print a link (valid 24 hours) for it to sign in to the [console](#console) with: made from the console URL of the node the command runs on; one that serves no console prints the link's path. With `--key` (or `--id`, `--secret`), a service instead: a user with an access key of a random 20-char ID (or `--id`), whose ID is printed, with a generated 40-char secret unless `--secret` is given (min. 8 chars). `cairn role create` does the same. |
+| `cairn user create <name> [--admin] [--id <ID>] [--secret <S>]` | Create an IAM user with an access key of a random 20-char ID (or `--id`), whose ID is printed, with a generated 40-char secret unless `--secret` is given (min. 8 chars): a service's. `--admin` gives it `AdministratorAccess`. `cairn role create` does the same. |
+| `cairn directory-user create <user-name> [--admin] [--display-name <N>] [--email <E>]` | Create a user of Cairn's own [directory](#directory-users), and print a link (valid 7 days) for it to set up a passkey for the [console](#console) with: made from the console URL of the node the command runs on; one that serves no console prints the link's path. `--admin` assigns it the permission set `AdministratorAccess` (made if there's none) in the management account; given for a user that exists already, it does that and prints a new link. |
+| `cairn directory-user link <user-name>` | Print a new setup link for a user of Cairn's own directory (after it lost its passkeys, say). |
 | `cairn account root-link` | Print a one-time link (15 minutes) to sign in to the console as the account's root user. |
 | `cairn account root-key` | Print temporary credentials (15 minutes) of the account's root user, as shell `export`s. |
 | `cairn account root-mfa [--replace]` | Make the account's root user's virtual MFA device, for MFA delete, and print its serial number and secret (as an `otpauth://` URI). `--replace` makes a new one; the old one's codes stop working. |
@@ -1224,34 +1226,35 @@ Identity Center's directory users and groups aren't, yet (see
 
 ## Console
 
-The console is Cairn's web UI: people manage the account's buckets,
+The console is Cairn's web UI: people manage the accounts' buckets,
 objects, users and policies there, and its operators watch and run the
 cluster. It's off unless a node is started with `--listen-console` and
 `--console-url`; any number of nodes may serve it, behind one URL. People
-sign in with **passkeys** (IAM users), or at an **identity source**, an
-OpenID Connect provider (as [directory users](#directory-users)): there are
-no passwords, and access keys are for S3, never for the console.
+sign in as [directory users](#directory-users), as at IAM Identity
+Center's access portal: with **passkeys** (users of Cairn's own directory),
+or at an **identity source**, an OpenID Connect provider. There are no
+passwords, IAM users don't sign in (they have access keys, for S3 and the
+IAM API, never for the console), and the root user only with a link from a
+node.
 
 ```sh
 cairn serve ... --listen-console 0.0.0.0:9480 --console-url https://console.example.com
 ```
 
-The first person comes from the command line: an admin, and the link it
-prints to enroll a passkey with (the console's sign-in page shows the
-command until someone has enrolled). Everyone after that can be made in the
-console.
+The first person comes from the command line: a directory user with the
+permission set `AdministratorAccess`, and the link it prints to set up a
+passkey with (the console's sign-in page shows the command until someone
+can sign in). Everyone after that is made in the console.
 
 ```sh
-cairn user create ada --admin    # on a node that serves the console
+cairn directory-user create ada --admin    # on a node that serves the console
 ```
 
-A **login** (a person, with passkeys) acts as a user. An enrollment link is
-for a user: opened signed out, it makes a new login.
-
-The console acts as its identity: it allows exactly what that identity's S3,
-IAM and `cairn:` requests would be allowed, by the same policies (the user's
-attached and inline policies, and the bucket's policy; an explicit Deny
-wins), and denies with S3's messages.
+The console acts as its identity, the session of the permission set's role
+(or of a role switched to): it allows exactly what that identity's S3, IAM
+and `cairn:` requests would be allowed, by the same policies (the role's
+policies, and the bucket's policy; an explicit Deny wins), and denies with
+S3's messages.
 
 The menu at the top right is the person's: who the session acts as, its
 passkeys (a directory user's permission sets and credentials), and signing
@@ -1284,12 +1287,9 @@ out.
   managed policies (AdministratorAccess makes an admin), make, deactivate
   and delete access keys (a key's secret never changes, as in IAM: rotate a
   key by making a second one, moving its clients over, and deleting the
-  first), write inline policies, which the server checks as IAM does,
-  and make enrollment links. People and service users are listed apart:
-  both are IAM users, as in AWS, but a person signs in to the console (or
-  has a link out to), with how, and when they last did; a service has only
-  access keys. A new person gets a console link and no access key; a new
-  service, an access key. Each user shows the groups it's in.
+  first), and write inline policies, which the server checks as IAM does.
+  IAM users are for services and scripts: they don't sign in to the console
+  (people are directory users). Each user shows the groups it's in.
 - **Groups:** [groups](#users-and-permissions), as IAM's actions allow:
   make one (with a path), add and remove members, attach and write
   policies, rename or move it, and delete it once it has no members or
@@ -1359,9 +1359,9 @@ restarts; everything else is read from the database.
 
 ### Directory users
 
-People can also sign in as **directory users**, as in IAM Identity Center,
-with no IAM user behind them: users of **Cairn's own directory**, who sign
-in with passkeys, and whoever an identity source vouches for. An
+People sign in to the console as **directory users**, as in IAM Identity
+Center, with no IAM user behind them: users of **Cairn's own directory**,
+who sign in with passkeys, and whoever an identity source vouches for. An
 administrator decides what they may do with **permission sets** and
 **assignments**, on the console's Identity Center page, or through
 Identity Center's APIs (below):
@@ -1399,11 +1399,12 @@ link**, valid 7 days and working once: the console makes one when it
 makes the user, and the user's row makes more (after an administrator
 removed a lost passkey, say), as does the command line on a node. Signed
 in, they add more passkeys on their own page (at most 8), rename them and
-remove them, but never their last, as a login does. Their passkeys sign
-them in as a login's do, as multi-factor.
+remove them, but never their last. Their passkeys sign them in as
+multi-factor.
 
 ```sh
-cairn directory-user link grace
+cairn directory-user create grace --admin   # the first administrator
+cairn directory-user link grace             # a new link, for a lost passkey
 ```
 
 
@@ -1458,10 +1459,11 @@ aws sso-admin create-account-assignment --instance-arn ... --permission-set-arn 
   opens it. Cairn speaks plain HTTP: put a TLS-terminating proxy in front
   (`http://localhost` works for trying it out, as browsers treat it as
   secure). Passkeys are bound to the console URL's host, so changing it
-  makes everyone enroll again.
-- **Enrollment.** An identity gets a first passkey through a one-time link,
-  valid 24 hours: `cairn user create <name>` prints the first, the user's
-  page in the console makes more. Once signed in, people add more passkeys (at most 8; a second one,
+  makes everyone set theirs up again.
+- **Setup links.** A user of Cairn's own directory gets a first passkey
+  through a one-time link, valid 7 days: `cairn directory-user create
+  <name>` prints the first, the Identity Center page in the console makes
+  more. Once signed in, people add more passkeys (at most 8; a second one,
   on another device, keeps them from being locked out) and remove them, but
   never their last. A lost passkey takes a new link.
 - **The root user** signs in with a link from `cairn account root-link`
@@ -1484,8 +1486,7 @@ aws sso-admin create-account-assignment --instance-arn ... --permission-set-arn 
   Register `<console URL>/api/oidc/callback` with the provider as the
   client's redirect URI. Cairn uses the authorization code flow with PKCE,
   and checks the ID token's signature by the provider's keys (RS*, PS*,
-  ES256, ES384, EdDSA), issuer, audience, expiry and nonce. A login keeps at
-  least one passkey: its last can't be removed.
+  ES256, ES384, EdDSA), issuer, audience, expiry and nonce.
 - **Passkeys** are checked by Cairn itself (WebAuthn, with EdDSA, ES256 or
   RS256 keys), with user verification (a PIN or biometrics) every time, and
   without attestation: any authenticator works. A passkey whose signature

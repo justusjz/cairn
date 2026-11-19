@@ -4,7 +4,7 @@
 //!
 //! Cairn doesn't care which authenticator a passkey is on, so it asks for no
 //! attestation and ignores any statement it gets: what binds a registration
-//! to its user is the enrollment link or session it came through, not a
+//! to its user is the setup link or session it came through, not a
 //! vendor's certificate. Every ceremony requires user verification (a
 //! passkey is the only factor), and a credential's public key is one of
 //! EdDSA (Ed25519), ES256 (P-256) or RS256, the three every authenticator

@@ -217,15 +217,16 @@ struct Cli {
 enum Command {
     /// Run a storage node.
     Serve(ServeArgs),
-    /// Create the first users: people (with a console link) or services
-    /// (with an access key). The rest is IAM's: the API, or the console.
+    /// Create the first IAM users: services, with an access key. The rest
+    /// is IAM's: the API, or the console.
     #[command(alias = "role")]
     User(users::UserArgs),
     /// Become the account's root user for a while: a console link, or a
     /// temporary access key.
     Account(accounts::AccountArgs),
-    /// Make a user of Cairn's own directory (Identity Center's) a link to
-    /// set up a passkey with.
+    /// Make the first people: users of Cairn's own directory (Identity
+    /// Center's), who sign in to the console with passkeys, and links for
+    /// them to set one up with.
     DirectoryUser(identity_center::DirectoryUserArgs),
     /// Configure the OpenID Connect providers people may sign in to the
     /// console at.

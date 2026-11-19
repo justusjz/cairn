@@ -522,22 +522,22 @@ pub struct UserArgs {
 
 #[derive(Subcommand, Debug, Serialize, Deserialize)]
 enum UserCommand {
-    /// Create a user: a person, who signs in to the console with the
-    /// one-time link printed (valid 24 hours), or with `--key` a
-    /// service, with an access key, whose ID and secret are printed.
+    /// Create a user with an access key, whose ID and secret are printed:
+    /// a service's. People sign in to the console as directory users
+    /// instead (`cairn directory-user create`).
     Create {
         /// The user's name.
         name: String,
-        /// Make a service: an access key of a random ID, and no console
-        /// link. A random secret is generated unless given.
-        #[arg(long)]
+        /// What the key always is now (kept for scripts that say it).
+        #[arg(long, hide = true)]
+        #[serde(default)]
         key: bool,
         /// Give the key this ID instead of a random one (for scripted
-        /// setups that need a known one). Implies `--key`.
+        /// setups that need a known one).
         #[arg(long)]
         id: Option<String>,
         /// Use this secret instead of generating one (at least 8
-        /// characters). Implies `--key`.
+        /// characters); a random one is generated otherwise.
         #[arg(long)]
         secret: Option<String>,
         /// Give the user `AdministratorAccess`: everything in its account.
@@ -557,29 +557,23 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: UserArgs, out: &mut cra
     match args.command {
         UserCommand::Create {
             name,
-            key,
+            key: _,
             id,
             secret,
             admin,
         } => {
-            if key || id.is_some() || secret.is_some() {
-                let generated = secret.is_none();
-                let key = match id {
-                    Some(id) => {
-                        validate_name(&id)?;
-                        id
-                    }
-                    None => generate_key_id()?,
-                };
-                let (key, secret) = create_with_key(&client, account_id, &name, key, secret, admin).await?;
-                outln!(out, "access key: {key}");
-                if generated {
-                    outln!(out, "secret key: {secret}");
+            let generated = secret.is_none();
+            let key = match id {
+                Some(id) => {
+                    validate_name(&id)?;
+                    id
                 }
-            } else {
-                validate_name(&name)?;
-                let token = crate::console::store::create_person(&client, account_id, &name, admin).await?;
-                enrollment_link(app, &token, out);
+                None => generate_key_id()?,
+            };
+            let (key, secret) = create_with_key(&client, account_id, &name, key, secret, admin).await?;
+            outln!(out, "access key: {key}");
+            if generated {
+                outln!(out, "secret key: {secret}");
             }
             // Its identity in the KMS, so that key owners can grant it keys
             // now; if the KMS can't be reached, the next maintenance pass
@@ -595,9 +589,9 @@ pub async fn run(app: &std::sync::Arc<crate::App>, args: UserArgs, out: &mut cra
     Ok(())
 }
 
-/// Prints an enrollment link made of `token`: from the node's console URL,
-/// or, if it serves no console, the path to open there.
-pub(crate) fn enrollment_link(app: &crate::App, token: &str, out: &mut crate::admin::Output) {
+/// Prints a directory user's setup link made of `token`: from the node's
+/// console URL, or, if it serves no console, the path to open there.
+pub(crate) fn setup_link(app: &crate::App, token: &str, out: &mut crate::admin::Output) {
     match app.console.origin() {
         Some(origin) => outln!(out, "{origin}/enroll#{token}"),
         None => {

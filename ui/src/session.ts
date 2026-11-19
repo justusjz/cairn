@@ -46,10 +46,9 @@ export const api = {
   enrollOptions: (token: string) => ok(client.POST("/enroll/options", { body: { token } })),
   enroll: (token: string, challenge_id: string, name: string, credential: Registration) =>
     ok(client.POST("/enroll", { body: { token, challenge_id, name, credential } })),
-  enrollLink: (token: string) => ok(client.POST("/enroll/link", { body: { token } })),
   loginOptions: () => ok(client.POST("/login/options")),
   oidcProviders: () => ok(client.GET("/oidc/providers")),
-  /** Whether anyone has enrolled yet. */
+  /** Whether anyone can sign in yet. */
   setup: () => ok(client.GET("/setup")),
   /** Starts a sign-in at an identity source, as a directory user: the URL to
    * send the browser to. */

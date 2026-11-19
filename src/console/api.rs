@@ -1,8 +1,8 @@
-//! The console's JSON API, under `/api`: signing in with a passkey (a new
-//! login's first through an enrollment link, which adds its identity to a
-//! signed-in login instead), or at an identity source as a directory user
-//! (who picks a permission set, and may take its credentials), signing out,
-//! and the login's own passkeys. Its OpenAPI spec, with
+//! The console's JSON API, under `/api`: signing in as a directory user,
+//! with a passkey (a user of Cairn's own directory, whose first comes
+//! through a setup link) or at an identity source, who picks a permission
+//! set and may take its credentials; signing in as the root user, with a
+//! link from a node; signing out, and the user's own passkeys. Its OpenAPI spec, with
 //! `manage`'s routes, is committed as `ui/openapi.json`, which the UI's
 //! types are generated from.
 //!
@@ -27,7 +27,7 @@ use utoipa::{IntoParams, OpenApi, ToSchema};
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
-use super::{Console, DirectorySigned, PasskeyHolder, Signed, cleared_cookie, root_cookie, session_cookie, session_token, store, webauthn};
+use super::{Console, DirectorySigned, PasskeyHolder, cleared_cookie, root_cookie, session_cookie, session_token, store, webauthn};
 use super::web::{ApiError, ErrorBody};
 
 type Result<T> = std::result::Result<T, ApiError>;
@@ -45,7 +45,6 @@ pub(super) fn router() -> OpenApiRouter<Arc<Console>> {
     OpenApiRouter::with_openapi(Doc::openapi())
         .routes(routes!(enroll_options))
         .routes(routes!(enroll))
-        .routes(routes!(enroll_link))
         .routes(routes!(login_options))
         .routes(routes!(login))
         .routes(routes!(logout))
@@ -94,21 +93,13 @@ struct Ceremony {
     options: Value,
 }
 
-/// The login a new passkey made with `challenge` is for, when it's a new
-/// login's: its ID follows from the challenge, so that the passkey's user
-/// handle (which authenticators keep) can be the login's ID before it
-/// exists.
-fn new_login_id(challenge: &[u8]) -> Uuid {
-    let hash = ring::digest::digest(&ring::digest::SHA256, challenge);
-    Uuid::from_slice(&hash.as_ref()[..16]).expect("16 bytes")
-}
-
-/// Options to register a passkey for `login` (its ID, the user handle),
-/// named `name`, not on an authenticator that has one of `existing` already.
-fn creation_options(console: &Console, login: Uuid, name: &str, challenge: &[u8], existing: &[Vec<u8>]) -> Value {
+/// Options to register a passkey for directory user `user` (its ID, the
+/// user handle), named `name`, not on an authenticator that has one of
+/// `existing` already.
+fn creation_options(console: &Console, user: Uuid, name: &str, challenge: &[u8], existing: &[Vec<u8>]) -> Value {
     json!({
         "rp": { "id": console.party.id, "name": "Cairn" },
-        "user": { "id": b64(login.as_bytes()), "name": name, "displayName": name },
+        "user": { "id": b64(user.as_bytes()), "name": name, "displayName": name },
         "challenge": b64(challenge),
         "pubKeyCredParams": webauthn::ALGORITHMS.iter().map(|alg| json!({ "type": "public-key", "alg": alg })).collect::<Vec<_>>(),
         "timeout": store::CHALLENGE_TTL.as_millis() as u64,
@@ -136,20 +127,16 @@ fn request_options(console: &Console, challenge: &[u8]) -> Value {
 
 #[derive(Deserialize, ToSchema)]
 struct Enrollment {
-    /// The token of the enrollment link (after its `#`).
+    /// The token of the setup link (after its `#`).
     token: String,
 }
 
-/// What an enrollment link is for, and the options to make a new login's
-/// passkey for it (signed out; signed in, `/enroll/link` adds it to the
-/// login instead).
+/// Whose a setup link is, and the options to make a passkey of the
+/// directory user's with it.
 #[derive(Serialize, ToSchema)]
 struct EnrollCeremony {
-    /// The identity: `user @ account`, or a directory user's user name.
+    /// The directory user's user name.
     identity: String,
-    /// Whether the link is a directory user's setup link (whose passkey is
-    /// its own, never a login's).
-    directory: bool,
     #[serde(flatten)]
     ceremony: Ceremony,
 }
@@ -161,17 +148,13 @@ struct EnrollCeremony {
 ))]
 async fn enroll_options(State(console): ConsoleState, Json(body): Json<Enrollment>) -> Result<Json<EnrollCeremony>> {
     let client = console.app.pool.get().await?;
-    let (handle, label, directory) = match store::enrollment(&client, &body.token).await? {
-        Some(identity) => (None, identity.label(), false),
-        // A directory user's setup link: its passkeys' user handle is its ID.
-        None => match store::setup_link(&client, &body.token).await? {
-            Some((user, name)) => (Some(user), name, true),
-            None => return Err(ApiError::BadRequest("this enrollment link has been used, or has expired".into())),
-        },
+    // Its passkeys' user handle is the user's ID.
+    let Some((user, name)) = store::setup_link(&client, &body.token).await? else {
+        return Err(ApiError::BadRequest("this link has been used, or has expired".into()));
     };
-    let (id, challenge) = store::create_challenge(&client, store::Purpose::Enroll, None).await?;
-    let options = creation_options(&console, handle.unwrap_or_else(|| new_login_id(&challenge)), &label, &challenge, &[]);
-    Ok(Json(EnrollCeremony { identity: label, directory, ceremony: Ceremony { challenge_id: id.to_string(), options } }))
+    let (id, challenge) = store::create_challenge(&client, store::Purpose::Enroll).await?;
+    let options = creation_options(&console, user, &name, &challenge, &[]);
+    Ok(Json(EnrollCeremony { identity: name, ceremony: Ceremony { challenge_id: id.to_string(), options } }))
 }
 
 #[utoipa::path(post, path = "/login/options", responses(
@@ -181,7 +164,7 @@ async fn enroll_options(State(console): ConsoleState, Json(body): Json<Enrollmen
 ))]
 async fn login_options(State(console): ConsoleState) -> Result<Json<Ceremony>> {
     let client = console.app.pool.get().await?;
-    let (id, challenge) = store::create_challenge(&client, store::Purpose::Login, None).await?;
+    let (id, challenge) = store::create_challenge(&client, store::Purpose::Login).await?;
     Ok(Json(Ceremony { challenge_id: id.to_string(), options: request_options(&console, &challenge) }))
 }
 
@@ -192,20 +175,12 @@ async fn login_options(State(console): ConsoleState) -> Result<Json<Ceremony>> {
 ))]
 async fn passkey_options(State(console): ConsoleState, holder: PasskeyHolder) -> Result<Json<Ceremony>> {
     let client = console.app.pool.get().await?;
-    let options = match holder {
-        PasskeyHolder::Login(session) => {
-            let (id, challenge) = store::create_challenge(&client, store::Purpose::Add, Some(session.login)).await?;
-            let existing = store::credential_ids(&client, session.login).await?;
-            (id, creation_options(&console, session.login, &session.login_name, &challenge, &existing))
-        }
-        // Its passkeys' user handle is its ID, as its setup link's.
-        PasskeyHolder::Directory(session) => {
-            let (id, challenge) = store::create_directory_challenge(&client, session.user_id).await?;
-            let existing = store::directory_credential_ids(&client, session.user_id).await?;
-            (id, creation_options(&console, session.user_id, &session.user_name, &challenge, &existing))
-        }
-    };
-    Ok(Json(Ceremony { challenge_id: options.0.to_string(), options: options.1 }))
+    let session = holder.0;
+    // Its passkeys' user handle is its ID, as its setup link's.
+    let (id, challenge) = store::create_directory_challenge(&client, session.user_id).await?;
+    let existing = store::directory_credential_ids(&client, session.user_id).await?;
+    let options = creation_options(&console, session.user_id, &session.user_name, &challenge, &existing);
+    Ok(Json(Ceremony { challenge_id: id.to_string(), options }))
 }
 
 // ─── Responses ───────────────────────────────────────────────────────────────
@@ -226,7 +201,7 @@ struct Assertion {
     client_data_json: String,
     authenticator_data: String,
     signature: String,
-    /// The login the passkey is of, as the authenticator says.
+    /// The directory user the passkey is of, as the authenticator says.
     user_handle: Option<String>,
 }
 
@@ -260,24 +235,13 @@ fn new_passkey<'a>(credential: &'a webauthn::NewCredential, name: &'a str) -> st
     }
 }
 
-/// Who signed with a passkey: a login, or a user of Cairn's own directory
-/// (its ID), and the passkey's credential ID.
-enum Signer {
-    Login(Uuid, Vec<u8>),
-    Directory(Uuid, Vec<u8>),
-}
-
 /// Checks an assertion against its challenge, with a directory user's
-/// passkey: who signed, whose use is recorded.
-async fn asserted_directory(
-    console: &Console,
-    client: &deadpool_postgres::Object,
-    challenge: &[u8],
-    a: &Assertion,
-    credential_id: Vec<u8>,
-    passkey: store::DirectoryPasskey,
-) -> Result<Signer> {
+/// passkey: who signed (the user's ID) with which passkey (its credential
+/// ID), whose use is recorded.
+async fn asserted(console: &Console, client: &deadpool_postgres::Object, challenge: &[u8], a: &Assertion) -> Result<(Uuid, Vec<u8>)> {
+    let credential_id = unb64(&a.id, "id")?;
     let unknown = || ApiError::BadRequest("this passkey isn't registered with this console (anymore)".into());
+    let passkey = store::directory_passkey(client, &credential_id).await?.ok_or_else(unknown)?;
     if let Some(handle) = &a.user_handle
         && unb64(handle, "user_handle")? != passkey.user.as_bytes()
     {
@@ -301,45 +265,7 @@ async fn asserted_directory(
             "this passkey's signature counter went backwards, so it may have been copied; it's refused".into(),
         ));
     }
-    Ok(Signer::Directory(passkey.user, credential_id))
-}
-
-/// Checks an assertion against its challenge: who signed (a login, or a
-/// user of Cairn's own directory), whose passkey's use is recorded.
-async fn asserted(console: &Console, client: &deadpool_postgres::Object, challenge: &[u8], a: &Assertion) -> Result<Signer> {
-    let credential_id = unb64(&a.id, "id")?;
-    let unknown = || ApiError::BadRequest("this passkey isn't registered with this console (anymore)".into());
-    let passkey = match store::passkey(client, &credential_id).await? {
-        Some(passkey) => passkey,
-        None => match store::directory_passkey(client, &credential_id).await? {
-            Some(passkey) => return asserted_directory(console, client, challenge, a, credential_id, passkey).await,
-            None => return Err(unknown()),
-        },
-    };
-    if let Some(handle) = &a.user_handle
-        && unb64(handle, "user_handle")? != passkey.login.as_bytes()
-    {
-        return Err(unknown());
-    }
-    let asserted = webauthn::verify_assertion(
-        &console.party,
-        challenge,
-        &passkey.public_key,
-        &unb64(&a.client_data_json, "client_data_json")?,
-        &unb64(&a.authenticator_data, "authenticator_data")?,
-        &unb64(&a.signature, "signature")?,
-    )
-    .map_err(refused)?;
-    if !store::record_use(client, &credential_id, asserted.sign_count, asserted.backed_up).await? {
-        eprintln!(
-            "console: a passkey of login {} signed with counter {} after {}: refused, as it may be a clone",
-            passkey.login, asserted.sign_count, passkey.sign_count
-        );
-        return Err(ApiError::BadRequest(
-            "this passkey's signature counter went backwards, so it may have been copied; it's refused".into(),
-        ));
-    }
-    Ok(Signer::Login(passkey.login, credential_id))
+    Ok((passkey.user, credential_id))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -357,8 +283,8 @@ struct Enroll {
     passkey: NewPasskey,
 }
 
-/// Makes a new login, with a first passkey, for an enrollment link's
-/// identity (using the link up), and signs in with it.
+/// Gives a directory user of Cairn's own directory a passkey with its setup
+/// link (using the link up), and signs in with it.
 #[utoipa::path(post, path = "/enroll", request_body = Enroll, responses(
     (status = 200, body = Me, description = "Signed in; the session's cookie is set"),
     (status = "4XX", body = ErrorBody),
@@ -369,36 +295,12 @@ async fn enroll(State(console): ConsoleState, Json(body): Json<Enroll>) -> Resul
     let p = &body.passkey;
     let name = store::check_name(&p.name)?;
     let challenge = take_challenge(&client, &p.challenge_id, store::Purpose::Enroll).await?.bytes;
-    let Some(identity) = store::enrollment(&client, &body.token).await? else {
-        // A directory user's setup link: its first (or another) passkey,
-        // and it's signed in with it.
-        if store::setup_link(&client, &body.token).await?.is_some() {
-            let credential = registered(&console, &challenge, &p.credential)?;
-            let user = store::new_directory_passkey(&client, &body.token, &new_passkey(&credential, name)).await?;
-            return directory_signed_in(&console, &client, user, &credential.id).await;
-        }
-        return Err(ApiError::BadRequest("this enrollment link has been used, or has expired".into()));
-    };
+    if store::setup_link(&client, &body.token).await?.is_none() {
+        return Err(ApiError::BadRequest("this link has been used, or has expired".into()));
+    }
     let credential = registered(&console, &challenge, &p.credential)?;
-    let login = new_login_id(&challenge);
-    let account = store::new_login(&client, login, &identity.label(), &body.token, &new_passkey(&credential, name)).await?;
-    signed_in(&console, &client, login, &account, &credential.id).await
-}
-
-/// Starts a session for `login`, signed in with passkey `credential` (just
-/// now), as its identity in `account`: the response with its cookie, and
-/// who's signed in.
-async fn signed_in(
-    console: &Console,
-    client: &deadpool_postgres::Object,
-    login: Uuid,
-    account: &str,
-    credential: &[u8],
-) -> Result<Response> {
-    let token = store::create_session(client, login, account, credential).await?;
-    let session = store::session(client, &token).await?.ok_or_else(|| anyhow::anyhow!("a new session is gone"))?;
-    let me = me_of(console, client, &session).await?;
-    Ok(([(header::SET_COOKIE, session_cookie(&token))], Json(me)).into_response())
+    let user = store::new_directory_passkey(&client, &body.token, &new_passkey(&credential, name)).await?;
+    directory_signed_in(&console, &client, user, &credential.id).await
 }
 
 /// Starts a session for directory user `user` of Cairn's own directory,
@@ -429,7 +331,7 @@ struct Login {
     credential: Assertion,
 }
 
-/// Signs in with a passkey, as the login's identity.
+/// Signs in with a passkey, as its directory user.
 #[utoipa::path(post, path = "/login", request_body = Login, responses(
     (status = 200, body = Me, description = "Signed in; the session's cookie is set"),
     (status = "4XX", body = ErrorBody),
@@ -438,17 +340,8 @@ struct Login {
 async fn login(State(console): ConsoleState, Json(body): Json<Login>) -> Result<Response> {
     let client = console.app.pool.get().await?;
     let challenge = take_challenge(&client, &body.challenge_id, store::Purpose::Login).await?.bytes;
-    let (login, credential) = match asserted(&console, &client, &challenge, &body.credential).await? {
-        Signer::Login(login, credential) => (login, credential),
-        Signer::Directory(user, credential) => return directory_signed_in(&console, &client, user, &credential).await,
-    };
-    let identities = store::identities(&client, login).await?;
-    let Some(first) = identities.first() else {
-        return Err(ApiError::Forbidden(
-            "this login isn't in any account (anymore): ask an administrator for an enrollment link".into(),
-        ));
-    };
-    signed_in(&console, &client, login, &first.account_id, &credential).await
+    let (user, credential) = asserted(&console, &client, &challenge, &body.credential).await?;
+    directory_signed_in(&console, &client, user, &credential).await
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -503,63 +396,34 @@ async fn logout(State(console): ConsoleState, headers: HeaderMap) -> Result<Resp
     Ok((StatusCode::NO_CONTENT, [(header::SET_COOKIE, cleared_cookie())]).into_response())
 }
 
-/// Adds an enrollment link's identity to the signed-in login (using the
-/// link up).
-#[utoipa::path(post, path = "/enroll/link", request_body = Enrollment, responses(
-    (status = 200, body = Me),
-    (status = "4XX", body = ErrorBody),
-    (status = "5XX", body = ErrorBody),
-))]
-async fn enroll_link(State(console): ConsoleState, signed: Signed, Json(body): Json<Enrollment>) -> Result<Json<Me>> {
-    let client = console.app.pool.get().await?;
-    if store::setup_link(&client, &body.token).await?.is_some() {
-        return Err(ApiError::BadRequest("this is a directory user's link: make a passkey of its own with it".into()));
-    }
-    store::enroll(&client, signed.session.login, &body.token).await?;
-    let session = store::session(&client, &signed.token).await?.ok_or_else(|| ApiError::Unauthorized("sign in first".into()))?;
-    Ok(Json(me_of(&console, &client, &session).await?))
-}
+// ─── Who's signed in ─────────────────────────────────────────────────────────
 
-// ─── The signed-in login ─────────────────────────────────────────────────────
-
-/// Who the login is: a user of the account.
+/// Who a session acts as: a principal of an account.
 #[derive(Serialize, ToSchema)]
 struct IdentitySummary {
     account_id: String,
     account: String,
-    /// The user's name.
+    /// The principal's name: a role's (a permission set's, or one switched
+    /// to), or `root`.
     user: String,
-    /// The user's ARN, which policies name it by.
+    /// Its ARN, which policies name it by.
     arn: String,
     /// Whether its account is the organization's management account, whose
     /// alone Identity Center and the organization are.
     management: bool,
 }
 
-impl IdentitySummary {
-    fn of(identity: &store::Identity, management: &str) -> IdentitySummary {
-        IdentitySummary {
-            account_id: identity.account_id.clone(),
-            account: identity.account.clone(),
-            user: identity.user.name.clone(),
-            arn: identity.arn(),
-            management: identity.account_id == management,
-        }
-    }
-}
-
-/// The signed-in login: who it acts as, its passkeys. Or the account's
-/// root user (`root`), or a directory user (`directory`), which have no
-/// login: no passkeys.
+/// Who's signed in: a directory user (`directory`), who it acts as, and its
+/// passkeys (a user of Cairn's own directory's); or the account's root user
+/// (`root`), which has none.
 #[derive(Serialize, ToSchema)]
 struct Me {
-    /// The login's name (`root` for the root user; a directory user's own).
+    /// The directory user's name (`root` for the root user).
     name: String,
     /// Whether the session is the account's root user's, which no identity
     /// policy restricts (only resource policies' denies do).
     root: bool,
-    /// When the root user's session ends at the latest (seconds since the
-    /// epoch); a login's has none here.
+    /// When the session ends at the latest (seconds since the epoch).
     expires_at: Option<f64>,
     /// Who the session acts as.
     identity: IdentitySummary,
@@ -638,40 +502,6 @@ struct PasskeySummary {
     current: bool,
 }
 
-async fn me_of(console: &Console, client: &deadpool_postgres::Object, session: &store::Session) -> Result<Me> {
-    // As a page of the console would ask it.
-    let user = super::session_user(client, session, axum::http::Method::GET, HeaderMap::new(), String::new(), None).await?;
-    let cluster = match user {
-        Some(user) => {
-            let actor = super::Actor(Arc::new(user));
-            actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?
-        }
-        None => false,
-    };
-    let passkeys = store::passkeys(client, session.login).await?;
-    Ok(Me {
-        directory: None,
-        switched: None,
-        name: session.login_name.clone(),
-        root: false,
-        expires_at: None,
-        identity: IdentitySummary::of(&session.identity, &crate::users::account(client).await?),
-        mfa: true,
-        cluster,
-        passkeys: passkeys
-            .into_iter()
-            .map(|p| PasskeySummary {
-                current: p.credential_id == session.credential_id,
-                id: b64(&p.credential_id),
-                name: p.name,
-                backed_up: p.backed_up,
-                created_at: p.created_at,
-                last_used_at: p.last_used_at,
-            })
-            .collect(),
-    })
-}
-
 #[utoipa::path(get, path = "/me", responses(
     (status = 200, body = Me),
     (status = "4XX", body = ErrorBody),
@@ -681,8 +511,9 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
     let unauthorized = || ApiError::Unauthorized("sign in first".into());
     let token = session_token(&headers).ok_or_else(unauthorized)?;
     let client = console.app.pool.get().await?;
-    if let Some(session) = store::session(&client, &token).await? {
-        let me = me_of(&console, &client, &session).await?;
+    #[cfg(test)]
+    if let Some(user) = super::e2e::test_session(&client, &token, &axum::http::Method::GET, &HeaderMap::new(), "", None).await {
+        let me = test_me(&console, &client, user).await?;
         return Ok(Json(switched_me(&console, &client, &headers, me).await?));
     }
     if let Some(session) = store::directory_session(&client, &token).await? {
@@ -691,6 +522,34 @@ async fn me(State(console): ConsoleState, headers: HeaderMap) -> Result<Json<Me>
     }
     let root = store::root_session(&client, &token).await?.ok_or_else(unauthorized)?;
     Ok(Json(root_me(&console, &root).await?))
+}
+
+/// Who a test session is (see `e2e::TEST_SESSIONS`): an IAM user.
+#[cfg(test)]
+async fn test_me(console: &Console, client: &deadpool_postgres::Object, user: super::actor::User) -> Result<Me> {
+    let management = crate::users::account(client).await?;
+    let account = user.account.clone();
+    let row = client.query_opt("SELECT name FROM accounts WHERE id = $1", &[&account]).await?;
+    let identity = IdentitySummary {
+        management: account == management,
+        account_id: account,
+        account: row.map(|r| r.get::<_, String>(0)).unwrap_or_default(),
+        user: user.principal.name.clone(),
+        arn: user.principal.arn(),
+    };
+    let actor = super::Actor(Arc::new(user));
+    let cluster = actor.allows(&console.app, "cairn:GetCluster", crate::s3::actions::On::Cluster).await?;
+    Ok(Me {
+        name: identity.user.clone(),
+        root: false,
+        expires_at: None,
+        identity,
+        mfa: true,
+        cluster,
+        passkeys: Vec::new(),
+        directory: None,
+        switched: None,
+    })
 }
 
 /// `me`, as the role its session switched to, if it did and that lasts.
@@ -946,7 +805,7 @@ async fn root_me(console: &Console, root: &store::RootSession) -> Result<Me> {
     })
 }
 
-/// Adds a passkey to the signed-in login, or user of Cairn's own directory.
+/// Adds a passkey to the signed-in user of Cairn's own directory.
 #[utoipa::path(post, path = "/passkeys", request_body = NewPasskey, responses(
     (status = 204, description = "Added"),
     (status = "4XX", body = ErrorBody),
@@ -956,19 +815,12 @@ async fn add_passkey(State(console): ConsoleState, holder: PasskeyHolder, Json(b
     let client = console.app.pool.get().await?;
     let name = store::check_name(&body.name)?;
     let challenge = take_challenge(&client, &body.challenge_id, store::Purpose::Add).await?;
-    let (login, user) = match &holder {
-        PasskeyHolder::Login(session) => (Some(session.login), None),
-        PasskeyHolder::Directory(session) => (None, Some(session.user_id)),
-    };
-    if (challenge.login, challenge.directory_user) != (login, user) {
+    let user = holder.0.user_id;
+    if challenge.directory_user != Some(user) {
         return Err(ApiError::BadRequest("this challenge isn't yours".into()));
     }
     let credential = registered(&console, &challenge.bytes, &body.credential)?;
-    let key = new_passkey(&credential, name);
-    match holder {
-        PasskeyHolder::Login(session) => store::add_passkey(&client, session.login, &key).await?,
-        PasskeyHolder::Directory(session) => store::add_directory_passkey(&client, session.user_id, &key).await?,
-    }
+    store::add_directory_passkey(&client, user, &new_passkey(&credential, name)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -977,7 +829,7 @@ struct PasskeyName {
     name: String,
 }
 
-/// Renames one of the signed-in login's (or own directory user's) passkeys.
+/// Renames one of the signed-in directory user's passkeys.
 #[utoipa::path(put, path = "/passkeys/{id}", params(("id" = String, Path)), request_body = PasskeyName, responses(
     (status = 204, description = "Renamed"),
     (status = "4XX", body = ErrorBody),
@@ -992,15 +844,12 @@ async fn rename_passkey(
     let name = store::check_name(&body.name)?;
     let client = console.app.pool.get().await?;
     let id = unb64(&id, "id")?;
-    match holder {
-        PasskeyHolder::Login(session) => store::rename_passkey(&client, session.login, &id, name).await?,
-        PasskeyHolder::Directory(session) => store::rename_directory_passkey(&client, session.user_id, &id, name).await?,
-    }
+    store::rename_directory_passkey(&client, holder.0.user_id, &id, name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Removes one of the signed-in login's (or own directory user's) passkeys
-/// (not its last), and ends the sessions signed in with it.
+/// Removes one of the signed-in directory user's passkeys (not its last),
+/// and ends the sessions signed in with it.
 #[utoipa::path(delete, path = "/passkeys/{id}", params(("id" = String, Path)), responses(
     (status = 204, description = "Removed"),
     (status = "4XX", body = ErrorBody),
@@ -1009,10 +858,7 @@ async fn rename_passkey(
 async fn delete_passkey(State(console): ConsoleState, holder: PasskeyHolder, Path(id): Path<String>) -> Result<StatusCode> {
     let client = console.app.pool.get().await?;
     let id = unb64(&id, "id")?;
-    match holder {
-        PasskeyHolder::Login(session) => store::delete_passkey(&client, session.login, &id).await?,
-        PasskeyHolder::Directory(session) => store::delete_directory_passkey(&client, session.user_id, &id).await?,
-    }
+    store::delete_directory_passkey(&client, holder.0.user_id, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1038,9 +884,10 @@ async fn oidc_providers(State(console): ConsoleState) -> Result<Json<Vec<Provide
 /// Whether the console is set up yet.
 #[derive(Serialize, ToSchema)]
 struct Setup {
-    /// Whether anyone has enrolled (and so can sign in). Until someone has,
-    /// the sign-in page says how to make the first person, on a node.
-    enrolled: bool,
+    /// Whether anyone can sign in: a directory user has a passkey, or
+    /// there's an identity source. Until then, the sign-in page says how to
+    /// make the first administrator, on a node.
+    can_sign_in: bool,
 }
 
 /// Whether the console is set up yet (for the sign-in page).
@@ -1049,8 +896,8 @@ struct Setup {
     (status = "5XX", body = ErrorBody),
 ))]
 async fn setup(State(console): ConsoleState) -> Result<Json<Setup>> {
-    let enrolled = store::anyone_enrolled(&console.app.pool.get().await?).await?;
-    Ok(Json(Setup { enrolled }))
+    let can_sign_in = store::anyone_can_sign_in(&console.app.pool.get().await?).await?;
+    Ok(Json(Setup { can_sign_in }))
 }
 
 /// Where providers send the browser back to: register it with them.

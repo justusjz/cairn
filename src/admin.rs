@@ -212,11 +212,29 @@ pub(crate) mod e2e {
         let out = cairn(&app, &["user", "create", "cli-ada", "--key"]).await;
         assert_eq!(out.error.as_deref(), Some("a user named \"cli-ada\" already exists"));
 
-        // A person's enrollment link: this node serves no console, so only
-        // the path.
+        // Without `--key`, it has one all the same.
         let out = cairn(&app, &["user", "create", "cli-cy"]).await;
+        assert!(out.stdout.starts_with("access key: "), "{}", out.stdout);
+
+        // The first administrator: a directory user with AdministratorAccess
+        // in the management account, and its setup link (this node serves no
+        // console, so only the path).
+        let out = cairn(&app, &["directory-user", "create", "cli-dee", "--admin"]).await;
+        assert_eq!(out.error, None);
         assert!(out.stdout.starts_with("/enroll#"), "{}", out.stdout);
         assert!(out.stderr.contains("serves no console"), "{}", out.stderr);
+        let client = app.pool.get().await.unwrap();
+        let management = crate::users::account(&client).await.unwrap();
+        let dee = crate::identity_center::users(&client, Some(crate::identity_center::Lookup::Name("cli-dee"))).await.unwrap().pop().unwrap();
+        let eligible = crate::identity_center::eligible(&client, &management, dee.id).await.unwrap();
+        assert_eq!(eligible.iter().map(|e| (e.set.name.as_str(), e.account.as_str())).collect::<Vec<_>>(), [("AdministratorAccess", management.as_str())]);
+        // Again: refused without `--admin`; with it, the same set, and a new link.
+        let out = cairn(&app, &["directory-user", "create", "cli-dee"]).await;
+        assert!(out.error.unwrap().contains("already"));
+        let out = cairn(&app, &["directory-user", "create", "cli-dee", "--admin"]).await;
+        assert_eq!(out.error, None);
+        assert!(out.stdout.starts_with("/enroll#"), "{}", out.stdout);
+        assert_eq!(crate::identity_center::eligible(&client, &management, dee.id).await.unwrap().len(), 1);
         // The root user's link: again only the path, after the account.
         let account = crate::users::account(&app.pool.get().await.unwrap()).await.unwrap();
         let out = cairn(&app, &["account", "root-link"]).await;

@@ -112,7 +112,7 @@ async fn older_cairns_see_the_first_keys_secret_and_cant_change_users() {
 }
 
 /// Older Cairns read users by the tables' and columns' old names (migration
-/// 47), as they loaded a request's user; they may not link logins to users.
+/// 47), as they loaded a request's user; they may not change users' keys.
 #[tokio::test]
 async fn older_cairns_read_users_by_their_old_names() {
     let Some(app) = node().await else { return };
@@ -146,7 +146,7 @@ async fn older_cairns_read_users_by_their_old_names() {
 
     let tx = client.transaction().await.unwrap();
     tx.batch_execute("SET LOCAL cairn.users = '5'").await.unwrap();
-    let err = tx.batch_execute("DELETE FROM login_identities").await.unwrap_err();
+    let err = tx.batch_execute("DELETE FROM access_keys").await.unwrap_err();
     assert!(format!("{err:?}").contains("too old to change users"), "{err:?}");
 }
 
@@ -469,7 +469,8 @@ async fn the_operators_join_the_account() {
     .await
     .unwrap();
     tx.commit().await.unwrap();
-    crate::db::init(&pool, usize::MAX).await.unwrap();
+    // Up to before migration 83, which drops the logins.
+    crate::db::init(&pool, 82).await.unwrap();
 
     let account = users::account(&client).await.unwrap();
     let names: Vec<String> = client.query("SELECT name FROM accounts WHERE NOT operator AND NOT internal", &[]).await.unwrap().iter().map(|r| r.get(0)).collect();
@@ -530,7 +531,8 @@ async fn the_roots_login_becomes_an_admin() {
     .await
     .unwrap();
     tx.commit().await.unwrap();
-    crate::db::init(&pool, usize::MAX).await.unwrap();
+    // Up to before migration 83, which drops the logins.
+    crate::db::init(&pool, 82).await.unwrap();
     let row = client
         .query_one(
             "SELECT r.name, r.admin FROM login_identities i JOIN users r ON r.id = i.user_id

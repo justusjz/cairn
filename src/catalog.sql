@@ -90,13 +90,9 @@
 --           setting its thumbprints (I10).
 --   M(m)    A managed policy's row. Exclusive: tagging it (I10); making,
 --           deleting a version, or setting its default (I13).
---   L(l)    A console login's row (see `console`). Exclusive: giving it a
---           passkey, removing one, linking an identity to it (I10).
 --   Y(y)    A user of Cairn's own directory's row (`identity_users`; see
 --           `identity_center`). Exclusive: giving it a passkey (signed in,
 --           or with a setup link), removing one (I10).
---   E(e)    An enrollment link's row: locked by the transaction that uses
---           it up, so that it's used once.
 --   X(x)    The blob's row. Shared: referencing it, changing or deleting
 --           a part on it, or changing its `lost_ranges` (the scrubber,
 --           which locks the row with nothing else). Exclusive: committing it, deleting it, removing a
@@ -198,14 +194,11 @@
 --     statement (T59). An IAM OIDC provider has at most 100 client
 --     IDs and 50 tags: under D(d), counted in a later statement (T50,
 --     T51); its thumbprints (at most five, checked before) are replaced
---     under D(d) too (T52). Likewise a console login
---     has at most 8 passkeys, as IAM's MFA devices, and at least one, but
---     by being deleted, under L(l) (T30, T31); and at most one identity per
---     account (T33, T34; the login_identities indexes are a backstop). So
---     does a user of Cairn's own directory, under Y(y) (T65, T66), but
---     it may have none (until it uses a setup link, or after an
---     administrator removed them all). Deleting a key or a
---     policy only takes from them. The console's enrollments, challenges and
+--     under D(d) too (T52). Likewise a user of Cairn's own directory has
+--     at most 8 passkeys, as IAM's MFA devices, under Y(y) (T65), and
+--     doesn't remove its own last one (T66): it has none until it uses a
+--     setup link, or after an administrator removed them all. Deleting a
+--     key or a policy only takes from them. The console's setup links, challenges and
 --     sessions are each used up or ended by a single DELETE, whose condition
 --     is on its own row (F2), so each is used once.
 -- I11. A version that Object Lock keeps (a legal hold, or a retention that
@@ -254,7 +247,7 @@
 -- There are none, by three rules, which every transaction follows:
 --
 -- A. All of a transaction's locks are taken up front, in one global order:
---    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, O, Q, D, M, L, Y, X (by
+--    B, A, U, P, S (by stripe), K (by lock id), G (by primary key), R, O, Q, D, M, Y, X (by
 --    blob id), each stripe in one mode, each blob
 --    in its final mode (exclusive wins over shared). A transaction that waits
 --    for a lock therefore only ever waits for one that comes later in the
@@ -2565,8 +2558,7 @@ BEGIN
         status := 'too_many';
         RETURN;
     END IF;
-    IF EXISTS (SELECT 1 FROM directory_passkeys WHERE credential_id = p_credential)
-       OR EXISTS (SELECT 1 FROM passkeys WHERE credential_id = p_credential) THEN
+    IF EXISTS (SELECT 1 FROM directory_passkeys WHERE credential_id = p_credential) THEN
         status := 'taken';
         RETURN;
     END IF;
@@ -2603,142 +2595,6 @@ BEGIN
     RETURN 'deleted';
 END
 $$;
-
--- T30: gives a login a passkey, signed in, unless it has `p_max` already
--- (I10). Takes L(l) exclusively, then counts. Returns 'added',
--- 'no_such_login', 'too_many' or 'taken' (the credential is registered
--- already).
-CREATE OR REPLACE FUNCTION pg_temp.cairn_add_passkey(
-    p_login uuid, p_credential bytea, p_public_key bytea, p_sign_count bigint,
-    p_name text, p_backup_eligible boolean, p_backed_up boolean, p_max integer)
-RETURNS text LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM 1 FROM logins WHERE id = p_login FOR UPDATE;
-    IF NOT FOUND THEN
-        RETURN 'no_such_login';
-    END IF;
-    IF (SELECT count(*) FROM passkeys WHERE login_id = p_login) >= p_max THEN
-        RETURN 'too_many';
-    END IF;
-    INSERT INTO passkeys (credential_id, login_id, public_key, sign_count, name, backup_eligible, backed_up)
-    VALUES (p_credential, p_login, p_public_key, p_sign_count, p_name, p_backup_eligible, p_backed_up)
-    ON CONFLICT DO NOTHING;
-    IF NOT FOUND THEN
-        RETURN 'taken';
-    END IF;
-    RETURN 'added';
-END
-$$;
-
--- T31: removes one of a login's passkeys (and so the sessions signed in with
--- it), unless it's the login's last, so that no one locks themselves out of
--- the console. Takes
--- L(l) exclusively, then counts. Returns 'deleted', 'no_such_passkey' or
--- 'last'.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_delete_passkey(p_login uuid, p_credential bytea)
-RETURNS text LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM 1 FROM logins WHERE id = p_login FOR UPDATE;
-    IF NOT EXISTS (SELECT 1 FROM passkeys WHERE login_id = p_login AND credential_id = p_credential) THEN
-        RETURN 'no_such_passkey';
-    END IF;
-    IF (SELECT count(*) FROM passkeys WHERE login_id = p_login) <= 1 THEN
-        RETURN 'last';
-    END IF;
-    DELETE FROM passkeys WHERE login_id = p_login AND credential_id = p_credential;
-    RETURN 'deleted';
-END
-$$;
-
--- Links the identity of enrollment `p_enrollment` (a user of the account)
--- to login `p_login`, which holds L(l) exclusively, using the
--- enrollment up: moved from the login it was linked to, if any (its passkeys
--- lost, say). The enrollment's row is locked first (E), so that it's used
--- once. Returns 'linked', 'no_enrollment' (used, expired, or its user gone)
--- or 'account_taken' (the login has another identity in that account), and
--- the identity's account.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_link_identity(p_login uuid, p_enrollment bytea,
-    OUT status text, OUT account text)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_user uuid;
-BEGIN
-    SELECT e.account_id, e.user_id INTO account, v_user FROM console_enrollments e
-    WHERE e.token_hash = p_enrollment AND e.expires_at > now()
-      AND (e.user_id IS NULL OR EXISTS (SELECT 1 FROM users r WHERE r.id = e.user_id))
-    FOR UPDATE;
-    IF NOT FOUND THEN
-        status := 'no_enrollment';
-        RETURN;
-    END IF;
-    IF EXISTS (SELECT 1 FROM login_identities WHERE login_id = p_login AND account_id = account
-               AND user_id IS DISTINCT FROM v_user) THEN
-        status := 'account_taken';
-        RETURN;
-    END IF;
-    DELETE FROM console_enrollments WHERE token_hash = p_enrollment;
-    DELETE FROM login_identities
-    WHERE account_id = account AND user_id IS NOT DISTINCT FROM v_user AND login_id <> p_login;
-    INSERT INTO login_identities (login_id, account_id, user_id) VALUES (p_login, account, v_user)
-    ON CONFLICT DO NOTHING;
-    status := 'linked';
-END
-$$;
-
--- T33: links an enrollment's identity to a signed-in login (see
--- `cairn_link_identity`). Takes L(l) exclusively, then E. Returns as that.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_enroll(p_login uuid, p_enrollment bytea,
-    OUT status text, OUT account text)
-LANGUAGE plpgsql AS $$
-BEGIN
-    PERFORM 1 FROM logins WHERE id = p_login FOR UPDATE;
-    IF NOT FOUND THEN
-        status := 'no_such_login';
-        RETURN;
-    END IF;
-    SELECT * INTO status, account FROM pg_temp.cairn_link_identity(p_login, p_enrollment);
-END
-$$;
-
--- T34: a new login `p_login`, named `p_name`, with its first passkey, for the identity
--- of enrollment `p_enrollment` (see `cairn_link_identity`): all of it, or
--- nothing. The new login's row is no one else's yet (L), then E. Returns
--- 'created', 'no_enrollment' or 'taken' (the credential is registered
--- already), the login and the identity's account.
-CREATE OR REPLACE FUNCTION pg_temp.cairn_new_login(
-    p_login uuid, p_name text, p_enrollment bytea, p_credential bytea, p_public_key bytea, p_sign_count bigint,
-    p_passkey text, p_backup_eligible boolean, p_backed_up boolean,
-    OUT status text, OUT login uuid, OUT account text)
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM console_enrollments e WHERE e.token_hash = p_enrollment AND e.expires_at > now()) THEN
-        status := 'no_enrollment';
-        RETURN;
-    END IF;
-    IF EXISTS (SELECT 1 FROM passkeys WHERE credential_id = p_credential) THEN
-        status := 'taken';
-        RETURN;
-    END IF;
-    IF EXISTS (SELECT 1 FROM logins WHERE id = p_login) THEN
-        status := 'taken';
-        RETURN;
-    END IF;
-    INSERT INTO logins (id, name) VALUES (p_login, p_name) RETURNING id INTO login;
-    SELECT l.status, l.account INTO status, account FROM pg_temp.cairn_link_identity(login, p_enrollment) l;
-    IF status <> 'linked' THEN
-        -- Used up meanwhile: the new login goes again.
-        DELETE FROM logins WHERE id = login;
-        login := NULL;
-        RETURN;
-    END IF;
-    INSERT INTO passkeys (credential_id, login_id, public_key, sign_count, name, backup_eligible, backed_up)
-    VALUES (p_credential, login, p_public_key, p_sign_count, p_passkey, p_backup_eligible, p_backed_up);
-    status := 'created';
-END
-$$;
-
-
-
 
 -- T18: PutBucketLifecycleConfiguration and DeleteBucketLifecycle: sets (or,
 -- with NULL, removes) the bucket's lifecycle configuration, with a new

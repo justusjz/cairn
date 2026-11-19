@@ -2681,7 +2681,7 @@
     },
     "/enroll": {
       "post": {
-        "summary": "Makes a new login, with a first passkey, for an enrollment link's\nidentity (using the link up), and signs in with it.",
+        "summary": "Gives a directory user of Cairn's own directory a passkey with its setup\nlink (using the link up), and signs in with it.",
         "operationId": "enroll",
         "requestBody": {
           "content": {
@@ -2696,51 +2696,6 @@
         "responses": {
           "200": {
             "description": "Signed in; the session's cookie is set",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/Me"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/enroll/link": {
-      "post": {
-        "summary": "Adds an enrollment link's identity to the signed-in login (using the\nlink up).",
-        "operationId": "enroll_link",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/Enrollment"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
             "content": {
               "application/json": {
                 "schema": {
@@ -3599,7 +3554,7 @@
     },
     "/login": {
       "post": {
-        "summary": "Signs in with a passkey, as the login's identity.",
+        "summary": "Signs in with a passkey, as its directory user.",
         "operationId": "login",
         "requestBody": {
           "content": {
@@ -4549,7 +4504,7 @@
     },
     "/passkeys": {
       "post": {
-        "summary": "Adds a passkey to the signed-in login, or user of Cairn's own directory.",
+        "summary": "Adds a passkey to the signed-in user of Cairn's own directory.",
         "operationId": "add_passkey",
         "requestBody": {
           "content": {
@@ -4622,7 +4577,7 @@
     },
     "/passkeys/{id}": {
       "put": {
-        "summary": "Renames one of the signed-in login's (or own directory user's) passkeys.",
+        "summary": "Renames one of the signed-in directory user's passkeys.",
         "operationId": "rename_passkey",
         "parameters": [
           {
@@ -4669,7 +4624,7 @@
         }
       },
       "delete": {
-        "summary": "Removes one of the signed-in login's (or own directory user's) passkeys\n(not its last), and ends the sessions signed in with it.",
+        "summary": "Removes one of the signed-in directory user's passkeys (not its last),\nand ends the sessions signed in with it.",
         "operationId": "delete_passkey",
         "parameters": [
           {
@@ -7379,51 +7334,6 @@
         }
       }
     },
-    "/users/{user}/enrollment": {
-      "post": {
-        "summary": "Makes a user an enrollment link for the console, replacing its last.",
-        "operationId": "create_enrollment",
-        "parameters": [
-          {
-            "name": "user",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "201": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EnrollmentLink"
-                }
-              }
-            }
-          },
-          "4XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          },
-          "5XX": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorBody"
-                }
-              }
-            }
-          }
-        }
-      }
-    },
     "/users/{user}/keys": {
       "post": {
         "summary": "Makes a new access key for a user, with a random ID and secret; a user\nhas at most two.",
@@ -7892,7 +7802,7 @@
               "string",
               "null"
             ],
-            "description": "The login the passkey is of, as the authenticator says."
+            "description": "The directory user the passkey is of, as the authenticator says."
           }
         }
       },
@@ -8695,36 +8605,6 @@
         },
         "additionalProperties": false
       },
-      "ConsoleAccess": {
-        "type": "object",
-        "description": "How a user signs in to the console (see `store::ConsoleAccess`).",
-        "required": [
-          "enrolled",
-          "passkeys",
-          "link_pending"
-        ],
-        "properties": {
-          "enrolled": {
-            "type": "boolean",
-            "description": "Whether it enrolled (a login is linked to it)."
-          },
-          "last_sign_in": {
-            "type": [
-              "number",
-              "null"
-            ],
-            "format": "double"
-          },
-          "link_pending": {
-            "type": "boolean",
-            "description": "Whether an enrollment link for it is out, and works still."
-          },
-          "passkeys": {
-            "type": "integer",
-            "format": "int64"
-          }
-        }
-      },
       "Counts": {
         "type": "object",
         "description": "Counts of requests, by how they ended, and of what they moved.",
@@ -8872,7 +8752,7 @@
         "properties": {
           "access_key": {
             "type": "boolean",
-            "description": "Whether it gets an access key (a service's), of a random ID; a person\ngets none, and signs in to the console through its link."
+            "description": "Whether it gets an access key, of a random ID (else it has none\nuntil one is made)."
           },
           "boundary": {
             "type": [
@@ -9305,22 +9185,17 @@
           {
             "type": "object",
             "required": [
-              "identity",
-              "directory"
+              "identity"
             ],
             "properties": {
-              "directory": {
-                "type": "boolean",
-                "description": "Whether the link is a directory user's setup link (whose passkey is\nits own, never a login's)."
-              },
               "identity": {
                 "type": "string",
-                "description": "The identity: `user @ account`, or a directory user's user name."
+                "description": "The directory user's user name."
               }
             }
           }
         ],
-        "description": "What an enrollment link is for, and the options to make a new login's\npasskey for it (signed out; signed in, `/enroll/link` adds it to the\nlogin instead)."
+        "description": "Whose a setup link is, and the options to make a passkey of the\ndirectory user's with it."
       },
       "Enrollment": {
         "type": "object",
@@ -9330,13 +9205,13 @@
         "properties": {
           "token": {
             "type": "string",
-            "description": "The token of the enrollment link (after its `#`)."
+            "description": "The token of the setup link (after its `#`)."
           }
         }
       },
       "EnrollmentLink": {
         "type": "object",
-        "description": "A one-time link for a user to register its first passkey for the\nconsole, valid 24 hours.",
+        "description": "A one-time link for a user of Cairn's own directory to set up a passkey\nfor the console with, valid 7 days.",
         "required": [
           "path"
         ],
@@ -9771,7 +9646,7 @@
       },
       "IdentitySummary": {
         "type": "object",
-        "description": "Who the login is: a user of the account.",
+        "description": "Who a session acts as: a principal of an account.",
         "required": [
           "account_id",
           "account",
@@ -9788,7 +9663,7 @@
           },
           "arn": {
             "type": "string",
-            "description": "The user's ARN, which policies name it by."
+            "description": "Its ARN, which policies name it by."
           },
           "management": {
             "type": "boolean",
@@ -9796,7 +9671,7 @@
           },
           "user": {
             "type": "string",
-            "description": "The user's name."
+            "description": "The principal's name: a role's (a permission set's, or one switched\nto), or `root`."
           }
         }
       },
@@ -10769,7 +10644,7 @@
       },
       "Me": {
         "type": "object",
-        "description": "The signed-in login: who it acts as, its passkeys. Or the account's\nroot user (`root`), or a directory user (`directory`), which have no\nlogin: no passkeys.",
+        "description": "Who's signed in: a directory user (`directory`), who it acts as, and its\npasskeys (a user of Cairn's own directory's); or the account's root user\n(`root`), which has none.",
         "required": [
           "name",
           "root",
@@ -10800,7 +10675,7 @@
               "null"
             ],
             "format": "double",
-            "description": "When the root user's session ends at the latest (seconds since the\nepoch); a login's has none here."
+            "description": "When the session ends at the latest (seconds since the epoch)."
           },
           "identity": {
             "$ref": "#/components/schemas/IdentitySummary",
@@ -10812,7 +10687,7 @@
           },
           "name": {
             "type": "string",
-            "description": "The login's name (`root` for the root user; a directory user's own)."
+            "description": "The directory user's name (`root` for the root user)."
           },
           "passkeys": {
             "type": "array",
@@ -12810,12 +12685,12 @@
         "type": "object",
         "description": "Whether the console is set up yet.",
         "required": [
-          "enrolled"
+          "can_sign_in"
         ],
         "properties": {
-          "enrolled": {
+          "can_sign_in": {
             "type": "boolean",
-            "description": "Whether anyone has enrolled (and so can sign in). Until someone has,\nthe sign-in page says how to make the first person, on a node."
+            "description": "Whether anyone can sign in: a directory user has a passkey, or\nthere's an identity source. Until then, the sign-in page says how to\nmake the first administrator, on a node."
           }
         }
       },
@@ -13384,17 +13259,6 @@
               "null"
             ],
             "description": "Its permissions boundary's ARN, which caps what its policies allow."
-          },
-          "console": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ConsoleAccess",
-                "description": "How it signs in to the console, if it does (a person's); `None`:\nit doesn't, and no link for it is out (a service's)."
-              },
-              {
-                "type": "null"
-              }
-            ]
           },
           "created_at": {
             "type": "number",

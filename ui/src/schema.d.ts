@@ -766,30 +766,10 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Makes a new login, with a first passkey, for an enrollment link's
-         *     identity (using the link up), and signs in with it.
+         * Gives a directory user of Cairn's own directory a passkey with its setup
+         *     link (using the link up), and signs in with it.
          */
         post: operations["enroll"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/enroll/link": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Adds an enrollment link's identity to the signed-in login (using the
-         *     link up).
-         */
-        post: operations["enroll_link"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1036,7 +1016,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Signs in with a passkey, as the login's identity. */
+        /** Signs in with a passkey, as its directory user. */
         post: operations["login"];
         delete?: never;
         options?: never;
@@ -1380,7 +1360,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Adds a passkey to the signed-in login, or user of Cairn's own directory. */
+        /** Adds a passkey to the signed-in user of Cairn's own directory. */
         post: operations["add_passkey"];
         delete?: never;
         options?: never;
@@ -1412,12 +1392,12 @@ export interface paths {
             cookie?: never;
         };
         get?: never;
-        /** Renames one of the signed-in login's (or own directory user's) passkeys. */
+        /** Renames one of the signed-in directory user's passkeys. */
         put: operations["rename_passkey"];
         post?: never;
         /**
-         * Removes one of the signed-in login's (or own directory user's) passkeys
-         *     (not its last), and ends the sessions signed in with it.
+         * Removes one of the signed-in directory user's passkeys (not its last),
+         *     and ends the sessions signed in with it.
          */
         delete: operations["delete_passkey"];
         options?: never;
@@ -2145,23 +2125,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/users/{user}/enrollment": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Makes a user an enrollment link for the console, replacing its last. */
-        post: operations["create_enrollment"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/users/{user}/keys": {
         parameters: {
             query?: never;
@@ -2277,7 +2240,7 @@ export interface components {
             client_data_json: string;
             id: string;
             signature: string;
-            /** @description The login the passkey is of, as the authenticator says. */
+            /** @description The directory user the passkey is of, as the authenticator says. */
             user_handle?: string | null;
         };
         /**
@@ -2627,17 +2590,6 @@ export interface components {
         Configuration: {
             rules: components["schemas"]["Rule"][];
         };
-        /** @description How a user signs in to the console (see `store::ConsoleAccess`). */
-        ConsoleAccess: {
-            /** @description Whether it enrolled (a login is linked to it). */
-            enrolled: boolean;
-            /** Format: double */
-            last_sign_in?: number | null;
-            /** @description Whether an enrollment link for it is out, and works still. */
-            link_pending: boolean;
-            /** Format: int64 */
-            passkeys: number;
-        };
         /** @description Counts of requests, by how they ended, and of what they moved. */
         Counts: {
             /** Format: int64 */
@@ -2700,8 +2652,8 @@ export interface components {
         };
         CreateUser: {
             /**
-             * @description Whether it gets an access key (a service's), of a random ID; a person
-             *     gets none, and signs in to the console through its link.
+             * @description Whether it gets an access key, of a random ID (else it has none
+             *     until one is made).
              */
             access_key?: boolean;
             /** @description Its permissions boundary: a managed policy's ARN. */
@@ -2872,26 +2824,20 @@ export interface components {
             token: string;
         };
         /**
-         * @description What an enrollment link is for, and the options to make a new login's
-         *     passkey for it (signed out; signed in, `/enroll/link` adds it to the
-         *     login instead).
+         * @description Whose a setup link is, and the options to make a passkey of the
+         *     directory user's with it.
          */
         EnrollCeremony: components["schemas"]["Ceremony"] & {
-            /**
-             * @description Whether the link is a directory user's setup link (whose passkey is
-             *     its own, never a login's).
-             */
-            directory: boolean;
-            /** @description The identity: `user @ account`, or a directory user's user name. */
+            /** @description The directory user's user name. */
             identity: string;
         };
         Enrollment: {
-            /** @description The token of the enrollment link (after its `#`). */
+            /** @description The token of the setup link (after its `#`). */
             token: string;
         };
         /**
-         * @description A one-time link for a user to register its first passkey for the
-         *     console, valid 24 hours.
+         * @description A one-time link for a user of Cairn's own directory to set up a passkey
+         *     for the console with, valid 7 days.
          */
         EnrollmentLink: {
             /** @description The link's path, for the console's URL. */
@@ -3048,18 +2994,21 @@ export interface components {
             private_issuers: boolean;
             providers: components["schemas"]["IdentityProvider"][];
         };
-        /** @description Who the login is: a user of the account. */
+        /** @description Who a session acts as: a principal of an account. */
         IdentitySummary: {
             account: string;
             account_id: string;
-            /** @description The user's ARN, which policies name it by. */
+            /** @description Its ARN, which policies name it by. */
             arn: string;
             /**
              * @description Whether its account is the organization's management account, whose
              *     alone Identity Center and the organization are.
              */
             management: boolean;
-            /** @description The user's name. */
+            /**
+             * @description The principal's name: a role's (a permission set's, or one switched
+             *     to), or `root`.
+             */
             user: string;
         };
         /**
@@ -3452,9 +3401,9 @@ export interface components {
             sweep_shard: number;
         };
         /**
-         * @description The signed-in login: who it acts as, its passkeys. Or the account's
-         *     root user (`root`), or a directory user (`directory`), which have no
-         *     login: no passkeys.
+         * @description Who's signed in: a directory user (`directory`), who it acts as, and its
+         *     passkeys (a user of Cairn's own directory's); or the account's root user
+         *     (`root`), which has none.
          */
         Me: {
             /**
@@ -3465,15 +3414,14 @@ export interface components {
             directory?: components["schemas"]["DirectoryMe"] | null;
             /**
              * Format: double
-             * @description When the root user's session ends at the latest (seconds since the
-             *     epoch); a login's has none here.
+             * @description When the session ends at the latest (seconds since the epoch).
              */
             expires_at?: number | null;
             /** @description Who the session acts as. */
             identity: components["schemas"]["IdentitySummary"];
             /** @description Whether it was signed in with a passkey (`aws:MultiFactorAuthPresent`). */
             mfa: boolean;
-            /** @description The login's name (`root` for the root user; a directory user's own). */
+            /** @description The directory user's name (`root` for the root user). */
             name: string;
             passkeys: components["schemas"]["PasskeySummary"][];
             /**
@@ -4244,10 +4192,11 @@ export interface components {
         /** @description Whether the console is set up yet. */
         Setup: {
             /**
-             * @description Whether anyone has enrolled (and so can sign in). Until someone has,
-             *     the sign-in page says how to make the first person, on a node.
+             * @description Whether anyone can sign in: a directory user has a passkey, or
+             *     there's an identity source. Until then, the sign-in page says how to
+             *     make the first administrator, on a node.
              */
-            enrolled: boolean;
+            can_sign_in: boolean;
         };
         SlotCounts: components["schemas"]["Counts"] & {
             /**
@@ -4458,7 +4407,6 @@ export interface components {
             attached: components["schemas"]["AttachedPolicy"][];
             /** @description Its permissions boundary's ARN, which caps what its policies allow. */
             boundary?: string | null;
-            console?: components["schemas"]["ConsoleAccess"] | null;
             /** Format: double */
             created_at: number;
             /** @description The groups it's in, by name, whose policies are its own too. */
@@ -6789,45 +6737,6 @@ export interface operations {
         };
         responses: {
             /** @description Signed in; the session's cookie is set */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["Me"];
-                };
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    enroll_link: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["Enrollment"];
-            };
-        };
-        responses: {
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -10895,43 +10804,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-            "4XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-            "5XX": {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ErrorBody"];
-                };
-            };
-        };
-    };
-    create_enrollment: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                user: string;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            201: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["EnrollmentLink"];
-                };
             };
             "4XX": {
                 headers: {

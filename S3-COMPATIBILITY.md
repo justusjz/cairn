@@ -268,9 +268,11 @@ These follow AWS's documentation and API models, not real requests:
 
 ## Cairn's own additions
 
-- **The console:** a web UI with passkey or OpenID Connect sign-in. It acts
-  as the signed-in user: every operation is authorized as its `s3:`, `iam:`
-  or `cairn:` action. It switches roles as AWS's console does.
+- **The console:** a web UI that people sign in to as directory users
+  (Identity Center's), with passkeys or at an OpenID Connect provider; IAM
+  users have access keys only. It acts as the signed-in permission set's
+  role session: every operation is authorized as its `s3:`, `iam:` or
+  `cairn:` action. It switches roles as AWS's console does.
 - **Operators:** the cluster's settings and nodes are managed through `cairn:`
   actions on `arn:aws:cairn:::cluster` (`CairnOperatorAccess` allows them
   all).
