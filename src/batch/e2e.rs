@@ -1122,3 +1122,204 @@ async fn batch_replication_needs_its_permission_and_a_configuration() {
     let (_, files) = report_of(&app, &id).await;
     assert!(files[0].1.contains(",400,SrcBucketReplicationConfigMissing,"), "{files:?}");
 }
+
+/// The bucket copy jobs copy into.
+const COPIES: &str = "copies";
+
+/// Makes `COPIES`, versioned (so that a second copy would show), and the
+/// role jobs act as, allowed `actions` on every bucket, but `s3:PutObject`
+/// under `COPIES`' `denied/`.
+async fn copying(app: &Arc<App>, actions: &str) {
+    use crate::s3::buckets::versioning::put_bucket_versioning;
+    let client = app.pool.get().await.unwrap();
+    client.execute("INSERT INTO buckets (name) VALUES ($1)", &[&COPIES]).await.unwrap();
+    let body = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    let response = put_bucket_versioning(app, COPIES, Bytes::from(body), crate::mfa::Presented::Absent).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    role(app, super::SERVICE, actions).await;
+    let account = users::account(&client).await.unwrap();
+    let role = roles::Role::load(&client, &account, ROLE).await.unwrap().unwrap();
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":{actions},"Resource":"*"}},
+            {{"Effect":"Deny","Action":"s3:PutObject","Resource":"arn:aws:s3:::{COPIES}/denied/*"}}]}}"#
+    );
+    roles::put_policy(&client, &role, "p", &policy).await.unwrap();
+}
+
+/// What's kept of `bucket`'s `key`'s versions, newest first: their ETags,
+/// Content-Types, metadata and tags.
+async fn copies_of(app: &App, bucket: &str, key: &str) -> Vec<(String, String, String, String)> {
+    let client = app.pool.get().await.unwrap();
+    let rows = client
+        .query(
+            "SELECT etag, content_type, coalesce(metadata, ''), tags FROM objects
+             WHERE bucket = $1 AND key = $2 ORDER BY last_modified DESC, id DESC",
+            &[&bucket, &key],
+        )
+        .await
+        .unwrap();
+    rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3))).collect()
+}
+
+/// An S3PutObjectCopy operation into `COPIES`, with `rest`.
+fn copy_operation(rest: &str) -> String {
+    format!("<S3PutObjectCopy><TargetResource>arn:aws:s3:::{COPIES}</TargetResource>{rest}</S3PutObjectCopy>")
+}
+
+/// A copy job copies each object of its manifest into its bucket, under
+/// its prefix, as CopyObject would: with the metadata and tags it asks
+/// for, or their sources'.
+#[tokio::test]
+async fn a_job_copies_the_objects_of_its_manifest() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    copying(&app, r#"["s3:GetObject","s3:PutObject","s3:PutObjectTagging"]"#).await;
+    put(&app, "src/a", b"alpha".to_vec()).await;
+    put(&app, "src/my photo+1.jpg", b"photo".to_vec()).await;
+    let etag = manifest(&app, "manifest.csv", &format!("{BUCKET},src/a\n{BUCKET},src/my+photo%2B1.jpg\n")).await;
+    let replace = copy_operation(
+        "<MetadataDirective>REPLACE</MetadataDirective><NewObjectMetadata><ContentType>text/plain</ContentType>\
+         <UserMetadata><entry><key>colour</key><value>blue</value></entry></UserMetadata></NewObjectMetadata>\
+         <NewObjectTagging><member><Key>team</Key><Value>red</Value></member></NewObjectTagging>\
+         <TargetKeyPrefix>copied/</TargetKeyPrefix>",
+    );
+    let id = create(&app, &admin, &create_request("t1", &replace, "manifest.csv", &etag, false, &account)).await;
+    let job = describe(&app, &admin, &id).await;
+    assert!(job.contains("<S3PutObjectCopy><TargetResource>arn:aws:s3:::copies</TargetResource>"), "{job}");
+    step(&app, 1).await;
+    step(&app, 2).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("2"), "{job}");
+    let md5 = |data: &[u8]| -> String {
+        use md5::Digest;
+        md5::Md5::digest(data).iter().map(|b| format!("{b:02x}")).collect()
+    };
+    let copies = copies_of(&app, COPIES, "copied/src/a").await;
+    assert_eq!(copies.len(), 1);
+    let (copy_etag, content_type, metadata, tags) = &copies[0];
+    assert_eq!((copy_etag.as_str(), content_type.as_str(), tags.as_str()), (md5(b"alpha").as_str(), "text/plain", "team=red"));
+    assert!(metadata.contains("x-amz-meta-colour: blue"), "{metadata}");
+    assert_eq!(copies_of(&app, COPIES, "copied/src/my photo+1.jpg").await[0].0, md5(b"photo"));
+    // The sources are as they were.
+    assert_eq!(copies_of(&app, BUCKET, "src/a").await[0].1, "application/octet-stream");
+
+    // Without a directive or tags, a copy keeps its source's, and its key.
+    let id = create(&app, &admin, &create_request("t2", &copy_operation(""), "manifest.csv", &etag, false, &account)).await;
+    step(&app, 3).await;
+    step(&app, 4).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    let copies = copies_of(&app, COPIES, "src/a").await;
+    assert_eq!(copies, [(md5(b"alpha"), "application/octet-stream".to_owned(), String::new(), String::new())]);
+    // Nothing's left of their tasks' records.
+    let client = app.pool.get().await.unwrap();
+    let records: i64 = client.query_one("SELECT count(*) FROM batch_job_copies", &[]).await.unwrap().get(0);
+    assert_eq!(records, 0);
+}
+
+/// A page of copies done again, as when a node dies after its copies but
+/// before it saved where its job had got to, makes no second version of
+/// them: each task's copy is recorded with it, and found done. A write of
+/// a task recorded already is refused.
+#[tokio::test]
+async fn copies_are_made_once() {
+    let Some(app) = node().await else { return };
+    // Ten tasks a minute.
+    crate::settings::LIFECYCLE_RATE.set(&app.pool.get().await.unwrap(), 600).await.unwrap();
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    copying(&app, r#"["s3:GetObject","s3:PutObject"]"#).await;
+    let mut lines = String::new();
+    for i in 0..15 {
+        put(&app, &format!("k{i:02}"), vec![i]).await;
+        lines.push_str(&format!("{BUCKET},k{i:02}\n"));
+    }
+    let etag = manifest(&app, "manifest.csv", &lines).await;
+    let id = create(&app, &admin, &create_request("t1", &copy_operation(""), "manifest.csv", &etag, false, &account)).await;
+    step(&app, 1).await;
+    step(&app, 2).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("10"), "{job}");
+    // The node "died" before it saved its page: where the job had got to
+    // is where the page started.
+    let client = app.pool.get().await.unwrap();
+    let job_id: uuid::Uuid = id.parse().unwrap();
+    client
+        .execute("UPDATE batch_jobs SET cursor = 0, succeeded = 0, failed = 0 WHERE id = $1", &[&job_id])
+        .await
+        .unwrap();
+    let records: i64 =
+        client.query_one("SELECT count(*) FROM batch_job_copies WHERE job_id = $1", &[&job_id]).await.unwrap().get(0);
+    assert_eq!(records, 10);
+    step(&app, 3).await;
+    step(&app, 4).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("15"), "{job}");
+    for i in 0..15 {
+        assert_eq!(copies_of(&app, COPIES, &format!("k{i:02}")).await.len(), 1, "k{i:02}");
+    }
+
+    // The catalog refuses a task's second write, whoever makes it.
+    client.execute("INSERT INTO batch_job_copies (job_id, task) VALUES ($1, 0)", &[&job_id]).await.unwrap();
+    let copied = crate::notifications::scope(async {
+        crate::notifications::set_batch_task(Some((job_id, 0)));
+        crate::s3::objects::copy::copy_object(
+            &app,
+            COPIES,
+            "k00",
+            &format!("/{BUCKET}/k00"),
+            None,
+            "",
+            "",
+            None,
+            &crate::s3::conditional::Preconditions::default(),
+            crate::s3::objects::copy::CopyKeys::default(),
+        )
+        .await
+    })
+    .await;
+    assert!(copied.is_err());
+    assert_eq!(copies_of(&app, COPIES, "k00").await.len(), 1);
+}
+
+/// A copy task fails as its CopyObject would: denied to the role, of a
+/// source that isn't there, or that doesn't meet the job's conditions.
+/// CreateJob refuses a storage class the cluster hasn't.
+#[tokio::test]
+async fn copies_fail_as_copy_object_does() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    copying(&app, r#"["s3:GetObject","s3:PutObject"]"#).await;
+    put(&app, "a", b"a".to_vec()).await;
+    let etag = manifest(&app, "manifest.csv", &format!("{BUCKET},a\n{BUCKET},missing\n")).await;
+    // Under `denied/`, which the role may not write to.
+    let denied = copy_operation("<TargetKeyPrefix>denied/</TargetKeyPrefix>");
+    let id = with_report(&create_request("t1", &denied, "manifest.csv", &etag, false, &account), &report("FailedTasksOnly"));
+    let id = create(&app, &admin, &id).await;
+    step(&app, 1).await;
+    step(&app, 2).await;
+    let (_, files) = report_of(&app, &id).await;
+    assert!(files[0].1.contains(&format!("{BUCKET},a,,failed,403,AccessDenied,")), "{files:?}");
+    assert!(files[0].1.contains("s3:PutObject"), "{files:?}");
+
+    // Of what's there, only what was modified since a day from now.
+    let tomorrow = crate::sessions::iso(SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_secs() + 86_400);
+    let since = copy_operation(&format!("<ModifiedSinceConstraint>{tomorrow}</ModifiedSinceConstraint>"));
+    let id = with_report(&create_request("t2", &since, "manifest.csv", &etag, false, &account), &report("FailedTasksOnly"));
+    let id = create(&app, &admin, &id).await;
+    step(&app, 3).await;
+    step(&app, 4).await;
+    let (_, files) = report_of(&app, &id).await;
+    assert!(files[0].1.contains(&format!("{BUCKET},a,,failed,412,PreconditionFailed,")), "{files:?}");
+    assert!(files[0].1.contains(&format!("{BUCKET},missing,,failed,404,NoSuchKey,")), "{files:?}");
+    assert!(copies_of(&app, COPIES, "a").await.is_empty());
+
+    let unknown = copy_operation("<StorageClass>NEARLINE</StorageClass>");
+    let request = create_request("t3", &unknown, "manifest.csv", &etag, false, &account);
+    let (status, body) = body_of(control::create(&app, &access(&admin), &account, request.as_bytes()).await.unwrap()).await;
+    assert_eq!((status, element(&body, "Code")), (StatusCode::BAD_REQUEST, Some("BadRequestException")), "{body}");
+}

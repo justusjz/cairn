@@ -90,9 +90,9 @@ Done:
   paced by the rate lifecycle sweeps go at, which they share. Implemented. Batch
   Operations: jobs that tag objects (or remove their tags) and set their
   Object Lock retention and legal holds, from CSV manifests or inventory
-  reports (CSV or Parquet), as a role, at that rate too, with completion reports.
-  Implemented. Next: copies (once a copy done twice, when a node dies mid-page,
-  makes no second version).
+  reports (CSV or Parquet), as a role, at that rate too, with completion reports,
+  and copy objects, each copy recorded with the version it writes, so that one
+  done again when a node dies mid-page makes no second version. Implemented.
 - **Storage classes.** Classes of the operator's, each in a pool of the
   nodes' disks (`--data-dir <pool>=<path>`, several per node) with a layout
   of its own; objects ask for one with `x-amz-storage-class`, and change

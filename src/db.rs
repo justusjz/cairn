@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "13";
+pub(crate) const PROTOCOL: &str = "14";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -259,6 +259,7 @@ const MIGRATIONS: &[&str] = &[
     VERSION_ORDER,
     TIERS,
     ACLS,
+    BATCH_COPIES,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -3852,6 +3853,36 @@ ALTER TABLE objects ADD COLUMN owner_id text;
 ALTER TABLE objects ADD COLUMN acl text;
 ALTER TABLE multipart_uploads ADD COLUMN owner_id text;
 ALTER TABLE multipart_uploads ADD COLUMN acl text;
+"#;
+
+/// Migration 79: Batch Operations' copies (see `batch::copy`). A job's task
+/// that writes a version (S3PutObjectCopy's) is recorded, by its job and
+/// its ordinal (the tasks before it in the manifest), in the transaction
+/// that writes it (`cairn_batch_task`), which refuses to write it again:
+/// a page of tasks done again after a node died mid-page finds the ones
+/// it did done, and makes no second version of them. The records go once
+/// the job ends, and with it.
+///
+/// The protocol goes to 14, so that no older node takes a turn of a job
+/// it can't read, or writes a task's version without recording it.
+const BATCH_COPIES: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '14' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+CREATE TABLE batch_job_copies (
+    job_id uuid NOT NULL REFERENCES batch_jobs (id) ON DELETE CASCADE,
+    task   bigint NOT NULL,
+    PRIMARY KEY (job_id, task)
+);
+CREATE TRIGGER batch_job_copies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON batch_job_copies
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 
 #[cfg(test)]

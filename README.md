@@ -1761,8 +1761,9 @@ S3 Batch Operations: a job (S3 Control's `CreateJob`,
 `aws s3control create-job`) does one operation to every object a manifest
 lists, as a role. Cairn does `S3PutObjectTagging` (replacing each object's
 tags), `S3DeleteObjectTagging`, `S3PutObjectRetention`,
-`S3PutObjectLegalHold` ([Object Lock](#object-lock)) and
-`S3ReplicateObject` ([Batch Replication](#batch-replication)). Its manifest is a
+`S3PutObjectLegalHold` ([Object Lock](#object-lock)),
+`S3ReplicateObject` ([Batch Replication](#batch-replication)) and
+`S3PutObjectCopy` (copies, below). Its manifest is a
 CSV object of lines `bucket,key` (or `bucket,key,versionId`, as its
 `Fields` say), keys URL-encoded, or an [inventory report](#inventory)'s
 `manifest.json` (`S3InventoryReport_CSV_20161130`, without `Fields`), of CSV
@@ -1821,6 +1822,26 @@ all. Each task that can't is a failed task:
   --operation '{"S3PutObjectRetention":{"Retention":{"Mode":"GOVERNANCE",
     "RetainUntilDate":"2030-01-01T00:00:00Z"}}}'
   --operation '{"S3PutObjectLegalHold":{"LegalHold":{"Status":"ON"}}}'
+```
+
+A copy job copies each object into its bucket (`TargetResource`), at its
+key after the job's `TargetKeyPrefix`, as a CopyObject request would: so
+the role needs `s3:GetObject` (`s3:GetObjectVersion`, for a manifest with
+version IDs) on each object and `s3:PutObject` on its copy, and
+`s3:PutObjectTagging` if the job gives copies tags. A copy keeps its
+source's metadata and tags, unless the job replaces them
+(`MetadataDirective` `REPLACE` with `NewObjectMetadata`, and
+`NewObjectTagging`); it can also ask for a storage class, encryption
+(`SSEAlgorithm`, `SSEAwsKmsKeyId`), an ACL, Object Lock and a checksum
+algorithm, and copy only objects modified since or before a time. A task
+fails as its CopyObject would: an SSE-C object can't be copied (the job has
+no key for it), nor one larger than 5 GiB. Each copy is made once, even if
+the node doing it dies before it saved where its job had got to:
+
+```sh
+  --operation '{"S3PutObjectCopy":{"TargetResource":"arn:aws:s3:::archive",
+    "TargetKeyPrefix":"2026/","StorageClass":"STANDARD_IA",
+    "NewObjectTagging":[{"Key":"copied","Value":"yes"}]}}'
 ```
 
 A completion report (`--report`) goes to a bucket, under its prefix, as S3

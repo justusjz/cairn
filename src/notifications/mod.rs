@@ -38,6 +38,9 @@ pub struct Requester {
     /// its bucket owner's full control alone (see `s3::acl`):
     /// `cairn_write_acl` reads them from the context.
     pub acl: Option<Value>,
+    /// The Batch Operations task the task's write is (see `batch::copy`):
+    /// `cairn_batch_task` reads it from the context, and records it, once.
+    pub batch_task: Option<Value>,
 }
 
 tokio::task_local! {
@@ -86,6 +89,14 @@ pub fn set_replica(version_id: &str, last_modified: &str, etag: Option<&str>, ss
 pub fn set_acl(acl: Option<(String, Option<String>)>) {
     let acl = acl.map(|(owner, grants)| json!({ "owner": owner, "grants": grants }));
     let _ = REQUESTER.try_with(|r| r.lock().unwrap().acl = acl);
+}
+
+/// Makes the task's writes those of task `task` (its ordinal) of the Batch
+/// Operations job `job` (`None`: of none), which the catalog records with
+/// the version it writes, and refuses to write twice (see `batch::copy`).
+pub fn set_batch_task(task: Option<(uuid::Uuid, i64)>) {
+    let task = task.map(|(job, task)| json!({ "job": job.to_string(), "task": task }));
+    let _ = REQUESTER.try_with(|r| r.lock().unwrap().batch_task = task);
 }
 
 /// What `set_acl` set: the owner and stored grants.
@@ -151,6 +162,9 @@ fn base(r: &Requester) -> Value {
     }
     if let Some(acl) = &r.acl {
         context["acl"] = acl.clone();
+    }
+    if let Some(task) = &r.batch_task {
+        context["batch_task"] = task.clone();
     }
     context
 }

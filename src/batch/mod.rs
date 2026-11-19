@@ -6,12 +6,14 @@
 //!
 //! - Operations: `S3PutObjectTagging` (replacing each version's tags),
 //!   `S3DeleteObjectTagging`, `S3PutObjectRetention` and
-//!   `S3PutObjectLegalHold` (see `s3::object_lock`), and `S3ReplicateObject`
+//!   `S3PutObjectLegalHold` (see `s3::object_lock`), `S3ReplicateObject`
 //!   (Batch Replication: each version is queued to be replicated by its
 //!   bucket's replication configuration, as a new version is; see
-//!   `replicate`). Doing any of them twice does no harm, which a job relies
-//!   on (below): a retention set again is set to the same date, which isn't
-//!   shortening it, and a version is queued once. Others are refused with
+//!   `replicate`), and `S3PutObjectCopy` (see `copy`). Doing any but a copy
+//!   twice does no harm, which a job relies on (below): a retention set
+//!   again is set to the same date, which isn't shortening it, and a
+//!   version is queued once; a copy is recorded with the version it
+//!   writes, so that it's done once (see `copy`). Others are refused with
 //!   501 NotImplemented.
 //! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`), and
 //!   inventory reports (`S3InventoryReport_CSV_20161130`) of CSV or Parquet
@@ -43,7 +45,8 @@
 //! if it has a report. A node that dies mid-page
 //! leaves its page to be done again by another: its tasks were done, but
 //! not counted, and are done and counted again, which is why only
-//! operations that can be repeated are run.
+//! operations that can be repeated are run, or, a copy, that are recorded
+//! as they're done.
 //!
 //! A job acts as its role, as S3 assumes it: as the
 //! `batchoperations.s3.amazonaws.com` service, which the role's trust
@@ -56,6 +59,7 @@
 //! A job is kept for 90 days after it ends, as S3 keeps them.
 
 pub mod control;
+pub mod copy;
 pub mod manifest;
 mod parquet;
 pub mod report;
@@ -148,6 +152,9 @@ pub enum Operation {
     /// (Batch Replication; see `replicate`).
     #[serde(rename = "replicate")]
     Replicate,
+    /// Copies each version (see `copy`).
+    #[serde(rename = "copy")]
+    Copy(Box<copy::Copy>),
 }
 
 impl Operation {
@@ -159,6 +166,7 @@ impl Operation {
             Operation::PutRetention { .. } => "S3PutObjectRetention",
             Operation::PutLegalHold { .. } => "S3PutObjectLegalHold",
             Operation::Replicate => "S3ReplicateObject",
+            Operation::Copy(_) => "S3PutObjectCopy",
         }
     }
 }
@@ -357,6 +365,8 @@ async fn end(client: &Object, job: &Job, status: &str, failures: &[&Failure], no
             &[&job.id, &status, &now, &failures],
         )
         .await?;
+    // Its copies' records (see `copy`): no turn of it is taken again.
+    client.execute_cached("DELETE FROM batch_job_copies WHERE job_id = $1", &[&job.id]).await?;
     Ok(())
 }
 
@@ -547,7 +557,15 @@ async fn run(
         .await?;
     turn.status = "Active".to_owned();
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
-    let mut access = Access::new(Some(&principal), &principal.account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
+    // A copy's requests have headers, as policies see them.
+    let headers = match &job.operation {
+        Operation::Copy(copy) => match copy.headers() {
+            Ok(headers) => headers,
+            Err(why) => anyhow::bail!("job {}: its copy's {why}", job.id),
+        },
+        _ => HeaderMap::new(),
+    };
+    let mut access = Access::new(Some(&principal), &principal.account, &Method::PUT, &headers, "", &origin)?;
     let tags = match &job.operation {
         Operation::PutTagging { tags } => match Tags::from_pairs(tags.clone(), crate::s3::tags::On::Object) {
             Ok(tags) => tags,
@@ -564,8 +582,12 @@ async fn run(
         Operation::PutLegalHold { on } => {
             crate::s3::object_lock::set_context(&mut access.context, None, None, Some(if *on { "ON" } else { "OFF" }))
         }
-        Operation::DeleteTagging | Operation::Replicate => {}
+        Operation::DeleteTagging | Operation::Replicate | Operation::Copy(_) => {}
     }
+    let copier = match &job.operation {
+        Operation::Copy(copy) => Some(copy::Copier::new(job.id, copy, headers, &mut access)?),
+        _ => None,
+    };
     let mut source = match (&job.inventory, job.manifest.format.as_str()) {
         (Some(inventory), _) => Source::Inventory(inventory, None),
         (None, manifest::INVENTORY) => anyhow::bail!("job {} was prepared without its inventory report's files", job.id),
@@ -590,9 +612,18 @@ async fn run(
             for entry in entries {
                 // Preparing checked every entry, and the manifest is pinned
                 // to its ETag: one that isn't a task fails all the same.
+                // Its ordinal: the tasks before it, as the job's counts
+                // (saved with its cursor) and the page's tell.
+                let ordinal = succeeded + failed;
                 let (task, result) = match entry {
                     Ok(task) => {
-                        let result = run_task(app, &mut access, &who, &job.operation, &tags, &task).await?;
+                        let result = match &copier {
+                            Some(copier) => match unfit(&task, &job.operation) {
+                                Some(failure) => Err(failure),
+                                None => copier.run(app, &mut access, &principal, &who, ordinal, &task).await?,
+                            },
+                            None => run_task(app, &mut access, &who, &job.operation, &tags, &task).await?,
+                        };
                         (task, result)
                     }
                     Err(bad) => {
@@ -697,12 +728,8 @@ async fn run_task(
     task: &Task,
 ) -> anyhow::Result<Result<(), TaskFailure>> {
     let Task { bucket, key, version_id } = task;
-    if version_id.as_deref().is_some_and(|v| !crate::s3::versions::is_version_id(v)) {
-        return Ok(Err(TaskFailure::new(400, "InvalidArgument", "Invalid version id specified")));
-    }
-    if crate::s3::directory::is_directory(bucket) {
-        let what = format!("{} isn't done to a directory bucket's objects.", operation.name());
-        return Ok(Err(TaskFailure::new(501, "NotImplemented", what)));
+    if let Some(failure) = unfit(task, operation) {
+        return Ok(Err(failure));
     }
     // The request the task is, as policies see it.
     let query = |subresource: &str| match version_id {
@@ -716,7 +743,7 @@ async fn run_task(
                 Operation::PutTagging { .. } => (Method::PUT, Tagging::Put),
                 _ => (Method::DELETE, Tagging::Delete),
             };
-            if let Err(failure) = authorize(app, access, who, &method, bucket, key, &query("tagging")).await? {
+            if let Err(failure) = authorize(app, access, who, &method, bucket, key, &query("tagging"), &HeaderMap::new()).await? {
                 return Ok(Err(failure));
             }
             return Ok(match tagging::set_tags(app, bucket, key, version_id, tags, tagging).await? {
@@ -729,7 +756,7 @@ async fn run_task(
             });
         }
         Operation::PutRetention { mode, until, bypass } => {
-            if let Err(failure) = authorize(app, access, who, &Method::PUT, bucket, key, &query("retention")).await? {
+            if let Err(failure) = authorize(app, access, who, &Method::PUT, bucket, key, &query("retention"), &HeaderMap::new()).await? {
                 return Ok(Err(failure));
             }
             let retention = match (mode.as_deref().and_then(Mode::parse), until.as_deref().and_then(parse_date)) {
@@ -748,11 +775,12 @@ async fn run_task(
             Change::Retention { retention, bypass: *bypass && access.allows(&check) }
         }
         Operation::PutLegalHold { on } => {
-            if let Err(failure) = authorize(app, access, who, &Method::PUT, bucket, key, &query("legal-hold")).await? {
+            if let Err(failure) = authorize(app, access, who, &Method::PUT, bucket, key, &query("legal-hold"), &HeaderMap::new()).await? {
                 return Ok(Err(failure));
             }
             Change::LegalHold(*on)
         }
+        Operation::Copy(_) => anyhow::bail!("a copy's task is its copier's"),
         Operation::Replicate => {
             // No request of S3's API is this: it's allowed as its action is.
             let checks = [actions::Check { action: "s3:InitiateReplication", on: actions::On::Object(bucket.clone(), key.clone()) }];
@@ -782,6 +810,19 @@ async fn run_task(
         LockOutcome::NoSuchBucket => Err(no_such_bucket()),
         LockOutcome::Contended => Err(slow_down()),
     })
+}
+
+/// Why `operation` can't be done to `task`'s object, if it can't: its
+/// version ID isn't one, or its bucket is a directory bucket.
+fn unfit(task: &Task, operation: &Operation) -> Option<TaskFailure> {
+    if task.version_id.as_deref().is_some_and(|v| !crate::s3::versions::is_version_id(v)) {
+        return Some(TaskFailure::new(400, "InvalidArgument", "Invalid version id specified"));
+    }
+    if crate::s3::directory::is_directory(&task.bucket) {
+        let what = format!("{} isn't done to a directory bucket's objects.", operation.name());
+        return Some(TaskFailure::new(501, "NotImplemented", what));
+    }
+    None
 }
 
 /// Batch Replication's task: queues the version (the key's current one if
@@ -844,8 +885,9 @@ fn slow_down() -> TaskFailure {
 }
 
 /// Whether `access` (of `who`, by its ARN) allows the request (`method` on
-/// `bucket`'s `key`, with `query`), as `s3::handle_request` authorizes it;
-/// why not, as S3 would answer, if it doesn't.
+/// `bucket`'s `key`, with `query` and `headers`), as `s3::handle_request`
+/// authorizes it; why not, as S3 would answer, if it doesn't.
+#[allow(clippy::too_many_arguments)]
 async fn authorize(
     app: &App,
     access: &mut Access,
@@ -854,16 +896,16 @@ async fn authorize(
     bucket: &str,
     key: &str,
     query: &str,
+    headers: &HeaderMap,
 ) -> anyhow::Result<Result<(), TaskFailure>> {
-    let headers = HeaderMap::new();
-    let Some(operation) = actions::operation(method, bucket, key, query, &headers) else {
+    let Some(operation) = actions::operation(method, bucket, key, query, headers) else {
         anyhow::bail!("{method} {bucket}/{key}?{query} is no operation");
     };
     access.forget_object_tags();
     let exists = access.load(app, bucket).await?;
     access.load_all(app, &operation.checks).await?;
-    crate::s3::abac::prepare(app, access, &operation, bucket, key, query, &headers).await?;
-    crate::s3::acl::prepare(app, access, &operation, bucket, key, query, &headers).await?;
+    crate::s3::abac::prepare(app, access, &operation, bucket, key, query, headers).await?;
+    crate::s3::acl::prepare(app, access, &operation, bucket, key, query, headers).await?;
     Ok(match access.first_denied(&operation.checks) {
         None => Ok(()),
         Some(_) if !exists => Err(no_such_bucket()),
@@ -896,7 +938,7 @@ async fn may_read(
         Some(v) => format!("versionId={}", percent_encoding::utf8_percent_encode(v, percent_encoding::NON_ALPHANUMERIC)),
         None => String::new(),
     };
-    Ok(authorize(app, &mut access, &principal.arn(), &Method::GET, bucket, key, &query)
+    Ok(authorize(app, &mut access, &principal.arn(), &Method::GET, bucket, key, &query, &HeaderMap::new())
         .await?
         .map_err(|why| Failure::new("ManifestUnreadable", format!("Reading {arn} failed: {why}."))))
 }
@@ -1004,5 +1046,13 @@ mod tests {
         assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), put);
         assert_eq!(serde_json::from_str::<Operation>(r#"{"t":"delete_tagging"}"#).unwrap(), Operation::DeleteTagging);
         assert_eq!(serde_json::to_string(&Operation::Replicate).unwrap(), r#"{"t":"replicate"}"#);
+        let copy = Operation::Copy(Box::new(copy::Copy {
+            target: "arn:aws:s3:::dest".to_owned(),
+            prefix: Some("p/".to_owned()),
+            ..copy::Copy::default()
+        }));
+        let json = serde_json::to_string(&copy).unwrap();
+        assert_eq!(json, r#"{"t":"copy","target":"arn:aws:s3:::dest","prefix":"p/"}"#);
+        assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), copy);
     }
 }

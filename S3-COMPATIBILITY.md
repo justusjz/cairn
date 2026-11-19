@@ -60,7 +60,7 @@ please report it.
 | Server access logging | 🟡 | Not logged yet: lifecycle actions (`S3.EXPIRE.OBJECT`, …), DeleteObjects' keys (`BATCH.DELETE.OBJECT`), POST Object's requester. Host ID and TLS fields are `-`. |
 | [Event notifications](#event-notifications), to SNS topics | 🟡 | |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
-| [Batch Operations](#batch-operations): tagging, Object Lock, replication | 🟡 | |
+| [Batch Operations](#batch-operations): tagging, Object Lock, replication, copies | 🟡 | |
 | Batch Operations: other operations, manifest generators | ❌ | |
 | [Replication](#replication) to buckets in the cluster | 🟡 | |
 | Replication to other clusters or providers, RTC | ❌ | |
@@ -210,6 +210,8 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | --- | --- | --- |
 | `S3PutObjectTagging`, `S3DeleteObjectTagging`, `S3PutObjectRetention`, `S3PutObjectLegalHold` | ✅ | |
 | `S3ReplicateObject` (Batch Replication) | 🟡 | A task succeeds once its version is queued. A task without a version ID replicates the current version. |
+| `S3PutObjectCopy` | 🟡 | Not into directory buckets. `NewObjectMetadata`'s `ContentLength` and `ContentMD5` are ignored. Its checksum algorithm is one of CopyObject's: CRC32, CRC32C, CRC64NVME, SHA-1 or SHA-256. |
+| `S3PutObjectCopy`: requester pays, event holds, `AnnotationDirective` `EXCLUDE` | ❌ | |
 | Other operations | ❌ | |
 | CSV manifests, CSV and Parquet inventory reports | ✅ | A Parquet report's row group may hold at most 64 MiB of buckets, keys and version IDs. |
 | ORC inventory reports, manifest generators | ❌ | |
