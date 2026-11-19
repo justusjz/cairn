@@ -1,6 +1,7 @@
 //! Apache Iceberg, as S3 Tables has it: tables' metadata (`metadata`), its
 //! files in tables' storage (here), and Iceberg's REST catalog (`rest`).
 
+pub mod avro;
 pub mod metadata;
 pub(crate) mod rest;
 
@@ -72,7 +73,7 @@ fn server_side(app: &App, table: &Table) -> anyhow::Result<Option<ServerSide>> {
 pub async fn write(
     app: &Arc<App>,
     table: &Table,
-    role: Uuid,
+    role: Option<Uuid>,
     location: &str,
     metadata: &Map<String, Value>,
 ) -> anyhow::Result<Result<(), FileError>> {
@@ -95,7 +96,7 @@ pub async fn write(
         payload,
         &Preconditions::default(),
         Wanted::new(None, server.as_ref()),
-        Some(role),
+        role,
         Lock::default(),
         &table.storage_class,
     )
@@ -115,19 +116,19 @@ pub async fn write(
     }
 }
 
-/// Reads the metadata file at `location` in `table`'s storage (gzipped, if
-/// its name says so), as the principal `role`.
-pub async fn read(
+/// Reads the file at `location` in `table`'s storage, as the principal
+/// `role` (none: Cairn itself, which can't open SSE-KMS files), if it's at
+/// most `max` bytes.
+pub async fn read_file(
     app: &Arc<App>,
     table: &Table,
-    role: Uuid,
+    role: Option<Uuid>,
     location: &str,
-) -> anyhow::Result<Result<Map<String, Value>, FileError>> {
+    max: u64,
+) -> anyhow::Result<Result<Bytes, FileError>> {
     let unusable = |why: String| Ok(Err(FileError::Unusable(why)));
     let Some(key) = key_of(table, location) else {
-        return unusable(format!(
-            "The table's metadata location {location} isn't in its storage."
-        ));
+        return unusable(format!("{location} isn't in the table's storage."));
     };
     let response = crate::s3::objects::get::get_object(
         app,
@@ -138,15 +139,14 @@ pub async fn read(
         None,
         &Preconditions::default(),
         None,
-        Some(role),
+        role,
         false,
     )
     .await?;
     if response.status() != StatusCode::OK {
-        return unusable(format!(
-            "The table's metadata file {location} can't be read: {}",
-            response.status()
-        ));
+        let status = response.status();
+        let why = crate::inventory::refusal(box_full(response).await).await;
+        return unusable(format!("{location} can't be read: {status} {why}"));
     }
     let length = response
         .headers()
@@ -154,13 +154,39 @@ pub async fn read(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
-    if length > MAX_METADATA {
+    if length > max {
         return unusable(format!(
-            "The table's metadata file is larger than {} MB.",
-            MAX_METADATA / 1024 / 1024
+            "{location} is larger than {} MB.",
+            max / 1024 / 1024
         ));
     }
-    let body = response.into_body().collect().await?.to_bytes();
+    Ok(Ok(response.into_body().collect().await?.to_bytes()))
+}
+
+/// A response's body, whole, as `refusal` takes it.
+async fn box_full(response: hyper::Response<crate::body::ResBody>) -> hyper::Response<Full<Bytes>> {
+    let (parts, body) = response.into_parts();
+    let body = body
+        .collect()
+        .await
+        .map(|b| b.to_bytes())
+        .unwrap_or_default();
+    hyper::Response::from_parts(parts, Full::new(body))
+}
+
+/// Reads the metadata file at `location` in `table`'s storage (gzipped, if
+/// its name says so), as the principal `role`.
+pub async fn read(
+    app: &Arc<App>,
+    table: &Table,
+    role: Option<Uuid>,
+    location: &str,
+) -> anyhow::Result<Result<Map<String, Value>, FileError>> {
+    let unusable = |why: String| Ok(Err(FileError::Unusable(why)));
+    let body = match read_file(app, table, role, location, MAX_METADATA).await? {
+        Ok(body) => body,
+        Err(e) => return Ok(Err(e)),
+    };
     let text = match location.ends_with(".gz") {
         false => body.to_vec(),
         true => {

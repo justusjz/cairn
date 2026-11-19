@@ -2619,7 +2619,8 @@ s3_tables_ok() {
 # Iceberg's REST catalog (`/iceberg`), as PyIceberg uses it, signed with
 # SigV4 for s3tables: a table made, appended to, its schema evolved, read
 # back, two writers racing (the stale one's commit refused, and retried by
-# PyIceberg), renamed and purged.
+# PyIceberg), maintained (its first jobs, within a few minutes), renamed
+# and purged.
 iceberg_catalog_ok() {
     AWS_ACCESS_KEY_ID="$ACCESS_KEY" AWS_SECRET_ACCESS_KEY="$SECRET_KEY" AWS_REGION=us-east-1 \
     python3 -I - "http://${SERVER_HOST}:${SERVER_PORT}" "iceberg-$$" <<'PYEOF'
@@ -2649,6 +2650,15 @@ first.append(pa.table({"id": [3], "name": ["c"], "price": [1.5]}, schema=rows(pr
 second.append(pa.table({"id": [4], "name": ["d"], "price": [2.5]}, schema=rows(price)))
 ids = sorted(cat.load_table("sales.orders").scan().to_arrow()["id"].to_pylist())
 assert ids == [1, 2, 3, 4], ids
+# Maintenance runs on it (its jobs are due at once), reading its manifests.
+import time
+for _ in range(60):
+    status = tables.get_table_maintenance_job_status(tableBucketARN=arn, namespace="sales", name="orders")["status"]
+    jobs = [status[k]["status"] for k in ("icebergSnapshotManagement", "icebergUnreferencedFileRemoval")]
+    if "Not_Yet_Run" not in jobs:
+        break
+    time.sleep(5)
+assert jobs == ["Successful", "Successful"], status
 cat.rename_table("sales.orders", "sales.orders2")
 assert tables.get_table(tableBucketARN=arn, namespace="sales", name="orders2")["metadataLocation"]
 cat.purge_table("sales.orders2")

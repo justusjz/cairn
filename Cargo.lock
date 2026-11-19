@@ -314,6 +314,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "snap",
  "tokio",
  "tokio-postgres",
  "tokio-rustls",

@@ -291,6 +291,27 @@ with the configuration that goes in the README.
 
 ## Phase 3: snapshot management and unreferenced file removal
 
+Done, as below, with these choices made on the way:
+
+- Avro is read by Cairn's own reader (`tables::iceberg::avro`): object
+  container files, the `null`, `deflate` and `snappy` codecs, decoded by
+  their own schemas into JSON. Not the `apache-avro` crate: maintenance
+  only needs paths out of manifests, and the crate brings a large tree of
+  dependencies into the static binary. `zstandard` isn't read (a job on
+  such a table fails, saying so).
+- Snapshot management runs hourly per table, unreferenced file removal
+  daily; jobs are rows (`table_maintenance_runs`, migration 85) that a
+  pass takes with `SKIP LOCKED`, every minute, on any node. Not paced by
+  the lifecycle rate: a job reads one table's manifests.
+- Unreferenced files are noted in `table_unreferenced_files`, not made
+  noncurrent versions (table storage is unversioned): they stay readable
+  until they're deleted.
+- The files only expired snapshots referenced are noted noncurrent when
+  the expiry commits, as AWS's are.
+- Maintenance acts as Cairn, which opens SSE-S3 files but has no identity
+  for SSE-KMS keys: a table with SSE-KMS isn't maintained (its jobs fail,
+  saying so). AWS has its maintenance service granted the key instead.
+
 The maintenance that keeps a table's storage from growing forever. A
 background loop (`tables::maintenance`, spawned in `main` as lifecycle
 sweeps are): its runs are rows that any node takes, paced by the rate

@@ -57,6 +57,9 @@ rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem
 # Batch Operations manifests (`batch::parquet`): its low-level API, without
 # Arrow; Snappy, as S3 writes them, and gzip, which other writers use.
 parquet = { version = "60.1.0", default-features = false, features = ["snap", "flate2-rust_backend"] }
+# Snappy, for the Avro files of Iceberg tables' manifests (see
+# `tables::iceberg::avro`): parquet's own.
+snap = "1"
 
 [dev-dependencies]
 # The mock OIDC issuer's HTTPS (`oidc::mock`); hyper-rustls's already.

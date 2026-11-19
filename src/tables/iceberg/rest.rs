@@ -460,7 +460,7 @@ impl Ctx<'_> {
         let Some(location) = &table.metadata_location else {
             return Ok(None);
         };
-        let read = super::read(self.app, table, self.principal.id, location)
+        let read = super::read(self.app, table, Some(self.principal.id), location)
             .await
             .map_err(|e| from_tables(e.into(), ""))?;
         let current = read.map_err(from_file)?;
@@ -603,7 +603,7 @@ impl Ctx<'_> {
         file: &str,
         metadata: &Map<String, Value>,
     ) -> Result<(), Answer> {
-        let written = super::write(self.app, table, self.principal.id, file, metadata)
+        let written = super::write(self.app, table, Some(self.principal.id), file, metadata)
             .await
             .map_err(|e| from_tables(e.into(), ""))?;
         written.map_err(from_file)?;

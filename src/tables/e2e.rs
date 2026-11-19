@@ -1526,3 +1526,245 @@ async fn create_table_with_metadata() {
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// ─── Maintenance ─────────────────────────────────────────────────────────────
+
+/// A manifest list (Avro), listing `manifests`.
+fn manifest_list(manifests: &[&str]) -> Vec<u8> {
+    use crate::tables::iceberg::avro::tests::file;
+    let schema = json!({ "type": "record", "name": "manifest_file", "fields": [
+        { "name": "manifest_path", "type": "string" },
+        { "name": "added_snapshot_id", "type": "long" },
+    ]});
+    let mut block = Vec::new();
+    for m in manifests {
+        // A string (its length, zigzag), then a long.
+        let mut n = (m.len() as u64) << 1;
+        loop {
+            let byte = (n & 0x7f) as u8;
+            n >>= 7;
+            if n == 0 {
+                block.push(byte);
+                break;
+            }
+            block.push(byte | 0x80);
+        }
+        block.extend_from_slice(m.as_bytes());
+        block.push(2);
+    }
+    file(&schema, "deflate", &[(manifests.len() as i64, block)])
+}
+
+/// A manifest (Avro), listing `files`.
+fn manifest(files: &[&str]) -> Vec<u8> {
+    use crate::tables::iceberg::avro::tests::{file, manifest_entry, manifest_schema};
+    let block: Vec<u8> = files.iter().flat_map(|f| manifest_entry(f)).collect();
+    file(&manifest_schema(), "snappy", &[(files.len() as i64, block)])
+}
+
+#[tokio::test]
+async fn maintenance_expires_snapshots_and_removes_files() {
+    use crate::tables::maintenance::{Outcome, SNAPSHOTS, UNREFERENCED, pass, run_job};
+    use std::time::{Duration, SystemTime};
+    let Some(app) = node().await else { return };
+    let admin = user(&app, "admin", ADMIN).await;
+    let arn = bucket(&app, &admin, &bucket_name()).await;
+    let v1 = format!("/iceberg/v1/{arn}");
+    call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces"),
+        "",
+        json!({ "namespace": ["n"] }),
+    )
+    .await;
+    let (status, created) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &format!("{v1}/namespaces/n/tables"),
+        "",
+        json!({ "name": "t", "schema": iceberg_schema() }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{created}");
+    let location = created["metadata"]["location"].as_str().unwrap().to_owned();
+    let storage = location.strip_prefix("s3://").unwrap().to_owned();
+    let id: uuid::Uuid = {
+        let client = app.pool.get().await.unwrap();
+        client
+            .query_one("SELECT id FROM tables WHERE storage = $1", &[&storage])
+            .await
+            .unwrap()
+            .get(0)
+    };
+    let put = |key: &str, data: Vec<u8>| {
+        let (app, storage, key) = (app.clone(), storage.clone(), key.to_owned());
+        async move { crate::e2e::put_to(&app, &storage, &key, data).await }
+    };
+    let path = |key: &str| format!("{location}/{key}");
+    // Two snapshots' files, and one nothing references.
+    put("data/a.parquet", b"a".to_vec()).await;
+    put("data/b.parquet", b"b".to_vec()).await;
+    put("data/orphan.parquet", b"o".to_vec()).await;
+    put("metadata/m1.avro", manifest(&[&path("data/a.parquet")])).await;
+    put("metadata/m2.avro", manifest(&[&path("data/b.parquet")])).await;
+    put(
+        "metadata/l1.avro",
+        manifest_list(&[&path("metadata/m1.avro")]),
+    )
+    .await;
+    put(
+        "metadata/l2.avro",
+        manifest_list(&[&path("metadata/m1.avro"), &path("metadata/m2.avro")]),
+    )
+    .await;
+    let now = SystemTime::now();
+    let ms = |t: SystemTime| {
+        t.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    };
+    let hour = Duration::from_secs(3600);
+    let day = 24 * hour;
+    let table = format!("{v1}/namespaces/n/tables/t");
+    for (id, parent, sequence, list, at) in [
+        (1, None, 1, "l1", now - 3 * hour),
+        (2, Some(1), 2, "l2", now - 2 * hour),
+    ] {
+        let (status, body) = call(&app, &admin, Method::POST, &table, "", json!({ "requirements": [], "updates": [
+            { "action": "add-snapshot", "snapshot": { "snapshot-id": id, "parent-snapshot-id": parent, "sequence-number": sequence,
+              "timestamp-ms": ms(at), "manifest-list": path(&format!("metadata/{list}.avro")), "summary": { "operation": "append" }, "schema-id": 0 } },
+            { "action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": id },
+        ]})).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+    let exists = |key: &'static str| {
+        let (app, storage) = (app.clone(), storage.clone());
+        async move {
+            let client = app.pool.get().await.unwrap();
+            client
+                .query_opt(
+                    "SELECT 1 FROM objects WHERE bucket = $1 AND key = $2 AND is_latest",
+                    &[&storage, &key],
+                )
+                .await
+                .unwrap()
+                .is_some()
+        }
+    };
+
+    // Unreferenced: the orphan, noted; noncurrent after 3 days; deleted 10
+    // days after that. Nothing referenced goes.
+    let outcome = run_job(&app, id, UNREFERENCED, now).await.unwrap();
+    assert!(
+        matches!(&outcome, Outcome::Successful(m) if m.starts_with("1 file(s) unreferenced")),
+        "{outcome:?}"
+    );
+    run_job(&app, id, UNREFERENCED, now + 3 * day)
+        .await
+        .unwrap();
+    run_job(&app, id, UNREFERENCED, now + 12 * day)
+        .await
+        .unwrap();
+    assert!(exists("data/orphan.parquet").await);
+    let outcome = run_job(&app, id, UNREFERENCED, now + 13 * day)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&outcome, Outcome::Successful(m) if m.ends_with("1 deleted")),
+        "{outcome:?}"
+    );
+    assert!(!exists("data/orphan.parquet").await);
+    for key in [
+        "data/a.parquet",
+        "data/b.parquet",
+        "metadata/m1.avro",
+        "metadata/l1.avro",
+        "metadata/l2.avro",
+    ] {
+        assert!(exists(key).await, "{key}");
+    }
+
+    // Snapshots: older than an hour, beyond the newest one: the first goes,
+    // and what only it referenced (its manifest list) is noncurrent at once.
+    let (status, _) = call(&app, &admin, Method::PUT, &format!("/tables/{arn}/n/t/maintenance/icebergSnapshotManagement"), "",
+        json!({ "value": { "status": "enabled", "settings": { "icebergSnapshotManagement": { "minSnapshotsToKeep": 1, "maxSnapshotAgeHours": 1 } } } })).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let outcome = run_job(&app, id, SNAPSHOTS, now).await.unwrap();
+    assert_eq!(outcome, Outcome::Successful("1 snapshot(s) expired".into()));
+    let (_, loaded) = call(&app, &admin, Method::GET, &table, "", Value::Null).await;
+    let snapshots: Vec<i64> = loaded["metadata"]["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["snapshot-id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(snapshots, [2]);
+    assert_eq!(
+        run_job(&app, id, SNAPSHOTS, now).await.unwrap(),
+        Outcome::Successful("no snapshot expired".into())
+    );
+    run_job(&app, id, UNREFERENCED, now + day).await.unwrap();
+    assert!(exists("metadata/l1.avro").await);
+    run_job(&app, id, UNREFERENCED, now + 11 * day)
+        .await
+        .unwrap();
+    assert!(!exists("metadata/l1.avro").await);
+    // m1 is l2's too.
+    assert!(exists("metadata/m1.avro").await);
+    assert!(exists("data/a.parquet").await);
+
+    // Jobs taken by a pass, and their status told.
+    assert_eq!(pass(&app, now + 30 * day).await.unwrap(), 2);
+    assert_eq!(pass(&app, now + 30 * day).await.unwrap(), 0);
+    let (_, status) = call(
+        &app,
+        &admin,
+        Method::GET,
+        &format!("/tables/{arn}/n/t/maintenance-job-status"),
+        "",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status["status"]["icebergSnapshotManagement"]["status"],
+        "Successful"
+    );
+    assert!(status["status"]["icebergUnreferencedFileRemoval"]["lastRunTimestamp"].is_string());
+    assert_eq!(status["status"]["icebergCompaction"]["status"], "Disabled");
+
+    // A table that keeps its files: refused, saying why.
+    let (status, _) = call(
+        &app,
+        &admin,
+        Method::POST,
+        &table,
+        "",
+        json!({ "requirements": [], "updates": [
+        { "action": "set-properties", "updates": { "gc.enabled": "false" } }]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let outcome = run_job(&app, id, UNREFERENCED, now).await.unwrap();
+    assert!(
+        matches!(&outcome, Outcome::Failed(m) if m.contains("gc.enabled")),
+        "{outcome:?}"
+    );
+    // A manifest that can't be read deletes nothing.
+    let (status, _) = call(&app, &admin, Method::POST, &table, "", json!({ "requirements": [], "updates": [
+        { "action": "remove-properties", "removals": ["gc.enabled"] },
+        { "action": "add-snapshot", "snapshot": { "snapshot-id": 3, "parent-snapshot-id": 2, "sequence-number": 3,
+          "timestamp-ms": ms(now), "manifest-list": path("metadata/missing.avro"), "summary": { "operation": "append" }, "schema-id": 0 } },
+    ]})).await;
+    assert_eq!(status, StatusCode::OK);
+    let outcome = run_job(&app, id, UNREFERENCED, now + 60 * day)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&outcome, Outcome::Failed(m) if m.contains("missing.avro")),
+        "{outcome:?}"
+    );
+    assert!(exists("data/b.parquet").await);
+}

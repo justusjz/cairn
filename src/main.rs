@@ -510,6 +510,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(backup::run(app.clone()));
     tokio::spawn(backup::restore::run(app.clone()));
     tokio::spawn(tables::storage::run(app.clone()));
+    tokio::spawn(tables::maintenance::run(app.clone()));
     // The users' identities in the KMS, now rather than in a minute.
     let identifying = app.clone();
     tokio::spawn(async move {
