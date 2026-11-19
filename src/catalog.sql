@@ -837,6 +837,35 @@ BEGIN
 END
 $$;
 
+-- Records that the transaction's write is a Batch Operations job's task's
+-- (see `batch::copy`), if its `cairn.notify` says it is (`batch_task`: the
+-- job's ID, and the task's ordinal), in the transaction that writes its
+-- version: so a task done again, after a node died between the write and
+-- saving where its job had got to, is found done, and never makes a second
+-- version. A task that's recorded already (by a write that committed
+-- meanwhile) is refused, which rolls the write back. Under the job's row's
+-- KEY SHARE lock (its foreign key), which only deleting the job, once
+-- it's ended, conflicts with.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_batch_task() RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_task jsonb;
+BEGIN
+    IF coalesce(current_setting('cairn.notify', true), '') = '' THEN
+        RETURN;
+    END IF;
+    v_task := current_setting('cairn.notify', true)::jsonb -> 'batch_task';
+    IF v_task IS NULL THEN
+        RETURN;
+    END IF;
+    INSERT INTO batch_job_copies (job_id, task)
+    VALUES ((v_task ->> 'job')::uuid, (v_task ->> 'task')::bigint)
+    ON CONFLICT DO NOTHING;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'cairn: task % of batch job % is done already', v_task ->> 'task', v_task ->> 'job';
+    END IF;
+END
+$$;
+
 CREATE OR REPLACE FUNCTION pg_temp.cairn_put_version(
     p_bucket text, p_key text, p_versioning text, p_size bigint, p_etag text,
     p_content_type text, p_metadata text, p_sse_c_key bytea, p_kms_key_id text,
@@ -880,6 +909,7 @@ BEGIN
         PERFORM pg_temp.cairn_remove_null_version(p_bucket, p_key);
         v_version_id := 'null';
     END IF;
+    PERFORM pg_temp.cairn_batch_task();
     SELECT * INTO v_modified, v_latest FROM pg_temp.cairn_version_time(p_bucket, p_key, v_replica);
     IF v_latest THEN
         PERFORM pg_temp.cairn_demote_current(p_bucket, p_key);

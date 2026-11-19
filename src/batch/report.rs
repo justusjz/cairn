@@ -15,7 +15,7 @@
 //!   job ends, once it has run (`Complete`, `Failed` after its tasks failed
 //!   too often, or `Cancelled` while active).
 
-use std::{sync::Arc, time::SystemTime};
+use std::{borrow::Cow, sync::Arc, time::SystemTime};
 
 use deadpool_postgres::Object;
 use http_body_util::{BodyExt, Full};
@@ -50,13 +50,13 @@ pub const FAILED_TASKS_ONLY: &str = "FailedTasksOnly";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaskFailure {
     pub status: u16,
-    pub code: &'static str,
+    pub code: Cow<'static, str>,
     pub message: String,
 }
 
 impl TaskFailure {
-    pub fn new(status: u16, code: &'static str, message: impl Into<String>) -> TaskFailure {
-        TaskFailure { status, code, message: message.into() }
+    pub fn new(status: u16, code: impl Into<Cow<'static, str>>, message: impl Into<String>) -> TaskFailure {
+        TaskFailure { status, code: code.into(), message: message.into() }
     }
 }
 
@@ -246,7 +246,7 @@ impl Writer {
 async fn may_put(app: &App, principal: &Principal, bucket: &str, key: &str) -> anyhow::Result<Result<(), TaskFailure>> {
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
     let mut access = Access::new(Some(principal), &principal.account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
-    authorize(app, &mut access, &principal.arn(), &Method::PUT, bucket, key, "").await
+    authorize(app, &mut access, &principal.arn(), &Method::PUT, bucket, key, "", &HeaderMap::new()).await
 }
 
 /// What an S3 error response says: its code and message.
@@ -283,7 +283,7 @@ fn csv_line(line: &Line) -> String {
     let Task { bucket, key, version_id } = &line.task;
     let (status, http, code, message) = match &line.result {
         Ok(()) => ("succeeded", 200, "", "Successful"),
-        Err(failure) => ("failed", failure.status, failure.code, failure.message.as_str()),
+        Err(failure) => ("failed", failure.status, failure.code.as_ref(), failure.message.as_str()),
     };
     let columns = [
         bucket.as_str(),

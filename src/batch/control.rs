@@ -62,7 +62,6 @@ const STATUSES: &[&str] = &[
 /// S3's operations Cairn doesn't do yet.
 const UNIMPLEMENTED: &[&str] = &[
     "LambdaInvoke",
-    "S3PutObjectCopy",
     "S3PutObjectAcl",
     "S3InitiateRestoreObject",
     "S3ComputeObjectChecksum",
@@ -79,7 +78,7 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response<Full<Bytes>>
     format_s3_error(status, code, message)
 }
 
-fn bad_request(message: &str) -> Response<Full<Bytes>> {
+pub(super) fn bad_request(message: &str) -> Response<Full<Bytes>> {
     error(StatusCode::BAD_REQUEST, "BadRequestException", message)
 }
 
@@ -87,7 +86,7 @@ fn not_found() -> Response<Full<Bytes>> {
     error(StatusCode::NOT_FOUND, "NotFoundException", "Job not found")
 }
 
-fn not_implemented(what: &str) -> Response<Full<Bytes>> {
+pub(super) fn not_implemented(what: &str) -> Response<Full<Bytes>> {
     error(StatusCode::NOT_IMPLEMENTED, "NotImplemented", &format!("{what} isn't implemented."))
 }
 
@@ -306,7 +305,7 @@ impl Described {
     }
 }
 
-fn element(name: &str, text: &str) -> String {
+pub(super) fn element(name: &str, text: &str) -> String {
     format!("<{name}>{}</{name}>", xml_escape(text))
 }
 
@@ -315,7 +314,7 @@ fn time(t: SystemTime) -> String {
     crate::sessions::iso(t.duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_secs()))
 }
 
-fn tags_xml(name: &str, tags: &[(String, String)]) -> String {
+pub(super) fn tags_xml(name: &str, tags: &[(String, String)]) -> String {
     let mut out = format!("<{name}>");
     for (key, value) in tags {
         out.push_str(&format!("<member>{}{}</member>", element("Key", key), element("Value", value)));
@@ -350,6 +349,7 @@ fn operation_xml(operation: &Operation) -> String {
             if *on { "ON" } else { "OFF" }
         ),
         Operation::Replicate => "<Operation><S3ReplicateObject/></Operation>".to_owned(),
+        Operation::Copy(copy) => format!("<Operation>{}</Operation>", copy.xml()),
     }
 }
 
@@ -440,19 +440,19 @@ pub(crate) struct NewJob {
 }
 
 /// The child elements of `node`.
-fn children<'a, 'input>(node: roxmltree::Node<'a, 'input>) -> impl Iterator<Item = roxmltree::Node<'a, 'input>> {
+pub(super) fn children<'a, 'input>(node: roxmltree::Node<'a, 'input>) -> impl Iterator<Item = roxmltree::Node<'a, 'input>> {
     node.children().filter(|n| n.is_element())
 }
 
-fn child<'a, 'input>(node: roxmltree::Node<'a, 'input>, name: &str) -> Option<roxmltree::Node<'a, 'input>> {
+pub(super) fn child<'a, 'input>(node: roxmltree::Node<'a, 'input>, name: &str) -> Option<roxmltree::Node<'a, 'input>> {
     children(node).find(|n| n.tag_name().name() == name)
 }
 
-fn text<'a>(node: roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
+pub(super) fn text<'a>(node: roxmltree::Node<'a, '_>, name: &str) -> Option<&'a str> {
     child(node, name).map(|n| n.text().unwrap_or(""))
 }
 
-fn boolean(node: roxmltree::Node, name: &str) -> Result<Option<bool>, Response<Full<Bytes>>> {
+pub(super) fn boolean(node: roxmltree::Node, name: &str) -> Result<Option<bool>, Response<Full<Bytes>>> {
     match text(node, name) {
         None => Ok(None),
         Some("true") => Ok(Some(true)),
@@ -462,7 +462,7 @@ fn boolean(node: roxmltree::Node, name: &str) -> Result<Option<bool>, Response<F
 }
 
 /// A `<member>` list of tags (`S3TagSet`), unchecked.
-fn tag_members(node: roxmltree::Node) -> Result<Vec<(String, String)>, Response<Full<Bytes>>> {
+pub(super) fn tag_members(node: roxmltree::Node) -> Result<Vec<(String, String)>, Response<Full<Bytes>>> {
     let mut pairs = Vec::new();
     for member in children(node) {
         let (Some(key), Some(value)) = (text(member, "Key"), text(member, "Value")) else {
@@ -532,6 +532,7 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
             }
         }
         "S3ReplicateObject" => Operation::Replicate,
+        "S3PutObjectCopy" => Operation::Copy(Box::new(super::copy::parse(operation)?)),
         name if UNIMPLEMENTED.contains(&name) => return Err(not_implemented(&format!("The {name} operation"))),
         name => return Err(bad_request(&format!("{name} isn't an operation."))),
     };
@@ -690,6 +691,11 @@ pub(crate) async fn create(app: &App, access: &Access, account: &str, body: &[u8
         Ok(job) => job,
         Err(refused) => return Ok(refused),
     };
+    if let Operation::Copy(copy) = &job.operation
+        && let Err(refused) = super::copy::check(app, copy).await?
+    {
+        return Ok(refused);
+    }
     let mut context = Context::default();
     context.set("s3:RequestJobPriority", job.priority.to_string());
     context.set("s3:RequestJobOperation", job.operation.name());
@@ -1050,8 +1056,23 @@ mod tests {
 
     #[test]
     fn what_cairn_doesnt_do_is_not_implemented() {
-        let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::b</TargetResource></S3PutObjectCopy>";
+        let acl = "<S3PutObjectAcl><AccessControlPolicy><CannedAccessControlList>private</CannedAccessControlList>\
+                   </AccessControlPolicy></S3PutObjectAcl>";
+        assert_eq!(refusal(&request(acl, "")), (501, "NotImplemented".to_owned()));
+        let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::b</TargetResource>\
+                    <RequesterPays>true</RequesterPays></S3PutObjectCopy>";
         assert_eq!(refusal(&request(copy, "")), (501, "NotImplemented".to_owned()));
+    }
+
+    #[test]
+    fn copies_are_parsed_and_described() {
+        let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::b</TargetResource>\
+                    <TargetKeyPrefix>copies/</TargetKeyPrefix></S3PutObjectCopy>";
+        let job = parse_create(request(copy, "").as_bytes()).unwrap();
+        let Operation::Copy(parsed) = &job.operation else { panic!("{:?}", job.operation) };
+        assert_eq!(parsed.bucket(), "b");
+        assert_eq!(job.operation.name(), "S3PutObjectCopy");
+        assert_eq!(operation_xml(&job.operation), format!("<Operation>{copy}</Operation>"));
     }
 
     #[test]

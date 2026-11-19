@@ -355,7 +355,7 @@ mod tests {
     /// needs it is a choice to make, not a default to fall into.
     const CAPTURED: &[&str] = &[
         "access_grants", "access_grants_instances", "access_grants_locations", "access_keys", "accounts",
-        "batch_job_results", "batch_jobs", "bucket_notifications", "buckets", "console_challenges",
+        "batch_job_copies", "batch_job_results", "batch_jobs", "bucket_notifications", "buckets", "console_challenges",
         "console_directory_sessions", "console_enrollments", "console_root_links", "console_root_sessions",
         "console_sessions", "console_switched_roles", "directory_passkeys", "directory_setup_links",
         "iam_group_attached_policies", "iam_group_members", "iam_group_policies", "iam_groups",
