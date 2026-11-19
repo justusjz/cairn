@@ -370,7 +370,7 @@ mod tests {
         "permission_set_provisions", "permission_sets", "replication_queue", "role_grants", "root_mfa_devices",
         "session_keys",
         "settings", "sns_deliveries", "sns_signing_keys", "sns_subscriptions", "sns_tokens", "sns_topics",
-        "sso_operations", "storage_classes", "user_attached_policies", "user_policies", "user_tags", "users",
+        "sso_operations", "storage_classes", "tiers", "user_attached_policies", "user_policies", "user_tags", "users",
     ];
 
     #[tokio::test]
