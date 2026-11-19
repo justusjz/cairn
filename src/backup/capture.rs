@@ -364,7 +364,8 @@ mod tests {
         "oidc_flows", "oidc_providers", "organization_policies", "organization_policy_attachments",
         "organization_policy_types", "organization_requests", "organizational_units", "parts", "passkeys",
         "permission_set_assignments", "permission_set_customer_policies", "permission_set_managed_policies",
-        "permission_set_provisions", "permission_sets", "role_grants", "root_mfa_devices", "session_keys",
+        "permission_set_provisions", "permission_sets", "replication_queue", "role_grants", "root_mfa_devices",
+        "session_keys",
         "settings", "sns_deliveries", "sns_signing_keys", "sns_subscriptions", "sns_tokens", "sns_topics",
         "sso_operations", "storage_classes", "user_attached_policies", "user_policies", "user_tags", "users",
     ];
