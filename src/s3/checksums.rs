@@ -12,14 +12,20 @@
 //!   checksums, as raw bytes, in order (`composite`), reported with `-N`
 //!   for the number of parts, like a multipart ETag. Not for CRC64/NVME.
 //!
+//! Only the CRCs combine, so the other algorithms' (the SHAs, MD5, the
+//! XXHashes) multipart checksums are all COMPOSITE, as S3's are.
+//!
 //! The values are kept as they're reported (base64, with any `-N`). An
 //! encrypted object's (and its parts') would let whoever holds the catalog
 //! test guesses at the plaintext, so they're stored sealed under its key, as
 //! SSE-S3 ETags are (`encryption::Storing`); algorithm and type aren't.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use md5::Md5;
 use sha1::Sha1;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512};
+use std::hash::Hasher as _;
+use twox_hash::{XxHash3_64, XxHash3_128, XxHash64};
 use crate::encryption::{Field, Owner, Storing};
 
 /// The algorithms of S3's `x-amz-checksum-*` headers and trailers.
@@ -30,15 +36,25 @@ pub enum Algorithm {
     Crc64Nvme,
     Sha1,
     Sha256,
+    Sha512,
+    Md5,
+    XxHash64,
+    XxHash3,
+    XxHash128,
 }
 
 impl Algorithm {
-    pub const ALL: [Algorithm; 5] = [
+    pub const ALL: [Algorithm; 10] = [
         Algorithm::Crc32,
         Algorithm::Crc32c,
         Algorithm::Crc64Nvme,
         Algorithm::Sha1,
         Algorithm::Sha256,
+        Algorithm::Sha512,
+        Algorithm::Md5,
+        Algorithm::XxHash64,
+        Algorithm::XxHash3,
+        Algorithm::XxHash128,
     ];
 
     /// The header (or trailer) that carries it.
@@ -49,6 +65,11 @@ impl Algorithm {
             Algorithm::Crc64Nvme => "x-amz-checksum-crc64nvme",
             Algorithm::Sha1 => "x-amz-checksum-sha1",
             Algorithm::Sha256 => "x-amz-checksum-sha256",
+            Algorithm::Sha512 => "x-amz-checksum-sha512",
+            Algorithm::Md5 => "x-amz-checksum-md5",
+            Algorithm::XxHash64 => "x-amz-checksum-xxhash64",
+            Algorithm::XxHash3 => "x-amz-checksum-xxhash3",
+            Algorithm::XxHash128 => "x-amz-checksum-xxhash128",
         }
     }
 
@@ -64,6 +85,11 @@ impl Algorithm {
             Algorithm::Crc64Nvme => "CRC64NVME",
             Algorithm::Sha1 => "SHA1",
             Algorithm::Sha256 => "SHA256",
+            Algorithm::Sha512 => "SHA512",
+            Algorithm::Md5 => "MD5",
+            Algorithm::XxHash64 => "XXHASH64",
+            Algorithm::XxHash3 => "XXHASH3",
+            Algorithm::XxHash128 => "XXHASH128",
         }
     }
 
@@ -82,9 +108,11 @@ impl Algorithm {
     pub fn len(self) -> usize {
         match self {
             Algorithm::Crc32 | Algorithm::Crc32c => 4,
-            Algorithm::Crc64Nvme => 8,
+            Algorithm::Crc64Nvme | Algorithm::XxHash64 | Algorithm::XxHash3 => 8,
+            Algorithm::Md5 | Algorithm::XxHash128 => 16,
             Algorithm::Sha1 => 20,
             Algorithm::Sha256 => 32,
+            Algorithm::Sha512 => 64,
         }
     }
 
@@ -94,7 +122,7 @@ impl Algorithm {
     }
 
     /// Whether checksums of pieces combine into the whole's (`combine`):
-    /// the CRCs'.
+    /// the CRCs'. Only these can be a multipart upload's FULL_OBJECT ones.
     pub fn combines(self) -> bool {
         self.crc().is_some()
     }
@@ -105,7 +133,13 @@ impl Algorithm {
             Algorithm::Crc32 => Some((0xedb8_8320, 32)),
             Algorithm::Crc32c => Some((0x82f6_3b78, 32)),
             Algorithm::Crc64Nvme => Some((0x9a6c_9329_ac4b_c9b5, 64)),
-            Algorithm::Sha1 | Algorithm::Sha256 => None,
+            Algorithm::Sha1
+            | Algorithm::Sha256
+            | Algorithm::Sha512
+            | Algorithm::Md5
+            | Algorithm::XxHash64
+            | Algorithm::XxHash3
+            | Algorithm::XxHash128 => None,
         }
     }
 }
@@ -147,6 +181,11 @@ pub enum Hasher {
     Crc64Nvme(crc64fast_nvme::Digest),
     Sha1(Sha1),
     Sha256(Sha256),
+    Sha512(Sha512),
+    Md5(Md5),
+    XxHash64(XxHash64),
+    XxHash3(XxHash3_64),
+    XxHash128(XxHash3_128),
 }
 
 impl Hasher {
@@ -157,6 +196,12 @@ impl Hasher {
             Algorithm::Crc64Nvme => Hasher::Crc64Nvme(crc64fast_nvme::Digest::new()),
             Algorithm::Sha1 => Hasher::Sha1(Sha1::new()),
             Algorithm::Sha256 => Hasher::Sha256(Sha256::new()),
+            Algorithm::Sha512 => Hasher::Sha512(Sha512::new()),
+            Algorithm::Md5 => Hasher::Md5(Md5::new()),
+            // With the default seed, 0, as S3's.
+            Algorithm::XxHash64 => Hasher::XxHash64(XxHash64::with_seed(0)),
+            Algorithm::XxHash3 => Hasher::XxHash3(XxHash3_64::new()),
+            Algorithm::XxHash128 => Hasher::XxHash128(XxHash3_128::new()),
         }
     }
 
@@ -167,10 +212,16 @@ impl Hasher {
             Hasher::Crc64Nvme(h) => h.write(data),
             Hasher::Sha1(h) => h.update(data),
             Hasher::Sha256(h) => h.update(data),
+            Hasher::Sha512(h) => h.update(data),
+            Hasher::Md5(h) => h.update(data),
+            Hasher::XxHash64(h) => h.write(data),
+            Hasher::XxHash3(h) => h.write(data),
+            Hasher::XxHash128(h) => h.write(data),
         }
     }
 
-    /// The checksum's bytes, big-endian for the CRCs, as S3 encodes them.
+    /// The checksum's bytes, big-endian for the CRCs and XXHashes (their
+    /// canonical form), as S3 encodes them.
     pub fn finish(self) -> Vec<u8> {
         match self {
             Hasher::Crc32(h) => h.finalize().to_be_bytes().to_vec(),
@@ -178,6 +229,11 @@ impl Hasher {
             Hasher::Crc64Nvme(h) => h.sum64().to_be_bytes().to_vec(),
             Hasher::Sha1(h) => h.finalize().to_vec(),
             Hasher::Sha256(h) => h.finalize().to_vec(),
+            Hasher::Sha512(h) => h.finalize().to_vec(),
+            Hasher::Md5(h) => h.finalize().to_vec(),
+            Hasher::XxHash64(h) => h.finish().to_be_bytes().to_vec(),
+            Hasher::XxHash3(h) => h.finish().to_be_bytes().to_vec(),
+            Hasher::XxHash128(h) => h.finish_128().to_be_bytes().to_vec(),
         }
     }
 }
@@ -279,8 +335,8 @@ pub fn invalid() -> hyper::Response<http_body_util::Full<hyper::body::Bytes>> {
 /// What a CreateMultipartUpload asks for (`x-amz-checksum-algorithm`,
 /// `x-amz-checksum-type`), as MinIO takes it (S3 documents only that
 /// CRC64NVME is always FULL_OBJECT): an algorithm's type defaults to
-/// COMPOSITE, but CRC64NVME's, which is always FULL_OBJECT; the SHAs can't
-/// be FULL_OBJECT; a type without an algorithm is no checksum, unless it's
+/// COMPOSITE, but CRC64NVME's, which is always FULL_OBJECT; only the CRCs
+/// can be FULL_OBJECT (S3 documents which); a type without an algorithm is no checksum, unless it's
 /// FULL_OBJECT, which needs one. `None` for no checksum.
 pub fn requested_upload(
     headers: &hyper::HeaderMap,
@@ -299,7 +355,7 @@ pub fn requested_upload(
     let algorithm = Algorithm::from_name(algorithm).ok_or_else(invalid)?;
     let kind = match (algorithm, kind) {
         (Algorithm::Crc64Nvme, _) => Type::FullObject,
-        (Algorithm::Sha1 | Algorithm::Sha256, Some(Type::FullObject)) => return Err(invalid()),
+        (algorithm, Some(Type::FullObject)) if !algorithm.combines() => return Err(invalid()),
         (_, kind) => kind.unwrap_or(Type::Composite),
     };
     Ok(Some((algorithm, kind)))
@@ -449,6 +505,27 @@ mod tests {
         assert_eq!(check(Algorithm::Crc32), encode(&0xcbf43926u32.to_be_bytes()));
         assert_eq!(check(Algorithm::Crc32c), encode(&0xe3069283u32.to_be_bytes()));
         assert_eq!(check(Algorithm::Crc64Nvme), encode(&0xae8b14860a799888u64.to_be_bytes()));
+        // And the others' known values, over "" (and SHA-512's over "abc").
+        let empty = |a| encode(&digest(a, b""));
+        assert_eq!(empty(Algorithm::Md5), encode(&0xd41d8cd98f00b204e9800998ecf8427eu128.to_be_bytes()));
+        assert_eq!(empty(Algorithm::XxHash64), encode(&0xef46db3751d8e999u64.to_be_bytes()));
+        assert_eq!(empty(Algorithm::XxHash3), encode(&0x2d06800538d394c2u64.to_be_bytes()));
+        assert_eq!(empty(Algorithm::XxHash128), encode(&0x99aa06d3014798d86001c324468d497fu128.to_be_bytes()));
+        assert_eq!(
+            encode(&digest(Algorithm::Sha512, b"abc")),
+            "3a81oZNherrMQXNJriBBMRLm+k6JqX6iCp7u5ktV05ohkpkqJ0/BqDa6PCOj/uu9RU1EI2Q86A4qmslPpUyknw=="
+        );
+        // Streamed in pieces, the same as at once.
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 31 + i / 7) as u8).collect();
+        for algorithm in Algorithm::ALL {
+            let mut hasher = Hasher::new(algorithm);
+            for chunk in data.chunks(333) {
+                hasher.update(chunk);
+            }
+            let streamed = hasher.finish();
+            assert_eq!(streamed.len(), algorithm.len(), "{algorithm:?}");
+            assert_eq!(streamed, digest(algorithm, &data), "{algorithm:?}");
+        }
     }
 
     #[test]
@@ -497,7 +574,12 @@ mod tests {
         assert_eq!(upload(&[(ALGORITHM, "SHA1"), (TYPE, "FULL_OBJECT")]), Err(400));
         assert_eq!(upload(&[(TYPE, "COMPOSITE")]), Ok(None));
         assert_eq!(upload(&[(TYPE, "FULL_OBJECT")]), Err(400));
-        assert_eq!(upload(&[(ALGORITHM, "MD5")]), Err(400));
+        assert_eq!(upload(&[(ALGORITHM, "md5")]), Ok(Some((Md5, Composite))));
+        assert_eq!(upload(&[(ALGORITHM, "XXHASH128"), (TYPE, "COMPOSITE")]), Ok(Some((XxHash128, Composite))));
+        for algorithm in ["SHA512", "MD5", "XXHASH64", "XXHASH3", "XXHASH128"] {
+            assert_eq!(upload(&[(ALGORITHM, algorithm), (TYPE, "FULL_OBJECT")]), Err(400), "{algorithm}");
+        }
+        assert_eq!(upload(&[(ALGORITHM, "XXHASH32")]), Err(400));
         assert_eq!(upload(&[(ALGORITHM, "CRC32"), (TYPE, "PARTIAL")]), Err(400));
     }
 
@@ -508,6 +590,6 @@ mod tests {
             assert_eq!(Algorithm::from_header(algorithm.header()), Some(algorithm));
         }
         assert_eq!(Type::from_name("composite"), Some(Type::Composite));
-        assert_eq!(Algorithm::from_name("MD5"), None);
+        assert_eq!(Algorithm::from_name("XXHASH32"), None);
     }
 }

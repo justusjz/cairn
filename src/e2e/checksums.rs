@@ -288,6 +288,40 @@ async fn composite_uploads() {
     assert_eq!((status, again), (StatusCode::OK, body));
 }
 
+/// S3's newer algorithms (SHA-512, MD5, the XXHashes): a PUT's is stored
+/// and told as the others are; an upload's is COMPOSITE, of its parts'.
+#[tokio::test]
+async fn newer_algorithms() {
+    let Some(app) = node().await else { return };
+    let body = data(100_000);
+    let (one, two) = (data(MIN), data(1000));
+    for algorithm in [Algorithm::Sha512, Algorithm::Md5, Algorithm::XxHash64, Algorithm::XxHash3, Algorithm::XxHash128] {
+        let name = algorithm.name();
+        let key = format!("put-{name}");
+        let value = b64(algorithm, &body);
+        let result = put_with(&app, &key, body.clone(), &[(algorithm.header(), &value)]).await;
+        assert!(matches!(result, UploadResult::Committed { .. }), "{name}");
+        assert_eq!(told(&app, &key, None, None).await, Some((format!("{name}:{value}"), "FULL_OBJECT".into())));
+        assert_eq!(stored(&app, &key).await, (Some(name.into()), Some("FULL_OBJECT".into()), Some(value)));
+        // A wrong one is BadDigest.
+        let wrong = b64(algorithm, b"other");
+        let result = put_with(&app, &key, body.clone(), &[(algorithm.header(), &wrong)]).await;
+        assert!(matches!(result, UploadResult::Rejected(ref r) if r.code == "BadDigest"), "{name}");
+
+        let key = format!("upload-{name}");
+        let id = create(&app, &key, Some((algorithm, Type::Composite)), None).await;
+        let e1 = upload_part(&app, &key, &id, 1, &one, Some(algorithm), None).await.unwrap();
+        let e2 = upload_part(&app, &key, &id, 2, &two, Some(algorithm), None).await.unwrap();
+        let (l1, l2) = (vec![(algorithm, b64(algorithm, &one))], vec![(algorithm, b64(algorithm, &two))]);
+        let composite = checksums::composite(algorithm, &[checksums::digest(algorithm, &one), checksums::digest(algorithm, &two)]);
+        let claim = [(algorithm.header(), composite.as_str())];
+        let (status, _, body) = complete(&app, &key, &id, &[(1, &e1, &l1), (2, &e2, &l2)], &claim, None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains(&format!("<Checksum{name}>{composite}</Checksum{name}>")), "{body}");
+        assert_eq!(told(&app, &key, None, None).await, Some((format!("{name}:{composite}"), "COMPOSITE".into())));
+    }
+}
+
 /// A FULL_OBJECT upload's object checksum is its parts' combined: of the
 /// algorithm asked for, or, without one, S3's default, CRC64NVME. Its parts
 /// may come without their checksums, and be listed without them, as in S3.

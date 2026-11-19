@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "14";
+pub(crate) const PROTOCOL: &str = "15";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -260,6 +260,7 @@ const MIGRATIONS: &[&str] = &[
     TIERS,
     ACLS,
     BATCH_COPIES,
+    CHECKSUM_ALGORITHMS,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -3883,6 +3884,47 @@ CREATE TABLE batch_job_copies (
 );
 CREATE TRIGGER batch_job_copies_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON batch_job_copies
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 80: S3's newer checksum algorithms (see `s3::checksums`):
+/// SHA512, MD5, XXHASH64, XXHASH3 and XXHASH128, as objects' and uploads'.
+/// The checks are NOT VALID, as `CHECKSUMS`'s were.
+///
+/// The protocol goes to 15, so that no older node handles an upload of one
+/// of them. It doesn't know their names, so it takes such an upload as one
+/// without an algorithm, whose checksum is a FULL_OBJECT CRC64NVME, and
+/// reads its parts' checksums as CRC64NVMEs: an XXHASH64 or XXHASH3 one has
+/// a CRC64NVME's length, so it would complete the upload with a CRC64NVME
+/// combined from them, which isn't the object's. (And it would store parts
+/// without checking them against the checksums their clients sent.)
+const CHECKSUM_ALGORITHMS: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '15' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE objects DROP CONSTRAINT objects_checksum;
+ALTER TABLE objects ADD CONSTRAINT objects_checksum CHECK (
+    (checksum_algorithm IS NULL) = (checksum IS NULL)
+    AND (checksum_algorithm IS NULL) = (checksum_type IS NULL)
+    AND (checksum_algorithm IS NULL
+         OR checksum_algorithm IN ('CRC32', 'CRC32C', 'CRC64NVME', 'SHA1', 'SHA256',
+                                   'SHA512', 'MD5', 'XXHASH64', 'XXHASH3', 'XXHASH128'))
+    AND (checksum_type IS NULL OR checksum_type IN ('FULL_OBJECT', 'COMPOSITE'))
+) NOT VALID;
+ALTER TABLE multipart_uploads DROP CONSTRAINT multipart_uploads_checksum;
+ALTER TABLE multipart_uploads ADD CONSTRAINT multipart_uploads_checksum CHECK (
+    (checksum_algorithm IS NULL) = (checksum_type IS NULL)
+    AND (checksum_algorithm IS NULL
+         OR checksum_algorithm IN ('CRC32', 'CRC32C', 'CRC64NVME', 'SHA1', 'SHA256',
+                                   'SHA512', 'MD5', 'XXHASH64', 'XXHASH3', 'XXHASH128'))
+    AND (checksum_type IS NULL OR checksum_type IN ('FULL_OBJECT', 'COMPOSITE'))
+) NOT VALID;
 "#;
 
 #[cfg(test)]

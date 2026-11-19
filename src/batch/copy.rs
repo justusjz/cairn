@@ -23,8 +23,7 @@
 //! back.
 //!
 //! Not as in S3: no requester pays, event holds or annotations
-//! (`AnnotationDirective` `EXCLUDE`), and only the checksum algorithms
-//! Cairn has (see `s3::checksums`). `NewObjectMetadata`'s `ContentLength`
+//! (`AnnotationDirective` `EXCLUDE`). `NewObjectMetadata`'s `ContentLength`
 //! and `ContentMD5` are ignored, as they don't apply to a copy.
 
 use std::{
@@ -78,12 +77,6 @@ const CANNED: &[&str] = &[
     "authenticated-read",
     "bucket-owner-read",
     "bucket-owner-full-control",
-];
-
-/// The checksum algorithms S3 Control names (`S3ChecksumAlgorithm`):
-/// those Cairn hasn't are refused as unimplemented.
-const ALGORITHMS: &[&str] = &[
-    "CRC32", "CRC32C", "SHA1", "SHA256", "CRC64NVME", "SHA512", "MD5", "XXHASH64", "XXHASH3", "XXHASH128",
 ];
 
 /// What's escaped in a copy source's bucket and key: all but what S3's
@@ -541,13 +534,11 @@ pub(super) fn parse(operation: roxmltree::Node) -> Result<Copy, Response<Full<By
         return Err(bad_request("An ObjectLockLegalHoldStatus is ON or OFF."));
     }
     let checksum = owned(operation, "ChecksumAlgorithm");
-    if let Some(name) = checksum.as_deref() {
-        if !ALGORITHMS.contains(&name) {
-            return Err(bad_request(&format!("{name} isn't a ChecksumAlgorithm.")));
-        }
-        if Algorithm::from_name(name).is_none() {
-            return Err(not_implemented(&format!("The checksum algorithm {name}")));
-        }
+    // S3 Control's names (`S3ChecksumAlgorithm`) are S3's, exactly.
+    if let Some(name) = checksum.as_deref()
+        && Algorithm::from_name(name).is_none_or(|a| a.name() != name)
+    {
+        return Err(bad_request(&format!("{name} isn't a ChecksumAlgorithm.")));
     }
     let storage_class = owned(operation, "StorageClass");
     if storage_class.as_deref() == Some("") {
@@ -816,7 +807,7 @@ mod tests {
             ("<RequesterPays>true</RequesterPays>", 501),
             ("<ObjectLockEventHold>ON</ObjectLockEventHold>", 501),
             ("<AnnotationDirective>EXCLUDE</AnnotationDirective>", 501),
-            ("<ChecksumAlgorithm>XXHASH3</ChecksumAlgorithm>", 501),
+            ("<ChecksumAlgorithm>xxhash3</ChecksumAlgorithm>", 400),
             ("<ChecksumAlgorithm>ROT13</ChecksumAlgorithm>", 400),
             ("<MetadataDirective>KEEP</MetadataDirective>", 400),
             ("<CannedAccessControlList>everyone</CannedAccessControlList>", 400),
