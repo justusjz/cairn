@@ -977,3 +977,76 @@ async fn objects_from_before_have_none() {
         Some((format!("CRC64NVME:{crc64}"), "FULL_OBJECT".into()))
     );
 }
+
+/// Checksums worked out of objects' data at rest (Batch Operations'
+/// `S3ComputeObjectChecksum`; see `copy::compute_checksum`): of a multipart
+/// object's whole data, or COMPOSITE, of its parts'; a single PUT's is
+/// always of its whole data. An SSE-C object's key Cairn doesn't have, and
+/// a missing one has nothing to read.
+#[tokio::test]
+async fn checksums_are_computed_at_rest() {
+    use crate::s3::objects::copy::compute_checksum;
+    let Some(app) = node().await else { return };
+    let (one, two) = (data(MIN), data(1000));
+    let id = create(&app, "m", None, None).await;
+    let e1 = upload_part(&app, "m", &id, 1, &one, None, None)
+        .await
+        .unwrap();
+    let e2 = upload_part(&app, "m", &id, 2, &two, None, None)
+        .await
+        .unwrap();
+    let parts = [(1, e1.as_str(), &[][..]), (2, e2.as_str(), &[][..])];
+    let (status, _, body) = complete(&app, "m", &id, &parts, &[], None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let compute = |key: &'static str, algorithm, kind| {
+        let app = app.clone();
+        async move {
+            compute_checksum(&app, BUCKET, key, None, algorithm, kind, None)
+                .await
+                .unwrap()
+        }
+    };
+    let whole = compute("m", Algorithm::Sha256, Type::FullObject)
+        .await
+        .unwrap();
+    let all = [one.clone(), two.clone()].concat();
+    assert_eq!(whole.raw, checksums::digest(Algorithm::Sha256, &all));
+    assert_eq!(whole.checksum.kind, Type::FullObject);
+    assert!(whole.etag.ends_with("-2"), "{}", whole.etag);
+    for algorithm in [Algorithm::Crc32, Algorithm::Md5, Algorithm::XxHash128] {
+        let raws = vec![
+            checksums::digest(algorithm, &one),
+            checksums::digest(algorithm, &two),
+        ];
+        let composite = compute("m", algorithm, Type::Composite).await.unwrap();
+        assert_eq!(composite.checksum.kind, Type::Composite);
+        assert_eq!(
+            composite.checksum.value,
+            checksums::composite(algorithm, &raws)
+        );
+        assert_eq!(composite.raw, checksums::digest(algorithm, &raws.concat()));
+    }
+
+    put(&app, "single", data(10)).await;
+    let single = compute("single", Algorithm::Crc32, Type::Composite)
+        .await
+        .unwrap();
+    assert_eq!(single.checksum.kind, Type::FullObject);
+    assert_eq!(single.raw, checksums::digest(Algorithm::Crc32, &data(10)));
+
+    let customer = customer_key(&[7; 32]);
+    put_sealed(&app, "sealed", data(10), &customer).await;
+    let refused = compute("sealed", Algorithm::Crc32, Type::FullObject)
+        .await
+        .unwrap_err();
+    let (status, _, body) = text(refused).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body.contains("SSE-C encryption type is not supported"),
+        "{body}"
+    );
+    let missing = compute("missing", Algorithm::Crc32, Type::FullObject)
+        .await
+        .unwrap_err();
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+}

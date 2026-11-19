@@ -60,8 +60,8 @@ please report it.
 | Server access logging | 🟡 | Not logged yet: lifecycle actions (`S3.EXPIRE.OBJECT`, …), DeleteObjects' keys (`BATCH.DELETE.OBJECT`), POST Object's requester. Host ID and TLS fields are `-`. |
 | [Event notifications](#event-notifications), to SNS topics | 🟡 | |
 | Event notifications to SQS, Lambda, EventBridge | ❌ | |
-| [Batch Operations](#batch-operations): tagging, Object Lock, replication, copies | 🟡 | |
-| Batch Operations: other operations | ❌ | |
+| [Batch Operations](#batch-operations): tagging, Object Lock, replication, copies, ACLs, checksums, encryption updates | 🟡 | |
+| Batch Operations: `LambdaInvoke`, `S3InitiateRestoreObject` | ❌ | |
 | [Replication](#replication) to buckets in the cluster | 🟡 | |
 | Replication to other clusters or providers, RTC | ❌ | |
 | [Directory buckets](#directory-buckets) (S3 Express One Zone), CreateSession | 🟡 | |
@@ -191,7 +191,7 @@ multi-factor. MFA at an OpenID Connect provider isn't trusted.
 | `BlockPublicAcls`, `IgnorePublicAcls` | ✅ | |
 | `aws-exec-read` | 🟡 | `private`: there's no EC2 to grant. |
 | Logging `TargetGrants` | ❌ | Refused, as S3 refuses them for a target with ACLs disabled. |
-| Batch Operations' `S3PutObjectAcl`, access logs' `aclRequired` | ❌ | `aclRequired` is `-`. |
+| Access logs' `aclRequired` | ❌ | `-`. |
 | ListMultipartUploads' `Owner` | 🟡 | Always the bucket owner. |
 
 ### Event notifications
@@ -216,7 +216,10 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 | `S3ReplicateObject` (Batch Replication) | 🟡 | A task succeeds once its version is queued. A task without a version ID replicates the current version. |
 | `S3PutObjectCopy` | 🟡 | Not into directory buckets. `NewObjectMetadata`'s `ContentLength` and `ContentMD5` are ignored. |
 | `S3PutObjectCopy`: requester pays, event holds, `AnnotationDirective` `EXCLUDE` | ❌ | |
-| Other operations | ❌ | |
+| `S3PutObjectAcl` | ✅ | Each task is the PutObjectAcl request it would be, and fails as that would: with the bucket's ACLs disabled, say. |
+| `S3ComputeObjectChecksum` | 🟡 | `COMPOSITE` of an object that isn't multipart is its `FULL_OBJECT` one, as reported. A `COMPOSITE` result's `checksum_base64` has no `-N`. |
+| `S3UpdateObjectEncryption` | 🟡 | `BucketKeyEnabled` is ignored. The KMS key ARN may be `arn:aws:kms:<region>:<account>:key/<mount>/<key>` or `arn:aws:kms:<mount>/<key>`. An SSE-S3 object's ETag, its MD5, is kept, as on S3: so it's then stored in the clear, as SSE-KMS objects' ETags are. Replicas aren't updated, as on S3. |
+| `LambdaInvoke`, `S3InitiateRestoreObject` | ❌ | |
 | CSV manifests, CSV and Parquet inventory reports | ✅ | A Parquet report's row group may hold at most 64 MiB of buckets, keys and version IDs. |
 | Manifest generators (`S3JobManifestGenerator`) | 🟡 | A versioned bucket's manifest has every version but delete markers. A manifest that isn't written out is kept in Cairn's internal bucket until the job ends. Output files are named by Cairn (`<prefix>/job-<id>/…`). Failure codes are Cairn's. |
 | Manifest generators: `MatchAnyObjectEncryption` | ❌ | |

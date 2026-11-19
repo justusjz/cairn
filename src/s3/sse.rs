@@ -48,6 +48,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     App,
+    db::Cached,
     encryption::{self, Field, Key, Owner},
     kms::{Identity, KeyId, KmsError},
     s3::sse_c::CustomerKey,
@@ -897,6 +898,146 @@ pub fn echo_onto<B>(
     let echoed = echo(builder, stored, given).body(()).unwrap();
     parts.headers = echoed.into_parts().0.headers;
     Response::from_parts(parts, body)
+}
+
+/// Batch Operations' S3UpdateObjectEncryption (see `batch`): changes how the
+/// version of `bucket`/`key` named `version_id` (else its current one) is
+/// encrypted to SSE-KMS, as `request` asks, in place: its object key, which
+/// its data stays encrypted under, is sealed under a new data key of the
+/// KMS key it names, asked for as the role `role` (the old SSE-KMS one's
+/// opened as it too, an SSE-S3 one's as Cairn). Nothing else of it changes,
+/// as S3 has it: not its data, checksums, last modified time, or ETag, which
+/// an SSE-S3 version keeps sealed (its content's MD5: see the module's doc)
+/// and SSE-KMS keeps in the clear, as it does its parts'. So a version that
+/// was SSE-S3 has its MD5 in the clear from then on, as it would on S3.
+/// Refused for a plain or SSE-C version, as S3 refuses them, and for one
+/// that's retained or under a legal hold (see T73); or with the response a
+/// GET of a version that isn't there gets.
+pub(crate) async fn update_encryption(
+    app: &App,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    request: &KmsRequest,
+    role: Option<Uuid>,
+) -> anyhow::Result<Result<(), Response<Full<Bytes>>>> {
+    for attempt in 0..crate::db::MAX_TX_ATTEMPTS {
+        crate::db::backoff(attempt).await;
+        let client = app.pool.get().await?;
+        let version = match crate::s3::objects::get::lookup_version(
+            &client, bucket, key, version_id,
+        )
+        .await?
+        {
+            Ok(version) => version,
+            Err(missing) => return Ok(Err(missing.read_response())),
+        };
+        let (sealed, was_s3) = match &version.encryption {
+            Stored::Kms(envelope) => (&envelope.sealed, false),
+            Stored::S3(envelope) => (&envelope.sealed, true),
+            Stored::Plain => {
+                return Ok(Err(bad_request(
+                    "InvalidRequest",
+                    "The encryption of an object that isn't encrypted can't be updated.",
+                )));
+            }
+            Stored::Customer { .. } => {
+                return Ok(Err(bad_request(
+                    "InvalidRequest",
+                    "The encryption of an SSE-C object can't be updated.",
+                )));
+            }
+        };
+        let object_key = match open(app, &version.encryption, None, role, bucket, key).await? {
+            Ok(object_key) => object_key.expect("an SSE-KMS or SSE-S3 object has a key"),
+            Err(refused) => return Ok(Err(refused)),
+        };
+        let envelope = match reseal(app, &object_key, request, role, bucket, key).await? {
+            Ok(envelope) => envelope,
+            Err(refused) => return Ok(Err(refused)),
+        };
+        // An SSE-S3 version's ETags, opened.
+        let (etag, part_ids, part_etags) = if was_s3 {
+            let owner = Owner::Object { bucket, key };
+            let etag = encryption::open_value(&object_key, Field::Etag, owner, &version.etag)
+                .with_context(|| {
+                    format!("the stored ETag of {bucket}/{key} doesn't open under its key")
+                })?;
+            let rows = client
+                .query_cached(
+                    "SELECT id, etag, enc_salt FROM parts WHERE object_id = $1 ORDER BY part_number",
+                    &[&version.id],
+                )
+                .await?;
+            let mut ids = Vec::with_capacity(rows.len());
+            let mut etags = Vec::with_capacity(rows.len());
+            for row in rows {
+                let salt: Option<&[u8]> = row.get(2);
+                let salt: &encryption::Salt = salt
+                    .and_then(|salt| salt.try_into().ok())
+                    .context("an encrypted object's part has no salt")?;
+                let stored: String = row.get(1);
+                let etag =
+                    encryption::open_value(&object_key, Field::Etag, Owner::Part(salt), &stored)
+                        .with_context(|| {
+                            format!(
+                                "a stored part ETag of {bucket}/{key} doesn't open under its key"
+                            )
+                        })?;
+                ids.push(row.get::<_, i64>(0));
+                etags.push(etag);
+            }
+            (Some(etag), Some(ids), Some(etags))
+        } else {
+            (None, None, None)
+        };
+        let columns = Stored::Kms(envelope);
+        let columns = columns.columns();
+        let status = match client
+            .query_one_cached(
+                "SELECT status FROM pg_temp.cairn_update_encryption($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                &[
+                    &bucket as &(dyn tokio_postgres::types::ToSql + Sync),
+                    &key,
+                    &version.id,
+                    sealed,
+                    &columns.kms_key_id,
+                    &columns.kms_data_key,
+                    &columns.kms_sealed,
+                    &columns.kms_context,
+                    &etag,
+                    &part_ids,
+                    &part_etags,
+                ],
+            )
+            .await
+        {
+            Ok(row) => row.get::<_, String>(0),
+            Err(e) if crate::db::is_conflict(&e) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        return Ok(match status.as_str() {
+            "updated" => Ok(()),
+            // Replaced, deleted or changed meanwhile: as it is now.
+            "changed" => continue,
+            "locked" => Err(format_s3_error(
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "The object is protected by Object Lock: its retention or legal hold must be removed first.",
+            )),
+            "no_such_bucket" => Err(format_s3_error(
+                StatusCode::NOT_FOUND,
+                "NoSuchBucket",
+                "The specified bucket does not exist",
+            )),
+            status => anyhow::bail!("cairn_update_encryption answered {status}"),
+        });
+    }
+    Ok(Err(format_s3_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "SlowDown",
+        "Please reduce your request rate.",
+    )))
 }
 
 #[cfg(test)]

@@ -94,7 +94,9 @@ Done:
   objects and S3's filters (snapshots, kept internally or written out), as a
   role, at that rate too, with completion reports, and copy objects, each copy
   recorded with the version it writes, so that one done again when a node dies
-  mid-page makes no second version. Implemented.
+  mid-page makes no second version; set their ACLs, work out their checksums
+  at rest (in the completion report), and change their encryption to SSE-KMS
+  in place. Implemented.
 - **Storage classes.** Classes of the operator's, each in a pool of the
   nodes' disks (`--data-dir <pool>=<path>`, several per node) with a layout
   of its own; objects ask for one with `x-amz-storage-class`, and change

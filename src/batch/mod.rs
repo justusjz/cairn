@@ -9,12 +9,16 @@
 //!   `S3PutObjectLegalHold` (see `s3::object_lock`), `S3ReplicateObject`
 //!   (Batch Replication: each version is queued to be replicated by its
 //!   bucket's replication configuration, as a new version is; see
-//!   `replicate`), and `S3PutObjectCopy` (see `copy`). Doing any but a copy
+//!   `replicate`), `S3PutObjectCopy` (see `copy`), `S3PutObjectAcl` (see
+//!   `acl`), `S3ComputeObjectChecksum` (see `checksum`), and
+//!   `S3UpdateObjectEncryption` (see `encryption`). Doing any but a copy
 //!   twice does no harm, which a job relies on (below): a retention set
-//!   again is set to the same date, which isn't shortening it, and a
-//!   version is queued once; a copy is recorded with the version it
-//!   writes, so that it's done once (see `copy`). Others are refused with
-//!   501 NotImplemented.
+//!   again is set to the same date, which isn't shortening it, a version is
+//!   queued once, an ACL set again is the same, a checksum changes nothing,
+//!   and an encryption updated again seals the same key again; a copy is
+//!   recorded with the version it writes, so that it's done once (see
+//!   `copy`). Others (`LambdaInvoke`, `S3InitiateRestoreObject`) are
+//!   refused with 501 NotImplemented.
 //! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`), and
 //!   inventory reports (`S3InventoryReport_CSV_20161130`, `…_20211130`) of
 //!   CSV or Parquet (see `source`); or, with a manifest generator, one the
@@ -60,8 +64,11 @@
 //!
 //! A job is kept for 90 days after it ends, as S3 keeps them.
 
+pub mod acl;
+pub mod checksum;
 pub mod control;
 pub mod copy;
+pub mod encryption;
 pub mod generate;
 pub mod manifest;
 mod parquet;
@@ -162,6 +169,15 @@ pub enum Operation {
     /// Copies each version (see `copy`).
     #[serde(rename = "copy")]
     Copy(Box<copy::Copy>),
+    /// Sets each version's ACL (see `acl`).
+    #[serde(rename = "put_acl")]
+    PutAcl(Box<acl::SetAcl>),
+    /// Works out each version's checksum (see `checksum`).
+    #[serde(rename = "compute_checksum")]
+    ComputeChecksum(checksum::ComputeChecksum),
+    /// Changes each version's encryption to SSE-KMS (see `encryption`).
+    #[serde(rename = "update_encryption")]
+    UpdateEncryption(encryption::UpdateEncryption),
 }
 
 impl Operation {
@@ -174,6 +190,9 @@ impl Operation {
             Operation::PutLegalHold { .. } => "S3PutObjectLegalHold",
             Operation::Replicate => "S3ReplicateObject",
             Operation::Copy(_) => "S3PutObjectCopy",
+            Operation::PutAcl(_) => "S3PutObjectAcl",
+            Operation::ComputeChecksum(_) => "S3ComputeObjectChecksum",
+            Operation::UpdateEncryption(_) => "S3UpdateObjectEncryption",
         }
     }
 }
@@ -689,12 +708,14 @@ async fn run(
         signed: None,
         form: false,
     };
-    // A copy's requests have headers, as policies see them.
+    // A copy's requests have headers, as policies see them, and so do an
+    // ACL's.
     let headers = match &job.operation {
         Operation::Copy(copy) => match copy.headers() {
             Ok(headers) => headers,
             Err(why) => anyhow::bail!("job {}: its copy's {why}", job.id),
         },
+        Operation::PutAcl(acl) => acl.headers(),
         _ => HeaderMap::new(),
     };
     let mut access = Access::new(
@@ -729,7 +750,12 @@ async fn run(
             None,
             Some(if *on { "ON" } else { "OFF" }),
         ),
-        Operation::DeleteTagging | Operation::Replicate | Operation::Copy(_) => {}
+        Operation::UpdateEncryption(update) => update.set_context(&mut access),
+        Operation::DeleteTagging
+        | Operation::Replicate
+        | Operation::Copy(_)
+        | Operation::PutAcl(_)
+        | Operation::ComputeChecksum(_) => {}
     }
     let copier = match &job.operation {
         Operation::Copy(copy) => Some(copy::Copier::new(job.id, copy, headers, &mut access)?),
@@ -770,9 +796,12 @@ async fn run(
                         let result = match &copier {
                             Some(copier) => match unfit(&task, &job.operation) {
                                 Some(failure) => Err(failure),
-                                None => copier.run(app, &mut access, &principal, &who, ordinal, &task).await?,
+                                None => copier
+                                    .run(app, &mut access, &principal, &who, ordinal, &task)
+                                    .await?
+                                    .map(|()| None),
                             },
-                            None => run_task(app, &mut access, &who, &job.operation, &tags, &task).await?,
+                            None => run_task(app, &mut access, &principal, &who, &job.operation, &tags, &task).await?,
                         };
                         (task, result)
                     }
@@ -782,7 +811,7 @@ async fn run(
                     }
                 };
                 match &result {
-                    Ok(()) => {
+                    Ok(_) => {
                         succeeded += 1;
                         turn.succeeded += 1;
                     }
@@ -868,15 +897,17 @@ async fn run(
 }
 
 /// Does `operation` to the object of `task`, as `access` (its role's
-/// session's, `who`) allows it; why not, if it didn't.
+/// session's, `principal`, `who`) allows it: what its report's line says
+/// of it, if anything but that it succeeded; why not, if it didn't.
 async fn run_task(
     app: &Arc<App>,
     access: &mut Access,
+    principal: &Principal,
     who: &str,
     operation: &Operation,
     tags: &Tags,
     task: &Task,
-) -> anyhow::Result<Result<(), TaskFailure>> {
+) -> anyhow::Result<Result<Option<String>, TaskFailure>> {
     let Task {
         bucket,
         key,
@@ -884,6 +915,22 @@ async fn run_task(
     } = task;
     if let Some(failure) = unfit(task, operation) {
         return Ok(Err(failure));
+    }
+    match operation {
+        Operation::PutAcl(acl) => {
+            return Ok(acl::run(app, access, who, acl, task).await?.map(|()| None));
+        }
+        Operation::ComputeChecksum(compute) => {
+            return Ok(checksum::run(app, access, principal, who, compute, task)
+                .await?
+                .map(Some));
+        }
+        Operation::UpdateEncryption(update) => {
+            return Ok(encryption::run(app, access, principal, who, update, task)
+                .await?
+                .map(|()| None));
+        }
+        _ => {}
     }
     // The request the task is, as policies see it.
     let query = |subresource: &str| match version_id {
@@ -916,7 +963,7 @@ async fn run_task(
             }
             return Ok(
                 match tagging::set_tags(app, bucket, key, version_id, tags, tagging).await? {
-                    Outcome::Tagged(_) => Ok(()),
+                    Outcome::Tagged(_) => Ok(None),
                     Outcome::DeleteMarker(_) => Err(delete_marker()),
                     Outcome::NoSuchVersion => Err(no_such_version()),
                     Outcome::NoSuchKey => Err(no_such_key()),
@@ -987,6 +1034,9 @@ async fn run_task(
             Change::LegalHold(*on)
         }
         Operation::Copy(_) => anyhow::bail!("a copy's task is its copier's"),
+        Operation::PutAcl(_) | Operation::ComputeChecksum(_) | Operation::UpdateEncryption(_) => {
+            unreachable!("done above")
+        }
         Operation::Replicate => {
             // No request of S3's API is this: it's allowed as its action is.
             let checks = [actions::Check {
@@ -997,7 +1047,9 @@ async fn run_task(
             let exists = access.load(app, bucket).await?;
             access.load_all(app, &checks).await?;
             return Ok(match access.first_denied(&checks) {
-                None => replicate(app, bucket, key, version_id).await?,
+                None => replicate(app, bucket, key, version_id)
+                    .await?
+                    .map(|()| None),
                 Some(_) if !exists => Err(no_such_bucket()),
                 Some((check, _)) => Err(TaskFailure::new(
                     403,
@@ -1013,7 +1065,7 @@ async fn run_task(
     };
     Ok(
         match crate::s3::object_lock::change_lock(app, bucket, key, version_id, change).await? {
-            LockOutcome::Set => Ok(()),
+            LockOutcome::Set => Ok(None),
             LockOutcome::Locked => Err(TaskFailure::new(
                 403,
                 "AccessDenied",
@@ -1412,5 +1464,32 @@ mod tests {
             r#"{"t":"copy","target":"arn:aws:s3:::dest","prefix":"p/"}"#
         );
         assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), copy);
+        let compute = Operation::ComputeChecksum(checksum::ComputeChecksum {
+            algorithm: "CRC32".to_owned(),
+            kind: "FULL_OBJECT".to_owned(),
+        });
+        let json = serde_json::to_string(&compute).unwrap();
+        assert_eq!(
+            json,
+            r#"{"t":"compute_checksum","algorithm":"CRC32","kind":"FULL_OBJECT"}"#
+        );
+        assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), compute);
+        let update = Operation::UpdateEncryption(encryption::UpdateEncryption {
+            key_arn: "arn:aws:kms:transit/k".to_owned(),
+            bucket_key: false,
+        });
+        let json = serde_json::to_string(&update).unwrap();
+        assert_eq!(
+            json,
+            r#"{"t":"update_encryption","key_arn":"arn:aws:kms:transit/k"}"#
+        );
+        assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), update);
+        let acl = Operation::PutAcl(Box::new(acl::SetAcl {
+            canned: Some("private".to_owned()),
+            list: None,
+        }));
+        let json = serde_json::to_string(&acl).unwrap();
+        assert_eq!(json, r#"{"t":"put_acl","canned":"private"}"#);
+        assert_eq!(serde_json::from_str::<Operation>(&json).unwrap(), acl);
     }
 }

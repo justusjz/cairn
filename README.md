@@ -1811,8 +1811,10 @@ S3 Batch Operations: a job (S3 Control's `CreateJob`,
 lists, as a role. Cairn does `S3PutObjectTagging` (replacing each object's
 tags), `S3DeleteObjectTagging`, `S3PutObjectRetention`,
 `S3PutObjectLegalHold` ([Object Lock](#object-lock)),
-`S3ReplicateObject` ([Batch Replication](#batch-replication)) and
-`S3PutObjectCopy` (copies, below). Its manifest is
+`S3ReplicateObject` ([Batch Replication](#batch-replication)),
+`S3PutObjectCopy` (copies, below), `S3PutObjectAcl` ([ACLs](#acls)),
+`S3ComputeObjectChecksum` and `S3UpdateObjectEncryption` (below). Its
+manifest is
 [generated](#generated-manifests) from a bucket's objects, or a
 CSV object of lines `bucket,key` (or `bucket,key,versionId`, as its
 `Fields` say), keys URL-encoded, or an [inventory report](#inventory)'s
@@ -1893,6 +1895,42 @@ the node doing it dies before it saved where its job had got to:
   --operation '{"S3PutObjectCopy":{"TargetResource":"arn:aws:s3:::archive",
     "TargetKeyPrefix":"2026/","StorageClass":"STANDARD_IA",
     "NewObjectTagging":[{"Key":"copied","Value":"yes"}]}}'
+```
+
+An ACL job sets each object's ACL as PutObjectAcl would, to a canned ACL
+or to a list of grants, so the role needs `s3:PutObjectAcl`
+(`s3:PutObjectVersionAcl` for versions), and a task fails where
+PutObjectAcl would: in a bucket with ACLs disabled, say:
+
+```sh
+  --operation '{"S3PutObjectAcl":{"AccessControlPolicy":{"CannedAccessControlList":"public-read"}}}'
+```
+
+A checksum job works out each object's checksum from its data, in any of
+S3's algorithms, of the whole object (`FULL_OBJECT`) or, for a multipart
+object, of its parts' checksums (`COMPOSITE`, not for `CRC64NVME`), and
+reports it in the task's line of the completion report, as S3 does: JSON,
+`{"checksum_base64":…,"etag":…,"checksumAlgorithm":…,"checksumType":…,"checksum_hex":…}`.
+The role needs `s3:GetObject` (and the use of an SSE-KMS object's key); an
+SSE-C object's task fails, as Cairn has no key for it:
+
+```sh
+  --operation '{"S3ComputeObjectChecksum":{"ChecksumAlgorithm":"SHA256","ChecksumType":"FULL_OBJECT"}}'
+```
+
+An encryption job changes each SSE-S3 or SSE-KMS object to SSE-KMS under
+the key it names, in place: its data isn't read or written again, only its
+key sealed under a new data key, and it keeps its ETag, checksum and last
+modified time. So an SSE-S3 object's ETag, its MD5, is then stored in the
+clear, as on S3, where SSE-KMS objects' ETags tell nothing of their
+content. The role needs `s3:UpdateObjectEncryption`, and the KMS must let
+it use the key (and an SSE-KMS object's old one). A plain or SSE-C object's
+task fails, and so does one of an object that's retained or under a legal
+hold, as on S3:
+
+```sh
+  --operation '{"S3UpdateObjectEncryption":{"ObjectEncryption":{"SSEKMS":
+    {"KMSKeyArn":"arn:aws:kms:us-east-1:<account ID>:key/transit/invoices"}}}}'
 ```
 
 A completion report (`--report`) goes to a bucket, under its prefix, as S3

@@ -77,7 +77,9 @@ impl std::fmt::Display for TaskFailure {
 /// A task done, as its line of the report has it.
 pub struct Line {
     pub task: Task,
-    pub result: Result<(), TaskFailure>,
+    /// What it says of a task that succeeded (else `Successful`), or why it
+    /// failed.
+    pub result: Result<Option<String>, TaskFailure>,
 }
 
 /// A result file written: its key, and whether its tasks succeeded or
@@ -397,7 +399,12 @@ fn csv_line(line: &Line) -> String {
         version_id,
     } = &line.task;
     let (status, http, code, message) = match &line.result {
-        Ok(()) => ("succeeded", 200, "", "Successful"),
+        Ok(message) => (
+            "succeeded",
+            200,
+            "",
+            message.as_deref().unwrap_or("Successful"),
+        ),
         Err(failure) => (
             "failed",
             failure.status,
@@ -458,11 +465,19 @@ mod tests {
     fn lines_are_s3s() {
         let ok = Line {
             task: task("photos/a b.jpg", None),
-            result: Ok(()),
+            result: Ok(None),
         };
         assert_eq!(
             csv_line(&ok),
             "b,photos/a+b.jpg,,succeeded,200,,Successful\n"
+        );
+        let computed = Line {
+            task: task("k", None),
+            result: Ok(Some(r#"{"checksum_base64":"bS9TOQ=="}"#.to_owned())),
+        };
+        assert_eq!(
+            csv_line(&computed),
+            "b,k,,succeeded,200,,\"{\"\"checksum_base64\"\":\"\"bS9TOQ==\"\"}\"\n"
         );
         let failed = Line {
             task: task("k", Some("v1")),

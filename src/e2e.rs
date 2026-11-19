@@ -32,7 +32,7 @@ mod cors;
 mod deadlocks;
 mod directory;
 mod encrypted;
-mod kms;
+pub(crate) mod kms;
 mod limits;
 mod listing;
 mod locking;

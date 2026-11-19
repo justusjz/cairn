@@ -872,7 +872,7 @@ async fn done(app: &App, job: Uuid, ordinal: i64) -> anyhow::Result<bool> {
 }
 
 /// The task's failure that a refusal (an S3 error's response) is.
-async fn failure_of(response: Response<Full<Bytes>>) -> TaskFailure {
+pub(super) async fn failure_of(response: Response<Full<Bytes>>) -> TaskFailure {
     let status = response.status().as_u16();
     let body = response
         .into_body()
