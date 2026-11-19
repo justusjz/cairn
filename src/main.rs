@@ -509,6 +509,7 @@ async fn serve_main(args: ServeArgs) -> anyhow::Result<()> {
     tokio::spawn(access_log::run(app.clone()));
     tokio::spawn(backup::run(app.clone()));
     tokio::spawn(backup::restore::run(app.clone()));
+    tables::iceberg::io::clean(&app);
     tokio::spawn(tables::storage::run(app.clone()));
     tokio::spawn(tables::maintenance::run(app.clone()));
     // The users' identities in the KMS, now rather than in a minute.

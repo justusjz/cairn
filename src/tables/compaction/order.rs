@@ -41,6 +41,13 @@ pub type Error = String;
 /// How many rows a batch the sorter gives out holds, at most.
 const OUT_ROWS: usize = 8192;
 
+/// The fewest rows a batch of a run being merged holds.
+const MERGE_ROWS: usize = 64;
+
+/// The row groups and pages runs are spilled in, at most.
+const SPILL_ROW_GROUP: usize = 8 << 20;
+const SPILL_PAGE: usize = 64 << 10;
+
 /// The bytes each column contributes to a z-value.
 const Z_BYTES: usize = 8;
 
@@ -279,6 +286,9 @@ pub struct Sorter {
     converter: Option<RowConverter>,
     buffered: Vec<RecordBatch>,
     buffered_bytes: usize,
+    /// All the rows given, and their bytes: what a row takes, on average.
+    total_rows: usize,
+    total_bytes: usize,
     runs: Vec<PathBuf>,
 }
 
@@ -292,6 +302,8 @@ impl Sorter {
             converter: None,
             buffered: Vec::new(),
             buffered_bytes: 0,
+            total_rows: 0,
+            total_bytes: 0,
             runs: Vec::new(),
         }
     }
@@ -313,7 +325,10 @@ impl Sorter {
         if batch.num_rows() == 0 {
             return Ok(());
         }
-        self.buffered_bytes += batch.get_array_memory_size();
+        let bytes = batch.get_array_memory_size();
+        self.buffered_bytes += bytes;
+        self.total_bytes += bytes;
+        self.total_rows += batch.num_rows();
         self.buffered.push(batch);
         if self.buffered_bytes > self.budget {
             self.spill()?;
@@ -321,28 +336,38 @@ impl Sorter {
         Ok(())
     }
 
-    /// The buffered rows, as one sorted batch (none, if there are none).
-    fn sort_buffered(&mut self) -> Result<Option<RecordBatch>, Error> {
-        let Some(first) = self.buffered.first() else {
+    /// The buffered rows, ordered (none, if there are none): the batches
+    /// stay as they are, their rows' order is worked out, and the rows are
+    /// given out in that order a batch at a time (see `Ordered`); so
+    /// sorting takes little memory besides the rows' own.
+    fn sort_buffered(&mut self) -> Result<Option<Ordered>, Error> {
+        if self.buffered.is_empty() {
             return Ok(None);
-        };
-        let schema = first.schema();
-        let batch = arrow_select::concat::concat_batches(&schema, &self.buffered)
-            .map_err(|e| e.to_string())?;
-        self.buffered.clear();
+        }
+        let batches = std::mem::take(&mut self.buffered);
         self.buffered_bytes = 0;
-        let rows = self.rows(&batch)?;
-        let mut indices: Vec<u32> = (0..batch.num_rows() as u32).collect();
-        indices.sort_by(|a, b| rows.row(*a as usize).cmp(&rows.row(*b as usize)));
-        let indices = arrow_array::UInt32Array::from(indices);
-        arrow_select::take::take_record_batch(&batch, &indices)
-            .map(Some)
-            .map_err(|e| e.to_string())
+        let rows = batches
+            .iter()
+            .map(|batch| self.rows(batch))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut order: Vec<(usize, usize)> = batches
+            .iter()
+            .enumerate()
+            .flat_map(|(i, batch)| (0..batch.num_rows()).map(move |row| (i, row)))
+            .collect();
+        order.sort_by(|a, b| rows[a.0].row(a.1).cmp(&rows[b.0].row(b.1)));
+        Ok(Some(Ordered {
+            batches,
+            order,
+            offset: 0,
+        }))
     }
 
-    /// Sorts what's buffered, and writes it as a run.
+    /// Sorts what's buffered, and writes it as a run: in small row groups
+    /// and pages, so it's written, and read back as it's merged, in little
+    /// memory.
     fn spill(&mut self) -> Result<(), Error> {
-        let Some(sorted) = self.sort_buffered()? else {
+        let Some(mut ordered) = self.sort_buffered()? else {
             return Ok(());
         };
         std::fs::create_dir_all(&self.spill_dir)
@@ -351,13 +376,15 @@ impl Sorter {
             .spill_dir
             .join(format!("run-{}.parquet", self.runs.len()));
         let file = File::create(&path).map_err(|e| format!("Spilling: {e}"))?;
+        let properties = parquet::file::properties::WriterProperties::builder()
+            .set_max_row_group_bytes(Some(SPILL_ROW_GROUP))
+            .set_data_page_size_limit(SPILL_PAGE)
+            .build();
+        let schema = ordered.batches[0].schema();
         let mut writer =
-            ArrowWriter::try_new(file, sorted.schema(), None).map_err(|e| e.to_string())?;
-        for offset in (0..sorted.num_rows()).step_by(OUT_ROWS) {
-            let length = OUT_ROWS.min(sorted.num_rows() - offset);
-            writer
-                .write(&sorted.slice(offset, length))
-                .map_err(|e| e.to_string())?;
+            ArrowWriter::try_new(file, schema, Some(properties)).map_err(|e| e.to_string())?;
+        while let Some(batch) = ordered.next_batch(OUT_ROWS)? {
+            writer.write(&batch).map_err(|e| e.to_string())?;
         }
         writer.close().map_err(|e| e.to_string())?;
         self.runs.push(path);
@@ -368,14 +395,17 @@ impl Sorter {
     pub fn finish(mut self) -> Result<Sorted, Error> {
         if self.runs.is_empty() {
             let sorted = self.sort_buffered()?;
-            return Ok(Sorted::Memory(sorted, 0));
+            return Ok(Sorted::Memory(sorted));
         }
         self.spill()?;
+        // Each run being merged holds a batch: together, about the budget.
+        let row_bytes = (self.total_bytes / self.total_rows.max(1)).max(1);
+        let batch_rows = (self.budget / self.runs.len() / row_bytes).clamp(MERGE_ROWS, OUT_ROWS);
         let mut runs = Vec::new();
         for path in &self.runs {
             let file = File::open(path).map_err(|e| format!("Reading a spill: {e}"))?;
             let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-                .and_then(|b| b.with_batch_size(OUT_ROWS).build())
+                .and_then(|b| b.with_batch_size(batch_rows).build())
                 .map_err(|e| e.to_string())?;
             runs.push(Run {
                 reader,
@@ -502,10 +532,36 @@ impl Merge {
     }
 }
 
+/// Batches, and the order of their rows: (batch, row) each, and how many
+/// are given out.
+pub struct Ordered {
+    batches: Vec<RecordBatch>,
+    order: Vec<(usize, usize)>,
+    offset: usize,
+}
+
+impl Ordered {
+    /// The next `rows` rows, in order, as a batch.
+    fn next_batch(&mut self, rows: usize) -> Result<Option<RecordBatch>, Error> {
+        if self.offset >= self.order.len() {
+            return Ok(None);
+        }
+        let end = (self.offset + rows).min(self.order.len());
+        let sources: Vec<&RecordBatch> = self.batches.iter().collect();
+        let batch = arrow_select::interleave::interleave_record_batch(
+            &sources,
+            &self.order[self.offset..end],
+        )
+        .map_err(|e| e.to_string())?;
+        self.offset = end;
+        Ok(Some(batch))
+    }
+}
+
 /// Sorted rows, as batches.
 pub enum Sorted {
-    /// In memory: one sorted batch, and how much of it is given out.
-    Memory(Option<RecordBatch>, usize),
+    /// In memory.
+    Memory(Option<Ordered>),
     Merge(Box<Merge>),
 }
 
@@ -513,16 +569,8 @@ impl Sorted {
     /// The next batch of rows, in order.
     pub fn next_batch(&mut self) -> Result<Option<RecordBatch>, Error> {
         match self {
-            Sorted::Memory(None, _) => Ok(None),
-            Sorted::Memory(Some(batch), offset) => {
-                if *offset >= batch.num_rows() {
-                    return Ok(None);
-                }
-                let length = OUT_ROWS.min(batch.num_rows() - *offset);
-                let out = batch.slice(*offset, length);
-                *offset += length;
-                Ok(Some(out))
-            }
+            Sorted::Memory(None) => Ok(None),
+            Sorted::Memory(Some(ordered)) => ordered.next_batch(OUT_ROWS),
             Sorted::Merge(merge) => merge.next(),
         }
     }

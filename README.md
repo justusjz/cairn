@@ -2245,9 +2245,14 @@ run (`get-table-maintenance-job-status`):
   - `auto` (the default): `sort` if the table has a sort order, else
     `binpack`.
 
-  Sorting what's more than 256 MiB spills to the node's first data dir.
-  Files are written as Parquet, compressed as the table's
-  `write.parquet.compression-codec` says (zstd by default); a format
+  Compaction takes little memory whatever the files' sizes: input files
+  are read one at a time, sorting what's more than 64 MiB spills to the
+  node's first data dir, and files being written are spooled there too
+  (past 8 MiB) and streamed into the object store as they're closed. What
+  a crash leaves there is removed as the node starts.
+  Files are written as Parquet, in row groups of at most 32 MiB (or the
+  table's `write.parquet.row-group-size-bytes`, if less), compressed as the
+  table's `write.parquet.compression-codec` says (zstd by default); a format
   version 3 table's rows keep their lineage (`_row_id`). A commit that came
   in while compaction ran is fine if it only appended; any other drops the
   rewrite, which is tried again at the next run.

@@ -73,6 +73,10 @@ use order::{Key, Sorter};
 
 pub const COMPACTION: &str = "icebergCompaction";
 
+/// The directory (in the node's first data dir) sorts spill to, emptied as
+/// the node starts (see `iceberg::io::clean`) and as a job starts.
+pub const SPILL: &str = "table-compaction";
+
 /// Which files are candidates: under this share of the target size, or
 /// over that.
 const MIN_RATIO: f64 = 0.75;
@@ -83,7 +87,7 @@ const MIN_INPUT_FILES: usize = 5;
 /// The most a run rewrites, and a group holds.
 const MAX_RUN_BYTES: u64 = 16 << 30;
 /// The memory a sort takes before it spills.
-const SORT_BUDGET: usize = 256 << 20;
+const SORT_BUDGET: usize = 64 << 20;
 /// How many times a commit is made again, on top of others' appends.
 const COMMIT_ATTEMPTS: usize = 5;
 
@@ -231,10 +235,22 @@ fn writer_properties(metadata: &TableMetadata) -> Result<WriterProperties, Strin
             ));
         }
     };
+    // A row group is held in memory, encoded, until it's complete: so it's
+    // kept to `write.parquet.row-group-size-bytes`, at most `ROW_GROUP`.
+    let row_group = properties
+        .get("write.parquet.row-group-size-bytes")
+        .and_then(|b| b.parse::<usize>().ok())
+        .filter(|b| *b > 0)
+        .map_or(ROW_GROUP, |b| b.min(ROW_GROUP));
     Ok(WriterProperties::builder()
         .set_compression(compression)
+        .set_max_row_group_bytes(Some(row_group))
         .build())
 }
+
+/// The largest row group compaction writes (Iceberg's default is 128 MiB):
+/// what a file being written holds in memory, at most.
+const ROW_GROUP: usize = 32 << 20;
 
 /// The table's strategy, as its configuration (`strategy`) and sort order
 /// say it.
@@ -353,7 +369,7 @@ pub async fn compact(app: &Arc<App>, table: &Table, now: SystemTime) -> anyhow::
         Strategy::Sort => Some(Key::sort(metadata.default_sort_order())),
         Strategy::ZOrder => Some(Key::z_order(metadata.default_sort_order())),
     };
-    let spill_root = app.store.data_dir().join("table-compaction");
+    let spill_root = app.store.data_dir().join(SPILL);
     // Only one job runs on a node at a time (see `maintenance::pass`):
     // what's there is a crashed one's.
     let _ = std::fs::remove_dir_all(&spill_root);
@@ -428,8 +444,11 @@ async fn rewrite(
         why
     };
     let tasks: Vec<iceberg::Result<FileScanTask>> = group.tasks.iter().cloned().map(Ok).collect();
+    // One file at a time: the rows are written in order anyway, and each
+    // file read holds a row group in memory.
     let mut batches = reader
         .reader_builder()
+        .with_data_file_concurrency_limit(1)
         .build()
         .read(Box::pin(futures_util::stream::iter(tasks)))
         .map_err(e)?

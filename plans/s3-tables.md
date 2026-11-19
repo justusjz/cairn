@@ -379,13 +379,25 @@ AWS's. Choices made on the way:
   `_row_id` and `_last_updated_sequence_number` too, written into the new
   files (the reader gives the latter run-end encoded: made plain).
 - **Ordering** (`compaction::order`): Arrow's row format, and an external
-  merge sort that spills sorted runs (Parquet) past 256 MiB to the node's
-  first data dir, so a group of any size is sorted whole. Z-order as
+  merge sort that spills sorted runs (Parquet) past 64 MiB to the node's
+  first data dir, so a group of any size is sorted whole. A chunk is sorted
+  as indices into its batches (no copy of it), given out in small
+  interleaved batches; runs are written in small row groups and pages, and
+  merged with batches sized so all runs' together are about the budget. Z-order as
   Iceberg's Spark z-order (8 ordered bytes a column, bits interleaved),
   but floats' bits flipped exactly.
 - **Writing** with the crate's rolling Parquet writer, at the target size,
   in the group's partition, compressed as the table says (zstd by
-  default; also gzip, snappy, none).
+  default; also gzip, snappy, none), in row groups of at most 32 MiB (a
+  row group is held in memory until it's complete). The storage adapter
+  keeps up to 8 MiB of a file being written in memory, then spools it to
+  `<data dir>/table-writes` and streams it into `put_object` as it's
+  closed (with its length); `table-writes` and `table-compaction` are
+  emptied as the node starts.
+- **Memory**: input files are read one at a time. Measured on 217 MiB of
+  data rewritten into 64 MiB files: the job's live memory is about
+  125 MiB (binpack) to 135 MiB (sort), down from 860 MiB of peak RSS
+  for a sort before; glibc's per-thread arenas keep more RSS than that.
 - **Committing** a `replace` snapshot by hand (the crate has no rewrite
   action): manifests with rewritten files rewritten (those deleted), new
   manifests for the new files, and dangling delete files removed (none of

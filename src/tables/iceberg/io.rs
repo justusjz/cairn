@@ -225,12 +225,18 @@ impl TableStorage {
         }
     }
 
-    async fn put(&self, path: &str, bytes: Bytes) -> Result<()> {
+    /// Writes `body`, `length` bytes, to `path`: streamed into the object
+    /// store, which lays it out as it comes, knowing its size.
+    async fn put<B>(&self, path: &str, body: B, length: u64) -> Result<()>
+    where
+        B: hyper::body::Body<Data = Bytes> + Unpin + Send,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         let key = self.key(path)?;
         let server = self.server_side()?;
-        let payload = Payload::unchecked()
+        let payload = Payload::unchecked_of(length)
             .at_most(MAX_UPLOAD)
-            .map_err(|_| unexpected("an unchecked payload has no length"))?;
+            .map_err(|_| unexpected(format!("{path} is larger than an object may be")))?;
         let response = crate::s3::objects::put::put_object(
             &self.app,
             &self.bucket,
@@ -238,7 +244,7 @@ impl TableStorage {
             "application/octet-stream",
             "",
             "",
-            Full::new(bytes),
+            body,
             payload,
             &Preconditions::default(),
             Wanted::new(None, server.as_ref()),
@@ -316,7 +322,8 @@ impl Storage for TableStorage {
     }
 
     async fn write(&self, path: &str, bs: Bytes) -> Result<()> {
-        self.put(path, bs).await
+        let length = bs.len() as u64;
+        self.put(path, Full::new(bs), length).await
     }
 
     async fn writer(&self, path: &str) -> Result<Box<dyn FileWrite>> {
@@ -325,6 +332,8 @@ impl Storage for TableStorage {
             storage: self.clone(),
             path: path.to_owned(),
             buffer: Vec::new(),
+            spool: None,
+            size: 0,
             closed: false,
         }))
     }
@@ -376,32 +385,192 @@ impl FileRead for Reader {
     }
 }
 
-/// Writes a file: what's written is kept, and stored as it's closed.
+/// What a file being written keeps in memory, at most: beyond it, it's
+/// spooled to disk (see `Writer`).
+const IN_MEMORY: usize = 8 << 20;
+
+/// The directory (in the node's first data dir) files being written are
+/// spooled in, emptied as the node starts (see `clean`).
+const SPOOL: &str = "table-writes";
+
+/// Empties the directories tables' writes and compaction leave on the
+/// node's disk while they run (a crash's leftovers): as the node starts.
+pub fn clean(app: &App) {
+    for dir in [SPOOL, crate::tables::compaction::SPILL] {
+        let path = app.store.data_dir().join(dir);
+        if let Err(e) = std::fs::remove_dir_all(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("tables: emptying {}: {e}", path.display());
+        }
+    }
+}
+
+/// A file being written. What's written is kept in memory up to
+/// `IN_MEMORY` bytes (metadata files, manifests); a larger file (data
+/// files, up to the table's target size and more) goes to a spool file on
+/// the node's disk instead, so a writer takes little memory whatever it
+/// writes. As it's closed, it's stored, streamed from the spool, and the
+/// spool file is removed (also if it's never closed: see `Drop`).
 struct Writer {
     storage: TableStorage,
     path: String,
     buffer: Vec<u8>,
+    /// The spool file, and its path, once there's one.
+    spool: Option<(tokio::fs::File, std::path::PathBuf)>,
+    size: u64,
     closed: bool,
+}
+
+impl Writer {
+    /// Moves what's in memory to a new spool file.
+    async fn spill(&mut self) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let dir = self.storage.app.store.data_dir().join(SPOOL);
+        tokio::fs::create_dir_all(&dir).await.map_err(unexpected)?;
+        let path = dir.join(Uuid::new_v4().to_string());
+        let mut file = tokio::fs::File::create(&path).await.map_err(unexpected)?;
+        file.write_all(&self.buffer).await.map_err(unexpected)?;
+        self.buffer = Vec::new();
+        self.spool = Some((file, path));
+        Ok(())
+    }
+}
+
+impl Drop for Writer {
+    fn drop(&mut self) {
+        if let Some((_, path)) = &self.spool {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+type Frames = std::pin::Pin<
+    Box<dyn futures_core::Stream<Item = std::io::Result<hyper::body::Frame<Bytes>>> + Send>,
+>;
+
+/// The body of a spool file: read in chunks of a MiB.
+fn spooled(file: tokio::fs::File) -> http_body_util::StreamBody<Frames> {
+    let stream = futures_util::stream::unfold(file, |mut file| async move {
+        use tokio::io::AsyncReadExt;
+        let mut chunk = vec![0u8; 1 << 20];
+        match file.read(&mut chunk).await {
+            Ok(0) => None,
+            Ok(n) => {
+                chunk.truncate(n);
+                Some((Ok(hyper::body::Frame::data(Bytes::from(chunk))), file))
+            }
+            Err(e) => Some((Err(e), file)),
+        }
+    });
+    http_body_util::StreamBody::new(Box::pin(stream))
 }
 
 #[async_trait]
 impl FileWrite for Writer {
     async fn write(&mut self, bs: Bytes) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
         if self.closed {
             return Err(unexpected("the file is closed"));
         }
-        self.buffer.extend_from_slice(&bs);
+        self.size += bs.len() as u64;
+        match &mut self.spool {
+            Some((file, _)) => file.write_all(&bs).await.map_err(unexpected)?,
+            None => {
+                self.buffer.extend_from_slice(&bs);
+                if self.buffer.len() > IN_MEMORY {
+                    self.spill().await?;
+                }
+            }
+        }
         Ok(())
     }
 
     async fn close(&mut self) -> Result<FileMetadata> {
+        use tokio::io::AsyncWriteExt;
         if self.closed {
             return Err(unexpected("the file is closed already"));
         }
         self.closed = true;
-        let bytes = Bytes::from(std::mem::take(&mut self.buffer));
-        let size = bytes.len() as u64;
-        self.storage.put(&self.path, bytes).await?;
+        let size = self.size;
+        match &mut self.spool {
+            None => {
+                let bytes = Bytes::from(std::mem::take(&mut self.buffer));
+                self.storage.put(&self.path, Full::new(bytes), size).await?;
+            }
+            Some((file, path)) => {
+                file.flush().await.map_err(unexpected)?;
+                let reader = tokio::fs::File::open(&path).await.map_err(unexpected)?;
+                self.storage.put(&self.path, spooled(reader), size).await?;
+            }
+        }
         Ok(FileMetadata { size })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn writes_large_files_through_a_spool() {
+        let Some(app) = crate::e2e::node_with(crate::packer::Config::default(), None).await else {
+            return;
+        };
+        let bucket = format!(
+            "w{}{}",
+            uuid::Uuid::new_v4().simple(),
+            crate::tables::names::STORAGE_SUFFIX
+        )
+        .chars()
+        .take(63 - 10)
+        .collect::<String>()
+            + crate::tables::names::STORAGE_SUFFIX;
+        let account = crate::users::account(&app.pool.get().await.unwrap())
+            .await
+            .unwrap();
+        crate::tables::storage::create(&app.pool.get().await.unwrap(), &bucket, &account)
+            .await
+            .unwrap();
+        let storage = TableStorage {
+            app: app.clone(),
+            bucket: bucket.clone(),
+            class: crate::classes::STANDARD.to_owned(),
+            sse_algorithm: "AES256".to_owned(),
+            kms_key: None,
+            role: None,
+        };
+        let spool = app.store.data_dir().join(SPOOL);
+        for size in [100, IN_MEMORY * 2 + 12345] {
+            let path = format!("s3://{bucket}/data/f-{size}");
+            let mut writer = storage.writer(&path).await.unwrap();
+            let data: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+            for chunk in data.chunks(1 << 20) {
+                writer.write(Bytes::copy_from_slice(chunk)).await.unwrap();
+            }
+            let spooled = std::fs::read_dir(&spool).map_or(0, |d| d.count());
+            assert_eq!(spooled, usize::from(size > IN_MEMORY), "{size}");
+            assert_eq!(writer.close().await.unwrap().size, size as u64);
+            drop(writer);
+            // The spool file is gone, and the file is as written.
+            assert_eq!(std::fs::read_dir(&spool).map_or(0, |d| d.count()), 0);
+            assert_eq!(storage.read(&path).await.unwrap().as_ref(), &data[..]);
+            assert_eq!(storage.metadata(&path).await.unwrap().size, size as u64);
+        }
+        // Not closed: its spool goes all the same.
+        let mut writer = storage
+            .writer(&format!("s3://{bucket}/data/abandoned"))
+            .await
+            .unwrap();
+        writer
+            .write(Bytes::from(vec![0u8; IN_MEMORY + 1]))
+            .await
+            .unwrap();
+        drop(writer);
+        assert_eq!(std::fs::read_dir(&spool).map_or(0, |d| d.count()), 0);
+        // What a crash leaves is emptied as the node starts.
+        std::fs::write(spool.join("leftover"), b"x").unwrap();
+        clean(&app);
+        assert!(!spool.exists());
     }
 }
