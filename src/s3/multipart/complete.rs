@@ -613,6 +613,11 @@ async fn try_complete(
     let mut parts = Vec::with_capacity(requested.len());
     for ((number, etag), listed) in requested.iter().zip(&request.listed.checksums) {
         let Some(part) = staged.get(number).filter(|part| part.etag == *etag) else {
+            // Completed since it was read, by a request like this one, say:
+            // its parts are the object's now.
+            if client.query_opt_cached("SELECT 1 FROM multipart_uploads WHERE upload_id = $1", &[upload_id]).await?.is_none() {
+                return completed(app, client, bucket, key, upload_id, combined.as_deref(), request.claimed, keys).await;
+            }
             return Ok(CompleteOutcome::InvalidPart);
         };
         let listed = listed.iter().find(|(a, _)| Some(*a) == algorithm).map(|(_, value)| value);
