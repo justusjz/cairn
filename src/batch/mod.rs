@@ -16,8 +16,10 @@
 //!   writes, so that it's done once (see `copy`). Others are refused with
 //!   501 NotImplemented.
 //! - Manifests: CSV objects (`S3BatchOperations_CSV_20180820`), and
-//!   inventory reports (`S3InventoryReport_CSV_20161130`) of CSV or Parquet
-//!   (see `source`); not manifests S3 generates.
+//!   inventory reports (`S3InventoryReport_CSV_20161130`, `…_20211130`) of
+//!   CSV or Parquet (see `source`); or, with a manifest generator, one the
+//!   job generates from a bucket's objects, while it's prepared, before it
+//!   prepares that (see `generate`).
 //! - Completion reports: as S3 writes them, of all tasks or only those that
 //!   failed (see `report`).
 //!
@@ -60,6 +62,7 @@
 
 pub mod control;
 pub mod copy;
+pub mod generate;
 pub mod manifest;
 mod parquet;
 pub mod report;
@@ -183,6 +186,10 @@ pub struct Manifest {
     pub version_id: Option<String>,
     /// Its ETag, as given (quoted or not).
     pub etag: String,
+    /// Whether the job generated it (see `generate`): Cairn wrote it and
+    /// its data files, which the role need not be allowed to read.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generated: bool,
 }
 
 impl Manifest {
@@ -237,6 +244,10 @@ pub(crate) struct Job {
     manifest: Manifest,
     report: Report,
     role_arn: String,
+    /// Its manifest generator, if it has one, and where generating its
+    /// manifest has got to (see `generate`).
+    generator: Option<generate::Generator>,
+    generation: Option<generate::Generation>,
     /// Its inventory report's data files, once preparing has read its
     /// manifest (if its manifest is one).
     inventory: Option<Inventory>,
@@ -303,7 +314,8 @@ pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Op
     let row = client
         .query_opt_cached(
             "SELECT id, account_id, status, operation, manifest, role_arn, prepared, total, cursor,
-                    succeeded, failed, waiting_since, report, prepared_file, cursor_file, inventory
+                    succeeded, failed, waiting_since, report, prepared_file, cursor_file, inventory,
+                    generator, generation
              FROM batch_jobs
              WHERE status IN ('New', 'Preparing', 'Ready', 'Active', 'Cancelling') AND NOT (id = ANY($1))
              ORDER BY priority DESC, waiting_since LIMIT 1",
@@ -315,6 +327,8 @@ pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Op
     let manifest: String = row.get(4);
     let report: String = row.get(12);
     let inventory: Option<String> = row.get(15);
+    let generator: Option<String> = row.get(16);
+    let generation: Option<String> = row.get(17);
     let job = Job {
         id: row.get(0),
         account: row.get(1),
@@ -323,6 +337,8 @@ pub(crate) async fn next(client: &Object, visited: &[Uuid]) -> anyhow::Result<Op
         manifest: serde_json::from_str(&manifest)?,
         report: serde_json::from_str(&report)?,
         role_arn: row.get(5),
+        generator: generator.as_deref().map(serde_json::from_str).transpose()?,
+        generation: generation.as_deref().map(serde_json::from_str).transpose()?,
         inventory: inventory.as_deref().map(serde_json::from_str).transpose()?,
         prepared: Position { file: row.get(13), offset: row.get::<_, i64>(6) as u64 },
         total: row.get(7),
@@ -348,7 +364,7 @@ pub(crate) async fn turn(
             let principal = session(client, &job).await?.ok();
             conclude(app, client, &job, principal.as_ref(), "Cancelled", None, now, &mut turn).await?;
         }
-        "New" | "Preparing" => prepare(app, client, &job, now, &mut turn).await?,
+        "New" | "Preparing" => prepare(app, client, &job, now, budget, &mut turn).await?,
         _ => run(app, client, &job, now, budget, &mut turn).await?,
     }
     Ok(turn)
@@ -419,22 +435,36 @@ async fn conclude(
 /// Reads the job's manifest through from where preparing it got to, as
 /// far as `PREPARE_BYTES` goes, checking and counting its lines; once
 /// it's at the end, the job is ready (or suspended, to be confirmed).
-async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, turn: &mut Turn) -> anyhow::Result<()> {
+async fn prepare(app: &Arc<App>, client: &Object, job: &Job, now: SystemTime, budget: &mut i64, turn: &mut Turn) -> anyhow::Result<()> {
     let principal = match session(client, job).await? {
         Ok(principal) => principal,
         Err(failure) => return fail(client, job, failure, now, turn).await,
     };
-    if let Err(failure) = may_read_manifest(app, &principal, &job.manifest).await? {
-        return fail(client, job, failure, now, turn).await;
-    }
     if let Some(writer) = Writer::of(&job.report, job.id)
         && let Err(failure) = writer.check(app, &principal).await?
     {
         return fail(client, job, failure, now, turn).await;
     }
+    // Its manifest, to be generated first.
+    if job.manifest.format == manifest::TO_BE_GENERATED {
+        let Some(generator) = &job.generator else {
+            anyhow::bail!("job {} has neither a manifest nor a generator", job.id);
+        };
+        return match generate::step(app, client, job, generator, &principal, now, budget).await? {
+            Ok(found) => {
+                turn.prepared += found.tasks;
+                turn.status = found.status;
+                Ok(())
+            }
+            Err(failure) => fail(client, job, failure, now, turn).await,
+        };
+    }
+    if let Err(failure) = may_read_manifest(app, &principal, &job.manifest).await? {
+        return fail(client, job, failure, now, turn).await;
+    }
     let mut total = job.total;
     let (prepared, inventory, done) = match job.manifest.format.as_str() {
-        manifest::INVENTORY => {
+        format if manifest::is_inventory(format) => {
             let mut inventory = match &job.inventory {
                 Some(inventory) => inventory.clone(),
                 None => match source::read_inventory(app, &job.manifest, principal.id).await? {
@@ -590,7 +620,7 @@ async fn run(
     };
     let mut source = match (&job.inventory, job.manifest.format.as_str()) {
         (Some(inventory), _) => Source::Inventory(inventory, None),
-        (None, manifest::INVENTORY) => anyhow::bail!("job {} was prepared without its inventory report's files", job.id),
+        (None, format) if manifest::is_inventory(format) => anyhow::bail!("job {} was prepared without its inventory report's files", job.id),
         (None, _) => Source::Csv(&job.manifest),
     };
     let writer = Writer::of(&job.report, job.id);
@@ -919,6 +949,9 @@ async fn authorize(
 
 /// Whether the job's role session (`principal`) may read its manifest.
 async fn may_read_manifest(app: &App, principal: &Principal, manifest: &Manifest) -> anyhow::Result<Result<(), Failure>> {
+    if manifest.generated {
+        return Ok(Ok(()));
+    }
     may_read(app, principal, &manifest.bucket, &manifest.key, manifest.version_id.as_deref(), &manifest.arn).await
 }
 

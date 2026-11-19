@@ -52,7 +52,7 @@ pub(crate) async fn connect_through(url: &str, last: usize) -> anyhow::Result<Po
 /// writes to the catalog. Changing the protocol in a way that's unsafe to run
 /// alongside the old one means bumping this, in a new migration that requires
 /// the new version.
-pub(crate) const PROTOCOL: &str = "15";
+pub(crate) const PROTOCOL: &str = "16";
 
 /// What this Cairn's sessions declare as `cairn.users`, which the users'
 /// gate (`cairn_require_users`, last raised by `USERS_RENAMED`) requires of
@@ -262,6 +262,7 @@ const MIGRATIONS: &[&str] = &[
     BATCH_COPIES,
     CHECKSUM_ALGORITHMS,
     TRANSITIONS,
+    BATCH_MANIFEST_GENERATORS,
 ];
 
 /// The schema's version that this Cairn migrates to.
@@ -3957,6 +3958,45 @@ ALTER TABLE blobs ADD COLUMN misplaced_size bigint NOT NULL DEFAULT 0;
 -- (see `cairn_claim`, `cairn_claim_tier`).
 CREATE INDEX blobs_misplaced ON blobs (storage_class) WHERE misplaced_size > 0;
 ALTER TABLE lifecycle_sweeps ADD COLUMN transitioned bigint NOT NULL DEFAULT 0;
+"#;
+
+/// Migration 82: Batch Operations' manifest generators (see
+/// `batch::generate`), and the internal account and bucket the manifests
+/// they make are kept in (see `internal`), unless they're written out.
+///
+/// The internal account (`accounts.internal`) is no one's: closed from the
+/// start, so that it has no principals, and in no listing of accounts
+/// (Organizations' or ACLs'). It owns one bucket, `cairn_internal`, a name
+/// no S3 bucket can have, which no request reaches (see `s3`). A job's
+/// generator (`batch_jobs.generator`) is CreateJob's, as JSON; where its
+/// walk of its source bucket has got to (`generation`), as JSON, until its
+/// manifest is written, when its `manifest` becomes that manifest.
+///
+/// The protocol goes to 16, so that no older node takes a turn of a job
+/// with a generator, which it would take for a job with a manifest.
+const BATCH_MANIFEST_GENERATORS: &str = r#"
+CREATE OR REPLACE FUNCTION cairn_require_protocol() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_setting('cairn.protocol', true) IS DISTINCT FROM '16' THEN
+        RAISE EXCEPTION 'this Cairn is too old for its database, which another node upgraded; upgrade it too'
+            USING ERRCODE = 'object_not_in_prerequisite_state';
+    END IF;
+    RETURN NULL;
+END
+$$;
+
+ALTER TABLE accounts ADD COLUMN internal boolean NOT NULL DEFAULT false;
+CREATE UNIQUE INDEX accounts_internal ON accounts (internal) WHERE internal;
+INSERT INTO accounts (id, name, internal, closed_at)
+SELECT id, 'Cairn internal', true, now() FROM (
+    SELECT lpad(floor(random() * 1e12)::bigint::text, 12, '0') AS id FROM generate_series(1, 100)
+) candidates
+WHERE NOT EXISTS (SELECT 1 FROM accounts a WHERE a.id = candidates.id)
+LIMIT 1;
+INSERT INTO buckets (name, account_id) SELECT 'cairn_internal', id FROM accounts WHERE internal;
+
+ALTER TABLE batch_jobs ADD COLUMN generator text,
+    ADD COLUMN generation text;
 "#;
 
 #[cfg(test)]

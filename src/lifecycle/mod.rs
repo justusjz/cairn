@@ -193,6 +193,7 @@ async fn take_step(app: &Arc<App>, now: SystemTime) -> anyhow::Result<Vec<Result
     // every step until its lease runs out.
     let walked: anyhow::Result<()> = async {
         crate::batch::forget_old(&client, now).await?;
+        crate::batch::generate::forget_generated(app, &client).await?;
         while budget > 0 {
             // The lifecycle sweep, inventory report or batch job that has
             // waited longest; of two that have waited as long, a sweep

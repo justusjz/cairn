@@ -1323,3 +1323,279 @@ async fn copies_fail_as_copy_object_does() {
     let (status, body) = body_of(control::create(&app, &access(&admin), &account, request.as_bytes()).await.unwrap()).await;
     assert_eq!((status, element(&body, "Code")), (StatusCode::BAD_REQUEST, Some("BadRequestException")), "{body}");
 }
+
+/// A job's request with a manifest generator of `generator` (the inside
+/// of its `S3JobManifestGenerator`) instead of a manifest.
+fn generator_request(token: &str, operation: &str, generator: &str, account: &str) -> String {
+    format!(
+        "<CreateJobRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">\
+         <ConfirmationRequired>false</ConfirmationRequired>\
+         <Operation>{operation}</Operation><Report><Enabled>false</Enabled></Report>\
+         <ClientRequestToken>{token}</ClientRequestToken>\
+         <ManifestGenerator><S3JobManifestGenerator>{generator}</S3JobManifestGenerator></ManifestGenerator>\
+         <Priority>10</Priority><RoleArn>arn:aws:iam::{account}:role/{ROLE}</RoleArn></CreateJobRequest>"
+    )
+}
+
+/// Takes steps from `*minute` on until the job ends: its `<Job>`.
+async fn run_out(app: &Arc<App>, principal: &Principal, id: &str, minute: &mut u32) -> String {
+    for _ in 0..20 {
+        *minute += 1;
+        step(app, *minute).await;
+        let job = describe(app, principal, id).await;
+        if super::TERMINAL.contains(&element(&job, "Status").unwrap()) {
+            return job;
+        }
+    }
+    panic!("job {id} never ended");
+}
+
+/// The keys in the internal bucket.
+async fn internal_keys(app: &App) -> Vec<String> {
+    let client = app.pool.get().await.unwrap();
+    let rows = client
+        .query("SELECT key FROM objects WHERE bucket = $1 ORDER BY key", &[&crate::internal::BUCKET])
+        .await
+        .unwrap();
+    rows.iter().map(|r| r.get(0)).collect()
+}
+
+/// A job that generates its manifest walks its source bucket, keeps what
+/// passes its filters as a manifest in the internal bucket, which no one
+/// sees, and runs from that; the manifest goes once the job has ended.
+#[tokio::test]
+async fn a_job_generates_its_manifest() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(&app, super::SERVICE, r#"["s3:PutObjectTagging","s3:PutInventoryConfiguration"]"#).await;
+    put(&app, "logs/a b.gz", b"a".to_vec()).await;
+    put(&app, "logs/big.gz", vec![0; 100]).await;
+    put(&app, "logs/c.txt", b"c".to_vec()).await;
+    put(&app, "other/d.gz", b"d".to_vec()).await;
+    let generator = format!(
+        "<SourceBucket>arn:aws:s3:::{BUCKET}</SourceBucket><EnableManifestOutput>false</EnableManifestOutput>\
+         <Filter><KeyNameConstraint><MatchAnyPrefix><member>logs/</member></MatchAnyPrefix>\
+         <MatchAnySuffix><member>.gz</member></MatchAnySuffix></KeyNameConstraint>\
+         <ObjectSizeLessThanBytes>50</ObjectSizeLessThanBytes>\
+         <ObjectReplicationStatuses><member>NONE</member></ObjectReplicationStatuses></Filter>"
+    );
+    let id = create(&app, &admin, &generator_request("t1", PUT_TAGS, &generator, &account)).await;
+    let job = describe(&app, &admin, &id).await;
+    assert!(job.contains("<ManifestGenerator><S3JobManifestGenerator>"), "{job}");
+    assert!(!job.contains("<Manifest>"), "{job}");
+
+    let mut minute = 0;
+    let job = run_out(&app, &admin, &id, &mut minute).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert_eq!(element(&job, "TotalNumberOfTasks"), Some("1"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("1"), "{job}");
+    assert!(!job.contains("GeneratedManifestDescriptor"), "an internal manifest is no one's to see: {job}");
+    assert_eq!(tags_of(&app, "logs/a b.gz").await, "team=red");
+    for untouched in ["logs/big.gz", "logs/c.txt", "other/d.gz"] {
+        assert_eq!(tags_of(&app, untouched).await, "", "{untouched}");
+    }
+    // What it wrote is gone the step after it ended; and no listing
+    // shows the internal bucket.
+    let buckets = crate::s3::buckets::list::buckets(&app).await.unwrap();
+    assert!(buckets.iter().all(|b| b.name != crate::internal::BUCKET));
+    assert!(!internal_keys(&app).await.is_empty());
+    minute += 1;
+    step(&app, minute).await;
+    assert_eq!(internal_keys(&app).await, Vec::<String>::new());
+}
+
+/// A manifest written out goes where its output location says, as the
+/// role, and stays; DescribeJob tells where. In a versioned bucket, it
+/// has each version (but delete markers), and it's a snapshot: a copy
+/// into the bucket it walked doesn't copy its own copies.
+#[tokio::test]
+async fn a_generated_manifest_is_written_out_and_is_a_snapshot() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    copying(&app, r#"["s3:GetObject","s3:GetObjectVersion","s3:PutObject","s3:PutInventoryConfiguration"]"#).await;
+    let body = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    let response = crate::s3::buckets::versioning::put_bucket_versioning(&app, BUCKET, Bytes::from(body), crate::mfa::Presented::Absent)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    put(&app, "src/a", b"one".to_vec()).await;
+    put(&app, "src/a", b"two".to_vec()).await;
+    put(&app, "src/b", b"b".to_vec()).await;
+    let deleted = crate::s3::objects::delete::delete_object(&app, BUCKET, "src/b", None, false, None, crate::mfa::Presented::Absent)
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    // Into the bucket it walks, under the prefix it walks.
+    let operation = format!("<S3PutObjectCopy><TargetResource>arn:aws:s3:::{BUCKET}</TargetResource><TargetKeyPrefix>src/</TargetKeyPrefix></S3PutObjectCopy>");
+    let generator = format!(
+        "<SourceBucket>arn:aws:s3:::{BUCKET}</SourceBucket>\
+         <ManifestOutputLocation><Bucket>arn:aws:s3:::{COPIES}</Bucket><ManifestPrefix>generated</ManifestPrefix>\
+         <ManifestFormat>S3InventoryReport_CSV_20211130</ManifestFormat></ManifestOutputLocation>\
+         <Filter><KeyNameConstraint><MatchAnyPrefix><member>src/</member></MatchAnyPrefix></KeyNameConstraint></Filter>\
+         <EnableManifestOutput>true</EnableManifestOutput>"
+    );
+    let id = create(&app, &admin, &generator_request("t1", &operation, &generator, &account)).await;
+    let mut minute = 0;
+    let job = run_out(&app, &admin, &id, &mut minute).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    // Both versions of src/a, and src/b's under its marker.
+    assert_eq!(element(&job, "TotalNumberOfTasks"), Some("3"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("3"), "{job}");
+    let manifest_key = format!("generated/job-{id}/manifest.json");
+    assert_eq!(element(&job, "Format"), Some("S3InventoryReport_CSV_20211130"), "{job}");
+    assert_eq!(element(&job, "ObjectArn"), Some(format!("arn:aws:s3:::{COPIES}/{manifest_key}").as_str()), "{job}");
+    // Copies of each version, and none of the copies.
+    assert_eq!(versions_of(&app, BUCKET, "src/src/a").await.len(), 2);
+    assert_eq!(versions_of(&app, BUCKET, "src/src/b").await.len(), 1);
+    let client = app.pool.get().await.unwrap();
+    let copied: i64 = client
+        .query_one("SELECT count(*) FROM objects WHERE bucket = $1 AND key LIKE 'src/src/src/%'", &[&BUCKET])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(copied, 0);
+    // Its manifest is there to be used again, and nothing is internal.
+    let get = |key: String| {
+        let app = app.clone();
+        async move {
+            let response = crate::s3::objects::get::get_object(
+                &app,
+                COPIES,
+                &key,
+                None,
+                None,
+                None,
+                &crate::s3::conditional::Preconditions::default(),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{key}");
+            response.into_body().collect().await.unwrap().to_bytes()
+        }
+    };
+    let manifest: serde_json::Value = serde_json::from_slice(&get(manifest_key).await).unwrap();
+    assert_eq!(manifest["fileSchema"], "Bucket, Key, VersionId");
+    assert_eq!(manifest["destinationBucket"], format!("arn:aws:s3:::{COPIES}"));
+    let data_key = manifest["files"][0]["key"].as_str().unwrap().to_owned();
+    let mut lines = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&get(data_key).await[..]), &mut lines).unwrap();
+    let versions: Vec<String> = versions_of(&app, BUCKET, "src/a").await.iter().map(|(v, _)| v.clone()).collect();
+    assert!(lines.starts_with(&format!("{BUCKET},src/a,{}\n{BUCKET},src/a,{}\n", versions[0], versions[1])), "{lines}");
+    assert_eq!(internal_keys(&app).await, Vec::<String>::new());
+}
+
+/// `EligibleForReplication` picks what the source bucket's replication
+/// configuration replicates: a Batch Replication job of those.
+#[tokio::test]
+async fn a_generated_manifest_has_what_replication_would_replicate() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(&app, super::SERVICE, r#"["s3:PutInventoryConfiguration","s3:InitiateReplication"]"#).await;
+    let client = app.pool.get().await.unwrap();
+    replicating(&app, &admin).await;
+    // Written before there's a configuration: not replicated.
+    let config: Option<String> =
+        client.query_one("SELECT replication FROM buckets WHERE name = $1", &[&BUCKET]).await.unwrap().get(0);
+    client.execute("UPDATE buckets SET replication = NULL WHERE name = $1", &[&BUCKET]).await.unwrap();
+    put(&app, "data/a", b"one".to_vec()).await;
+    put(&app, "data/a", b"two".to_vec()).await;
+    put(&app, "other", b"o".to_vec()).await;
+    client.execute("UPDATE buckets SET replication = $2 WHERE name = $1", &[&BUCKET, &config]).await.unwrap();
+    let generator = format!(
+        "<SourceBucket>arn:aws:s3:::{BUCKET}</SourceBucket><EnableManifestOutput>false</EnableManifestOutput>\
+         <Filter><EligibleForReplication>true</EligibleForReplication></Filter>"
+    );
+    let id = create(&app, &admin, &generator_request("t1", "<S3ReplicateObject/>", &generator, &account)).await;
+    let mut minute = 0;
+    let job = run_out(&app, &admin, &id, &mut minute).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert_eq!(element(&job, "TotalNumberOfTasks"), Some("2"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("2"), "{job}");
+    while crate::replication::round(&app).await.unwrap() > 0 {}
+    assert_eq!(versions_of(&app, BACKUP, "data/a").await.len(), 2);
+    assert!(versions_of(&app, BACKUP, "other").await.is_empty());
+}
+
+/// A generator whose role may not list its source (as S3 asks:
+/// `s3:PutInventoryConfiguration`), or whose source isn't there, fails its
+/// job, saying why. CreateJob takes a manifest or a generator, not both.
+#[tokio::test]
+async fn generators_that_cant_be_used_fail_their_jobs() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    tagging_role(&app).await;
+    put(&app, "a", b"a".to_vec()).await;
+    let generator = |bucket: &str| {
+        format!("<SourceBucket>arn:aws:s3:::{bucket}</SourceBucket><EnableManifestOutput>false</EnableManifestOutput>")
+    };
+    let denied = create(&app, &admin, &generator_request("t1", PUT_TAGS, &generator(BUCKET), &account)).await;
+    let missing = create(&app, &admin, &generator_request("t2", PUT_TAGS, &generator("missing"), &account)).await;
+    let mut minute = 0;
+    let job = run_out(&app, &admin, &denied, &mut minute).await;
+    assert_eq!(element(&job, "Status"), Some("Failed"), "{job}");
+    assert_eq!(element(&job, "FailureCode"), Some("SourceBucketUnreadable"), "{job}");
+    assert!(element(&job, "FailureReason").unwrap().contains("s3:PutInventoryConfiguration"), "{job}");
+    let job = run_out(&app, &admin, &missing, &mut minute).await;
+    assert_eq!(element(&job, "FailureCode"), Some("SourceBucketUnreadable"), "{job}");
+    assert_eq!(tags_of(&app, "a").await, "");
+
+    let both = generator_request("t3", PUT_TAGS, &generator(BUCKET), &account).replace(
+        "<Priority>",
+        &format!(
+            "<Manifest><Spec><Format>S3BatchOperations_CSV_20180820</Format><Fields><member>Bucket</member>\
+             <member>Key</member></Fields></Spec><Location><ObjectArn>arn:aws:s3:::{BUCKET}/m.csv</ObjectArn>\
+             <ETag>x</ETag></Location></Manifest><Priority>"
+        ),
+    );
+    let (status, body) = body_of(control::create(&app, &access(&admin), &account, both.as_bytes()).await.unwrap()).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+/// A walk takes turns (two versions a turn, in tests), each writing a data
+/// file of its own, and goes on from where the last left off, within a
+/// key's versions too: every version is a task, once.
+#[tokio::test]
+async fn generating_a_manifest_takes_turns() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(&app, super::SERVICE, r#"["s3:PutObjectTagging","s3:PutObjectVersionTagging","s3:PutInventoryConfiguration"]"#).await;
+    let body = "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    let response = crate::s3::buckets::versioning::put_bucket_versioning(&app, BUCKET, Bytes::from(body), crate::mfa::Presented::Absent)
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    for data in [&b"1"[..], b"2", b"3"] {
+        put(&app, "k", data.to_vec()).await;
+    }
+    put(&app, "l", b"l".to_vec()).await;
+    let generator = format!("<SourceBucket>arn:aws:s3:::{BUCKET}</SourceBucket><EnableManifestOutput>false</EnableManifestOutput>");
+    let id = create(&app, &admin, &generator_request("t1", PUT_TAGS, &generator, &account)).await;
+    let mut minute = 0;
+    let job = run_out(&app, &admin, &id, &mut minute).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert_eq!(element(&job, "TotalNumberOfTasks"), Some("4"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("4"), "{job}");
+    let client = app.pool.get().await.unwrap();
+    let tags: Vec<String> = client
+        .query("SELECT tags FROM objects WHERE bucket = $1", &[&BUCKET])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(tags, ["team=red"; 4]);
+    let generation: String = client.query_one("SELECT generation FROM batch_jobs", &[]).await.unwrap().get(0);
+    let generation: super::generate::Generation = serde_json::from_str(&generation).unwrap();
+    assert_eq!((generation.files.len(), generation.read, generation.tasks), (2, 4, 4));
+    let mut keys = internal_keys(&app).await;
+    keys.sort();
+    assert_eq!(keys, [format!("jobs/{id}/data/0.csv.gz"), format!("jobs/{id}/data/1.csv.gz"), format!("jobs/{id}/manifest.json")]);
+}

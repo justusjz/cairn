@@ -16,6 +16,17 @@ pub const CSV: &str = "S3BatchOperations_CSV_20180820";
 /// The format of an inventory report's `manifest.json`: its data files are
 /// CSV or Parquet, as it says (see `source`), whatever the name says.
 pub const INVENTORY: &str = "S3InventoryReport_CSV_20161130";
+/// The format of a manifest a job generates (see `generate`): an inventory
+/// report's `manifest.json` too, read as one is.
+pub const GENERATED_INVENTORY: &str = "S3InventoryReport_CSV_20211130";
+/// What a job with a manifest generator has as its manifest's format until
+/// its manifest is generated (never CreateJob's).
+pub const TO_BE_GENERATED: &str = "Generated";
+
+/// Whether a manifest of `format` is an inventory report's `manifest.json`.
+pub fn is_inventory(format: &str) -> bool {
+    format == INVENTORY || format == GENERATED_INVENTORY
+}
 
 /// The longest key, in bytes, as S3 takes them.
 const MAX_KEY: usize = 1024;

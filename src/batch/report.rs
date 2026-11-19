@@ -243,14 +243,14 @@ impl Writer {
 }
 
 /// Whether `principal` may put `key` in `bucket`.
-async fn may_put(app: &App, principal: &Principal, bucket: &str, key: &str) -> anyhow::Result<Result<(), TaskFailure>> {
+pub(super) async fn may_put(app: &App, principal: &Principal, bucket: &str, key: &str) -> anyhow::Result<Result<(), TaskFailure>> {
     let origin = Origin { peer: None, trusted_proxies: &[], signed: None, form: false };
     let mut access = Access::new(Some(principal), &principal.account, &Method::PUT, &HeaderMap::new(), "", &origin)?;
     authorize(app, &mut access, &principal.arn(), &Method::PUT, bucket, key, "", &HeaderMap::new()).await
 }
 
 /// What an S3 error response says: its code and message.
-async fn refusal(response: hyper::Response<Full<Bytes>>) -> String {
+pub(super) async fn refusal(response: hyper::Response<Full<Bytes>>) -> String {
     let status = response.status();
     let body = response.into_body().collect().await.map(|b| b.to_bytes()).unwrap_or_default();
     let body = String::from_utf8_lossy(&body);
@@ -300,7 +300,7 @@ fn csv_line(line: &Line) -> String {
 }
 
 /// A CSV column: quoted if it has a comma, a quote or a line break.
-fn quoted(column: &str) -> String {
+pub(super) fn quoted(column: &str) -> String {
     match column.contains([',', '"', '\n', '\r']) {
         true => format!("\"{}\"", column.replace('"', "\"\"")),
         false => column.to_owned(),

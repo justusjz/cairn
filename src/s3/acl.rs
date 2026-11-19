@@ -379,7 +379,7 @@ pub struct Accounts(HashMap<String, String>);
 
 impl Accounts {
     pub async fn load(client: &deadpool_postgres::Object) -> anyhow::Result<Accounts> {
-        let rows = client.query_cached("SELECT id FROM accounts", &[]).await?;
+        let rows = client.query_cached("SELECT id FROM accounts WHERE NOT internal", &[]).await?;
         let mut by_id = HashMap::new();
         for row in rows {
             let id: String = row.get(0);

@@ -169,7 +169,7 @@ async fn the_account_becomes_the_management_account() {
     let account: String = client.query_one("SELECT id FROM accounts WHERE NOT operator", &[]).await.unwrap().get(0);
     crate::db::init(&pool, usize::MAX).await.unwrap();
     let rows: Vec<(String, bool)> =
-        client.query("SELECT id, management FROM accounts", &[]).await.unwrap().iter().map(|r| (r.get(0), r.get(1))).collect();
+        client.query("SELECT id, management FROM accounts WHERE NOT internal", &[]).await.unwrap().iter().map(|r| (r.get(0), r.get(1))).collect();
     assert_eq!(rows, [(account.clone(), true)], "{before} before");
     assert_eq!(users::account(&client).await.unwrap(), account);
 }

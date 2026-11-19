@@ -92,6 +92,10 @@ pub struct DataFile {
     pub md5: String,
     /// Its ETag, once preparing the job has read it.
     pub etag: Option<String>,
+    /// Whether the job generated it (see `generate`), so that the role
+    /// need not be allowed to read it, as with its manifest.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub generated: bool,
 }
 
 /// An inventory report's `manifest.json`, as S3 (and Cairn, see
@@ -165,7 +169,13 @@ pub async fn read_inventory(app: &Arc<App>, manifest: &Manifest, role: Uuid) -> 
     let files = parsed
         .files
         .into_iter()
-        .map(|f| DataFile { bucket: bucket.to_owned(), key: f.key, md5: f.md5.to_ascii_lowercase(), etag: None })
+        .map(|f| DataFile {
+            bucket: bucket.to_owned(),
+            key: f.key,
+            md5: f.md5.to_ascii_lowercase(),
+            etag: None,
+            generated: manifest.generated,
+        })
         .collect();
     Ok(Ok(Inventory { format, fields: fields.iter().map(|f| f.name().to_owned()).collect(), files }))
 }
@@ -294,7 +304,9 @@ impl DataLines {
     /// preparing recorded one.
     pub async fn open(app: &Arc<App>, file: &DataFile, principal: &Principal) -> anyhow::Result<Result<DataLines, Failure>> {
         let arn = format!("arn:aws:s3:::{}/{}", file.bucket, file.key);
-        if let Err(failure) = may_read(app, principal, &file.bucket, &file.key, None, &arn).await? {
+        if !file.generated
+            && let Err(failure) = may_read(app, principal, &file.bucket, &file.key, None, &arn).await?
+        {
             return Ok(Err(failure));
         }
         let role = principal.id;
@@ -470,7 +482,9 @@ impl ParquetRows {
     /// if it didn't, reads it whole first, for its MD5 and ETag.
     pub async fn open(app: &Arc<App>, file: &DataFile, principal: &Principal) -> anyhow::Result<Result<ParquetRows, Failure>> {
         let arn = format!("arn:aws:s3:::{}/{}", file.bucket, file.key);
-        if let Err(failure) = may_read(app, principal, &file.bucket, &file.key, None, &arn).await? {
+        if !file.generated
+            && let Err(failure) = may_read(app, principal, &file.bucket, &file.key, None, &arn).await?
+        {
             return Ok(Err(failure));
         }
         let invalid = |why: String| Ok(Err(Failure::new("ManifestInvalid", format!("The data file {arn} {why}."))));
