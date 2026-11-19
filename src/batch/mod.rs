@@ -71,7 +71,7 @@ pub mod copy;
 pub mod encryption;
 pub mod generate;
 pub mod manifest;
-mod parquet;
+pub(crate) mod parquet;
 pub mod report;
 pub mod source;
 

@@ -3,11 +3,12 @@
 //! records it selects, framed as an event stream (see `eventstream`).
 //!
 //! What's supported: CSV (all of its options) and JSON (`LINES`, and
-//! `DOCUMENT` as values one after another) input, uncompressed or gzipped;
+//! `DOCUMENT` as values one after another) input, uncompressed or gzipped,
+//! and Parquet (see `parquet`);
 //! CSV or JSON output; Progress events; `ScanRange`; and the SQL `sql`
-//! describes, timestamps (see `timestamp`) among it. Not (yet): Parquet
-//! input, BZIP2, and paths in `FROM`, which are refused as `NotImplemented`
-//! (501) or `UnsupportedSyntax` (400).
+//! describes, timestamps (see `timestamp`) among it. Not (yet): BZIP2,
+//! and paths in `FROM`, which are refused as `NotImplemented` (501) or
+//! `UnsupportedSyntax` (400).
 //!
 //! A `ScanRange` reads the records whose first byte is in it, as AWS's API
 //! reference says ("A record is processed when its first byte is contained
@@ -35,6 +36,7 @@ mod eval;
 mod eventstream;
 mod input;
 mod output;
+mod parquet;
 mod request;
 mod sql;
 mod timestamp;
@@ -149,6 +151,27 @@ pub async fn select_object_content(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     let etag = object.headers().get(hyper::header::ETAG).cloned();
+    // Parquet is read by its footer and its columns' chunks (see `parquet`).
+    if let Input::Parquet = request.input {
+        let source = parquet::Source {
+            app: app.clone(),
+            bucket: bucket.to_owned(),
+            key: key.to_owned(),
+            customer_key: customer_key.cloned(),
+            role,
+            etag,
+            size,
+        };
+        drop(object);
+        return parquet::select(
+            source,
+            query,
+            request.output,
+            request.scan_range,
+            request.progress,
+        )
+        .await;
+    }
     let mut scanner = Scanner::new(query, request.input, request.output);
     let mut body = object.into_body();
     // What reading a range's header took.
@@ -266,6 +289,21 @@ struct Events {
 }
 
 impl Events {
+    /// Events to `tx`, of a stream that has read `scanned` bytes so far.
+    fn new(tx: FrameSender, progress: bool, scanned: u64) -> Events {
+        Events {
+            tx,
+            stats: Stats {
+                scanned,
+                processed: scanned,
+                returned: 0,
+            },
+            last_sent: Instant::now(),
+            last_progress: Instant::now(),
+            progress,
+        }
+    }
+
     /// Sends `message`. `false` if the client is gone.
     async fn send(&mut self, message: Bytes) -> bool {
         self.last_sent = Instant::now();
@@ -276,12 +314,23 @@ impl Events {
     /// or Cont event if it's time for one. `false` if the client is gone.
     async fn flush(&mut self, scanner: &mut Scanner) -> bool {
         let out = std::mem::take(&mut scanner.out);
+        self.records(&out).await && self.tick().await
+    }
+
+    /// Sends `out` as Records events. `false` if the client is gone.
+    async fn records(&mut self, out: &[u8]) -> bool {
         for piece in out.chunks(MAX_EVENT) {
             self.stats.returned += piece.len() as u64;
             if !self.send(eventstream::records(piece)).await {
                 return false;
             }
         }
+        true
+    }
+
+    /// Sends a Progress or Cont event if it's time for one. `false` if the
+    /// client is gone.
+    async fn tick(&mut self) -> bool {
         if self.progress && self.last_progress.elapsed() >= PROGRESS_EVERY {
             self.last_progress = Instant::now();
             if !self.send(self.stats.progress()).await {
@@ -304,17 +353,7 @@ async fn stream(
     progress: bool,
     scanned: u64,
 ) {
-    let mut events = Events {
-        tx,
-        stats: Stats {
-            scanned,
-            processed: scanned,
-            returned: 0,
-        },
-        last_sent: Instant::now(),
-        last_progress: Instant::now(),
-        progress,
-    };
+    let mut events = Events::new(tx, progress, scanned);
     let mut gunzip = gzip.then(|| flate2::write::MultiGzDecoder::new(Vec::new()));
     let not_gzip = || {
         SelectError::new(
@@ -452,7 +491,8 @@ impl Scanner {
     fn delimiter(&self) -> &[u8] {
         match &self.input {
             Input::Csv(csv) => &csv.record_delimiter,
-            Input::Json(_) => b"\n",
+            // (Parquet's ranges are of its row groups: see `parquet`.)
+            Input::Json(_) | Input::Parquet => b"\n",
         }
     }
 
@@ -586,6 +626,8 @@ impl Scanner {
                     Read::Skip(next) => Read::Skip(next),
                     Read::More => Read::More,
                 },
+                // Its records are given to `record` (see `parquet`).
+                Input::Parquet => Read::More,
             };
             match read {
                 Read::Record(record, next) => {

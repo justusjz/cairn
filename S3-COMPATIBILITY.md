@@ -69,8 +69,8 @@ please report it.
 | [S3 Tables](#s3-tables): table buckets, namespaces, tables, their storage, policies, Iceberg REST endpoint, compaction, snapshot management, unreferenced file removal | 🟡 | |
 | S3 Tables: replication, logging | ❌ | |
 | Analytics, metrics, Intelligent-Tiering, Storage Lens | ❌ | |
-| [S3 Select](#s3-select): CSV and JSON, uncompressed or GZIP, `ScanRange`, timestamps and their functions | 🟡 | |
-| S3 Select: Parquet, BZIP2 | ❌ | `501 NotImplemented`. |
+| [S3 Select](#s3-select): CSV and JSON, uncompressed or GZIP, Parquet, `ScanRange`, timestamps and their functions | 🟡 | |
+| S3 Select: BZIP2 | ❌ | `501 NotImplemented`. |
 | Requester pays | ❌ | |
 | Access points, Object Lambda, Multi-Region Access Points | ❌ | |
 
@@ -270,7 +270,7 @@ Through SNS topics, on the S3 endpoint for requests signed for `sns`.
 
 ### S3 Select
 
-SelectObjectContent runs AWS's SQL over CSV and JSON objects: `SELECT`
+SelectObjectContent runs AWS's SQL over CSV, JSON and Parquet objects: `SELECT`
 lists (or `*`), `FROM S3Object` with an alias, `WHERE` and `LIMIT`; paths
 (`s.name`, `s."Name"`, `_1`, `s.a.b[0]`); operators, `LIKE`, `BETWEEN`,
 `IN`, `IS [NOT] NULL|MISSING`, `CASE`, `CAST`; the string, conditional,
@@ -278,6 +278,17 @@ date and time functions, with timestamps (`` `2007-02-23T12:14Z` ``,
 `TO_TIMESTAMP`, `CAST(... AS TIMESTAMP)`); and `COUNT`, `SUM`, `AVG`, `MIN`
 and `MAX`. The object is read as
 it streams, and a `LIMIT` stops reading it.
+
+A Parquet object is read by its footer, and then only the chunks of the
+columns a query reads, a row group at a time; a row group may be at most
+512 MB uncompressed, as in S3. Its types are S3 Select's: integers,
+`DECIMAL` (as a float, as elsewhere), strings and `ENUM`, `DATE` and
+`TIMESTAMP` (`MILLIS`, `MICROS`, `NANOS`) as timestamps, and `LIST`s; and
+also booleans, floats, doubles, groups and `MAP`s (as structs), and
+`BINARY` that's UTF-8 (as a string). `INT96` timestamps and `TIME`s are
+`400 UnsupportedParquetType`, if a query reads them; columns compressed
+with anything but Snappy or GZIP, `400 ParquetUnsupportedCompressionCodec`.
+A `ScanRange` of a Parquet object reads the row groups that start in it.
 
 A `ScanRange` reads the records whose first byte is in it, each to its end
 (as AWS's API reference has it), of uncompressed CSV and JSON `LINES`; a
@@ -305,6 +316,10 @@ in both, and returned twice, as AWS's rule has it.
 | `ScanRange` that starts within a multi-character `RecordDelimiter` that repeats itself (`||` in `||||`) | Not checked (AWS takes single characters) | The first record found after the range's start may be cut differently than reading from the object's start cuts it. |
 | Keywords (`FileHeaderInfo`, `Type`, `CompressionType`, `QuoteFields`, `ExpressionType`) | Any case (`Use`, `Lines`) | Any case. |
 | Error codes and messages | AWS's | AWS's documented codes, and `EvaluatorInvalidArguments` for division by zero, which they don't cover; the messages are Cairn's. |
+| Parquet error codes | `UnsupportedParquetType`, `ParquetUnsupportedCompressionCodec`, `OverMaxParquetBlockSize`; AWS's list of them didn't load to check | Those, and `ParquetParsingError` for an object that isn't Parquet. |
+| `DECIMAL`, and `INT(64)` | Decimals | A float, and an integer. |
+| Nested data (lists, groups) in CSV output | Only JSON output has it; a `LIST` in CSV only if the query reads only simple values | Written as its JSON. |
+| A `TIMESTAMP(NANOS)` within a list or group | A timestamp | An integer (the nanoseconds); top-level columns' are timestamps. |
 | Progress events | Every so often | Every second, if asked for; Cont events after 5 seconds without one. |
 
 ### Edge cases

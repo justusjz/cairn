@@ -416,6 +416,29 @@ impl Timestamp {
         }
     }
 
+    /// The timestamp `nanos` nanoseconds after 1970-01-01 (UTC), as precise
+    /// as `precision`: at `Z` if `utc`, else of an unknown offset (a local
+    /// time, as Parquet's not adjusted to UTC are).
+    pub fn from_unix(
+        nanos: i128,
+        precision: Precision,
+        utc: bool,
+    ) -> Result<Timestamp, SelectError> {
+        let epoch = Timestamp {
+            year: 1970,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+            second: 0,
+            nanos: 0,
+            offset: utc.then_some(0),
+            precision,
+        };
+        let seconds = i64::try_from(nanos.div_euclid(NANOS)).map_err(|_| out_of_range())?;
+        epoch.at_local(seconds, nanos.rem_euclid(NANOS) as u32, precision)
+    }
+
     /// Now, to the millisecond, in UTC.
     pub fn now() -> Timestamp {
         let since = std::time::SystemTime::now()
@@ -748,6 +771,25 @@ mod tests {
             code("MMMMMM"),
             "EvaluatorInvalidTimestampFormatPatternToken"
         );
+    }
+
+    #[test]
+    fn reads_unix_times() {
+        let at = |nanos, precision, utc| {
+            Timestamp::from_unix(nanos, precision, utc)
+                .unwrap()
+                .to_text()
+        };
+        assert_eq!(at(0, Precision::Day, true), "1970-01-01T");
+        assert_eq!(
+            at(1_500_000_000_123_000_000, Precision::Fraction(3), true),
+            "2017-07-14T02:40:00.123Z"
+        );
+        assert_eq!(
+            at(-1_000, Precision::Fraction(9), false),
+            "1969-12-31T23:59:59.999999000-00:00"
+        );
+        assert!(Timestamp::from_unix(i128::MAX, Precision::Second, true).is_err());
     }
 
     #[test]

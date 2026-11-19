@@ -57,6 +57,7 @@ pub struct Names {
 }
 
 /// A client's key, as a request supplied it.
+#[derive(Clone)]
 pub struct CustomerKey {
     key: Zeroizing<Key>,
     /// Its MD5, base64, as the request gave it (and responses echo it).

@@ -45,6 +45,7 @@ impl ScanRange {
 pub enum Input {
     Csv(CsvInput),
     Json(JsonType),
+    Parquet,
 }
 
 fn malformed() -> SelectError {
@@ -205,7 +206,14 @@ pub fn parse(body: &[u8]) -> Result<SelectRequest, SelectError> {
                 ));
             }
         }),
-        "Parquet" => return Err(not_implemented("Parquet input")),
+        // Its columns are compressed, if anything is: never all of it.
+        "Parquet" if gzip => {
+            return Err(invalid(
+                "InvalidCompressionFormat",
+                "Parquet objects aren't compressed as a whole (their columns may be): CompressionType must be NONE.",
+            ));
+        }
+        "Parquet" => Input::Parquet,
         _ => return Err(malformed()),
     };
     // As in S3: ranges only of what can be split into records without
@@ -214,11 +222,13 @@ pub fn parse(body: &[u8]) -> Result<SelectRequest, SelectError> {
         let splits = match &input {
             Input::Csv(_) => !quoted_delimiters,
             Input::Json(json) => *json == JsonType::Lines,
+            // By its row groups.
+            Input::Parquet => true,
         };
         if gzip || !splits {
             return Err(invalid(
                 "UnsupportedScanRangeInput",
-                "Scan range queries are not supported on this type of object: only on uncompressed CSV (without AllowQuotedRecordDelimiter) and JSON LINES.",
+                "Scan range queries are not supported on this type of object: only on Parquet, uncompressed CSV (without AllowQuotedRecordDelimiter) and JSON LINES.",
             ));
         }
     }
@@ -330,7 +340,10 @@ mod tests {
         let code =
             |input: &str, output: &str| parse(request(input, output).as_bytes()).unwrap_err().code;
         let csv = "<CSV/>";
-        assert_eq!(code("<Parquet/>", csv), "NotImplemented");
+        assert_eq!(
+            code("<Parquet/><CompressionType>GZIP</CompressionType>", csv),
+            "InvalidCompressionFormat"
+        );
         assert_eq!(
             code("<CSV/><CompressionType>BZIP2</CompressionType>", csv),
             "NotImplemented"
