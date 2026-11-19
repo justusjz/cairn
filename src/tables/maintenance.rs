@@ -17,7 +17,7 @@
 //!   its metadata files (the current one and its log), its statistics
 //!   files, and every file of every snapshot (manifest lists, manifests,
 //!   and the data and delete files they list, whatever their status), read
-//!   from the manifests (Avro: see `iceberg::avro`). A file of its storage
+//!   from the manifests (with the `iceberg` crate's readers). A file of its storage
 //!   nothing references is noted; after `unreferencedDays` of that, it's
 //!   noncurrent, and after `nonCurrentDays` more, deleted. A file that's
 //!   referenced again meanwhile is forgotten. If anything can't be read,
@@ -33,14 +33,16 @@ use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ::iceberg::TableUpdate;
+use ::iceberg::spec::{TableMetadata, TableMetadataBuilder};
 use hyper::body::Bytes;
-use serde_json::{Map, Value, json};
+use serde_json::Value;
 use uuid::Uuid;
 
 use super::{
     Table, TableBucket,
     buckets::bucket_maintenance,
-    iceberg::{self, FileError, avro, metadata},
+    iceberg::{self, FileError},
     table::table_maintenance,
 };
 use crate::App;
@@ -58,9 +60,6 @@ const CLAIM: Duration = Duration::from_secs(1800);
 /// How often a node looks for jobs that are due, and how many it takes.
 const PASS_EVERY: Duration = Duration::from_secs(60);
 const JOBS_PER_PASS: i64 = 20;
-
-/// The largest manifest list or manifest maintenance reads.
-const MAX_MANIFEST: u64 = 256 << 20;
 
 /// How a job went.
 #[derive(Debug, PartialEq)]
@@ -208,11 +207,11 @@ fn settings(configuration: &Value, kind: &str) -> Option<Value> {
     (value["status"] == "enabled").then(|| value["settings"][kind].clone())
 }
 
-/// The table's current metadata, as Cairn reads it.
+/// The table's current metadata, as Cairn reads it, and where it is.
 async fn current(
     app: &Arc<App>,
     table: &Table,
-) -> anyhow::Result<Result<(String, Map<String, Value>), String>> {
+) -> anyhow::Result<Result<(String, TableMetadata), String>> {
     let Some(location) = &table.metadata_location else {
         return Ok(Err("The table has no metadata.".into()));
     };
@@ -227,45 +226,37 @@ async fn current(
     })
 }
 
-fn property<'a>(metadata: &'a Map<String, Value>, name: &str) -> Option<&'a str> {
-    metadata.get("properties")?.get(name)?.as_str()
+fn property<'a>(metadata: &'a TableMetadata, name: &str) -> Option<&'a str> {
+    metadata.properties().get(name).map(String::as_str)
+}
+
+/// The names of the table's refs (its branches and tags).
+fn refs(metadata: &TableMetadata) -> Vec<String> {
+    serde_json::to_value(metadata)
+        .ok()
+        .and_then(|m| m["refs"].as_object().map(|r| r.keys().cloned().collect()))
+        .unwrap_or_default()
 }
 
 /// The snapshots that expire, of `metadata`'s, as of `now` (ms), keeping
 /// the newest `keep` of `main`'s and those younger than `max_age` (ms).
-pub fn expiring(metadata: &Map<String, Value>, keep: usize, max_age: i64, now: i64) -> Vec<i64> {
-    let snapshots: Vec<&Value> = metadata
-        .get("snapshots")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .collect();
-    let parent = |id: i64| {
-        snapshots
-            .iter()
-            .find(|s| s["snapshot-id"].as_i64() == Some(id))
-            .and_then(|s| s["parent-snapshot-id"].as_i64())
-    };
+pub fn expiring(metadata: &TableMetadata, keep: usize, max_age: i64, now: i64) -> Vec<i64> {
     let mut ancestry = Vec::new();
-    let mut next = metadata
-        .get("refs")
-        .and_then(|r| r.get("main"))
-        .and_then(|m| m["snapshot-id"].as_i64());
+    let mut next = metadata.snapshot_for_ref("main").map(|s| s.snapshot_id());
     while let Some(id) = next {
         if ancestry.contains(&id) {
             break;
         }
         ancestry.push(id);
-        next = parent(id);
+        next = metadata
+            .snapshot_by_id(id)
+            .and_then(|s| s.parent_snapshot_id());
     }
     let kept: HashSet<i64> = ancestry.iter().take(keep.max(1)).copied().collect();
-    snapshots
-        .iter()
-        .filter_map(|s| {
-            let id = s["snapshot-id"].as_i64()?;
-            let at = s["timestamp-ms"].as_i64().unwrap_or(0);
-            (!kept.contains(&id) && at < now - max_age).then_some(id)
-        })
+    metadata
+        .snapshots()
+        .filter(|s| !kept.contains(&s.snapshot_id()) && s.timestamp_ms() < now - max_age)
+        .map(|s| s.snapshot_id())
         .collect()
 }
 
@@ -283,18 +274,16 @@ async fn expire_snapshots(
         Ok(current) => current,
         Err(why) => return Ok(Outcome::Failed(why)),
     };
-    if let Some(refs) = current.get("refs").and_then(Value::as_object)
-        && refs.keys().any(|name| name != "main")
-    {
+    if refs(&current).iter().any(|name| name != "main") {
         return Ok(Outcome::Failed(
             "Snapshot management isn't supported for tables with branches or tags other than main."
                 .into(),
         ));
     }
     if current
-        .get("properties")
-        .and_then(Value::as_object)
-        .is_some_and(|p| p.keys().any(|k| k.starts_with("history.expire.")))
+        .properties()
+        .keys()
+        .any(|k| k.starts_with("history.expire."))
     {
         return Ok(Outcome::Failed(
             "Snapshot management isn't supported when the table has history.expire.* properties."
@@ -312,21 +301,15 @@ async fn expire_snapshots(
         return Ok(Outcome::Successful("no snapshot expired".into()));
     }
     let before = referenced(app, table, &location, &current).await?;
-    let previous_at = current
-        .get("last-updated-ms")
-        .and_then(Value::as_i64)
-        .unwrap_or(0);
-    let mut builder = metadata::Builder::new(current, ms(now));
-    if let Err(e) =
-        builder.apply(&[json!({ "action": "remove-snapshots", "snapshot-ids": expired })])
-    {
-        return Ok(Outcome::Failed(format!("{e:?}")));
-    }
-    let built = match builder.build(Some((&location, previous_at))) {
-        Ok(built) => built,
-        Err(e) => return Ok(Outcome::Failed(format!("{e:?}"))),
+    let builder = TableMetadataBuilder::new_from_metadata(current, Some(location.clone()));
+    let update = TableUpdate::RemoveSnapshots {
+        snapshot_ids: expired.clone(),
     };
-    let file = metadata::next_file(
+    let built = match update.apply(builder).and_then(|b| b.build()) {
+        Ok(built) => built.metadata,
+        Err(e) => return Ok(Outcome::Failed(e.message().to_owned())),
+    };
+    let file = iceberg::next_file(
         &table.warehouse_location(),
         Some(&location),
         &Uuid::new_v4().to_string(),
@@ -391,93 +374,81 @@ fn key_of(table: &Table, path: &str) -> Option<String> {
 }
 
 /// The keys of everything `metadata` (at `location`) references in
-/// `table`'s storage; `Err` with why, if some of it can't be read.
+/// `table`'s storage: its metadata files, statistics, manifest lists,
+/// manifests, and the data and delete files they list (whatever their
+/// status); `Err` with why, if some of it can't be read.
 async fn referenced(
     app: &Arc<App>,
     table: &Table,
     location: &str,
-    metadata: &Map<String, Value>,
+    metadata: &TableMetadata,
 ) -> anyhow::Result<Result<HashSet<String>, String>> {
+    let io = iceberg::io::file_io(app, table, None);
+    let reader = match ::iceberg::table::Table::builder()
+        .metadata(metadata.clone())
+        .identifier(::iceberg::TableIdent::from_strs(["maintenance", "table"])?)
+        .file_io(io)
+        .runtime(::iceberg::Runtime::current())
+        .readonly(true)
+        .build()
+    {
+        Ok(reader) => reader,
+        Err(e) => return Ok(Err(e.message().to_owned())),
+    };
     let mut paths: Vec<String> = vec![location.to_owned()];
-    for entry in metadata
-        .get("metadata-log")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        paths.extend(entry["metadata-file"].as_str().map(str::to_owned));
-    }
-    for field in ["statistics", "partition-statistics"] {
-        for entry in metadata
-            .get(field)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-        {
-            paths.extend(entry["statistics-path"].as_str().map(str::to_owned));
-        }
-    }
+    paths.extend(
+        metadata
+            .metadata_log()
+            .iter()
+            .map(|l| l.metadata_file.clone()),
+    );
+    paths.extend(
+        metadata
+            .statistics_iter()
+            .map(|s| s.statistics_path.clone()),
+    );
+    paths.extend(
+        metadata
+            .partition_statistics_iter()
+            .map(|s| s.statistics_path.clone()),
+    );
     let mut manifests = Vec::new();
-    for snapshot in metadata
-        .get("snapshots")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        if let Some(list) = snapshot["manifest-list"].as_str() {
-            paths.push(list.to_owned());
-            let records = match manifest(app, table, list).await? {
-                Ok(records) => records,
-                Err(why) => return Ok(Err(why)),
-            };
-            manifests.extend(
-                records
-                    .iter()
-                    .filter_map(|r| r["manifest_path"].as_str().map(str::to_owned)),
-            );
-        }
-        // Format version 1's manifests, listed in the snapshot.
-        for m in snapshot["manifests"].as_array().into_iter().flatten() {
-            manifests.extend(m.as_str().map(str::to_owned));
+    for snapshot in metadata.snapshots() {
+        paths.push(snapshot.manifest_list().to_owned());
+        let list = match reader.manifest_list_reader(snapshot).load().await {
+            Ok(list) => list,
+            Err(e) => {
+                return Ok(Err(format!(
+                    "{} can't be read: {}",
+                    snapshot.manifest_list(),
+                    e.message()
+                )));
+            }
+        };
+        for manifest in list.entries() {
+            if !manifests
+                .iter()
+                .any(|m: &::iceberg::spec::ManifestFile| m.manifest_path == manifest.manifest_path)
+            {
+                manifests.push(manifest.clone());
+            }
         }
     }
-    manifests.sort();
-    manifests.dedup();
-    for path in manifests {
-        let records = match manifest(app, table, &path).await? {
-            Ok(records) => records,
-            Err(why) => return Ok(Err(why)),
+    for manifest in manifests {
+        let read = match reader.manifest_reader().read(&manifest).await {
+            Ok(read) => read,
+            Err(e) => {
+                return Ok(Err(format!(
+                    "{} can't be read: {}",
+                    manifest.manifest_path,
+                    e.message()
+                )));
+            }
         };
-        paths.push(path);
-        paths.extend(
-            records
-                .iter()
-                .filter_map(|r| r["data_file"]["file_path"].as_str().map(str::to_owned)),
-        );
+        paths.extend(read.entries().iter().map(|e| e.file_path().to_owned()));
+        paths.push(manifest.manifest_path);
     }
     Ok(Ok(paths.iter().filter_map(|p| key_of(table, p)).collect()))
-}
-
-/// The records of the Avro file at `path` (a manifest list or manifest).
-async fn manifest(
-    app: &Arc<App>,
-    table: &Table,
-    path: &str,
-) -> anyhow::Result<Result<Vec<Value>, String>> {
-    if key_of(table, path).is_none() {
-        return Ok(Err(format!("{path} isn't in the table's storage.")));
-    }
-    let normalized = format!(
-        "s3://{}/{}",
-        table.storage,
-        key_of(table, path).unwrap_or_default()
-    );
-    let bytes: Bytes = match iceberg::read_file(app, table, None, &normalized, MAX_MANIFEST).await?
-    {
-        Ok(bytes) => bytes,
-        Err(FileError::Unusable(why) | FileError::Refused(why)) => return Ok(Err(why)),
-    };
-    Ok(avro::records(&bytes).map_err(|why| format!("{path} can't be read: {why}")))
 }
 
 async fn remove_unreferenced(
@@ -596,39 +567,70 @@ async fn remove_unreferenced(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
-    fn snapshot(id: i64, parent: Option<i64>, at: i64) -> Value {
-        json!({ "snapshot-id": id, "parent-snapshot-id": parent, "timestamp-ms": at })
+    /// A table's metadata, with these snapshots (ID, parent, when), `main`
+    /// at `main`.
+    fn table(snapshots: &[(i64, Option<i64>, i64)], main: i64) -> TableMetadata {
+        let creation = iceberg::Creation {
+            schema: json!({ "type": "struct", "fields": [{ "id": 1, "name": "id", "required": true, "type": "long" }] }),
+            ..Default::default()
+        };
+        let mut builder = TableMetadataBuilder::new_from_metadata(
+            iceberg::new_table(&creation, "s3://t").unwrap(),
+            None,
+        );
+        for (sequence, (id, parent, at)) in snapshots.iter().enumerate() {
+            let update: TableUpdate = serde_json::from_value(json!({ "action": "add-snapshot", "snapshot": {
+                "snapshot-id": id, "parent-snapshot-id": parent, "sequence-number": sequence + 1,
+                "timestamp-ms": at, "manifest-list": format!("s3://t/metadata/snap-{id}.avro"),
+                "summary": { "operation": "append" }, "schema-id": 0,
+            }}))
+            .unwrap();
+            builder = update.apply(builder).unwrap();
+        }
+        let main = ::iceberg::spec::SnapshotReference::new(
+            main,
+            ::iceberg::spec::SnapshotRetention::branch(None, None, None),
+        );
+        builder
+            .set_ref("main", main)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata
     }
 
     #[test]
     fn what_expires() {
         let hour = 3_600_000;
-        let now = 100 * hour;
-        let m = json!({
-            "refs": { "main": { "snapshot-id": 4, "type": "branch" } },
-            "snapshots": [
-                snapshot(1, None, now - 50 * hour),
-                snapshot(2, Some(1), now - 40 * hour),
-                snapshot(3, Some(2), now - 5 * hour),
-                snapshot(4, Some(3), now - hour),
+        // Snapshots can't be from before their table's last change: they're
+        // from after now, and expire at a later now.
+        let t0 = ms(SystemTime::now());
+        let now = t0 + 100 * hour;
+        let m = table(
+            &[
+                (1, None, t0 + 50 * hour),
                 // Off main, and old.
-                snapshot(9, Some(1), now - 45 * hour),
+                (9, Some(1), t0 + 55 * hour),
+                (2, Some(1), t0 + 60 * hour),
+                (3, Some(2), t0 + 95 * hour),
+                (4, Some(3), t0 + 99 * hour),
             ],
-        });
-        let m = m.as_object().unwrap();
+            4,
+        );
         // Keep 1, up to 10 hours old: 1, 2 and 9 go.
-        let mut gone = expiring(m, 1, 10 * hour, now);
+        let mut gone = expiring(&m, 1, 10 * hour, now);
         gone.sort();
         assert_eq!(gone, [1, 2, 9]);
         // Keep 3 of main's: only 1 and 9.
-        let mut gone = expiring(m, 3, 10 * hour, now);
+        let mut gone = expiring(&m, 3, 10 * hour, now);
         gone.sort();
         assert_eq!(gone, [1, 9]);
         // Up to 100 hours old: none.
-        assert!(expiring(m, 1, 100 * hour, now).is_empty());
+        assert!(expiring(&m, 1, 100 * hour, now).is_empty());
         // The current one stays, however old.
-        let old = json!({ "refs": { "main": { "snapshot-id": 1 } }, "snapshots": [snapshot(1, None, 0)] });
-        assert!(expiring(old.as_object().unwrap(), 1, hour, now).is_empty());
+        let old = table(&[(1, None, t0)], 1);
+        assert!(expiring(&old, 1, hour, now).is_empty());
     }
 }

@@ -309,7 +309,8 @@ These follow AWS's documentation and API models, not real requests:
   the messages of their errors, which errors a refused operation on table
   storage gets (Cairn: S3's `405 MethodNotAllowed`), and the order of
   ListTables' pages (Cairn: by namespace, then name). The REST catalog
-  follows Iceberg's REST spec and Java's `TableMetadata.Builder`, and the
+  follows Iceberg's REST spec and the `iceberg` crate's port of Java's
+  `TableMetadata.Builder`, and the
   operations AWS lists for its endpoint; its errors' messages, and the
   metadata it writes, may differ from AWS's in detail.
 - Directory buckets' errors for unsupported operations, delimiters,

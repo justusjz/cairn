@@ -1104,11 +1104,20 @@ fn iceberg_schema() -> Value {
 }
 
 /// An append's updates: a snapshot (`id`, after `parent`), and main at it.
+/// Now, in ms: a snapshot's time (which may not be before its table's last
+/// change).
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 fn append(id: i64, parent: Option<i64>, sequence: i64) -> Value {
     json!([
         { "action": "add-snapshot", "snapshot": {
             "snapshot-id": id, "parent-snapshot-id": parent, "sequence-number": sequence,
-            "timestamp-ms": 1_700_000_000_000i64 + id, "manifest-list": format!("s3://x/snap-{id}.avro"),
+            "timestamp-ms": now_ms() + id, "manifest-list": format!("s3://x/snap-{id}.avro"),
             "summary": { "operation": "append" }, "schema-id": 0 } },
         { "action": "set-snapshot-ref", "ref-name": "main", "type": "branch", "snapshot-id": id },
     ])
@@ -1529,37 +1538,107 @@ async fn create_table_with_metadata() {
 
 // ─── Maintenance ─────────────────────────────────────────────────────────────
 
-/// A manifest list (Avro), listing `manifests`.
-fn manifest_list(manifests: &[&str]) -> Vec<u8> {
-    use crate::tables::iceberg::avro::tests::file;
-    let schema = json!({ "type": "record", "name": "manifest_file", "fields": [
-        { "name": "manifest_path", "type": "string" },
-        { "name": "added_snapshot_id", "type": "long" },
-    ]});
-    let mut block = Vec::new();
-    for m in manifests {
-        // A string (its length, zigzag), then a long.
-        let mut n = (m.len() as u64) << 1;
-        loop {
-            let byte = (n & 0x7f) as u8;
-            n >>= 7;
-            if n == 0 {
-                block.push(byte);
-                break;
-            }
-            block.push(byte | 0x80);
-        }
-        block.extend_from_slice(m.as_bytes());
-        block.push(2);
+/// Writes, as a client would (with Iceberg's own writers), a manifest at
+/// `path` in the storage of table `storage`, listing the data files
+/// `files`, of snapshot `snapshot`.
+async fn write_manifest(
+    app: &Arc<App>,
+    storage: &str,
+    path: &str,
+    snapshot: i64,
+    files: &[&str],
+) -> ::iceberg::spec::ManifestFile {
+    use ::iceberg::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, ManifestWriterBuilder,
+    };
+    let (table, metadata) = table_of(app, storage).await;
+    let io = super::iceberg::io::file_io(app, &table, None);
+    let mut writer = ManifestWriterBuilder::new(
+        io.new_output(path).unwrap(),
+        Some(snapshot),
+        metadata.current_schema().clone(),
+        metadata.default_partition_spec().as_ref().clone(),
+    )
+    .build_v2_data();
+    for file in files {
+        let data = DataFileBuilder::default()
+            .content(DataContentType::Data)
+            .file_path((*file).to_owned())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(1)
+            .build()
+            .unwrap();
+        writer.add_file(data, snapshot).unwrap();
     }
-    file(&schema, "deflate", &[(manifests.len() as i64, block)])
+    writer.write_manifest_file().await.unwrap()
 }
 
-/// A manifest (Avro), listing `files`.
-fn manifest(files: &[&str]) -> Vec<u8> {
-    use crate::tables::iceberg::avro::tests::{file, manifest_entry, manifest_schema};
-    let block: Vec<u8> = files.iter().flat_map(|f| manifest_entry(f)).collect();
-    file(&manifest_schema(), "snappy", &[(files.len() as i64, block)])
+/// Writes a manifest list at `path`, listing `manifests`, of snapshot
+/// `snapshot` (after `parent`, at `sequence`).
+async fn write_manifest_list(
+    app: &Arc<App>,
+    storage: &str,
+    path: &str,
+    (snapshot, parent, sequence): (i64, Option<i64>, i64),
+    manifests: Vec<::iceberg::spec::ManifestFile>,
+) {
+    let (table, _) = table_of(app, storage).await;
+    let io = super::iceberg::io::file_io(app, &table, None);
+    let output = io.new_output(path).unwrap();
+    let mut writer = ::iceberg::spec::ManifestListWriter::v2(
+        output.writer().await.unwrap(),
+        snapshot,
+        parent,
+        sequence,
+    );
+    writer.add_manifests(manifests.into_iter()).unwrap();
+    writer.close().await.unwrap();
+}
+
+/// Makes table `storage`'s metadata as if it were last changed `at`: a new
+/// file of it so, which the table points at.
+async fn backdate(app: &Arc<App>, storage: &str, at: std::time::SystemTime) {
+    let (table, metadata) = table_of(app, storage).await;
+    let mut json = serde_json::to_value(&metadata).unwrap();
+    json["last-updated-ms"] = json!(
+        at.duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    );
+    let metadata: ::iceberg::spec::TableMetadata = serde_json::from_value(json).unwrap();
+    let file = format!(
+        "{}/metadata/00000-backdated.metadata.json",
+        table.warehouse_location()
+    );
+    super::iceberg::write(app, &table, None, &file, &metadata)
+        .await
+        .unwrap()
+        .unwrap();
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE tables SET metadata_location = $2 WHERE id = $1",
+            &[&table.id, &file],
+        )
+        .await
+        .unwrap();
+}
+
+/// Table `storage`'s row, and its current metadata.
+async fn table_of(app: &Arc<App>, storage: &str) -> (super::Table, ::iceberg::spec::TableMetadata) {
+    let (_, table) = super::Table::by_storage(&app.pool.get().await.unwrap(), storage)
+        .await
+        .unwrap()
+        .unwrap();
+    let location = table.metadata_location.clone().unwrap();
+    let metadata = super::iceberg::read(app, &table, None, &location)
+        .await
+        .unwrap()
+        .unwrap();
+    (table, metadata)
 }
 
 #[tokio::test]
@@ -1608,19 +1687,46 @@ async fn maintenance_expires_snapshots_and_removes_files() {
     put("data/a.parquet", b"a".to_vec()).await;
     put("data/b.parquet", b"b".to_vec()).await;
     put("data/orphan.parquet", b"o".to_vec()).await;
-    put("metadata/m1.avro", manifest(&[&path("data/a.parquet")])).await;
-    put("metadata/m2.avro", manifest(&[&path("data/b.parquet")])).await;
-    put(
-        "metadata/l1.avro",
-        manifest_list(&[&path("metadata/m1.avro")]),
+    let m1 = write_manifest(
+        &app,
+        &storage,
+        &path("metadata/m1.avro"),
+        1,
+        &[&path("data/a.parquet")],
     )
     .await;
-    put(
-        "metadata/l2.avro",
-        manifest_list(&[&path("metadata/m1.avro"), &path("metadata/m2.avro")]),
+    let m2 = write_manifest(
+        &app,
+        &storage,
+        &path("metadata/m2.avro"),
+        2,
+        &[&path("data/b.parquet")],
     )
     .await;
+    write_manifest_list(
+        &app,
+        &storage,
+        &path("metadata/l1.avro"),
+        (1, None, 1),
+        vec![m1.clone()],
+    )
+    .await;
+    // m1, as l1 has it: of sequence number 1, once l1's snapshot commits.
+    let mut m1 = m1;
+    m1.sequence_number = 1;
+    m1.min_sequence_number = 1;
+    write_manifest_list(
+        &app,
+        &storage,
+        &path("metadata/l2.avro"),
+        (2, Some(1), 2),
+        vec![m1, m2],
+    )
+    .await;
+    // Snapshots of three and two hours ago, of a table made four hours ago
+    // (a snapshot can't be from before its table was last changed).
     let now = SystemTime::now();
+    backdate(&app, &storage, now - Duration::from_secs(4 * 3600)).await;
     let ms = |t: SystemTime| {
         t.duration_since(SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -1655,11 +1761,12 @@ async fn maintenance_expires_snapshots_and_removes_files() {
         }
     };
 
-    // Unreferenced: the orphan, noted; noncurrent after 3 days; deleted 10
-    // days after that. Nothing referenced goes.
+    // Unreferenced: the orphan (and the metadata file the backdating
+    // replaced), noted; noncurrent after 3 days; deleted 10 days after
+    // that. Nothing referenced goes.
     let outcome = run_job(&app, id, UNREFERENCED, now).await.unwrap();
     assert!(
-        matches!(&outcome, Outcome::Successful(m) if m.starts_with("1 file(s) unreferenced")),
+        matches!(&outcome, Outcome::Successful(m) if m.starts_with("2 file(s) unreferenced")),
         "{outcome:?}"
     );
     run_job(&app, id, UNREFERENCED, now + 3 * day)
@@ -1673,7 +1780,7 @@ async fn maintenance_expires_snapshots_and_removes_files() {
         .await
         .unwrap();
     assert!(
-        matches!(&outcome, Outcome::Successful(m) if m.ends_with("1 deleted")),
+        matches!(&outcome, Outcome::Successful(m) if m.ends_with("2 deleted")),
         "{outcome:?}"
     );
     assert!(!exists("data/orphan.parquet").await);

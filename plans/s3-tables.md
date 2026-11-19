@@ -225,8 +225,10 @@ Done, as below, with these choices made on the way:
   1000), so a table's metadata doesn't depend on its client's numbering.
 - Format versions 2 and 3; 1 is refused.
 - A table made through the `s3tables` API without metadata has none until
-  a commit gives it (as a staged creation's updates would: `assert-create`
-  holds); loading it is a 404 until then.
+  its first metadata file is given (UpdateTableMetadataLocation); loading
+  it is a 404, and a commit to it a 400, until then. (Before the move to
+  the `iceberg` crate, a commit could build it from nothing, as a staged
+  creation's updates would.)
 - A commit with no changes writes no file.
 - The config's S3 settings are defaults, not overrides, so that an
   engine's own (another endpoint, say) win.
@@ -259,11 +261,9 @@ a commit's changes and writes the new metadata file.
    - Snapshot log, metadata log (`write.metadata.previous-versions-max`),
      sequence numbers, last-updated-ms.
 
-   Kept as serde_json values with typed views of what's checked, so that
-   fields Cairn doesn't know survive a commit. Not the `iceberg` crate:
-   it brings Arrow, OpenDAL and an async runtime of its own into a static
-   binary for what is a few hundred lines of JSON rules. Iceberg's Java
-   and Rust builders are the reference, and their tests' cases are ours.
+   First Cairn's own (JSON, with typed views), now the `iceberg` crate's
+   (`TableMetadataBuilder`, `TableRequirement`, `TableUpdate`), a port of
+   Java's: see "The move to the `iceberg` crate" below.
 2. **The endpoint** (`tables::iceberg::rest`):
    - Under `/iceberg/v1/`: config, namespaces, tables, rename, as AWS
      lists them.
@@ -293,12 +293,9 @@ with the configuration that goes in the README.
 
 Done, as below, with these choices made on the way:
 
-- Avro is read by Cairn's own reader (`tables::iceberg::avro`): object
-  container files, the `null`, `deflate` and `snappy` codecs, decoded by
-  their own schemas into JSON. Not the `apache-avro` crate: maintenance
-  only needs paths out of manifests, and the crate brings a large tree of
-  dependencies into the static binary. `zstandard` isn't read (a job on
-  such a table fails, saying so).
+- Manifest lists and manifests are read with the `iceberg` crate's
+  readers (at first with an Avro reader of Cairn's own, until the move to
+  the crate, below), through a `FileIO` over the table's storage.
 - Snapshot management runs hourly per table, unreferenced file removal
   daily; jobs are rows (`table_maintenance_runs`, migration 85) that a
   pass takes with `SKIP LOCKED`, every minute, on any node. Not paced by
@@ -341,6 +338,31 @@ lifecycle sweeps go at.
 Tests: e2e tests that expire snapshots and remove files of a table
 PyIceberg wrote, with the days made seconds.
 
+## The move to the `iceberg` crate
+
+Compaction needs far more of Iceberg than paths out of manifests: writing
+manifests and manifest lists, reading data files with their deletes
+applied (positional, equality, v3's deletion vectors), writing data files
+with their metrics, partition transforms. So before it, Cairn moved to
+`iceberg` (Apache Iceberg's Rust implementation, 0.11), measured first:
+
+- Stripped release binary: 34.1 MB before; 41.3 MB with only the Arrow
+  pieces any compaction needs (Parquet's Arrow reader and writer, sort
+  kernels); 54.9 MB with `iceberg` (+13.7 MB over Arrow alone, +61% in
+  all). Release builds take about a minute longer.
+- It pins Arrow and Parquet 58, which Cairn's `parquet` follows (60 to 58:
+  Cairn's own use of it didn't change). One stack, no duplicates but a few
+  crypto traits' versions. `zstd` is C, which `musl-gcc` builds, as it
+  does `ring`.
+- Its storage is pluggable (`iceberg::io::Storage`): Cairn's
+  (`tables::iceberg::io`) reads and writes a table's storage straight
+  through the object store, as the table's (its class, its encryption),
+  as the requester or as Cairn.
+
+What it replaced: Cairn's metadata builder (requirements, updates, fresh
+IDs, the metadata log: the crate's is a port of Java's), and its Avro
+reader. Tests are now written with the crate's own manifest writers.
+
 ## Phase 4: compaction
 
 Rewriting a table's small data files into large ones, as a commit of
@@ -355,9 +377,11 @@ plan by far:
 - metrics for the new files' manifests;
 - sort and z-order.
 
-Binpack first, without deletes, once Phases 1 to 3 are in use and someone
-needs it. Until then, compaction stays refused (501 to enabling it, and
-`Disabled` in its status), as S3-COMPATIBILITY.md will say.
+Next, on the `iceberg` crate (which reads data files with their deletes
+applied, writes data files with their metrics, and writes manifests): all
+of AWS's strategies, `binpack`, `sort` and `z-order`, and `auto`. Until
+then, compaction stays refused (501 to enabling it, and `Disabled` in its
+status), as S3-COMPATIBILITY.md says.
 
 ## Phase 5: the rest, as needed
 

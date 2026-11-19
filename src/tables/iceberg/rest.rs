@@ -21,14 +21,13 @@ use hyper::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use super::{
-    FileError,
-    metadata::{self, Builder, Creation, Failure},
-};
+use super::{Creation, Failure, FileError};
 use crate::{
     policy::Context,
     tables::{Answer, Ctx, Error, Input, NO_NAMESPACE, NO_TABLE, Table, TableBucket, Target},
 };
+use iceberg::spec::{TableMetadata, TableMetadataBuilder};
+use iceberg::{TableRequirement, TableUpdate};
 
 /// An Iceberg REST error: its status, its exception's type, its message.
 pub(crate) fn rest_error(status: StatusCode, kind: &str, message: impl Into<String>) -> Answer {
@@ -157,13 +156,6 @@ fn encode(s: &str) -> String {
     percent_encoding::utf8_percent_encode(s, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
-/// Now, in ms.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as i64)
-}
-
 /// A request's JSON body, as an object.
 fn body_of(body: &[u8]) -> Result<Map<String, Value>, Answer> {
     match serde_json::from_slice(body) {
@@ -198,10 +190,10 @@ fn json_of(answer: Answer) -> Value {
 }
 
 /// A table's metadata, as the catalog answers it when it's loaded.
-fn load_result(location: &str, metadata: Map<String, Value>) -> Value {
+fn load_result(location: &str, metadata: &TableMetadata) -> Value {
     json!({
         "metadata-location": location,
-        "metadata": Value::Object(metadata),
+        "metadata": metadata,
         "config": {},
     })
 }
@@ -456,7 +448,7 @@ impl Ctx<'_> {
     }
 
     /// A table's current metadata, if it has any.
-    async fn current(&self, table: &Table) -> Result<Option<Map<String, Value>>, Answer> {
+    async fn current(&self, table: &Table) -> Result<Option<TableMetadata>, Answer> {
         let Some(location) = &table.metadata_location else {
             return Ok(None);
         };
@@ -474,7 +466,7 @@ impl Ctx<'_> {
                 StatusCode::OK,
                 Some(load_result(
                     table.metadata_location.as_deref().unwrap_or(""),
-                    metadata,
+                    &metadata,
                 )),
             ),
             Ok(None) => rest_error(
@@ -516,7 +508,7 @@ impl Ctx<'_> {
             .await
         {
             Ok((_, location, metadata)) => {
-                Answer::Raw(StatusCode::OK, Some(load_result(&location, metadata)))
+                Answer::Raw(StatusCode::OK, Some(load_result(&location, &metadata)))
             }
             Err(answer) => answer,
         }
@@ -533,9 +525,9 @@ impl Ctx<'_> {
         name: &str,
         creation: &Creation,
         input: Option<&Input>,
-    ) -> Result<(String, String, Map<String, Value>), Answer> {
+    ) -> Result<(String, String, TableMetadata), Answer> {
         // What it's made with is checked before it's made.
-        let check = metadata::new_table(creation, "s3://check", "check", 0);
+        let check = super::new_table(creation, "s3://check");
         check.map_err(from_failure)?;
         let (account, bucket_name, bucket) = self
             .bucket_of(arn)
@@ -577,10 +569,8 @@ impl Ctx<'_> {
             return Err(commit_failed("The table was deleted as it was made."));
         };
         let location = table.warehouse_location();
-        let uuid = Uuid::new_v4().to_string();
-        let built =
-            metadata::new_table(creation, &location, &uuid, now_ms()).map_err(from_failure)?;
-        let file = metadata::next_file(&location, None, &Uuid::new_v4().to_string());
+        let built = super::new_table(creation, &location).map_err(from_failure)?;
+        let file = super::next_file(&location, None, &Uuid::new_v4().to_string());
         match self.swap(&table, &token, &file, &built).await {
             Ok(()) => Ok((table_arn, file, built)),
             Err(answer) => {
@@ -601,7 +591,7 @@ impl Ctx<'_> {
         table: &Table,
         token: &str,
         file: &str,
-        metadata: &Map<String, Value>,
+        metadata: &TableMetadata,
     ) -> Result<(), Answer> {
         let written = super::write(self.app, table, Some(self.principal.id), file, metadata)
             .await
@@ -666,55 +656,61 @@ impl Ctx<'_> {
             or_answer!(checked, |e| from_tables(e, "CommitFailedException"));
         }
         let current = or_answer!(self.current(&table).await, |e| e);
-        if let Some(current) = &current {
-            or_answer!(metadata::check_readable(current), from_failure);
-        }
-        or_answer!(
-            metadata::check_requirements(current.as_ref(), &requirements),
-            from_failure
+        let requirements: Vec<TableRequirement> = or_answer!(
+            serde_json::from_value(Value::Array(requirements)),
+            |e: serde_json::Error| bad_request(format!("The commit's requirements aren't: {e}"))
         );
-        let now = now_ms();
-        let previous = current.as_ref().map(|c| {
-            (
-                table.metadata_location.clone().unwrap_or_default(),
-                c.get("last-updated-ms")
-                    .and_then(Value::as_i64)
-                    .unwrap_or(0),
-            )
-        });
-        let location = table.warehouse_location();
-        let base = current
-            .clone()
-            .unwrap_or_else(|| metadata::empty(&location, now));
-        let mut builder = Builder::new(base, now);
-        or_answer!(builder.apply(&updates), from_failure);
-        if !builder.changed()
-            && let (Some(current), Some(file)) = (current, &table.metadata_location)
-        {
+        let updates: Vec<TableUpdate> = or_answer!(
+            serde_json::from_value(Value::Array(updates)),
+            |e: serde_json::Error| bad_request(format!("The commit's updates aren't: {e}"))
+        );
+        for requirement in &requirements {
+            or_answer!(requirement.check(current.as_ref()), |e: iceberg::Error| {
+                from_failure(e.into())
+            });
+        }
+        let (Some(current), Some(previous)) = (current, table.metadata_location.clone()) else {
+            return bad_request(
+                "The table has no metadata yet: create it through the catalog, or give it its \
+                 first metadata file with UpdateTableMetadataLocation.",
+            );
+        };
+        if !super::supported(current.format_version()) {
+            return bad_request(format!(
+                "The table's format version {} isn't supported: 2 or 3 only.",
+                current.format_version()
+            ));
+        }
+        let mut builder =
+            TableMetadataBuilder::new_from_metadata(current.clone(), Some(previous.clone()));
+        for update in updates {
+            builder = or_answer!(update.apply(builder), |e: iceberg::Error| from_failure(
+                e.into()
+            ));
+        }
+        let built = or_answer!(builder.build(), |e: iceberg::Error| from_failure(e.into()));
+        if built.changes.is_empty() {
             return Answer::Raw(
                 StatusCode::OK,
-                Some(json!({ "metadata-location": file, "metadata": Value::Object(current) })),
+                Some(json!({ "metadata-location": previous, "metadata": current })),
             );
         }
-        let built = or_answer!(
-            builder.build(previous.as_ref().map(|(file, at)| (file.as_str(), *at))),
-            from_failure
-        );
-        if built.get("location").and_then(Value::as_str) != Some(location.as_str()) {
+        let built = built.metadata;
+        let location = table.warehouse_location();
+        if built.location() != location {
             return bad_request("A table's location is its storage's, which can't be changed.");
         }
-        let file = metadata::next_file(
-            &location,
-            table.metadata_location.as_deref(),
-            &Uuid::new_v4().to_string(),
-        );
+        if !super::supported(built.format_version()) {
+            return bad_request("Tables' format versions are 2 or 3 only.");
+        }
+        let file = super::next_file(&location, Some(&previous), &Uuid::new_v4().to_string());
         or_answer!(
             self.swap(&table, &table.version_token, &file, &built).await,
             |e| e
         );
         Answer::Raw(
             StatusCode::OK,
-            Some(json!({ "metadata-location": file, "metadata": Value::Object(built) })),
+            Some(json!({ "metadata-location": file, "metadata": built })),
         )
     }
 
@@ -802,11 +798,29 @@ pub(crate) fn creation_of(metadata: &Value) -> Result<Creation, String> {
     };
     Ok(Creation {
         schema,
+        // S3 Tables' shapes, as Iceberg's (its IDs in camel case).
         partition_spec: iceberg
             .get("partitionSpec")
             .filter(|v| v.is_object())
-            .cloned(),
-        write_order: iceberg.get("writeOrder").filter(|v| v.is_object()).cloned(),
+            .map(|spec| {
+                let mut spec =
+                    json!({ "fields": spec.get("fields").cloned().unwrap_or(json!([])) });
+                if let Some(id) = iceberg["partitionSpec"].get("specId") {
+                    spec["spec-id"] = id.clone();
+                }
+                spec
+            }),
+        write_order: iceberg
+            .get("writeOrder")
+            .filter(|v| v.is_object())
+            .map(|order| {
+                let mut out =
+                    json!({ "fields": order.get("fields").cloned().unwrap_or(json!([])) });
+                if let Some(id) = order.get("orderId") {
+                    out["order-id"] = id.clone();
+                }
+                out
+            }),
         properties,
     })
 }
@@ -822,7 +836,8 @@ mod tests {
             { "name": "name", "type": "string" },
         ]}, "partitionSpec": { "fields": [{ "source-id": 1, "transform": "bucket[4]", "name": "b" }] } } }))
         .unwrap();
-        let m = metadata::new_table(&creation, "s3://t", "u", 0).unwrap();
+        let m =
+            serde_json::to_value(super::super::new_table(&creation, "s3://t").unwrap()).unwrap();
         assert_eq!(m["schemas"][0]["fields"][1]["id"], 2);
         assert_eq!(m["partition-specs"][0]["fields"][0]["source-id"], 1);
         assert!(creation_of(&json!({})).is_err());
