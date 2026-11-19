@@ -2532,6 +2532,12 @@ export interface components {
             live_nodes: number;
             /**
              * Format: int64
+             * @description The bytes of its blobs that belong in lower classes, since lifecycle
+             *     transitions: the packer moves them as it rewrites the blobs.
+             */
+            lower_bytes: number;
+            /**
+             * Format: int64
              * @description Committed blobs outside its pool, which the packer rewrites into it.
              */
             misplaced: number;
@@ -2546,6 +2552,12 @@ export interface components {
             /** Format: int64 */
             parity_shards?: number | null;
             pool: string;
+            /**
+             * Format: int64
+             * @description Its place in the classes' order, the warmest highest (see
+             *     `classes`), if it has one.
+             */
+            rank?: number | null;
             /**
              * Format: int64
              * @description Its blobs in tiers, and their bytes.
@@ -3212,6 +3224,8 @@ export interface components {
             removed: number;
             /** Format: double */
             started: number;
+            /** Format: int64 */
+            transitioned?: number;
         };
         /**
          * @description What the bucket-access template may allow on a bucket.
@@ -3287,6 +3301,7 @@ export interface components {
         /** @description A bucket's lifecycle configuration. */
         LifecycleConfiguration: {
             rules: components["schemas"]["LifecycleRule"][];
+            transition_minimum?: components["schemas"]["TransitionMinimum"] | null;
         };
         /**
          * Format: int64
@@ -3329,6 +3344,17 @@ export interface components {
              */
             newer_versions?: number | null;
         };
+        /** @description `NoncurrentVersionTransition`. */
+        LifecycleNoncurrentTransition: {
+            /** Format: int32 */
+            days: number;
+            /**
+             * Format: int32
+             * @description How many of the newest noncurrent versions stay where they are.
+             */
+            newer_versions?: number | null;
+            storage_class: string;
+        };
         LifecycleRule: {
             /**
              * Format: int32
@@ -3342,6 +3368,17 @@ export interface components {
             /** @description Its name, unique among the bucket's rules; one is made up if empty. */
             id?: string;
             noncurrent_expiration?: components["schemas"]["LifecycleNoncurrentExpiration"] | null;
+            /** @description `NoncurrentVersionTransition`s, each into a class of its own. */
+            noncurrent_transitions?: components["schemas"]["LifecycleNoncurrentTransition"][];
+            /** @description `Transition`s, each into a class of its own. */
+            transitions?: components["schemas"]["LifecycleTransition"][];
+        };
+        /** @description `Transition`: one of `days` and `date`, and the class. */
+        LifecycleTransition: {
+            date?: components["schemas"]["LifecycleDay"] | null;
+            /** Format: int32 */
+            days?: number | null;
+            storage_class: string;
         };
         /** @description A page of a bucket's keys, rolled up at `/` like a directory listing. */
         Listing: {
@@ -4259,6 +4296,8 @@ export interface components {
             removed: number;
             /** Format: double */
             started: number;
+            /** Format: int64 */
+            transitioned: number;
         };
         SwitchRole: {
             /** @description The role's account, by its ID. */
@@ -4336,6 +4375,11 @@ export interface components {
             /** Format: int32 */
             subscriptions_pending: number;
         };
+        /**
+         * @description S3's `x-amz-transition-default-minimum-object-size`.
+         * @enum {string}
+         */
+        TransitionMinimum: "all_storage_classes_128K" | "varies_by_storage_class";
         UnitName: {
             name: string;
         };

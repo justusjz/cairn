@@ -903,8 +903,12 @@ async fn handle_request(
                 if !payload::has_body_checksum(req.headers()) {
                     return Ok(box_response(missing_checksum()));
                 }
+                let minimum = req
+                    .headers()
+                    .get(crate::s3::buckets::lifecycle::MINIMUM_HEADER)
+                    .map(|v| v.to_str().unwrap_or("").to_owned());
                 match read_body(req, &secret, true).await? {
-                    Ok(body) => put_bucket_lifecycle(&app, &bucket, body).await?,
+                    Ok(body) => put_bucket_lifecycle(&app, &bucket, body, minimum.as_deref()).await?,
                     Err(rejection) => util::rejection_response(&rejection),
                 }
             }

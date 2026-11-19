@@ -309,7 +309,7 @@ function LifecycleView(props: { lifecycle: Lifecycle; refresh: () => void }) {
           { label: "Rules", num: true },
           "Sweep",
           "Last sweep",
-          { label: "Expired / removed / aborted", num: true },
+          { label: "Expired / removed / aborted / transitioned", num: true },
         ]}
       >
         <For each={l().buckets}>{(b) => <LifecycleRow bucket={b} />}</For>
@@ -368,7 +368,7 @@ function LifecycleRow(props: { bucket: LifecycleBucket }) {
         <Show when={b().last} fallback="–">
           {(last) => (
             <>
-              {num(last().expired)} / {num(last().removed)} / {num(last().aborted)}
+              {num(last().expired)} / {num(last().removed)} / {num(last().aborted)} / {num(last().transitioned ?? 0)}
             </>
           )}
         </Show>

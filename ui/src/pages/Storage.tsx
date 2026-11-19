@@ -258,10 +258,22 @@ function Classes(props: { storage: StorageInfo }) {
       ? `coded ${c.layout_data_shards}+${c.layout_parity_shards}`
       : plural(c.layout_parity_shards + 1, "copy", "copies");
   return (
-    <Panel title="Storage classes" note="defined with cairn class set · objects ask for one with x-amz-storage-class">
+    <Panel
+      title="Storage classes"
+      note="defined with cairn class set · objects ask for one with x-amz-storage-class · lifecycle rules move them into lower ranked ones"
+    >
       <Table
         count={props.storage.classes.length}
-        columns={["Class", "Pool", "Layout", { label: "Nodes", num: true }, { label: "Blobs", num: true }, { label: "Bytes", num: true }, ""]}
+        columns={[
+          "Class",
+          { label: "Rank", num: true },
+          "Pool",
+          "Layout",
+          { label: "Nodes", num: true },
+          { label: "Blobs", num: true },
+          { label: "Bytes", num: true },
+          "",
+        ]}
       >
         <For each={props.storage.classes}>
           {(c) => {
@@ -269,6 +281,7 @@ function Classes(props: { storage: StorageInfo }) {
             return (
               <tr>
                 <td class="mono">{c.name}</td>
+                <td class="num">{c.rank ?? "–"}</td>
                 <td class="mono">
                   <Show when={c.tier} fallback={c.pool}>
                     tier {c.tier}
@@ -304,6 +317,9 @@ function Classes(props: { storage: StorageInfo }) {
                     <div class="subtle small">
                       {num(c.misplaced)} blobs ({bytes(c.misplaced_bytes)}) moving into {c.pool}
                     </div>
+                  </Show>
+                  <Show when={c.lower_bytes > 0}>
+                    <div class="subtle small">{bytes(c.lower_bytes)} of lower classes, until the packer moves it</div>
                   </Show>
                 </td>
               </tr>

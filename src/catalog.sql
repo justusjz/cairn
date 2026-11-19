@@ -512,11 +512,20 @@ $$;
 
 -- Sets the blobs' `dead_size` to exactly the bytes that no part references:
 -- the size, less the union of the parts' byte ranges (parts can share bytes,
--- through copies). Under X(x) exclusive.
+-- through copies). And their `misplaced_size` (see `classes`): the bytes of
+-- the extents (runs of referenced bytes, back to back or overlapping) that
+-- no part of a version or upload of the blob's own class references, but
+-- only those of other, ranked classes, while the blob's class is ranked too.
+-- The packer moves exactly those (see `packer::relocate`), each extent into
+-- the highest of its versions' classes, so that a blob it rewrites isn't a
+-- candidate again for the same bytes. A part of a class without a rank, or
+-- of no version or upload, keeps its extent where it is. Under X(x)
+-- exclusive.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_refresh_dead_size(p_blobs uuid[])
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-    UPDATE blobs b SET dead_size = b.size - coalesce(live.bytes, 0)
+    UPDATE blobs b SET dead_size = b.size - coalesce(live.bytes, 0),
+                       misplaced_size = coalesce(misplaced.bytes, 0)
     FROM (SELECT DISTINCT unnest(p_blobs) AS blob_id) AS t
     LEFT JOIN (
         SELECT blob_id, sum(upper(r) - lower(r))::bigint AS bytes
@@ -527,6 +536,25 @@ BEGIN
         ) AS ranges
         GROUP BY blob_id
     ) AS live ON live.blob_id = t.blob_id
+    LEFT JOIN (
+        SELECT e.blob_id, sum(upper(e.r) - lower(e.r))::bigint AS bytes
+        FROM (
+            SELECT blob_id, unnest(range_agg(int8range(blob_offset, blob_offset + size))) AS r
+            FROM parts WHERE blob_id = ANY(p_blobs)
+            GROUP BY blob_id
+        ) AS e
+        JOIN blobs eb ON eb.blob_id = e.blob_id
+        JOIN storage_classes ec ON ec.name = eb.storage_class
+        WHERE ec.rank IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM parts p
+            LEFT JOIN objects o ON o.id = p.object_id
+            LEFT JOIN multipart_uploads u ON u.upload_id = p.upload_id
+            LEFT JOIN storage_classes pc ON pc.name = coalesce(o.storage_class, u.storage_class)
+            WHERE p.blob_id = e.blob_id AND int8range(p.blob_offset, p.blob_offset + p.size) && e.r
+              AND (pc.rank IS NULL OR pc.name = eb.storage_class)
+        )
+        GROUP BY e.blob_id
+    ) AS misplaced ON misplaced.blob_id = t.blob_id
     WHERE b.blob_id = t.blob_id;
 END
 $$;
@@ -1201,7 +1229,9 @@ $$;
 -- Takes B(b) shared, K(b,k), then X: the source's blobs shared, and those of
 -- the version it replaces. The copy's checksum is Cairn's to work out; its
 -- parts keep the source's parts' checksums if `p_part_checksums` (they're in
--- the copy's algorithm, and open under its key).
+-- the copy's algorithm, and open under its key). Its storage class is
+-- `p_storage_class`, which must be its source's or one ranked below it (see
+-- `classes`), or NULL for its source's.
 CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_source bigint, p_part_ids bigint[], p_part_sizes bigint[],
     p_bucket text, p_key text, p_size bigint, p_etag text, p_content_type text,
@@ -1210,6 +1240,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_copy_object(
     p_checksum_type text, p_checksum text, p_tags text, p_part_checksums boolean,
     p_new_version_id text, p_lock_mode text, p_lock_until timestamptz, p_legal_hold boolean,
     p_conditional boolean, p_expected bigint, p_notify text DEFAULT NULL,
+    p_storage_class text DEFAULT NULL,
     OUT status text, OUT version_id text, OUT last_modified text,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -1255,8 +1286,9 @@ BEGIN
         p_sse_c_key, p_kms_key_id, p_kms_data_key, p_kms_sealed, p_kms_context,
         p_sse_s3, p_checksum_algorithm, p_checksum_type, p_checksum, p_tags, p_new_version_id,
         p_lock_mode, p_lock_until, p_legal_hold,
-        -- Of the class of the bytes it shares, its source's.
-        coalesce((SELECT b.storage_class FROM blobs b WHERE b.blob_id = s.blob_ids[1]), 'STANDARD'));
+        -- The class it asks for, which its source's blobs stand in for (it's
+        -- its source's, or below it: see `classes`), else its source's.
+        coalesce(p_storage_class, (SELECT o.storage_class FROM objects o WHERE o.id = p_source), 'STANDARD'));
     version_id := v.version_id;
     SELECT to_char(o.last_modified AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS".000Z"')
     INTO last_modified FROM objects o WHERE o.id = v.id;
@@ -1814,6 +1846,73 @@ BEGIN
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(pg_temp.cairn_exclusive(f.blobs, f.exclusive));
     status := 'expired';
+END
+$$;
+
+-- T72: a lifecycle sweep's transitions (see `lifecycle`). Takes B(b)
+-- shared and K(b,k) for every key, as T17 does, and nothing else: it
+-- changes only versions' storage classes, which their blobs stand in for
+-- already (see `classes`), and moves no bytes. Each target is a version the
+-- sweep found due, by its row id, and the class it's due to go to,
+-- checked again under the locks: it's still there, not a delete marker,
+-- current if `p_current` (and noncurrent if not), with the tags the sweep
+-- read (`p_tags`, as T17 checks them), and of a class ranked above
+-- `p_classes`. Object Lock doesn't keep a version from it, as in S3.
+--
+-- The blobs the transitioned versions' parts are on go into the garbage
+-- log, which nothing but folds reads: the next fold works out the bytes on
+-- them that are now misplaced (`cairn_refresh_dead_size`), which the
+-- packer then moves.
+--
+-- 'changed' if the bucket's configuration isn't of `p_generation` anymore,
+-- 'no_such_bucket', or 'transitioned', with which targets were.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_lifecycle_transition(
+    p_bucket text, p_generation bigint, p_keys text[], p_ids bigint[], p_classes text[],
+    p_current boolean[], p_tags text[], p_notify text DEFAULT NULL,
+    OUT status text, OUT applied boolean[]
+) LANGUAGE plpgsql AS $$
+DECLARE
+    v_ok boolean;
+    v_ids bigint[] := '{}';
+    r record;
+BEGIN
+    PERFORM pg_temp.cairn_notify_start(p_notify);
+    applied := '{}';
+    IF pg_temp.cairn_lock_bucket(p_bucket) IS NULL THEN
+        status := 'no_such_bucket';
+        RETURN;
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM buckets
+        WHERE name = p_bucket AND lifecycle IS NOT NULL AND lifecycle_generation = p_generation
+    ) THEN
+        status := 'changed';
+        RETURN;
+    END IF;
+    PERFORM pg_temp.cairn_lock_keys(p_bucket, p_keys);
+    FOR i IN 1 .. coalesce(cardinality(p_keys), 0) LOOP
+        v_ok := EXISTS (
+            SELECT 1 FROM objects o
+            JOIN storage_classes oc ON oc.name = o.storage_class
+            JOIN storage_classes tc ON tc.name = p_classes[i]
+            WHERE o.id = p_ids[i] AND o.bucket = p_bucket AND o.key = p_keys[i]
+              AND NOT o.is_delete_marker AND o.is_latest = p_current[i] AND o.tags = p_tags[i]
+              AND tc.rank < oc.rank
+        );
+        applied := applied || v_ok;
+        IF v_ok THEN
+            v_ids := v_ids || p_ids[i];
+        END IF;
+    END LOOP;
+    UPDATE objects o SET storage_class = t.class
+    FROM unnest(p_ids, p_classes, applied) AS t(id, class, ok)
+    WHERE o.id = t.id AND t.ok;
+    INSERT INTO blob_garbage (blob_id, size)
+    SELECT DISTINCT p.blob_id, 0 FROM parts p WHERE p.object_id = ANY(v_ids);
+    FOR r IN SELECT o.key, o.size, o.etag, o.version_id FROM objects o WHERE o.id = ANY(v_ids) LOOP
+        PERFORM pg_temp.cairn_notify(p_bucket, r.key, 'LifecycleTransition', r.size, r.etag, r.version_id);
+    END LOOP;
+    status := 'transitioned';
 END
 $$;
 
@@ -2803,9 +2902,42 @@ BEGIN
 END
 $$;
 
+-- Adds to `sources` (and their live bytes to `total`) the committed blobs
+-- of class `p_class` that are worth compacting for their misplaced bytes
+-- (see `cairn_refresh_dead_size`) together with their garbage: the least
+-- live data that stays first, until their live bytes would exceed
+-- `p_budget`, as T14's compaction does, but for those it took already.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_claim_misplaced(
+    p_class text, p_compact_threshold float8, p_max_sources bigint, p_budget bigint,
+    INOUT sources uuid[], INOUT total bigint
+) LANGUAGE plpgsql AS $$
+DECLARE
+    r record;
+BEGIN
+    FOR r IN
+        SELECT blob_id, size - dead_size AS live FROM blobs
+        WHERE storage_class = p_class AND misplaced_size > 0 AND state = 'committed'
+          AND dead_size + misplaced_size >= size * p_compact_threshold
+          AND NOT (blob_id = ANY(sources))
+          AND (pack_lease_until IS NULL OR pack_lease_until < NOW())
+          AND NOT EXISTS (SELECT 1 FROM lost_ranges l JOIN parts p ON p.blob_id = l.blob_id
+                          WHERE l.blob_id = blobs.blob_id
+                            AND p.blob_offset < l.stop AND p.blob_offset + p.size > l.start)
+        ORDER BY size - dead_size - misplaced_size
+        LIMIT p_max_sources FOR UPDATE SKIP LOCKED
+    LOOP
+        EXIT WHEN cardinality(sources) >= p_max_sources
+            OR (total + r.live > p_budget AND cardinality(sources) > 0);
+        total := total + r.live;
+        sources := sources || r.blob_id;
+    END LOOP;
+END
+$$;
+
 -- T14: claims the source blobs for a packing job, if there's one worth
 -- running (see `packer::claim`), all of storage class `p_class`: `p_kind` is
--- 'compact', 'consolidate', 'upgrade' (a blob from before checksums, one at
+-- 'compact' (blobs mostly garbage, or garbage and misplaced bytes, see
+-- `classes`), 'consolidate', 'upgrade' (a blob from before checksums, one at
 -- a time) or 'convert' (blobs of more than `p_small_size` live bytes not in
 -- `p_data_shards` data shards and, if it isn't NULL, `p_parity_shards`
 -- parity shards, unless `p_data_shards` is NULL; then blobs of any size not
@@ -2859,6 +2991,8 @@ BEGIN
             v_total := v_total + r.live;
             v_sources := v_sources || r.blob_id;
         END LOOP;
+        SELECT * INTO v_sources, v_total FROM pg_temp.cairn_claim_misplaced(
+            p_class, p_compact_threshold, p_max_sources, p_budget, v_sources, v_total);
         IF cardinality(v_sources) = 0 THEN
             RETURN '{}';
         END IF;
@@ -2879,6 +3013,8 @@ BEGIN
             v_total := v_total + r.live;
             v_sources := v_sources || r.blob_id;
         END LOOP;
+        SELECT * INTO v_sources, v_total FROM pg_temp.cairn_claim_misplaced(
+            p_class, p_compact_threshold, p_max_sources, p_budget, v_sources, v_total);
         IF cardinality(v_sources) = 0 THEN
             RETURN '{}';
         END IF;
@@ -3020,7 +3156,8 @@ $$;
 -- ('missing_locations', with how many of one blob's did). Then commits the new
 -- blobs, moves each part that's still where the job found it into its new
 -- blob (I7), drops the sources and new blobs that nothing references anymore,
--- and releases the leases on the sources that remain ('committed').
+-- and releases the leases on the sources that remain ('committed'), unless
+-- `p_release` is false: the job goes on with them (see `packer::relocate`).
 --
 -- The new blobs come as parallel arrays (`p_out_*`), and their shards as
 -- (blob, node, shard, CRC64/NVME of the shard's file) tuples (`p_loc_*`);
@@ -3031,7 +3168,7 @@ CREATE OR REPLACE FUNCTION pg_temp.cairn_pack_commit(
     p_out_parity_shards smallint[], p_stripe_unit int,
     p_loc_blobs uuid[], p_loc_nodes int[], p_loc_shards smallint[], p_loc_crcs bigint[],
     p_part_ids bigint[], p_old_blobs uuid[], p_old_offsets bigint[],
-    p_new_blobs uuid[], p_new_offsets bigint[],
+    p_new_blobs uuid[], p_new_offsets bigint[], p_release boolean DEFAULT true,
     OUT status text, OUT present bigint,
     OUT reap_blob uuid[], OUT reap_node int[], OUT reap_peer text[]
 ) LANGUAGE plpgsql AS $$
@@ -3084,7 +3221,9 @@ BEGIN
     PERFORM pg_temp.cairn_refresh_dead_size(v_touched);
     SELECT * INTO reap_blob, reap_node, reap_peer
     FROM pg_temp.cairn_drop_unreferenced_blobs(v_touched);
-    UPDATE blobs SET pack_lease_until = NULL WHERE blob_id = ANY(p_sources);
+    IF p_release THEN
+        UPDATE blobs SET pack_lease_until = NULL WHERE blob_id = ANY(p_sources);
+    END IF;
     status := 'committed';
 END
 $$;
@@ -3098,7 +3237,8 @@ $$;
 --   (`p_target_size`), the oldest has waited `p_wait_secs`, or
 --   `p_max_sources` of them wait;
 -- - 'compact': its remote blobs in `p_tier` with at least
---   `p_compact_threshold` of them garbage, least live data first;
+--   `p_compact_threshold` of them garbage or misplaced (see `classes`),
+--   least live data that stays first;
 -- - 'move': its remote blobs in another tier than `p_tier` (any, if it's
 --   NULL: the class is no longer a tier's), oldest first.
 --
@@ -3150,9 +3290,10 @@ BEGIN
             SELECT b.blob_id, b.size - b.dead_size AS live FROM blobs b
             JOIN tier_blobs t ON t.blob_id = b.blob_id
             WHERE b.state = 'remote' AND b.storage_class = p_class AND t.tier = p_tier
-              AND b.dead_size > 0 AND b.dead_size >= b.size * p_compact_threshold
+              AND (b.dead_size > 0 OR b.misplaced_size > 0)
+              AND b.dead_size + b.misplaced_size >= b.size * p_compact_threshold
               AND (b.pack_lease_until IS NULL OR b.pack_lease_until < NOW())
-            ORDER BY b.size - b.dead_size
+            ORDER BY b.size - b.dead_size - b.misplaced_size
             LIMIT p_max_sources FOR UPDATE OF b SKIP LOCKED
         LOOP
             EXIT WHEN v_total + r.live > p_budget AND cardinality(v_sources) > 0;

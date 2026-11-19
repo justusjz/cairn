@@ -1,6 +1,7 @@
 //! Lifecycle rules: expiring objects, noncurrent versions and incomplete
-//! uploads, as a bucket's lifecycle configuration says (see `rules`, and
-//! `s3::buckets::lifecycle` for how it's set).
+//! uploads, and transitioning objects and noncurrent versions into lower
+//! storage classes, as a bucket's lifecycle configuration says (see `rules`,
+//! and `s3::buckets::lifecycle` for how it's set).
 //!
 //! Like S3, Cairn applies the rules in the background, not as objects are
 //! read: an expired object stays readable until a sweep gets to it.
@@ -42,6 +43,13 @@
 //! Expirations are deletes, as DeleteObject's: an expired current version in
 //! a versioned bucket gets a delete marker, and stays as a noncurrent version
 //! until a rule (or a role with `delete-version`) removes it.
+//!
+//! Transitions (`cairn_lifecycle_transition`) change only the versions'
+//! storage classes, to lower ones, which their blobs stand in for (see
+//! `classes`): so a transition costs a sweep no more than an expiration,
+//! and is as quick. The bytes stay where they are until the packer rewrites
+//! their blobs, which it does once enough of them is misplaced or garbage,
+//! and then moves them into the class they belong in.
 
 use std::{collections::BTreeMap, sync::Arc, time::{Duration, SystemTime}};
 
@@ -59,7 +67,7 @@ use crate::{
 
 pub mod rules;
 
-use rules::{Configuration, Day, Due, Kind, Version};
+use rules::{Configuration, Day, Due, Kind, Ranks, Version};
 
 /// How long a claim on a step lasts: how long until another node takes it
 /// up if its node dies. Each page extends it.
@@ -91,6 +99,8 @@ pub struct Report {
     pub removed: i64,
     /// Uploads aborted.
     pub aborted: i64,
+    /// Current and noncurrent versions transitioned.
+    pub transitioned: i64,
     /// Whether it ended the sweep.
     pub finished: bool,
     /// Whether the configuration changed under it, which ended the sweep
@@ -101,7 +111,7 @@ pub struct Report {
 impl Report {
     /// Whether it changed nothing worth reporting.
     pub fn is_empty(&self) -> bool {
-        self.expired + self.removed + self.aborted == 0 && !self.interrupted
+        self.expired + self.removed + self.aborted + self.transitioned == 0 && !self.interrupted
     }
 }
 
@@ -109,8 +119,9 @@ impl std::fmt::Display for Report {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "bucket {}: expired {} objects, removed {} noncurrent versions and delete markers, aborted {} uploads",
-            self.bucket, self.expired, self.removed, self.aborted
+            "bucket {}: expired {} objects, removed {} noncurrent versions and delete markers, aborted {} uploads, \
+             transitioned {} versions",
+            self.bucket, self.expired, self.removed, self.aborted, self.transitioned
         )?;
         if self.interrupted {
             write!(f, " (its configuration changed; starting over)")?;
@@ -130,6 +141,8 @@ pub struct LastSweep {
     pub expired: i64,
     pub removed: i64,
     pub aborted: i64,
+    #[serde(default)]
+    pub transitioned: i64,
 }
 
 /// A bucket's sweep, as a step gets to it.
@@ -142,8 +155,9 @@ struct Sweep {
     generation: i64,
     /// When it started, and the key it has got to; `None` if it's yet to.
     started: Option<(SystemTime, String)>,
-    /// What it had done before this turn: read, expired, removed, aborted.
-    before: [i64; 4],
+    /// What it had done before this turn: read, expired, removed, aborted,
+    /// transitioned.
+    before: [i64; 5],
 }
 
 /// Takes the cluster's next lifecycle step, if it's due as of `now` (the
@@ -313,7 +327,7 @@ async fn next_sweep(client: &Object, now: SystemTime, visited: &[String]) -> any
     let row = client
         .query_opt_cached(
             "SELECT b.name, b.lifecycle, s.started, s.cursor, s.seen, s.expired, s.removed, s.aborted,
-                    s.generation, s.due
+                    s.generation, s.due, s.transitioned
              FROM lifecycle_sweeps s JOIN buckets b ON b.name = s.bucket
              WHERE s.due <= $1 AND NOT (s.bucket = ANY($2))
                AND b.lifecycle IS NOT NULL AND b.lifecycle_generation = s.generation
@@ -330,7 +344,7 @@ async fn next_sweep(client: &Object, now: SystemTime, visited: &[String]) -> any
             config: row.get(1),
             generation: row.get(8),
             started: started.map(|started| (started, cursor.unwrap_or_default())),
-            before: [row.get(4), row.get(5), row.get(6), row.get(7)],
+            before: [row.get(4), row.get(5), row.get(6), row.get(7), row.get(10)],
         }
     }))
 }
@@ -344,11 +358,11 @@ async fn save(
     cursor: &str,
     report: &Report,
 ) -> anyhow::Result<bool> {
-    let [read, expired, removed, aborted] = sweep.before;
+    let [read, expired, removed, aborted, transitioned] = sweep.before;
     let updated = client
         .execute_cached(
             "UPDATE lifecycle_sweeps SET started = $3, cursor = $4, seen = $5,
-                 expired = $6, removed = $7, aborted = $8
+                 expired = $6, removed = $7, aborted = $8, transitioned = $9
              WHERE bucket = $1 AND generation = $2",
             &[
                 &sweep.bucket,
@@ -359,6 +373,7 @@ async fn save(
                 &(expired + report.expired),
                 &(removed + report.removed),
                 &(aborted + report.aborted),
+                &(transitioned + report.transitioned),
             ],
         )
         .await?;
@@ -388,7 +403,7 @@ async fn finish(
     now: SystemTime,
 ) -> anyhow::Result<bool> {
     let secs = |t: SystemTime| t.duration_since(SystemTime::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
-    let [read, expired, removed, aborted] = sweep.before;
+    let [read, expired, removed, aborted, transitioned] = sweep.before;
     let last = LastSweep {
         started: secs(started),
         finished: secs(now),
@@ -396,13 +411,14 @@ async fn finish(
         expired: expired + report.expired,
         removed: removed + report.removed,
         aborted: aborted + report.aborted,
+        transitioned: transitioned + report.transitioned,
     };
     let last = serde_json::to_string(&last)?;
     let next = (started + SWEEP).max(now);
     let updated = client
         .execute_cached(
             "UPDATE lifecycle_sweeps SET started = NULL, cursor = NULL, seen = 0,
-                 expired = 0, removed = 0, aborted = 0, last = $3, due = $4
+                 expired = 0, removed = 0, aborted = 0, transitioned = 0, last = $3, due = $4
              WHERE bucket = $1 AND generation = $2",
             &[&sweep.bucket, &sweep.generation, &last, &next],
         )
@@ -423,6 +439,7 @@ async fn turn(
         anyhow::anyhow!("its lifecycle configuration isn't one this Cairn knows (written by a newer one?): {e}")
     })?;
     let today = Day::of(now);
+    let ranks = ranks(app);
     let mut report = Report { bucket: sweep.bucket.clone(), ..Report::default() };
     let (started, mut after) = sweep.started.clone().unwrap_or((now, String::new()));
     let interrupted = |mut report: Report| {
@@ -443,7 +460,7 @@ async fn turn(
             // A key with more versions than the page held: all of them, a
             // page at a time (in this turn: a sweep resumes at a key).
             if versions.len() == 1 && versions.values().all(|v| v.len() as i64 == limit) {
-                if !long_key(app, client, &sweep, &rules, &last, today, now, &mut report, budget).await? {
+                if !long_key(app, client, &sweep, &rules, &ranks, &last, today, now, &mut report, budget).await? {
                     return interrupted(report);
                 }
             } else {
@@ -452,13 +469,13 @@ async fn turn(
                 // expired, as they would be if a newer one went first.
                 let mut due: Vec<(String, Due)> = versions
                     .iter()
-                    .flat_map(|(key, versions)| rules.due(key, versions, today).into_iter().map(|due| (key.clone(), due)))
+                    .flat_map(|(key, versions)| {
+                        rules.due(&ranks, key, versions, today).into_iter().map(|due| (key.clone(), due))
+                    })
                     .collect();
                 due.reverse();
-                for batch in due.chunks(BATCH) {
-                    if !expire(app, client, &sweep.bucket, sweep.generation, batch, &mut report).await? {
-                        return interrupted(report);
-                    }
+                if !apply(app, client, &sweep, due, &mut report).await? {
+                    return interrupted(report);
                 }
                 let read = versions.values().map(|v| v.len() as i64).sum::<i64>();
                 report.read += read;
@@ -530,7 +547,7 @@ async fn page(
     prefixes: &[String],
     limit: i64,
 ) -> anyhow::Result<Option<(Page, String, bool)>> {
-    const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, last_modified, tags";
+    const COLUMNS: &str = "key, id, version_id, is_latest, is_delete_marker, size, last_modified, tags, storage_class";
     // The ranges of keys under the prefixes, from the first that isn't
     // behind `after`: on to the next once one has no keys left.
     let ranges: Vec<(&String, Option<String>)> =
@@ -578,6 +595,7 @@ async fn page(
             size: row.get(5),
             last_modified: row.get(6),
             tags: row.get(7),
+            storage_class: row.get(8),
         })
     }
     let mut versions = BTreeMap::new();
@@ -600,6 +618,7 @@ async fn long_key(
     client: &Object,
     sweep: &Sweep,
     rules: &Configuration,
+    ranks: &Ranks,
     key: &str,
     today: Day,
     now: SystemTime,
@@ -618,7 +637,8 @@ async fn long_key(
         let (after_modified, after_id) = after.unzip();
         let rows = client
             .query_cached(
-                "SELECT id, version_id, is_latest, is_delete_marker, size, last_modified, tags FROM objects
+                "SELECT id, version_id, is_latest, is_delete_marker, size, last_modified, tags, storage_class
+                 FROM objects
                  WHERE bucket = $1 AND key = $2
                    AND ($3::timestamptz IS NULL OR (last_modified, id) > ($3, $4::bigint))
                  ORDER BY last_modified, id LIMIT $5",
@@ -635,6 +655,7 @@ async fn long_key(
                 size: row.get(4),
                 last_modified: row.get(5),
                 tags: row.get(6),
+                storage_class: row.get(7),
             })
             .collect();
         let next = (run.len() as i64 > PAGE).then(|| run.pop()).flatten();
@@ -648,12 +669,10 @@ async fn long_key(
         run.reverse();
         let before = next.as_ref().map(|next| (next, (total - read - n - 1).max(0) as usize));
         let mut due: Vec<(String, Due)> =
-            rules.due_after(key, before, &run, today).into_iter().map(|due| (key.to_owned(), due)).collect();
+            rules.due_after(ranks, key, before, &run, today).into_iter().map(|due| (key.to_owned(), due)).collect();
         due.reverse();
-        for batch in due.chunks(BATCH) {
-            if !expire(app, client, &sweep.bucket, sweep.generation, batch, report).await? {
-                return Ok(false);
-            }
+        if !apply(app, client, sweep, due, report).await? {
+            return Ok(false);
         }
         read += n;
         report.read += n;
@@ -664,6 +683,90 @@ async fn long_key(
         }
     }
     Ok(true)
+}
+
+/// The classes that have ranks, as this node knows them (see `classes`).
+fn ranks(app: &App) -> Ranks {
+    app.classes.all().values().filter_map(|c| Some((c.name.clone(), c.rank?))).collect()
+}
+
+/// Expires and transitions what's `due` (each key's oldest first), in
+/// batches: the expirations first, in that order, then the transitions,
+/// counting what it did in `report`. Whether the sweep is still the
+/// bucket's (see `expire`).
+async fn apply(
+    app: &Arc<App>,
+    client: &Object,
+    sweep: &Sweep,
+    due: Vec<(String, Due)>,
+    report: &mut Report,
+) -> anyhow::Result<bool> {
+    let (transitions, expirations): (Vec<_>, Vec<_>) = due.into_iter().partition(|(_, due)| due.kind.is_transition());
+    for batch in expirations.chunks(BATCH) {
+        if !expire(app, client, &sweep.bucket, sweep.generation, batch, report).await? {
+            return Ok(false);
+        }
+    }
+    for batch in transitions.chunks(BATCH) {
+        if !transition(client, &sweep.bucket, sweep.generation, batch, report).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Transitions a batch of due versions (`cairn_lifecycle_transition`),
+/// counting those that still were in `report`. Whether the bucket's
+/// configuration was still of `generation` (and its bucket still there).
+async fn transition(
+    client: &Object,
+    bucket: &str,
+    generation: i64,
+    batch: &[(String, Due)],
+    report: &mut Report,
+) -> anyhow::Result<bool> {
+    let keys: Vec<&str> = batch.iter().map(|(key, _)| key.as_str()).collect();
+    let ids: Vec<i64> = batch.iter().map(|(_, due)| due.version.id).collect();
+    let (classes, current): (Vec<&str>, Vec<bool>) = batch
+        .iter()
+        .map(|(_, due)| match &due.kind {
+            Kind::Transition { class, current } => (class.as_str(), *current),
+            kind => unreachable!("not a transition: {kind:?}"),
+        })
+        .unzip();
+    let tags: Vec<&str> = batch.iter().map(|(_, due)| due.version.tags.as_str()).collect();
+    for attempt in 0..db::MAX_TX_ATTEMPTS {
+        db::backoff(attempt).await;
+        let result = client
+            .query_one_cached(
+                "SELECT status, applied FROM pg_temp.cairn_lifecycle_transition($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &bucket,
+                    &generation,
+                    &keys,
+                    &ids,
+                    &classes,
+                    &current,
+                    &tags,
+                    &crate::notifications::lifecycle_context(),
+                ],
+            )
+            .await;
+        let row = match result {
+            Ok(row) => row,
+            Err(e) if db::is_conflict(&e) => continue,
+            Err(e) => return Err(e.into()),
+        };
+        match row.get::<_, &str>(0) {
+            "transitioned" => {}
+            "changed" | "no_such_bucket" => return Ok(false),
+            status => unreachable!("cairn_lifecycle_transition: unknown status {status}"),
+        }
+        let applied: Vec<bool> = row.get(1);
+        report.transitioned += applied.iter().filter(|a| **a).count() as i64;
+        return Ok(true);
+    }
+    Err(crate::Contended("a lifecycle run kept conflicting with other requests".to_owned()).into())
 }
 
 /// Expires a batch of due versions (`cairn_lifecycle_expire`), counting
@@ -724,7 +827,7 @@ async fn expire(
         }
         let applied: Vec<bool> = row.get(1);
         for ((_, due), applied) in batch.iter().zip(applied) {
-            match (applied, due.kind) {
+            match (applied, &due.kind) {
                 (false, _) => {}
                 (true, Kind::Current) => report.expired += 1,
                 (true, _) => report.removed += 1,

@@ -13,26 +13,52 @@
 //!   written, or a delete marker), keeping the newest few if asked.
 //! - `AbortIncompleteMultipartUpload`: an upload is aborted a number of days
 //!   after it was created.
+//! - `Transition`: the current version moves to a lower storage class (see
+//!   `classes`) a number of days after it was written, or from a date on.
+//! - `NoncurrentVersionTransition`: a noncurrent version moves to a lower
+//!   class a number of days after it became noncurrent, but the newest few
+//!   if asked.
 //!
 //! As in S3, a number of days counts from the version's time to the next
 //! midnight UTC after that many days: an object written at 10:30 on the 1st,
 //! under a rule of 1 day, expires at midnight starting the 3rd.
 //!
-//! Not supported, and refused when asked for: transitions to other storage
-//! classes (Cairn has one). That would be more fields here, and more kinds
-//! of `Due`; the stored JSON refuses fields it doesn't know
-//! (`deny_unknown_fields`), so that a node too old to know a newer rule's
-//! field skips the bucket instead of applying the rule without it (as nodes
-//! from before tag filters do with a rule that has one).
+//! A transition only changes the version's class, and leaves its bytes
+//! where they are, which the class they're in stands in for (see
+//! `classes`), until the packer moves them. So it goes only to a lower class
+//! than the version's: of the transitions due, the one to the lowest class.
+//! A version that's due to expire isn't transitioned. Classes that aren't
+//! ranked are neither transitioned into nor out of. As in S3, a rule without
+//! a size filter doesn't transition objects under 128 KiB, unless the
+//! configuration says otherwise (`TransitionMinimum`); nor do S3's rules on
+//! the days between transitions apply, since the classes are the
+//! operator's.
+//!
+//! The stored JSON refuses fields it doesn't know (`deny_unknown_fields`), so
+//! that a node too old to know a newer rule's field skips the bucket instead
+//! of applying the rule without it (as nodes from before tag filters do with
+//! a rule that has one, and nodes from before transitions with a rule that
+//! transitions).
 //!
 //! What S3 takes, and its errors, follow S3 itself where it was observed
 //! (see `plans/tagging.md`).
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 use crate::s3::{tags::Tags, util::xml_escape};
+
+/// The storage classes that have a rank, by name (see `classes`).
+pub type Ranks = BTreeMap<String, i32>;
+
+/// The smallest object a rule without a size filter transitions, as in S3.
+pub const MIN_TRANSITION_SIZE: i64 = 128 * 1024;
+/// The classes that `varies_by_storage_class` transitions smaller objects
+/// into, as S3 does (its Glacier Flexible Retrieval and Deep Archive).
+const SMALL_OBJECT_CLASSES: &[&str] = &["GLACIER", "DEEP_ARCHIVE"];
 
 /// The most rules a configuration may have, as in S3.
 const MAX_RULES: usize = 1000;
@@ -52,6 +78,41 @@ const ABORT_WITH_SIZE: &str = "AbortIncompleteMultipartUpload cannot be specifie
 #[schema(as = LifecycleConfiguration)]
 pub struct Configuration {
     pub rules: Vec<Rule>,
+    /// Which objects too small for a transition are, for the rules without
+    /// a size filter: S3's `x-amz-transition-default-minimum-object-size`.
+    /// `None` is its default, `all_storage_classes_128K`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition_minimum: Option<TransitionMinimum>,
+}
+
+/// S3's `x-amz-transition-default-minimum-object-size`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+pub enum TransitionMinimum {
+    /// Objects under 128 KiB aren't transitioned.
+    #[serde(rename = "all_storage_classes_128K")]
+    AllStorageClasses128K,
+    /// Nor are they, but into GLACIER and DEEP_ARCHIVE.
+    #[serde(rename = "varies_by_storage_class")]
+    VariesByStorageClass,
+}
+
+impl TransitionMinimum {
+    /// The header's value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransitionMinimum::AllStorageClasses128K => "all_storage_classes_128K",
+            TransitionMinimum::VariesByStorageClass => "varies_by_storage_class",
+        }
+    }
+
+    /// The header's value, parsed; `None` if it isn't one.
+    pub fn parse(value: &str) -> Option<TransitionMinimum> {
+        match value {
+            "all_storage_classes_128K" => Some(TransitionMinimum::AllStorageClasses128K),
+            "varies_by_storage_class" => Some(TransitionMinimum::VariesByStorageClass),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
@@ -71,6 +132,36 @@ pub struct Rule {
     /// `AbortIncompleteMultipartUpload`'s `DaysAfterInitiation`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub abort_upload_days: Option<u32>,
+    /// `Transition`s, each into a class of its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions: Vec<Transition>,
+    /// `NoncurrentVersionTransition`s, each into a class of its own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub noncurrent_transitions: Vec<NoncurrentTransition>,
+}
+
+/// `Transition`: one of `days` and `date`, and the class.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(as = LifecycleTransition)]
+pub struct Transition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub days: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<Day>,
+    pub storage_class: String,
+}
+
+/// `NoncurrentVersionTransition`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+#[schema(as = LifecycleNoncurrentTransition)]
+pub struct NoncurrentTransition {
+    pub days: u32,
+    /// How many of the newest noncurrent versions stay where they are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub newer_versions: Option<u32>,
+    pub storage_class: String,
 }
 
 /// Which objects a rule applies to: those with keys starting with `prefix`,
@@ -264,8 +355,6 @@ pub enum Invalid {
     Argument(String),
     /// 400 InvalidRequest: likewise, where S3 answers so.
     Request(String),
-    /// 501 NotImplemented: something S3 has and Cairn doesn't.
-    Unsupported(String),
 }
 
 type Node<'a, 'i> = roxmltree::Node<'a, 'i>;
@@ -327,7 +416,7 @@ impl Configuration {
             return Err(Invalid::Argument(format!("a lifecycle configuration has at most {MAX_RULES} rules")));
         }
         let rules = rules.into_iter().map(Rule::parse).collect::<Result<Vec<_>, _>>()?;
-        Configuration { rules }.check().map_err(Invalid::Argument)
+        Configuration { rules, transition_minimum: None }.check().map_err(Invalid::Argument)
     }
 
     /// Checks a configuration as it's given other than in S3's XML (by the
@@ -381,21 +470,18 @@ impl Configuration {
         self.rules.iter().filter(|r| r.enabled)
     }
 
-    /// Whether any rule expires objects or versions (rather than only
-    /// aborting uploads).
+    /// Whether any rule expires or transitions objects or versions (rather
+    /// than only aborting uploads).
     pub fn expires_objects(&self) -> bool {
-        self.enabled().any(|r| r.expiration.is_some() || r.noncurrent_expiration.is_some())
+        self.enabled().any(Rule::acts_on_versions)
     }
 
-    /// The prefixes a sweep has to walk for the rules that expire objects or
-    /// versions: those of their keys, in order, none under another (just the
-    /// empty one, if one covers every key).
+    /// The prefixes a sweep has to walk for the rules that expire or
+    /// transition objects or versions: those of their keys, in order, none
+    /// under another (just the empty one, if one covers every key).
     pub fn prefixes(&self) -> Vec<String> {
-        let mut prefixes: Vec<&str> = self
-            .enabled()
-            .filter(|r| r.expiration.is_some() || r.noncurrent_expiration.is_some())
-            .map(|r| r.filter.prefix.as_str())
-            .collect();
+        let mut prefixes: Vec<&str> =
+            self.enabled().filter(|r| r.acts_on_versions()).map(|r| r.filter.prefix.as_str()).collect();
         prefixes.sort_unstable();
         let mut kept: Vec<String> = Vec::new();
         for prefix in prefixes {
@@ -412,17 +498,67 @@ impl Configuration {
         self.enabled().any(|r| r.abort_upload_days.is_some())
     }
 
+    /// The storage classes its transitions go to that aren't ranked
+    /// classes of `ranks` (see `classes`): what's wrong, if any is.
+    pub fn check_classes(&self, ranks: &Ranks, defined: impl Fn(&str) -> bool) -> Result<(), String> {
+        let classes = self.rules.iter().flat_map(|r| {
+            r.transitions
+                .iter()
+                .map(|t| t.storage_class.as_str())
+                .chain(r.noncurrent_transitions.iter().map(|t| t.storage_class.as_str()))
+        });
+        for class in classes {
+            if !defined(class) {
+                return Err(format!("there's no storage class {class} to transition objects into"));
+            }
+            if !ranks.contains_key(class) {
+                return Err(format!(
+                    "the storage class {class} has no rank: objects are only transitioned between ranked classes"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// What's due among the versions of `key` (all of them, newest first),
-    /// as of `today`.
-    pub fn due(&self, key: &str, versions: &[Version], today: Day) -> Vec<Due> {
-        self.due_after(key, None, versions, today)
+    /// as of `today`, with the classes ranked as `ranks` has them.
+    pub fn due(&self, ranks: &Ranks, key: &str, versions: &[Version], today: Day) -> Vec<Due> {
+        self.due_after(ranks, key, None, versions, today)
+    }
+
+    /// Whether `rule` leaves an object of `size` alone for being too small
+    /// to transition into `class` (see `TransitionMinimum`).
+    fn too_small(&self, rule: &Rule, class: &str, size: i64) -> bool {
+        let filtered = rule.filter.size_greater_than.is_some() || rule.filter.size_less_than.is_some();
+        let exempt = self.transition_minimum == Some(TransitionMinimum::VariesByStorageClass)
+            && SMALL_OBJECT_CLASSES.contains(&class);
+        !filtered && !exempt && size < MIN_TRANSITION_SIZE
+    }
+
+    /// The class to transition `version` into, of `classes` (those of the
+    /// transitions due), if any is: the lowest, if it's below the
+    /// version's own class.
+    fn coldest<'a>(ranks: &Ranks, version: &Version, classes: impl Iterator<Item = &'a str>) -> Option<String> {
+        let own = *ranks.get(&version.storage_class)?;
+        classes
+            .filter_map(|class| Some((*ranks.get(class)?, class)))
+            .filter(|(rank, _)| *rank < own)
+            .min()
+            .map(|(_, class)| class.to_owned())
     }
 
     /// `due`, for a run of `key`'s versions (newest first) that comes
     /// right after `before`: the version before them, and its place among
     /// all of them (0: the newest). `None`: they start with the newest. So
     /// a key with many versions is taken a run at a time.
-    pub fn due_after(&self, key: &str, before: Option<(&Version, usize)>, versions: &[Version], today: Day) -> Vec<Due> {
+    pub fn due_after(
+        &self,
+        ranks: &Ranks,
+        key: &str,
+        before: Option<(&Version, usize)>,
+        versions: &[Version],
+        today: Day,
+    ) -> Vec<Due> {
         let mut due = Vec::new();
         let Some((newest, older)) = versions.split_first() else { return due };
         if before.is_none() && newest.is_latest {
@@ -439,6 +575,17 @@ impl Configuration {
             if expired {
                 let kind = if newest.delete_marker { Kind::Marker } else { Kind::Current };
                 due.push(Due { version: newest.clone(), kind });
+            } else if !newest.delete_marker {
+                let classes = rules().flat_map(|r| {
+                    r.transitions
+                        .iter()
+                        .filter(|t| t.transitions(newest.last_modified, today))
+                        .filter(move |t| !self.too_small(r, &t.storage_class, newest.size))
+                        .map(|t| t.storage_class.as_str())
+                });
+                if let Some(class) = Self::coldest(ranks, newest, classes) {
+                    due.push(Due { version: newest.clone(), kind: Kind::Transition { class, current: true } });
+                }
             }
         }
         // A version became noncurrent when the next one was written.
@@ -465,6 +612,18 @@ impl Configuration {
                 // Those noncurrent versions, and the current one.
                 let kind = Kind::Noncurrent { successor: successor.id, newer: keeps as i32 + 1 };
                 due.push(Due { version: version.clone(), kind });
+            } else if !version.delete_marker {
+                let classes = self.enabled().filter(|r| r.filter.matches(key, version)).flat_map(|r| {
+                    r.noncurrent_transitions
+                        .iter()
+                        .filter(|t| successor.last_modified <= today.cutoff(t.days))
+                        .filter(|t| newer >= t.newer_versions.unwrap_or(0) as usize)
+                        .filter(move |t| !self.too_small(r, &t.storage_class, version.size))
+                        .map(|t| t.storage_class.as_str())
+                });
+                if let Some(class) = Self::coldest(ranks, version, classes) {
+                    due.push(Due { version: version.clone(), kind: Kind::Transition { class, current: false } });
+                }
             }
         }
         due
@@ -493,6 +652,7 @@ impl Configuration {
             size,
             last_modified: written,
             tags: tags.to_owned(),
+            storage_class: String::new(),
         };
         let after = Day::after(written);
         earliest(self.enabled().filter(|r| r.filter.matches(key, &version)).filter_map(|r| {
@@ -569,6 +729,7 @@ impl Rule {
         if self.abort_upload_days == Some(0) {
             return Err("DaysAfterInitiation must be at least 1".to_owned());
         }
+        self.check_transitions()?;
         if self.abort_upload_days.is_some() && !f.tags.is_empty() {
             // An upload has no tags yet.
             return Err(ABORT_WITH_TAGS.to_owned());
@@ -577,8 +738,80 @@ impl Rule {
             // An upload has no size yet.
             return Err(ABORT_WITH_SIZE.to_owned());
         }
-        if self.expiration.is_none() && self.noncurrent_expiration.is_none() && self.abort_upload_days.is_none() {
+        if !self.acts_on_versions() && self.abort_upload_days.is_none() {
             return Err("At least one action needs to be specified in a rule".to_owned());
+        }
+        Ok(())
+    }
+
+    /// Whether it expires or transitions objects or versions.
+    fn acts_on_versions(&self) -> bool {
+        self.expiration.is_some()
+            || self.noncurrent_expiration.is_some()
+            || !self.transitions.is_empty()
+            || !self.noncurrent_transitions.is_empty()
+    }
+
+    /// What's wrong with its transitions, if anything, as S3 says it where
+    /// S3 has the rule.
+    fn check_transitions(&self) -> Result<(), String> {
+        for t in &self.transitions {
+            match (t.days, t.date) {
+                (Some(_), Some(_)) => return Err("a Transition has either Days or a Date".to_owned()),
+                (None, None) => return Err("a Transition needs Days or a Date".to_owned()),
+                _ => {}
+            }
+        }
+        let classes = |classes: Vec<&str>, what: &str| {
+            let mut sorted = classes.clone();
+            sorted.sort_unstable();
+            match sorted.windows(2).any(|w| w[0] == w[1]) {
+                true => Err(format!("'StorageClass' must be different for '{what}' actions in same 'Rule'")),
+                false => Ok(()),
+            }
+        };
+        classes(self.transitions.iter().map(|t| t.storage_class.as_str()).collect(), "Transition")?;
+        classes(
+            self.noncurrent_transitions.iter().map(|t| t.storage_class.as_str()).collect(),
+            "NoncurrentVersionTransition",
+        )?;
+        let by_days = self.transitions.iter().any(|t| t.days.is_some());
+        let by_date = self.transitions.iter().any(|t| t.date.is_some());
+        if by_days && by_date {
+            return Err("Found mixed 'Date' and 'Days' based Transition actions in lifecycle rule".to_owned());
+        }
+        if let Some(e) = &self.expiration {
+            if (by_days && e.date.is_some()) || (by_date && e.days.is_some()) {
+                return Err("Found mixed 'Date' and 'Days' based Expiration and Transition actions in lifecycle rule"
+                    .to_owned());
+            }
+            if let Some(days) = e.days
+                && self.transitions.iter().filter_map(|t| t.days).any(|t| t >= days)
+            {
+                return Err("'Days' in Expiration action must be greater than 'Days' in Transition action".to_owned());
+            }
+            if let Some(date) = e.date
+                && self.transitions.iter().filter_map(|t| t.date).any(|t| t >= date)
+            {
+                return Err("'Date' in Expiration action must be later than 'Date' in Transition action".to_owned());
+            }
+        }
+        if let Some(n) = &self.noncurrent_expiration
+            && self.noncurrent_transitions.iter().any(|t| t.days >= n.days)
+        {
+            return Err("'NoncurrentDays' in NoncurrentVersionExpiration action must be greater than \
+                        'NoncurrentDays' in NoncurrentVersionTransition action"
+                .to_owned());
+        }
+        for t in &self.noncurrent_transitions {
+            if t.newer_versions.is_some_and(|v| v == 0 || v > MAX_NEWER_NONCURRENT) {
+                return Err(format!("NewerNoncurrentVersions must be between 1 and {MAX_NEWER_NONCURRENT}"));
+            }
+        }
+        for class in self.transitions.iter().map(|t| &t.storage_class).chain(self.noncurrent_transitions.iter().map(|t| &t.storage_class)) {
+            if !crate::classes::valid_name(class) {
+                return Err(format!("{class:?} isn't the name of a storage class"));
+            }
         }
         Ok(())
     }
@@ -598,11 +831,6 @@ impl Rule {
                 "NoncurrentVersionTransition",
             ],
         )?;
-        if !children(node, "Transition").is_empty() || !children(node, "NoncurrentVersionTransition").is_empty() {
-            return Err(Invalid::Unsupported(
-                "lifecycle transitions aren't supported yet: objects change storage class by being copied into it".to_owned(),
-            ));
-        }
         let id = match text(node, "ID")? {
             Some(id) if id.len() > MAX_ID_LENGTH => {
                 return Err(Invalid::Argument(format!("ID length should not exceed allowed limit of {MAX_ID_LENGTH}")));
@@ -667,10 +895,25 @@ impl Rule {
             // An upload has no size yet.
             return Err(Invalid::Request(ABORT_WITH_SIZE.to_owned()));
         }
-        if expiration.is_none() && noncurrent_expiration.is_none() && abort_upload_days.is_none() {
+        let transitions = children(node, "Transition").into_iter().map(Transition::parse).collect::<Result<Vec<_>, _>>()?;
+        let noncurrent_transitions = children(node, "NoncurrentVersionTransition")
+            .into_iter()
+            .map(NoncurrentTransition::parse)
+            .collect::<Result<Vec<_>, _>>()?;
+        let rule = Rule {
+            id,
+            enabled,
+            filter,
+            expiration,
+            noncurrent_expiration,
+            abort_upload_days,
+            transitions,
+            noncurrent_transitions,
+        };
+        if !rule.acts_on_versions() && rule.abort_upload_days.is_none() {
             return Err(Invalid::Argument("At least one action needs to be specified in a rule".to_owned()));
         }
-        Ok(Rule { id, enabled, filter, expiration, noncurrent_expiration, abort_upload_days })
+        Ok(rule)
     }
 
     fn write_xml(&self, out: &mut String) {
@@ -689,6 +932,27 @@ impl Rule {
                 out.push_str("<ExpiredObjectDeleteMarker>true</ExpiredObjectDeleteMarker>");
             }
             out.push_str("</Expiration>");
+        }
+        for t in &self.transitions {
+            out.push_str("<Transition>");
+            if let Some(days) = t.days {
+                out.push_str(&format!("<Days>{days}</Days>"));
+            }
+            if let Some(date) = t.date {
+                out.push_str(&format!("<Date>{}</Date>", date.to_iso()));
+            }
+            out.push_str(&format!("<StorageClass>{}</StorageClass></Transition>", xml_escape(&t.storage_class)));
+        }
+        for t in &self.noncurrent_transitions {
+            out.push_str(&format!(
+                "<NoncurrentVersionTransition><NoncurrentDays>{}</NoncurrentDays><StorageClass>{}</StorageClass>",
+                t.days,
+                xml_escape(&t.storage_class)
+            ));
+            if let Some(newer) = t.newer_versions {
+                out.push_str(&format!("<NewerNoncurrentVersions>{newer}</NewerNoncurrentVersions>"));
+            }
+            out.push_str("</NoncurrentVersionTransition>");
         }
         if let Some(n) = &self.noncurrent_expiration {
             out.push_str(&format!("<NoncurrentVersionExpiration><NoncurrentDays>{}</NoncurrentDays>", n.days));
@@ -855,6 +1119,46 @@ impl Expiration {
     }
 }
 
+/// A `<StorageClass>`, as given.
+fn storage_class(node: Node, action: &str) -> Result<String, Invalid> {
+    text(node, "StorageClass")?.ok_or_else(|| Invalid::Malformed(format!("a {action} needs a StorageClass")))
+}
+
+impl Transition {
+    fn parse(node: Node) -> Result<Transition, Invalid> {
+        only(node, &["Days", "Date", "StorageClass"])?;
+        let transition = Transition {
+            days: number(node, "Days", 0u32)?,
+            date: text(node, "Date")?.as_deref().map(Day::parse).transpose()?,
+            storage_class: storage_class(node, "Transition")?,
+        };
+        match (transition.days, transition.date) {
+            (Some(_), Some(_)) => Err(Invalid::Malformed("a Transition has either Days or a Date".to_owned())),
+            (None, None) => Err(Invalid::Malformed("a Transition needs Days or a Date".to_owned())),
+            _ => Ok(transition),
+        }
+    }
+
+    /// Whether a current version written at `written` is due for it by
+    /// `today`.
+    fn transitions(&self, written: SystemTime, today: Day) -> bool {
+        self.days.is_some_and(|days| written <= today.cutoff(days)) || self.date.is_some_and(|date| today >= date)
+    }
+}
+
+impl NoncurrentTransition {
+    fn parse(node: Node) -> Result<NoncurrentTransition, Invalid> {
+        only(node, &["NoncurrentDays", "NewerNoncurrentVersions", "StorageClass"])?;
+        let days = number(node, "NoncurrentDays", 0u32)?
+            .ok_or_else(|| Invalid::Malformed("NoncurrentVersionTransition needs NoncurrentDays".to_owned()))?;
+        let newer_versions = number(node, "NewerNoncurrentVersions", 1u32)?;
+        if newer_versions.is_some_and(|n| n > MAX_NEWER_NONCURRENT) {
+            return Err(Invalid::Argument(format!("NewerNoncurrentVersions must be at most {MAX_NEWER_NONCURRENT}")));
+        }
+        Ok(NoncurrentTransition { days, newer_versions, storage_class: storage_class(node, "NoncurrentVersionTransition")? })
+    }
+}
+
 /// The least text that sorts after every text starting with `prefix`, or
 /// `None` if there's none (or the prefix is empty): as `cairn_prefix_end`
 /// works it out, by code points, which is byte order in UTF-8.
@@ -883,17 +1187,20 @@ pub struct Version {
     pub last_modified: SystemTime,
     /// Its tags, stored form (see `s3::tags`).
     pub tags: String,
+    /// Its storage class (see `classes`).
+    pub storage_class: String,
 }
 
 /// A version that a rule made due, and what made it so, as
-/// `cairn_lifecycle_expire` checks it again.
+/// `cairn_lifecycle_expire` (or `cairn_lifecycle_transition`) checks it
+/// again.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Due {
     pub version: Version,
     pub kind: Kind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum Kind {
     /// The current version expires (a delete, as DeleteObject's).
     Current,
@@ -905,15 +1212,24 @@ pub enum Kind {
     /// it's removed. (Not how many were newer when it was read: others
     /// expired since, in an earlier batch, don't make it undue.)
     Noncurrent { successor: i64, newer: i32 },
+    /// The version moves to the lower class `class`: the current one, if
+    /// `current` (which it must still be), else a noncurrent one.
+    Transition { class: String, current: bool },
 }
 
 impl Kind {
-    pub fn as_db(self) -> &'static str {
+    pub fn as_db(&self) -> &'static str {
         match self {
             Kind::Current => "current",
             Kind::Marker => "marker",
             Kind::Noncurrent { .. } => "noncurrent",
+            Kind::Transition { .. } => "transition",
         }
+    }
+
+    /// Whether it's a transition (rather than an expiration).
+    pub fn is_transition(&self) -> bool {
+        matches!(self, Kind::Transition { .. })
     }
 }
 
@@ -990,6 +1306,8 @@ mod tests {
                 expiration: Some(Expiration { days: Some(30), ..Expiration::default() }),
                 noncurrent_expiration: None,
                 abort_upload_days: None,
+                transitions: Vec::new(),
+                noncurrent_transitions: Vec::new(),
             }
         );
         assert_eq!(
@@ -1120,15 +1438,6 @@ mod tests {
         for (bad, why) in request {
             assert_eq!(parse(&bad), Err(Invalid::Request(why.to_owned())), "{bad}");
         }
-        let unsupported = [
-            rule(
-                "<Filter/><Status>Enabled</Status><Transition><Days>1</Days>\
-                 <StorageClass>GLACIER</StorageClass></Transition>",
-            ),
-        ];
-        for bad in unsupported {
-            assert!(matches!(parse(&bad), Err(Invalid::Unsupported(_))), "{bad}");
-        }
     }
 
     #[test]
@@ -1224,22 +1533,22 @@ mod tests {
         let later = Day(first.0 + 5);
         let tagged = |id, latest, marker, tags: &str| Version { tags: tags.to_owned(), ..version(id, at(first, 10), latest, marker, 10) };
         // Every tag, with its value; others don't matter.
-        assert_eq!(kinds(&rules.due("logs/x", &[tagged(1, true, false, "a=1&b=&c=3")], later)), vec![(1, Kind::Current)]);
+        assert_eq!(kinds(&rules.due(&ranks(), "logs/x", &[tagged(1, true, false, "a=1&b=&c=3")], later)), vec![(1, Kind::Current)]);
         for tags in ["", "a=1", "a=1&b=x", "a=2&b=", "b="] {
-            assert_eq!(rules.due("logs/x", &[tagged(1, true, false, tags)], later), vec![], "{tags}");
+            assert_eq!(rules.due(&ranks(), "logs/x", &[tagged(1, true, false, tags)], later), vec![], "{tags}");
         }
         // Not under the prefix.
-        assert_eq!(rules.due("other", &[tagged(1, true, false, "a=1&b=")], later), vec![]);
+        assert_eq!(rules.due(&ranks(), "other", &[tagged(1, true, false, "a=1&b=")], later), vec![]);
         // A noncurrent version by its own tags, not its successor's.
         let versions = [tagged(3, true, false, ""), tagged(2, false, false, "a=1&b="), tagged(1, false, false, "a=1")];
         assert_eq!(
-            kinds(&rules.due("logs/x", &versions, later)),
+            kinds(&rules.due(&ranks(), "logs/x", &versions, later)),
             vec![(2, Kind::Noncurrent { successor: 3, newer: 1 })]
         );
         // A delete marker has no tags.
         let versions = [tagged(2, true, true, ""), tagged(1, false, false, "a=1&b=")];
         assert_eq!(
-            kinds(&rules.due("logs/x", &versions, later)),
+            kinds(&rules.due(&ranks(), "logs/x", &versions, later)),
             vec![(1, Kind::Noncurrent { successor: 2, newer: 1 })]
         );
     }
@@ -1253,11 +1562,21 @@ mod tests {
             size,
             last_modified: written,
             tags: String::new(),
+            storage_class: "STANDARD".to_owned(),
         }
     }
 
     fn kinds(due: &[Due]) -> Vec<(i64, Kind)> {
-        due.iter().map(|d| (d.version.id, d.kind)).collect()
+        due.iter().map(|d| (d.version.id, d.kind.clone())).collect()
+    }
+
+    /// The classes the tests rank: STANDARD, a lower one, and a lower one
+    /// still; and ODD, which has no rank.
+    fn ranks() -> Ranks {
+        [("FAST", 10), ("STANDARD", 0), ("COLD", -10), ("ARCHIVE", -20)]
+            .into_iter()
+            .map(|(name, rank)| (name.to_owned(), rank))
+            .collect()
     }
 
     #[test]
@@ -1271,19 +1590,19 @@ mod tests {
         let object = [version(1, at(first, 10), true, false, 10)];
         // Written at 10:00 on the 1st: one day later is 10:00 on the 2nd, so
         // it expires at midnight starting the 3rd.
-        assert_eq!(rules.due("logs/a", &object, Day(first.0 + 1)), vec![]);
-        assert_eq!(kinds(&rules.due("logs/a", &object, Day(first.0 + 2))), vec![(1, Kind::Current)]);
+        assert_eq!(rules.due(&ranks(), "logs/a", &object, Day(first.0 + 1)), vec![]);
+        assert_eq!(kinds(&rules.due(&ranks(), "logs/a", &object, Day(first.0 + 2))), vec![(1, Kind::Current)]);
         // Not another prefix's, nor a larger object.
-        assert_eq!(rules.due("other/a", &object, Day(first.0 + 2)), vec![]);
+        assert_eq!(rules.due(&ranks(), "other/a", &object, Day(first.0 + 2)), vec![]);
         let large = [version(1, at(first, 10), true, false, 100)];
-        assert_eq!(rules.due("logs/a", &large, Day(first.0 + 2)), vec![]);
+        assert_eq!(rules.due(&ranks(), "logs/a", &large, Day(first.0 + 2)), vec![]);
         // A disabled rule does nothing.
         let mut disabled = rules.clone();
         disabled.rules[0].enabled = false;
-        assert_eq!(disabled.due("logs/a", &object, Day(first.0 + 2)), vec![]);
+        assert_eq!(disabled.due(&ranks(), "logs/a", &object, Day(first.0 + 2)), vec![]);
         // A current delete marker doesn't expire again.
         let hidden = [version(2, at(first, 10), true, true, 0), version(1, at(first, 9), false, false, 10)];
-        assert_eq!(rules.due("logs/a", &hidden, Day(first.0 + 2)), vec![]);
+        assert_eq!(rules.due(&ranks(), "logs/a", &hidden, Day(first.0 + 2)), vec![]);
     }
 
     #[test]
@@ -1295,8 +1614,8 @@ mod tests {
         .unwrap();
         let date = day(2026, 6, 1);
         let object = [version(1, at(date, 5), true, false, 1)];
-        assert_eq!(rules.due("a", &object, Day(date.0 - 1)), vec![]);
-        assert_eq!(kinds(&rules.due("a", &object, date)), vec![(1, Kind::Current)]);
+        assert_eq!(rules.due(&ranks(), "a", &object, Day(date.0 - 1)), vec![]);
+        assert_eq!(kinds(&rules.due(&ranks(), "a", &object, date)), vec![(1, Kind::Current)]);
     }
 
     #[test]
@@ -1309,12 +1628,12 @@ mod tests {
         .unwrap();
         let today = day(2026, 1, 1);
         let lone = [version(3, at(today, 0), true, true, 0)];
-        assert_eq!(kinds(&rules.due("a", &lone, today)), vec![(3, Kind::Marker)]);
+        assert_eq!(kinds(&rules.due(&ranks(), "a", &lone, today)), vec![(3, Kind::Marker)]);
         let hiding = [version(3, at(today, 0), true, true, 0), version(2, at(today, 0), false, false, 10)];
-        assert_eq!(rules.due("a", &hiding, today), vec![]);
+        assert_eq!(rules.due(&ranks(), "a", &hiding, today), vec![]);
         // Objects don't expire under it.
         let object = [version(1, at(Day(0), 0), true, false, 10)];
-        assert_eq!(rules.due("a", &object, today), vec![]);
+        assert_eq!(rules.due(&ranks(), "a", &object, today), vec![]);
     }
 
     #[test]
@@ -1336,24 +1655,24 @@ mod tests {
         // The newest noncurrent version (3) is kept regardless. 2 became
         // noncurrent at noon on the 3rd, so is due from the 6th; 1 at noon on
         // the 1st, so from the 4th.
-        assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 2))), vec![]);
+        assert_eq!(kinds(&rules.due(&ranks(), "a", &versions, Day(first.0 + 2))), vec![]);
         let noncurrent = |successor, newer| Kind::Noncurrent { successor, newer };
         // Each needs the noncurrent version kept, and the current one, to be
         // there still when it's expired.
-        assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 3))), vec![(1, noncurrent(2, 2))]);
-        assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 4))), vec![(1, noncurrent(2, 2))]);
-        assert_eq!(kinds(&rules.due("a", &versions, Day(first.0 + 5))).len(), 2);
+        assert_eq!(kinds(&rules.due(&ranks(), "a", &versions, Day(first.0 + 3))), vec![(1, noncurrent(2, 2))]);
+        assert_eq!(kinds(&rules.due(&ranks(), "a", &versions, Day(first.0 + 4))), vec![(1, noncurrent(2, 2))]);
+        assert_eq!(kinds(&rules.due(&ranks(), "a", &versions, Day(first.0 + 5))).len(), 2);
         let later = Day(first.0 + 30);
-        assert_eq!(kinds(&rules.due("a", &versions, later)), vec![(2, noncurrent(3, 2)), (1, noncurrent(2, 2))]);
+        assert_eq!(kinds(&rules.due(&ranks(), "a", &versions, later)), vec![(2, noncurrent(3, 2)), (1, noncurrent(2, 2))]);
         // A run of versions at a time (as a key with many is taken), the same.
         for split in 1..versions.len() {
             let (run, rest) = versions.split_at(split);
-            let mut due = rules.due_after("a", None, run, later);
-            due.extend(rules.due_after("a", Some((&run[split - 1], split - 1)), rest, later));
-            assert_eq!(due, rules.due("a", &versions, later), "{split}");
+            let mut due = rules.due_after(&ranks(), "a", None, run, later);
+            due.extend(rules.due_after(&ranks(), "a", Some((&run[split - 1], split - 1)), rest, later));
+            assert_eq!(due, rules.due(&ranks(), "a", &versions, later), "{split}");
         }
         // The current version never is.
-        assert_eq!(rules.due("a", &versions[..1], Day(first.0 + 30)), vec![]);
+        assert_eq!(rules.due(&ranks(), "a", &versions[..1], Day(first.0 + 30)), vec![]);
     }
 
     #[test]
@@ -1467,12 +1786,191 @@ mod tests {
             size: 5,
             last_modified: written,
             tags: String::new(),
+            storage_class: "STANDARD".to_owned(),
         };
-        assert!(rules.due("d/x", std::slice::from_ref(&version), Day(due.0 - 1)).is_empty());
-        assert_eq!(rules.due("d/x", std::slice::from_ref(&version), due).len(), 1);
+        assert!(rules.due(&ranks(), "d/x", std::slice::from_ref(&version), Day(due.0 - 1)).is_empty());
+        assert_eq!(rules.due(&ranks(), "d/x", std::slice::from_ref(&version), due).len(), 1);
         // At midnight exactly, the days count from it.
         let midnight = day(2026, 11, 15).midnight();
         assert_eq!(rules.expiry("d/x", 5, "", midnight).unwrap().0, day(2026, 11, 25));
         assert_eq!(Day(0).to_http(), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    fn transition(days: u32, class: &str) -> String {
+        format!("<Transition><Days>{days}</Days><StorageClass>{class}</StorageClass></Transition>")
+    }
+
+    #[test]
+    fn parses_and_writes_transitions() {
+        let rules = parse(&format!(
+            "<Rule><ID>t</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>\
+             <Expiration><Days>365</Days></Expiration>{}{}\
+             <NoncurrentVersionTransition><NoncurrentDays>7</NoncurrentDays><StorageClass>COLD</StorageClass>\
+             <NewerNoncurrentVersions>2</NewerNoncurrentVersions></NoncurrentVersionTransition></Rule>\
+             <Rule><ID>d</ID><Filter/><Status>Enabled</Status><Transition><Date>2027-01-01T00:00:00Z</Date>\
+             <StorageClass>ARCHIVE</StorageClass></Transition></Rule>",
+            transition(0, "COLD"),
+            transition(90, "ARCHIVE"),
+        ))
+        .unwrap();
+        assert_eq!(
+            rules.rules[0].transitions,
+            [
+                Transition { days: Some(0), date: None, storage_class: "COLD".to_owned() },
+                Transition { days: Some(90), date: None, storage_class: "ARCHIVE".to_owned() },
+            ]
+        );
+        assert_eq!(
+            rules.rules[0].noncurrent_transitions,
+            [NoncurrentTransition { days: 7, newer_versions: Some(2), storage_class: "COLD".to_owned() }]
+        );
+        assert_eq!(rules.rules[1].transitions[0].date, Some(day(2027, 1, 1)));
+        assert_eq!(Configuration::parse(&rules.to_xml()), Ok(rules.clone()));
+        assert_eq!(Configuration::from_json(&rules.to_json()).unwrap(), rules);
+        assert_eq!(rules.prefixes(), [""]);
+        // Only ranked classes, that exist.
+        let defined = |class: &str| ["STANDARD", "COLD", "ARCHIVE", "ODD"].contains(&class);
+        assert_eq!(rules.check_classes(&ranks(), defined), Ok(()));
+        let odd = parse(&format!("<Rule><Filter/><Status>Enabled</Status>{}</Rule>", transition(1, "ODD"))).unwrap();
+        assert!(odd.check_classes(&ranks(), defined).unwrap_err().contains("no rank"));
+        let gone = parse(&format!("<Rule><Filter/><Status>Enabled</Status>{}</Rule>", transition(1, "GLACIER"))).unwrap();
+        assert!(gone.check_classes(&ranks(), defined).unwrap_err().contains("no storage class"));
+        // The minimum is stored with the rules.
+        let mut varies = rules.clone();
+        varies.transition_minimum = Some(TransitionMinimum::VariesByStorageClass);
+        assert!(varies.to_json().contains("varies_by_storage_class"));
+        assert_eq!(Configuration::from_json(&varies.to_json()).unwrap(), varies);
+    }
+
+    #[test]
+    fn refuses_bad_transitions() {
+        let rule = |body: &str| format!("<Rule><ID>r</ID><Filter/><Status>Enabled</Status>{body}</Rule>");
+        let malformed = [
+            rule("<Transition><Days>1</Days></Transition>"),
+            rule("<Transition><StorageClass>COLD</StorageClass></Transition>"),
+            rule("<Transition><Days>1</Days><Date>2027-01-01T00:00:00Z</Date><StorageClass>COLD</StorageClass></Transition>"),
+            rule("<Transition><Days>-1</Days><StorageClass>COLD</StorageClass></Transition>"),
+            rule("<NoncurrentVersionTransition><StorageClass>COLD</StorageClass></NoncurrentVersionTransition>"),
+            rule("<Transition><Days>1</Days><StorageClass>COLD</StorageClass><Bogus/></Transition>"),
+        ];
+        for bad in malformed {
+            assert!(matches!(parse(&bad), Err(Invalid::Malformed(_))), "{bad}");
+        }
+        let invalid = [
+            rule(&format!("{}{}", transition(1, "COLD"), transition(2, "COLD"))),
+            rule(&format!(
+                "{}<Transition><Date>2027-01-01T00:00:00Z</Date><StorageClass>ARCHIVE</StorageClass></Transition>",
+                transition(1, "COLD")
+            )),
+            rule(&format!("<Expiration><Days>30</Days></Expiration>{}", transition(30, "COLD"))),
+            rule(&format!(
+                "<Expiration><Date>2027-01-01T00:00:00Z</Date></Expiration>{}",
+                transition(30, "COLD")
+            )),
+            rule(
+                "<NoncurrentVersionExpiration><NoncurrentDays>5</NoncurrentDays></NoncurrentVersionExpiration>\
+                 <NoncurrentVersionTransition><NoncurrentDays>5</NoncurrentDays><StorageClass>COLD</StorageClass>\
+                 </NoncurrentVersionTransition>",
+            ),
+            rule(&transition(1, "cold")),
+        ];
+        for bad in invalid {
+            assert!(matches!(parse(&bad), Err(Invalid::Argument(_))), "{bad}");
+        }
+    }
+
+    #[test]
+    fn current_versions_transition_to_the_lowest_class_due() {
+        let rules = parse(&format!(
+            "<Rule><ID>r</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>{}{}</Rule>",
+            transition(1, "COLD"),
+            transition(30, "ARCHIVE"),
+        ))
+        .unwrap();
+        let first = day(2026, 1, 1);
+        let size = MIN_TRANSITION_SIZE;
+        let object = [version(1, at(first, 10), true, false, size)];
+        let to = |class: &str| Kind::Transition { class: class.to_owned(), current: true };
+        assert_eq!(rules.due(&ranks(), "logs/a", &object, Day(first.0 + 1)), vec![]);
+        assert_eq!(kinds(&rules.due(&ranks(), "logs/a", &object, Day(first.0 + 2))), vec![(1, to("COLD"))]);
+        assert_eq!(kinds(&rules.due(&ranks(), "logs/a", &object, Day(first.0 + 40))), vec![(1, to("ARCHIVE"))]);
+        // Not again into its own class, nor into a higher one.
+        let mut cold = object.clone();
+        cold[0].storage_class = "COLD".to_owned();
+        assert_eq!(rules.due(&ranks(), "logs/a", &cold, Day(first.0 + 2)), vec![]);
+        assert_eq!(kinds(&rules.due(&ranks(), "logs/a", &cold, Day(first.0 + 40))), vec![(1, to("ARCHIVE"))]);
+        let mut archived = object.clone();
+        archived[0].storage_class = "ARCHIVE".to_owned();
+        assert_eq!(rules.due(&ranks(), "logs/a", &archived, Day(first.0 + 40)), vec![]);
+        // Nor out of a class without a rank.
+        let mut odd = object.clone();
+        odd[0].storage_class = "ODD".to_owned();
+        assert_eq!(rules.due(&ranks(), "logs/a", &odd, Day(first.0 + 40)), vec![]);
+        // Not a small object, unless the rule filters by size, or the
+        // configuration lets small ones into S3's archive classes.
+        let small = [version(1, at(first, 10), true, false, size - 1)];
+        assert_eq!(rules.due(&ranks(), "logs/a", &small, Day(first.0 + 2)), vec![]);
+        let sized = parse(&format!(
+            "<Rule><ID>r</ID><Filter><ObjectSizeGreaterThan>0</ObjectSizeGreaterThan></Filter>\
+             <Status>Enabled</Status>{}</Rule>",
+            transition(1, "COLD")
+        ))
+        .unwrap();
+        assert_eq!(kinds(&sized.due(&ranks(), "logs/a", &small, Day(first.0 + 2))), vec![(1, to("COLD"))]);
+        let glacier = parse(&format!("<Rule><ID>r</ID><Filter/><Status>Enabled</Status>{}</Rule>", transition(1, "GLACIER"))).unwrap();
+        let mut ranked = ranks();
+        ranked.insert("GLACIER".to_owned(), -30);
+        assert_eq!(glacier.due(&ranked, "a", &small, Day(first.0 + 2)), vec![]);
+        let mut varies = glacier.clone();
+        varies.transition_minimum = Some(TransitionMinimum::VariesByStorageClass);
+        assert_eq!(kinds(&varies.due(&ranked, "a", &small, Day(first.0 + 2))), vec![(1, to("GLACIER"))]);
+        // A version that expires isn't transitioned.
+        let expiring = parse(&format!(
+            "<Rule><ID>e</ID><Filter/><Status>Enabled</Status><Expiration><Days>2</Days></Expiration>{}</Rule>",
+            transition(1, "COLD")
+        ))
+        .unwrap();
+        assert_eq!(kinds(&expiring.due(&ranks(), "a", &object, Day(first.0 + 3))), vec![(1, Kind::Current)]);
+        // Delete markers have nothing to transition.
+        let marker = [version(2, at(first, 10), true, true, 0), version(1, at(first, 9), false, false, size)];
+        assert_eq!(rules.due(&ranks(), "logs/a", &marker, Day(first.0 + 2)), vec![]);
+    }
+
+    #[test]
+    fn noncurrent_versions_transition_from_when_they_became_noncurrent() {
+        let rules = parse(
+            "<Rule><ID>r</ID><Filter/><Status>Enabled</Status><NoncurrentVersionTransition>\
+             <NoncurrentDays>2</NoncurrentDays><StorageClass>COLD</StorageClass>\
+             <NewerNoncurrentVersions>1</NewerNoncurrentVersions></NoncurrentVersionTransition>\
+             <NoncurrentVersionExpiration><NoncurrentDays>10</NoncurrentDays></NoncurrentVersionExpiration></Rule>",
+        )
+        .unwrap();
+        let first = day(2026, 1, 1);
+        let size = MIN_TRANSITION_SIZE;
+        let versions = [
+            version(4, at(Day(first.0 + 4), 12), true, false, size),
+            version(3, at(Day(first.0 + 2), 12), false, false, size),
+            version(2, at(first, 12), false, true, 0),
+            version(1, at(Day(0), 0), false, false, size),
+        ];
+        let cold = Kind::Transition { class: "COLD".to_owned(), current: false };
+        // 3 is the newest noncurrent version, which stays; 2 is a delete
+        // marker; 1 became noncurrent at noon on the 1st.
+        assert_eq!(rules.due(&ranks(), "a", &versions, Day(first.0 + 2)), vec![]);
+        assert_eq!(kinds(&rules.due(&ranks(), "a", &versions, Day(first.0 + 3))), vec![(1, cold.clone())]);
+        // Until it expires.
+        let later = Day(first.0 + 12);
+        assert_eq!(
+            kinds(&rules.due(&ranks(), "a", &versions, later)),
+            vec![(1, Kind::Noncurrent { successor: 2, newer: 1 })]
+        );
+        // A run of versions at a time, the same.
+        let today = Day(first.0 + 5);
+        for split in 1..versions.len() {
+            let (run, rest) = versions.split_at(split);
+            let mut due = rules.due_after(&ranks(), "a", None, run, today);
+            due.extend(rules.due_after(&ranks(), "a", Some((&run[split - 1], split - 1)), rest, today));
+            assert_eq!(due, rules.due(&ranks(), "a", &versions, today), "{split}");
+        }
     }
 }

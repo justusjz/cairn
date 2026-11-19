@@ -8442,7 +8442,8 @@
           "misplaced",
           "misplaced_bytes",
           "remote_blobs",
-          "remote_bytes"
+          "remote_bytes",
+          "lower_bytes"
         ],
         "properties": {
           "blobs": {
@@ -8478,6 +8479,11 @@
             "type": "integer",
             "format": "int64"
           },
+          "lower_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The bytes of its blobs that belong in lower classes, since lifecycle\ntransitions: the packer moves them as it rewrites the blobs."
+          },
           "misplaced": {
             "type": "integer",
             "format": "int64",
@@ -8504,6 +8510,14 @@
           },
           "pool": {
             "type": "string"
+          },
+          "rank": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Its place in the classes' order, the warmest highest (see\n`classes`), if it has one."
           },
           "remote_blobs": {
             "type": "integer",
@@ -10157,6 +10171,10 @@
           "started": {
             "type": "number",
             "format": "double"
+          },
+          "transitioned": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -10307,6 +10325,17 @@
             "items": {
               "$ref": "#/components/schemas/LifecycleRule"
             }
+          },
+          "transition_minimum": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/TransitionMinimum",
+                "description": "Which objects too small for a transition are, for the rules without\na size filter: S3's `x-amz-transition-default-minimum-object-size`.\n`None` is its default, `all_storage_classes_128K`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "additionalProperties": false
@@ -10415,6 +10444,34 @@
         },
         "additionalProperties": false
       },
+      "LifecycleNoncurrentTransition": {
+        "type": "object",
+        "description": "`NoncurrentVersionTransition`.",
+        "required": [
+          "days",
+          "storage_class"
+        ],
+        "properties": {
+          "days": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "newer_versions": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "How many of the newest noncurrent versions stay where they are.",
+            "minimum": 0
+          },
+          "storage_class": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "LifecycleRule": {
         "type": "object",
         "required": [
@@ -10461,6 +10518,51 @@
                 "type": "null"
               }
             ]
+          },
+          "noncurrent_transitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LifecycleNoncurrentTransition"
+            },
+            "description": "`NoncurrentVersionTransition`s, each into a class of its own."
+          },
+          "transitions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LifecycleTransition"
+            },
+            "description": "`Transition`s, each into a class of its own."
+          }
+        },
+        "additionalProperties": false
+      },
+      "LifecycleTransition": {
+        "type": "object",
+        "description": "`Transition`: one of `days` and `date`, and the class.",
+        "required": [
+          "storage_class"
+        ],
+        "properties": {
+          "date": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/LifecycleDay"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "days": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "storage_class": {
+            "type": "string"
           }
         },
         "additionalProperties": false
@@ -12823,7 +12925,8 @@
           "read",
           "expired",
           "removed",
-          "aborted"
+          "aborted",
+          "transitioned"
         ],
         "properties": {
           "aborted": {
@@ -12849,6 +12952,10 @@
           "started": {
             "type": "number",
             "format": "double"
+          },
+          "transitioned": {
+            "type": "integer",
+            "format": "int64"
           }
         }
       },
@@ -13044,6 +13151,14 @@
             "minimum": 0
           }
         }
+      },
+      "TransitionMinimum": {
+        "type": "string",
+        "description": "S3's `x-amz-transition-default-minimum-object-size`.",
+        "enum": [
+          "all_storage_classes_128K",
+          "varies_by_storage_class"
+        ]
       },
       "UnitName": {
         "type": "object",

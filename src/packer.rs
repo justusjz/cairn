@@ -42,6 +42,17 @@
 //!   blob's parity shards are its copies, which the mover adds or drops
 //!   without rewriting it (see `mover`).
 //!
+//! - **Relocation** comes with compaction, consolidation and conversion,
+//!   and with the jobs that move blobs into tiers (see `tiers`): a job's
+//!   parts whose bytes belong in a lower storage class than their blob's
+//!   (they're **misplaced**: only versions of lower classes use them, since
+//!   lifecycle transitions, see `classes`) are moved into new blobs of that
+//!   class first, and the job goes on with the rest. Compaction takes a
+//!   blob once its garbage and misplaced bytes together are a large enough
+//!   fraction of it (`blobs.misplaced_size`, which folds work out with the
+//!   garbage): bytes in a higher class than they need cost more, but are as
+//!   good, so they wait for a rewrite that's worth it.
+//!
 //! Every job writes a new blob coded if coding is on (`Layouts`), and the
 //! blob is larger than [`SMALL_SIZE`] (coding a small blob would cost more in
 //! the padding of its last row than it saves). So coded data that's
@@ -187,6 +198,17 @@ pub struct JobReport {
     pub(crate) parts: usize,
     pub(crate) bytes: u64,
     pub(crate) outputs: Vec<Uuid>,
+    /// What it moved into lower classes first (see `relocate`).
+    pub(crate) relocated: Relocated,
+}
+
+/// What a job moved into lower storage classes than its sources' (see
+/// `relocate`): parts, their bytes, and the new blobs.
+#[derive(Default, Debug)]
+pub struct Relocated {
+    pub parts: usize,
+    pub bytes: u64,
+    pub outputs: Vec<Uuid>,
 }
 
 impl JobReport {
@@ -213,7 +235,12 @@ impl std::fmt::Display for JobReport {
             self.outputs.len(),
             self.parts,
             self.bytes
-        )
+        )?;
+        let r = &self.relocated;
+        if r.parts > 0 {
+            write!(f, ", and {} parts ({} bytes) into {} blobs of lower classes", r.parts, r.bytes, r.outputs.len())?;
+        }
+        Ok(())
     }
 }
 
@@ -691,25 +718,53 @@ async fn pack(
         }
     }
     drop(client);
-    let report = |parts: &[Part], runs: &[Run], written: &[Written]| JobReport {
+    // Upgrades and restores keep to their own blobs' classes: an upgrade
+    // reads one replica at a time, and a restore's sources are a backup's.
+    let mut relocated = Relocated::default();
+    if matches!(kind, Kind::Compact | Kind::Consolidate | Kind::Convert) {
+        (parts, relocated) = relocate(app, sources, parts, &blobs).await?;
+    }
+    let mut relocated = Some(relocated);
+    let mut report = |parts: &[Part], runs: &[Run], written: &[Written]| JobReport {
         kind,
         sources: sources.len(),
         parts: parts.len(),
         bytes: runs.iter().map(|r| r.length).sum(),
         outputs: written.iter().map(|w| w.blob_id).collect(),
+        relocated: relocated.take().unwrap_or_default(),
     };
     if parts.is_empty() {
         // Nothing left to move: the sources are garbage already.
-        commit(app, sources, &[], &[]).await?;
+        commit(app, sources, &[], &[], true).await?;
         return Ok(report(&parts, &[], &[]));
     }
     let runs = lay_out(&mut parts, app.pack.target_size);
     reached(app, Stage::Loaded).await;
 
-    // The new blobs, in order: `written[i]` is output `i`.
+    let written = write_runs(app, &runs, &mut parts, &blobs, class, coding, outputs).await?;
+    reached(app, Stage::Copied).await;
+    verify_outputs(app, &written, &parts).await?;
+    reached(app, Stage::Verified).await;
+    commit(app, sources, &written, &parts, true).await?;
+    Ok(report(&parts, &runs, &written))
+}
+
+/// Writes the new blobs that `runs` (as `lay_out` gave them) make up, of
+/// class `class`, coded in `coding` data shards if they're large enough,
+/// adding each to `outputs` once it exists. Drops the parts of runs whose
+/// source vanished while the job ran (all its parts were deleted), whose
+/// place in a new blob is padding. The new blobs, in order: output `i` is
+/// the `i`th.
+async fn write_runs(
+    app: &Arc<App>,
+    runs: &[Run],
+    parts: &mut Vec<Part>,
+    blobs: &HashMap<Uuid, (Option<Layout>, Vec<Location>)>,
+    class: &Class,
+    coding: Option<u32>,
+    outputs: &mut Vec<Uuid>,
+) -> anyhow::Result<Vec<Written>> {
     let mut written = Vec::new();
-    // Runs whose source vanished while the job ran (all its parts were
-    // deleted), and whose place in a new blob is padding.
     let mut vanished = Vec::new();
     for output in runs.chunk_by(|a, b| a.output == b.output) {
         // Its size is known: its runs are copied as they are, or padded.
@@ -740,16 +795,146 @@ async fn pack(
     for range in vanished.into_iter().rev() {
         parts.drain(range);
     }
-    reached(app, Stage::Copied).await;
+    Ok(written)
+}
+
+/// Verifies each new blob of `written` against its parts (`parts`, in
+/// order of their new blobs).
+async fn verify_outputs(app: &App, written: &[Written], parts: &[Part]) -> anyhow::Result<()> {
     for (i, output) in written.iter().enumerate() {
-        // The parts are in order of their new blobs.
         let start = parts.partition_point(|p| p.output < i);
         let end = parts.partition_point(|p| p.output <= i);
         verify(app, output, &parts[start..end]).await?;
     }
-    reached(app, Stage::Verified).await;
-    commit(app, sources, &written, &parts).await?;
-    Ok(report(&parts, &runs, &written))
+    Ok(())
+}
+
+/// Where the misplaced parts among the parts of `sources` belong (see
+/// `classes`): for each part to move, the class it goes to. Parts that
+/// share bytes (overlap, as `lay_out` combines them into an extent) go
+/// together, into the highest class of their versions (or uploads), and
+/// only if none of those is the blob's own class, and all of them, and the
+/// blob's class, are ranked: as `cairn_refresh_dead_size` counts what's
+/// misplaced. Classes as this node knows them.
+pub(crate) async fn destinations(app: &App, client: &Object, sources: &[Uuid]) -> anyhow::Result<HashMap<i64, String>> {
+    let rows = client
+        .query_cached(
+            "SELECT p.id, p.blob_id, p.blob_offset, p.size, b.storage_class,
+                    coalesce(o.storage_class, u.storage_class)
+             FROM parts p
+             JOIN blobs b ON b.blob_id = p.blob_id
+             LEFT JOIN objects o ON o.id = p.object_id
+             LEFT JOIN multipart_uploads u ON u.upload_id = p.upload_id
+             WHERE p.blob_id = ANY($1)
+             ORDER BY p.blob_id, p.blob_offset",
+            &[&sources],
+        )
+        .await?;
+    let classes = app.classes.all();
+    let rank = |name: &str| classes.get(name).and_then(|c| c.rank);
+    let mut moves = HashMap::new();
+    // Each extent: its blob and class, where it ends, and its parts with
+    // their classes.
+    type Extent = (Uuid, String, i64, Vec<(i64, Option<String>)>);
+    let mut extent: Option<Extent> = None;
+    let mut place = |extent: Option<Extent>| {
+        let Some((_, blob_class, _, parts)) = extent else { return };
+        let Some(blob_rank) = rank(&blob_class) else { return };
+        let mut best: Option<(i32, &str)> = None;
+        for (_, class) in &parts {
+            let Some(class) = class.as_deref().filter(|c| *c != blob_class) else { return };
+            let Some(r) = rank(class) else { return };
+            if best.is_none_or(|(b, _)| r > b) {
+                best = Some((r, class));
+            }
+        }
+        if let Some((_, class)) = best.filter(|(r, _)| *r != blob_rank) {
+            for (id, _) in &parts {
+                moves.insert(*id, class.to_owned());
+            }
+        }
+    };
+    for row in &rows {
+        let (id, blob_id, offset, size): (i64, Uuid, i64, i64) = (row.get(0), row.get(1), row.get(2), row.get(3));
+        let class: Option<String> = row.get(5);
+        match &mut extent {
+            Some((blob, _, end, parts)) if *blob == blob_id && offset < *end => {
+                *end = (*end).max(offset + size);
+                parts.push((id, class));
+            }
+            _ => {
+                let next = Some((blob_id, row.get(4), offset + size, vec![(id, class)]));
+                place(std::mem::replace(&mut extent, next));
+            }
+        }
+    }
+    place(extent);
+    Ok(moves)
+}
+
+/// Moves the misplaced parts among `parts` (all the live parts of the
+/// claimed `sources`, see `load_parts`) into new blobs of the classes they
+/// belong in (see `destinations`), as a packing job would, one class at a
+/// time, and commits them, keeping the sources' leases. Returns the parts
+/// left, for the job to go on with, and what it moved. On failure, its new
+/// blobs are deleted (left to the GC if that fails too).
+pub(crate) async fn relocate(
+    app: &Arc<App>,
+    sources: &[Uuid],
+    parts: Vec<Part>,
+    blobs: &HashMap<Uuid, (Option<Layout>, Vec<Location>)>,
+) -> anyhow::Result<(Vec<Part>, Relocated)> {
+    let moves = destinations(app, &app.pool.get().await?, sources).await?;
+    if moves.is_empty() {
+        return Ok((parts, Relocated::default()));
+    }
+    let known = app.classes.all();
+    let (mut moving, rest): (Vec<Part>, Vec<Part>) =
+        parts.into_iter().partition(|p| moves.get(&p.id).is_some_and(|class| known.contains_key(class)));
+    // By class, each in the order the job laid them out by.
+    moving.sort_by_key(|p| moves[&p.id].clone());
+    let mut outputs = Vec::new();
+    let result = async {
+        let mut written: Vec<Written> = Vec::new();
+        let mut moved: Vec<Part> = Vec::new();
+        let mut bytes = 0;
+        let mut by_class: Vec<(String, Vec<Part>)> = Vec::new();
+        for part in moving {
+            let class = &moves[&part.id];
+            match by_class.last_mut() {
+                Some((c, parts)) if c == class => parts.push(part),
+                _ => by_class.push((class.clone(), vec![part])),
+            }
+        }
+        for (name, mut parts) in by_class {
+            let class = app.classes.get(&name);
+            let coding = coding(app, &class).await?;
+            let runs = lay_out(&mut parts, app.pack.target_size);
+            bytes += runs.iter().map(|r| r.length).sum::<u64>();
+            let new = write_runs(app, &runs, &mut parts, blobs, &class, coding, &mut outputs).await?;
+            verify_outputs(app, &new, &parts).await?;
+            let offset = written.len();
+            for part in &mut parts {
+                part.output += offset;
+            }
+            written.extend(new);
+            moved.extend(parts);
+        }
+        commit(app, sources, &written, &moved, false).await?;
+        anyhow::Ok(Relocated { parts: moved.len(), bytes, outputs: written.iter().map(|w| w.blob_id).collect() })
+    }
+    .await;
+    match result {
+        Ok(relocated) => Ok((rest, relocated)),
+        Err(e) => {
+            for blob_id in outputs {
+                if let Err(e) = crate::blobs::abandon(app, blob_id).await {
+                    eprintln!("packer: deleting abandoned blob {blob_id} failed: {e:#}");
+                }
+            }
+            Err(e)
+        }
+    }
 }
 
 /// Loads the parts of `sources` in the order they're to be laid out: by age
@@ -1137,11 +1322,12 @@ async fn commit(
     sources: &[Uuid],
     written: &[Written],
     parts: &[Part],
+    release: bool,
 ) -> anyhow::Result<()> {
     let mut client = app.pool.get().await?;
     for attempt in 0..db::MAX_TX_ATTEMPTS {
         db::backoff(attempt).await;
-        match try_commit(&mut client, sources, written, parts).await {
+        match try_commit(&mut client, sources, written, parts, release).await {
             Ok(reap) => {
                 reap_blobs(app, reap);
                 return Ok(());
@@ -1172,6 +1358,7 @@ async fn try_commit(
     sources: &[Uuid],
     written: &[Written],
     parts: &[Part],
+    release: bool,
 ) -> Result<Vec<ReapTarget>, CommitError> {
     // The new blobs. CRCs are stored as their 64 bits, read as a signed BIGINT.
     let out_blobs: Vec<Uuid> = written.iter().map(|w| w.blob_id).collect();
@@ -1200,7 +1387,7 @@ async fn try_commit(
         .query_one_cached(
             "SELECT status, present, reap_blob, reap_node, reap_peer
              FROM pg_temp.cairn_pack_commit($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12,
-                                            $13, $14, $15, $16)",
+                                            $13, $14, $15, $16, $17)",
             &[
                 &sources,
                 &out_blobs,
@@ -1218,6 +1405,7 @@ async fn try_commit(
                 &old_offsets,
                 &new_blobs,
                 &new_offsets,
+                &release,
             ],
         )
         .await?;

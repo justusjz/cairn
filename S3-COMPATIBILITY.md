@@ -50,7 +50,8 @@ please report it.
 | Object Lock: retention, legal holds, default retention | ✅ | |
 | Object Lock event-based holds | ❌ | |
 | Lifecycle: expiration, noncurrent versions, delete markers, incomplete uploads | ✅ | |
-| Lifecycle transitions, restore | ❌ | |
+| Lifecycle transitions (`Transition`, `NoncurrentVersionTransition`) | 🟡 | Into the operator's ranked classes, lower than the version's own only. S3's minimum days between transitions into its classes don't apply. An object's data moves into its new class's storage later, when the packer rewrites it; the class it reports changes at once. |
+| Restore (`RestoreObject`) | ❌ | |
 | Storage classes | 🟡 | The operator's, by S3's names or others. One of S3's the operator hasn't defined is stored as `STANDARD`. None needs a restore. |
 | CORS | ✅ | |
 | Static website hosting | ✅ | Also on custom domains: a host name is the website of the bucket of that name. |

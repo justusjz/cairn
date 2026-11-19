@@ -377,9 +377,10 @@ another, onto itself, say:
 aws s3 cp s3://my-bucket/backup.tar s3://my-bucket/backup.tar --storage-class STANDARD
 ```
 
-A copy within a class shares its source's bytes; one into another class (a
-copy that names no class is STANDARD, as in S3) writes them again, in its
-pool. A multipart upload's parts are of the class it was created in.
+A copy within a class shares its source's bytes, and so does one into a
+[lower class](#the-order-of-classes) than its source's; one into another
+class (a copy that names no class is STANDARD, as in S3) writes them again,
+in its pool. A multipart upload's parts are of the class it was created in.
 
 A change of a class applies to new objects within a heartbeat. Its existing
 data is rewritten by the [packer](#packing), as after a change of the
@@ -392,8 +393,33 @@ pool's `--data-dir`, which would lose them; [remove](#removing-nodes-and-repair)
 the node first. `cairn node list` shows the nodes' pools, and the console's
 Storage page each class's pool, layout, nodes and data.
 
-Lifecycle rules can't move objects between classes yet (`Transition`); copy
-them instead.
+#### The order of classes
+
+Give the classes a **rank**, the warmest highest, for
+[lifecycle rules](#lifecycle-rules) to move objects down into colder ones
+(`Transition`):
+
+```sh
+cairn class set STANDARD_IA --rank -10
+cairn class set GLACIER_IR --rank -20
+cairn class set FAST --pool nvme --rank 10   # above STANDARD, which is 0
+```
+
+A class stands in for every class below it: its blobs may hold their
+objects' data, and do, for a while. That's your promise, which Cairn takes
+as given: keeping data in a higher class than it needs costs more, but is
+otherwise as good. (A colder pool may well have more parity shards, for
+less reliable disks: that's fine, as long as the warmer class is at least as
+safe.) A class without a rank (`--rank none`, as every class but STANDARD
+has until it's given one) is no other's, and lifecycle rules don't
+transition objects into or out of it. No two classes share a rank.
+
+A transition changes only the object's class: its data stays where it is,
+and the [packer](#packing) moves it into the new class's pool the next time
+it rewrites the blob it's in, which it does once enough of the blob is
+garbage or data that belongs in lower classes (a quarter, together). Data
+that a version of a higher class shares (a copy, say) stays where that one
+needs it. `cairn class list` shows the ranks.
 
 Upgrade every node: once one runs a Cairn with storage classes, older ones
 can no longer write (they'd place shards on nodes without their pool), as
@@ -1613,7 +1639,8 @@ and deletes versions as DeleteObject does, without a bypass.
 
 ## Lifecycle rules
 
-A bucket's lifecycle configuration expires objects automatically, as in S3.
+A bucket's lifecycle configuration expires objects automatically, and moves
+them into colder [storage classes](#the-order-of-classes), as in S3.
 Setting one is bucket management, as `PutLifecycleConfiguration` is its own
 permission in S3, so only an admin can, and needs no grant on the bucket's
 objects: the rules are carried out by Cairn, not as the admin. A role that may
@@ -1648,6 +1675,26 @@ What a rule can do:
   marker, was written), keeping the `NewerNoncurrentVersions` newest ones.
 - **`AbortIncompleteMultipartUpload`**: an upload is aborted
   `DaysAfterInitiation` days after it was started.
+- **`Transition`** with `Days` (0 or more) or a `Date`, and a
+  `StorageClass`: the current version moves into that class that many days
+  after it was written, or from that date on. A rule may have several, each
+  into a class of its own.
+- **`NoncurrentVersionTransition`**: a noncurrent version moves into its
+  `StorageClass` `NoncurrentDays` after it became noncurrent, but the
+  `NewerNoncurrentVersions` newest ones.
+
+Transitions go into lower [ranked](#the-order-of-classes) classes only:
+of the transitions due for a version, the one into the lowest class, if
+that's below the version's own; a rule's class must be defined and ranked
+when the rule is set. A version due to expire isn't transitioned. As in S3,
+a rule without a size filter doesn't transition objects under 128 KiB,
+unless the request that set the rules said
+`x-amz-transition-default-minimum-object-size: varies_by_storage_class`
+(then objects of any size go into `GLACIER` and `DEEP_ARCHIVE`); S3's rules
+on the days between transitions into its own classes don't apply, since the
+classes are yours. A transition only changes the version's class, at the cost
+of an expiration (Object Lock doesn't keep a version from it, as in S3): its
+data follows when the packer gets to it.
 
 A rule's `Filter` picks objects by key prefix (`Prefix`), by size
 (`ObjectSizeGreaterThan`, `ObjectSizeLessThan`; not for delete markers or
@@ -1661,7 +1708,8 @@ expires at the start of the 3rd.
 Rules are applied in the background, not as objects are read: an expired
 object stays readable until a sweep gets to it. Each bucket with rules is
 swept once a day, starting when the rules are set: a sweep walks the keys
-under the prefixes of the rules that expire anything, and expires what's due.
+under the prefixes of the rules that expire or transition anything, and
+expires and transitions what's due.
 
 Sweeps go at a rate you set for the whole cluster, in object versions read
 per hour (1,000,000 by default; 0 pauses them), so that however much there is
@@ -1690,10 +1738,6 @@ changing) the configuration stops a sweep before its next expiration. Nor is
 a version whose tags changed since a sweep read it. Every
 node uses the database's clock, so a node whose clock is off doesn't expire
 anything early.
-
-Not supported, and refused with `501 NotImplemented`: transitions to other
-[storage classes](#storage-classes) (`Transition`,
-`NoncurrentVersionTransition`); copy objects into another class instead.
 
 ## Inventory
 

@@ -49,7 +49,7 @@ async fn configure(app: &App, rules: &str) {
     let body = format!(
         "<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{rules}</LifecycleConfiguration>"
     );
-    let response = put_bucket_lifecycle(app, BUCKET, Bytes::from(body)).await.unwrap();
+    let response = put_bucket_lifecycle(app, BUCKET, Bytes::from(body), None).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
 
@@ -162,7 +162,7 @@ async fn buckets_take_turns() {
     for bucket in [BUCKET, "other"] {
         lone_markers(&app, bucket, 1500).await;
         let body = format!("<LifecycleConfiguration>{MARKERS}</LifecycleConfiguration>");
-        put_bucket_lifecycle(&app, bucket, Bytes::from(body)).await.unwrap();
+        put_bucket_lifecycle(&app, bucket, Bytes::from(body), None).await.unwrap();
     }
     set_rate(&app, 60_000).await;
     let step = |after| {
@@ -353,7 +353,7 @@ async fn a_version_written_since_is_not_expired() {
     let client = app.pool.get().await.unwrap();
     let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
     let due: Vec<_> = rules
-        .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
+        .due(&Default::default(), "a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
         .into_iter()
         .map(|due| ("a".to_owned(), due))
         .collect();
@@ -373,7 +373,7 @@ async fn a_version_written_since_is_not_expired() {
     .await;
     let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
     let due: Vec<_> = rules
-        .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
+        .due(&Default::default(), "a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
         .into_iter()
         .map(|due| ("a".to_owned(), due))
         .collect();
@@ -441,7 +441,7 @@ async fn a_version_retagged_since_is_not_expired() {
     let client = app.pool.get().await.unwrap();
     let (versions, _, _) = page(&client, BUCKET, "", &everything(), super::PAGE).await.unwrap().unwrap();
     let due: Vec<_> = rules
-        .due("a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
+        .due(&Default::default(), "a", &versions["a"], super::Day::of(SystemTime::now() + DAY * 3))
         .into_iter()
         .map(|due| ("a".to_owned(), due))
         .collect();

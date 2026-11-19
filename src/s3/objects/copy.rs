@@ -328,9 +328,11 @@ pub async fn copy_object(
             (None, true) => version.storage_class.as_str(),
             _ => keys.storage_class(),
         };
-        // Its bytes are shared only within a storage class: a copy into
-        // another one writes them again, in its pool and layout.
-        if !keys.shares(encryption) || version.storage_class != storage_class {
+        // Its bytes are shared only by a copy into its source's storage
+        // class, or one below it, which the source's blobs stand in for (see
+        // `classes`): a copy into another one writes them again, in its pool
+        // and layout.
+        if !keys.shares(encryption) || !shares_class(app, &version.storage_class, storage_class) {
             let dest = Dest {
                 bucket: dest_bucket,
                 key: dest_key,
@@ -691,6 +693,14 @@ enum ObjectCopy {
     NoSuchBucket,
 }
 
+/// Whether a copy of a version of class `source` into class `dest` may
+/// share its bytes: it's the same class, or one ranked below it, which the
+/// source's blobs stand in for, since they stand in for the source's (see
+/// `classes`).
+fn shares_class(app: &App, source: &str, dest: &str) -> bool {
+    source == dest || crate::classes::below(&app.classes.all(), dest, source)
+}
+
 /// The transaction that makes a copy of `source` at `bucket`/`key`: a new
 /// version with parts on the source's bytes.
 async fn commit_object_copy(
@@ -715,7 +725,7 @@ async fn commit_object_copy(
                     "SELECT status, version_id, last_modified, reap_blob, reap_node, reap_peer
                      FROM pg_temp.cairn_copy_object($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11,
                                                     $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                                                    $21, $22, $23, $24, $25, $26, $27)",
+                                                    $21, $22, $23, $24, $25, $26, $27, $28)",
                     &[
                         &source.version.id,
                         &part_ids,
@@ -744,6 +754,7 @@ async fn commit_object_copy(
                         &expected.is_some(),
                         &expected.flatten(),
                         &crate::notifications::context(Some("Copy"), Some(plain_etag)),
+                        &dest.storage_class,
                     ],
                 )
                 .await?;
@@ -904,8 +915,9 @@ pub async fn copy_part(
             sse::echo_onto(resp, &upload_encryption, dest_key)
         };
         let encrypted = !version.encryption.is_plain() || !upload_encryption.is_plain();
-        // Bytes are shared only within a storage class (see `CopyKeys`).
-        let reclassed = version.storage_class != upload.storage_class;
+        // Bytes are shared only within a storage class, or into a lower one
+        // (see `CopyKeys`).
+        let reclassed = !shares_class(app, &version.storage_class, &upload.storage_class);
         let holding = part_holding(&source.parts, start, end).filter(|_| !encrypted && !reclassed);
         let Some((index, within)) = holding else {
             let keys = match stream_keys(app, &source, source_key, &src_bucket, &src_key, &upload_encryption, dest_key, role, bucket, key).await? {
