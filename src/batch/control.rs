@@ -71,13 +71,7 @@ const STATUSES: &[&str] = &[
 ];
 
 /// S3's operations Cairn doesn't do yet.
-const UNIMPLEMENTED: &[&str] = &[
-    "LambdaInvoke",
-    "S3PutObjectAcl",
-    "S3InitiateRestoreObject",
-    "S3ComputeObjectChecksum",
-    "S3UpdateObjectEncryption",
-];
+const UNIMPLEMENTED: &[&str] = &["LambdaInvoke", "S3InitiateRestoreObject"];
 
 /// Whether a request to `path` (as sent) with `headers` is S3 Control's, on
 /// Batch Operations' jobs.
@@ -412,6 +406,9 @@ fn operation_xml(operation: &Operation) -> String {
         ),
         Operation::Replicate => "<Operation><S3ReplicateObject/></Operation>".to_owned(),
         Operation::Copy(copy) => format!("<Operation>{}</Operation>", copy.xml()),
+        Operation::PutAcl(acl) => format!("<Operation>{}</Operation>", acl.xml()),
+        Operation::ComputeChecksum(compute) => format!("<Operation>{}</Operation>", compute.xml()),
+        Operation::UpdateEncryption(update) => format!("<Operation>{}</Operation>", update.xml()),
     }
 }
 
@@ -634,6 +631,11 @@ pub(crate) fn parse_create(body: &[u8]) -> Result<NewJob, Response<Full<Bytes>>>
         }
         "S3ReplicateObject" => Operation::Replicate,
         "S3PutObjectCopy" => Operation::Copy(Box::new(super::copy::parse(operation)?)),
+        "S3PutObjectAcl" => Operation::PutAcl(Box::new(super::acl::parse(operation)?)),
+        "S3ComputeObjectChecksum" => Operation::ComputeChecksum(super::checksum::parse(operation)?),
+        "S3UpdateObjectEncryption" => {
+            Operation::UpdateEncryption(super::encryption::parse(operation)?)
+        }
         name if UNIMPLEMENTED.contains(&name) => {
             return Err(not_implemented(&format!("The {name} operation")));
         }
@@ -1354,10 +1356,10 @@ mod tests {
 
     #[test]
     fn what_cairn_doesnt_do_is_not_implemented() {
-        let acl = "<S3PutObjectAcl><AccessControlPolicy><CannedAccessControlList>private</CannedAccessControlList>\
-                   </AccessControlPolicy></S3PutObjectAcl>";
+        let restore = "<S3InitiateRestoreObject><ExpirationInDays>1</ExpirationInDays>\
+                       </S3InitiateRestoreObject>";
         assert_eq!(
-            refusal(&request(acl, "")),
+            refusal(&request(restore, "")),
             (501, "NotImplemented".to_owned())
         );
         let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::b</TargetResource>\

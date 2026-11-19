@@ -2655,3 +2655,302 @@ async fn generating_a_manifest_takes_turns() {
         ]
     );
 }
+
+/// The ACL of `key`'s current version, as stored (see `s3::acl`).
+async fn acl_of(app: &App, key: &str) -> Option<String> {
+    let client = app.pool.get().await.unwrap();
+    client
+        .query_one(
+            "SELECT acl FROM objects WHERE bucket = $1 AND key = $2 AND is_latest",
+            &[&BUCKET, &key],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// Enables ACLs on the test bucket (`ObjectWriter`), or disables them,
+/// with public ones allowed.
+async fn acls(app: &App, enabled: bool) {
+    let client = app.pool.get().await.unwrap();
+    let ownership = if enabled {
+        "ObjectWriter"
+    } else {
+        "BucketOwnerEnforced"
+    };
+    client
+        .execute(
+            "UPDATE buckets SET object_ownership = $2, public_access_block = 0 WHERE name = $1",
+            &[&BUCKET, &ownership],
+        )
+        .await
+        .unwrap();
+    client
+        .execute("UPDATE accounts SET public_access_block = 0", &[])
+        .await
+        .unwrap();
+}
+
+/// Jobs set versions' ACLs, as PutObjectAcl would: to a canned one, or to
+/// grants; and fail where PutObjectAcl would, with ACLs disabled, or as a
+/// role that may not set them.
+#[tokio::test]
+async fn jobs_set_acls() {
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(
+        &app,
+        super::SERVICE,
+        r#"["s3:GetObject","s3:PutObject","s3:PutObjectAcl","s3:PutObjectVersionAcl"]"#,
+    )
+    .await;
+    acls(&app, true).await;
+    put(&app, "a", b"a".to_vec()).await;
+    put(&app, "b", b"b".to_vec()).await;
+    let etag = manifest(
+        &app,
+        "manifest.csv",
+        &format!("{BUCKET},a\n{BUCKET},b\n{BUCKET},missing\n"),
+    )
+    .await;
+    let canned = "<S3PutObjectAcl><AccessControlPolicy><CannedAccessControlList>public-read\
+                  </CannedAccessControlList></AccessControlPolicy></S3PutObjectAcl>";
+    let id = create(
+        &app,
+        &admin,
+        &create_request("t1", canned, "manifest.csv", &etag, false, &account),
+    )
+    .await;
+    let job = describe(&app, &admin, &id).await;
+    assert!(
+        job.contains("<CannedAccessControlList>public-read</CannedAccessControlList>"),
+        "{job}"
+    );
+    step(&app, 1).await;
+    step(&app, 2).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("2"));
+    assert_eq!(element(&job, "NumberOfTasksFailed"), Some("1"));
+    for key in ["a", "b"] {
+        let acl = acl_of(&app, key).await.unwrap();
+        assert!(acl.contains("AllUsers"), "{acl}");
+    }
+
+    // Grants, under the owner's canonical ID.
+    let owner = crate::s3::util::canonical_id(&account);
+    let grants = format!(
+        "<S3PutObjectAcl><AccessControlPolicy><AccessControlList><Grants>\
+         <member><Grantee><Identifier>{owner}</Identifier><TypeIdentifier>id</TypeIdentifier></Grantee>\
+         <Permission>FULL_CONTROL</Permission></member>\
+         <member><Grantee><Identifier>http://acs.amazonaws.com/groups/global/AuthenticatedUsers</Identifier>\
+         <TypeIdentifier>uri</TypeIdentifier></Grantee><Permission>READ_ACP</Permission></member>\
+         </Grants><Owner><ID>{owner}</ID></Owner></AccessControlList></AccessControlPolicy></S3PutObjectAcl>"
+    );
+    let id = create(
+        &app,
+        &admin,
+        &create_request("t2", &grants, "manifest.csv", &etag, false, &account),
+    )
+    .await;
+    step(&app, 3).await;
+    step(&app, 4).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("2"), "{job}");
+    let acl = acl_of(&app, "a").await.unwrap();
+    assert!(!acl.contains("AllUsers"), "{acl}");
+    assert!(
+        acl.contains("AuthenticatedUsers") && acl.contains("READ_ACP"),
+        "{acl}"
+    );
+
+    // With ACLs disabled, every task fails, as PutObjectAcl does.
+    acls(&app, false).await;
+    let failing = with_report(
+        &create_request("t3", canned, "manifest.csv", &etag, false, &account),
+        &report("FailedTasksOnly"),
+    );
+    let id = create(&app, &admin, &failing).await;
+    step(&app, 5).await;
+    step(&app, 6).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "NumberOfTasksFailed"), Some("3"), "{job}");
+    let (_, files) = report_of(&app, &id).await;
+    assert!(
+        files[0].1.contains(&format!(
+            "{BUCKET},a,,failed,400,AccessControlListNotSupported,"
+        )),
+        "{}",
+        files[0].1
+    );
+}
+
+/// A job works out each version's checksum, as its report tells; a task on
+/// what isn't there, or that the role may not read, fails.
+#[tokio::test]
+async fn jobs_compute_checksums() {
+    use crate::s3::checksums::{Algorithm, digest, encode};
+    let Some(app) = node().await else { return };
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(&app, super::SERVICE, r#"["s3:GetObject","s3:PutObject"]"#).await;
+    let data = b"hello, checksums".to_vec();
+    put(&app, "a", data.clone()).await;
+    let etag = manifest(
+        &app,
+        "manifest.csv",
+        &format!("{BUCKET},a\n{BUCKET},missing\n"),
+    )
+    .await;
+    let operation = "<S3ComputeObjectChecksum><ChecksumAlgorithm>SHA256</ChecksumAlgorithm>\
+                     <ChecksumType>FULL_OBJECT</ChecksumType></S3ComputeObjectChecksum>";
+    let request = with_report(
+        &create_request("t1", operation, "manifest.csv", &etag, false, &account),
+        &report("AllTasks"),
+    );
+    let id = create(&app, &admin, &request).await;
+    let job = describe(&app, &admin, &id).await;
+    assert!(
+        job.contains("<S3ComputeObjectChecksum><ChecksumAlgorithm>SHA256</ChecksumAlgorithm>"),
+        "{job}"
+    );
+    step(&app, 1).await;
+    step(&app, 2).await;
+    assert_eq!(status_of(&app, &admin, &id).await, "Complete");
+    let (_, files) = report_of(&app, &id).await;
+    let raw = digest(Algorithm::Sha256, &data);
+    let hex: String = raw.iter().map(|b| format!("{b:02X}")).collect();
+    use md5::Digest;
+    let md5: String = md5::Md5::digest(&data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let message = format!(
+        r#"{{"checksumAlgorithm":"SHA256","checksumType":"FULL_OBJECT","checksum_base64":"{}","checksum_hex":"{hex}","etag":"{md5}"}}"#,
+        encode(&raw)
+    );
+    assert_eq!(
+        files,
+        [
+            (
+                "succeeded".to_owned(),
+                format!(
+                    "{BUCKET},a,,succeeded,200,,\"{}\"\n",
+                    message.replace('"', "\"\"")
+                )
+            ),
+            (
+                "failed".to_owned(),
+                format!(
+                    "{BUCKET},missing,,failed,404,NoSuchKey,The specified key does not exist.\n"
+                )
+            ),
+        ]
+    );
+    // CRC64NVME has no COMPOSITE checksums.
+    let crc = "<S3ComputeObjectChecksum><ChecksumAlgorithm>CRC64NVME</ChecksumAlgorithm>\
+               <ChecksumType>COMPOSITE</ChecksumType></S3ComputeObjectChecksum>";
+    let (status, _) = body_of(
+        control::create(
+            &app,
+            &access(&admin),
+            &account,
+            create_request("t2", crc, "manifest.csv", &etag, false, &account).as_bytes(),
+        )
+        .await
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// A job changes versions' encryption to SSE-KMS, as its role, which needs
+/// `s3:UpdateObjectEncryption` and the use of the key: a plain version's
+/// task fails, and so does a version's under a legal hold.
+#[tokio::test]
+async fn jobs_update_encryption() {
+    let Some(app) = crate::e2e::kms_node().await else {
+        return;
+    };
+    crate::settings::LIFECYCLE_RATE
+        .set(&app.pool.get().await.unwrap(), 1_000_000)
+        .await
+        .unwrap();
+    let account = account(&app).await;
+    let admin = user(&app, "admin", None).await;
+    role(
+        &app,
+        super::SERVICE,
+        r#"["s3:GetObject","s3:UpdateObjectEncryption"]"#,
+    )
+    .await;
+    crate::e2e::kms::allow_iam_role(&app, ROLE, &["transit/cairn-test"]).await;
+    lock_bucket(&app).await;
+    crate::e2e::kms::put_sse_s3(&app, "s3", b"secret".to_vec()).await;
+    crate::e2e::kms::put_sse_s3(&app, "held", b"held".to_vec()).await;
+    app.pool
+        .get()
+        .await
+        .unwrap()
+        .execute(
+            "UPDATE objects SET legal_hold = true WHERE bucket = $1 AND key = 'held'",
+            &[&BUCKET],
+        )
+        .await
+        .unwrap();
+    put(&app, "plain", b"plain".to_vec()).await;
+    let etag = manifest(
+        &app,
+        "manifest.csv",
+        &format!("{BUCKET},s3\n{BUCKET},plain\n{BUCKET},held\n"),
+    )
+    .await;
+    let operation = "<S3UpdateObjectEncryption><ObjectEncryption><SSE-KMS>\
+                     <KMSKeyArn>arn:aws:kms:us-east-1:123456789012:key/transit/cairn-test</KMSKeyArn>\
+                     </SSE-KMS></ObjectEncryption></S3UpdateObjectEncryption>";
+    let request = with_report(
+        &create_request("t1", operation, "manifest.csv", &etag, false, &account),
+        &report("FailedTasksOnly"),
+    );
+    // The report's writes need `s3:PutObject` too.
+    let client = app.pool.get().await.unwrap();
+    let role_row = roles::Role::load(&client, &account, ROLE)
+        .await
+        .unwrap()
+        .unwrap();
+    let put_reports = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::{BUCKET}/reports/*"}}]}}"#
+    );
+    roles::put_policy(&client, &role_row, "reports", &put_reports)
+        .await
+        .unwrap();
+    let id = create(&app, &admin, &request).await;
+    step(&app, 1).await;
+    step(&app, 2).await;
+    let job = describe(&app, &admin, &id).await;
+    assert_eq!(element(&job, "Status"), Some("Complete"), "{job}");
+    assert_eq!(element(&job, "NumberOfTasksSucceeded"), Some("1"));
+    let (_, files) = report_of(&app, &id).await;
+    let failed = &files[0].1;
+    assert!(
+        failed.contains(&format!("{BUCKET},plain,,failed,400,InvalidRequest,")),
+        "{failed}"
+    );
+    assert!(
+        failed.contains(&format!("{BUCKET},held,,failed,403,AccessDenied,")),
+        "{failed}"
+    );
+    let row = client
+        .query_one(
+            "SELECT sse_kms_key_id, sse_s3 FROM objects WHERE bucket = $1 AND key = 's3' AND is_latest",
+            &[&BUCKET],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        row.get::<_, Option<String>>(0).as_deref(),
+        Some("transit/cairn-test")
+    );
+    assert!(!row.get::<_, bool>(1));
+}

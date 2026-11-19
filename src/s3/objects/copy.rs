@@ -22,8 +22,9 @@ use crate::{
         expiration,
         multipart::upload,
         objects::get::{
-            Missing, ObjectVersion, PartLocation, lookup_version, lost_data, no_such_version,
-            reads_lost, resolve_object_parts, select_parts_in_range, spawn_range_stream,
+            Missing, ObjectVersion, PartLocation, is_multipart, lookup_version, lost_data,
+            no_such_version, reads_lost, resolve_object_parts, select_parts_in_range,
+            spawn_range_stream,
         },
         sse::{self, Stored, Wanted},
         sse_c::CustomerKey,
@@ -1558,6 +1559,135 @@ async fn hash_range(
         crc64nvme: crc.sum64(),
         checksum: checksum.map(checksums::Hasher::finish),
     })
+}
+
+/// A checksum of a version's data worked out at rest (Batch Operations'
+/// `S3ComputeObjectChecksum`; see `batch`), with the version's ETag.
+#[derive(Debug)]
+pub(crate) struct Computed {
+    /// As it's reported: base64, a COMPOSITE one's with `-N`.
+    pub checksum: Checksum,
+    /// Its bytes.
+    pub raw: Vec<u8>,
+    /// The version's ETag, as clients know it.
+    pub etag: String,
+}
+
+/// Works out the `algorithm` checksum of the version of `bucket`/`key`
+/// named `version_id` (else its current one) from its data, read (and
+/// decrypted, an SSE-KMS one's key asked of the KMS as `role`): of the
+/// whole object, or, `Type::Composite`, of its parts' checksums, if it's
+/// multipart (a single PUT's is always of the whole, as its stored one is).
+/// Refused for an SSE-C object, whose key Cairn doesn't have, as S3 refuses
+/// it; or with the response a GET of a version that isn't there gets.
+pub(crate) async fn compute_checksum(
+    app: &Arc<App>,
+    bucket: &str,
+    key: &str,
+    version_id: Option<&str>,
+    algorithm: Algorithm,
+    kind: Type,
+    role: Option<Uuid>,
+) -> anyhow::Result<Result<Computed, Response<Full<Bytes>>>> {
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let source = {
+            let mut client = app.pool.get().await?;
+            let tx = client
+                .build_transaction()
+                .isolation_level(IsolationLevel::RepeatableRead)
+                .start()
+                .await?;
+            let version = match lookup_version(&tx, bucket, key, version_id).await? {
+                Ok(version) => version,
+                Err(missing) => return Ok(Err(missing.read_response())),
+            };
+            let parts = source_parts(&tx, version.id).await?;
+            let locations = resolve_object_parts(&tx, version.id).await?;
+            tx.commit().await?;
+            Source {
+                version,
+                parts,
+                locations,
+            }
+        };
+        let encryption = &source.version.encryption;
+        if matches!(encryption, Stored::Customer { .. }) {
+            return Ok(Err(format_s3_error(
+                StatusCode::BAD_REQUEST,
+                "InvalidRequest",
+                "SSE-C encryption type is not supported for this operation",
+            )));
+        }
+        let object_key = match sse::open(app, encryption, None, role, bucket, key).await? {
+            Ok(object_key) => object_key,
+            Err(refused) => return Ok(Err(refused)),
+        };
+        let etag = match &object_key {
+            Some(object_key) if matches!(encryption, Stored::S3(_)) => Storing::Sealed(object_key)
+                .read(
+                    Field::Etag,
+                    Owner::Object { bucket, key },
+                    &source.version.etag,
+                )?,
+            _ => source.version.etag.clone(),
+        };
+        let multipart = source.parts.len() > 1 || is_multipart(&etag);
+        let hashing = || Hashing {
+            md5: false,
+            checksum: Some(algorithm),
+            key: object_key.as_deref(),
+        };
+        let computed = match kind {
+            Type::Composite if multipart => {
+                let mut raws = Vec::with_capacity(source.parts.len());
+                let mut start = 0;
+                let mut read = Ok(());
+                for part in &source.parts {
+                    let end = start + part.object_size();
+                    match hash_range(app, source.locations.clone(), start, end, hashing()).await {
+                        Ok(hashes) => raws.push(hashes.checksum.expect("asked for")),
+                        Err(e) => {
+                            read = Err(e);
+                            break;
+                        }
+                    }
+                    start = end;
+                }
+                read.map(|()| {
+                    let raw = checksums::digest(algorithm, &raws.concat());
+                    let checksum = Checksum {
+                        algorithm,
+                        kind: Type::Composite,
+                        value: checksums::composite(algorithm, &raws),
+                    };
+                    (checksum, raw)
+                })
+            }
+            _ => {
+                let size = source.version.size as u64;
+                hash_range(app, source.locations.clone(), 0, size, hashing())
+                    .await
+                    .map(|hashes| {
+                        let raw = hashes.checksum.expect("asked for");
+                        (Checksum::full(algorithm, &raw), raw)
+                    })
+            }
+        };
+        match computed {
+            Ok((checksum, raw)) => {
+                return Ok(Ok(Computed {
+                    checksum,
+                    raw,
+                    etag,
+                }));
+            }
+            // Its data went with it: work out what's there now.
+            Err(_) if attempts < MAX_SOURCE_ATTEMPTS && source.changed(app).await? => continue,
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 fn no_such_bucket() -> Response<Full<Bytes>> {

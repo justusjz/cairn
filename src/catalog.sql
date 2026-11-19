@@ -2015,6 +2015,64 @@ BEGIN
 END
 $$;
 
+-- T73: UpdateObjectEncryption (Batch Operations' S3UpdateObjectEncryption;
+-- see `s3::sse::update_encryption`): stores the version's object key, which
+-- its data stays encrypted under, sealed under another SSE-KMS data key, in
+-- place, as the caller sealed it (`p_kms_*`); and, for a version that was
+-- SSE-S3, its ETag and its parts' as SSE-KMS keeps them, in the clear
+-- (`p_etag`, and `p_part_ids` with `p_part_etags`; NULLs: as they are).
+-- Takes B(b) shared, K(b,k), and X(x) shared for its parts' blobs, whose
+-- rows it changes. The version, by its row id `p_id`, must still be the one
+-- the caller read: its sealed key still `p_sealed`, and its parts still
+-- `p_part_ids`, if given. A version that's retained or under a legal hold
+-- isn't changed, as S3 has it. Returns 'updated', 'no_such_bucket',
+-- 'changed' (it isn't the one read anymore, or is gone), or 'locked'.
+CREATE OR REPLACE FUNCTION pg_temp.cairn_update_encryption(
+    p_bucket text, p_key text, p_id bigint, p_sealed bytea, p_kms_key_id text,
+    p_kms_data_key text, p_kms_sealed bytea, p_kms_context text, p_etag text,
+    p_part_ids bigint[], p_part_etags text[],
+    OUT status text
+) LANGUAGE plpgsql AS $$
+DECLARE
+    o record;
+    v_blobs uuid[];
+BEGIN
+    IF pg_temp.cairn_lock_bucket(p_bucket) IS NULL THEN
+        status := 'no_such_bucket';
+        RETURN;
+    END IF;
+    PERFORM pg_temp.cairn_lock_keys(p_bucket, ARRAY[p_key]);
+    SELECT ob.id, ob.sse_kms_sealed, ob.retain_until, ob.legal_hold INTO o
+    FROM objects ob
+    WHERE ob.id = p_id AND ob.bucket = p_bucket AND ob.key = p_key AND NOT ob.is_delete_marker;
+    IF NOT FOUND OR o.sse_kms_sealed IS DISTINCT FROM p_sealed THEN
+        status := 'changed';
+        RETURN;
+    END IF;
+    IF o.retain_until > NOW() OR coalesce(o.legal_hold, false) THEN
+        status := 'locked';
+        RETURN;
+    END IF;
+    IF p_part_ids IS NOT NULL THEN
+        SELECT coalesce(array_agg(p.blob_id), '{}') INTO v_blobs FROM parts p WHERE p.object_id = o.id;
+        PERFORM pg_temp.cairn_lock_blobs(v_blobs, array_fill(false, ARRAY[cardinality(v_blobs)]));
+        IF (SELECT coalesce(array_agg(p.id ORDER BY p.id), '{}') FROM parts p WHERE p.object_id = o.id)
+           IS DISTINCT FROM (SELECT coalesce(array_agg(i ORDER BY i), '{}') FROM unnest(p_part_ids) AS i) THEN
+            status := 'changed';
+            RETURN;
+        END IF;
+        UPDATE parts p SET etag = t.etag
+        FROM unnest(p_part_ids, p_part_etags) AS t(id, etag)
+        WHERE p.id = t.id AND p.object_id = o.id;
+    END IF;
+    UPDATE objects SET sse_kms_key_id = p_kms_key_id, sse_kms_data_key = p_kms_data_key,
+                       sse_kms_sealed = p_kms_sealed, sse_kms_context = p_kms_context,
+                       sse_s3 = false, etag = coalesce(p_etag, etag)
+    WHERE id = o.id;
+    status := 'updated';
+END
+$$;
+
 -- T39: PutObjectRetention: sets the retention (`p_mode` and `p_until`;
 -- NULLs to remove it) of the version `p_version_id` of the key, or of its
 -- current version if NULL, in place, as S3 lets it be changed: a retention

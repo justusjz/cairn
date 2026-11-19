@@ -1749,3 +1749,220 @@ async fn checksums_under_the_kms() {
     let other = role(&app, "bob", &[]).await;
     assert_eq!(head(Some(other)).await.status(), StatusCode::FORBIDDEN);
 }
+
+/// Lets the IAM role `name` (its sessions: a batch job's, say) use exactly
+/// `keys`, as `allow` lets a user's.
+pub(crate) async fn allow_iam_role(app: &App, name: &str, keys: &[&str]) {
+    crate::users::identify(app).await.unwrap();
+    let entity: String = app
+        .pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT kms_entity_id FROM iam_roles WHERE name = $1",
+            &[&name],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    let policy: String = keys
+        .iter()
+        .map(|key| {
+            let (mount, name) = key.rsplit_once('/').unwrap();
+            format!(
+                "path \"{mount}/datakey/plaintext/{name}\" {{ capabilities = [\"update\"] }}\n\
+                 path \"{mount}/decrypt/{name}\" {{ capabilities = [\"update\"] }}\n"
+            )
+        })
+        .collect();
+    let policy_name = format!("e2e-iam-{entity}");
+    bao(
+        hyper::Method::POST,
+        &format!("sys/policies/acl/{policy_name}"),
+        serde_json::json!({ "policy": policy }),
+    )
+    .await;
+    bao(
+        hyper::Method::POST,
+        &format!("identity/entity/id/{entity}"),
+        serde_json::json!({ "policies": [policy_name] }),
+    )
+    .await;
+}
+
+/// Writes `data` as `key` with SSE-S3, as a role of no keys of its own
+/// would: for other modules' tests.
+pub(crate) async fn put_sse_s3(app: &Arc<App>, key: &str, data: Vec<u8>) {
+    allow_cairn(app, &["transit/cairn-sse-s3"]).await;
+    let writer = role(app, "writer", &[]).await;
+    put_s3(app, writer, key, data).await;
+}
+
+/// UpdateObjectEncryption (Batch Operations'; see `sse::update_encryption`):
+/// an SSE-S3 multipart object becomes SSE-KMS in place, keeping its data,
+/// ETag (its MD5s', now stored in the clear, as are its parts') and
+/// checksum; an SSE-KMS one goes under another key, as a role the KMS lets
+/// use both. Plain objects, and roles that may not use the keys, are
+/// refused. Checksums are worked out of its data at rest, of the whole or
+/// of its parts.
+#[tokio::test]
+async fn encryption_is_updated_in_place() {
+    use crate::s3::checksums::{self, Algorithm, Type};
+    let Some(app) = kms_node().await else { return };
+    allow_cairn(&app, &["transit/cairn-sse-s3"]).await;
+    let alice = role(
+        &app,
+        "alice",
+        &["transit/cairn-test", "transit/cairn-other"],
+    )
+    .await;
+    let bob = role(&app, "bob", &["transit/cairn-test"]).await;
+    let (upload_id, _) = create(&app, alice, "m", Wanted::S3).await;
+    let (first, second) = (data(5 << 20), data(70_000));
+    let part_etags = vec![
+        put_part(&app, alice, upload_id, "m", 1, first.clone()).await,
+        put_part(&app, alice, upload_id, "m", 2, second.clone()).await,
+    ];
+    assert_eq!(part_etags[0], md5_hex(&first));
+    assert_eq!(
+        complete(&app, alice, "m", upload_id, &part_etags).await.0,
+        StatusCode::OK
+    );
+    let etag = etag_of(&app, "m").await;
+    assert!(etag.ends_with("-2"), "{etag}");
+    let stored = |key: &'static str| {
+        let app = app.clone();
+        async move {
+            let client = app.pool.get().await.unwrap();
+            let row = client
+                .query_one(
+                    "SELECT etag, sse_kms_key_id, sse_s3, checksum,
+                            (SELECT array_agg(p.etag ORDER BY p.part_number) FROM parts p WHERE p.object_id = o.id)
+                     FROM objects o WHERE key = $1 AND is_latest",
+                    &[&key],
+                )
+                .await
+                .unwrap();
+            let r: (String, Option<String>, bool, Option<String>, Vec<String>) =
+                (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4));
+            r
+        }
+    };
+    let before = stored("m").await;
+    assert_ne!(before.0, etag, "sealed");
+
+    let to = |key: &str| kms(Some(key), &[]);
+    sse::update_encryption(&app, BUCKET, "m", None, &to("cairn-other"), Some(alice))
+        .await
+        .unwrap()
+        .unwrap();
+    let after = stored("m").await;
+    assert_eq!(after.0, etag, "the ETag, in the clear");
+    assert_eq!(after.1.as_deref(), Some("transit/cairn-other"));
+    assert!(!after.2);
+    assert_eq!(after.3, before.3, "the checksum, sealed as it was");
+    assert_eq!(after.4, part_etags, "the parts' ETags, in the clear");
+    let (status, headers, body) = get(&app, Some(alice), "m", None).await;
+    assert_eq!(
+        (status, headers),
+        (StatusCode::OK, Headers::kms("transit/cairn-other", None))
+    );
+    assert!(body == [first.clone(), second.clone()].concat());
+    // Bob may not use the old key.
+    let refused = sse::update_encryption(&app, BUCKET, "m", None, &to("cairn-test"), Some(bob))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(code(refused).await.0, StatusCode::FORBIDDEN);
+    sse::update_encryption(&app, BUCKET, "m", None, &to("cairn-test"), Some(alice))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored("m").await.0, etag);
+    let (status, headers, _) = get(&app, Some(bob), "m", None).await;
+    assert_eq!(
+        (status, headers),
+        (StatusCode::OK, Headers::kms("transit/cairn-test", None))
+    );
+
+    // Its checksums, worked out of its data, as Bob.
+    let compute = |algorithm, kind| {
+        let app = app.clone();
+        async move {
+            crate::s3::objects::copy::compute_checksum(
+                &app,
+                BUCKET,
+                "m",
+                None,
+                algorithm,
+                kind,
+                Some(bob),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+        }
+    };
+    let whole = compute(Algorithm::Sha256, Type::FullObject).await;
+    let all = [first.clone(), second.clone()].concat();
+    assert_eq!(whole.raw, checksums::digest(Algorithm::Sha256, &all));
+    assert_eq!(whole.etag, etag);
+    let parts = vec![
+        checksums::digest(Algorithm::Crc32, &first),
+        checksums::digest(Algorithm::Crc32, &second),
+    ];
+    let composite = compute(Algorithm::Crc32, Type::Composite).await;
+    assert_eq!(composite.checksum.kind, Type::Composite);
+    assert_eq!(
+        composite.checksum.value,
+        checksums::composite(Algorithm::Crc32, &parts)
+    );
+    assert_eq!(
+        composite.raw,
+        checksums::digest(Algorithm::Crc32, &parts.concat())
+    );
+
+    // A plain object has no encryption to update; a missing one, nothing.
+    put(&app, "plain", data(10)).await;
+    let refused =
+        sse::update_encryption(&app, BUCKET, "plain", None, &to("cairn-test"), Some(alice))
+            .await
+            .unwrap()
+            .unwrap_err();
+    assert_eq!(
+        code(refused).await,
+        (StatusCode::BAD_REQUEST, "InvalidRequest".to_owned())
+    );
+    let refused = sse::update_encryption(
+        &app,
+        BUCKET,
+        "missing",
+        None,
+        &to("cairn-test"),
+        Some(alice),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert_eq!(
+        code(refused).await,
+        (StatusCode::NOT_FOUND, "NoSuchKey".to_owned())
+    );
+    // A single PUT's COMPOSITE checksum is of the whole object.
+    let single = crate::s3::objects::copy::compute_checksum(
+        &app,
+        BUCKET,
+        "plain",
+        None,
+        Algorithm::Crc32,
+        Type::Composite,
+        None,
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(single.checksum.kind, Type::FullObject);
+    assert_eq!(single.raw, checksums::digest(Algorithm::Crc32, &data(10)));
+    assert_eq!(single.etag, md5_hex(&data(10)));
+}
