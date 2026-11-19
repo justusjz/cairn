@@ -269,6 +269,7 @@ dependencies = [
  "deadpool-postgres",
  "flate2",
  "futures-core",
+ "futures-util",
  "getrandom 0.4.2",
  "hmac",
  "http-body-util",

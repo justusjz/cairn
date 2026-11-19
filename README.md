@@ -94,7 +94,8 @@ Caddy gets a certificate for `s3.example.com` and `console.example.com` as
 it starts, and one for any other host the first time a client asks for it,
 if Cairn [serves something there](#https-for-websites-and-buckets); plain
 HTTP is redirected to HTTPS. Back up the `postgres` and `cairn` volumes: the
-database, and the data.
+database, and the data; or let Cairn [back itself up](#backups) to another S3
+service.
 
 **Wildcard certificates.** A certificate per bucket is fine for a few, but
 Let's Encrypt issues at most 50 a week per registered domain. With more
@@ -134,7 +135,7 @@ cairn user create admin --admin --key  # prints its access key ID and secret
 ```
 
 The `cairn` commands that manage the cluster (`user`, `account`, `oidc`,
-`config`, `node` and `sessions`) don't touch the database themselves:
+`config`, `node`, `backup` and `sessions`) don't touch the database themselves:
 they run on a node, sent to its peer endpoint. That's the node on this
 host by default (`http://127.0.0.1:9431`, the default `--listen-peer`), or
 the one `--peer-url` (`CAIRN_PEER_URL`, as `cairn serve` has it) names, so
@@ -2486,6 +2487,113 @@ every node:
   deleted on the next pass.
 
 There's nothing to run or configure.
+
+## Backups
+
+Cairn backs the whole cluster up to a bucket of another S3 service: its data,
+and everything in its database (buckets, objects and their versions, users,
+policies, settings, ...). A new cluster can be restored from that bucket
+alone: no copy of the database is needed, and none has to be made. Changes
+reach the backup every 5 minutes (the most a restore can lose), and the
+backup holds few, large objects, however many the cluster has.
+
+```sh
+cairn backup enable --endpoint https://s3.eu-central-1.amazonaws.com --region eu-central-1 \
+    --bucket my-backups --prefix cairn/ \
+    --access-key-id AKIA... --secret-access-key ...   # or CAIRN_BACKUP_ACCESS_KEY_ID/_SECRET_ACCESS_KEY
+# backing up to s3://my-backups/cairn/ at https://s3.eu-central-1.amazonaws.com, every 300s
+# key: 3q2+7wD...
+cairn backup status
+```
+
+**Keep the key it prints**, somewhere other than the cluster (`cairn backup
+key` prints it again while the cluster is there): everything in the backup
+is encrypted with it, and a restore needs it. The bucket should have
+versioning on (and, better, Object Lock, or a lifecycle rule that keeps
+noncurrent versions for a while), so that what's deleted there, by mistake
+or by whoever has the credentials, can be got back. The prefix must be the
+backup's own: `enable` refuses one that holds objects already. Use
+`--path-style` for services that don't take the bucket in the host name
+(most but AWS).
+
+| Flag | Default | |
+| --- | --- | --- |
+| `--interval` | `5m` | How often changes are shipped: the RPO. |
+| `--retention` | `7d` | How long what the cluster no longer needs is kept in the backup: how far back a restore can go. |
+| `--pack-size` | `256MiB` | How large the backup's objects of data are. |
+
+`cairn backup enable` again changes them (or, with another bucket or
+prefix, starts a new backup there); `cairn backup disable` stops it (what's
+in the bucket stays, and enabling it again there carries on); `cairn backup
+now [--base]` runs a cycle at once.
+
+### How it works
+
+One node at a time runs the backup (any node takes over if it's gone). While
+a backup is on, triggers log every change to the database's tables in the
+transaction that makes it. Every interval, the node ships what was logged,
+in a **journal**, together with the bytes of the parts it added, copied from
+the cluster and checked against their checksums. Up to a pack's worth of
+bytes goes into the journal; more goes into **packs** of `--pack-size`. So a
+cycle writes one object, or a few, whatever was written; a cluster that's
+idle writes none. A copy (CopyObject) shares its source's bytes in the
+backup, as in the cluster. Every so often (once the journals since add up to
+its size, after 2016 journals, or after an upgrade changed the schema), a
+**base** snapshot of the database follows. A large one (hundreds of GiB, for
+hundreds of millions of objects) takes a while: it's written in chunks, in
+between the journals, which go on every 5 minutes meanwhile, and it carries
+on from its last chunk after an interruption (a node going down, the target
+being unreachable), on whichever node runs the backup next. Until it's
+complete, the base before it is the one a restore uses. Data that was there before the
+backup was turned on is copied a batch every few seconds, until it's all in:
+`cairn backup status` shows how much is left.
+
+The backup doesn't rewrite its objects to reclaim space: with versioning on
+the bucket, that would only keep another copy around. A pack is deleted once
+nothing in it is needed anymore (after the retention). Just two things are
+written again, both bounded: the bytes in journals are moved into a pack
+once there's a pack's worth, or a day has passed (so a trickle of small
+writes doesn't leave an object behind every 5 minutes), and a pack of which
+less than half is still needed has that half rewritten, together with that
+of other such packs. So the backup holds at most about twice what's live for
+good, and a rewrite adds at most half a pack's size while the old pack is
+still kept.
+
+Everything is encrypted (XChaCha20-Poly1305, with a key of each object's own
+derived from the backup's key and its name), so that the target holds
+nothing readable without the key, and nothing it holds can be altered,
+swapped or cut short unnoticed. Objects encrypted with SSE-KMS or SSE-S3
+stay encrypted as they are: restoring them needs the same KMS, whose keys
+aren't in the backup. Nor are the nodes' flags.
+
+### Restoring
+
+Restore into a new, empty database, before starting any node on it:
+
+```sh
+createdb cairn_restored
+cairn restore --database postgres://user:pass@db.internal/cairn_restored \
+    --endpoint https://s3.eu-central-1.amazonaws.com --region eu-central-1 \
+    --bucket my-backups --prefix cairn/ \
+    --access-key-id AKIA... --secret-access-key ... --key 3q2+7wD...
+# restoring to 2026-11-18T09:30:12Z (schema 74): the base after journal 812 and 140 journals
+```
+
+It loads the database as it was at the last journal (or as of `--at
+2026-11-18T08:00:00Z`, any time within the retention; `--list` shows what's
+there). Then start the new cluster's nodes on that database, as usual (they
+can be other machines, and more or fewer of them, with the same pools as the
+storage classes need). Every object is readable at once: what isn't in the
+cluster yet is read from the backup. Meanwhile, the nodes copy the data into
+the cluster in the background, checked against its checksums, which
+`cairn backup status` shows. The restored cluster isn't backed up until you
+turn that on, to a new prefix.
+
+The cluster comes back with its settings, such as `parity-shards`: a new
+cluster with fewer nodes than those need has to change them first. Parts
+whose bytes the backup lacks (written in the moments before the last
+journal, or deleted from the cluster then) are reported, and reads of them
+fail, as of data lost to damage.
 
 ## License
 

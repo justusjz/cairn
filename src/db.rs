@@ -170,7 +170,7 @@ pub async fn backoff(attempt: usize) {
 
 /// Arbitrary key for the advisory lock that serializes migrations, so nodes
 /// starting at the same time don't race to apply the same step.
-const MIGRATION_LOCK: i64 = 0x6361_6972_6e00; // "cairn\0"
+pub(crate) const MIGRATION_LOCK: i64 = 0x6361_6972_6e00; // "cairn\0"
 
 /// The advisory lock that keeps garbage folds from running concurrently (see
 /// `cairn_fold_garbage`, which repeats it as a literal).
@@ -254,7 +254,13 @@ const MIGRATIONS: &[&str] = &[
     STORAGE_CLASSES,
     DIRECTORY_PASSKEY_CHALLENGES,
     SWITCHED_ROLES,
+    BACKUPS,
 ];
+
+/// The schema's version that this Cairn migrates to.
+pub(crate) fn schema_version() -> i32 {
+    MIGRATIONS.len() as i32
+}
 
 /// Applies every pending migration in a single transaction, so a failure leaves
 /// the schema untouched. Refuses to run against a database migrated by a newer
@@ -264,6 +270,9 @@ pub(crate) async fn init(pool: &Pool, last: usize) -> anyhow::Result<()> {
     let tx = client.transaction().await?;
     tx.execute("SELECT pg_advisory_xact_lock($1)", &[&MIGRATION_LOCK])
         .await?;
+    // A migration's changes aren't captured for a backup: it takes a new
+    // base after one (see `backup::capture`).
+    tx.execute("SELECT set_config('cairn.backup_capture', 'off', true)", &[]).await?;
     tx.batch_execute(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
              version     INT PRIMARY KEY,
@@ -317,6 +326,9 @@ pub(crate) async fn init(pool: &Pool, last: usize) -> anyhow::Result<()> {
         )
         .await?;
         eprintln!("applied schema migration {version}");
+    }
+    if last >= MIGRATIONS.len() {
+        crate::backup::refresh_capture(&tx).await?;
     }
     tx.commit().await?;
     Ok(())
@@ -3464,6 +3476,138 @@ CREATE TABLE console_switched_roles (
 );
 CREATE INDEX console_switched_roles_expires ON console_switched_roles (expires_at);
 CREATE TRIGGER console_switched_roles_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON console_switched_roles
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+"#;
+
+/// Migration 74: backups to another S3 service, and restores from them (see
+/// `backup`).
+///
+/// - `backup_config`, `backup_state`: the one backup's target and settings,
+///   and where its runner (one node at a time, by a lease) has got to.
+/// - `backup_changes`: every change to the tables that are backed up, as
+///   their capture triggers log it while a backup is on (see
+///   `backup::capture`), until the runner ships it.
+/// - `backup_objects`: the objects written to the target, and how much of
+///   each is still needed; `backup_parts`: where in them each part's bytes
+///   are.
+/// - `restore_source`, `restore_blobs`: after a restore, the backup the
+///   cluster's data is still being copied from, and the blobs that are still
+///   there: a blob in the new state `restoring` is the bytes of an object of
+///   the backup, which no node holds yet.
+///
+/// No new lock protocol: the runner's rows are its own (and a lease
+/// guards them, not a lock); a restoring blob is never claimed by the
+/// packer's or the mover's jobs (they take committed blobs only), but by the
+/// restorer's, which moves its parts as a packing job does (T15).
+const BACKUPS: &str = r#"
+ALTER TABLE blobs DROP CONSTRAINT blobs_state_check;
+ALTER TABLE blobs ADD CONSTRAINT blobs_state_check
+    CHECK (state = ANY (ARRAY['pending', 'committed', 'restoring']));
+CREATE INDEX blobs_restoring ON blobs (created_at) WHERE state = 'restoring';
+
+CREATE TABLE backup_config (
+    id                boolean PRIMARY KEY DEFAULT true CHECK (id),
+    endpoint          text NOT NULL,
+    region            text NOT NULL,
+    bucket            text NOT NULL,
+    prefix            text NOT NULL,
+    path_style        boolean NOT NULL,
+    access_key_id     text NOT NULL,
+    secret_access_key text NOT NULL,
+    key               bytea NOT NULL CHECK (octet_length(key) = 32),
+    interval_secs     integer NOT NULL CHECK (interval_secs > 0),
+    retention_secs    bigint NOT NULL CHECK (retention_secs >= 0),
+    pack_size         bigint NOT NULL CHECK (pack_size > 0),
+    enabled           boolean NOT NULL,
+    created_at        timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE backup_state (
+    id               boolean PRIMARY KEY DEFAULT true CHECK (id),
+    holder           uuid,
+    lease_until      timestamptz,
+    generation       bigint NOT NULL DEFAULT 0,
+    journal_seq      bigint NOT NULL DEFAULT 0,
+    journal_id       uuid,
+    journal_at       timestamptz,
+    base_seq         bigint,
+    base_ready_seq   bigint,
+    building         text,
+    base_id          uuid,
+    base_at          timestamptz,
+    base_version     integer,
+    base_size        bigint,
+    journals_since_base bigint NOT NULL DEFAULT 0,
+    bytes_since_base bigint NOT NULL DEFAULT 0,
+    backfill_after   bigint,
+    cycled_at        timestamptz,
+    requested        text,
+    last_error       text,
+    last_error_at    timestamptz
+);
+INSERT INTO backup_state DEFAULT VALUES;
+CREATE TABLE backup_changes (
+    seq  bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    xid  xid8 NOT NULL,
+    tbl  text NOT NULL,
+    op   "char" NOT NULL,
+    key  text,
+    row  text
+);
+CREATE TABLE backup_objects (
+    id            uuid PRIMARY KEY,
+    name          text NOT NULL UNIQUE,
+    kind          text NOT NULL CHECK (kind IN ('pack', 'journal', 'base')),
+    seq           bigint,
+    size          bigint NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    refs          bigint NOT NULL DEFAULT 0,
+    live_bytes    bigint NOT NULL DEFAULT 0,
+    dead_since    timestamptz,
+    superseded_at timestamptz,
+    base          uuid
+);
+CREATE INDEX backup_objects_kind ON backup_objects (kind, seq);
+CREATE TABLE backup_parts (
+    part_id  bigint PRIMARY KEY,
+    object   uuid NOT NULL REFERENCES backup_objects (id),
+    "offset" bigint NOT NULL,
+    size     bigint NOT NULL,
+    class    text NOT NULL
+);
+CREATE INDEX backup_parts_object ON backup_parts (object);
+CREATE TABLE restore_source (
+    id                boolean PRIMARY KEY DEFAULT true CHECK (id),
+    endpoint          text NOT NULL,
+    region            text NOT NULL,
+    bucket            text NOT NULL,
+    prefix            text NOT NULL,
+    path_style        boolean NOT NULL,
+    access_key_id     text NOT NULL,
+    secret_access_key text NOT NULL,
+    key               bytea NOT NULL CHECK (octet_length(key) = 32),
+    state             text NOT NULL CHECK (state IN ('loading', 'restoring', 'done')),
+    restored_to       timestamptz,
+    started_at        timestamptz NOT NULL DEFAULT now(),
+    finished_at       timestamptz
+);
+CREATE TABLE restore_blobs (
+    blob_id uuid PRIMARY KEY REFERENCES blobs (blob_id) ON DELETE CASCADE,
+    name    text,
+    size    bigint NOT NULL
+);
+CREATE TRIGGER backup_config_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON backup_config
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER backup_state_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON backup_state
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER backup_changes_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON backup_changes
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER backup_objects_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON backup_objects
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER backup_parts_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON backup_parts
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER restore_source_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON restore_source
+    FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
+CREATE TRIGGER restore_blobs_protocol BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE ON restore_blobs
     FOR EACH STATEMENT EXECUTE FUNCTION cairn_require_protocol();
 "#;
 

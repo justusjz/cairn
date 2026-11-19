@@ -42,6 +42,7 @@ webpki-roots = "1.0.11"
 ring = "0.17"
 multer = { version = "3.1", default-features = false }
 futures-core = "0.3.34"
+futures-util = { version = "0.3.32", default-features = false, features = ["sink", "std"] }
 reed-solomon-simd = "3.1"
 tower = { version = "0.5", features = ["util"] }
 # Inventory reports are gzipped CSV (see `inventory`); the pure-Rust backend.

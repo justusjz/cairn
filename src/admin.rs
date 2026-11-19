@@ -53,6 +53,7 @@ pub enum Command {
     Node(crate::nodes::NodeArgs),
     Class(crate::classes::ClassArgs),
     Sessions(crate::sessions::SessionsArgs),
+    Backup(crate::backup::BackupArgs),
 }
 
 /// What a command printed, and how it failed, if it did.
@@ -97,6 +98,7 @@ pub async fn run(app: &Arc<App>, command: Command) -> Output {
         Command::Node(args) => crate::nodes::run(app, args, &mut out).await,
         Command::Class(args) => crate::classes::run(app, args, &mut out).await,
         Command::Sessions(args) => crate::sessions::run(app, args, &mut out).await,
+        Command::Backup(args) => crate::backup::run_command(app, args, &mut out).await,
     };
     if let Err(e) = result {
         if !matches!(e.downcast_ref::<crate::users::Invalid>(), Some(_)) {

@@ -191,6 +191,7 @@ impl std::fmt::Display for JobReport {
             Kind::Consolidate => "consolidated",
             Kind::Upgrade => "upgraded",
             Kind::Convert => "converted",
+            Kind::Restore => "restored",
         };
         write!(
             f,
@@ -204,13 +205,16 @@ impl std::fmt::Display for JobReport {
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Kind {
+pub(crate) enum Kind {
     Compact,
     Consolidate,
     /// Rewrites a blob from before checksums into a checksummed one.
     Upgrade,
     /// Rewrites large blobs in the cluster's layout.
     Convert,
+    /// Copies a blob that's still in a backup into the cluster (see
+    /// `backup::restore`).
+    Restore,
 }
 
 /// Runs packing jobs until there's nothing left worth packing (or the pass hits
@@ -521,6 +525,7 @@ async fn claim(app: &App, kind: Kind, class: &Class) -> anyhow::Result<Option<Ve
         Kind::Consolidate => "consolidate",
         Kind::Upgrade => "upgrade",
         Kind::Convert => unreachable!("conversions are claimed by `claim_conversion`"),
+        Kind::Restore => unreachable!("restores are claimed by `backup::restore`"),
     };
     claim_with(app, kind, class, None).await
 }
@@ -565,20 +570,20 @@ async fn claim_with(app: &App, kind: &str, class: &Class, layouts: Option<Layout
 
 /// A live part to move: where it is, where it's going, and the checksum that
 /// its bytes must still match once they're there.
-struct Part {
-    id: i64,
-    blob_id: Uuid,
-    offset: u64,
-    size: u64,
+pub(crate) struct Part {
+    pub id: i64,
+    pub blob_id: Uuid,
+    pub offset: u64,
+    pub size: u64,
     /// The new blob it goes to (the job's first, second, ...), and where.
-    output: usize,
-    new_offset: u64,
+    pub output: usize,
+    pub new_offset: u64,
     /// The run it's copied with.
-    run: usize,
+    pub run: usize,
     /// The part's CRC64/NVME, or for a part from before checksums, its MD5
     /// (which is its ETag).
-    crc64nvme: Option<u64>,
-    etag: String,
+    pub crc64nvme: Option<u64>,
+    pub etag: String,
 }
 
 /// A byte range of a source blob that's copied as a whole: the bytes its parts
@@ -595,18 +600,18 @@ struct Extent {
 
 /// A contiguous range of a source blob, copied in one read: one or more
 /// extents that sit back to back in the source and stay that way in a new blob.
-struct Run {
-    output: usize,
-    blob_id: Uuid,
-    offset: u64,
-    length: u64,
+pub(crate) struct Run {
+    pub output: usize,
+    pub blob_id: Uuid,
+    pub offset: u64,
+    pub length: u64,
     /// The parts it holds, as a range of the job's parts.
-    parts: std::ops::Range<usize>,
+    pub parts: std::ops::Range<usize>,
 }
 
 /// Runs a job on the claimed `sources`. On failure, the new blobs are deleted
 /// (left to the GC if that fails too), and the sources stay leased.
-async fn run_job(
+pub(crate) async fn run_job(
     app: &Arc<App>,
     kind: Kind,
     sources: &[Uuid],
@@ -745,7 +750,7 @@ async fn load_parts(client: &Object, sources: &[Uuid]) -> anyhow::Result<Vec<Par
 
 /// Each source blob's layout (`None` for a blob from before checksums) and
 /// the nodes holding its shards, this node first, then the freshest.
-async fn load_blobs(
+pub(crate) async fn load_blobs(
     client: &Object,
     node: i32,
     sources: &[Uuid],
@@ -777,7 +782,7 @@ async fn load_blobs(
 /// back to back. Each part keeps its distance from its extent's start. Groups
 /// the extents into runs that can each be copied in one read, and sorts the
 /// parts by run, and so by new blob and place in it.
-fn lay_out(parts: &mut [Part], target: u64) -> Vec<Run> {
+pub(crate) fn lay_out(parts: &mut [Part], target: u64) -> Vec<Run> {
     // Each blob's parts, by offset; the ranges of those that overlap are
     // combined into one extent.
     let mut by_offset: Vec<usize> = (0..parts.len()).collect();
@@ -968,7 +973,7 @@ impl std::error::Error for Mismatch {}
 
 /// Checks the parts in a stream of the new blob's bytes. The parts must be in
 /// order of their new offsets; they may overlap.
-struct Verifier<'a> {
+pub(crate) struct Verifier<'a> {
     parts: &'a [Part],
     /// The next part to start checking.
     next: usize,
@@ -1015,7 +1020,7 @@ impl PartHash {
 }
 
 impl<'a> Verifier<'a> {
-    fn new(parts: &'a [Part]) -> Verifier<'a> {
+    pub(crate) fn new(parts: &'a [Part]) -> Verifier<'a> {
         Verifier {
             parts,
             next: 0,
@@ -1026,7 +1031,7 @@ impl<'a> Verifier<'a> {
     }
 
     /// Takes the next `data` of the blob.
-    fn update(&mut self, data: &[u8]) {
+    pub(crate) fn update(&mut self, data: &[u8]) {
         if self.failed.is_some() {
             return;
         }
@@ -1065,7 +1070,7 @@ impl<'a> Verifier<'a> {
         self.pos = end;
     }
 
-    fn finish(mut self) -> Result<(), String> {
+    pub(crate) fn finish(mut self) -> Result<(), String> {
         // Empty parts at the very end see no data, so they end here.
         self.update(&[]);
         if let Some(i) = self.failed {

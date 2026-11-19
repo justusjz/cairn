@@ -98,6 +98,13 @@ Done:
   of its own; objects ask for one with `x-amz-storage-class`, and change
   class by being copied; the packer rewrites a class's data after a change
   of its pool or layout. Implemented.
+- **Backups.** The whole cluster, continuously, to a bucket of another S3
+  service: its database's changes in journals every few minutes (the RPO),
+  with the parts' bytes, in few, large, encrypted objects, and base
+  snapshots; restored into a new database from that bucket alone, with
+  the data readable at once and copied into the new cluster in the
+  background. Implemented, with restores to a point in time within the
+  retention.
 - **Lifecycle transitions.** Moving objects between storage classes by
   lifecycle rules (`Transition`, `NoncurrentVersionTransition`), as a
   rewrite of their data into the class, paced as sweeps are. Expiration
